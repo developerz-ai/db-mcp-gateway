@@ -53,6 +53,8 @@ Files: keep them under 300 LOC. Extract by responsibility, not by line count.
 - **Tracing, not println.** `tracing` spans on every tool dispatch with `request_id`, `user`, `server`, `database`.
 - **Audit before result.** The audit write completes before the success response goes out. Use a transaction or 2-phase commit pattern with the state DB.
 - **Per-DB pools, sized by config.** Never one global pool. Never share a pool across `(server, database)`.
+- **Fully async, hot-path-fair.** This gateway serves an entire org's worth of agents concurrently. Every layer (transport, authz, exec, audit) is `async` end-to-end. No `std::sync::Mutex` on the request path — use `tokio::sync` primitives. No `block_on`. A slow query on one DB must never block a request against another, and a burst from one user must not starve others.
+- **Cancellation safety.** When an agent disconnects, the corresponding tokio task is dropped — every `await` point on the way down to the DB driver must surface that cancellation as a `pg_cancel_backend` (Postgres) and a clean audit row with `outcome: cancelled`. Test this; it's easy to write code that holds a connection until the query finishes on its own.
 - **No backwards-compat shims** for unreleased code. Once we cut v1, then we worry about migrations.
 - **No comments restating code.** Only document non-obvious *why*: a hidden invariant, a workaround for a specific bug, behavior that would surprise a reader.
 

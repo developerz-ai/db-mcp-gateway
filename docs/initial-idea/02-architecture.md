@@ -49,6 +49,31 @@ One reason to change per layer. Don't blur these.
 - One Postgres pool for the state DB.
 - A background task per pool for health checks; one for audit retention pruning; one for SSO key rotation.
 
+## Concurrency
+
+The gateway is the shared substrate for an *entire engineering org* hammering away from multiple agents at once. Every layer is built for that load shape from the start.
+
+- **All I/O is async.** Tokio runtime, axum HTTP, sqlx async driver. One slow query never blocks another developer's request.
+- **No per-user serialization.** A developer can run multiple agents (Claude Code in one repo, Cursor in another) under the same SSO identity, and they share the session token but not the connection — every request gets a fresh pooled connection.
+- **Per-database concurrency cap.** The pool `max_connections` is the upper bound. Bursts beyond that queue at the gateway with the `acquire_timeout` ceiling — agents see a clean `unavailable` error instead of cascading timeouts down to the DB.
+- **Tool dispatch is non-blocking.** Each MCP request is its own tokio task. Cancellations (agent disconnect, statement timeout) propagate cleanly down to the DB driver — `pg_cancel_backend` on Postgres — so an abandoned query doesn't burn a connection until it finishes on its own.
+- **Audit writes don't queue head-of-line.** The audit log writer has its own state-DB pool, separate from session reads, so a burst of queries doesn't starve session validation or vice versa.
+- **Fairness.** When a `(server, database)` pool is saturated, waiters are FIFO. We will not implement per-user priority in v1; if one user is dominating prod, the operator's lever is the permissions config (lower `row_limit`, lower `statement_timeout_ms`), not in-gateway scheduling.
+
+### What this means in practice
+
+| Scenario | Behavior |
+|---|---|
+| 50 agents call `list_databases` simultaneously | All return in parallel; no target DB hit at all — served from cached metadata |
+| 10 agents `run_query` against `prod/app` (pool max 5) | First 5 execute; next 5 queue up to `acquire_timeout`; queue beyond that returns `unavailable` |
+| One agent runs a slow 25s query | Other agents' queries against the same DB execute in parallel on other pool connections; that agent's own *next* query waits or fails fast |
+| Agent disconnects mid-query | `pg_cancel_backend` fires, the connection returns to the pool within seconds, audit log records `outcome: cancelled` |
+| 1000 audit writes in 10s | Audit pool absorbs the burst; if it can't, the *request* fails (synchronous audit invariant — see [01-overview](01-overview.md)) rather than queueing audit and lying about durability |
+
+### HA
+
+For organizations that need to survive a single gateway instance going down: run two replicas behind a load balancer. Session state is in the state DB, not in-process, so sessions follow the request to whichever replica picks it up. Sticky sessions are *not* required. The only singleton background task — audit retention pruning — uses an advisory lock in the state DB so only one replica runs it at a time.
+
 ## Statelessness
 
 The gateway process is stateless apart from in-memory caches (JWKS, sessions, decoded permissions). Restarting the binary loses nothing that isn't reloadable from config + state DB. Two replicas behind a load balancer is the path to HA; sticky sessions are not required because session state is in the state DB.
