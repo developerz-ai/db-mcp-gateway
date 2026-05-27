@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# bin/ci — reproduce the CI pipeline locally. Run before pushing.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+bin/lint
+bin/test
+echo "✓ CI checks passed"

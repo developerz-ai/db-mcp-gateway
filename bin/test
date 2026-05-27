@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# bin/test — unit + integration tests. Brings up the dev stack if needed.
+# Pass-through args go to `cargo test` (e.g. bin/test --test smoke -- --nocapture).
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if [[ -f .env ]]; then
+  set -a; . ./.env; set +a
+fi
+
+# Integration tests need a live Postgres. Bring up the dev stack if it isn't running.
+if ! docker compose -f docker-compose.dev.yml ps --status running --quiet state-db | grep -q .; then
+  echo "→ bringing up dev stack for tests"
+  docker compose -f docker-compose.dev.yml up -d --wait
+fi
+
+exec cargo test --all-targets "$@"

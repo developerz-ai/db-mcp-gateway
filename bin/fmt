@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# bin/fmt — format every file in place.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+exec cargo fmt --all

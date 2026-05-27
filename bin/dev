@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# bin/dev — local dev stack control.
+#   bin/dev up         start state-db + target-db
+#   bin/dev down       stop and remove containers
+#   bin/dev reset      down + remove volumes (fresh DBs)
+#   bin/dev logs [svc] follow logs
+#   bin/dev psql state psql into state-db
+#   bin/dev psql target psql into target-db
+#   bin/dev ps         compose ps
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if [[ -f .env ]]; then
+  set -a; . ./.env; set +a
+fi
+
+COMPOSE=(docker compose -f docker-compose.dev.yml)
+
+case "${1:-up}" in
+  up)    "${COMPOSE[@]}" up -d ;;
+  down)  "${COMPOSE[@]}" down ;;
+  reset) "${COMPOSE[@]}" down -v ;;
+  logs)  shift; "${COMPOSE[@]}" logs -f "${@:-}" ;;
+  ps)    "${COMPOSE[@]}" ps ;;
+  psql)
+    target="${2:-state}"
+    case "$target" in
+      state)  exec "${COMPOSE[@]}" exec state-db  psql -U "${STATE_DB_USER:-gateway}"  -d "${STATE_DB_NAME:-gateway}" ;;
+      target) exec "${COMPOSE[@]}" exec target-db psql -U "${TARGET_DB_USER:-app}"    -d "${TARGET_DB_NAME:-app}" ;;
+      *) echo "unknown psql target: $target (use 'state' or 'target')" >&2; exit 2 ;;
+    esac
+    ;;
+  *) echo "usage: bin/dev {up|down|reset|logs [svc]|ps|psql state|psql target}" >&2; exit 2 ;;
+esac
