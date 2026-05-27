@@ -20,7 +20,18 @@ pub fn dispatch(request: Request) -> Option<Response> {
 
     match method.as_str() {
         "initialize" => Some(Response::result(response_id(), &InitializeResult::new())),
-        "notifications/initialized" => None,
+        // A notification by definition; if a client (wrongly) sends it with an
+        // `id`, it's a request and JSON-RPC requires we answer rather than hang it.
+        "notifications/initialized" => {
+            if is_notification {
+                None
+            } else {
+                Some(Response::error(
+                    response_id(),
+                    ErrorObject::invalid_request(),
+                ))
+            }
+        }
         "ping" => Some(Response::result(response_id(), &EmptyResult {})),
         "tools/list" => Some(Response::result(
             response_id(),
@@ -88,6 +99,19 @@ mod tests {
         )
         .unwrap();
         assert!(dispatch(notification).is_none());
+    }
+
+    #[test]
+    fn initialized_with_an_id_is_invalid_request() {
+        let response = dispatch_value(
+            json!({"jsonrpc": "2.0", "id": 9, "method": "notifications/initialized"}),
+        );
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            value["error"]["code"],
+            crate::transport::jsonrpc::INVALID_REQUEST
+        );
+        assert_eq!(value["id"], 9);
     }
 
     #[test]

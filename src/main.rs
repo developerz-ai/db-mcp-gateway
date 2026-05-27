@@ -33,7 +33,12 @@ async fn main() -> anyhow::Result<()> {
 /// drain cleanly on `docker stop`.
 async fn shutdown_signal() {
     let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            // Handler install failed — don't let this resolve, or `select!` would
+            // shut the server down without any real signal.
+            tracing::error!(%error, "failed to install Ctrl-C handler");
+            std::future::pending::<()>().await;
+        }
     };
 
     #[cfg(unix)]
@@ -42,7 +47,10 @@ async fn shutdown_signal() {
             Ok(mut signal) => {
                 signal.recv().await;
             }
-            Err(error) => tracing::error!(%error, "failed to install SIGTERM handler"),
+            Err(error) => {
+                tracing::error!(%error, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
         }
     };
 
