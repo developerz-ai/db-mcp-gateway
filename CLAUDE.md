@@ -76,15 +76,21 @@ Files ≤300 LOC. Split by responsibility.
 
 ## Conventions
 
+The bar: idiomatic, boring, readable Rust. No spaghetti, no premature abstraction. A function reads top to bottom without chasing state. Equally-correct options → pick the one easier to delete. `clippy -D warnings` is the floor, not the ceiling.
+
 - Errors typed. `thiserror` for domain; `anyhow` only at `main.rs` boundary. Every client error has a stable code (see `docs/initial-idea/03-mcp-tools.md`).
-- No `unwrap`/`expect` outside `main` and tests. Panic in hot path crashes every user.
+- No `unwrap`/`expect` outside `main` and tests. Panic in hot path crashes every user. Propagate with `?`; branch with `match`/`if let`/`let ... else`.
+- Newtype over bare primitives when a value has meaning (`RequestId(String)`, not `String`). Make illegal states unrepresentable — `enum` over contradictory `bool`+`Option`. Validate input into a type once at the edge; don't re-validate downstream.
+- Derive, don't hand-roll (`Debug`, `Clone`, serde). Every public type derives `Debug` at minimum. Keep `pub` surface minimal.
+- Borrow by default (`&str` over `String`, `&[T]` over `Vec<T>`). `.clone()` only when ownership must move — non-obvious clone gets a one-line `// why`. `Arc<T>` for shared read-only; add a lock only when you mutate shared state, keep the critical section tiny.
+- Functions do one thing. Need "and" to describe it → split it. No premature abstraction: concrete first, introduce a trait when the **second** impl arrives (e.g. `DbAdapter`). Iterator chains over manual index loops where they read clearer.
 - `tracing`, not `println`. Every tool dispatch is a span with `request_id`, `user`, `server`, `database`.
 - Audit write commits **before** success response goes out. Two-phase commit with state DB.
 - Per-DB pools, sized by config. Never one global pool. Never share a pool across `(server, database)`.
-- Async end-to-end. No `std::sync::Mutex` on request path — use `tokio::sync`. No `block_on`. Slow query on DB A must never block DB B. One noisy user must not starve others.
+- Async end-to-end. No `std::sync::Mutex` on request path — use `tokio::sync`. No `block_on`, no blocking I/O in async fns (offload with `spawn_blocking`). Never hold a `std::sync` guard across `.await`. Slow query on DB A must never block DB B. One noisy user must not starve others.
 - Cancellation safety. Agent disconnect → tokio task dropped → `pg_cancel_backend` → audit row `outcome: cancelled`. Test it; easy to write code that holds the conn until the query finishes anyway.
 - No backwards-compat shims pre-v1.
-- No comments restating code. Only document non-obvious *why*.
+- Comment the non-obvious *why*, never the *what*. Rename until code doesn't need the *what*. `///` on public items whose contract isn't obvious from the signature. Architecture decisions go in `docs/initial-idea/`, not code comments.
 
 ## Testing
 
