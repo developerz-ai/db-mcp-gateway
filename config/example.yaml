@@ -1,0 +1,90 @@
+# Example gateway config. Copy to config.yaml, fill in, point the gateway at it with --config.
+# Schema and validation rules: docs/initial-idea/08-config.md
+# Secrets references: ${ENV}, vault:path, aws-sm:arn:..., gcp-sm:projects/.../secrets/...
+
+gateway:
+  bind: 0.0.0.0:8443
+  external_url: https://db.internal.example.com
+  env: production              # 'production' rejects inline literal secrets
+  state_db:
+    url: ${STATE_DB_URL}
+    pool_size: 10
+
+auth:
+  oidc:
+    issuer: https://example.okta.com
+    client_id: ${OIDC_CLIENT_ID}
+    client_secret: ${OIDC_CLIENT_SECRET}
+    groups_claim: groups
+    session_ttl_hours: 8
+
+servers:
+  - name: prod
+    kind: postgres
+    host: prod-rw.db.internal
+    port: 5432
+    tls: required
+    databases:
+      - name: app
+        role: mcp_gateway_prod_app_ro
+        password: vault:secret/prod/db/app_ro_password
+        description: "Main customer-facing app DB"
+        sql_capture: redacted        # full | redacted | metadata_only
+        pool:
+          max_connections: 5
+          idle_timeout_seconds: 300
+          acquire_timeout_seconds: 10
+
+      - name: billing
+        role: mcp_gateway_prod_billing_ro
+        password: vault:secret/prod/db/billing_ro_password
+        sql_capture: metadata_only
+        pool:
+          max_connections: 3
+
+  - name: staging
+    kind: postgres
+    host: staging.db.internal
+    port: 5432
+    tls: required
+    databases:
+      - name: app
+        role: mcp_gateway_staging_app_ro
+        password: ${STAGING_APP_RO_PASSWORD}
+        pool:
+          max_connections: 5
+
+permissions:
+  - group: backend-engineers
+    grants:
+      - { server: staging, database: "*", action: query_read }
+      - { server: prod,    database: "*", action: schema_read }
+
+  - group: oncall
+    grants:
+      - server: prod
+        database: "*"
+        action: query_read
+        constraints:
+          require_reason: true
+          statement_timeout_ms: 5000
+          row_limit: 1000
+
+  - group: data-platform
+    grants:
+      - server: prod
+        database: app
+        action: query_read
+        constraints:
+          row_limit: 10000
+
+logging:
+  hot_retention_days: 90
+  archive:
+    kind: s3
+    bucket: example-db-mcp-audit
+    prefix: gateway/
+    region: us-east-1
+  stream:
+    - kind: otlp
+      endpoint: https://otel.internal:4317

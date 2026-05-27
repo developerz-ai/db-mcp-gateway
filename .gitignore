@@ -1,0 +1,30 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local dev / secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local config overrides
+config/local.yaml
+config/*.local.yaml
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Claude Code per-machine settings (project-shared settings live in .claude/)
+.claude/settings.local.json
+
+# Test / build artifacts
+/coverage
+*.profraw
+*.profdata
