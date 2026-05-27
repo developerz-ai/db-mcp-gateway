@@ -28,6 +28,16 @@
                                     └─────────────────────┘
 ```
 
+## Transport (wire protocol)
+
+The gateway speaks **MCP over Streamable HTTP** (the 2025-03+ MCP transport), not the deprecated two-endpoint HTTP+SSE transport:
+
+- A single configurable endpoint (default `/mcp`).
+- `POST` carries client→server JSON-RPC 2.0 messages; the gateway replies with a JSON-RPC response (`application/json`), or `202 Accepted` for notifications.
+- `GET` opens the server→client SSE stream for server-initiated messages. On connect it emits a non-normative `greeting` event (protocol version + server identity) so a plain `curl` confirms liveness, then holds open with keep-alives.
+
+Protocol version: `2025-06-18`. The framing is hand-rolled JSON-RPC; it gets swapped for an official MCP server SDK when one stabilizes (see [11-roadmap](11-roadmap.md)). Transport owns framing only — auth, tool dispatch, and audit are separate layers below.
+
 ## Layers inside the gateway
 
 One reason to change per layer. Don't blur these.
