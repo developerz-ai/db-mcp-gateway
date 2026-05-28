@@ -10,10 +10,45 @@ use std::time::Duration;
 
 use common::{MockUser, spawn_mock_idp};
 use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
-use db_mcp_gateway::config::Config;
+use db_mcp_gateway::config::{Config, ConfigFile};
 use db_mcp_gateway::state;
 use db_mcp_gateway::transport::{self, AppState, AuthFacade, PendingFlows};
 use serde_json::{Value, json};
+
+/// Config the e2e booted gateway sees. The user logs in with groups
+/// `[engineers, oncall]`, so `engineers` grants visibility on `prod`,
+/// `oncall` on `staging`. `analytics` is visible to neither and must be
+/// filtered out of `list_servers`. The literal `hunter2` is in the YAML
+/// so we can assert end-to-end that it never reaches the wire.
+const E2E_CONFIG_YAML: &str = r#"
+servers:
+  - name: prod
+    kind: postgres
+    description: E2E prod
+    host: prod.example.invalid
+    databases:
+      - { name: app, role: ro, password: hunter2 }
+  - name: staging
+    kind: postgres
+    description: E2E staging
+    host: staging.example.invalid
+    databases:
+      - { name: app, role: ro, password: stagingpw }
+  - name: analytics
+    kind: mysql
+    description: E2E analytics
+    host: analytics.example.invalid
+    databases:
+      - { name: dw, role: ro, password: dwpw }
+
+permissions:
+  - group: engineers
+    grants:
+      - { server: prod, database: "*", action: schema_read }
+  - group: oncall
+    grants:
+      - { server: staging, database: "*", action: query_read }
+"#;
 
 fn state_db_url() -> String {
     std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
@@ -55,6 +90,7 @@ async fn login_via_mock_idp_then_call_tool() {
         bind: addr,
         ..Config::default()
     };
+    let config_file = ConfigFile::from_yaml_str(E2E_CONFIG_YAML).expect("e2e yaml is well-formed");
     let app = transport::router(
         &config,
         AppState {
@@ -64,6 +100,7 @@ async fn login_via_mock_idp_then_call_tool() {
                 oidc,
                 flows: PendingFlows::default(),
             }),
+            config: Arc::new(config_file),
         },
     );
     tokio::spawn(async move {
@@ -120,7 +157,11 @@ async fn login_via_mock_idp_then_call_tool() {
         .to_string();
     assert!(!session_token.is_empty());
 
-    // 4. With the bearer, tools/call ping → "pong".
+    // 4. With the bearer, tools/call list_servers returns the caller's
+    //    visible servers — and only those. User is in `engineers + oncall`,
+    //    so they see `prod` + `staging`, never `analytics`. Crucially, the
+    //    literal password `hunter2` from the YAML must not appear anywhere
+    //    in the wire response.
     let resp: Value = client
         .post(format!("{gateway_url}/mcp"))
         .bearer_auth(&session_token)
@@ -128,7 +169,7 @@ async fn login_via_mock_idp_then_call_tool() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": { "name": "ping" }
+            "params": { "name": "list_servers" }
         }))
         .send()
         .await
@@ -138,7 +179,20 @@ async fn login_via_mock_idp_then_call_tool() {
         .json()
         .await
         .unwrap();
-    assert_eq!(resp["result"]["content"][0]["text"], "pong");
+
+    let payload = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("list_servers result is JSON-stringified text content");
+    assert!(payload.contains("\"name\":\"prod\""), "{payload}");
+    assert!(payload.contains("\"name\":\"staging\""), "{payload}");
+    assert!(!payload.contains("\"name\":\"analytics\""), "{payload}");
+    let full_response = serde_json::to_string(&resp).unwrap();
+    for forbidden in ["hunter2", "stagingpw", "dwpw"] {
+        assert!(
+            !full_response.contains(forbidden),
+            "leak: `{forbidden}` appeared in tool response: {full_response}"
+        );
+    }
 
     // 5. Without a bearer, the same call → 401 with the full unauth contract:
     //    structured error.category/code and a login_url for the agent.
@@ -148,7 +202,7 @@ async fn login_via_mock_idp_then_call_tool() {
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
-            "params": { "name": "ping" }
+            "params": { "name": "list_servers" }
         }))
         .send()
         .await
@@ -175,7 +229,7 @@ async fn login_via_mock_idp_then_call_tool() {
             "jsonrpc": "2.0",
             "id": 3,
             "method": "tools/call",
-            "params": { "name": "ping" }
+            "params": { "name": "list_servers" }
         }))
         .send()
         .await

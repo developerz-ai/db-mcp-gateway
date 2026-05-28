@@ -15,11 +15,7 @@ use crate::config::{Permission, Server};
 /// Returns true iff `identity` has at least one grant on `server` — across
 /// any database, any action. Used to filter the `list_servers` output so a
 /// user never learns of a server they have zero grants on.
-pub fn can_see_server(
-    identity: &Identity,
-    server: &Server,
-    permissions: &[Permission],
-) -> bool {
+pub fn can_see_server(identity: &Identity, server: &Server, permissions: &[Permission]) -> bool {
     permissions
         .iter()
         .filter(|perm| identity.groups.iter().any(|g| g == &perm.group))

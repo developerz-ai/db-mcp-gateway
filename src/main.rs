@@ -54,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
             oidc,
             flows: PendingFlows::default(),
         }),
+        config: Arc::new(config_file),
     };
 
     let app = transport::router(&config, app_state);

@@ -14,6 +14,7 @@ mod auth_routes;
 mod dispatch;
 mod sse;
 
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::IntoResponse;
@@ -25,6 +26,7 @@ pub use app_state::{AppState, AuthFacade, PendingFlows};
 
 use crate::auth::Identity;
 use crate::config::Config;
+use crate::tools;
 
 /// Build the axum router, mounting the MCP endpoint and the auth routes.
 pub fn router(config: &Config, state: AppState) -> Router {
@@ -62,6 +64,7 @@ fn normalize_path(path: &str) -> String {
 /// `Identity` is injected by `auth_middleware::bearer_auth` (or absent in tests
 /// that bypass auth). It threads through to the audit layer in a later issue.
 async fn post_handler(
+    State(state): State<AppState>,
     identity: Option<Extension<Identity>>,
     body: String,
 ) -> axum::response::Response {
@@ -89,6 +92,18 @@ async fn post_handler(
         .map(|i| i.user_sub.as_str())
         .unwrap_or("anonymous");
     tracing::debug!(method = %request.method, %user, "mcp request");
+
+    // `tools/call` needs identity + loaded config; everything else is pure.
+    if request.method == "tools/call" {
+        let is_notification = request.id.is_none();
+        let id = request.id.clone().unwrap_or(Value::Null);
+        let response = tools::dispatch_call(id, identity.as_deref(), &state.config, request.params);
+        return if is_notification {
+            StatusCode::ACCEPTED.into_response()
+        } else {
+            Json(response).into_response()
+        };
+    }
 
     match dispatch::dispatch(request) {
         Some(response) => Json(response).into_response(),

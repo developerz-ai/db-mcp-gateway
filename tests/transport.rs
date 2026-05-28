@@ -20,7 +20,7 @@ async fn spawn_gateway() -> String {
         mcp_path: "/mcp".to_string(),
         ..Config::default()
     };
-    let app = transport::router(&config, AppState { auth: None });
+    let app = transport::router(&config, AppState::for_tests());
     let listener = tokio::net::TcpListener::bind(config.bind).await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -57,20 +57,17 @@ async fn initialize_returns_protocol_version() {
 }
 
 #[tokio::test]
-async fn dummy_tool_call_roundtrips() {
+async fn tools_list_advertises_list_servers() {
     let url = spawn_gateway().await;
     let response = client()
         .post(&url)
-        .json(
-            &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "ping"}}),
-        )
+        .json(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
         .send()
         .await
         .unwrap();
 
     let body: Value = response.json().await.unwrap();
-    assert_eq!(body["result"]["content"][0]["text"], "pong");
-    assert_eq!(body["result"]["isError"], false);
+    assert_eq!(body["result"]["tools"][0]["name"], "list_servers");
 }
 
 #[tokio::test]
