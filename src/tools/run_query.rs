@@ -170,7 +170,12 @@ fn tool_error_from_exec(id: Value, err: ExecError) -> Response {
 }
 
 fn tool_error(id: Value, code: &'static str, message: &str) -> Response {
+    // Spec 03 §Errors: every error includes `request_id` so callers can
+    // correlate with server logs. The JSON-RPC envelope already carries `id`,
+    // but we duplicate it inside the structured body so the contract holds
+    // when an agent only inspects the tool payload.
     let body = serde_json::json!({
+        "request_id": id.clone(),
         "code": code,
         "message": message,
     });
@@ -204,6 +209,7 @@ mod tests {
         assert_eq!(value["result"]["isError"], true);
         let text = value["result"]["content"][0]["text"].as_str().unwrap();
         let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["request_id"], 7);
         assert_eq!(body["code"], "forbidden");
         assert_eq!(body["message"], "nope");
     }
