@@ -13,8 +13,11 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
+use sqlx::PgPool;
+
 use crate::auth::{AuthConfig, OidcClient, SessionStore};
 use crate::config::ConfigFile;
+use crate::exec::PoolRegistry;
 
 /// `state → nonce` from /auth/login lives here until /auth/callback consumes
 /// (and removes) it. TTL-bounded so a wedged login can't accumulate.
@@ -26,10 +29,16 @@ pub struct AppState {
     /// Loaded `servers:` + `permissions:` from the YAML config. Empty when
     /// tests don't care about tool dispatch.
     pub config: Arc<ConfigFile>,
+    /// Per-`(server, database)` target Postgres pools. Lazy.
+    pub pool_registry: PoolRegistry,
+    /// Gateway's own state DB. Tools that audit (`run_query`) need it; tests
+    /// that only exercise the wire protocol leave it `None`.
+    pub state_db: Option<PgPool>,
 }
 
 impl AppState {
-    /// Test helper: empty config, no auth. Production code never uses this.
+    /// Test helper: empty config, no auth, no state DB, empty pool registry.
+    /// Production code never uses this.
     #[cfg(any(test, debug_assertions))]
     pub fn for_tests() -> Self {
         Self {
@@ -38,6 +47,8 @@ impl AppState {
                 servers: Vec::new(),
                 permissions: Vec::new(),
             }),
+            pool_registry: PoolRegistry::new(),
+            state_db: None,
         }
     }
 }

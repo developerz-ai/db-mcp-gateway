@@ -67,6 +67,27 @@ pub struct Grant {
     pub server: String,
     pub database: String,
     pub action: Action,
+    /// Per-grant constraints layered on top of the action. Optional in YAML;
+    /// `authz::evaluate` merges these most-restrictively across all matching
+    /// grants (spec 06 §Evaluation).
+    #[serde(default)]
+    pub constraints: Constraints,
+}
+
+/// Constraints from spec 06. All fields optional — the *absence* of a value
+/// means "no constraint from this grant". Merging logic lives in
+/// `authz::Constraints` because the spec is clearest about merge in that
+/// context (most-restrictive-wins).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct Constraints {
+    #[serde(default)]
+    pub require_reason: bool,
+    /// Cap on rows returned to the agent (gateway truncates beyond this).
+    #[serde(default)]
+    pub row_limit: Option<u32>,
+    /// Postgres-side `statement_timeout` for queries executed under this grant.
+    #[serde(default)]
+    pub statement_timeout_ms: Option<u32>,
 }
 
 /// Hierarchical: `query_write` implies `query_read` implies `schema_read`.

@@ -12,7 +12,7 @@ pub mod schema;
 pub mod secret;
 pub mod yaml;
 
-pub use schema::{Action, Database, Grant, Permission, Server, ServerKind, Tls};
+pub use schema::{Action, Constraints, Database, Grant, Permission, Server, ServerKind, Tls};
 pub use secret::Password;
 pub use yaml::{ConfigFile, ConfigFileError};
 

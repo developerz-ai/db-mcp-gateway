@@ -15,6 +15,10 @@ pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Logical names of the MCP tools the gateway exposes. The string values are
 /// the protocol-level tool names agents pass to `tools/call`.
 pub const LIST_SERVERS_TOOL: &str = "list_servers";
+pub const LIST_DATABASES_TOOL: &str = "list_databases";
+pub const DESCRIBE_SCHEMA_TOOL: &str = "describe_schema";
+pub const SAMPLE_TABLE_TOOL: &str = "sample_table";
+pub const RUN_QUERY_TOOL: &str = "run_query";
 
 /// Response to `initialize` — the MCP handshake greeting.
 #[derive(Debug, Serialize)]
@@ -80,20 +84,90 @@ pub struct ToolsListResult {
 }
 
 impl ToolsListResult {
-    /// Snapshot of the currently registered MCP tools. As more tools land
-    /// (#4 onward) this grows; for #3 it's just `list_servers`.
+    /// Snapshot of the currently registered MCP tools. Grows as more tools
+    /// land in later issues.
     pub fn current() -> Self {
         Self {
-            tools: vec![Tool {
-                name: LIST_SERVERS_TOOL,
-                description: "List the database servers the caller is permitted to see. \
-                              Returns logical name, kind, and description — no connection info.",
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false
-                }),
-            }],
+            tools: vec![
+                Tool {
+                    name: LIST_SERVERS_TOOL,
+                    description: "List the database servers the caller is permitted to see. \
+                                  Returns logical name, kind, and description — no connection info.",
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }),
+                },
+                Tool {
+                    name: LIST_DATABASES_TOOL,
+                    description: "List databases on a configured server that the caller is \
+                                  permitted to see. Returns logical name + description — \
+                                  no connection info.",
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "server": { "type": "string" }
+                        },
+                        "required": ["server"],
+                        "additionalProperties": false
+                    }),
+                },
+                Tool {
+                    name: DESCRIBE_SCHEMA_TOOL,
+                    description: "Return tables + columns + types for a given database. \
+                                  Optional `schema` (default `public`) and `table` narrow \
+                                  the result. No row data is returned.",
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "server":   { "type": "string" },
+                            "database": { "type": "string" },
+                            "schema":   { "type": "string" },
+                            "table":    { "type": "string" }
+                        },
+                        "required": ["server", "database"],
+                        "additionalProperties": false
+                    }),
+                },
+                Tool {
+                    name: SAMPLE_TABLE_TOOL,
+                    description: "Return a small sample of rows from a table — `SELECT * \
+                                  FROM \"<schema>\".\"<table>\" LIMIT n`. Useful for \"what \
+                                  does this data look like\" without writing SQL. Schema and \
+                                  table identifiers must be plain alphanumerics.",
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "server":   { "type": "string" },
+                            "database": { "type": "string" },
+                            "table":    { "type": "string" },
+                            "schema":   { "type": "string" },
+                            "limit":    { "type": "integer", "minimum": 1 }
+                        },
+                        "required": ["server", "database", "table"],
+                        "additionalProperties": false
+                    }),
+                },
+                Tool {
+                    name: RUN_QUERY_TOOL,
+                    description: "Execute SQL against a configured (server, database) under the \
+                                  caller's grants. Returns columns, rows, truncation flag, and \
+                                  elapsed_ms. Statement timeout + row cap enforced by policy.",
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "server":   { "type": "string" },
+                            "database": { "type": "string" },
+                            "sql":      { "type": "string" },
+                            "limit":    { "type": "integer", "minimum": 1 },
+                            "reason":   { "type": "string" }
+                        },
+                        "required": ["server", "database", "sql"],
+                        "additionalProperties": false
+                    }),
+                },
+            ],
         }
     }
 }

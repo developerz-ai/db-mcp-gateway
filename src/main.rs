@@ -6,6 +6,7 @@ use std::sync::Arc;
 use clap::Parser;
 use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
 use db_mcp_gateway::config::ConfigFile;
+use db_mcp_gateway::exec::PoolRegistry;
 use db_mcp_gateway::transport::{AppState, AuthFacade, PendingFlows};
 use db_mcp_gateway::{config::Config, state, transport};
 use tracing_subscriber::EnvFilter;
@@ -45,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
         "state DB connected, migrations applied"
     );
 
-    let sessions = SessionStore::new(state_db);
+    let sessions = SessionStore::new(state_db.clone());
     let oidc = OidcClient::new(auth_config.clone())?;
     let app_state = AppState {
         auth: Some(AuthFacade {
@@ -55,6 +56,8 @@ async fn main() -> anyhow::Result<()> {
             flows: PendingFlows::default(),
         }),
         config: Arc::new(config_file),
+        pool_registry: PoolRegistry::new(),
+        state_db: Some(state_db),
     };
 
     let app = transport::router(&config, app_state);

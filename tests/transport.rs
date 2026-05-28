@@ -57,7 +57,7 @@ async fn initialize_returns_protocol_version() {
 }
 
 #[tokio::test]
-async fn tools_list_advertises_list_servers() {
+async fn tools_list_advertises_all_registered_tools() {
     let url = spawn_gateway().await;
     let response = client()
         .post(&url)
@@ -70,10 +70,19 @@ async fn tools_list_advertises_list_servers() {
     let tools = body["result"]["tools"]
         .as_array()
         .expect("tools/list returns an array");
-    assert!(
-        tools.iter().any(|t| t["name"] == "list_servers"),
-        "expected list_servers in advertised tools: {body}"
-    );
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    for expected in [
+        "list_servers",
+        "list_databases",
+        "describe_schema",
+        "sample_table",
+        "run_query",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "expected `{expected}` in advertised tools: {body}"
+        );
+    }
 }
 
 #[tokio::test]
