@@ -17,11 +17,7 @@ use crate::auth::{AuthError, Identity, SessionId, SessionStore, jwt};
 
 use super::app_state::{AppState, AuthFacade};
 
-pub async fn bearer_auth(
-    State(state): State<AppState>,
-    mut req: Request,
-    next: Next,
-) -> Response {
+pub async fn bearer_auth(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     let Some(auth) = state.auth.as_ref() else {
         // Test bootstrap: no auth wired. Production main never builds AppState
         // this way.

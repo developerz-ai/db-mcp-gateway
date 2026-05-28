@@ -86,7 +86,8 @@ impl OidcClient {
     /// remembers them across the redirect).
     pub async fn authorize_url(&self, state: &str, nonce: &str) -> Result<Url, AuthError> {
         let discovery = self.discover().await?;
-        let mut url = Url::parse(&discovery.authorization_endpoint).map_err(|_| AuthError::Discovery)?;
+        let mut url =
+            Url::parse(&discovery.authorization_endpoint).map_err(|_| AuthError::Discovery)?;
         url.query_pairs_mut()
             .append_pair("response_type", "code")
             .append_pair("client_id", &self.config.client_id)
@@ -172,11 +173,7 @@ impl OidcClient {
             })
             .unwrap_or_default();
 
-        Ok(VerifiedIdentity {
-            sub,
-            email,
-            groups,
-        })
+        Ok(VerifiedIdentity { sub, email, groups })
     }
 
     async fn discover(&self) -> Result<DiscoveryDocument, AuthError> {
@@ -210,7 +207,13 @@ impl OidcClient {
     }
 
     async fn decoding_key(&self, kid: &str) -> Result<DecodingKey, AuthError> {
-        if let Some(key) = self.jwks.read().await.as_ref().and_then(|m| m.get(kid).cloned()) {
+        if let Some(key) = self
+            .jwks
+            .read()
+            .await
+            .as_ref()
+            .and_then(|m| m.get(kid).cloned())
+        {
             return Ok(key);
         }
         let discovery = self.discover().await?;
@@ -251,4 +254,3 @@ impl OidcClient {
         Ok(key)
     }
 }
-

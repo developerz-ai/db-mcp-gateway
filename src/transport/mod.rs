@@ -30,18 +30,22 @@ use crate::config::Config;
 pub fn router(config: &Config, state: AppState) -> Router {
     let path = normalize_path(&config.mcp_path);
 
-    let mcp_post = post(post_handler).route_layer(middleware::from_fn_with_state(
-        state.clone(),
-        auth_middleware::bearer_auth,
-    ));
-    let mcp = Router::new().route(&path, get(sse::handler).merge(mcp_post));
+    // Bearer-gated routes: /mcp POST and /auth/logout (needs a session to
+    // revoke). SSE GET and /auth/{login,callback} stay open.
+    let gated = Router::new()
+        .route(&path, post(post_handler))
+        .route("/auth/logout", post(auth_routes::logout))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware::bearer_auth,
+        ));
 
-    let auth = Router::new()
+    let open = Router::new()
+        .route(&path, get(sse::handler))
         .route("/auth/login", post(auth_routes::login))
-        .route("/auth/callback", get(auth_routes::callback))
-        .route("/auth/logout", post(auth_routes::logout));
+        .route("/auth/callback", get(auth_routes::callback));
 
-    mcp.merge(auth).with_state(state)
+    open.merge(gated).with_state(state)
 }
 
 /// axum routes require a leading slash; tolerate config that omits it.

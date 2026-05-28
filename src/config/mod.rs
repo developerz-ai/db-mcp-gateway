@@ -6,8 +6,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
-const DEFAULT_STATE_DB_URL: &str =
-    "postgres://gateway:gateway-dev-only@localhost:5433/gateway";
+const DEFAULT_STATE_DB_URL: &str = "postgres://gateway:gateway-dev-only@localhost:5433/gateway";
 const DEFAULT_STATE_DB_POOL_SIZE: u32 = 10;
 
 #[derive(Debug, Clone)]
