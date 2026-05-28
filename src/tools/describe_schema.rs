@@ -18,7 +18,9 @@ use crate::config::{Action, ConfigFile, Database, Server};
 use crate::exec::{self, ExecError, PoolRegistry};
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
-use super::audit_dispatch::{AuditHeader, Outcome, audit_dispatch, tool_error, tool_success};
+use super::audit_dispatch::{
+    AuditHeader, Outcome, RequestContext, audit_dispatch, error_outcome, success_outcome,
+};
 
 const TOOL_NAME: &str = "describe_schema";
 const DEFAULT_SCHEMA: &str = "public";
@@ -63,6 +65,7 @@ pub async fn run(
     config: &ConfigFile,
     registry: &PoolRegistry,
     state_db: Option<&PgPool>,
+    request_ctx: &RequestContext,
     arguments: Option<Value>,
 ) -> Response {
     let args: Arguments = match arguments.map(serde_json::from_value::<Arguments>) {
@@ -80,9 +83,10 @@ pub async fn run(
         server: Some(&args.server),
         database: Some(&args.database),
         sql: None,
+        reason: None,
     };
     let work = compute_outcome(id.clone(), identity, config, registry, &args);
-    audit_dispatch(id, identity, state_db, header, work).await
+    audit_dispatch(id, identity, state_db, request_ctx, header, work).await
 }
 
 async fn compute_outcome(
@@ -131,43 +135,29 @@ async fn compute_outcome(
             let payload = match assemble_tables(&exec_result) {
                 Ok(p) => p,
                 Err(_) => {
-                    return Outcome {
-                        response: tool_error(
-                            id,
-                            "internal",
-                            "catalog response shape changed unexpectedly",
-                        ),
-                        code: "internal",
-                        elapsed_ms: Some(elapsed),
-                    };
+                    return error_outcome(
+                        id,
+                        "internal",
+                        "catalog response shape changed unexpectedly",
+                    );
                 }
             };
+            let table_count = i64::try_from(payload.tables.len()).unwrap_or(i64::MAX);
             let text = match serde_json::to_string(&payload) {
                 Ok(t) => t,
-                Err(_) => {
-                    return Outcome {
-                        response: tool_error(id, "internal", "failed to serialize result"),
-                        code: "internal",
-                        elapsed_ms: Some(elapsed),
-                    };
-                }
+                Err(_) => return error_outcome(id, "internal", "failed to serialize result"),
             };
-            Outcome {
-                response: tool_success(id, text),
-                code: "success",
-                elapsed_ms: Some(elapsed),
-            }
+            // row_count = number of tables surfaced; describe_schema doesn't
+            // truncate, so always Some(false) — operators can tell from the
+            // audit row whether the call produced data.
+            success_outcome(id, text, Some(elapsed), Some(table_count), Some(false))
         }
         Err(err) => outcome_from_exec_error(id, err),
     }
 }
 
 fn forbidden(id: Value) -> Outcome {
-    Outcome {
-        response: tool_error(id, "forbidden", "no grants for this server/database"),
-        code: "forbidden",
-        elapsed_ms: None,
-    }
+    error_outcome(id, "forbidden", "no grants for this server/database")
 }
 
 fn find_server_db<'a>(
@@ -242,11 +232,7 @@ fn outcome_from_exec_error(id: Value, err: ExecError) -> Outcome {
         ExecError::Sql => ("syntax_error", "catalog query was rejected"),
         ExecError::PasswordUnresolved { .. } => ("internal", "server-side configuration error"),
     };
-    Outcome {
-        response: tool_error(id, code, message),
-        code,
-        elapsed_ms: None,
-    }
+    error_outcome(id, code, message)
 }
 
 #[cfg(test)]

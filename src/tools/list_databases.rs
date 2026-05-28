@@ -16,7 +16,9 @@ use crate::authz::{self, Decision};
 use crate::config::{Action, ConfigFile, Database};
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
-use super::audit_dispatch::{AuditHeader, Outcome, audit_dispatch, tool_error, tool_success};
+use super::audit_dispatch::{
+    AuditHeader, Outcome, RequestContext, audit_dispatch, error_outcome, success_outcome,
+};
 
 const TOOL_NAME: &str = "list_databases";
 
@@ -43,6 +45,7 @@ pub async fn run(
     identity: &Identity,
     config: &ConfigFile,
     state_db: Option<&PgPool>,
+    request_ctx: &RequestContext,
     arguments: Option<Value>,
 ) -> Response {
     let args: Arguments = match arguments.map(serde_json::from_value::<Arguments>) {
@@ -60,9 +63,10 @@ pub async fn run(
         server: Some(&args.server),
         database: None,
         sql: None,
+        reason: None,
     };
     let work = compute_outcome(id.clone(), identity, config, &args);
-    audit_dispatch(id, identity, state_db, header, work).await
+    audit_dispatch(id, identity, state_db, request_ctx, header, work).await
 }
 
 async fn compute_outcome(
@@ -72,11 +76,7 @@ async fn compute_outcome(
     args: &Arguments,
 ) -> Outcome {
     let Some(server) = config.servers.iter().find(|s| s.name == args.server) else {
-        return Outcome {
-            response: tool_error(id, "forbidden", "no grants for this server"),
-            code: "forbidden",
-            elapsed_ms: None,
-        };
+        return error_outcome(id, "forbidden", "no grants for this server");
     };
 
     let visible: Vec<&Database> = server
@@ -97,13 +97,10 @@ async fn compute_outcome(
         .collect();
 
     if visible.is_empty() {
-        return Outcome {
-            response: tool_error(id, "forbidden", "no grants for this server"),
-            code: "forbidden",
-            elapsed_ms: None,
-        };
+        return error_outcome(id, "forbidden", "no grants for this server");
     }
 
+    let row_count = i64::try_from(visible.len()).unwrap_or(i64::MAX);
     let view: Vec<SafeDatabaseView> = visible
         .into_iter()
         .map(|db| SafeDatabaseView {
@@ -114,20 +111,10 @@ async fn compute_outcome(
     let payload = ListDatabasesResult { databases: view };
     let text = match serde_json::to_string(&payload) {
         Ok(t) => t,
-        Err(_) => {
-            return Outcome {
-                response: tool_error(id, "internal", "failed to serialize result"),
-                code: "internal",
-                elapsed_ms: None,
-            };
-        }
+        Err(_) => return error_outcome(id, "internal", "failed to serialize result"),
     };
 
-    Outcome {
-        response: tool_success(id, text),
-        code: "success",
-        elapsed_ms: None,
-    }
+    success_outcome(id, text, None, Some(row_count), Some(false))
 }
 
 #[cfg(test)]

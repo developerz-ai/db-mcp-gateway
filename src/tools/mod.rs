@@ -27,6 +27,8 @@ use crate::config::ConfigFile;
 use crate::exec::PoolRegistry;
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
+pub use audit_dispatch::RequestContext;
+
 // Re-export canonical names so dispatch and the advertised capability can
 // never drift apart.
 pub use crate::transport::protocol::DESCRIBE_SCHEMA_TOOL as DESCRIBE_SCHEMA;
@@ -58,6 +60,7 @@ pub async fn dispatch_call(
     config: &ConfigFile,
     registry: &PoolRegistry,
     state_db: Option<&PgPool>,
+    request_ctx: &RequestContext,
     params: Option<Value>,
 ) -> Response {
     let Some(identity) = identity else {
@@ -87,16 +90,62 @@ pub async fn dispatch_call(
     let _enter = span.enter();
 
     match call.name.as_str() {
-        LIST_SERVERS => list_servers::run(id, identity, config, call.arguments),
-        LIST_DATABASES => list_databases::run(id, identity, config, state_db, call.arguments).await,
+        LIST_SERVERS => {
+            // list_servers is still synchronous (no DB hit, no audit in this
+            // slice — Slice 2 wires both).
+            list_servers::run(id, identity, config, state_db, request_ctx, call.arguments)
+        }
+        LIST_DATABASES => {
+            list_databases::run(id, identity, config, state_db, request_ctx, call.arguments).await
+        }
         DESCRIBE_SCHEMA => {
-            describe_schema::run(id, identity, config, registry, state_db, call.arguments).await
+            describe_schema::run(
+                id,
+                identity,
+                config,
+                registry,
+                state_db,
+                request_ctx,
+                call.arguments,
+            )
+            .await
         }
         SAMPLE_TABLE => {
-            sample_table::run(id, identity, config, registry, state_db, call.arguments).await
+            sample_table::run(
+                id,
+                identity,
+                config,
+                registry,
+                state_db,
+                request_ctx,
+                call.arguments,
+            )
+            .await
         }
-        EXPLAIN => explain::run(id, identity, config, registry, state_db, call.arguments).await,
-        RUN_QUERY => run_query::run(id, identity, config, registry, state_db, call.arguments).await,
+        EXPLAIN => {
+            explain::run(
+                id,
+                identity,
+                config,
+                registry,
+                state_db,
+                request_ctx,
+                call.arguments,
+            )
+            .await
+        }
+        RUN_QUERY => {
+            run_query::run(
+                id,
+                identity,
+                config,
+                registry,
+                state_db,
+                request_ctx,
+                call.arguments,
+            )
+            .await
+        }
         other => Response::error(
             id,
             ErrorObject::invalid_params(format!("unknown tool: {other}")),

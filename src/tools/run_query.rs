@@ -2,10 +2,8 @@
 //! caps enforced both at the DB (via `SET LOCAL statement_timeout`) and at
 //! the gateway (early stop after `row_limit` + `truncated` flag).
 //!
-//! Per spec doc 03, errors are structured JSON with a `code` from the
-//! published list (`forbidden`, `timeout`, `syntax_error`, `unavailable`,
-//! `reason_required`, `internal`). Audit + response envelope are handled by
-//! `tools::audit_dispatch` — this file only does the compute step.
+//! Audit + response envelope are handled by `tools::audit_dispatch` — this
+//! file only does the compute step.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -18,13 +16,14 @@ use crate::exec::sql_guard;
 use crate::exec::{self, ExecError, PoolRegistry};
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
-use super::audit_dispatch::{AuditHeader, Outcome, audit_dispatch, tool_error, tool_success};
+use super::audit_dispatch::{
+    AuditHeader, Outcome, RequestContext, audit_dispatch, error_outcome, success_outcome,
+};
 
 const TOOL_NAME: &str = "run_query";
 
 /// Hard floor on result rows when no grant constraint and no caller limit
-/// apply. Spec 03 §"Results are size-capped" — keeps the gateway from holding
-/// an unbounded result set in memory.
+/// apply. Spec 03 §"Results are size-capped".
 const DEFAULT_ROW_LIMIT: u32 = 1000;
 
 #[derive(Debug, Deserialize)]
@@ -52,6 +51,7 @@ pub async fn run(
     config: &ConfigFile,
     registry: &PoolRegistry,
     state_db: Option<&PgPool>,
+    request_ctx: &RequestContext,
     arguments: Option<Value>,
 ) -> Response {
     let args: Arguments = match arguments.map(serde_json::from_value::<Arguments>) {
@@ -71,9 +71,10 @@ pub async fn run(
         server: Some(&args.server),
         database: Some(&args.database),
         sql: Some(&args.sql),
+        reason: args.reason.as_deref(),
     };
     let work = compute_outcome(id.clone(), identity, config, registry, &args);
-    audit_dispatch(id, identity, state_db, header, work).await
+    audit_dispatch(id, identity, state_db, request_ctx, header, work).await
 }
 
 async fn compute_outcome(
@@ -84,11 +85,7 @@ async fn compute_outcome(
     args: &Arguments,
 ) -> Outcome {
     let Some((server, database)) = find_server_db(config, &args.server, &args.database) else {
-        return Outcome {
-            response: tool_error(id, "forbidden", "no grants for this server/database"),
-            code: "forbidden",
-            elapsed_ms: None,
-        };
+        return error_outcome(id, "forbidden", "no grants for this server/database");
     };
 
     let decision = authz::evaluate(
@@ -101,38 +98,26 @@ async fn compute_outcome(
     let constraints = match decision {
         Decision::Allow { constraints } => constraints,
         Decision::Deny => {
-            return Outcome {
-                response: tool_error(id, "forbidden", "no grants for this server/database"),
-                code: "forbidden",
-                elapsed_ms: None,
-            };
+            return error_outcome(id, "forbidden", "no grants for this server/database");
         }
     };
 
     if constraints.require_reason && args.reason.as_deref().is_none_or(str::is_empty) {
-        return Outcome {
-            response: tool_error(
-                id,
-                "reason_required",
-                "policy requires a `reason` for this server/database",
-            ),
-            code: "reason_required",
-            elapsed_ms: None,
-        };
+        return error_outcome(
+            id,
+            "reason_required",
+            "policy requires a `reason` for this server/database",
+        );
     }
 
     // Defense-in-depth on top of the read-only role: reject writes / DDL /
     // multi-statement before they ever hit the pool. See exec::sql_guard.
     if let Err(err) = sql_guard::is_read_only(&args.sql) {
-        return Outcome {
-            response: tool_error(
-                id,
-                "forbidden_sql",
-                &format!("SQL rejected by gateway: {err}"),
-            ),
-            code: "forbidden_sql",
-            elapsed_ms: None,
-        };
+        return error_outcome(
+            id,
+            "forbidden_sql",
+            &format!("SQL rejected by gateway: {err}"),
+        );
     }
 
     let row_limit = effective_row_limit(args.limit, constraints.row_limit);
@@ -150,39 +135,27 @@ async fn compute_outcome(
 
     let pool = match registry.get_or_open(server, database).await {
         Ok(p) => p,
-        Err(err) => return outcome_from_exec_error(id, err, None),
+        Err(err) => return outcome_from_exec_error(id, err),
     };
 
     match exec::run_query(&pool, &args.sql, timeout_ms, row_limit).await {
         Ok(result) => {
             let elapsed = i64::try_from(result.elapsed_ms).unwrap_or(i64::MAX);
+            let row_count = i64::try_from(result.rows.len()).unwrap_or(i64::MAX);
+            let truncated = result.truncated;
             let payload = SuccessPayload {
                 columns: &result.columns,
                 rows: &result.rows,
-                truncated: result.truncated,
+                truncated,
                 elapsed_ms: result.elapsed_ms,
             };
-            // SuccessPayload only contains primitives + serde_json::Value
-            // (which round-trips), so serialization is practically infallible
-            // — but CLAUDE.md bans `expect` on the hot path, so fall through
-            // to a typed internal error instead of panicking.
             let text = match serde_json::to_string(&payload) {
                 Ok(t) => t,
-                Err(_) => {
-                    return Outcome {
-                        response: tool_error(id, "internal", "failed to serialize result"),
-                        code: "internal",
-                        elapsed_ms: Some(elapsed),
-                    };
-                }
+                Err(_) => return error_outcome(id, "internal", "failed to serialize result"),
             };
-            Outcome {
-                response: tool_success(id, text),
-                code: "success",
-                elapsed_ms: Some(elapsed),
-            }
+            success_outcome(id, text, Some(elapsed), Some(row_count), Some(truncated))
         }
-        Err(err) => outcome_from_exec_error(id, err, None),
+        Err(err) => outcome_from_exec_error(id, err),
     }
 }
 
@@ -204,21 +177,16 @@ fn effective_row_limit(caller: Option<u32>, grant: Option<u32>) -> u32 {
     }
 }
 
-fn outcome_from_exec_error(id: Value, err: ExecError, elapsed_ms: Option<i64>) -> Outcome {
+fn outcome_from_exec_error(id: Value, err: ExecError) -> Outcome {
     let (code, message) = match err {
         ExecError::Timeout => ("timeout", "query exceeded the configured statement_timeout"),
         ExecError::Connection | ExecError::Unavailable => {
             ("unavailable", "target database is unreachable")
         }
         ExecError::Sql => ("syntax_error", "the target DB rejected the SQL"),
-        // Operator-facing config problem; user-side message stays generic.
         ExecError::PasswordUnresolved { .. } => ("internal", "server-side configuration error"),
     };
-    Outcome {
-        response: tool_error(id, code, message),
-        code,
-        elapsed_ms,
-    }
+    error_outcome(id, code, message)
 }
 
 #[cfg(test)]

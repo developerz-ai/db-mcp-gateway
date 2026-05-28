@@ -31,6 +31,8 @@ pub fn run(
     id: Value,
     identity: &Identity,
     config: &ConfigFile,
+    _state_db: Option<&sqlx::PgPool>,
+    _request_ctx: &super::audit_dispatch::RequestContext,
     _arguments: Option<Value>,
 ) -> Response {
     let servers: Vec<SafeServerView> = config
@@ -127,7 +129,8 @@ permissions:
     }
 
     fn run_for(groups: &[&str]) -> String {
-        let response = run(Value::from(1), &identity(groups), &load(), None);
+        let ctx = crate::tools::RequestContext::default();
+        let response = run(Value::from(1), &identity(groups), &load(), None, &ctx, None);
         let json = serde_json::to_value(&response).unwrap();
         json["result"]["content"][0]["text"]
             .as_str()
