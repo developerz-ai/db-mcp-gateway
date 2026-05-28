@@ -15,6 +15,9 @@ pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Logical names of the MCP tools the gateway exposes. The string values are
 /// the protocol-level tool names agents pass to `tools/call`.
 pub const LIST_SERVERS_TOOL: &str = "list_servers";
+pub const LIST_DATABASES_TOOL: &str = "list_databases";
+pub const DESCRIBE_SCHEMA_TOOL: &str = "describe_schema";
+pub const SAMPLE_TABLE_TOOL: &str = "sample_table";
 pub const RUN_QUERY_TOOL: &str = "run_query";
 
 /// Response to `initialize` — the MCP handshake greeting.
@@ -93,6 +96,56 @@ impl ToolsListResult {
                     input_schema: json!({
                         "type": "object",
                         "properties": {},
+                        "additionalProperties": false
+                    }),
+                },
+                Tool {
+                    name: LIST_DATABASES_TOOL,
+                    description: "List databases on a configured server that the caller is \
+                                  permitted to see. Returns logical name + description — \
+                                  no connection info.",
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "server": { "type": "string" }
+                        },
+                        "required": ["server"],
+                        "additionalProperties": false
+                    }),
+                },
+                Tool {
+                    name: DESCRIBE_SCHEMA_TOOL,
+                    description: "Return tables + columns + types for a given database. \
+                                  Optional `schema` (default `public`) and `table` narrow \
+                                  the result. No row data is returned.",
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "server":   { "type": "string" },
+                            "database": { "type": "string" },
+                            "schema":   { "type": "string" },
+                            "table":    { "type": "string" }
+                        },
+                        "required": ["server", "database"],
+                        "additionalProperties": false
+                    }),
+                },
+                Tool {
+                    name: SAMPLE_TABLE_TOOL,
+                    description: "Return a small sample of rows from a table — `SELECT * \
+                                  FROM \"<schema>\".\"<table>\" LIMIT n`. Useful for \"what \
+                                  does this data look like\" without writing SQL. Schema and \
+                                  table identifiers must be plain alphanumerics.",
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "server":   { "type": "string" },
+                            "database": { "type": "string" },
+                            "table":    { "type": "string" },
+                            "schema":   { "type": "string" },
+                            "limit":    { "type": "integer", "minimum": 1 }
+                        },
+                        "required": ["server", "database", "table"],
                         "additionalProperties": false
                     }),
                 },
