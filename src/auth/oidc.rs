@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use jsonwebtoken::{DecodingKey, Validation};
 use serde::Deserialize;
@@ -54,24 +55,49 @@ pub struct VerifiedIdentity {
 }
 
 /// OIDC Relying Party client. Cheap to clone; shares the inner cache.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OidcClient {
     config: Arc<AuthConfig>,
     http: reqwest::Client,
     discovery: Arc<RwLock<Option<DiscoveryDocument>>>,
-    jwks: Arc<RwLock<Option<HashMap<String, DecodingKey>>>>,
+    jwks: Arc<RwLock<Option<JwksCache>>>,
 }
+
+/// JWKS with a fetched-at timestamp so we can rotate keys without a restart.
+#[derive(Clone)]
+struct JwksCache {
+    keys: HashMap<String, DecodingKey>,
+    fetched_at: Instant,
+}
+
+impl std::fmt::Debug for JwksCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `DecodingKey` from `jsonwebtoken` 9.x doesn't derive `Debug`. Print
+        // the count and freshness instead — opaque key material never belongs
+        // in a log line anyway.
+        f.debug_struct("JwksCache")
+            .field("keys", &self.keys.len())
+            .field("fetched_at", &self.fetched_at)
+            .finish()
+    }
+}
+
+/// JWKS cache lifetime. Keeps the IdP load low while bounding rotation lag.
+const JWKS_TTL: Duration = Duration::from_secs(3600);
 
 impl OidcClient {
     pub fn new(config: AuthConfig) -> Self {
+        // The auth callback is the only place we follow redirects; the token
+        // exchange must not redirect (security: SSRF guard). The builder is
+        // infallible with default features; degrade to the plain client if a
+        // future TLS misconfiguration changes that.
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             config: Arc::new(config),
-            // The auth callback is the only place we follow redirects; the
-            // token exchange must not redirect (security: SSRF guard).
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("reqwest client builds with default features"),
+            http,
             discovery: Arc::new(RwLock::new(None)),
             jwks: Arc::new(RwLock::new(None)),
         }
@@ -207,13 +233,12 @@ impl OidcClient {
     }
 
     async fn decoding_key(&self, kid: &str) -> Result<DecodingKey, AuthError> {
-        if let Some(key) = self
-            .jwks
-            .read()
-            .await
-            .as_ref()
-            .and_then(|m| m.get(kid).cloned())
-        {
+        // Fast path: live cache that hasn't aged out.
+        if let Some(key) = self.jwks.read().await.as_ref().and_then(|cache| {
+            (cache.fetched_at.elapsed() < JWKS_TTL)
+                .then(|| cache.keys.get(kid).cloned())
+                .flatten()
+        }) {
             return Ok(key);
         }
         let discovery = self.discover().await?;
@@ -250,7 +275,10 @@ impl OidcClient {
             }
         }
         let key = by_kid.get(kid).cloned().ok_or(AuthError::IdToken)?;
-        *self.jwks.write().await = Some(by_kid);
+        *self.jwks.write().await = Some(JwksCache {
+            keys: by_kid,
+            fetched_at: Instant::now(),
+        });
         Ok(key)
     }
 }

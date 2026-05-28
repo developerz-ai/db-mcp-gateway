@@ -19,12 +19,12 @@ use crate::auth::{AuthConfig, OidcClient, SessionStore};
 /// (and removes) it. TTL-bounded so a wedged login can't accumulate.
 const FLOW_TTL: Duration = Duration::from_secs(5 * 60);
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AppState {
     pub auth: Option<AuthFacade>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AuthFacade {
     pub config: Arc<AuthConfig>,
     pub sessions: SessionStore,
@@ -32,7 +32,7 @@ pub struct AuthFacade {
     pub flows: PendingFlows,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct PendingFlows {
     inner: Arc<Mutex<HashMap<String, PendingFlow>>>,
 }

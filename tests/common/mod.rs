@@ -33,6 +33,7 @@ pub struct MockUser {
     pub groups: Vec<String>,
 }
 
+#[derive(Debug)]
 pub struct MockIdpHandle {
     pub issuer: String,
     pub client_id: String,
@@ -43,6 +44,7 @@ pub struct MockIdpHandle {
 struct MockIdpState {
     issuer: String,
     client_id: String,
+    client_secret: String,
     user: MockUser,
     /// `code → nonce`, populated by /authorize and consumed by /token.
     codes: Arc<Mutex<HashMap<String, String>>>,
@@ -57,6 +59,7 @@ pub async fn spawn_mock_idp(client_id: &str, client_secret: &str, user: MockUser
     let state = MockIdpState {
         issuer: issuer.clone(),
         client_id: client_id.to_string(),
+        client_secret: client_secret.to_string(),
         user,
         codes: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -98,38 +101,47 @@ struct AuthorizeQuery {
     redirect_uri: String,
     state: String,
     nonce: String,
-    #[serde(default)]
-    _response_type: Option<String>,
-    #[serde(default)]
-    _client_id: Option<String>,
+    response_type: String,
+    client_id: String,
     #[serde(default)]
     _scope: Option<String>,
 }
 
-async fn authorize(State(s): State<MockIdpState>, Query(q): Query<AuthorizeQuery>) -> Redirect {
+async fn authorize(
+    State(s): State<MockIdpState>,
+    Query(q): Query<AuthorizeQuery>,
+) -> Result<Redirect, StatusCode> {
+    // Catch regressions in the gateway's request composition: missing or wrong
+    // OIDC protocol fields should fail the test, not silently pass.
+    if q.response_type != "code" || q.client_id != s.client_id {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let code = Uuid::new_v4().simple().to_string();
     s.codes.lock().await.insert(code.clone(), q.nonce);
     let target = format!("{}?code={}&state={}", q.redirect_uri, code, q.state);
-    Redirect::temporary(&target)
+    Ok(Redirect::temporary(&target))
 }
 
 #[derive(Debug, Deserialize)]
 struct TokenForm {
     code: String,
-    #[serde(default)]
-    _grant_type: Option<String>,
+    grant_type: String,
+    client_id: String,
+    client_secret: String,
     #[serde(default)]
     _redirect_uri: Option<String>,
-    #[serde(default)]
-    _client_id: Option<String>,
-    #[serde(default)]
-    _client_secret: Option<String>,
 }
 
 async fn token(
     State(s): State<MockIdpState>,
     Form(form): Form<TokenForm>,
 ) -> Result<Json<Value>, StatusCode> {
+    if form.grant_type != "authorization_code"
+        || form.client_id != s.client_id
+        || form.client_secret != s.client_secret
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     let nonce = s
         .codes
         .lock()

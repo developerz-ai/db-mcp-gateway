@@ -16,6 +16,7 @@ use serde_json::json;
 use crate::auth::{AuthError, Identity, SessionId, SessionStore, jwt};
 
 use super::app_state::{AppState, AuthFacade};
+use super::auth_routes::{LOGIN_URL, auth_error_fields};
 
 pub async fn bearer_auth(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     let Some(auth) = state.auth.as_ref() else {
@@ -63,15 +64,11 @@ async fn lookup(sessions: &SessionStore, id: SessionId) -> Result<Identity, Auth
 
 fn unauthorized(err: AuthError) -> Response {
     // Only the typed reason — never embed the token or the underlying error
-    // string. login_url is stable; agents redirect users there.
+    // string. `login_url` is stable; agents redirect users there.
+    let (category, code) = auth_error_fields(&err);
     let body = json!({
-        "error": match err {
-            AuthError::MissingBearer => "missing_bearer",
-            AuthError::InvalidSession | AuthError::Jwt(_) => "invalid_session",
-            AuthError::RevokedSession => "revoked_session",
-            _ => "auth_error",
-        },
-        "login_url": "/auth/login",
+        "error": { "category": category, "code": code },
+        "login_url": LOGIN_URL,
     });
     (StatusCode::UNAUTHORIZED, Json(body)).into_response()
 }

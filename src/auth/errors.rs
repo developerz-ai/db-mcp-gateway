@@ -15,6 +15,12 @@ pub enum AuthError {
     #[error("ID token verification failed")]
     IdToken,
 
+    /// CSRF `state` from the callback was unknown/expired/replayed. Kept
+    /// distinct from `IdToken` so ops can tell the two apart in logs, even
+    /// though both surface as the same HTTP code to the client.
+    #[error("OIDC callback state is invalid or expired")]
+    InvalidState,
+
     #[error("session token is invalid or expired")]
     InvalidSession,
 

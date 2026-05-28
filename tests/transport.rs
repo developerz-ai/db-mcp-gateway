@@ -9,9 +9,11 @@ use serde_json::{Value, json};
 
 /// Boot the gateway on an ephemeral port and return the full MCP endpoint URL.
 ///
-/// These tests exercise the wire protocol; `AppState { auth: None }` lets the
-/// bearer middleware pass through without a real OIDC/state-DB. Auth's HTTP
-/// behavior is covered by `tests/auth.rs`.
+/// These tests exercise the transport wire protocol only; `AppState { auth:
+/// None }` bypasses auth wiring by design. Auth/session behavior is covered by
+/// `tests/auth_e2e.rs`. Audit-row assertions are intentionally omitted here
+/// because this harness has no audit integration yet (audit module lands in a
+/// later issue).
 async fn spawn_gateway() -> String {
     let config = Config {
         bind: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),

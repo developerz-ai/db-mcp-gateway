@@ -19,10 +19,20 @@ pub struct Config {
     pub state_db: StateDbConfig,
 }
 
-#[derive(Debug, Clone)]
+/// `Debug` is hand-rolled to redact `url`, which carries the Postgres password.
+#[derive(Clone)]
 pub struct StateDbConfig {
     pub url: String,
     pub pool_size: u32,
+}
+
+impl std::fmt::Debug for StateDbConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateDbConfig")
+            .field("url", &"<redacted>")
+            .field("pool_size", &self.pool_size)
+            .finish()
+    }
 }
 
 impl Default for Config {

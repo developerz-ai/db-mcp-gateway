@@ -61,10 +61,12 @@ pub fn verify(signing_key: &[u8], token: &str) -> Result<SessionClaims, AuthErro
 }
 
 fn unix_now() -> u64 {
+    // Pre-epoch clock would yield a JWT with iat/exp in the distant past, so
+    // verification fails closed. Better than panicking on the hot path.
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock is before UNIX epoch")
-        .as_secs()
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

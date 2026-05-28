@@ -140,7 +140,8 @@ async fn login_via_mock_idp_then_call_tool() {
         .unwrap();
     assert_eq!(resp["result"]["content"][0]["text"], "pong");
 
-    // 5. Without a bearer, the same call → 401.
+    // 5. Without a bearer, the same call → 401 with the full unauth contract:
+    //    structured error.category/code and a login_url for the agent.
     let unauth = client
         .post(format!("{gateway_url}/mcp"))
         .json(&json!({
@@ -153,8 +154,12 @@ async fn login_via_mock_idp_then_call_tool() {
         .await
         .unwrap();
     assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let unauth_body: Value = unauth.json().await.unwrap();
+    assert_eq!(unauth_body["error"]["category"], "unauthenticated");
+    assert_eq!(unauth_body["error"]["code"], "missing_bearer");
+    assert_eq!(unauth_body["login_url"], "/auth/login");
 
-    // 6. Logout revokes; subsequent call → 401.
+    // 6. Logout revokes; subsequent call → 401 (same contract, code differs).
     let logout = client
         .post(format!("{gateway_url}/auth/logout"))
         .bearer_auth(&session_token)
@@ -176,4 +181,8 @@ async fn login_via_mock_idp_then_call_tool() {
         .await
         .unwrap();
     assert_eq!(after_logout.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let after_body: Value = after_logout.json().await.unwrap();
+    assert_eq!(after_body["error"]["category"], "unauthenticated");
+    assert_eq!(after_body["error"]["code"], "revoked_session");
+    assert_eq!(after_body["login_url"], "/auth/login");
 }

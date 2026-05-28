@@ -46,7 +46,10 @@ impl From<SessionId> for Uuid {
 /// Per-request identity. Cloned cheaply (groups is small, strings are short).
 /// What `auth::middleware` attaches to the request extensions for handlers and
 /// the audit layer to read.
-#[derive(Debug, Clone)]
+///
+/// Manual `Debug` redacts `user_email` (PII). The audit writer reads the field
+/// directly; nothing else should log it.
+#[derive(Clone)]
 pub struct Identity {
     pub session_id: SessionId,
     pub user_sub: String,
@@ -54,7 +57,20 @@ pub struct Identity {
     pub groups: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field("session_id", &self.session_id)
+            .field("user_sub", &self.user_sub)
+            .field("user_email", &"<redacted>")
+            .field("groups", &self.groups)
+            .finish()
+    }
+}
+
+/// Authoritative session row. `Debug` redacts `user_email` (PII) — see
+/// `Identity` above for the same rationale.
+#[derive(Clone)]
 pub struct Session {
     pub id: SessionId,
     pub user_sub: String,
@@ -63,6 +79,20 @@ pub struct Session {
     pub agent_client: Option<String>,
     pub expires_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("id", &self.id)
+            .field("user_sub", &self.user_sub)
+            .field("user_email", &"<redacted>")
+            .field("groups", &self.groups)
+            .field("agent_client", &self.agent_client)
+            .field("expires_at", &self.expires_at)
+            .field("revoked_at", &self.revoked_at)
+            .finish()
+    }
 }
 
 impl Session {
@@ -85,6 +115,17 @@ impl Session {
 pub struct SessionStore {
     pool: PgPool,
     cache: Arc<RwLock<HashMap<SessionId, Session>>>,
+}
+
+impl std::fmt::Debug for SessionStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hand-rolled: `PgPool` Debug leaks the connection string, and reading
+        // the cache here would need an async lock. Print structural info only.
+        f.debug_struct("SessionStore")
+            .field("pool", &"<PgPool>")
+            .field("cache", &"<RwLock<HashMap<SessionId, Session>>>")
+            .finish()
+    }
 }
 
 impl SessionStore {

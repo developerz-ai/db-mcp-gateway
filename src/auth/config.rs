@@ -11,7 +11,9 @@ const DEFAULT_GROUPS_CLAIM: &str = "groups";
 const DEFAULT_SESSION_TTL_HOURS: u64 = 8;
 const DEFAULT_DEV_SIGNING_KEY: &str = "dev-only-session-signing-key-change-me";
 
-#[derive(Debug, Clone)]
+/// `Debug` is hand-rolled to redact `client_secret` and `session_signing_key`.
+/// Both are secrets and CLAUDE.md forbids them from appearing in logs/errors.
+#[derive(Clone)]
 pub struct AuthConfig {
     pub issuer: String,
     pub client_id: String,
@@ -27,6 +29,22 @@ pub struct AuthConfig {
     pub session_signing_key: Vec<u8>,
     /// Skip the live IdP. Tests boot an in-process mock at `issuer` instead.
     pub mock_mode: bool,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("redirect_url", &self.redirect_url)
+            .field("audience", &self.audience)
+            .field("groups_claim", &self.groups_claim)
+            .field("session_ttl", &self.session_ttl)
+            .field("session_signing_key", &"<redacted>")
+            .field("mock_mode", &self.mock_mode)
+            .finish()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
