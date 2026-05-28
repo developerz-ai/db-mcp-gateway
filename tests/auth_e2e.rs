@@ -49,7 +49,7 @@ async fn login_via_mock_idp_then_call_tool() {
         ..AuthConfig::default()
     };
     let sessions = SessionStore::new(pool);
-    let oidc = OidcClient::new(auth_config.clone());
+    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient http builder");
 
     let config = Config {
         bind: addr,

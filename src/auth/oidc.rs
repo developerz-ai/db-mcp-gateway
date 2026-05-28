@@ -86,21 +86,21 @@ impl std::fmt::Debug for JwksCache {
 const JWKS_TTL: Duration = Duration::from_secs(3600);
 
 impl OidcClient {
-    pub fn new(config: AuthConfig) -> Self {
-        // The auth callback is the only place we follow redirects; the token
-        // exchange must not redirect (security: SSRF guard). The builder is
-        // infallible with default features; degrade to the plain client if a
-        // future TLS misconfiguration changes that.
+    pub fn new(config: AuthConfig) -> Result<Self, AuthError> {
+        // Token exchange must not follow redirects (SSRF guard). Fall back to
+        // `Client::new()` is NOT acceptable — that uses the default redirect
+        // policy (up to 10 hops in reqwest 0.12) and would silently re-open
+        // the very SSRF surface this client is supposed to close.
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Self {
+            .map_err(|_| AuthError::HttpClient)?;
+        Ok(Self {
             config: Arc::new(config),
             http,
             discovery: Arc::new(RwLock::new(None)),
             jwks: Arc::new(RwLock::new(None)),
-        }
+        })
     }
 
     pub fn config(&self) -> &AuthConfig {

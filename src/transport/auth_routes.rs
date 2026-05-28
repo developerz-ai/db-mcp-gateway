@@ -100,7 +100,10 @@ impl IntoResponse for AuthError {
             | AuthError::CodeExchange
             | AuthError::IdToken
             | AuthError::InvalidState => StatusCode::BAD_GATEWAY,
-            AuthError::State(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            // `HttpClient` is a boot-time failure surface — main bails before
+            // serving — so this arm is only reachable if a future caller
+            // constructs an `OidcClient` lazily. Treat it as internal.
+            AuthError::HttpClient | AuthError::State(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let (category, code) = auth_error_fields(&self);
         let mut body = serde_json::json!({
@@ -128,6 +131,7 @@ pub(crate) fn auth_error_fields(err: &AuthError) -> (&'static str, &'static str)
         AuthError::CodeExchange => ("internal", "oidc_code_exchange_failed"),
         AuthError::IdToken => ("internal", "oidc_id_token_invalid"),
         AuthError::InvalidState => ("internal", "oidc_invalid_state"),
+        AuthError::HttpClient => ("internal", "oidc_http_client_init_failed"),
         AuthError::State(_) => ("internal", "state_db_error"),
     }
 }

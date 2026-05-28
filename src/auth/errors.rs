@@ -6,6 +6,13 @@
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
+    /// Initial `reqwest::Client` build failed at boot. Surfaces only from
+    /// `OidcClient::new`; we refuse to fall back to a default client because
+    /// that would silently re-enable redirect following on the token-exchange
+    /// path (SSRF guard).
+    #[error("OIDC HTTP client init failed")]
+    HttpClient,
+
     #[error("OIDC discovery failed")]
     Discovery,
 

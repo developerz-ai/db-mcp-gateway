@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let sessions = SessionStore::new(state_db);
-    let oidc = OidcClient::new(auth_config.clone());
+    let oidc = OidcClient::new(auth_config.clone())?;
     let app_state = AppState {
         auth: Some(AuthFacade {
             config: Arc::new(auth_config),
