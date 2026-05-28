@@ -52,19 +52,12 @@ async fn catalog_query_returns_expected_columns_and_types() {
     let schema = fresh_schema_name();
 
     // Setup: a schema with a couple of tables of known shape.
+    run_query(&p, &format!("CREATE SCHEMA \"{schema}\""), None, 10)
+        .await
+        .expect("create schema");
     run_query(
         &p,
-        &format!("CREATE SCHEMA \"{schema}\""),
-        None,
-        10,
-    )
-    .await
-    .expect("create schema");
-    run_query(
-        &p,
-        &format!(
-            "CREATE TABLE \"{schema}\".\"users\" (id bigint NOT NULL, email text)"
-        ),
+        &format!("CREATE TABLE \"{schema}\".\"users\" (id bigint NOT NULL, email text)"),
         None,
         10,
     )
@@ -72,9 +65,7 @@ async fn catalog_query_returns_expected_columns_and_types() {
     .expect("create users");
     run_query(
         &p,
-        &format!(
-            "CREATE TABLE \"{schema}\".\"orders\" (id bigint NOT NULL, total numeric)"
-        ),
+        &format!("CREATE TABLE \"{schema}\".\"orders\" (id bigint NOT NULL, total numeric)"),
         None,
         10,
     )
@@ -164,10 +155,6 @@ async fn table_filter_narrows_results() {
 
     // Only the 2 columns of "b" — not "a".x.
     assert_eq!(result.rows.len(), 2);
-    let names: Vec<&str> = result
-        .rows
-        .iter()
-        .map(|r| r[2].as_str().unwrap())
-        .collect();
+    let names: Vec<&str> = result.rows.iter().map(|r| r[2].as_str().unwrap()).collect();
     assert_eq!(names, vec!["y", "z"]);
 }

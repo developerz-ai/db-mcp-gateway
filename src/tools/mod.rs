@@ -14,6 +14,7 @@ pub mod describe_schema;
 pub mod list_databases;
 pub mod list_servers;
 pub mod run_query;
+pub mod sample_table;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -31,6 +32,7 @@ pub use crate::transport::protocol::DESCRIBE_SCHEMA_TOOL as DESCRIBE_SCHEMA;
 pub use crate::transport::protocol::LIST_DATABASES_TOOL as LIST_DATABASES;
 pub use crate::transport::protocol::LIST_SERVERS_TOOL as LIST_SERVERS;
 pub use crate::transport::protocol::RUN_QUERY_TOOL as RUN_QUERY;
+pub use crate::transport::protocol::SAMPLE_TABLE_TOOL as SAMPLE_TABLE;
 
 #[derive(Debug, Deserialize)]
 struct CallParams {
@@ -87,6 +89,9 @@ pub async fn dispatch_call(
         LIST_DATABASES => list_databases::run(id, identity, config, state_db, call.arguments).await,
         DESCRIBE_SCHEMA => {
             describe_schema::run(id, identity, config, registry, state_db, call.arguments).await
+        }
+        SAMPLE_TABLE => {
+            sample_table::run(id, identity, config, registry, state_db, call.arguments).await
         }
         RUN_QUERY => run_query::run(id, identity, config, registry, state_db, call.arguments).await,
         other => Response::error(

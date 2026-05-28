@@ -71,7 +71,13 @@ async fn tools_list_advertises_all_registered_tools() {
         .as_array()
         .expect("tools/list returns an array");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-    for expected in ["list_servers", "list_databases", "run_query"] {
+    for expected in [
+        "list_servers",
+        "list_databases",
+        "describe_schema",
+        "sample_table",
+        "run_query",
+    ] {
         assert!(
             names.contains(&expected),
             "expected `{expected}` in advertised tools: {body}"

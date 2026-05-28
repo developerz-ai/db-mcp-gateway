@@ -70,9 +70,7 @@ pub async fn run(
         _ => {
             return Response::error(
                 id,
-                ErrorObject::invalid_params(
-                    "describe_schema requires `server` and `database`",
-                ),
+                ErrorObject::invalid_params("describe_schema requires `server` and `database`"),
             );
         }
     };
@@ -185,10 +183,7 @@ fn find_server_db<'a>(
 /// Build the catalog query + the bind values that go with it. Schema and
 /// table go through `$1` / `$2` — they're values, not identifiers, in this
 /// query, so the standard parameterised path is safe.
-fn build_catalog_query<'a>(
-    schema: &'a str,
-    table: Option<&'a str>,
-) -> (String, Vec<&'a str>) {
+fn build_catalog_query<'a>(schema: &'a str, table: Option<&'a str>) -> (String, Vec<&'a str>) {
     let base = "SELECT table_schema, table_name, column_name, data_type, is_nullable \
                 FROM information_schema.columns \
                 WHERE table_schema = $1";
