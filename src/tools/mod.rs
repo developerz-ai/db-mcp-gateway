@@ -91,9 +91,7 @@ pub async fn dispatch_call(
 
     match call.name.as_str() {
         LIST_SERVERS => {
-            // list_servers is still synchronous (no DB hit, no audit in this
-            // slice — Slice 2 wires both).
-            list_servers::run(id, identity, config, state_db, request_ctx, call.arguments)
+            list_servers::run(id, identity, config, state_db, request_ctx, call.arguments).await
         }
         LIST_DATABASES => {
             list_databases::run(id, identity, config, state_db, request_ctx, call.arguments).await
