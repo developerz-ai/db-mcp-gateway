@@ -1,8 +1,20 @@
 //! Bootstrap configuration for the gateway.
 //!
-//! Deliberately minimal: only what's needed to bind, mount the MCP endpoint,
-//! and reach the gateway's own Postgres. The full YAML schema, secrets
-//! resolution, hot reload, and validation land with issue #16.
+//! Two-layered today:
+//! - `Config` (this file) carries env-driven runtime knobs: bind address,
+//!   MCP path, state DB pool — what we needed for #1 and #2.
+//! - `ConfigFile` (`yaml`) carries the operator's YAML: `servers:` +
+//!   `permissions:` — what we need for #3.
+//!
+//! Unification of both into a single YAML lands with issue #16.
+
+pub mod schema;
+pub mod secret;
+pub mod yaml;
+
+pub use schema::{Action, Database, Grant, Permission, Server, ServerKind, Tls};
+pub use secret::Password;
+pub use yaml::{ConfigFile, ConfigFileError};
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 

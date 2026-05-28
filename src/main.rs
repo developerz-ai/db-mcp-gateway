@@ -1,11 +1,23 @@
 //! db-mcp-gateway — entry point: logging, config, signals, graceful shutdown.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use clap::Parser;
 use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
+use db_mcp_gateway::config::ConfigFile;
 use db_mcp_gateway::transport::{AppState, AuthFacade, PendingFlows};
 use db_mcp_gateway::{config::Config, state, transport};
 use tracing_subscriber::EnvFilter;
+
+#[derive(Debug, Parser)]
+#[command(name = "db-mcp-gateway", version, about)]
+struct Cli {
+    /// Path to the YAML config file (servers + permissions). Required; spec
+    /// 08-config.md says no half-loaded state.
+    #[arg(long, env = "DB_MCP_GATEWAY_CONFIG")]
+    config: PathBuf,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -13,6 +25,16 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .json()
         .init();
+
+    let cli = Cli::parse();
+
+    let config_file = ConfigFile::from_file(&cli.config)?;
+    tracing::info!(
+        path = %cli.config.display(),
+        servers = config_file.servers.len(),
+        permissions = config_file.permissions.len(),
+        "config loaded"
+    );
 
     let config = Config::from_env()?;
     let auth_config = AuthConfig::from_env()?;
