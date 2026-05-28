@@ -16,6 +16,7 @@ pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// the protocol-level tool names agents pass to `tools/call`.
 pub const LIST_SERVERS_TOOL: &str = "list_servers";
 pub const LIST_DATABASES_TOOL: &str = "list_databases";
+pub const DESCRIBE_SCHEMA_TOOL: &str = "describe_schema";
 pub const RUN_QUERY_TOOL: &str = "run_query";
 
 /// Response to `initialize` — the MCP handshake greeting.
@@ -108,6 +109,23 @@ impl ToolsListResult {
                             "server": { "type": "string" }
                         },
                         "required": ["server"],
+                        "additionalProperties": false
+                    }),
+                },
+                Tool {
+                    name: DESCRIBE_SCHEMA_TOOL,
+                    description: "Return tables + columns + types for a given database. \
+                                  Optional `schema` (default `public`) and `table` narrow \
+                                  the result. No row data is returned.",
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "server":   { "type": "string" },
+                            "database": { "type": "string" },
+                            "schema":   { "type": "string" },
+                            "table":    { "type": "string" }
+                        },
+                        "required": ["server", "database"],
                         "additionalProperties": false
                     }),
                 },

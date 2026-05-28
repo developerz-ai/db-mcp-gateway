@@ -168,13 +168,29 @@ pub async fn run_query(
     statement_timeout_ms: Option<u32>,
     row_limit: u32,
 ) -> Result<ExecResult, ExecError> {
+    run_query_with_string_binds(pool, sql, &[], statement_timeout_ms, row_limit).await
+}
+
+/// Like `run_query` but accepts text bind values for `$1`, `$2`, …
+///
+/// Used by tools that build parameterised SQL (e.g. `describe_schema` queries
+/// `information_schema.columns WHERE table_schema = $1`). Constrained to
+/// `&str` binds because that's all the tool surface needs today; richer
+/// types can land with the first tool that needs them.
+pub async fn run_query_with_string_binds(
+    pool: &PgPool,
+    sql: &str,
+    binds: &[&str],
+    statement_timeout_ms: Option<u32>,
+    row_limit: u32,
+) -> Result<ExecResult, ExecError> {
     // Belt-and-suspenders: a Tokio-side deadline so even a misapplied
     // SET LOCAL (or a DB that ignores it) still bounds the call.
     if let Some(ms) = statement_timeout_ms {
         let budget = Duration::from_millis(u64::from(ms) + TOKIO_TIMEOUT_SLACK_MS);
         match tokio::time::timeout(
             budget,
-            run_query_inner(pool, sql, statement_timeout_ms, row_limit),
+            run_query_inner(pool, sql, binds, statement_timeout_ms, row_limit),
         )
         .await
         {
@@ -182,13 +198,14 @@ pub async fn run_query(
             Err(_elapsed) => Err(ExecError::Timeout),
         }
     } else {
-        run_query_inner(pool, sql, statement_timeout_ms, row_limit).await
+        run_query_inner(pool, sql, binds, statement_timeout_ms, row_limit).await
     }
 }
 
 async fn run_query_inner(
     pool: &PgPool,
     sql: &str,
+    binds: &[&str],
     statement_timeout_ms: Option<u32>,
     row_limit: u32,
 ) -> Result<ExecResult, ExecError> {
@@ -208,7 +225,11 @@ async fn run_query_inner(
     let mut truncated = false;
 
     {
-        let mut stream = sqlx::query(sql).fetch(&mut *tx);
+        let mut query = sqlx::query(sql);
+        for bind in binds {
+            query = query.bind(*bind);
+        }
+        let mut stream = query.fetch(&mut *tx);
         while let Some(row_result) = stream.next().await {
             let row = row_result.map_err(classify)?;
             if columns.is_empty() {

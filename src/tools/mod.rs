@@ -10,6 +10,7 @@
 //! serialize a `crate::config::Server` to the wire.
 
 pub mod audit_dispatch;
+pub mod describe_schema;
 pub mod list_databases;
 pub mod list_servers;
 pub mod run_query;
@@ -26,6 +27,7 @@ use crate::transport::jsonrpc::{ErrorObject, Response};
 
 // Re-export canonical names so dispatch and the advertised capability can
 // never drift apart.
+pub use crate::transport::protocol::DESCRIBE_SCHEMA_TOOL as DESCRIBE_SCHEMA;
 pub use crate::transport::protocol::LIST_DATABASES_TOOL as LIST_DATABASES;
 pub use crate::transport::protocol::LIST_SERVERS_TOOL as LIST_SERVERS;
 pub use crate::transport::protocol::RUN_QUERY_TOOL as RUN_QUERY;
@@ -83,6 +85,9 @@ pub async fn dispatch_call(
     match call.name.as_str() {
         LIST_SERVERS => list_servers::run(id, identity, config, call.arguments),
         LIST_DATABASES => list_databases::run(id, identity, config, state_db, call.arguments).await,
+        DESCRIBE_SCHEMA => {
+            describe_schema::run(id, identity, config, registry, state_db, call.arguments).await
+        }
         RUN_QUERY => run_query::run(id, identity, config, registry, state_db, call.arguments).await,
         other => Response::error(
             id,
