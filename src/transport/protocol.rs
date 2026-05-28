@@ -15,6 +15,7 @@ pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Logical names of the MCP tools the gateway exposes. The string values are
 /// the protocol-level tool names agents pass to `tools/call`.
 pub const LIST_SERVERS_TOOL: &str = "list_servers";
+pub const LIST_DATABASES_TOOL: &str = "list_databases";
 pub const RUN_QUERY_TOOL: &str = "run_query";
 
 /// Response to `initialize` — the MCP handshake greeting.
@@ -93,6 +94,20 @@ impl ToolsListResult {
                     input_schema: json!({
                         "type": "object",
                         "properties": {},
+                        "additionalProperties": false
+                    }),
+                },
+                Tool {
+                    name: LIST_DATABASES_TOOL,
+                    description: "List databases on a configured server that the caller is \
+                                  permitted to see. Returns logical name + description — \
+                                  no connection info.",
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "server": { "type": "string" }
+                        },
+                        "required": ["server"],
                         "additionalProperties": false
                     }),
                 },

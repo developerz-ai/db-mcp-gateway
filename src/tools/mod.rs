@@ -10,6 +10,7 @@
 //! serialize a `crate::config::Server` to the wire.
 
 pub mod audit_dispatch;
+pub mod list_databases;
 pub mod list_servers;
 pub mod run_query;
 
@@ -25,6 +26,7 @@ use crate::transport::jsonrpc::{ErrorObject, Response};
 
 // Re-export canonical names so dispatch and the advertised capability can
 // never drift apart.
+pub use crate::transport::protocol::LIST_DATABASES_TOOL as LIST_DATABASES;
 pub use crate::transport::protocol::LIST_SERVERS_TOOL as LIST_SERVERS;
 pub use crate::transport::protocol::RUN_QUERY_TOOL as RUN_QUERY;
 
@@ -80,6 +82,7 @@ pub async fn dispatch_call(
 
     match call.name.as_str() {
         LIST_SERVERS => list_servers::run(id, identity, config, call.arguments),
+        LIST_DATABASES => list_databases::run(id, identity, config, state_db, call.arguments).await,
         RUN_QUERY => run_query::run(id, identity, config, registry, state_db, call.arguments).await,
         other => Response::error(
             id,
@@ -89,10 +92,11 @@ pub async fn dispatch_call(
 }
 
 /// Pull `server`/`database` out of `tools/call` arguments for the dispatch
-/// span. Only `run_query` addresses a specific target; everything else gets
-/// empty strings (tracing renders them as `server=""`).
+/// span. Tools that don't address a specific target (`list_servers`) get
+/// empty strings; per-DB tools (`run_query`) and server-scoped tools
+/// (`list_databases`) fill in what they have.
 fn span_targets(call: &CallParams) -> (&str, &str) {
-    if call.name != RUN_QUERY {
+    if matches!(call.name.as_str(), LIST_SERVERS) {
         return ("", "");
     }
     let args = match call.arguments.as_ref() {
