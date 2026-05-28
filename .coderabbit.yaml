@@ -9,13 +9,7 @@ language: en-US
 early_access: false
 enable_free_tier: true
 
-tone_instructions: |
-  db-mcp-gateway: Rust, axum, sqlx, tokio. Spec: docs/initial-idea/**.
-  CLAUDE.md "Non-negotiables" are absolute. Reject anything that:
-  weakens auth/authz, leaks credentials into logs/errors/responses,
-  skips or weakens audit, mocks the target DB in query-path tests, or
-  introduces an admin UI for permissions. Cite the rule. Prefer concrete
-  diffs. Skip nits. Behaviour change → spec update in same PR.
+tone_instructions: "db-mcp-gateway: Rust, axum, sqlx, tokio. CLAUDE.md Non-negotiables are absolute: no creds in logs/errors/responses, no skipped audit, no mocked target DB, no admin UI. Spec: docs/initial-idea/**. Cite the rule. Concrete diffs, skip nits."
 
 reviews:
   profile: assertive
