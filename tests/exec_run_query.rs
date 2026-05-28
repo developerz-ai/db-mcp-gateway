@@ -50,7 +50,10 @@ async fn quick_query_succeeds_with_columns_and_rows() {
     let result = run_query(&p, "SELECT 1::int8 AS n, 'hi'::text AS greeting", None, 100)
         .await
         .expect("simple SELECT runs");
-    assert_eq!(result.columns, vec!["n".to_string(), "greeting".to_string()]);
+    assert_eq!(
+        result.columns,
+        vec!["n".to_string(), "greeting".to_string()]
+    );
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0][0], serde_json::Value::from(1i64));
     assert_eq!(result.rows[0][1], serde_json::Value::from("hi"));
@@ -60,14 +63,9 @@ async fn quick_query_succeeds_with_columns_and_rows() {
 #[tokio::test]
 async fn row_limit_truncates_and_flags() {
     let p = pool().await;
-    let result = run_query(
-        &p,
-        "SELECT generate_series(1, 1000)::int8 AS n",
-        None,
-        10,
-    )
-    .await
-    .expect("series query runs");
+    let result = run_query(&p, "SELECT generate_series(1, 1000)::int8 AS n", None, 10)
+        .await
+        .expect("series query runs");
     assert_eq!(result.rows.len(), 10);
     assert!(result.truncated, "expected truncated=true beyond row_limit");
 }

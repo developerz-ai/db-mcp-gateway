@@ -93,11 +93,19 @@ async fn post_handler(
         .unwrap_or("anonymous");
     tracing::debug!(method = %request.method, %user, "mcp request");
 
-    // `tools/call` needs identity + loaded config; everything else is pure.
+    // `tools/call` needs identity + loaded config + pool registry; everything
+    // else is pure.
     if request.method == "tools/call" {
         let is_notification = request.id.is_none();
         let id = request.id.clone().unwrap_or(Value::Null);
-        let response = tools::dispatch_call(id, identity.as_deref(), &state.config, request.params);
+        let response = tools::dispatch_call(
+            id,
+            identity.as_deref(),
+            &state.config,
+            &state.pool_registry,
+            request.params,
+        )
+        .await;
         return if is_notification {
             StatusCode::ACCEPTED.into_response()
         } else {

@@ -172,7 +172,12 @@ pub async fn run_query(
     // SET LOCAL (or a DB that ignores it) still bounds the call.
     if let Some(ms) = statement_timeout_ms {
         let budget = Duration::from_millis(u64::from(ms) + TOKIO_TIMEOUT_SLACK_MS);
-        match tokio::time::timeout(budget, run_query_inner(pool, sql, statement_timeout_ms, row_limit)).await {
+        match tokio::time::timeout(
+            budget,
+            run_query_inner(pool, sql, statement_timeout_ms, row_limit),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_elapsed) => Err(ExecError::Timeout),
         }
@@ -207,11 +212,7 @@ async fn run_query_inner(
         while let Some(row_result) = stream.next().await {
             let row = row_result.map_err(classify)?;
             if columns.is_empty() {
-                columns = row
-                    .columns()
-                    .iter()
-                    .map(|c| c.name().to_string())
-                    .collect();
+                columns = row.columns().iter().map(|c| c.name().to_string()).collect();
             }
             if rows.len() >= limit {
                 truncated = true;
@@ -247,7 +248,9 @@ fn classify(err: sqlx::Error) -> ExecError {
 }
 
 fn decode_row(row: &PgRow) -> Vec<Value> {
-    (0..row.columns().len()).map(|i| decode_value(row, i)).collect()
+    (0..row.columns().len())
+        .map(|i| decode_value(row, i))
+        .collect()
 }
 
 /// Best-effort value decode for the common Postgres types. Real schema-aware

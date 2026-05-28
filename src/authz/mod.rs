@@ -74,7 +74,9 @@ pub fn evaluate(
         .iter()
         .map(|g| &g.constraints)
         .fold(Constraints::default(), |acc, c| merge(&acc, c));
-    Decision::Allow { constraints: merged }
+    Decision::Allow {
+        constraints: merged,
+    }
 }
 
 /// Merge two `Constraints` most-restrictively. Pure — same inputs, same
@@ -357,11 +359,13 @@ mod proptests {
             proptest::option::of(0u32..=1_000_000),
             proptest::option::of(0u32..=600_000),
         )
-            .prop_map(|(require_reason, row_limit, statement_timeout_ms)| Constraints {
-                require_reason,
-                row_limit,
-                statement_timeout_ms,
-            })
+            .prop_map(
+                |(require_reason, row_limit, statement_timeout_ms)| Constraints {
+                    require_reason,
+                    row_limit,
+                    statement_timeout_ms,
+                },
+            )
     }
 
     /// `min_option` is the meaning of "most restrictive" for `Option<u32>`:

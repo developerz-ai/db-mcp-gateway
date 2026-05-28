@@ -70,9 +70,14 @@ async fn tools_list_advertises_list_servers() {
     let tools = body["result"]["tools"]
         .as_array()
         .expect("tools/list returns an array");
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(
-        tools.iter().any(|t| t["name"] == "list_servers"),
+        names.contains(&"list_servers"),
         "expected list_servers in advertised tools: {body}"
+    );
+    assert!(
+        names.contains(&"run_query"),
+        "expected run_query in advertised tools: {body}"
     );
 }
 

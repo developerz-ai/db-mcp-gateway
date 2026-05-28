@@ -48,11 +48,26 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      # Separate target DB the exec layer connects to (#4 onward). Matches
+      # the `target-db` service in docker-compose.dev.yml — user/pass/db/port
+      # are the same so the same e2e configs work in CI and locally.
+      target-db:
+        image: postgres:16
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app-dev-only
+          POSTGRES_DB: app
+        ports: ["5434:5432"]
+        options: >-
+          --health-cmd "pg_isready -U app"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     env:
       DATABASE_URL: postgres://gateway:gateway@localhost:5432/gateway
       # Read by `Config::from_env` for the gateway's state DB pool. Kept
-      # distinct from DATABASE_URL because we'll connect to multiple target
-      # DBs once #3 lands.
+      # distinct from DATABASE_URL because we connect to multiple target
+      # DBs (see exec layer, #4).
       STATE_DB_URL: postgres://gateway:gateway@localhost:5432/gateway
     steps:
       - uses: actions/checkout@v4

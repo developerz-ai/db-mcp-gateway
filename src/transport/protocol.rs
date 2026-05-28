@@ -15,6 +15,7 @@ pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Logical names of the MCP tools the gateway exposes. The string values are
 /// the protocol-level tool names agents pass to `tools/call`.
 pub const LIST_SERVERS_TOOL: &str = "list_servers";
+pub const RUN_QUERY_TOOL: &str = "run_query";
 
 /// Response to `initialize` — the MCP handshake greeting.
 #[derive(Debug, Serialize)]
@@ -80,20 +81,40 @@ pub struct ToolsListResult {
 }
 
 impl ToolsListResult {
-    /// Snapshot of the currently registered MCP tools. As more tools land
-    /// (#4 onward) this grows; for #3 it's just `list_servers`.
+    /// Snapshot of the currently registered MCP tools. Grows as more tools
+    /// land in later issues.
     pub fn current() -> Self {
         Self {
-            tools: vec![Tool {
-                name: LIST_SERVERS_TOOL,
-                description: "List the database servers the caller is permitted to see. \
-                              Returns logical name, kind, and description — no connection info.",
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false
-                }),
-            }],
+            tools: vec![
+                Tool {
+                    name: LIST_SERVERS_TOOL,
+                    description: "List the database servers the caller is permitted to see. \
+                                  Returns logical name, kind, and description — no connection info.",
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }),
+                },
+                Tool {
+                    name: RUN_QUERY_TOOL,
+                    description: "Execute SQL against a configured (server, database) under the \
+                                  caller's grants. Returns columns, rows, truncation flag, and \
+                                  elapsed_ms. Statement timeout + row cap enforced by policy.",
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "server":   { "type": "string" },
+                            "database": { "type": "string" },
+                            "sql":      { "type": "string" },
+                            "limit":    { "type": "integer", "minimum": 1 },
+                            "reason":   { "type": "string" }
+                        },
+                        "required": ["server", "database", "sql"],
+                        "additionalProperties": false
+                    }),
+                },
+            ],
         }
     }
 }
