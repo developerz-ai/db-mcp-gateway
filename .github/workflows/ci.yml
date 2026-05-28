@@ -50,6 +50,10 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgres://gateway:gateway@localhost:5432/gateway
+      # Read by `Config::from_env` for the gateway's state DB pool. Kept
+      # distinct from DATABASE_URL because we'll connect to multiple target
+      # DBs once #3 lands.
+      STATE_DB_URL: postgres://gateway:gateway@localhost:5432/gateway
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
