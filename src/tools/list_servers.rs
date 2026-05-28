@@ -43,13 +43,15 @@ pub fn run(
     // MCP tool results carry JSON-as-text inside the `content` array.
     // Serialization of our safe-view types is infallible in practice, but
     // `expect` on the request path is banned (CLAUDE.md): degrade to an
-    // internal error rather than panic the worker.
+    // internal error rather than panic the worker. The client-facing message
+    // is a fixed code; serializer internals stay in the server log.
     let payload = match serde_json::to_string(&ListServersResult { servers }) {
         Ok(payload) => payload,
         Err(error) => {
+            tracing::error!(%error, "list_servers serialization failed");
             return Response::error(
                 id,
-                ErrorObject::internal(format!("list_servers serialization failed: {error}")),
+                ErrorObject::internal("tool.list_servers.serialization_failed"),
             );
         }
     };
