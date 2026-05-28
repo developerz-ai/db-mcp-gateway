@@ -4,9 +4,11 @@
 //! non-negotiable: every tool dispatch traces to an SSO-verified identity →
 //! audit row, and audit-write failures **fail the request**. No best-effort.
 //!
-//! Retention pruner lives in `audit::pruner` (issue #8 Slice 3). Archive +
-//! stream sinks (S3/GCS/OTLP/Kafka per spec 07) are out of scope for #8 and
-//! land in follow-up issues.
+//! Retention pruner lives in `audit::pruner`. Archive + stream sinks
+//! (S3/GCS/OTLP/Kafka per spec 07) are out of scope for #8 and land in
+//! follow-up issues.
+
+pub mod pruner;
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
