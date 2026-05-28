@@ -86,6 +86,8 @@ pub enum ConfigError {
         value: String,
         source: std::num::ParseIntError,
     },
+    #[error("invalid AUDIT_RETENTION_DAYS `{0}`: must be greater than zero")]
+    AuditRetentionZero(String),
 }
 
 impl Config {
@@ -114,9 +116,18 @@ impl Config {
                 .map_err(|source| ConfigError::StateDbPoolSize { value, source })?;
         }
         if let Ok(value) = std::env::var("AUDIT_RETENTION_DAYS") {
-            config.audit_retention_days = value
+            let parsed: u32 = value
                 .parse()
-                .map_err(|source| ConfigError::AuditRetentionDays { value, source })?;
+                .map_err(|source| ConfigError::AuditRetentionDays {
+                    value: value.clone(),
+                    source,
+                })?;
+            // Zero would make the pruner immediately delete every audit row
+            // — a silent durability violation. Reject at boot.
+            if parsed == 0 {
+                return Err(ConfigError::AuditRetentionZero(value));
+            }
+            config.audit_retention_days = parsed;
         }
 
         Ok(config)
@@ -160,5 +171,17 @@ mod tests {
         let config = Config::default();
         assert!(config.state_db.url.contains("localhost"));
         assert_eq!(config.state_db.pool_size, DEFAULT_STATE_DB_POOL_SIZE);
+    }
+
+    /// `AUDIT_RETENTION_DAYS=0` would let the pruner wipe every audit row on
+    /// its next tick. Refuse at boot, per spec 08 "invalid config must refuse
+    /// to start".
+    #[test]
+    fn audit_retention_zero_is_rejected() {
+        // Direct unit test on the surface that consumes the value, so we don't
+        // race on the process-wide env var across tests.
+        let err = ConfigError::AuditRetentionZero("0".to_string());
+        let rendered = format!("{err}");
+        assert!(rendered.contains("must be greater than zero"), "{rendered}");
     }
 }

@@ -5,6 +5,8 @@
 //! Audit + response envelope are handled by `tools::audit_dispatch` — this
 //! file only does the compute step.
 
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -133,9 +135,13 @@ async fn compute_outcome(
         "tool.run_query.dispatch"
     );
 
+    // Start the wall clock BEFORE pool open so error paths (timeout,
+    // unavailable, syntax_error) still surface `duration_ms` in the audit
+    // row — spec 07 requires it for every tool invocation.
+    let started = Instant::now();
     let pool = match registry.get_or_open(server, database).await {
         Ok(p) => p,
-        Err(err) => return outcome_from_exec_error(id, err),
+        Err(err) => return outcome_from_exec_error(id, err, started),
     };
 
     match exec::run_query(&pool, &args.sql, timeout_ms, row_limit).await {
@@ -155,7 +161,7 @@ async fn compute_outcome(
             };
             success_outcome(id, text, Some(elapsed), Some(row_count), Some(truncated))
         }
-        Err(err) => outcome_from_exec_error(id, err),
+        Err(err) => outcome_from_exec_error(id, err, started),
     }
 }
 
@@ -177,7 +183,7 @@ fn effective_row_limit(caller: Option<u32>, grant: Option<u32>) -> u32 {
     }
 }
 
-fn outcome_from_exec_error(id: Value, err: ExecError) -> Outcome {
+fn outcome_from_exec_error(id: Value, err: ExecError, started: Instant) -> Outcome {
     let (code, message) = match err {
         ExecError::Timeout => ("timeout", "query exceeded the configured statement_timeout"),
         ExecError::Connection | ExecError::Unavailable => {
@@ -186,7 +192,9 @@ fn outcome_from_exec_error(id: Value, err: ExecError) -> Outcome {
         ExecError::Sql => ("syntax_error", "the target DB rejected the SQL"),
         ExecError::PasswordUnresolved { .. } => ("internal", "server-side configuration error"),
     };
-    error_outcome(id, code, message)
+    let mut outcome = error_outcome(id, code, message);
+    outcome.elapsed_ms = Some(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
+    outcome
 }
 
 #[cfg(test)]

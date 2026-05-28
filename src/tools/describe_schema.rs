@@ -8,6 +8,8 @@
 //! PK/FK/indexes (mentioned in spec doc 03 §describe_schema) are deferred to
 //! a follow-up.
 
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -115,9 +117,12 @@ async fn compute_outcome(
     let schema = args.schema.as_deref().unwrap_or(DEFAULT_SCHEMA);
     let (sql, binds) = build_catalog_query(schema, args.table.as_deref());
 
+    // Wall clock starts before pool open so error paths still carry
+    // `duration_ms` into the audit row — spec 07 requires it on every call.
+    let started = Instant::now();
     let pool = match registry.get_or_open(server, database).await {
         Ok(p) => p,
-        Err(err) => return outcome_from_exec_error(id, err),
+        Err(err) => return outcome_from_exec_error(id, err, started),
     };
 
     let result = exec::run_query_with_string_binds(
@@ -147,12 +152,19 @@ async fn compute_outcome(
                 Ok(t) => t,
                 Err(_) => return error_outcome(id, "internal", "failed to serialize result"),
             };
-            // row_count = number of tables surfaced; describe_schema doesn't
-            // truncate, so always Some(false) — operators can tell from the
-            // audit row whether the call produced data.
-            success_outcome(id, text, Some(elapsed), Some(table_count), Some(false))
+            // row_count = number of tables surfaced. The catalog scan IS
+            // capped (`MAX_CATALOG_ROWS`), so persist the real truncation
+            // flag from exec — otherwise operators can't tell a clipped
+            // schema from a complete one.
+            success_outcome(
+                id,
+                text,
+                Some(elapsed),
+                Some(table_count),
+                Some(exec_result.truncated),
+            )
         }
-        Err(err) => outcome_from_exec_error(id, err),
+        Err(err) => outcome_from_exec_error(id, err, started),
     }
 }
 
@@ -223,7 +235,7 @@ fn assemble_tables(result: &exec::ExecResult) -> Result<DescribeSchemaResult, ()
     Ok(DescribeSchemaResult { tables })
 }
 
-fn outcome_from_exec_error(id: Value, err: ExecError) -> Outcome {
+fn outcome_from_exec_error(id: Value, err: ExecError, started: Instant) -> Outcome {
     let (code, message) = match err {
         ExecError::Timeout => ("timeout", "catalog query exceeded statement_timeout"),
         ExecError::Connection | ExecError::Unavailable => {
@@ -232,7 +244,9 @@ fn outcome_from_exec_error(id: Value, err: ExecError) -> Outcome {
         ExecError::Sql => ("syntax_error", "catalog query was rejected"),
         ExecError::PasswordUnresolved { .. } => ("internal", "server-side configuration error"),
     };
-    error_outcome(id, code, message)
+    let mut outcome = error_outcome(id, code, message);
+    outcome.elapsed_ms = Some(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
+    outcome
 }
 
 #[cfg(test)]
