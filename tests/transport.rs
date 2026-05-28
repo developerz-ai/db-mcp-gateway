@@ -4,17 +4,21 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
 use db_mcp_gateway::config::Config;
-use db_mcp_gateway::transport::{self, protocol};
+use db_mcp_gateway::transport::{self, AppState, protocol};
 use serde_json::{Value, json};
 
 /// Boot the gateway on an ephemeral port and return the full MCP endpoint URL.
+///
+/// These tests exercise the wire protocol; `AppState { auth: None }` lets the
+/// bearer middleware pass through without a real OIDC/state-DB. Auth's HTTP
+/// behavior is covered by `tests/auth.rs`.
 async fn spawn_gateway() -> String {
     let config = Config {
         bind: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
         mcp_path: "/mcp".to_string(),
         ..Config::default()
     };
-    let app = transport::router(&config);
+    let app = transport::router(&config, AppState { auth: None });
     let listener = tokio::net::TcpListener::bind(config.bind).await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

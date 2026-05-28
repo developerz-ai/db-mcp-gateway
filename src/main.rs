@@ -1,5 +1,9 @@
 //! db-mcp-gateway — entry point: logging, config, signals, graceful shutdown.
 
+use std::sync::Arc;
+
+use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
+use db_mcp_gateway::transport::{AppState, AuthFacade, PendingFlows};
 use db_mcp_gateway::{config::Config, state, transport};
 use tracing_subscriber::EnvFilter;
 
@@ -11,14 +15,26 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    let auth_config = AuthConfig::from_env()?;
 
-    let _state_db = state::connect(&config.state_db.url, config.state_db.pool_size).await?;
+    let state_db = state::connect(&config.state_db.url, config.state_db.pool_size).await?;
     tracing::info!(
         pool_size = config.state_db.pool_size,
         "state DB connected, migrations applied"
     );
 
-    let app = transport::router(&config);
+    let sessions = SessionStore::new(state_db);
+    let oidc = OidcClient::new(auth_config.clone());
+    let app_state = AppState {
+        auth: Some(AuthFacade {
+            config: Arc::new(auth_config),
+            sessions,
+            oidc,
+            flows: PendingFlows::default(),
+        }),
+    };
+
+    let app = transport::router(&config, app_state);
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     let addr = listener.local_addr()?;
