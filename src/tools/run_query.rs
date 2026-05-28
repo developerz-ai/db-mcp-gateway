@@ -14,6 +14,7 @@ use sqlx::PgPool;
 use crate::auth::Identity;
 use crate::authz::{self, Decision};
 use crate::config::{Action, ConfigFile, Database, Server};
+use crate::exec::sql_guard;
 use crate::exec::{self, ExecError, PoolRegistry};
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
@@ -116,6 +117,20 @@ async fn compute_outcome(
                 "policy requires a `reason` for this server/database",
             ),
             code: "reason_required",
+            elapsed_ms: None,
+        };
+    }
+
+    // Defense-in-depth on top of the read-only role: reject writes / DDL /
+    // multi-statement before they ever hit the pool. See exec::sql_guard.
+    if let Err(err) = sql_guard::is_read_only(&args.sql) {
+        return Outcome {
+            response: tool_error(
+                id,
+                "forbidden_sql",
+                &format!("SQL rejected by gateway: {err}"),
+            ),
+            code: "forbidden_sql",
             elapsed_ms: None,
         };
     }

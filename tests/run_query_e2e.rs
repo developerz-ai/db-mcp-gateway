@@ -299,4 +299,22 @@ async fn run_query_full_acceptance() {
     assert_eq!(resp["result"]["isError"], true);
     assert_eq!(payload(&resp)["code"], "forbidden");
     assert_audit_outcome(pool, sub, "forbidden", "bogus server").await;
+
+    // 6. AST guard: write/DDL/multi-statement SQL must be rejected with
+    //    `forbidden_sql` *before* reaching the DB. The audit row records
+    //    the rejection. This is defense in depth on top of the read-only
+    //    role — see issue #7 / `exec::sql_guard`.
+    for (sql, label) in [
+        ("DELETE FROM nonexistent_table", "DELETE rejected pre-DB"),
+        ("UPDATE foo SET x = 1", "UPDATE rejected pre-DB"),
+        ("DROP TABLE x", "DROP rejected pre-DB"),
+        ("SELECT 1; DELETE FROM x", "multi-statement rejected pre-DB"),
+        ("SELECT * FROM foo FOR UPDATE", "locking SELECT rejected pre-DB"),
+    ] {
+        let resp = call_run_query(url, bearer, "target", "app", sql, None).await;
+        assert_eq!(resp["result"]["isError"], true, "{label}: {resp}");
+        let body = payload(&resp);
+        assert_eq!(body["code"], "forbidden_sql", "{label}: {body}");
+        assert_audit_outcome(pool, sub, "forbidden_sql", label).await;
+    }
 }
