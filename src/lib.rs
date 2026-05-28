@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod authz;
 pub mod config;
+pub mod exec;
 pub mod state;
 pub mod tools;
 pub mod transport;
