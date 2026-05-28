@@ -318,6 +318,12 @@ async fn run_query_full_acceptance() {
         assert_eq!(resp["result"]["isError"], true, "{label}: {resp}");
         let body = payload(&resp);
         assert_eq!(body["code"], "forbidden_sql", "{label}: {body}");
+        // MCP error contract (docs/initial-idea/03-mcp-tools.md §Errors):
+        // every error body echoes the JSON-RPC request id.
+        assert_eq!(
+            body["request_id"], 1,
+            "{label}: missing or wrong request_id in error payload: {body}"
+        );
         assert_audit_outcome(pool, sub, "forbidden_sql", label).await;
     }
 }
