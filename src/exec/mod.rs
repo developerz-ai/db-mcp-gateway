@@ -11,6 +11,8 @@
 //!    wrap the query in `tokio::time::timeout` as belt-and-suspenders — if
 //!    the DB ignores `SET LOCAL`, the future still completes.
 
+pub mod sql_guard;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

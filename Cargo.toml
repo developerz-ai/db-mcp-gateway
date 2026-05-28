@@ -29,6 +29,7 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # db
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+sqlparser = "0.52"
 
 # auth / crypto
 jsonwebtoken = "9"
