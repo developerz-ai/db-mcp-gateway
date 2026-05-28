@@ -30,6 +30,8 @@ pub enum ConfigError {
         value: String,
         source: std::net::AddrParseError,
     },
+    #[error("invalid MCP_PATH `{0}`: must be a non-empty absolute path (e.g. `/mcp`)")]
+    McpPath(String),
 }
 
 impl Config {
@@ -47,9 +49,42 @@ impl Config {
                 .map_err(|source| ConfigError::Bind { value, source })?;
         }
         if let Ok(path) = std::env::var("MCP_PATH") {
-            config.mcp_path = path;
+            config.mcp_path = validate_mcp_path(path)?;
         }
 
         Ok(config)
+    }
+}
+
+fn validate_mcp_path(path: String) -> Result<String, ConfigError> {
+    let trimmed = path.trim();
+    if trimmed.is_empty()
+        || !trimmed.starts_with('/')
+        || trimmed == "/"
+        || trimmed.contains(char::is_whitespace)
+    {
+        return Err(ConfigError::McpPath(path));
+    }
+    Ok(trimmed.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_paths_are_accepted() {
+        assert_eq!(validate_mcp_path("/mcp".into()).unwrap(), "/mcp");
+        assert_eq!(validate_mcp_path("/v1/mcp".into()).unwrap(), "/v1/mcp");
+    }
+
+    #[test]
+    fn invalid_paths_are_rejected() {
+        for bad in ["", " ", "/", "mcp", "/with space", "  "] {
+            assert!(
+                validate_mcp_path(bad.into()).is_err(),
+                "expected `{bad}` to be rejected"
+            );
+        }
     }
 }
