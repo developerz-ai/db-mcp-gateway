@@ -4,16 +4,23 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
 use db_mcp_gateway::config::Config;
-use db_mcp_gateway::transport::{self, protocol};
+use db_mcp_gateway::transport::{self, AppState, protocol};
 use serde_json::{Value, json};
 
 /// Boot the gateway on an ephemeral port and return the full MCP endpoint URL.
+///
+/// These tests exercise the transport wire protocol only; `AppState { auth:
+/// None }` bypasses auth wiring by design. Auth/session behavior is covered by
+/// `tests/auth_e2e.rs`. Audit-row assertions are intentionally omitted here
+/// because this harness has no audit integration yet (audit module lands in a
+/// later issue).
 async fn spawn_gateway() -> String {
     let config = Config {
         bind: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
         mcp_path: "/mcp".to_string(),
+        ..Config::default()
     };
-    let app = transport::router(&config);
+    let app = transport::router(&config, AppState { auth: None });
     let listener = tokio::net::TcpListener::bind(config.bind).await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

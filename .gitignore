@@ -10,6 +10,12 @@ Cargo.lock.bak
 *.pem
 *.key
 
+# Exception: integration tests need a static RSA keypair to sign the mock
+# OIDC IdP's ID tokens. These files are plainly labelled test fixtures and
+# never touch a production code path. See tests/common/mod.rs.
+!tests/data/*.pem
+!tests/data/*.key
+
 # Local config overrides
 config/local.yaml
 config/*.local.yaml
@@ -23,6 +29,9 @@ config/*.local.yaml
 
 # Claude Code per-machine settings (project-shared settings live in .claude/)
 .claude/settings.local.json
+
+# claudetm (claude-task-master) per-repo state — pid, task logs, etc.
+.claude-task-master/
 
 # Test / build artifacts
 /coverage
