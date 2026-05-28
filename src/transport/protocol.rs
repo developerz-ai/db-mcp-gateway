@@ -18,6 +18,7 @@ pub const LIST_SERVERS_TOOL: &str = "list_servers";
 pub const LIST_DATABASES_TOOL: &str = "list_databases";
 pub const DESCRIBE_SCHEMA_TOOL: &str = "describe_schema";
 pub const SAMPLE_TABLE_TOOL: &str = "sample_table";
+pub const EXPLAIN_TOOL: &str = "explain";
 pub const RUN_QUERY_TOOL: &str = "run_query";
 
 /// Response to `initialize` — the MCP handshake greeting.
@@ -146,6 +147,22 @@ impl ToolsListResult {
                             "limit":    { "type": "integer", "minimum": 1 }
                         },
                         "required": ["server", "database", "table"],
+                        "additionalProperties": false
+                    }),
+                },
+                Tool {
+                    name: EXPLAIN_TOOL,
+                    description: "Return the query plan for a SELECT/CTE via \
+                                  `EXPLAIN (FORMAT JSON)`. SQL is AST-validated read-only \
+                                  before wrapping; the query itself is not executed.",
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "server":   { "type": "string" },
+                            "database": { "type": "string" },
+                            "sql":      { "type": "string" }
+                        },
+                        "required": ["server", "database", "sql"],
                         "additionalProperties": false
                     }),
                 },

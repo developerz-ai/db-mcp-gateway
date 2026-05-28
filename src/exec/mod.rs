@@ -11,6 +11,8 @@
 //!    wrap the query in `tokio::time::timeout` as belt-and-suspenders — if
 //!    the DB ignores `SET LOCAL`, the future still completes.
 
+pub mod sql_guard;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -275,9 +277,15 @@ fn decode_row(row: &PgRow) -> Vec<Value> {
 }
 
 /// Best-effort value decode for the common Postgres types. Real schema-aware
-/// type handling (timestamps, arrays, jsonb) arrives with the schema-typed
-/// tools (#6/#7) — for now anything we can't recognise serialises as `null`.
+/// type handling (timestamps, arrays) arrives with the tools that need them
+/// — for now anything we can't recognise serialises as `null`.
 fn decode_value(row: &PgRow, idx: usize) -> Value {
+    // JSON / JSONB first — these come back as opaque types that don't
+    // decode as String. Without this, an `EXPLAIN (FORMAT JSON)` plan or
+    // any `jsonb` column would surface to clients as `null`.
+    if let Ok(json) = row.try_get::<sqlx::types::Json<Value>, _>(idx) {
+        return json.0;
+    }
     // NULL has no concrete type to probe against; let it fall through to the
     // Option-of-string check which is the most permissive null detection.
     if let Ok(None) = row.try_get::<Option<String>, _>(idx) {
