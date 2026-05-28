@@ -12,9 +12,9 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 pub const SERVER_NAME: &str = "db-mcp-gateway";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The placeholder tool that exists only to prove the dispatch path end to end.
-/// Removed when real tools land (issue #3).
-pub const PING_TOOL: &str = "ping";
+/// Logical names of the MCP tools the gateway exposes. The string values are
+/// the protocol-level tool names agents pass to `tools/call`.
+pub const LIST_SERVERS_TOOL: &str = "list_servers";
 
 /// Response to `initialize` — the MCP handshake greeting.
 #[derive(Debug, Serialize)]
@@ -80,12 +80,14 @@ pub struct ToolsListResult {
 }
 
 impl ToolsListResult {
-    /// The scaffold tool surface — a single no-op `ping`. Real tools: issue #3.
-    pub fn scaffold() -> Self {
+    /// Snapshot of the currently registered MCP tools. As more tools land
+    /// (#4 onward) this grows; for #3 it's just `list_servers`.
+    pub fn current() -> Self {
         Self {
             tools: vec![Tool {
-                name: PING_TOOL,
-                description: "Liveness placeholder; returns \"pong\". Replaced by real tools (issue #3).",
+                name: LIST_SERVERS_TOOL,
+                description: "List the database servers the caller is permitted to see. \
+                              Returns logical name, kind, and description — no connection info.",
                 input_schema: json!({
                     "type": "object",
                     "properties": {},

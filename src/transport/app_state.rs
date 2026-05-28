@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use crate::auth::{AuthConfig, OidcClient, SessionStore};
+use crate::config::ConfigFile;
 
 /// `state → nonce` from /auth/login lives here until /auth/callback consumes
 /// (and removes) it. TTL-bounded so a wedged login can't accumulate.
@@ -22,6 +23,23 @@ const FLOW_TTL: Duration = Duration::from_secs(5 * 60);
 #[derive(Clone, Debug)]
 pub struct AppState {
     pub auth: Option<AuthFacade>,
+    /// Loaded `servers:` + `permissions:` from the YAML config. Empty when
+    /// tests don't care about tool dispatch.
+    pub config: Arc<ConfigFile>,
+}
+
+impl AppState {
+    /// Test helper: empty config, no auth. Production code never uses this.
+    #[cfg(any(test, debug_assertions))]
+    pub fn for_tests() -> Self {
+        Self {
+            auth: None,
+            config: Arc::new(ConfigFile {
+                servers: Vec::new(),
+                permissions: Vec::new(),
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

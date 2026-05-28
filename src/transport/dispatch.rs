@@ -1,19 +1,23 @@
 //! Routes a parsed JSON-RPC request to its MCP method handler.
 //!
-//! Pure and synchronous — no I/O, fully unit-testable. Auth, real tools, and
-//! per-request audit spans arrive in later issues (#2, #3, #8).
+//! Pure and synchronous — no I/O, fully unit-testable. `tools/call` is handled
+//! in `post_handler` instead because tools need access to identity and the
+//! loaded config; everything else stays here.
 
-use serde::Deserialize;
 use serde_json::Value;
 
 use super::jsonrpc::{ErrorObject, Request, Response};
-use super::protocol::{self, CallToolResult, EmptyResult, InitializeResult, ToolsListResult};
+use super::protocol::{EmptyResult, InitializeResult, ToolsListResult};
 
-/// Dispatch a request. Returns `Some(response)` for requests, `None` for
-/// notifications (which by definition expect no reply).
+/// Dispatch a stateless request. Returns `Some(response)` for requests, `None`
+/// for notifications (which by definition expect no reply). `tools/call` is
+/// not handled here — see `tools::dispatch_call` for the stateful path.
 pub fn dispatch(request: Request) -> Option<Response> {
     let Request {
-        id, method, params, ..
+        id,
+        method,
+        params: _,
+        ..
     } = request;
     let is_notification = id.is_none();
     let response_id = || id.clone().unwrap_or(Value::Null);
@@ -28,8 +32,12 @@ pub fn dispatch(request: Request) -> Option<Response> {
             Response::error(response_id(), ErrorObject::invalid_request())
         }
         "ping" => Response::result(response_id(), &EmptyResult {}),
-        "tools/list" => Response::result(response_id(), &ToolsListResult::scaffold()),
-        "tools/call" => handle_tool_call(response_id(), params),
+        "tools/list" => Response::result(response_id(), &ToolsListResult::current()),
+        // `tools/call` is routed elsewhere — see `super::post_handler`.
+        "tools/call" => Response::error(
+            response_id(),
+            ErrorObject::internal("tools/call must be routed via tools::dispatch_call"),
+        ),
         other => Response::error(response_id(), ErrorObject::method_not_found(other)),
     };
 
@@ -40,28 +48,12 @@ pub fn dispatch(request: Request) -> Option<Response> {
     }
 }
 
-fn handle_tool_call(id: Value, params: Option<Value>) -> Response {
-    #[derive(Deserialize)]
-    struct CallParams {
-        name: String,
-    }
-
-    match params.and_then(|p| serde_json::from_value::<CallParams>(p).ok()) {
-        Some(call) if call.name == protocol::PING_TOOL => {
-            Response::result(id, &CallToolResult::text("pong"))
-        }
-        Some(call) => Response::error(
-            id,
-            ErrorObject::invalid_params(format!("unknown tool: {}", call.name)),
-        ),
-        None => Response::error(id, ErrorObject::invalid_params("missing or invalid `name`")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::jsonrpc::{INVALID_PARAMS, METHOD_NOT_FOUND};
+    use crate::transport::jsonrpc::INTERNAL_ERROR;
+    use crate::transport::jsonrpc::METHOD_NOT_FOUND;
+    use crate::transport::protocol;
     use serde_json::json;
 
     fn dispatch_value(value: Value) -> Response {
@@ -120,38 +112,26 @@ mod tests {
         assert!(dispatch(notification).is_none());
     }
 
+    /// `tools/call` reaches us here only if the post handler forgot to route
+    /// it to `tools::dispatch_call`. Surfacing as an internal error makes the
+    /// mistake loud rather than silently returning a wrong shape.
     #[test]
-    fn ping_tool_returns_pong() {
-        let response = dispatch_value(
-            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "ping"}}),
-        );
+    fn tools_call_in_pure_dispatch_is_internal_error() {
+        let response = dispatch_value(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "list_servers"}
+        }));
         let value = serde_json::to_value(&response).unwrap();
-        assert_eq!(value["result"]["content"][0]["text"], "pong");
-        assert_eq!(value["result"]["isError"], false);
+        assert_eq!(value["error"]["code"], INTERNAL_ERROR);
     }
 
     #[test]
-    fn unknown_tool_is_invalid_params() {
-        let response = dispatch_value(
-            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "nope"}}),
-        );
-        let value = serde_json::to_value(&response).unwrap();
-        assert_eq!(value["error"]["code"], INVALID_PARAMS);
-    }
-
-    #[test]
-    fn tools_call_as_notification_yields_no_response() {
-        let notification = serde_json::from_value(
-            json!({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "ping"}}),
-        )
-        .unwrap();
-        assert!(dispatch(notification).is_none());
-    }
-
-    #[test]
-    fn tools_list_advertises_ping() {
+    fn tools_list_advertises_list_servers() {
         let response = dispatch_value(json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}));
         let value = serde_json::to_value(&response).unwrap();
-        assert_eq!(value["result"]["tools"][0]["name"], protocol::PING_TOOL);
+        assert_eq!(
+            value["result"]["tools"][0]["name"],
+            protocol::LIST_SERVERS_TOOL
+        );
     }
 }

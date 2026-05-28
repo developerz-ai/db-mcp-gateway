@@ -2,6 +2,8 @@
 //! everything testable lives here so integration tests can drive it directly.
 
 pub mod auth;
+pub mod authz;
 pub mod config;
 pub mod state;
+pub mod tools;
 pub mod transport;
