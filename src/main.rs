@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
         "state DB connected, migrations applied"
     );
 
-    let sessions = SessionStore::new(state_db);
+    let sessions = SessionStore::new(state_db.clone());
     let oidc = OidcClient::new(auth_config.clone())?;
     let app_state = AppState {
         auth: Some(AuthFacade {
@@ -57,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
         }),
         config: Arc::new(config_file),
         pool_registry: PoolRegistry::new(),
+        state_db: Some(state_db),
     };
 
     let app = transport::router(&config, app_state);

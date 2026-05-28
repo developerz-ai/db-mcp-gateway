@@ -84,7 +84,7 @@ async fn login_via_mock_idp_then_call_tool() {
         redirect_url: format!("{gateway_url}/auth/callback"),
         ..AuthConfig::default()
     };
-    let sessions = SessionStore::new(pool);
+    let sessions = SessionStore::new(pool.clone());
     let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient http builder");
 
     let config = Config {
@@ -103,6 +103,7 @@ async fn login_via_mock_idp_then_call_tool() {
             }),
             config: Arc::new(config_file),
             pool_registry: PoolRegistry::new(),
+            state_db: Some(pool),
         },
     );
     tokio::spawn(async move {

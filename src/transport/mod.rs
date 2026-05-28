@@ -103,6 +103,7 @@ async fn post_handler(
             identity.as_deref(),
             &state.config,
             &state.pool_registry,
+            state.state_db.as_ref(),
             request.params,
         )
         .await;

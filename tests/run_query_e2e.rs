@@ -69,13 +69,21 @@ permissions:
           row_limit: 50
 "#;
 
-async fn boot_gateway() -> (String, String) {
+struct BootedGateway {
+    url: String,
+    bearer: String,
+    state_db: sqlx::PgPool,
+    user_sub: String,
+}
+
+async fn boot_gateway() -> BootedGateway {
     let pool = state::connect(&state_db_url(), 5)
         .await
         .expect("state DB up (run `bin/dev up`)");
 
+    let user_sub = format!("test-user-{}", uuid::Uuid::new_v4().simple());
     let user = MockUser {
-        sub: format!("test-user-{}", uuid::Uuid::new_v4().simple()),
+        sub: user_sub.clone(),
         email: "rq-e2e@example.com".to_string(),
         groups: vec!["engineers".to_string()],
     };
@@ -93,7 +101,7 @@ async fn boot_gateway() -> (String, String) {
         redirect_url: format!("{gateway_url}/auth/callback"),
         ..AuthConfig::default()
     };
-    let sessions = SessionStore::new(pool);
+    let sessions = SessionStore::new(pool.clone());
     let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient http builder");
 
     let config = Config {
@@ -112,6 +120,7 @@ async fn boot_gateway() -> (String, String) {
                 flows: PendingFlows::default(),
             }),
             config: Arc::new(config_file),
+            state_db: Some(pool.clone()),
             pool_registry: PoolRegistry::new(),
         },
     );
@@ -149,8 +158,12 @@ async fn boot_gateway() -> (String, String) {
         .await
         .unwrap();
     let bearer = cb["session_token"].as_str().unwrap().to_string();
-
-    (gateway_url, bearer)
+    BootedGateway {
+        url: gateway_url,
+        bearer,
+        state_db: pool,
+        user_sub,
+    }
 }
 
 fn client() -> reqwest::Client {
@@ -196,14 +209,41 @@ fn payload(response: &Value) -> Value {
     serde_json::from_str(text).expect("payload is valid JSON")
 }
 
+/// Fetch and assert the most recent audit row for the caller's `run_query`
+/// matches the expected outcome. CLAUDE.md non-negotiable: every tool
+/// dispatch must produce an audited row.
+async fn assert_audit_outcome(
+    pool: &sqlx::PgPool,
+    user_sub: &str,
+    expected_outcome: &str,
+    label: &str,
+) {
+    use db_mcp_gateway::audit::latest_for_user_tool;
+    let row = latest_for_user_tool(pool, user_sub, "run_query")
+        .await
+        .expect("audit lookup query runs")
+        .unwrap_or_else(|| panic!("no audit row for `{label}` — request was unaudited"));
+    assert_eq!(
+        row.outcome, expected_outcome,
+        "`{label}` audit outcome (got {})",
+        row.outcome
+    );
+}
+
 #[tokio::test]
 async fn run_query_full_acceptance() {
-    let (url, bearer) = boot_gateway().await;
+    let booted = boot_gateway().await;
+    let (url, bearer, pool, sub) = (
+        booted.url.as_str(),
+        booted.bearer.as_str(),
+        &booted.state_db,
+        booted.user_sub.as_str(),
+    );
 
-    // 1. Quick query: 1 row, not truncated.
+    // 1. Quick query: 1 row, not truncated. Audit row: outcome=success.
     let resp = call_run_query(
-        &url,
-        &bearer,
+        url,
+        bearer,
         "target",
         "app",
         "SELECT 1::int8 AS n, 'hi'::text AS greeting",
@@ -216,18 +256,21 @@ async fn run_query_full_acceptance() {
     assert_eq!(body["rows"][0][0], 1);
     assert_eq!(body["rows"][0][1], "hi");
     assert_eq!(body["truncated"], false);
+    assert_audit_outcome(pool, sub, "success", "quick SELECT").await;
 
-    // 2. Timeout: pg_sleep(2) under a 200ms grant must return `timeout`.
-    let resp = call_run_query(&url, &bearer, "target", "app", "SELECT pg_sleep(2)", None).await;
+    // 2. Timeout: pg_sleep(2) under a 200ms grant. Audit row: outcome=timeout.
+    let resp = call_run_query(url, bearer, "target", "app", "SELECT pg_sleep(2)", None).await;
     assert_eq!(resp["result"]["isError"], true, "{resp}");
     let body = payload(&resp);
     assert_eq!(body["code"], "timeout", "{body}");
+    assert_audit_outcome(pool, sub, "timeout", "pg_sleep timeout").await;
 
     // 3. Row cap: generate 1000 rows with caller limit=10 → grant cap 50 →
-    //    effective 10 → truncated=true.
+    //    effective 10 → truncated=true. Audit row: outcome=success (the
+    //    query itself succeeded; truncation is a flag, not an error).
     let resp = call_run_query(
-        &url,
-        &bearer,
+        url,
+        bearer,
         "target",
         "app",
         "SELECT generate_series(1, 1000)::int8 AS n",
@@ -238,17 +281,22 @@ async fn run_query_full_acceptance() {
     let body = payload(&resp);
     assert_eq!(body["rows"].as_array().unwrap().len(), 10);
     assert_eq!(body["truncated"], true);
+    assert_audit_outcome(pool, sub, "success", "truncated query").await;
 
     // 4. Forbidden: `hidden` server is configured but engineer has no grant.
     //    Tool must return `forbidden` — never reveal whether `hidden` exists.
-    let resp = call_run_query(&url, &bearer, "hidden", "app", "SELECT 1", None).await;
+    //    Audit row: outcome=forbidden (CLAUDE.md: failed-authz tools still
+    //    leave a row).
+    let resp = call_run_query(url, bearer, "hidden", "app", "SELECT 1", None).await;
     assert_eq!(resp["result"]["isError"], true, "{resp}");
     let body = payload(&resp);
     assert_eq!(body["code"], "forbidden", "{body}");
+    assert_audit_outcome(pool, sub, "forbidden", "hidden server").await;
 
     // 5. Forbidden also when the server name is bogus — same code, same
-    //    message: no leakage of existence.
-    let resp = call_run_query(&url, &bearer, "nonexistent", "app", "SELECT 1", None).await;
+    //    message: no leakage of existence. Audit row: outcome=forbidden.
+    let resp = call_run_query(url, bearer, "nonexistent", "app", "SELECT 1", None).await;
     assert_eq!(resp["result"]["isError"], true);
     assert_eq!(payload(&resp)["code"], "forbidden");
+    assert_audit_outcome(pool, sub, "forbidden", "bogus server").await;
 }

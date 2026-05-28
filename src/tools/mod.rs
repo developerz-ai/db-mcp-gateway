@@ -14,6 +14,7 @@ pub mod run_query;
 
 use serde::Deserialize;
 use serde_json::Value;
+use sqlx::PgPool;
 use tracing::info_span;
 
 use crate::auth::Identity;
@@ -47,6 +48,7 @@ pub async fn dispatch_call(
     identity: Option<&Identity>,
     config: &ConfigFile,
     registry: &PoolRegistry,
+    state_db: Option<&PgPool>,
     params: Option<Value>,
 ) -> Response {
     let Some(identity) = identity else {
@@ -77,7 +79,9 @@ pub async fn dispatch_call(
 
     match call.name.as_str() {
         LIST_SERVERS => list_servers::run(id, identity, config, call.arguments),
-        RUN_QUERY => run_query::run(id, identity, config, registry, call.arguments).await,
+        RUN_QUERY => {
+            run_query::run(id, identity, config, registry, state_db, call.arguments).await
+        }
         other => Response::error(
             id,
             ErrorObject::invalid_params(format!("unknown tool: {other}")),
