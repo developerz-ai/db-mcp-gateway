@@ -94,6 +94,7 @@ pub async fn run(
     let timeout_ms = constraints.statement_timeout_ms;
 
     tracing::info!(
+        request_id = %id,
         user = %identity.user_sub,
         server = %server.name,
         database = %database.name,
@@ -117,8 +118,14 @@ pub async fn run(
                 truncated: result.truncated,
                 elapsed_ms: result.elapsed_ms,
             };
-            let text = serde_json::to_string(&payload)
-                .expect("SuccessPayload contains only safe types — serialization is infallible");
+            // SuccessPayload only contains primitives + serde_json::Value
+            // (which round-trips), so serialization is practically
+            // infallible — but CLAUDE.md bans `expect` on the hot path, so we
+            // fall through to a typed internal error instead of panicking.
+            let text = match serde_json::to_string(&payload) {
+                Ok(t) => t,
+                Err(_) => return tool_error(id, "internal", "failed to serialize result"),
+            };
             Response::result(
                 id,
                 &CallToolResult {

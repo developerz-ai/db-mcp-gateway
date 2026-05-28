@@ -60,13 +60,18 @@ pub async fn dispatch_call(
         }
     };
 
+    // Per-DB tools (`run_query`) carry `server`/`database` in their arguments;
+    // surface them on the span so every dispatch trace ties to a target.
+    // Other tools (`list_servers`) leave both empty by design.
+    let (span_server, span_database) = span_targets(&call);
+
     let span = info_span!(
         "tool_dispatch",
         request_id = %id,
         user = %identity.user_sub,
         tool = %call.name,
-        server = "",
-        database = "",
+        server = span_server,
+        database = span_database,
     );
     let _enter = span.enter();
 
@@ -78,4 +83,20 @@ pub async fn dispatch_call(
             ErrorObject::invalid_params(format!("unknown tool: {other}")),
         ),
     }
+}
+
+/// Pull `server`/`database` out of `tools/call` arguments for the dispatch
+/// span. Only `run_query` addresses a specific target; everything else gets
+/// empty strings (tracing renders them as `server=""`).
+fn span_targets(call: &CallParams) -> (&str, &str) {
+    if call.name != RUN_QUERY {
+        return ("", "");
+    }
+    let args = match call.arguments.as_ref() {
+        Some(a) => a,
+        None => return ("", ""),
+    };
+    let server = args.get("server").and_then(Value::as_str).unwrap_or("");
+    let database = args.get("database").and_then(Value::as_str).unwrap_or("");
+    (server, database)
 }
