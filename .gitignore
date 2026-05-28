@@ -30,6 +30,9 @@ config/*.local.yaml
 # Claude Code per-machine settings (project-shared settings live in .claude/)
 .claude/settings.local.json
 
+# claudetm (claude-task-master) per-repo state — pid, task logs, etc.
+.claude-task-master/
+
 # Test / build artifacts
 /coverage
 *.profraw
