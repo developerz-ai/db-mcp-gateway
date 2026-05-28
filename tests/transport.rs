@@ -67,7 +67,13 @@ async fn tools_list_advertises_list_servers() {
         .unwrap();
 
     let body: Value = response.json().await.unwrap();
-    assert_eq!(body["result"]["tools"][0]["name"], "list_servers");
+    let tools = body["result"]["tools"]
+        .as_array()
+        .expect("tools/list returns an array");
+    assert!(
+        tools.iter().any(|t| t["name"] == "list_servers"),
+        "expected list_servers in advertised tools: {body}"
+    );
 }
 
 #[tokio::test]

@@ -83,7 +83,14 @@ impl ConfigFile {
             }
         }
 
+        let mut group_names: HashSet<&str> = HashSet::new();
         for permission in &self.permissions {
+            if !group_names.insert(&permission.group) {
+                return Err(ConfigFileError::Invalid(format!(
+                    "duplicate permission group `{}`",
+                    permission.group
+                )));
+            }
             for grant in &permission.grants {
                 if grant.server != "*" && !server_names.contains(grant.server.as_str()) {
                     return Err(ConfigFileError::Invalid(format!(
@@ -106,9 +113,13 @@ impl ConfigFile {
 }
 
 fn grant_database_exists(servers: &[Server], server_name: &str, db_name: &str) -> bool {
-    // `*` server applies to every database; skip the check.
+    // Wildcard server still requires the database name to exist somewhere —
+    // otherwise typos like `database: app-typo` are accepted silently and
+    // surface only as cryptic runtime auth misses.
     if server_name == "*" {
-        return true;
+        return servers
+            .iter()
+            .any(|s| s.databases.iter().any(|d| d.name == db_name));
     }
     servers
         .iter()
@@ -230,6 +241,72 @@ permissions:
                 .iter()
                 .any(|p| p.group == "backend-engineers")
         );
+    }
+
+    #[test]
+    fn rejects_duplicate_permission_group() {
+        let yaml = r#"
+servers:
+  - name: prod
+    kind: postgres
+    host: a
+    databases:
+      - { name: app, role: ro, password: x }
+permissions:
+  - group: dup
+    grants:
+      - { server: prod, database: app, action: query_read }
+  - group: dup
+    grants:
+      - { server: prod, database: app, action: schema_read }
+"#;
+        let err = ConfigFile::from_yaml_str(yaml).unwrap_err();
+        let ConfigFileError::Invalid(msg) = err else {
+            panic!("expected Invalid, got {err:?}");
+        };
+        assert!(msg.contains("dup"), "{msg}");
+    }
+
+    #[test]
+    fn rejects_wildcard_server_grant_on_unknown_database() {
+        let yaml = r#"
+servers:
+  - name: prod
+    kind: postgres
+    host: a
+    databases:
+      - { name: app, role: ro, password: x }
+permissions:
+  - group: g
+    grants:
+      - { server: "*", database: ghost, action: query_read }
+"#;
+        assert!(matches!(
+            ConfigFile::from_yaml_str(yaml),
+            Err(ConfigFileError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_wildcard_server_grant_on_known_database() {
+        let yaml = r#"
+servers:
+  - name: prod
+    kind: postgres
+    host: a
+    databases:
+      - { name: app, role: ro, password: x }
+  - name: staging
+    kind: postgres
+    host: b
+    databases:
+      - { name: app, role: ro, password: y }
+permissions:
+  - group: g
+    grants:
+      - { server: "*", database: app, action: query_read }
+"#;
+        ConfigFile::from_yaml_str(yaml).expect("wildcard server + existing db is valid");
     }
 
     #[test]

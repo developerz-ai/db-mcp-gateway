@@ -110,3 +110,50 @@ async fn shutdown_signal() {
 
     tracing::info!("shutdown signal received");
 }
+
+#[cfg(test)]
+mod cli_tests {
+    use super::Cli;
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    /// `--config` is required user-facing behavior. Cover the full contract in
+    /// one test so we don't race on the shared `DB_MCP_GATEWAY_CONFIG` env var
+    /// (clap reads it from the process env at parse time).
+    #[test]
+    fn cli_parses_required_config_with_env_fallback() {
+        const ENV: &str = "DB_MCP_GATEWAY_CONFIG";
+
+        // Baseline: nothing set, no flag → parse fails (required arg).
+        // SAFETY: this test is the sole touch-point for $ENV in the bin
+        // test binary; no other test reads or writes it.
+        unsafe {
+            std::env::remove_var(ENV);
+        }
+        assert!(
+            Cli::try_parse_from(["db-mcp-gateway"]).is_err(),
+            "missing --config and env var must fail parse"
+        );
+
+        // Flag-only path: PathBuf comes from argv.
+        let cli = Cli::try_parse_from(["db-mcp-gateway", "--config", "/tmp/flag.yaml"])
+            .expect("flag-only parse succeeds");
+        assert_eq!(cli.config, PathBuf::from("/tmp/flag.yaml"));
+
+        // Env fallback: no flag, but $ENV set → that value wins.
+        unsafe {
+            std::env::set_var(ENV, "/tmp/from-env.yaml");
+        }
+        let cli = Cli::try_parse_from(["db-mcp-gateway"]).expect("env fallback parse succeeds");
+        assert_eq!(cli.config, PathBuf::from("/tmp/from-env.yaml"));
+
+        // Precedence: explicit flag beats env.
+        let cli = Cli::try_parse_from(["db-mcp-gateway", "--config", "/tmp/flag-wins.yaml"])
+            .expect("flag+env parse succeeds");
+        assert_eq!(cli.config, PathBuf::from("/tmp/flag-wins.yaml"));
+
+        unsafe {
+            std::env::remove_var(ENV);
+        }
+    }
+}

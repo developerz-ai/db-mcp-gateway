@@ -12,12 +12,15 @@ pub mod list_servers;
 
 use serde::Deserialize;
 use serde_json::Value;
+use tracing::info_span;
 
 use crate::auth::Identity;
 use crate::config::ConfigFile;
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
-pub const LIST_SERVERS: &str = "list_servers";
+// Re-export the canonical name so dispatch and the advertised capability can
+// never drift apart.
+pub use crate::transport::protocol::LIST_SERVERS_TOOL as LIST_SERVERS;
 
 #[derive(Debug, Deserialize)]
 struct CallParams {
@@ -30,6 +33,11 @@ struct CallParams {
 /// authenticated caller (the bearer-auth middleware guarantees presence on
 /// `/mcp` POST; the `Option` lets the caller surface "anonymous" as a defined
 /// internal-error rather than panicking).
+///
+/// Per CLAUDE.md, every tool dispatch is a tracing span with `request_id`,
+/// `user`, `server`, `database`. For `list_servers` no specific server or
+/// database applies, so those fields render empty; later per-DB tools fill
+/// them from the call arguments.
 pub fn dispatch_call(
     id: Value,
     identity: Option<&Identity>,
@@ -46,6 +54,16 @@ pub fn dispatch_call(
             return Response::error(id, ErrorObject::invalid_params("missing or invalid `name`"));
         }
     };
+
+    let span = info_span!(
+        "tool_dispatch",
+        request_id = %id,
+        user = %identity.user_sub,
+        tool = %call.name,
+        server = "",
+        database = "",
+    );
+    let _enter = span.enter();
 
     match call.name.as_str() {
         LIST_SERVERS => list_servers::run(id, identity, config, call.arguments),

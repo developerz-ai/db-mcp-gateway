@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::auth::Identity;
 use crate::authz;
 use crate::config::{ConfigFile, ServerKind};
-use crate::transport::jsonrpc::Response;
+use crate::transport::jsonrpc::{ErrorObject, Response};
 use crate::transport::protocol::CallToolResult;
 
 /// Credential-free server view returned over the wire.
@@ -41,8 +41,18 @@ pub fn run(
         .collect();
 
     // MCP tool results carry JSON-as-text inside the `content` array.
-    let payload = serde_json::to_string(&ListServersResult { servers })
-        .expect("ListServersResult contains only safe types — serialization is infallible");
+    // Serialization of our safe-view types is infallible in practice, but
+    // `expect` on the request path is banned (CLAUDE.md): degrade to an
+    // internal error rather than panic the worker.
+    let payload = match serde_json::to_string(&ListServersResult { servers }) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return Response::error(
+                id,
+                ErrorObject::internal(format!("list_servers serialization failed: {error}")),
+            );
+        }
+    };
     Response::result(id, &CallToolResult::text(payload))
 }
 

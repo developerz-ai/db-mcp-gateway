@@ -14,7 +14,12 @@ use serde::Deserialize;
 /// A secret reference as written in YAML. The variant tells us where the real
 /// value lives; we resolve lazily (and never log either the reference or the
 /// resolved value).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-rolled to redact `Literal` plaintext — a derived `Debug`
+/// would print the password verbatim, violating the no-creds-in-logs rule.
+/// `EnvVar` and `SecretBackend` carry only references (env var names, vault
+/// paths) which are safe to print and useful for diagnostics.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Password {
     /// Literal value inline in the YAML. Rejected in `env: production` by
     /// `Config::validate` (lands with issue #16's full validator).
@@ -24,6 +29,20 @@ pub enum Password {
     /// `vault:secret/path`, `aws-sm:arn:...`, `gcp-sm:projects/...` — resolved
     /// via the named backend.
     SecretBackend { scheme: String, reference: String },
+}
+
+impl std::fmt::Debug for Password {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Password::Literal(_) => f.write_str("Literal(<redacted>)"),
+            Password::EnvVar(name) => f.debug_tuple("EnvVar").field(name).finish(),
+            Password::SecretBackend { scheme, reference } => f
+                .debug_struct("SecretBackend")
+                .field("scheme", scheme)
+                .field("reference", reference)
+                .finish(),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for Password {
@@ -91,5 +110,33 @@ mod tests {
             Password::from_raw("not-a-scheme:hunter2"),
             Password::Literal("not-a-scheme:hunter2".into())
         );
+    }
+
+    /// Defends the non-negotiable "no creds in logs/errors/responses":
+    /// `format!("{:?}", literal)` must never print the plaintext.
+    #[test]
+    fn debug_redacts_literal_plaintext() {
+        let literal = Password::Literal("hunter2".to_string());
+        let rendered = format!("{literal:?}");
+        assert!(
+            !rendered.contains("hunter2"),
+            "literal leaked via Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("redacted"),
+            "no redaction marker: {rendered}"
+        );
+
+        // References (env names, vault paths) stay readable — useful in logs,
+        // and not themselves secret.
+        let env = Password::EnvVar("STATE_DB_PW".to_string());
+        assert!(format!("{env:?}").contains("STATE_DB_PW"));
+        let backend = Password::SecretBackend {
+            scheme: "vault".into(),
+            reference: "secret/prod/app_ro".into(),
+        };
+        let rendered = format!("{backend:?}");
+        assert!(rendered.contains("vault"));
+        assert!(rendered.contains("secret/prod/app_ro"));
     }
 }
