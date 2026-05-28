@@ -1,6 +1,6 @@
 //! db-mcp-gateway — entry point: logging, config, signals, graceful shutdown.
 
-use db_mcp_gateway::{config::Config, transport};
+use db_mcp_gateway::{config::Config, state, transport};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -11,6 +11,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
+
+    let _state_db = state::connect(&config.state_db.url, config.state_db.pool_size).await?;
+    tracing::info!(
+        pool_size = config.state_db.pool_size,
+        "state DB connected, migrations applied"
+    );
+
     let app = transport::router(&config);
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;

@@ -12,6 +12,7 @@ async fn spawn_gateway() -> String {
     let config = Config {
         bind: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
         mcp_path: "/mcp".to_string(),
+        ..Config::default()
     };
     let app = transport::router(&config);
     let listener = tokio::net::TcpListener::bind(config.bind).await.unwrap();

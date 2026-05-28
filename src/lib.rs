@@ -2,4 +2,5 @@
 //! everything testable lives here so integration tests can drive it directly.
 
 pub mod config;
+pub mod state;
 pub mod transport;
