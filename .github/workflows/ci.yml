@@ -65,4 +65,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-audit
         run: cargo install --locked cargo-audit
-      - run: cargo audit
+      # RUSTSEC-2023-0071 (rsa via sqlx-mysql) is unreachable: we only enable
+      # the postgres backend, sqlx-mysql is pulled in transitively but never
+      # executed. See audit.toml for the long-form justification.
+      - run: cargo audit --ignore RUSTSEC-2023-0071

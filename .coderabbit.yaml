@@ -1,0 +1,242 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+# db-mcp-gateway — CodeRabbit configuration
+#
+# Self-hosted MCP gateway giving AI agents audited, SSO-gated, read-only DB access.
+# Authority: CLAUDE.md (Non-negotiables) > docs/initial-idea/** (spec).
+
+language: en-US
+early_access: false
+enable_free_tier: true
+
+tone_instructions: |
+  db-mcp-gateway: Rust, axum, sqlx, tokio. Spec: docs/initial-idea/**.
+  CLAUDE.md "Non-negotiables" are absolute. Reject anything that:
+  weakens auth/authz, leaks credentials into logs/errors/responses,
+  skips or weakens audit, mocks the target DB in query-path tests, or
+  introduces an admin UI for permissions. Cite the rule. Prefer concrete
+  diffs. Skip nits. Behaviour change → spec update in same PR.
+
+reviews:
+  profile: assertive
+  request_changes_workflow: true
+  high_level_summary: true
+  high_level_summary_placeholder: "@coderabbitai summary"
+  auto_title_placeholder: "@coderabbitai"
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  sequence_diagrams: true
+  estimate_code_review_effort: true
+  suggested_reviewers: true
+  auto_assign_reviewers: false
+  abort_on_close: true
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    ignore_title_keywords:
+      - "WIP"
+      - "DRAFT"
+      - "DO NOT REVIEW"
+    drafts: false
+    base_branches:
+      - main
+
+  tools:
+    shellcheck: { enabled: true }
+    markdownlint: { enabled: true }
+    yamllint: { enabled: true }
+    actionlint: { enabled: true }
+    hadolint: { enabled: true }
+    gitleaks: { enabled: true }
+    github-checks: { enabled: true, timeout_ms: 900000 }
+    ruff: { enabled: false }
+    biome: { enabled: false }
+    eslint: { enabled: false }
+    rubocop: { enabled: false }
+
+  path_instructions:
+    - path: "**/*"
+      instructions: |
+        Review only changed files and code directly affected by the change.
+        Ignore unrelated files. Behaviour changes must update docs/initial-idea/**
+        in the same PR. Flag missing tests for new public behaviour.
+
+    # Rust source — global conventions from CLAUDE.md
+    - path: "src/**/*.rs"
+      instructions: |
+        Enforce CLAUDE.md "Conventions":
+        - No `unwrap`/`expect` outside `main.rs` and `#[cfg(test)]`. Panic in
+          the hot path crashes every user.
+        - Errors typed with `thiserror`. `anyhow` only at the `main.rs` boundary.
+        - Every client-visible error has a stable code (see docs/initial-idea/03-mcp-tools.md).
+        - `tracing` spans, never `println!`. Every tool dispatch span carries
+          `request_id`, `user`, `server`, `database`.
+        - Async end-to-end. No `std::sync::Mutex` on the request path — use
+          `tokio::sync`. No `block_on`.
+        - Cancellation safety: agent disconnect must cancel the in-flight query
+          via `pg_cancel_backend` and write an audit row with `outcome: cancelled`.
+        - No backwards-compat shims pre-v1.
+        - Files ≤300 LOC. Split by responsibility.
+        - Comments document non-obvious *why* only — never restate code.
+        - clippy clean (`cargo clippy --all-targets --all-features -- -D warnings`)
+          and rustfmt clean.
+
+    # Auth — security review required
+    - path: "src/auth/**"
+      instructions: |
+        SECURITY REVIEW REQUIRED. Spec: docs/initial-idea/04-auth-sso.md.
+        Verify: OIDC discovery, JWT signature + iss + aud + exp + nbf checks,
+        JWKS caching with rotation, session cache TTL, no token material logged.
+        Flag any path that promotes one user's session to another.
+
+    # Authz — security review required, pure logic
+    - path: "src/authz/**"
+      instructions: |
+        SECURITY REVIEW REQUIRED. Spec: docs/initial-idea/06-permissions.md.
+        Constraint merge: most restrictive value always wins. Property tests
+        with `proptest` are mandatory for the merge function. Read-only is the
+        default; write requires explicit per-grant opt-in AND a target-DB role
+        that already has write privileges. The gateway never provisions write
+        grants. Flag any authz bypass via constraint-merge edges.
+
+    # Tools — every new tool requires security review
+    - path: "src/tools/**"
+      instructions: |
+        SECURITY REVIEW REQUIRED for new tools. Spec: docs/initial-idea/03-mcp-tools.md.
+        Stable error codes. Tool dispatch span with request_id, user, server,
+        database. No business logic in the dispatch arm — delegate to a layer.
+
+    # Exec — query timeouts, row caps, cancellation, pools
+    - path: "src/exec/**"
+      instructions: |
+        SECURITY REVIEW REQUIRED. Statement timeout enforced server-side
+        (`SET LOCAL statement_timeout`), not just client-side. Row cap
+        enforced; never return more rows than configured.
+        Per-DB pools sized in config. Never one global pool. Never share
+        a pool across `(server, database)`.
+        Agent disconnect → tokio task drop → `pg_cancel_backend` → audit row
+        with `outcome: cancelled`. It is easy to write code that holds the
+        connection until the query finishes anyway — verify cancellation.
+        Connection strings, passwords, role secrets MUST NOT appear in any
+        response, error message, log line, or trace span attribute.
+
+    # Audit — append-only, synchronous, blocks the response
+    - path: "src/audit/**"
+      instructions: |
+        SECURITY REVIEW REQUIRED. Audit is synchronous: the audit row commits
+        BEFORE the success response goes out. Audit write fails → request fails.
+        No best-effort audit. Append-only. Spec: docs/initial-idea/07-logging-retention.md.
+        Two-phase commit semantics with the state DB. Flag any code path that
+        completes a tool call without an audit row, including the forbidden,
+        cancelled, and error outcomes.
+
+    # Config — YAML, validated at boot, secrets resolution
+    - path: "src/config/**"
+      instructions: |
+        Spec: docs/initial-idea/08-config.md. YAML parsed with serde, validated
+        at boot — config errors fail at startup, never at query time. Secrets
+        resolved from env/file refs, never logged. Hot reload on SIGHUP.
+
+    # State DB — sessions, audit log, denylist
+    - path: "src/state/**"
+      instructions: |
+        Co-deployed Postgres. Migrations idempotent, reversible.
+        Audit table append-only; no UPDATE/DELETE outside the retention pruner.
+
+    # Transport — MCP framing
+    - path: "src/transport/**"
+      instructions: |
+        MCP over Streamable HTTP. JSON-RPC 2.0 framing. Notifications never
+        get a response; requests always do (including error responses).
+        Spec: docs/initial-idea/02-architecture.md.
+
+    # Errors module
+    - path: "src/errors.rs"
+      instructions: |
+        Every variant must have a stable wire code documented in
+        docs/initial-idea/03-mcp-tools.md. Never embed credentials, raw
+        connection strings, or backend error strings that may leak them.
+
+    # Integration tests — real Postgres, audit assertion
+    - path: "tests/**/*.rs"
+      instructions: |
+        Integration tests boot the gateway against a real Postgres (CI service
+        container). NEVER mock the target DB in query-path tests.
+        Every test that hits a tool dispatch path MUST assert the audit row
+        exists. Tool failed authz → audit row with `outcome: forbidden`.
+        Tests for layers that exist in isolation (transport, config, etc.) may
+        skip the audit assertion when the layer has no audit integration yet
+        — call it out in a comment.
+
+    # Spec
+    - path: "docs/initial-idea/**"
+      instructions: |
+        Canonical spec. Behaviour changes to the gateway must land in the same
+        PR as the code. Architecture decisions live here, not in code comments.
+
+    # Operator + developer docs
+    - path: "docs/deployment/**"
+      instructions: |
+        Operator-facing. Verify any env var, port, or volume mount matches
+        what the binary actually reads.
+    - path: "docs/usage/**"
+      instructions: |
+        Developer-facing. Treat additions as public-API changes.
+
+    # CI workflows
+    - path: ".github/workflows/**"
+      instructions: |
+        Runner: `blacksmith-2vcpu-ubuntu-2404`. Pin actions to major versions.
+        `concurrency:` set on every workflow that builds or deploys.
+        Required jobs: fmt, clippy (`-D warnings`), test (with Postgres
+        service container), audit.
+
+    # Helm / k8s / Dockerfile
+    - path: "Dockerfile"
+      instructions: |
+        Multi-stage build. Distroless or chiseled base. Non-root user.
+        Healthcheck on the MCP endpoint. No build secrets baked in.
+
+    - path: "**/*.md"
+      instructions: |
+        claude-code-bible Ch.11 style: lead with the rule, tables over prose,
+        no filler, file paths over descriptions. Valid links, heading
+        hierarchy, accurate code examples.
+
+  path_filters:
+    - "!target/**"
+    - "!**/target/**"
+    - "!**/*.lock"
+    - "!Cargo.lock"
+    - "!**/*.log"
+    - "!.env*"
+    - "!**/.DS_Store"
+    - "!docs/_attic/**"
+
+chat:
+  auto_reply: true
+  art: false
+
+knowledge_base:
+  opt_out: false
+
+  web_search:
+    enabled: true
+
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "**/CLAUDE.md"
+      - "**/CODING_STANDARDS.md"
+      - "docs/initial-idea/**"
+
+  learnings:
+    scope: auto
+
+  issues:
+    scope: auto
+
+  pull_requests:
+    scope: auto

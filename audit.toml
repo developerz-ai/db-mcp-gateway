@@ -1,0 +1,14 @@
+# cargo-audit configuration.
+#
+# Ignored advisories must be justified here. Re-evaluate at every dependency bump.
+
+[advisories]
+ignore = [
+    # rsa 0.9 Marvin Attack timing side-channel.
+    # Pulled in transitively by sqlx-mysql via sqlx's default feature set, even
+    # though we only enable the postgres backend (see Cargo.toml). The mysql
+    # backend code never executes at runtime, so the vulnerable rsa code is
+    # unreachable. Re-check when sqlx exposes per-backend feature gates or
+    # rsa releases a fix.
+    "RUSTSEC-2023-0071",
+]
