@@ -4,11 +4,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use db_mcp_gateway::audit;
 use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
 use db_mcp_gateway::config::ConfigFile;
 use db_mcp_gateway::exec::PoolRegistry;
 use db_mcp_gateway::transport::{AppState, AuthFacade, PendingFlows};
 use db_mcp_gateway::{config::Config, state, transport};
+use sqlx::PgPool;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -57,8 +59,14 @@ async fn main() -> anyhow::Result<()> {
         }),
         config: Arc::new(config_file),
         pool_registry: PoolRegistry::new(),
-        state_db: Some(state_db),
+        state_db: Some(state_db.clone()),
     };
+
+    // Spawn the audit retention pruner. Ticks hourly, deletes rows older
+    // than `audit_retention_days`. The tokio runtime drops the task on
+    // graceful shutdown — DELETE is the only DB call, so cancelling
+    // mid-flight just rolls back; no half-state.
+    spawn_audit_pruner(state_db, config.audit_retention_days);
 
     let app = transport::router(&config, app_state);
 
@@ -71,11 +79,36 @@ async fn main() -> anyhow::Result<()> {
         "db-mcp-gateway listening"
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     Ok(())
+}
+
+/// Background task: tick hourly and prune any audit row older than the
+/// configured TTL. The task is detached — `tokio::time::interval` survives
+/// missed ticks (DelayBehavior) and the runtime cancels it on graceful
+/// shutdown, which is safe because the only DB write is a single DELETE.
+fn spawn_audit_pruner(pool: PgPool, ttl_days: u32) {
+    use std::time::Duration;
+    use tokio::time::{MissedTickBehavior, interval};
+
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(3600));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match audit::pruner::run_once(&pool, ttl_days).await {
+                Ok(0) => tracing::debug!("audit pruner: no expired rows"),
+                Ok(n) => tracing::info!(rows = n, ttl_days, "pruned old audit rows"),
+                Err(err) => tracing::error!(%err, "audit pruner run failed"),
+            }
+        }
+    });
 }
 
 /// Resolve when the process receives Ctrl-C or (on Unix) SIGTERM, so containers

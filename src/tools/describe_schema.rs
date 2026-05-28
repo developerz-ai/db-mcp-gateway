@@ -8,6 +8,8 @@
 //! PK/FK/indexes (mentioned in spec doc 03 §describe_schema) are deferred to
 //! a follow-up.
 
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -18,7 +20,9 @@ use crate::config::{Action, ConfigFile, Database, Server};
 use crate::exec::{self, ExecError, PoolRegistry};
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
-use super::audit_dispatch::{AuditHeader, Outcome, audit_dispatch, tool_error, tool_success};
+use super::audit_dispatch::{
+    AuditHeader, Outcome, RequestContext, audit_dispatch, error_outcome, success_outcome,
+};
 
 const TOOL_NAME: &str = "describe_schema";
 const DEFAULT_SCHEMA: &str = "public";
@@ -63,6 +67,7 @@ pub async fn run(
     config: &ConfigFile,
     registry: &PoolRegistry,
     state_db: Option<&PgPool>,
+    request_ctx: &RequestContext,
     arguments: Option<Value>,
 ) -> Response {
     let args: Arguments = match arguments.map(serde_json::from_value::<Arguments>) {
@@ -80,9 +85,10 @@ pub async fn run(
         server: Some(&args.server),
         database: Some(&args.database),
         sql: None,
+        reason: None,
     };
     let work = compute_outcome(id.clone(), identity, config, registry, &args);
-    audit_dispatch(id, identity, state_db, header, work).await
+    audit_dispatch(id, identity, state_db, request_ctx, header, work).await
 }
 
 async fn compute_outcome(
@@ -111,9 +117,12 @@ async fn compute_outcome(
     let schema = args.schema.as_deref().unwrap_or(DEFAULT_SCHEMA);
     let (sql, binds) = build_catalog_query(schema, args.table.as_deref());
 
+    // Wall clock starts before pool open so error paths still carry
+    // `duration_ms` into the audit row — spec 07 requires it on every call.
+    let started = Instant::now();
     let pool = match registry.get_or_open(server, database).await {
         Ok(p) => p,
-        Err(err) => return outcome_from_exec_error(id, err),
+        Err(err) => return outcome_from_exec_error(id, err, started),
     };
 
     let result = exec::run_query_with_string_binds(
@@ -131,43 +140,36 @@ async fn compute_outcome(
             let payload = match assemble_tables(&exec_result) {
                 Ok(p) => p,
                 Err(_) => {
-                    return Outcome {
-                        response: tool_error(
-                            id,
-                            "internal",
-                            "catalog response shape changed unexpectedly",
-                        ),
-                        code: "internal",
-                        elapsed_ms: Some(elapsed),
-                    };
+                    return error_outcome(
+                        id,
+                        "internal",
+                        "catalog response shape changed unexpectedly",
+                    );
                 }
             };
+            let table_count = i64::try_from(payload.tables.len()).unwrap_or(i64::MAX);
             let text = match serde_json::to_string(&payload) {
                 Ok(t) => t,
-                Err(_) => {
-                    return Outcome {
-                        response: tool_error(id, "internal", "failed to serialize result"),
-                        code: "internal",
-                        elapsed_ms: Some(elapsed),
-                    };
-                }
+                Err(_) => return error_outcome(id, "internal", "failed to serialize result"),
             };
-            Outcome {
-                response: tool_success(id, text),
-                code: "success",
-                elapsed_ms: Some(elapsed),
-            }
+            // row_count = number of tables surfaced. The catalog scan IS
+            // capped (`MAX_CATALOG_ROWS`), so persist the real truncation
+            // flag from exec — otherwise operators can't tell a clipped
+            // schema from a complete one.
+            success_outcome(
+                id,
+                text,
+                Some(elapsed),
+                Some(table_count),
+                Some(exec_result.truncated),
+            )
         }
-        Err(err) => outcome_from_exec_error(id, err),
+        Err(err) => outcome_from_exec_error(id, err, started),
     }
 }
 
 fn forbidden(id: Value) -> Outcome {
-    Outcome {
-        response: tool_error(id, "forbidden", "no grants for this server/database"),
-        code: "forbidden",
-        elapsed_ms: None,
-    }
+    error_outcome(id, "forbidden", "no grants for this server/database")
 }
 
 fn find_server_db<'a>(
@@ -233,7 +235,7 @@ fn assemble_tables(result: &exec::ExecResult) -> Result<DescribeSchemaResult, ()
     Ok(DescribeSchemaResult { tables })
 }
 
-fn outcome_from_exec_error(id: Value, err: ExecError) -> Outcome {
+fn outcome_from_exec_error(id: Value, err: ExecError, started: Instant) -> Outcome {
     let (code, message) = match err {
         ExecError::Timeout => ("timeout", "catalog query exceeded statement_timeout"),
         ExecError::Connection | ExecError::Unavailable => {
@@ -242,11 +244,9 @@ fn outcome_from_exec_error(id: Value, err: ExecError) -> Outcome {
         ExecError::Sql => ("syntax_error", "catalog query was rejected"),
         ExecError::PasswordUnresolved { .. } => ("internal", "server-side configuration error"),
     };
-    Outcome {
-        response: tool_error(id, code, message),
-        code,
-        elapsed_ms: None,
-    }
+    let mut outcome = error_outcome(id, code, message);
+    outcome.elapsed_ms = Some(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
+    outcome
 }
 
 #[cfg(test)]

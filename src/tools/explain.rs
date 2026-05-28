@@ -7,6 +7,8 @@
 //! doesn't execute (we stay conservative; an operator could enable ANALYZE
 //! later thinking EXPLAIN is always safe).
 
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -18,7 +20,9 @@ use crate::exec::sql_guard;
 use crate::exec::{self, ExecError, PoolRegistry};
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
-use super::audit_dispatch::{AuditHeader, Outcome, audit_dispatch, tool_error, tool_success};
+use super::audit_dispatch::{
+    AuditHeader, Outcome, RequestContext, audit_dispatch, error_outcome, success_outcome,
+};
 
 const TOOL_NAME: &str = "explain";
 /// EXPLAIN always returns a tiny result (one row, one column containing the
@@ -46,6 +50,7 @@ pub async fn run(
     config: &ConfigFile,
     registry: &PoolRegistry,
     state_db: Option<&PgPool>,
+    request_ctx: &RequestContext,
     arguments: Option<Value>,
 ) -> Response {
     let args: Arguments = match arguments.map(serde_json::from_value::<Arguments>) {
@@ -67,9 +72,10 @@ pub async fn run(
         // Audit the *user's* SQL, not the EXPLAIN-wrapped one — operators
         // see what the agent asked for.
         sql: Some(&args.sql),
+        reason: None,
     };
     let work = compute_outcome(id.clone(), identity, config, registry, &args);
-    audit_dispatch(id, identity, state_db, header, work).await
+    audit_dispatch(id, identity, state_db, request_ctx, header, work).await
 }
 
 async fn compute_outcome(
@@ -96,15 +102,11 @@ async fn compute_outcome(
     };
 
     if let Err(err) = sql_guard::is_read_only(&args.sql) {
-        return Outcome {
-            response: tool_error(
-                id,
-                "forbidden_sql",
-                &format!("SQL rejected by gateway: {err}"),
-            ),
-            code: "forbidden_sql",
-            elapsed_ms: None,
-        };
+        return error_outcome(
+            id,
+            "forbidden_sql",
+            &format!("SQL rejected by gateway: {err}"),
+        );
     }
 
     // Wrap *after* the guard accepts — the inner SQL is now known read-only.
@@ -113,9 +115,12 @@ async fn compute_outcome(
     let sql = format!("EXPLAIN (FORMAT JSON) {}", args.sql);
     let timeout_ms = constraints.statement_timeout_ms;
 
+    // Wall clock starts before pool open so error paths still carry
+    // `duration_ms` into the audit row — spec 07 requires it on every call.
+    let started = Instant::now();
     let pool = match registry.get_or_open(server, database).await {
         Ok(p) => p,
-        Err(err) => return outcome_from_exec_error(id, err),
+        Err(err) => return outcome_from_exec_error(id, err, started),
     };
 
     match exec::run_query(&pool, &sql, timeout_ms, EXPLAIN_RESULT_CAP).await {
@@ -123,19 +128,15 @@ async fn compute_outcome(
             let elapsed = i64::try_from(result.elapsed_ms).unwrap_or(i64::MAX);
 
             // Pull the plan out of result.rows[0][0]. Postgres returns it as
-            // a JSON-formatted text value; parse it back into a `Value`.
+            // a JSON-formatted text value or already-parsed JSON.
             let plan = match extract_plan(&result) {
                 Ok(p) => p,
                 Err(()) => {
-                    return Outcome {
-                        response: tool_error(
-                            id,
-                            "internal",
-                            "EXPLAIN returned an unexpected row shape",
-                        ),
-                        code: "internal",
-                        elapsed_ms: Some(elapsed),
-                    };
+                    return error_outcome(
+                        id,
+                        "internal",
+                        "EXPLAIN returned an unexpected row shape",
+                    );
                 }
             };
 
@@ -145,21 +146,12 @@ async fn compute_outcome(
             };
             let text = match serde_json::to_string(&payload) {
                 Ok(t) => t,
-                Err(_) => {
-                    return Outcome {
-                        response: tool_error(id, "internal", "failed to serialize result"),
-                        code: "internal",
-                        elapsed_ms: Some(elapsed),
-                    };
-                }
+                Err(_) => return error_outcome(id, "internal", "failed to serialize result"),
             };
-            Outcome {
-                response: tool_success(id, text),
-                code: "success",
-                elapsed_ms: Some(elapsed),
-            }
+            // EXPLAIN always returns one row (the plan); never truncated.
+            success_outcome(id, text, Some(elapsed), Some(1), Some(false))
         }
-        Err(err) => outcome_from_exec_error(id, err),
+        Err(err) => outcome_from_exec_error(id, err, started),
     }
 }
 
@@ -179,11 +171,7 @@ fn extract_plan(result: &exec::ExecResult) -> Result<Value, ()> {
 }
 
 fn forbidden(id: Value) -> Outcome {
-    Outcome {
-        response: tool_error(id, "forbidden", "no grants for this server/database"),
-        code: "forbidden",
-        elapsed_ms: None,
-    }
+    error_outcome(id, "forbidden", "no grants for this server/database")
 }
 
 fn find_server_db<'a>(
@@ -196,7 +184,7 @@ fn find_server_db<'a>(
     Some((server, database))
 }
 
-fn outcome_from_exec_error(id: Value, err: ExecError) -> Outcome {
+fn outcome_from_exec_error(id: Value, err: ExecError, started: Instant) -> Outcome {
     let (code, message) = match err {
         ExecError::Timeout => (
             "timeout",
@@ -208,11 +196,9 @@ fn outcome_from_exec_error(id: Value, err: ExecError) -> Outcome {
         ExecError::Sql => ("syntax_error", "the target DB rejected the SQL"),
         ExecError::PasswordUnresolved { .. } => ("internal", "server-side configuration error"),
     };
-    Outcome {
-        response: tool_error(id, code, message),
-        code,
-        elapsed_ms: None,
-    }
+    let mut outcome = error_outcome(id, code, message);
+    outcome.elapsed_ms = Some(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
+    outcome
 }
 
 #[cfg(test)]

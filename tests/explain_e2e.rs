@@ -99,7 +99,11 @@ async fn boot_gateway() -> BootedGateway {
         },
     );
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
     });
 
     let client = reqwest::Client::builder()

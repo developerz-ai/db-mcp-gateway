@@ -4,15 +4,25 @@
 //! port, role, password, or database listing. The output goes through a
 //! `Serialize`-able view type that doesn't even have a `password` field —
 //! leaking credentials is structurally impossible, not "remembered to strip".
+//!
+//! Audits every dispatch through `audit_dispatch` (spec 07: "every tool call
+//! writes one row"). The audit row has `server`/`database`/`sql` all `None`
+//! because `list_servers` doesn't address a target.
 
 use serde::Serialize;
 use serde_json::Value;
+use sqlx::PgPool;
 
 use crate::auth::Identity;
 use crate::authz;
 use crate::config::{ConfigFile, ServerKind};
-use crate::transport::jsonrpc::{ErrorObject, Response};
-use crate::transport::protocol::CallToolResult;
+use crate::transport::jsonrpc::Response;
+
+use super::audit_dispatch::{
+    AuditHeader, Outcome, RequestContext, audit_dispatch, error_outcome, success_outcome,
+};
+
+const TOOL_NAME: &str = "list_servers";
 
 /// Credential-free server view returned over the wire.
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -27,35 +37,46 @@ struct ListServersResult {
     servers: Vec<SafeServerView>,
 }
 
-pub fn run(
+pub async fn run(
     id: Value,
     identity: &Identity,
     config: &ConfigFile,
+    state_db: Option<&PgPool>,
+    request_ctx: &RequestContext,
     _arguments: Option<Value>,
 ) -> Response {
+    let header = AuditHeader {
+        tool: TOOL_NAME,
+        server: None,
+        database: None,
+        sql: None,
+        reason: None,
+    };
+    let work_id = id.clone();
+    let work = async move { compute_outcome(work_id, identity, config) };
+    audit_dispatch(id, identity, state_db, request_ctx, header, work).await
+}
+
+fn compute_outcome(id: Value, identity: &Identity, config: &ConfigFile) -> Outcome {
     let servers: Vec<SafeServerView> = config
         .servers
         .iter()
         .filter(|s| authz::can_see_server(identity, s, &config.permissions))
         .map(SafeServerView::from)
         .collect();
+    let row_count = i64::try_from(servers.len()).unwrap_or(i64::MAX);
 
-    // MCP tool results carry JSON-as-text inside the `content` array.
-    // Serialization of our safe-view types is infallible in practice, but
-    // `expect` on the request path is banned (CLAUDE.md): degrade to an
-    // internal error rather than panic the worker. The client-facing message
-    // is a fixed code; serializer internals stay in the server log.
     let payload = match serde_json::to_string(&ListServersResult { servers }) {
-        Ok(payload) => payload,
-        Err(error) => {
-            tracing::error!(%error, "list_servers serialization failed");
-            return Response::error(
-                id,
-                ErrorObject::internal("tool.list_servers.serialization_failed"),
-            );
+        Ok(t) => t,
+        Err(_) => {
+            // Serialization of our safe-view types is infallible in practice,
+            // but `expect` on the request path is banned (CLAUDE.md): degrade
+            // to a typed internal error instead of panicking.
+            return error_outcome(id, "internal", "tool.list_servers.serialization_failed");
         }
     };
-    Response::result(id, &CallToolResult::text(payload))
+
+    success_outcome(id, payload, None, Some(row_count), Some(false))
 }
 
 impl From<&crate::config::Server> for SafeServerView {
@@ -126,9 +147,12 @@ permissions:
         ConfigFile::from_yaml_str(YAML).expect("yaml parses")
     }
 
-    fn run_for(groups: &[&str]) -> String {
-        let response = run(Value::from(1), &identity(groups), &load(), None);
-        let json = serde_json::to_value(&response).unwrap();
+    /// Drives the sync `compute_outcome` directly. Unit-testing the filter +
+    /// shape logic doesn't need the audit chokepoint (covered by integration
+    /// tests against a real state DB).
+    fn body_for(groups: &[&str]) -> String {
+        let outcome = compute_outcome(Value::from(1), &identity(groups), &load());
+        let json = serde_json::to_value(&outcome.response).unwrap();
         json["result"]["content"][0]["text"]
             .as_str()
             .expect("content[0].text is the JSON-stringified payload")
@@ -137,7 +161,7 @@ permissions:
 
     #[test]
     fn engineer_sees_prod_and_staging_but_not_analytics() {
-        let body = run_for(&["backend-engineers"]);
+        let body = body_for(&["backend-engineers"]);
         assert!(body.contains("\"name\":\"prod\""), "{body}");
         assert!(body.contains("\"name\":\"staging\""), "{body}");
         assert!(!body.contains("\"name\":\"analytics\""), "{body}");
@@ -145,7 +169,7 @@ permissions:
 
     #[test]
     fn analyst_only_sees_analytics() {
-        let body = run_for(&["analytics-team"]);
+        let body = body_for(&["analytics-team"]);
         assert!(body.contains("\"name\":\"analytics\""), "{body}");
         assert!(!body.contains("\"name\":\"prod\""), "{body}");
         assert!(!body.contains("\"name\":\"staging\""), "{body}");
@@ -153,8 +177,18 @@ permissions:
 
     #[test]
     fn user_in_no_group_sees_nothing() {
-        let body = run_for(&[]);
+        let body = body_for(&[]);
         assert!(body.contains("\"servers\":[]"), "{body}");
+    }
+
+    /// row_count in Outcome equals the visible server count — operators
+    /// reading audit_calls.row_count get the same answer.
+    #[test]
+    fn row_count_matches_visible_servers() {
+        let outcome = compute_outcome(Value::from(1), &identity(&["backend-engineers"]), &load());
+        assert_eq!(outcome.code, "success");
+        assert_eq!(outcome.row_count, Some(2));
+        assert_eq!(outcome.truncated, Some(false));
     }
 
     /// The hard one: no inline password value (literal, env-ref, or vault-ref)
@@ -167,7 +201,7 @@ permissions:
             vec!["analytics-team"],
             vec!["backend-engineers", "analytics-team"],
         ] {
-            let body = run_for(&groups);
+            let body = body_for(&groups);
             assert!(!body.contains("hunter2"), "leaked literal password: {body}");
             assert!(
                 !body.contains("stagingpw"),

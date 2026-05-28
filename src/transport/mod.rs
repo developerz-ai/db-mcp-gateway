@@ -14,8 +14,12 @@ mod auth_routes;
 mod dispatch;
 mod sse;
 
-use axum::extract::State;
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
+use axum::http::header::USER_AGENT;
+use axum::http::{HeaderMap, header};
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -66,6 +70,8 @@ fn normalize_path(path: &str) -> String {
 async fn post_handler(
     State(state): State<AppState>,
     identity: Option<Extension<Identity>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     body: String,
 ) -> axum::response::Response {
     let request = match serde_json::from_str::<jsonrpc::Request>(&body) {
@@ -93,17 +99,27 @@ async fn post_handler(
         .unwrap_or("anonymous");
     tracing::debug!(method = %request.method, %user, "mcp request");
 
-    // `tools/call` needs identity + loaded config + pool registry; everything
-    // else is pure.
+    // `tools/call` needs identity + loaded config + pool registry + the
+    // request context (IP / agent client) that the audit row records;
+    // everything else is pure.
     if request.method == "tools/call" {
         let is_notification = request.id.is_none();
         let id = request.id.clone().unwrap_or(Value::Null);
+        let user_agent = headers
+            .get(USER_AGENT)
+            .or_else(|| headers.get(header::HeaderName::from_static("x-mcp-client")))
+            .and_then(|v| v.to_str().ok());
+        let request_ctx = tools::RequestContext::from_request(
+            connect_info.map(|ConnectInfo(addr)| addr),
+            user_agent,
+        );
         let response = tools::dispatch_call(
             id,
             identity.as_deref(),
             &state.config,
             &state.pool_registry,
             state.state_db.as_ref(),
+            &request_ctx,
             request.params,
         )
         .await;

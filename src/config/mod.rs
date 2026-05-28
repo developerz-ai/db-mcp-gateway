@@ -20,6 +20,8 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 const DEFAULT_STATE_DB_URL: &str = "postgres://gateway:gateway-dev-only@localhost:5433/gateway";
 const DEFAULT_STATE_DB_POOL_SIZE: u32 = 10;
+/// Spec 07 §Storage: "Hot — Gateway's state Postgres — 90 days (configurable)".
+const DEFAULT_AUDIT_RETENTION_DAYS: u32 = 90;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -29,6 +31,10 @@ pub struct Config {
     pub mcp_path: String,
     /// The gateway's own Postgres (sessions, audit, denylist).
     pub state_db: StateDbConfig,
+    /// Days to keep audit rows in hot storage before the pruner deletes
+    /// them. Archive sink (when added) would take rows out before delete;
+    /// without archive, this is the hard retention period.
+    pub audit_retention_days: u32,
 }
 
 /// `Debug` is hand-rolled to redact `url`, which carries the Postgres password.
@@ -56,6 +62,7 @@ impl Default for Config {
                 url: DEFAULT_STATE_DB_URL.to_string(),
                 pool_size: DEFAULT_STATE_DB_POOL_SIZE,
             },
+            audit_retention_days: DEFAULT_AUDIT_RETENTION_DAYS,
         }
     }
 }
@@ -74,6 +81,13 @@ pub enum ConfigError {
         value: String,
         source: std::num::ParseIntError,
     },
+    #[error("invalid AUDIT_RETENTION_DAYS `{value}`: {source}")]
+    AuditRetentionDays {
+        value: String,
+        source: std::num::ParseIntError,
+    },
+    #[error("invalid AUDIT_RETENTION_DAYS `{0}`: must be greater than zero")]
+    AuditRetentionZero(String),
 }
 
 impl Config {
@@ -100,6 +114,20 @@ impl Config {
             config.state_db.pool_size = value
                 .parse()
                 .map_err(|source| ConfigError::StateDbPoolSize { value, source })?;
+        }
+        if let Ok(value) = std::env::var("AUDIT_RETENTION_DAYS") {
+            let parsed: u32 = value
+                .parse()
+                .map_err(|source| ConfigError::AuditRetentionDays {
+                    value: value.clone(),
+                    source,
+                })?;
+            // Zero would make the pruner immediately delete every audit row
+            // — a silent durability violation. Reject at boot.
+            if parsed == 0 {
+                return Err(ConfigError::AuditRetentionZero(value));
+            }
+            config.audit_retention_days = parsed;
         }
 
         Ok(config)
@@ -143,5 +171,17 @@ mod tests {
         let config = Config::default();
         assert!(config.state_db.url.contains("localhost"));
         assert_eq!(config.state_db.pool_size, DEFAULT_STATE_DB_POOL_SIZE);
+    }
+
+    /// `AUDIT_RETENTION_DAYS=0` would let the pruner wipe every audit row on
+    /// its next tick. Refuse at boot, per spec 08 "invalid config must refuse
+    /// to start".
+    #[test]
+    fn audit_retention_zero_is_rejected() {
+        // Direct unit test on the surface that consumes the value, so we don't
+        // race on the process-wide env var across tests.
+        let err = ConfigError::AuditRetentionZero("0".to_string());
+        let rendered = format!("{err}");
+        assert!(rendered.contains("must be greater than zero"), "{rendered}");
     }
 }
