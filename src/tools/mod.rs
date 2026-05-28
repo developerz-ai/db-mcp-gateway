@@ -9,6 +9,7 @@
 //! MUST go through a credential-free view type (see `SafeServerView`); never
 //! serialize a `crate::config::Server` to the wire.
 
+pub mod audit_dispatch;
 pub mod list_servers;
 pub mod run_query;
 

@@ -4,25 +4,20 @@
 //!
 //! Per spec doc 03, errors are structured JSON with a `code` from the
 //! published list (`forbidden`, `timeout`, `syntax_error`, `unavailable`,
-//! `reason_required`, `internal`). We surface them as
-//! `CallToolResult { is_error: true, content: [JSON-text] }` so the MCP
-//! envelope stays a successful JSON-RPC response (per spec 03 §Errors).
-//!
-//! Audit (CLAUDE.md non-negotiable): every dispatch writes a row to
-//! `audit_calls` before the response goes out. Audit write failure fails the
-//! request — no best-effort audit.
+//! `reason_required`, `internal`). Audit + response envelope are handled by
+//! `tools::audit_dispatch` — this file only does the compute step.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
 
-use crate::audit::{self, AuditRow};
 use crate::auth::Identity;
 use crate::authz::{self, Decision};
 use crate::config::{Action, ConfigFile, Database, Server};
 use crate::exec::{self, ExecError, PoolRegistry};
 use crate::transport::jsonrpc::{ErrorObject, Response};
-use crate::transport::protocol::{CallToolResult, TextContent};
+
+use super::audit_dispatch::{AuditHeader, Outcome, audit_dispatch, tool_error, tool_success};
 
 const TOOL_NAME: &str = "run_query";
 
@@ -50,16 +45,6 @@ struct SuccessPayload<'a> {
     elapsed_ms: u64,
 }
 
-/// Same shape as a successful tool result, but carrying the outcome we'll
-/// write to `audit_calls` after the work completes. Kept internal so the
-/// audit hook stays the single chokepoint for every return.
-struct Outcome {
-    response: Response,
-    /// One of `"success"` or a spec 03 error code. Audited verbatim.
-    code: &'static str,
-    elapsed_ms: Option<i64>,
-}
-
 pub async fn run(
     id: Value,
     identity: &Identity,
@@ -68,16 +53,6 @@ pub async fn run(
     state_db: Option<&PgPool>,
     arguments: Option<Value>,
 ) -> Response {
-    // Audit is non-negotiable: refuse to dispatch the tool without a state
-    // DB to write into. Tests that exercise the wire protocol set
-    // `state_db: None` and don't call `run_query`.
-    let Some(state_db) = state_db else {
-        return Response::error(
-            id,
-            ErrorObject::internal("audit log unavailable — refusing to dispatch run_query"),
-        );
-    };
-
     let args: Arguments = match arguments.map(serde_json::from_value::<Arguments>) {
         Some(Ok(a)) => a,
         _ => {
@@ -90,33 +65,14 @@ pub async fn run(
         }
     };
 
-    let outcome = compute_outcome(id.clone(), identity, config, registry, &args).await;
-
-    // Synchronous audit write. Failure aborts the request — never let the
-    // response go out without an audited row (CLAUDE.md non-negotiable).
-    let row = AuditRow {
-        request_id: id.to_string(),
-        user_sub: identity.user_sub.clone(),
-        user_email: identity.user_email.clone(),
-        tool: TOOL_NAME.to_string(),
-        server: Some(args.server.clone()),
-        database: Some(args.database.clone()),
-        sql: Some(args.sql.clone()),
-        outcome: outcome.code.to_string(),
-        elapsed_ms: outcome.elapsed_ms,
+    let header = AuditHeader {
+        tool: TOOL_NAME,
+        server: Some(&args.server),
+        database: Some(&args.database),
+        sql: Some(&args.sql),
     };
-    if let Err(err) = audit::log(state_db, &row).await {
-        // Don't embed the underlying error string in the response (could
-        // leak DB connection details on some sqlx error paths). Operator
-        // sees the source via the tracing event.
-        tracing::error!(%err, request_id = %id, "audit write failed; aborting tool response");
-        return Response::error(
-            id,
-            ErrorObject::internal("audit write failed; request rejected"),
-        );
-    }
-
-    outcome.response
+    let work = compute_outcome(id.clone(), identity, config, registry, &args);
+    audit_dispatch(id, identity, state_db, header, work).await
 }
 
 async fn compute_outcome(
@@ -192,9 +148,9 @@ async fn compute_outcome(
                 elapsed_ms: result.elapsed_ms,
             };
             // SuccessPayload only contains primitives + serde_json::Value
-            // (which round-trips), so serialization is practically
-            // infallible — but CLAUDE.md bans `expect` on the hot path, so
-            // fall through to a typed internal error instead of panicking.
+            // (which round-trips), so serialization is practically infallible
+            // — but CLAUDE.md bans `expect` on the hot path, so fall through
+            // to a typed internal error instead of panicking.
             let text = match serde_json::to_string(&payload) {
                 Ok(t) => t,
                 Err(_) => {
@@ -206,13 +162,7 @@ async fn compute_outcome(
                 }
             };
             Outcome {
-                response: Response::result(
-                    id,
-                    &CallToolResult {
-                        content: vec![TextContent::new(text)],
-                        is_error: false,
-                    },
-                ),
+                response: tool_success(id, text),
                 code: "success",
                 elapsed_ms: Some(elapsed),
             }
@@ -256,25 +206,6 @@ fn outcome_from_exec_error(id: Value, err: ExecError, elapsed_ms: Option<i64>) -
     }
 }
 
-fn tool_error(id: Value, code: &'static str, message: &str) -> Response {
-    // Spec 03 §Errors: every error includes `request_id` so callers can
-    // correlate with server logs. The JSON-RPC envelope already carries `id`,
-    // but we duplicate it inside the structured body so the contract holds
-    // when an agent only inspects the tool payload.
-    let body = serde_json::json!({
-        "request_id": id.clone(),
-        "code": code,
-        "message": message,
-    });
-    Response::result(
-        id,
-        &CallToolResult {
-            content: vec![TextContent::new(body.to_string())],
-            is_error: true,
-        },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,18 +217,5 @@ mod tests {
         assert_eq!(effective_row_limit(Some(50), None), 50);
         assert_eq!(effective_row_limit(None, Some(20)), 20);
         assert_eq!(effective_row_limit(None, None), DEFAULT_ROW_LIMIT);
-    }
-
-    #[test]
-    fn tool_error_payload_shape() {
-        let response = tool_error(Value::from(7), "forbidden", "nope");
-        let value = serde_json::to_value(&response).unwrap();
-        assert_eq!(value["id"], 7);
-        assert_eq!(value["result"]["isError"], true);
-        let text = value["result"]["content"][0]["text"].as_str().unwrap();
-        let body: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(body["code"], "forbidden");
-        assert_eq!(body["message"], "nope");
-        assert_eq!(body["request_id"], 7);
     }
 }
