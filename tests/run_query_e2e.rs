@@ -309,7 +309,10 @@ async fn run_query_full_acceptance() {
         ("UPDATE foo SET x = 1", "UPDATE rejected pre-DB"),
         ("DROP TABLE x", "DROP rejected pre-DB"),
         ("SELECT 1; DELETE FROM x", "multi-statement rejected pre-DB"),
-        ("SELECT * FROM foo FOR UPDATE", "locking SELECT rejected pre-DB"),
+        (
+            "SELECT * FROM foo FOR UPDATE",
+            "locking SELECT rejected pre-DB",
+        ),
     ] {
         let resp = call_run_query(url, bearer, "target", "app", sql, None).await;
         assert_eq!(resp["result"]["isError"], true, "{label}: {resp}");

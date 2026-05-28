@@ -131,7 +131,9 @@ mod tests {
     #[test]
     fn ctes_allowed() {
         ok("WITH x AS (SELECT 1) SELECT * FROM x");
-        ok("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 5) SELECT * FROM n");
+        ok(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 5) SELECT * FROM n",
+        );
     }
 
     #[test]

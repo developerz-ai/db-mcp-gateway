@@ -76,6 +76,7 @@ async fn tools_list_advertises_all_registered_tools() {
         "list_databases",
         "describe_schema",
         "sample_table",
+        "explain",
         "run_query",
     ] {
         assert!(

@@ -11,6 +11,7 @@
 
 pub mod audit_dispatch;
 pub mod describe_schema;
+pub mod explain;
 pub mod list_databases;
 pub mod list_servers;
 pub mod run_query;
@@ -29,6 +30,7 @@ use crate::transport::jsonrpc::{ErrorObject, Response};
 // Re-export canonical names so dispatch and the advertised capability can
 // never drift apart.
 pub use crate::transport::protocol::DESCRIBE_SCHEMA_TOOL as DESCRIBE_SCHEMA;
+pub use crate::transport::protocol::EXPLAIN_TOOL as EXPLAIN;
 pub use crate::transport::protocol::LIST_DATABASES_TOOL as LIST_DATABASES;
 pub use crate::transport::protocol::LIST_SERVERS_TOOL as LIST_SERVERS;
 pub use crate::transport::protocol::RUN_QUERY_TOOL as RUN_QUERY;
@@ -93,6 +95,7 @@ pub async fn dispatch_call(
         SAMPLE_TABLE => {
             sample_table::run(id, identity, config, registry, state_db, call.arguments).await
         }
+        EXPLAIN => explain::run(id, identity, config, registry, state_db, call.arguments).await,
         RUN_QUERY => run_query::run(id, identity, config, registry, state_db, call.arguments).await,
         other => Response::error(
             id,
