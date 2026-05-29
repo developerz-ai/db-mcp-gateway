@@ -100,6 +100,19 @@ where
             "outcome" => "unavailable",
         )
         .increment(1);
+        // Contract (issue #14): exactly one dispatch line per call, even when
+        // we refuse before running the tool. `duration_ms = 0` because no
+        // tool work happened.
+        tracing::info!(
+            request_id = %id,
+            user_sub = %identity.user_sub,
+            tool = %header.tool,
+            server = header.server.unwrap_or(""),
+            db = header.database.unwrap_or(""),
+            outcome = "unavailable",
+            duration_ms = 0_i64,
+            "tool dispatched"
+        );
         return Response::error(
             id,
             ErrorObject::internal(format!(
