@@ -62,10 +62,9 @@ async fn sighup_reloads_tls_cert_without_dropping_listener() {
     // so we know exactly where to send requests.
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
+    // tokio sets the listener non-blocking; axum-server re-wraps it back into a
+    // tokio listener internally, so we leave the std handle as-is.
     let std_listener = listener.into_std().expect("into_std");
-    std_listener
-        .set_nonblocking(false)
-        .expect("blocking listener");
 
     let rustls = db_mcp_gateway::transport::tls::load(&cert_path, &key_path)
         .await

@@ -106,7 +106,7 @@ The env→YAML unification is still pending, so these come from the environment,
 | `AUDIT_RETENTION_DAYS` | `90` | Hot-retention window for the audit log |
 | `RUST_LOG` | (off) | Log filter — set `info` (or `info,db_mcp_gateway=debug`) to see startup/request logs |
 
-> **Cert rotation.** `kill -HUP <pid>` (or the pod's terminationGracePeriod-respecting `SIGHUP`) re-reads `TLS_CERT_PATH` + `TLS_KEY_PATH` in place. In-flight connections keep their old cert until they close; new handshakes pick up the new one. Cert-manager hooks into this automatically once #17 lands the infra stack.
+> **Cert rotation.** `kill -HUP <pid>` (or a pod lifecycle hook, sidecar, or reload controller that sends `SIGHUP`) re-reads `TLS_CERT_PATH` + `TLS_KEY_PATH` in place. In-flight connections keep their old cert until they close; new handshakes pick up the new one. Kubernetes does not send `SIGHUP` on its own — `terminationGracePeriodSeconds` only governs `SIGTERM` at shutdown — so operators must wire the reload signal explicitly. Cert-manager integration can automate this once #17 lands the infra stack.
 
 ### Permissions in a nutshell
 
