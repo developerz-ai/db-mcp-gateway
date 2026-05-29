@@ -68,6 +68,8 @@ A request is allowed iff *some* grant matches. Denies are not explicit — absen
 
 **New hires:** no entry → no access. The default is *nothing*.
 
+**Worker-db rollout (issue #19):** the deployable file is `config/permissions.yml`. Three Zitadel groups — `devs`, `devops`, `cto` — collectively own DBs on the shared CNPG cluster. v1 grants `query_read` only; `statement_timeout_ms: 30000`, `row_limit: 10000`. Per-dev DB ownership is intentionally deferred (would require a Zitadel group per app); revisit when the team passes ~10 devs or when scoping needs to be tighter than "all devs see all app DBs."
+
 ## Evaluation
 
 For a request `(user, groups, server, db, action)`:
