@@ -17,6 +17,7 @@ pub use secret::{Password, SecretError};
 pub use yaml::{ConfigFile, ConfigFileError, ConfigLoadError};
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::path::PathBuf;
 
 const DEFAULT_STATE_DB_URL: &str = "postgres://gateway:gateway-dev-only@localhost:5433/gateway";
 const DEFAULT_STATE_DB_POOL_SIZE: u32 = 10;
@@ -35,6 +36,30 @@ pub struct Config {
     /// them. Archive sink (when added) would take rows out before delete;
     /// without archive, this is the hard retention period.
     pub audit_retention_days: u32,
+    /// TLS termination at the gateway. `Enabled` carries the on-disk paths
+    /// the boot path reads and the SIGHUP handler reloads. `Disabled` is the
+    /// dev-only escape — when set, the gateway serves plain HTTP.
+    pub tls: TlsConfig,
+}
+
+/// TLS state — present-and-on or explicitly-off-for-dev. Modeled as an enum
+/// (not `Option<paths> + bool`) so the boot path can't accidentally serve
+/// plain HTTP because the cert paths happened to be empty. Spec 12-#12: TLS
+/// is the default; plain HTTP requires an explicit opt-out.
+#[derive(Debug, Clone)]
+pub enum TlsConfig {
+    Enabled {
+        cert_path: PathBuf,
+        key_path: PathBuf,
+    },
+    /// Dev-only. Boot emits a loud warning every minute.
+    Disabled,
+}
+
+impl TlsConfig {
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, TlsConfig::Enabled { .. })
+    }
 }
 
 /// `Debug` is hand-rolled to redact `url`, which carries the Postgres password.
@@ -63,6 +88,11 @@ impl Default for Config {
                 pool_size: DEFAULT_STATE_DB_POOL_SIZE,
             },
             audit_retention_days: DEFAULT_AUDIT_RETENTION_DAYS,
+            // No safe default for TLS exists at this layer — `from_env` resolves
+            // the real value, refusing to boot if the operator didn't supply
+            // cert+key or didn't explicitly opt out. `Default` is only used by
+            // tests and `for_tests`; both run plain HTTP.
+            tls: TlsConfig::Disabled,
         }
     }
 }
@@ -88,6 +118,23 @@ pub enum ConfigError {
     },
     #[error("invalid AUDIT_RETENTION_DAYS `{0}`: must be greater than zero")]
     AuditRetentionZero(String),
+    #[error(
+        "TLS is required but not configured: set TLS_CERT_PATH and TLS_KEY_PATH, \
+         or TLS_DISABLED=true for local dev (never in production)"
+    )]
+    TlsMissing,
+    #[error("TLS_CERT_PATH `{path}` is not readable: {source}")]
+    TlsCertUnreadable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("TLS_KEY_PATH `{path}` is not readable: {source}")]
+    TlsKeyUnreadable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("invalid TLS_DISABLED `{0}`: expected `true` or `false`")]
+    TlsDisabledFlag(String),
 }
 
 impl Config {
@@ -130,8 +177,47 @@ impl Config {
             config.audit_retention_days = parsed;
         }
 
+        config.tls = tls_from_env()?;
+
         Ok(config)
     }
+}
+
+/// Resolve `TlsConfig` from `TLS_DISABLED` / `TLS_CERT_PATH` / `TLS_KEY_PATH`.
+///
+/// Refuses to boot without TLS unless `TLS_DISABLED=true` is set explicitly —
+/// missing/empty cert paths are *not* an implicit opt-out (issue #12). The
+/// readability check here is cheap and catches the common "sealed-secret
+/// volume isn't mounted" failure before transport spins up.
+fn tls_from_env() -> Result<TlsConfig, ConfigError> {
+    if let Ok(raw) = std::env::var("TLS_DISABLED") {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => return Ok(TlsConfig::Disabled),
+            "false" | "0" | "no" | "" => {}
+            _ => return Err(ConfigError::TlsDisabledFlag(raw)),
+        }
+    }
+
+    let cert = std::env::var("TLS_CERT_PATH").ok().map(PathBuf::from);
+    let key = std::env::var("TLS_KEY_PATH").ok().map(PathBuf::from);
+    let (cert_path, key_path) = match (cert, key) {
+        (Some(c), Some(k)) => (c, k),
+        _ => return Err(ConfigError::TlsMissing),
+    };
+
+    std::fs::metadata(&cert_path).map_err(|source| ConfigError::TlsCertUnreadable {
+        path: cert_path.clone(),
+        source,
+    })?;
+    std::fs::metadata(&key_path).map_err(|source| ConfigError::TlsKeyUnreadable {
+        path: key_path.clone(),
+        source,
+    })?;
+
+    Ok(TlsConfig::Enabled {
+        cert_path,
+        key_path,
+    })
 }
 
 fn validate_mcp_path(path: String) -> Result<String, ConfigError> {
@@ -183,5 +269,16 @@ mod tests {
         let err = ConfigError::AuditRetentionZero("0".to_string());
         let rendered = format!("{err}");
         assert!(rendered.contains("must be greater than zero"), "{rendered}");
+    }
+
+    /// The TlsMissing message is operator-facing — it must spell out both env
+    /// vars AND the dev-only opt-out, so the first thing a stuck operator
+    /// reads in their logs already names the fix. Regression guard.
+    #[test]
+    fn tls_missing_error_names_the_envs_and_dev_escape() {
+        let rendered = format!("{}", ConfigError::TlsMissing);
+        assert!(rendered.contains("TLS_CERT_PATH"), "{rendered}");
+        assert!(rendered.contains("TLS_KEY_PATH"), "{rendered}");
+        assert!(rendered.contains("TLS_DISABLED"), "{rendered}");
     }
 }

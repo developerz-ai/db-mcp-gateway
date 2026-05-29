@@ -63,9 +63,12 @@ Co-deployed Postgres. Tiny — audit log is the bulky table and it's pruned (see
 
 ## TLS
 
-- Gateway listens on TLS by default. Reads cert + key paths from config.
-- Cert-manager + Helm makes this automatic on Kubernetes.
-- For docker-compose, the example repo includes a Caddy fronting variant — Caddy handles certs, gateway listens HTTP on localhost only.
+- Gateway terminates TLS in-process via rustls. Reads cert + key paths from `TLS_CERT_PATH` / `TLS_KEY_PATH`.
+- Refuses to boot without TLS unless `TLS_DISABLED=true` (dev-only escape; loud `WARN` log on every startup).
+- `SIGHUP` reloads the cert + key from the same paths without dropping live connections — rustls re-reads the handshake material atomically, in-flight sessions keep the old cert until they close. Matches cert-manager's rotation contract.
+- Reload failures (malformed PEM after a swap, wrong permissions) log the error and keep the previous cert serving; the next `SIGHUP` retries.
+- Cert-manager + the Kustomize stack in `developerz-ai/infrastructure` mounts the cert as a `Certificate` resource. Cert-manager does NOT send `SIGHUP` itself — a reload controller (e.g. `stakater/reloader`) or a lifecycle/sidecar hook must be wired in to translate the renewal into a `SIGHUP` on the pod. Without that wiring the gateway will keep serving the previous cert until restart.
+- For docker-compose without cert-manager, mount your PEMs into the container and `docker exec ... kill -HUP 1` after rotating them.
 
 ## Networking
 

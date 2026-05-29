@@ -17,6 +17,10 @@ path = "src/main.rs"
 # async runtime + http
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["macros"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+# rustls 0.23 requires explicit CryptoProvider selection — we pick aws-lc-rs
+# at boot in `transport::tls::install_crypto_provider`.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 futures = "0.3.32"            # Stream combinators for the SSE response
@@ -53,6 +57,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+rcgen = "0.13"                # Self-signed certs for the TLS+SIGHUP integration test
+libc = "0.2"                  # `raise(SIGHUP)` from the integration test (in-process signal)
 
 [profile.release]
 lto = "thin"
