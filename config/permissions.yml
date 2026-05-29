@@ -1,0 +1,78 @@
+# Deployable gateway config for the worker-db Postgres cluster.
+#
+# Pairs with the infra stack PR (#17): mounted as a sealed-secret at
+# /etc/gateway/config.yml. The Zitadel `groups` claim feeds the `permissions:`
+# group names below (devs / devops / cto). Per-dev mapping lives in
+# ../infrastructure/scripts/lib/sso/dev-mapping.ts — collective ownership in v1.
+#
+# Schema: docs/initial-idea/08-config.md.
+# Spec for grants + constraint merge: docs/initial-idea/06-permissions.md.
+
+servers:
+  - name: worker-db
+    kind: postgres
+    description: "Shared CNPG cluster on worker-1 (app + infra tenants)"
+    host: worker-db-rw.db.internal
+    port: 5432
+    tls: required
+    databases:
+      # App DBs — declared by stacks/apps/*/cnpg-database.yml in
+      # developerz-ai/infrastructure. Each RO role is provisioned out-of-band
+      # by the infra stack PR; gateway never creates roles.
+      - name: discord_server
+        role: mcp_gateway_discord_server_ro
+        password: ${FILE:/run/secrets/worker-db/discord_server_ro}
+        description: "discord-server bot state"
+
+      - name: legaldiligencemedellin
+        role: mcp_gateway_legaldiligencemedellin_ro
+        password: ${FILE:/run/secrets/worker-db/legaldiligencemedellin_ro}
+        description: "legaldiligencemedellin app DB"
+
+      # Infra-side DBs — cto-only.
+      - name: zitadel
+        role: mcp_gateway_zitadel_ro
+        password: ${FILE:/run/secrets/worker-db/zitadel_ro}
+        description: "Zitadel state (SSO IdP)"
+
+      - name: vaultwarden
+        role: mcp_gateway_vaultwarden_ro
+        password: ${FILE:/run/secrets/worker-db/vaultwarden_ro}
+        description: "Vaultwarden state (password vault)"
+
+permissions:
+  # devs: read-only on every app DB. Per-dev DB ownership isn't expressible in
+  # the group-based model; revisit if scope demands it (see issue #19 thread).
+  - group: devs
+    grants:
+      - server: worker-db
+        database: discord_server
+        action: query_read
+        constraints: &app_db_caps
+          statement_timeout_ms: 30000
+          row_limit: 10000
+      - server: worker-db
+        database: legaldiligencemedellin
+        action: query_read
+        constraints: *app_db_caps
+
+  # devops: same surface as devs in v1. Distinct group so we can diverge later
+  # (e.g. infra-DB schema_read, longer timeouts) without rewriting dev grants.
+  - group: devops
+    grants:
+      - server: worker-db
+        database: discord_server
+        action: query_read
+        constraints: *app_db_caps
+      - server: worker-db
+        database: legaldiligencemedellin
+        action: query_read
+        constraints: *app_db_caps
+
+  # cto: app DBs + infra-side DBs. Still read-only; writes are out of scope for v1.
+  - group: cto
+    grants:
+      - server: worker-db
+        database: "*"
+        action: query_read
+        constraints: *app_db_caps
