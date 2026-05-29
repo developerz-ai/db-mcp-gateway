@@ -19,11 +19,14 @@ The dispatch-time log line (one per `tools/call`) adds:
 | `request_id` | string | JSON-RPC request id |
 | `user_sub` | string | OIDC `sub` claim of the caller; `"anonymous"` on unauthenticated paths |
 | `tool` | string | `run_query` / `explain` / `list_servers` / … |
+| `server` | string | `<server>` from the call args, empty for tools that aren't server-scoped |
 | `db` | string | `<database>` from the call args, empty for tools that aren't database-scoped |
 | `outcome` | string | `success` / `forbidden` / `timeout` / `syntax_error` / `unavailable` / `forbidden_sql` / `internal` |
 | `duration_ms` | integer | Wall-clock the tool took; `0` for outcomes where the tool didn't start (e.g. forbidden before any work) |
 
-Other code paths emit a subset of these fields when relevant (e.g. the audit pruner emits `rows`, `ttl_days`). Adding new fields is fine; renaming or removing the ones above is a contract break.
+On audit-write failure the line additionally carries `audit_write_duration_ms` (integer) — wall-clock the failed audit insert took. `duration_ms` on that same line keeps the contract above (tool execution time), so `success` and `audit write failed` lines can be compared apples-to-apples.
+
+Other code paths emit a subset of these fields when relevant (e.g. the audit pruner emits `rows`, `ttl_days`). Adding new fields is fine; renaming or removing the ones above is a contract break. The canonical contract lives in [docs/initial-idea/07-logging-retention.md](../initial-idea/07-logging-retention.md).
 
 ## Redaction
 
@@ -74,5 +77,7 @@ Keep label cardinality under control — `user_sub` is high-cardinality (per use
 The JSON formatter runs in every binary, including dev. Pipe through `jq` to read:
 
 ```bash
-cargo run -- --config config.yml 2>&1 | jq -r '"\(.timestamp) \(.level) \(.tool // "") \(.message)"'
+cargo run -- --config config.yml | jq -r '"\(.timestamp) \(.level) \(.tool // "") \(.message)"'
 ```
+
+`stderr` is intentionally left untouched — `cargo`'s own diagnostics (build progress, panic backtraces) are not JSON and would break `jq`.

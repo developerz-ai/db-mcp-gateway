@@ -101,6 +101,10 @@ fn dispatch_log_line_matches_field_contract() {
         "subscriber emitted a `span` key — flatten_event should hoist fields"
     );
     assert!(
+        log.get("spans").is_none(),
+        "subscriber emitted a `spans` key — with_span_list(false) should drop it"
+    );
+    assert!(
         log.get("target").is_none(),
         "subscriber emitted a `target` key — with_target(false) should drop it"
     );
