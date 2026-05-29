@@ -101,25 +101,41 @@ fn build_connect_options(server: &Server, database: &Database, password: &str) -
         })
 }
 
+/// Adapt `Password::resolve` into `ExecError`. The boot-time walk in
+/// `ConfigFile::resolve_secrets` already failed fast on every unresolvable
+/// ref — but pools are opened lazily, so a `${FILE:…}` mount that disappears
+/// after boot (rotation gone wrong) still needs a structured error here.
 fn resolve_password(password: &Password) -> Result<String, ExecError> {
-    match password {
-        Password::Literal(s) => Ok(s.clone()),
-        Password::EnvVar(name) => std::env::var(name).map_err(|_| ExecError::PasswordUnresolved {
-            kind: "env",
-            reference: name.clone(),
-        }),
-        // vault: / aws-sm: / gcp-sm: resolution lands with #5. Until then we
-        // surface a structured error rather than silently failing the connect.
-        Password::SecretBackend { scheme, reference } => Err(ExecError::PasswordUnresolved {
-            kind: match scheme.as_str() {
-                "vault" => "vault",
-                "aws-sm" => "aws-sm",
-                "gcp-sm" => "gcp-sm",
-                _ => "unknown",
-            },
-            reference: reference.clone(),
-        }),
-    }
+    use crate::config::SecretError;
+    password.resolve().map_err(|err| match err {
+        SecretError::EnvNotSet(name) | SecretError::EnvNotUtf8(name) => {
+            ExecError::PasswordUnresolved {
+                kind: "env",
+                reference: name,
+            }
+        }
+        SecretError::FileUnreadable { path, .. } | SecretError::FileEmpty(path) => {
+            ExecError::PasswordUnresolved {
+                kind: "file",
+                reference: path.display().to_string(),
+            }
+        }
+        // Keep the stable `(kind, reference)` tool-facing shape: `kind` is the
+        // category, the scheme goes into `reference`. Emitting `kind: "vault"`
+        // would force tool callers to match on every supported backend name.
+        SecretError::BackendNotImplemented(scheme) => ExecError::PasswordUnresolved {
+            kind: "backend",
+            reference: scheme,
+        },
+        // Malformed refs are caught at YAML parse time, never reach here —
+        // but stay structured rather than panic if invariants drift. No
+        // payload is available (and intentionally so: the raw token could
+        // be a typo'd plaintext password — see `SecretError::Malformed`).
+        SecretError::Malformed => ExecError::PasswordUnresolved {
+            kind: "malformed",
+            reference: String::new(),
+        },
+    })
 }
 
 /// Typed execution errors. `Display` carries no secrets, hostnames, or
@@ -337,13 +353,19 @@ mod tests {
             Err(ExecError::PasswordUnresolved { kind: "env", .. })
         ));
 
-        assert!(matches!(
-            resolve_password(&Password::SecretBackend {
-                scheme: "vault".into(),
-                reference: "secret/path".into()
-            }),
-            Err(ExecError::PasswordUnresolved { kind: "vault", .. })
-        ));
+        // `kind: "backend"` keeps the tool-facing shape stable across
+        // backends; the scheme rides along in `reference` so operators can
+        // still tell vault from aws-sm in logs.
+        match resolve_password(&Password::SecretBackend {
+            scheme: "vault".into(),
+            reference: "secret/path".into(),
+        }) {
+            Err(ExecError::PasswordUnresolved { kind, reference }) => {
+                assert_eq!(kind, "backend");
+                assert_eq!(reference, "vault");
+            }
+            other => panic!("expected PasswordUnresolved {{ kind: backend, .. }}, got {other:?}"),
+        }
     }
 
     #[test]

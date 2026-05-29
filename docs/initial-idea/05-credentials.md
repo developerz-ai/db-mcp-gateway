@@ -12,11 +12,12 @@ For every `(server, database)` pair declared in config, the gateway needs:
 - a Postgres (or MySQL/MSSQL) role
 - the password / cert / IAM-token-issuer for that role
 
-These come from one of three sources, resolved at config load:
+These come from one of four sources, resolved at config load. Unresolved references abort boot — the gateway never serves a request it can't authenticate to.
 
 1. **Inline literal** in `config.yaml` (dev only — rejected if `env=production`).
-2. **Environment variable reference** — `${DB_PROD_RO_PASSWORD}` — resolved from the process env.
-3. **Secret manager reference** — `vault:secret/prod/db/ro_password`, `aws-sm:arn:...`, `gcp-sm:projects/.../secrets/...`. Resolved at startup and on hot reload.
+2. **Environment variable reference** — `${ENV:DB_PROD_RO_PASSWORD}` — resolved from the process env at startup.
+3. **File reference** — `${FILE:/run/secrets/db-prod-ro-password}` — read from disk at startup. Pairs with k8s sealed-secrets / external-secrets-operator / Vault Agent sidecar (all of which materialise secrets as files). Re-read on pool open so file rotation works without a restart.
+4. **Secret manager reference** — `vault:secret/prod/db/ro_password`, `aws-sm:arn:...`, `gcp-sm:projects/.../secrets/...`. Recognised today; backend integrations land later. Until then, the gateway refuses to start rather than failing on first DB connect.
 
 ## Per-database role design
 
