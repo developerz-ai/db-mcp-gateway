@@ -9,6 +9,7 @@ pub mod app_state;
 pub mod jsonrpc;
 pub mod probes;
 pub mod protocol;
+pub mod tls;
 
 mod auth_middleware;
 mod auth_routes;

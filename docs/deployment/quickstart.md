@@ -12,7 +12,7 @@ This gateway is mid-build (see [../initial-idea/11-roadmap.md](../initial-idea/1
 |---|---|
 | MCP tools, OIDC login, per-DB pools, synchronous audit | works |
 | `/healthz`, `/readyz`, `/metrics` | **works** — [#13](https://github.com/developerz-ai/db-mcp-gateway/issues/13). k8s probes + Prometheus scrape; see [Probes & metrics](#probes--metrics) below |
-| In-process TLS | planned — [#12](https://github.com/developerz-ai/db-mcp-gateway/issues/12); front with a TLS-terminating proxy meanwhile |
+| In-process TLS + cert reload on `SIGHUP` | **works** — [#12](https://github.com/developerz-ai/db-mcp-gateway/issues/12). `TLS_CERT_PATH` + `TLS_KEY_PATH` point at PEM files; `kill -HUP <pid>` reloads them in place without dropping live connections. Boot refuses to start without TLS unless `TLS_DISABLED=true` is set explicitly (dev-only). |
 | `${ENV:NAME}` + `${FILE:/path}` secret refs | **works** — resolved at boot ([#15](https://github.com/developerz-ai/db-mcp-gateway/issues/15)); an unset env or missing file aborts startup |
 | `vault:` / `aws-sm:` / `gcp-sm:` secret backends | recognised but **not implemented** — these abort at boot until the backends land |
 | Strict config validation | **works** — [#16](https://github.com/developerz-ai/db-mcp-gateway/issues/16): an unknown/misspelled key under `servers`/`databases`/`permissions`/`grants`/`constraints` aborts boot with a `line:column` pointer. Full key list: [config-reference.md](config-reference.md) |
@@ -53,9 +53,12 @@ docker run --rm --network host \
   -e DB_MCP_GATEWAY_CONFIG=/etc/gateway/config.yml \
   -e STATE_DB_URL='postgres://gateway:gateway-dev-only@localhost:5433/gateway' \
   -e TARGET_DB_PASSWORD='app-dev-only' \
+  -e TLS_DISABLED=true \
   -v "$PWD/config.yml:/etc/gateway/config.yml:ro" \
   ghcr.io/developerz-ai/db-mcp-gateway:main
 ```
+
+`TLS_DISABLED=true` is the explicit dev-only opt-out — the gateway refuses to boot otherwise (see [#12](https://github.com/developerz-ai/db-mcp-gateway/issues/12)). Real deploys mount cert+key and unset this var.
 
 The binary needs its config path. The published image bakes `DB_MCP_GATEWAY_CONFIG=/etc/gateway/config.yml` in (see [#10](https://github.com/developerz-ai/db-mcp-gateway/issues/10)), but passing it explicitly above keeps the recipe working for a locally-built image too — equivalently, append `--config /etc/gateway/config.yml` as a command argument.
 
@@ -97,8 +100,13 @@ The env→YAML unification is still pending, so these come from the environment,
 | `OIDC_REDIRECT_URL` | `http://localhost:8443/auth/callback` | Must match the IdP app's redirect URI |
 | `OIDC_GROUPS_CLAIM` | `groups` | ID-token claim carrying group membership |
 | `SESSION_SIGNING_KEY` | dev-only default | HMAC key for gateway-issued session JWTs — **set this in any real deploy** |
+| `TLS_CERT_PATH` | — | PEM-encoded leaf cert (+ intermediates). Required unless `TLS_DISABLED=true` |
+| `TLS_KEY_PATH` | — | PEM-encoded private key. Required unless `TLS_DISABLED=true` |
+| `TLS_DISABLED` | `false` | Dev-only escape. `true` serves plain HTTP and emits a `WARN` log on startup |
 | `AUDIT_RETENTION_DAYS` | `90` | Hot-retention window for the audit log |
 | `RUST_LOG` | (off) | Log filter — set `info` (or `info,db_mcp_gateway=debug`) to see startup/request logs |
+
+> **Cert rotation.** `kill -HUP <pid>` (or the pod's terminationGracePeriod-respecting `SIGHUP`) re-reads `TLS_CERT_PATH` + `TLS_KEY_PATH` in place. In-flight connections keep their old cert until they close; new handshakes pick up the new one. Cert-manager hooks into this automatically once #17 lands the infra stack.
 
 ### Permissions in a nutshell
 

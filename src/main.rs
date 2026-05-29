@@ -6,9 +6,10 @@ use std::sync::Arc;
 use clap::Parser;
 use db_mcp_gateway::audit;
 use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
-use db_mcp_gateway::config::ConfigFile;
+use db_mcp_gateway::config::{ConfigFile, TlsConfig};
 use db_mcp_gateway::exec::PoolRegistry;
 use db_mcp_gateway::transport::probes::ShutdownFlag;
+use db_mcp_gateway::transport::tls;
 use db_mcp_gateway::transport::{AppState, AuthFacade, PendingFlows};
 use db_mcp_gateway::{config::Config, state, transport};
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -39,6 +40,10 @@ async fn main() -> anyhow::Result<()> {
         .with_span_list(false)
         .with_target(false)
         .init();
+
+    // rustls 0.23 needs an explicit CryptoProvider; install before any TLS
+    // path touches `RustlsConfig` (issue #12).
+    tls::install_crypto_provider();
 
     let cli = Cli::parse();
 
@@ -97,23 +102,100 @@ async fn main() -> anyhow::Result<()> {
 
     let app = transport::router(&config, app_state);
 
-    let listener = tokio::net::TcpListener::bind(config.bind).await?;
-    let addr = listener.local_addr()?;
-    tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
-        %addr,
-        path = %config.mcp_path,
-        "db-mcp-gateway listening"
-    );
+    let handle = axum_server::Handle::new();
+    let shutdown_for_signal = shutdown.clone();
+    let handle_for_signal = handle.clone();
+    tokio::spawn(async move {
+        shutdown_signal(shutdown_for_signal).await;
+        // Drain in-flight requests, then close idle. The 30s window matches
+        // the upper bound on `statement_timeout` defaults; longer queries get
+        // SIGTERM-killed when the runtime tears down.
+        handle_for_signal.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
+    });
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal(shutdown))
-    .await?;
+    match config.tls.clone() {
+        TlsConfig::Enabled {
+            cert_path,
+            key_path,
+        } => {
+            let rustls = tls::load(&cert_path, &key_path).await?;
+            tracing::info!(
+                version = env!("CARGO_PKG_VERSION"),
+                addr = %config.bind,
+                path = %config.mcp_path,
+                cert_path = %cert_path.display(),
+                "db-mcp-gateway listening (TLS)"
+            );
+            // Hot-reload runs forever; abort when the server stops.
+            tokio::spawn(reload_on_sighup(rustls.clone(), cert_path, key_path));
+            axum_server::bind_rustls(config.bind, rustls)
+                .handle(handle)
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                .await?;
+        }
+        TlsConfig::Disabled => {
+            tracing::warn!(
+                addr = %config.bind,
+                "TLS disabled — serving plain HTTP. This is dev-only; never deploy without TLS."
+            );
+            tracing::info!(
+                version = env!("CARGO_PKG_VERSION"),
+                addr = %config.bind,
+                path = %config.mcp_path,
+                "db-mcp-gateway listening (plain HTTP)"
+            );
+            axum_server::bind(config.bind)
+                .handle(handle)
+                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                .await?;
+        }
+    }
 
     Ok(())
+}
+
+/// SIGHUP loop: every signal, re-read cert+key from the configured paths and
+/// hand them to the running `RustlsConfig`. Reload failure is logged loudly
+/// but never crashes the gateway — the old cert keeps serving until the next
+/// signal succeeds. Runs in its own task because `tokio::signal::unix::signal`
+/// is a long-lived stream.
+#[cfg(unix)]
+async fn reload_on_sighup(
+    rustls: axum_server::tls_rustls::RustlsConfig,
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut hup = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(error) => {
+            tracing::error!(%error, "failed to install SIGHUP handler — cert hot-reload disabled");
+            return;
+        }
+    };
+    while hup.recv().await.is_some() {
+        match tls::reload(&rustls, &cert_path, &key_path).await {
+            Ok(()) => tracing::info!(
+                cert_path = %cert_path.display(),
+                "TLS certificate reloaded"
+            ),
+            Err(error) => tracing::error!(
+                %error,
+                cert_path = %cert_path.display(),
+                "TLS certificate reload failed; keeping previous cert"
+            ),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn reload_on_sighup(
+    _rustls: axum_server::tls_rustls::RustlsConfig,
+    _cert_path: std::path::PathBuf,
+    _key_path: std::path::PathBuf,
+) {
+    // SIGHUP doesn't exist outside Unix; deployment targets are Linux only.
+    std::future::pending::<()>().await;
 }
 
 /// Background task: tick hourly and prune any audit row older than the
