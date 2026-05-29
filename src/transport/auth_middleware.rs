@@ -35,7 +35,7 @@ pub async fn bearer_auth(State(state): State<AppState>, mut req: Request, next: 
         Err(err) => return unauthorized(err),
     };
 
-    tracing::debug!(user = %identity.user_sub, session = ?identity.session_id, "request authenticated");
+    tracing::debug!(user_sub = %identity.user_sub, session = ?identity.session_id, "request authenticated");
     req.extensions_mut().insert(identity);
     next.run(req).await
 }

@@ -79,13 +79,16 @@ pub async fn dispatch_call(
     // Other tools (`list_servers`) leave both empty by design.
     let (span_server, span_database) = span_targets(&call);
 
+    // Field names are the log contract documented in
+    // docs/deployment/logging.md (issue #14): `user_sub`, `db` — Alloy/Loki
+    // parsers key off these directly. Renaming silently breaks consumers.
     let span = info_span!(
         "tool_dispatch",
         request_id = %id,
-        user = %identity.user_sub,
+        user_sub = %identity.user_sub,
         tool = %call.name,
         server = span_server,
-        database = span_database,
+        db = span_database,
     );
     let _enter = span.enter();
 

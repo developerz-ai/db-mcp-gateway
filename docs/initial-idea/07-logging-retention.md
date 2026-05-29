@@ -1,5 +1,14 @@
 # 07 — Logging & Retention
 
+Two distinct streams. Don't confuse them.
+
+| Stream | Where | Purpose |
+|---|---|---|
+| **Audit log** | State Postgres `audit_log` table | Forensic record. Synchronous, mandatory, append-only. |
+| **Stdout log** | Process stdout, one JSON object per line | Operational observability. Ingested by Loki / Splunk / etc. via Alloy. |
+
+The audit log is the system of record. The stdout log is a sidecar for operators; it MUST NOT be the only place a tool call leaves a trace.
+
 ## What "audit log" means here
 
 Append-only record of every tool invocation that hits a target database, written synchronously **before** results return to the agent. If the audit write fails, the request fails. There is no "best effort" audit.
@@ -84,3 +93,35 @@ A small read-only SQL view shipped with the gateway exposes the same fields with
 - The DB password / connection string. Never.
 - Result row contents. Counts and column names only. (Storing actual rows would defeat the purpose of redacted-SQL mode.)
 - Anything that would re-identify a user beyond what's already in the session.
+
+## Stdout log — dispatch line contract
+
+Every tool dispatch emits exactly one JSON-per-line record on stdout, in addition to (not in place of) the audit row. Loki / Alloy ingest this without per-line parsing; the keys are top-level and the types are stable. Operator-facing detail lives in [docs/deployment/logging.md](../deployment/logging.md); this section is the canonical field contract.
+
+Baseline keys on every log line:
+
+| Field | Type | Notes |
+|---|---|---|
+| `timestamp` | RFC 3339 string | Subscriber default |
+| `level` | string | `INFO` / `WARN` / `ERROR` / `DEBUG` |
+| `message` | string | Static log-line string |
+
+The dispatch line (`message = "tool dispatched"`) carries additionally:
+
+| Field | Type | When set |
+|---|---|---|
+| `request_id` | string | JSON-RPC request id |
+| `user_sub` | string | OIDC `sub` of the caller; `"anonymous"` on unauthenticated paths |
+| `tool` | string | Tool name (`run_query`, `explain`, …) |
+| `server` | string | Logical server name from call args, empty for tools that aren't server-scoped |
+| `db` | string | Logical database name from call args, empty for tools that aren't database-scoped |
+| `outcome` | string | One of the spec 03 codes (`success` / `forbidden` / `timeout` / `syntax_error` / `unavailable` / `forbidden_sql` / `internal`) |
+| `duration_ms` | integer | Wall-clock the tool itself took. `0` for outcomes where no tool work ran (e.g. `forbidden` before dispatch). |
+
+The audit-write-failure line adds:
+
+| Field | Type | Notes |
+|---|---|---|
+| `audit_write_duration_ms` | integer | Wall-clock the failed audit insert took. `duration_ms` on the same line keeps the contract above — tool execution time, not audit latency. |
+
+Renames or removals of any field above are contract breaks. Additions are fine.

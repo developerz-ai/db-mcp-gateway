@@ -100,6 +100,19 @@ where
             "outcome" => "unavailable",
         )
         .increment(1);
+        // Contract (issue #14): exactly one dispatch line per call, even when
+        // we refuse before running the tool. `duration_ms = 0` because no
+        // tool work happened.
+        tracing::info!(
+            request_id = %id,
+            user_sub = %identity.user_sub,
+            tool = %header.tool,
+            server = header.server.unwrap_or(""),
+            db = header.database.unwrap_or(""),
+            outcome = "unavailable",
+            duration_ms = 0_i64,
+            "tool dispatched"
+        );
         return Response::error(
             id,
             ErrorObject::internal(format!(
@@ -120,6 +133,22 @@ where
     if let Some(elapsed_ms) = outcome.elapsed_ms {
         histogram!(METRIC_QUERY_DURATION, "tool" => header.tool).record(elapsed_ms as f64 / 1000.0);
     }
+
+    // Single per-dispatch log line carrying the documented field contract
+    // (issue #14): request_id, user_sub, tool, server, db, outcome,
+    // duration_ms. Lives at the chokepoint so every tool gets it without
+    // per-tool code. `server` + `db` together fully scope the call per spec
+    // 03; emitting only `db` makes correlation ambiguous across servers.
+    tracing::info!(
+        request_id = %id,
+        user_sub = %identity.user_sub,
+        tool = %header.tool,
+        server = header.server.unwrap_or(""),
+        db = header.database.unwrap_or(""),
+        outcome = %outcome.code,
+        duration_ms = outcome.elapsed_ms.unwrap_or(0),
+        "tool dispatched"
+    );
 
     let row = AuditRow {
         request_id: id.to_string(),
@@ -146,10 +175,20 @@ where
         // Don't embed the underlying error string in the response (could leak
         // DB connection details on some sqlx error paths). Operator sees the
         // chained source via the tracing event.
+        //
+        // `duration_ms` keeps the same contract as the success log: wall-clock
+        // the tool itself took. The audit-insert latency is a separate field
+        // (`audit_write_duration_ms`) so consumers comparing dispatch lines
+        // across success/failure don't see two different semantics.
         tracing::error!(
             %err,
             request_id = %id,
+            user_sub = %identity.user_sub,
             tool = %header.tool,
+            server = header.server.unwrap_or(""),
+            db = header.database.unwrap_or(""),
+            duration_ms = outcome.elapsed_ms.unwrap_or(0),
+            audit_write_duration_ms = audit_started.elapsed().as_millis() as u64,
             "audit write failed; aborting tool response"
         );
         return Response::error(
