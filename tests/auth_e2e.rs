@@ -104,6 +104,8 @@ async fn login_via_mock_idp_then_call_tool() {
             config: Arc::new(config_file),
             pool_registry: PoolRegistry::new(),
             state_db: Some(pool),
+            shutdown: Default::default(),
+            metrics: None,
         },
     );
     tokio::spawn(async move {

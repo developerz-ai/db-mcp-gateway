@@ -9,7 +9,9 @@
 use std::future::Future;
 use std::net::IpAddr;
 use std::net::SocketAddr;
+use std::time::Instant;
 
+use metrics::{counter, histogram};
 use serde_json::Value;
 use sqlx::PgPool;
 
@@ -17,6 +19,16 @@ use crate::audit::{self, AuditRow};
 use crate::auth::Identity;
 use crate::transport::jsonrpc::{ErrorObject, Response};
 use crate::transport::protocol::{CallToolResult, TextContent};
+
+/// Per-call counter — `tool` is the tool name, `outcome` is the spec 03 code
+/// (`success`/`forbidden`/`timeout`/…). Both labels are bounded.
+const METRIC_TOOL_CALLS: &str = "tool_calls";
+/// Wall-clock the tool's own work took (from the `Outcome.elapsed_ms` the tool
+/// reports). Excludes the audit write — that has its own histogram.
+const METRIC_QUERY_DURATION: &str = "query_duration_seconds";
+/// Wall-clock the synchronous audit insert took. Spec calls audit-write a
+/// hot-path concern; this is the metric the alert in #22 will fire on.
+const METRIC_AUDIT_WRITE_DURATION: &str = "audit_write_duration_seconds";
 
 /// Result of a tool's compute step. Carries the response to send back AND
 /// the audit fields the helper will persist.
@@ -82,6 +94,12 @@ where
     Fut: Future<Output = Outcome>,
 {
     let Some(state_db) = state_db else {
+        counter!(
+            METRIC_TOOL_CALLS,
+            "tool" => header.tool,
+            "outcome" => "unavailable",
+        )
+        .increment(1);
         return Response::error(
             id,
             ErrorObject::internal(format!(
@@ -92,6 +110,16 @@ where
     };
 
     let outcome = work.await;
+
+    counter!(
+        METRIC_TOOL_CALLS,
+        "tool" => header.tool,
+        "outcome" => outcome.code,
+    )
+    .increment(1);
+    if let Some(elapsed_ms) = outcome.elapsed_ms {
+        histogram!(METRIC_QUERY_DURATION, "tool" => header.tool).record(elapsed_ms as f64 / 1000.0);
+    }
 
     let row = AuditRow {
         request_id: id.to_string(),
@@ -111,7 +139,10 @@ where
         agent_client: request_ctx.agent_client.clone(),
         ip: request_ctx.ip.map(|i| i.to_string()),
     };
-    if let Err(err) = audit::log(state_db, &row).await {
+    let audit_started = Instant::now();
+    let audit_result = audit::log(state_db, &row).await;
+    histogram!(METRIC_AUDIT_WRITE_DURATION).record(audit_started.elapsed().as_secs_f64());
+    if let Err(err) = audit_result {
         // Don't embed the underlying error string in the response (could leak
         // DB connection details on some sqlx error paths). Operator sees the
         // chained source via the tracing event.

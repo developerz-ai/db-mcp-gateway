@@ -122,6 +122,8 @@ async fn boot_gateway() -> BootedGateway {
             config: Arc::new(config_file),
             state_db: Some(pool.clone()),
             pool_registry: PoolRegistry::new(),
+            shutdown: Default::default(),
+            metrics: None,
         },
     );
     tokio::spawn(async move {

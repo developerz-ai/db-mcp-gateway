@@ -7,6 +7,7 @@
 
 pub mod app_state;
 pub mod jsonrpc;
+pub mod probes;
 pub mod protocol;
 
 mod auth_middleware;
@@ -49,7 +50,13 @@ pub fn router(config: &Config, state: AppState) -> Router {
     let open = Router::new()
         .route(&path, get(sse::handler))
         .route("/auth/login", post(auth_routes::login))
-        .route("/auth/callback", get(auth_routes::callback));
+        .route("/auth/callback", get(auth_routes::callback))
+        // Ops endpoints: k8s probes + Prometheus scraper. Unauthenticated by
+        // design — probes don't carry a bearer, and exposed bodies are
+        // generic strings + Prometheus exposition only (no DB internals).
+        .route("/healthz", get(probes::healthz))
+        .route("/readyz", get(probes::readyz))
+        .route("/metrics", get(probes::metrics));
 
     open.merge(gated).with_state(state)
 }

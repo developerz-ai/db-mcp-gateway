@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
+use metrics::gauge;
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow, PgSslMode};
@@ -83,6 +84,12 @@ impl PoolRegistry {
             .await
             .map_err(|_| ExecError::Connection)?;
 
+        // Single label `db = "<server>/<database>"` — bounded cardinality
+        // (declared in config, no user input). Live connection count would
+        // need a polling task; reporting the configured max is the cheap
+        // first signal for "pool exists for this db".
+        gauge!("pool_size", "db" => format!("{}/{}", server.name, database.name))
+            .set(DEFAULT_POOL_MAX_CONNECTIONS as f64);
         writer.insert(key, pool.clone());
         Ok(pool)
     }

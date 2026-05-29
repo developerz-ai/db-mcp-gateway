@@ -8,8 +8,10 @@ use db_mcp_gateway::audit;
 use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
 use db_mcp_gateway::config::ConfigFile;
 use db_mcp_gateway::exec::PoolRegistry;
+use db_mcp_gateway::transport::probes::ShutdownFlag;
 use db_mcp_gateway::transport::{AppState, AuthFacade, PendingFlows};
 use db_mcp_gateway::{config::Config, state, transport};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use sqlx::PgPool;
 use tracing_subscriber::EnvFilter;
 
@@ -47,12 +49,21 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     let auth_config = AuthConfig::from_env()?;
 
+    // Install the Prometheus recorder before anything starts emitting metrics.
+    // `install_recorder` registers a process-wide global — any later install
+    // (e.g. from a test harness sharing the binary) would fail, which is why
+    // tests bootstrap with `AppState::for_tests()` (no recorder).
+    let metrics_handle = PrometheusBuilder::new()
+        .install_recorder()
+        .map_err(|err| anyhow::anyhow!("failed to install Prometheus recorder: {err}"))?;
+
     let state_db = state::connect(&config.state_db.url, config.state_db.pool_size).await?;
     tracing::info!(
         pool_size = config.state_db.pool_size,
         "state DB connected, migrations applied"
     );
 
+    let shutdown = ShutdownFlag::new();
     let sessions = SessionStore::new(state_db.clone());
     let oidc = OidcClient::new(auth_config.clone())?;
     let app_state = AppState {
@@ -65,6 +76,8 @@ async fn main() -> anyhow::Result<()> {
         config: Arc::new(config_file),
         pool_registry: PoolRegistry::new(),
         state_db: Some(state_db.clone()),
+        shutdown: shutdown.clone(),
+        metrics: Some(metrics_handle),
     };
 
     // Spawn the audit retention pruner. Ticks hourly, deletes rows older
@@ -88,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(shutdown_signal(shutdown))
     .await?;
 
     Ok(())
@@ -117,8 +130,10 @@ fn spawn_audit_pruner(pool: PgPool, ttl_days: u32) {
 }
 
 /// Resolve when the process receives Ctrl-C or (on Unix) SIGTERM, so containers
-/// drain cleanly on `docker stop`.
-async fn shutdown_signal() {
+/// drain cleanly on `docker stop`. Flips `shutdown` *before* axum starts
+/// draining, so `/healthz` and `/readyz` go 503 in time for k8s to pull the
+/// pod out of the Service endpoint set.
+async fn shutdown_signal(shutdown: ShutdownFlag) {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
             // Handler install failed — don't let this resolve, or `select!` would
@@ -149,6 +164,7 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
 
+    shutdown.trigger();
     tracing::info!("shutdown signal received");
 }
 
