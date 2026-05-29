@@ -12,7 +12,7 @@ servers:
   - name: worker-db
     kind: postgres
     description: "Shared CNPG cluster on worker-1 (app + infra tenants)"
-    host: postgres-rw.postgres.svc.cluster.local
+    host: worker-db-rw.db.internal
     port: 5432
     tls: required
     databases:
