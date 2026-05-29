@@ -27,7 +27,7 @@ Boot-time validation (issue #16):
 
 > Other top-level keys (`gateway:`, `auth:`, `logging:`) are accepted for
 > forward-compat with the full spec but not parsed. Their settings come from
-> environment variables today — see `.env.example`.
+> environment variables today — see [`.env.example`](../../.env.example).
 
 ## Server
 
