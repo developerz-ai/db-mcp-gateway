@@ -36,10 +36,8 @@ servers:
         role: mcp_gateway_prod_app_ro
         password: vault:secret/prod/db/app_ro_password
         description: "Main customer-facing app DB"
-        # `sql_capture` and `pool:` are in the spec (docs/initial-idea/08-config.md)
-        # but not yet enforced — the parser rejects them today rather than letting
-        # an operator think they're tuned. They re-land when the relevant issues
-        # ship (sql_capture with full audit policies; pool with config-driven sizing).
+        # `sql_capture` and `pool:` are in the spec but not yet enforced.
+        # Parser rejects them until the features ship. See docs/initial-idea/08-config.md.
         # sql_capture: redacted          # planned: full | redacted | metadata_only
         # pool:
         #   max_connections: 5
