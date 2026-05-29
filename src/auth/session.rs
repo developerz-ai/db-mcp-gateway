@@ -174,6 +174,10 @@ impl SessionStore {
             revoked_at: None,
         };
         self.cache.write().await.insert(id, session.clone());
+        // `active_sessions` drifts on natural TTL expiry — only explicit
+        // revoke decrements. Operators reading this should treat it as a
+        // floor on real session count, not an exact number.
+        metrics::gauge!("active_sessions").increment(1.0);
         Ok(session)
     }
 
@@ -211,11 +215,19 @@ impl SessionStore {
 
     /// Mark a session revoked in the DB and drop it from cache. Idempotent.
     pub async fn revoke(&self, id: SessionId) -> Result<(), AuthError> {
-        sqlx::query("UPDATE sessions SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL")
-            .bind(Uuid::from(id))
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE sessions SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(Uuid::from(id))
+        .execute(&self.pool)
+        .await?;
         self.cache.write().await.remove(&id);
+        // Only decrement on real revocation — the `AND revoked_at IS NULL`
+        // guard makes a double-logout a no-op at the DB, and we mirror that
+        // here so the gauge can't go negative on idempotent revoke calls.
+        if result.rows_affected() > 0 {
+            metrics::gauge!("active_sessions").decrement(1.0);
+        }
         Ok(())
     }
 }

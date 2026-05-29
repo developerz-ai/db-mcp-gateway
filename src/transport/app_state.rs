@@ -13,8 +13,10 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
+use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::PgPool;
 
+use super::probes::ShutdownFlag;
 use crate::auth::{AuthConfig, OidcClient, SessionStore};
 use crate::config::ConfigFile;
 use crate::exec::PoolRegistry;
@@ -34,6 +36,12 @@ pub struct AppState {
     /// Gateway's own state DB. Tools that audit (`run_query`) need it; tests
     /// that only exercise the wire protocol leave it `None`.
     pub state_db: Option<PgPool>,
+    /// Flipped by the graceful-shutdown handler so `/healthz` and `/readyz`
+    /// return 503 while in-flight requests drain.
+    pub shutdown: ShutdownFlag,
+    /// Prometheus recorder handle. `None` in tests — installing the recorder
+    /// is a process-wide singleton and would clash across test binaries.
+    pub metrics: Option<PrometheusHandle>,
 }
 
 impl AppState {
@@ -49,6 +57,8 @@ impl AppState {
             }),
             pool_registry: PoolRegistry::new(),
             state_db: None,
+            shutdown: ShutdownFlag::new(),
+            metrics: None,
         }
     }
 }

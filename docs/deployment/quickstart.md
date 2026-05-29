@@ -11,7 +11,7 @@ This gateway is mid-build (see [../initial-idea/11-roadmap.md](../initial-idea/1
 | Capability | Status |
 |---|---|
 | MCP tools, OIDC login, per-DB pools, synchronous audit | works |
-| `/healthz`, `/readyz`, `/metrics` | planned — [#13](https://github.com/developerz-ai/db-mcp-gateway/issues/13) |
+| `/healthz`, `/readyz`, `/metrics` | **works** — [#13](https://github.com/developerz-ai/db-mcp-gateway/issues/13). k8s probes + Prometheus scrape; see [Probes & metrics](#probes--metrics) below |
 | In-process TLS | planned — [#12](https://github.com/developerz-ai/db-mcp-gateway/issues/12); front with a TLS-terminating proxy meanwhile |
 | `${ENV:NAME}` + `${FILE:/path}` secret refs | **works** — resolved at boot ([#15](https://github.com/developerz-ai/db-mcp-gateway/issues/15)); an unset env or missing file aborts startup |
 | `vault:` / `aws-sm:` / `gcp-sm:` secret backends | recognised but **not implemented** — these abort at boot until the backends land |
@@ -301,7 +301,48 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://db.internal.acme.com/mc
 # 401
 ```
 
-> Dedicated `/healthz` `/readyz` `/metrics` endpoints are planned in [#13](https://github.com/developerz-ai/db-mcp-gateway/issues/13). Until then, watch `docker compose logs gateway` for `db-mcp-gateway listening` and use the `401` probe above for liveness.
+For richer signals use the dedicated endpoints below.
+
+## Probes & metrics
+
+Three unauthenticated ops endpoints, mounted alongside `/mcp`:
+
+| Endpoint | Returns | What's behind it |
+|---|---|---|
+| `/healthz` | `200 ok` while running; `503 shutting down` once the process catches SIGTERM/Ctrl-C | Process liveness only — does not touch the state DB |
+| `/readyz` | `200 ok` when the state DB answers `SELECT 1` within 2s; `503` otherwise (or during shutdown) | Pulls the pod out of the Service endpoint set on transient DB outages, no restart |
+| `/metrics` | Prometheus text exposition (`text/plain; version=0.0.4`) | `tool_calls{tool,outcome}`, `query_duration_seconds`, `audit_write_duration_seconds`, `active_sessions`, `pool_size{db}` |
+
+### k8s probes
+
+```yaml
+livenessProbe:
+  httpGet: { path: /healthz, port: 8443 }
+  initialDelaySeconds: 5
+  periodSeconds: 10
+readinessProbe:
+  httpGet: { path: /readyz, port: 8443 }
+  initialDelaySeconds: 5
+  periodSeconds: 5
+```
+
+### Prometheus scrape
+
+```yaml
+- job_name: db-mcp-gateway
+  metrics_path: /metrics
+  static_configs:
+    - targets: ['db-mcp-gateway.gateway.svc:8443']
+```
+
+Smoke test:
+
+```bash
+curl -s https://db.internal.acme.com/metrics | head
+# # TYPE tool_calls counter
+# tool_calls{tool="list_servers",outcome="success"} 4
+# …
+```
 
 Then add the gateway to your own Claude Code and try a query — see [../usage/claude-code.md](../usage/claude-code.md).
 
