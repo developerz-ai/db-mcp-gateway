@@ -15,7 +15,8 @@ This gateway is mid-build (see [../initial-idea/11-roadmap.md](../initial-idea/1
 | In-process TLS | planned — [#12](https://github.com/developerz-ai/db-mcp-gateway/issues/12); front with a TLS-terminating proxy meanwhile |
 | `${ENV:NAME}` + `${FILE:/path}` secret refs | **works** — resolved at boot ([#15](https://github.com/developerz-ai/db-mcp-gateway/issues/15)); an unset env or missing file aborts startup |
 | `vault:` / `aws-sm:` / `gcp-sm:` secret backends | recognised but **not implemented** — these abort at boot until the backends land |
-| Single unified `config.yml` | planned — [#16](https://github.com/developerz-ai/db-mcp-gateway/issues/16). **Today the `--config` file carries `servers:` + `permissions:` only**; `gateway:` / `auth:` / `logging:` come from environment variables (see below) |
+| Strict config validation | **works** — [#16](https://github.com/developerz-ai/db-mcp-gateway/issues/16): an unknown/misspelled key under `servers`/`databases`/`permissions`/`grants`/`constraints` aborts boot with a `line:column` pointer. Full key list: [config-reference.md](config-reference.md) |
+| Unified `config.yml` | **not yet** — the `--config` file carries `servers:` + `permissions:` only; `gateway:` / `auth:` / `logging:` are accepted-but-ignored and come from environment variables today (see below) |
 | `gateway admin …` subcommands | planned — phase 8 |
 
 ## Run it locally
@@ -28,7 +29,7 @@ git clone https://github.com/developerz-ai/db-mcp-gateway && cd db-mcp-gateway
 cp .env.example .env
 bin/dev up
 
-# 2. write a minimal config — servers + permissions only (the rest is env, until #16)
+# 2. write a minimal config — servers + permissions only (state DB + OIDC come from env)
 cat > config.yml <<'YAML'
 servers:
   - name: local
@@ -85,7 +86,7 @@ Tear down with `bin/dev down` (add `reset` to wipe the volumes).
 
 ### The environment variables the gateway reads
 
-Until the unified YAML lands ([#16](https://github.com/developerz-ai/db-mcp-gateway/issues/16)), these come from the environment, not the `--config` file:
+The env→YAML unification is still pending, so these come from the environment, not the `--config` file:
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -185,7 +186,7 @@ Note the `client_id` and `client_secret`.
 
 ## 3. Configure the gateway
 
-Drop `config.yml` somewhere — full target shape below. **Heads-up (until [#16](https://github.com/developerz-ai/db-mcp-gateway/issues/16)):** the running binary reads only `servers:` and `permissions:` from this file; the `gateway:` / `auth:` / `logging:` blocks shown here are the planned shape but today come from environment variables (see the env table above). `databases[*].password` accepts `${ENV:NAME}`, `${FILE:/path}`, or a `vault:`/`aws-sm:`/`gcp-sm:` ref — all resolved at boot.
+Drop `config.yml` somewhere — full target shape below. **Heads-up:** the running binary reads only `servers:` and `permissions:` from this file; the `gateway:` / `auth:` / `logging:` blocks shown here are the planned shape but are accepted-but-ignored today and come from environment variables (see the env table above). Unknown keys *inside* `servers`/`databases`/`permissions`/`grants`/`constraints` abort boot ([#16](https://github.com/developerz-ai/db-mcp-gateway/issues/16)). `databases[*].password` accepts `${ENV:NAME}`, `${FILE:/path}`, or a `vault:`/`aws-sm:`/`gcp-sm:` ref — all resolved at boot.
 
 ```yaml
 gateway:
@@ -214,8 +215,10 @@ servers:
       - name: app
         role: mcp_gateway_prod_app_ro
         password: ${ENV:PROD_APP_RO_PASSWORD}   # or ${FILE:/run/secrets/prod-app-ro}
-        sql_capture: redacted
-        pool: { max_connections: 5 }
+        # sql_capture / pool are in the spec but not enforced yet; the parser
+        # rejects unknown keys (#16), so keep them commented until they ship:
+        # sql_capture: redacted
+        # pool: { max_connections: 5 }
 
 permissions:
   - group: backend-engineers
