@@ -13,7 +13,13 @@ use serde::Deserialize;
 
 use super::secret::Password;
 
+/// `deny_unknown_fields` turns a misspelled key (e.g. `databasses:` instead
+/// of `databases:`) into a boot-time error pointing at the line, instead of
+/// silently dropping the value — see issue #16. Top-level `ConfigFile` stays
+/// lenient because it carries un-modeled `gateway:` / `auth:` / `logging:`
+/// sections; strictness there waits for the env→YAML unification.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Server {
     pub name: String,
     pub kind: ServerKind,
@@ -47,6 +53,7 @@ pub enum Tls {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Database {
     pub name: String,
     pub role: String,
@@ -56,6 +63,7 @@ pub struct Database {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Permission {
     pub group: String,
     #[serde(default)]
@@ -63,6 +71,7 @@ pub struct Permission {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Grant {
     pub server: String,
     pub database: String,
@@ -79,6 +88,7 @@ pub struct Grant {
 /// `authz::Constraints` because the spec is clearest about merge in that
 /// context (most-restrictive-wins).
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Constraints {
     #[serde(default)]
     pub require_reason: bool,
