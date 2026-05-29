@@ -31,11 +31,12 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let config_file = ConfigFile::from_file(&cli.config)?;
-    // Spec 05 §"resolved at config load": every ${ENV:…} / ${FILE:…} ref must
-    // resolve cleanly here, or we refuse to start. A boot abort is a clearer
-    // operator signal than the user's first query failing on connect.
-    config_file.resolve_secrets()?;
+    // Spec 05 §"resolved at config load": `load` parses, validates, AND
+    // resolves every ${ENV:…} / ${FILE:…} ref in one shot. A boot abort is a
+    // clearer operator signal than the user's first query failing on connect,
+    // and folding resolve into the load helper makes it impossible to ship a
+    // SIGHUP path that forgets to re-resolve.
+    let config_file = ConfigFile::load(&cli.config)?;
     tracing::info!(
         path = %cli.config.display(),
         servers = config_file.servers.len(),

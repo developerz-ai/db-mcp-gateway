@@ -14,7 +14,7 @@ pub mod yaml;
 
 pub use schema::{Action, Constraints, Database, Grant, Permission, Server, ServerKind, Tls};
 pub use secret::{Password, SecretError};
-pub use yaml::{ConfigFile, ConfigFileError};
+pub use yaml::{ConfigFile, ConfigFileError, ConfigLoadError};
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 

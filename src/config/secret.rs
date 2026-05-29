@@ -77,8 +77,12 @@ impl<'de> Deserialize<'de> for Password {
 /// value.
 #[derive(Debug, thiserror::Error)]
 pub enum SecretError {
-    #[error("malformed secret reference `{0}`: expected `${{ENV:NAME}}` or `${{FILE:/path}}`")]
-    Malformed(String),
+    // No payload: a typo like `${hunter2}` would otherwise echo the
+    // (likely-literal) plaintext into a boot error / log, breaking the
+    // no-secrets-in-errors invariant. Operators get the shape-hint they need
+    // from the message; the actual offending bytes stay inside the config.
+    #[error("malformed secret reference: expected `${{ENV:NAME}}` or `${{FILE:/path}}`")]
+    Malformed,
 
     #[error("env var `{0}` referenced in config but not set in process environment")]
     EnvNotSet(String),
@@ -108,17 +112,17 @@ impl Password {
         if let Some(inner) = s.strip_prefix("${").and_then(|r| r.strip_suffix('}')) {
             if let Some(name) = inner.strip_prefix("ENV:") {
                 if name.is_empty() {
-                    return Err(SecretError::Malformed(s.to_string()));
+                    return Err(SecretError::Malformed);
                 }
                 return Ok(Password::EnvVar(name.to_string()));
             }
             if let Some(path) = inner.strip_prefix("FILE:") {
                 if path.is_empty() {
-                    return Err(SecretError::Malformed(s.to_string()));
+                    return Err(SecretError::Malformed);
                 }
                 return Ok(Password::File(PathBuf::from(path)));
             }
-            return Err(SecretError::Malformed(s.to_string()));
+            return Err(SecretError::Malformed);
         }
         if let Some((scheme, reference)) = s.split_once(':') {
             // Only treat as a backend reference when the scheme is recognised.
@@ -230,7 +234,7 @@ mod tests {
             "${}",                 // empty
         ] {
             assert!(
-                matches!(Password::parse(bad), Err(SecretError::Malformed(_))),
+                matches!(Password::parse(bad), Err(SecretError::Malformed)),
                 "expected `{bad}` to be rejected as malformed"
             );
         }
@@ -335,10 +339,13 @@ mod tests {
     }
 
     /// Defends the no-creds-in-Display rule across every error variant.
+    /// Includes a `Malformed` case to defend the no-payload contract: even if
+    /// a typo'd ref were the literal plaintext (e.g. `${hunter2}`), the error
+    /// message must not echo it back.
     #[test]
     fn errors_never_print_resolved_plaintext() {
         let cases = [
-            SecretError::Malformed("${weird}".into()),
+            SecretError::Malformed,
             SecretError::EnvNotSet("MY_VAR".into()),
             SecretError::EnvNotUtf8("MY_VAR".into()),
             SecretError::FileEmpty(PathBuf::from("/run/secrets/x")),

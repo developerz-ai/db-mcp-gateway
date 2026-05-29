@@ -38,7 +38,46 @@ pub enum ConfigFileError {
     Invalid(String),
 }
 
+/// Composite error returned by the canonical `ConfigFile::load*` path. Combines
+/// parse/validate failures with secret-resolution failures so callers (i.e.
+/// `main`) get a single `?` boundary and can't accidentally start with a
+/// half-loaded config.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigLoadError {
+    #[error(transparent)]
+    File(#[from] ConfigFileError),
+    #[error(transparent)]
+    Secret(#[from] SecretError),
+}
+
 impl ConfigFile {
+    /// Canonical "load and fully validate" entry point — parses, validates,
+    /// and resolves every secret reference. The boot path (`main`) and any
+    /// future `SIGHUP` reload MUST use this so it's impossible to start with
+    /// unresolved `${ENV:…}` / `${FILE:…}` refs lingering.
+    ///
+    /// Prefer this over `from_file` + `resolve_secrets`: the two-step path
+    /// is parse-only and exists for tests and inspection tooling.
+    pub fn load(path: &Path) -> Result<Self, ConfigLoadError> {
+        let parsed = Self::from_file(path)?;
+        parsed.resolve_secrets()?;
+        Ok(parsed)
+    }
+
+    /// String-input twin of `load`. Same fail-fast contract; useful for
+    /// in-memory configs (tests with literal passwords, `SIGHUP` reload
+    /// once the watcher hands us the new YAML).
+    pub fn load_yaml_str(raw: &str) -> Result<Self, ConfigLoadError> {
+        let parsed = Self::from_yaml_str(raw)?;
+        parsed.resolve_secrets()?;
+        Ok(parsed)
+    }
+
+    /// Parse + structural validation only. **Does not resolve secrets** —
+    /// the returned `ConfigFile` will silently carry unresolved `${ENV:…}` /
+    /// `${FILE:…}` references. Use `load` for the boot path; this helper is
+    /// for tests and config-inspection tooling that intentionally want to
+    /// look at the parsed structure without touching the host environment.
     pub fn from_file(path: &Path) -> Result<Self, ConfigFileError> {
         let raw = std::fs::read_to_string(path).map_err(|source| ConfigFileError::Read {
             path: path.to_path_buf(),
@@ -53,6 +92,8 @@ impl ConfigFile {
         })
     }
 
+    /// Parse + structural validation only. See `from_file` for the contract;
+    /// use `load_yaml_str` for the fail-fast variant.
     pub fn from_yaml_str(raw: &str) -> Result<Self, ConfigFileError> {
         let parsed: ConfigFile =
             serde_yaml::from_str(raw).map_err(|source| ConfigFileError::Parse {
@@ -66,8 +107,13 @@ impl ConfigFile {
     /// Resolve every secret reference declared under `servers:`, fail fast
     /// on the first unresolved one. Per spec 05/08: the gateway must refuse
     /// to start rather than fail noisily on the user's first query. Returns
-    /// the typed `SecretError` directly so callers (main, tests) see exactly
-    /// which env var or file went wrong.
+    /// the typed `SecretError` directly so callers (tests, the `SIGHUP`
+    /// reload path) see exactly which env var or file went wrong.
+    ///
+    /// `load` / `load_yaml_str` call this for you; reach for `resolve_secrets`
+    /// directly only when re-resolving an already-parsed config (e.g. a
+    /// hot-reload watcher that wants to check rotated `${FILE:…}` mounts
+    /// without re-parsing the YAML).
     ///
     /// Idempotent and side-effect-free against the config — the resolved
     /// plaintext is dropped immediately. Pool open re-resolves so file
@@ -328,6 +374,62 @@ permissions:
       - { server: "*", database: app, action: query_read }
 "#;
         ConfigFile::from_yaml_str(yaml).expect("wildcard server + existing db is valid");
+    }
+
+    /// `load_yaml_str` is the canonical boot path: parse failure AND
+    /// unresolved-secret failure both bubble out the same `?`, so `main`
+    /// (and future `SIGHUP`) can't accidentally start with half-loaded state.
+    #[test]
+    fn load_yaml_str_aborts_on_unresolved_secret() {
+        let yaml = r#"
+servers:
+  - name: s
+    kind: postgres
+    host: h
+    databases:
+      - { name: d, role: ro, password: vault:secret/x }
+"#;
+        // Vault backend isn't implemented → resolve fails → load fails.
+        let err = ConfigFile::load_yaml_str(yaml).expect_err("vault ref must abort load");
+        assert!(
+            matches!(
+                err,
+                ConfigLoadError::Secret(SecretError::BackendNotImplemented(_))
+            ),
+            "expected ConfigLoadError::Secret(BackendNotImplemented), got {err:?}"
+        );
+    }
+
+    /// Parse errors from `load_yaml_str` come through the same composite
+    /// error — callers see one type at the boundary, not two.
+    #[test]
+    fn load_yaml_str_surfaces_parse_errors() {
+        let yaml = r#"
+servers:
+  - { name: dup, kind: postgres, host: a }
+  - { name: dup, kind: postgres, host: b }
+"#;
+        let err = ConfigFile::load_yaml_str(yaml).expect_err("duplicate names rejected");
+        assert!(
+            matches!(err, ConfigLoadError::File(ConfigFileError::Invalid(_))),
+            "expected ConfigLoadError::File(Invalid), got {err:?}"
+        );
+    }
+
+    /// Literals resolve trivially, so `load_yaml_str` returns the same
+    /// `ConfigFile` shape as `from_yaml_str` for the happy path.
+    #[test]
+    fn load_yaml_str_succeeds_with_literal_passwords() {
+        let yaml = r#"
+servers:
+  - name: s
+    kind: postgres
+    host: h
+    databases:
+      - { name: d, role: ro, password: hunter2 }
+"#;
+        let cfg = ConfigFile::load_yaml_str(yaml).expect("literal passwords resolve");
+        assert_eq!(cfg.servers.len(), 1);
     }
 
     #[test]

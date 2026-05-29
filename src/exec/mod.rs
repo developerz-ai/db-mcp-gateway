@@ -120,23 +120,20 @@ fn resolve_password(password: &Password) -> Result<String, ExecError> {
                 reference: path.display().to_string(),
             }
         }
-        SecretError::BackendNotImplemented(scheme) => {
-            let kind: &'static str = match scheme.as_str() {
-                "vault" => "vault",
-                "aws-sm" => "aws-sm",
-                "gcp-sm" => "gcp-sm",
-                _ => "unknown",
-            };
-            ExecError::PasswordUnresolved {
-                kind,
-                reference: String::new(),
-            }
-        }
+        // Keep the stable `(kind, reference)` tool-facing shape: `kind` is the
+        // category, the scheme goes into `reference`. Emitting `kind: "vault"`
+        // would force tool callers to match on every supported backend name.
+        SecretError::BackendNotImplemented(scheme) => ExecError::PasswordUnresolved {
+            kind: "backend",
+            reference: scheme,
+        },
         // Malformed refs are caught at YAML parse time, never reach here —
-        // but stay structured rather than panic if invariants drift.
-        SecretError::Malformed(raw) => ExecError::PasswordUnresolved {
+        // but stay structured rather than panic if invariants drift. No
+        // payload is available (and intentionally so: the raw token could
+        // be a typo'd plaintext password — see `SecretError::Malformed`).
+        SecretError::Malformed => ExecError::PasswordUnresolved {
             kind: "malformed",
-            reference: raw,
+            reference: String::new(),
         },
     })
 }
@@ -356,13 +353,19 @@ mod tests {
             Err(ExecError::PasswordUnresolved { kind: "env", .. })
         ));
 
-        assert!(matches!(
-            resolve_password(&Password::SecretBackend {
-                scheme: "vault".into(),
-                reference: "secret/path".into()
-            }),
-            Err(ExecError::PasswordUnresolved { kind: "vault", .. })
-        ));
+        // `kind: "backend"` keeps the tool-facing shape stable across
+        // backends; the scheme rides along in `reference` so operators can
+        // still tell vault from aws-sm in logs.
+        match resolve_password(&Password::SecretBackend {
+            scheme: "vault".into(),
+            reference: "secret/path".into(),
+        }) {
+            Err(ExecError::PasswordUnresolved { kind, reference }) => {
+                assert_eq!(kind, "backend");
+                assert_eq!(reference, "vault");
+            }
+            other => panic!("expected PasswordUnresolved {{ kind: backend, .. }}, got {other:?}"),
+        }
     }
 
     #[test]
