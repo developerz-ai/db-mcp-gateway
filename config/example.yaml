@@ -1,20 +1,27 @@
 # Example gateway config. Copy to config.yaml, fill in, point the gateway at it with --config.
 # Schema and validation rules: docs/initial-idea/08-config.md
-# Secrets references: ${ENV}, vault:path, aws-sm:arn:..., gcp-sm:projects/.../secrets/...
+#
+# Secret references (resolved at startup; unresolved refs abort boot):
+#   ${ENV:VAR_NAME}           process environment lookup
+#   ${FILE:/run/secrets/foo}  file contents (sealed-secret mount, k8s file projection, etc.)
+#   vault:secret/path         secret backend — recognised, not implemented (boot aborts)
+#   aws-sm:arn:...            secret backend — recognised, not implemented (boot aborts)
+#   gcp-sm:projects/...       secret backend — recognised, not implemented (boot aborts)
+# Anything else is taken as an inline literal (dev/test only).
 
 gateway:
   bind: 0.0.0.0:8443
   external_url: https://db.internal.example.com
   env: production              # 'production' rejects inline literal secrets
   state_db:
-    url: ${STATE_DB_URL}
+    url: ${ENV:STATE_DB_URL}
     pool_size: 10
 
 auth:
   oidc:
     issuer: https://example.okta.com
-    client_id: ${OIDC_CLIENT_ID}
-    client_secret: ${OIDC_CLIENT_SECRET}
+    client_id: ${ENV:OIDC_CLIENT_ID}
+    client_secret: ${ENV:OIDC_CLIENT_SECRET}
     groups_claim: groups
     session_ttl_hours: 8
 
@@ -50,7 +57,9 @@ servers:
     databases:
       - name: app
         role: mcp_gateway_staging_app_ro
-        password: ${STAGING_APP_RO_PASSWORD}
+        # File mount: pair with a Kubernetes Secret + volumeMount or a
+        # sealed-secret. Refer to deployment docs for the helm/kustomize bit.
+        password: ${FILE:/run/secrets/staging-app-ro-password}
         pool:
           max_connections: 5
 

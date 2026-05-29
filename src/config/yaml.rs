@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use super::schema::{Permission, Server};
+use super::secret::SecretError;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfigFile {
@@ -60,6 +61,26 @@ impl ConfigFile {
             })?;
         parsed.validate()?;
         Ok(parsed)
+    }
+
+    /// Resolve every secret reference declared under `servers:`, fail fast
+    /// on the first unresolved one. Per spec 05/08: the gateway must refuse
+    /// to start rather than fail noisily on the user's first query. Returns
+    /// the typed `SecretError` directly so callers (main, tests) see exactly
+    /// which env var or file went wrong.
+    ///
+    /// Idempotent and side-effect-free against the config — the resolved
+    /// plaintext is dropped immediately. Pool open re-resolves so file
+    /// rotation still works without a restart.
+    pub fn resolve_secrets(&self) -> Result<(), SecretError> {
+        for server in &self.servers {
+            for db in &server.databases {
+                // Resolved value is dropped right here — never stored,
+                // never logged.
+                let _ = db.password.resolve()?;
+            }
+        }
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), ConfigFileError> {

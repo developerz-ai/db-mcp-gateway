@@ -101,25 +101,44 @@ fn build_connect_options(server: &Server, database: &Database, password: &str) -
         })
 }
 
+/// Adapt `Password::resolve` into `ExecError`. The boot-time walk in
+/// `ConfigFile::resolve_secrets` already failed fast on every unresolvable
+/// ref — but pools are opened lazily, so a `${FILE:…}` mount that disappears
+/// after boot (rotation gone wrong) still needs a structured error here.
 fn resolve_password(password: &Password) -> Result<String, ExecError> {
-    match password {
-        Password::Literal(s) => Ok(s.clone()),
-        Password::EnvVar(name) => std::env::var(name).map_err(|_| ExecError::PasswordUnresolved {
-            kind: "env",
-            reference: name.clone(),
-        }),
-        // vault: / aws-sm: / gcp-sm: resolution lands with #5. Until then we
-        // surface a structured error rather than silently failing the connect.
-        Password::SecretBackend { scheme, reference } => Err(ExecError::PasswordUnresolved {
-            kind: match scheme.as_str() {
+    use crate::config::SecretError;
+    password.resolve().map_err(|err| match err {
+        SecretError::EnvNotSet(name) | SecretError::EnvNotUtf8(name) => {
+            ExecError::PasswordUnresolved {
+                kind: "env",
+                reference: name,
+            }
+        }
+        SecretError::FileUnreadable { path, .. } | SecretError::FileEmpty(path) => {
+            ExecError::PasswordUnresolved {
+                kind: "file",
+                reference: path.display().to_string(),
+            }
+        }
+        SecretError::BackendNotImplemented(scheme) => {
+            let kind: &'static str = match scheme.as_str() {
                 "vault" => "vault",
                 "aws-sm" => "aws-sm",
                 "gcp-sm" => "gcp-sm",
                 _ => "unknown",
-            },
-            reference: reference.clone(),
-        }),
-    }
+            };
+            ExecError::PasswordUnresolved {
+                kind,
+                reference: String::new(),
+            }
+        }
+        // Malformed refs are caught at YAML parse time, never reach here —
+        // but stay structured rather than panic if invariants drift.
+        SecretError::Malformed(raw) => ExecError::PasswordUnresolved {
+            kind: "malformed",
+            reference: raw,
+        },
+    })
 }
 
 /// Typed execution errors. `Display` carries no secrets, hostnames, or

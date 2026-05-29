@@ -32,11 +32,15 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let config_file = ConfigFile::from_file(&cli.config)?;
+    // Spec 05 §"resolved at config load": every ${ENV:…} / ${FILE:…} ref must
+    // resolve cleanly here, or we refuse to start. A boot abort is a clearer
+    // operator signal than the user's first query failing on connect.
+    config_file.resolve_secrets()?;
     tracing::info!(
         path = %cli.config.display(),
         servers = config_file.servers.len(),
         permissions = config_file.permissions.len(),
-        "config loaded"
+        "config loaded; all secret refs resolved"
     );
 
     let config = Config::from_env()?;

@@ -411,6 +411,7 @@ dependencies = [
  "serde_yaml",
  "sqlparser",
  "sqlx",
+ "tempfile",
  "thiserror",
  "tokio",
  "tower",
