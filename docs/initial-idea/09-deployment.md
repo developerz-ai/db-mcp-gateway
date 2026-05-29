@@ -21,7 +21,7 @@ services:
       OIDC_CLIENT_ID: ${OIDC_CLIENT_ID}
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET}
     volumes:
-      - ./config.yaml:/etc/db-mcp-gateway/config.yaml:ro
+      - ./config.yml:/etc/gateway/config.yml:ro
     depends_on: [state-db]
 
   state-db:

@@ -84,7 +84,7 @@ logging:
 
 ## Resolution order
 
-1. File at `--config` flag, else `$DB_MCP_GATEWAY_CONFIG`, else `/etc/db-mcp-gateway/config.yaml`.
+1. File at `--config` flag, else `$DB_MCP_GATEWAY_CONFIG`, else `/etc/gateway/config.yml`.
 2. `${ENV:NAME}` placeholders expanded from process env; `${FILE:/path}` placeholders read from disk (trailing newline stripped). Unresolved or empty refs abort boot.
 3. `vault:`, `aws-sm:`, `gcp-sm:` references resolved from the named backend (when backend integrations land — until then, recognised refs also abort boot rather than silently failing at first DB connect).
 4. Final config validated against the schema. Errors at this stage refuse to start the process — no half-loaded state.

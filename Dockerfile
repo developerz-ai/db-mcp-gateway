@@ -23,7 +23,13 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 WORKDIR /app
 
 COPY --from=builder /src/target/release/db-mcp-gateway /usr/local/bin/db-mcp-gateway
-COPY --from=builder /src/config/example.yaml /etc/db-mcp-gateway/example.yaml
+# Reference copy. The live config is mounted at /etc/gateway/config.yml.
+COPY --from=builder /src/config/example.yaml /etc/gateway/example.yaml
+
+# Canonical config path. Supplied via the --config env fallback (clap), so a
+# bare `docker run -v ./config.yml:/etc/gateway/config.yml ...` boots, while
+# extra CLI flags still compose and an explicit `--config <path>` overrides.
+ENV DB_MCP_GATEWAY_CONFIG=/etc/gateway/config.yml
 
 EXPOSE 8443
 USER nonroot
