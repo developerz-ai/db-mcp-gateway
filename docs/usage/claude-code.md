@@ -67,6 +67,37 @@ What databases can I see through db-gateway?
 
 The agent will call `list_servers` / `list_databases` and show you what your group has access to. If you see nothing, you're authenticated but not in any group that has grants — talk to your platform team about adding you to one.
 
+### Your first query, end to end
+
+A real transcript. You stay in natural language; the agent picks the tools and the gateway audits every call under your SSO identity.
+
+```text
+You:    Which staging databases can I reach, and what's in the users table?
+
+Claude: [calls list_servers]        → staging (postgres)
+        [calls list_databases]      → staging/app
+        [calls describe_schema staging/app, table=users]
+
+        staging/app.users has:
+        | column     | type        |
+        |------------|-------------|
+        | id         | bigint      |
+        | email      | text        |
+        | created_at | timestamptz |
+        | status     | text        |
+
+You:    How many signed up in the last 7 days?
+
+Claude: [calls run_query staging/app]
+          select count(*) from users where created_at > now() - interval '7 days';
+
+        → 412
+
+        (returned in 38 ms; logged to the audit trail as your user)
+```
+
+Behind the scenes each step is a gateway tool call: `describe_schema` and `run_query` are gated by your group's grants, capped by the grant's `row_limit` / `statement_timeout_ms`, and written to the audit log before the result comes back.
+
 ## Daily use
 
 You don't invoke gateway tools directly. You talk to the agent in natural language and it picks the right tool:
