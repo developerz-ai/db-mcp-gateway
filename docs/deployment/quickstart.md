@@ -49,11 +49,14 @@ YAML
 # 3. run the gateway against the dev stack
 docker run --rm --network host \
   -e RUST_LOG=info \
+  -e DB_MCP_GATEWAY_CONFIG=/etc/gateway/config.yml \
   -e STATE_DB_URL='postgres://gateway:gateway-dev-only@localhost:5433/gateway' \
   -e TARGET_DB_PASSWORD='app-dev-only' \
   -v "$PWD/config.yml:/etc/gateway/config.yml:ro" \
   ghcr.io/developerz-ai/db-mcp-gateway:main
 ```
+
+The binary needs its config path. The published image bakes `DB_MCP_GATEWAY_CONFIG=/etc/gateway/config.yml` in (see [#10](https://github.com/developerz-ai/db-mcp-gateway/issues/10)), but passing it explicitly above keeps the recipe working for a locally-built image too — equivalently, append `--config /etc/gateway/config.yml` as a command argument.
 
 The `:main` tag is published on every push to `main` (see [#10](https://github.com/developerz-ai/db-mcp-gateway/issues/10)). Building from source instead? `docker build -t db-mcp-gateway:dev .` and swap that tag into the `docker run` above.
 
@@ -244,6 +247,7 @@ services:
     image: ghcr.io/developerz-ai/db-mcp-gateway:latest
     ports: ["8443:8443"]
     environment:
+      DB_MCP_GATEWAY_CONFIG: /etc/gateway/config.yml
       STATE_DB_URL: postgres://gateway:${STATE_DB_PW}@state-db:5432/gateway
       OIDC_CLIENT_ID: ${OIDC_CLIENT_ID}
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET}
