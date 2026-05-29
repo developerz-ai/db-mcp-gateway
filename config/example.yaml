@@ -36,18 +36,19 @@ servers:
         role: mcp_gateway_prod_app_ro
         password: vault:secret/prod/db/app_ro_password
         description: "Main customer-facing app DB"
-        sql_capture: redacted        # full | redacted | metadata_only
-        pool:
-          max_connections: 5
-          idle_timeout_seconds: 300
-          acquire_timeout_seconds: 10
+        # `sql_capture` and `pool:` are in the spec but not yet enforced.
+        # Parser rejects them until the features ship. See docs/initial-idea/08-config.md.
+        # sql_capture: redacted          # planned: full | redacted | metadata_only
+        # pool:
+        #   max_connections: 5
+        #   idle_timeout_seconds: 300
+        #   acquire_timeout_seconds: 10
 
       - name: billing
         role: mcp_gateway_prod_billing_ro
         password: vault:secret/prod/db/billing_ro_password
-        sql_capture: metadata_only
-        pool:
-          max_connections: 3
+        # sql_capture: metadata_only      # planned — see comment above
+        # pool: { max_connections: 3 }
 
   - name: staging
     kind: postgres
@@ -60,8 +61,7 @@ servers:
         # File mount: pair with a Kubernetes Secret + volumeMount or a
         # sealed-secret. Refer to deployment docs for the helm/kustomize bit.
         password: ${FILE:/run/secrets/staging-app-ro-password}
-        pool:
-          max_connections: 5
+        # pool: { max_connections: 5 }    # planned — see comment above
 
 permissions:
   - group: backend-engineers

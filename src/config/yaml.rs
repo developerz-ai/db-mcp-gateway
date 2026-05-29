@@ -28,14 +28,43 @@ pub enum ConfigFileError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to parse config file `{path}`")]
+    /// `Display` is the operator-facing line and we want it self-contained:
+    /// path, line:column (when serde_yaml supplies it), and the underlying
+    /// reason — including serde's `unknown field, expected one of …`
+    /// suggestion list. Chained via `source` so structured loggers still
+    /// walk the underlying `serde_yaml::Error`.
+    #[error("{path}{location}: {message}")]
     Parse {
         path: PathBuf,
+        /// `:line:column` when serde_yaml knows it, empty otherwise.
+        location: String,
+        /// Pre-rendered `source` text — keeps `Display` operator-friendly
+        /// without forcing every caller to walk the error chain.
+        message: String,
         #[source]
         source: serde_yaml::Error,
     },
     #[error("invalid config: {0}")]
     Invalid(String),
+}
+
+impl ConfigFileError {
+    /// Build a `Parse` error with location information extracted up-front.
+    /// Operators read `Display` first; making them dig through `source()`
+    /// for line numbers is the polish #16 is fixing.
+    fn parse_from(path: PathBuf, source: serde_yaml::Error) -> Self {
+        let location = source
+            .location()
+            .map(|loc| format!(":{}:{}", loc.line(), loc.column()))
+            .unwrap_or_default();
+        let message = source.to_string();
+        ConfigFileError::Parse {
+            path,
+            location,
+            message,
+            source,
+        }
+    }
 }
 
 /// Composite error returned by the canonical `ConfigFile::load*` path. Combines
@@ -84,8 +113,15 @@ impl ConfigFile {
             source,
         })?;
         Self::from_yaml_str(&raw).map_err(|err| match err {
-            ConfigFileError::Parse { source, .. } => ConfigFileError::Parse {
+            ConfigFileError::Parse {
+                location,
+                message,
+                source,
+                ..
+            } => ConfigFileError::Parse {
                 path: path.to_path_buf(),
+                location,
+                message,
                 source,
             },
             other => other,
@@ -95,11 +131,8 @@ impl ConfigFile {
     /// Parse + structural validation only. See `from_file` for the contract;
     /// use `load_yaml_str` for the fail-fast variant.
     pub fn from_yaml_str(raw: &str) -> Result<Self, ConfigFileError> {
-        let parsed: ConfigFile =
-            serde_yaml::from_str(raw).map_err(|source| ConfigFileError::Parse {
-                path: PathBuf::from("<inline>"),
-                source,
-            })?;
+        let parsed: ConfigFile = serde_yaml::from_str(raw)
+            .map_err(|source| ConfigFileError::parse_from(PathBuf::from("<inline>"), source))?;
         parsed.validate()?;
         Ok(parsed)
     }
@@ -446,5 +479,92 @@ servers:
             ConfigFile::from_yaml_str(yaml),
             Err(ConfigFileError::Invalid(_))
         ));
+    }
+
+    /// The headline example from #16: a typo in a `Constraints` field used to
+    /// be silently ignored (no timeout applied). Now it surfaces with the
+    /// misspelled key, the expected alternatives, and a line number.
+    #[test]
+    fn typo_in_constraint_field_is_rejected_with_line_and_suggestion() {
+        let yaml = "\
+servers:
+  - name: prod
+    kind: postgres
+    host: a
+    databases:
+      - { name: app, role: ro, password: x }
+permissions:
+  - group: g
+    grants:
+      - server: prod
+        database: app
+        action: query_read
+        constraints:
+          statemnt_timeout_ms: 5000
+";
+        let err = ConfigFile::from_yaml_str(yaml).expect_err("typo must be rejected");
+        let rendered = format!("{err}");
+        // Names the misspelled key, lists the right ones, and points at the line.
+        assert!(
+            rendered.contains("statemnt_timeout_ms"),
+            "missing misspelled key: {rendered}"
+        );
+        assert!(
+            rendered.contains("statement_timeout_ms"),
+            "missing suggestion: {rendered}"
+        );
+        // serde_yaml reports the line of the offending key. Exact column varies
+        // by serde_yaml version; assert just on a `:line:column` shape.
+        assert!(
+            rendered.contains(":14:") || rendered.contains(":13:"),
+            "expected `:14:` or `:13:` line marker in: {rendered}"
+        );
+    }
+
+    /// A typo in a key on the next-most-likely error surface — a `Database`
+    /// field — fails the same way. Defends the per-struct `deny_unknown_fields`
+    /// coverage across the inner schema, not just `Constraints`.
+    #[test]
+    fn typo_in_database_field_is_rejected() {
+        let yaml = "\
+servers:
+  - name: prod
+    kind: postgres
+    host: a
+    databases:
+      - name: app
+        role: ro
+        password: x
+        descriptoin: typo here
+";
+        let err = ConfigFile::from_yaml_str(yaml).expect_err("typo must be rejected");
+        let rendered = format!("{err}");
+        assert!(rendered.contains("descriptoin"), "missing key: {rendered}");
+        assert!(
+            rendered.contains("description"),
+            "missing suggestion: {rendered}"
+        );
+    }
+
+    /// A misspelled enum variant (action name) yields the same kind of
+    /// expected-vs-got message serde gives for unknown variants — surfaces
+    /// before the runtime can reach a confused authz miss.
+    #[test]
+    fn misspelled_action_is_rejected_with_variant_list() {
+        let yaml = "\
+servers:
+  - { name: prod, kind: postgres, host: a, databases: [{ name: app, role: ro, password: x }] }
+permissions:
+  - group: g
+    grants:
+      - { server: prod, database: app, action: query_reed }
+";
+        let err = ConfigFile::from_yaml_str(yaml).expect_err("typo must be rejected");
+        let rendered = format!("{err}");
+        assert!(rendered.contains("query_reed"), "missing got: {rendered}");
+        assert!(
+            rendered.contains("query_read"),
+            "missing expected: {rendered}"
+        );
     }
 }
