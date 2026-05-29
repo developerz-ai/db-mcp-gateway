@@ -121,6 +121,19 @@ where
         histogram!(METRIC_QUERY_DURATION, "tool" => header.tool).record(elapsed_ms as f64 / 1000.0);
     }
 
+    // Single per-dispatch log line carrying the documented field contract
+    // (issue #14): request_id, user_sub, tool, db, outcome, duration_ms.
+    // Lives at the chokepoint so every tool gets it without per-tool code.
+    tracing::info!(
+        request_id = %id,
+        user_sub = %identity.user_sub,
+        tool = %header.tool,
+        db = header.database.unwrap_or(""),
+        outcome = %outcome.code,
+        duration_ms = outcome.elapsed_ms.unwrap_or(0),
+        "tool dispatched"
+    );
+
     let row = AuditRow {
         request_id: id.to_string(),
         user_sub: identity.user_sub.clone(),
@@ -149,7 +162,10 @@ where
         tracing::error!(
             %err,
             request_id = %id,
+            user_sub = %identity.user_sub,
             tool = %header.tool,
+            db = header.database.unwrap_or(""),
+            duration_ms = audit_started.elapsed().as_millis() as u64,
             "audit write failed; aborting tool response"
         );
         return Response::error(

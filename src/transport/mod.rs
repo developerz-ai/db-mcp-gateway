@@ -100,11 +100,11 @@ async fn post_handler(
         }
     };
 
-    let user = identity
+    let user_sub = identity
         .as_ref()
         .map(|i| i.user_sub.as_str())
         .unwrap_or("anonymous");
-    tracing::debug!(method = %request.method, %user, "mcp request");
+    tracing::debug!(method = %request.method, %user_sub, "mcp request");
 
     // `tools/call` needs identity + loaded config + pool registry + the
     // request context (IP / agent client) that the audit row records;

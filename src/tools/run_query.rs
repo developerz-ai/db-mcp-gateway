@@ -127,9 +127,9 @@ async fn compute_outcome(
 
     tracing::info!(
         request_id = %id,
-        user = %identity.user_sub,
+        user_sub = %identity.user_sub,
         server = %server.name,
-        database = %database.name,
+        db = %database.name,
         row_limit,
         timeout_ms = ?timeout_ms,
         "tool.run_query.dispatch"

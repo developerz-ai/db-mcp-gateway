@@ -26,9 +26,18 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // JSON-per-line on stdout for Loki (see docs/deployment/logging.md for
+    // the field contract). `flatten_event` hoists `tracing::info!(k = v, …)`
+    // fields to the top level so Alloy doesn't need a nested-field stage;
+    // `with_target(false)` drops the noisy module path; spans don't render
+    // because every per-request field is also emitted on the event itself.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .json()
+        .flatten_event(true)
+        .with_current_span(false)
+        .with_span_list(false)
+        .with_target(false)
         .init();
 
     let cli = Cli::parse();
