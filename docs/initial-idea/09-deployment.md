@@ -94,7 +94,7 @@ Rule: When fronting databases with a connection pool proxy (e.g. pgcat), route t
 | Via cluster-internal proxy (Kubernetes) | `pgcat.pgcat.svc.cluster.local` | `6432` | `insecure` | Gateway → proxy → DB legs are mesh traffic; TLS terminates at gateway's public ingress (Traefik). Logs `WARN` every minute (`tls: insecure` is loud by design). |
 | Via cloud-managed proxy (RDS Proxy) | `prod-proxy.proxy.us-east-1.rds.amazonaws.com` | `5432` | `required` | Encryption in-transit expected; network isolation managed by cloud provider. |
 
-Verify the proxy endpoint and port with your infrastructure team. Gateway startup logs will show connection attempts; proxy unavailability will be visible in the logs or the proxy's own health endpoint — not in the gateway's `/readyz` probe (which only checks state DB and IdP connectivity).
+Verify the proxy endpoint and port with your infrastructure team. Proxy unavailability will appear in the gateway's startup logs and connection-attempt logs, or the proxy's own health endpoint — not in the gateway's `/readyz` probe (which only checks state DB reachability).
 
 ## Upgrades
 
