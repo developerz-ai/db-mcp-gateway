@@ -11,10 +11,14 @@
 servers:
   - name: worker-db
     kind: postgres
-    description: "Shared CNPG cluster on worker-1 (app + infra tenants)"
-    host: worker-db-rw.db.internal
-    port: 5432
-    tls: required
+    description: "Shared CNPG cluster on worker-db, fronted by pgcat"
+    # In-cluster route: gateway → pgcat → postgres. Apps never connect to
+    # postgres-rw directly (per stacks/stateful/README.md). The pod ↔ pgcat ↔
+    # postgres legs are all cluster-internal mesh traffic, so TLS terminates
+    # at the gateway's public ingress (Traefik) and the per-DB legs are plain.
+    host: pgcat.pgcat.svc.cluster.local
+    port: 6432
+    tls: insecure
     databases:
       # App DBs — declared by stacks/apps/*/cnpg-database.yml in
       # developerz-ai/infrastructure. Each RO role is provisioned out-of-band
