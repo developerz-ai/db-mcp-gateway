@@ -108,10 +108,10 @@ Quick reference. The deeper explanations + corporate-proxy / popup-blocker / `re
 
 | Symptom | Likely cause |
 |---|---|
-| `401` on every call, login URL loops | Browser callback got blocked. Copy the callback URL from the address bar into the prompt Claude Code shows. |
+| [`401` on every call, login URL loops](first-query.md#the-browser-popup-blocker-ate-the-sso-redirect) | Browser callback got blocked. Copy the callback URL from the address bar into the prompt Claude Code shows. |
 | `forbidden` on a query that used to work | You were removed from a group, or the group's grant was changed. Permissions are reviewed in git — check the gateway's config repo. |
-| `timeout` on `run_query` | Query was slow. Ask the agent to `explain` first, or narrow it. Operator-set; not bypassable. |
-| `row_limit_exceeded` (or `truncated: true`) | Result was clipped. Add a tighter `WHERE`/`LIMIT`, or aggregate. |
+| [`timeout` on `run_query`](first-query.md#timeout-on-run_query) | Query was slow. Ask the agent to `explain` first, or narrow it. Operator-set; not bypassable. |
+| [`row_limit_exceeded` (or `truncated: true`)](first-query.md#row_limit_exceeded-or-truncated-true-in-the-response) | Result was clipped. Add a tighter `WHERE`/`LIMIT`, or aggregate. |
 | Gateway tools missing from `/mcp` | Either the gateway URL is wrong, the gateway is down, or your token expired silently. `/mcp` → *Reconnect*. |
 | TLS / cert error instead of `401` | Corporate proxy is intercepting. See [first-query.md → Corporate proxy / VPN](first-query.md#corporate-proxy--vpn). |
 
