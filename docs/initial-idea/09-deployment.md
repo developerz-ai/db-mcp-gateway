@@ -94,7 +94,7 @@ Rule: When fronting databases with a connection pool proxy (e.g. pgcat), route t
 | Via cluster-internal proxy (Kubernetes) | `pgcat.pgcat.svc.cluster.local` | `6432` | `insecure` | Gateway → proxy → DB legs are mesh traffic; TLS terminates at gateway's public ingress (Traefik). Logs `WARN` every minute (`tls: insecure` is loud by design). |
 | Via cloud-managed proxy (RDS Proxy) | `prod-proxy.proxy.us-east-1.rds.amazonaws.com` | `5432` | `required` | Encryption in-transit expected; network isolation managed by cloud provider. |
 
-Verify the proxy endpoint and port with your infrastructure team. Proxy unavailability will appear in the gateway's startup logs and connection-attempt logs, or the proxy's own health endpoint — not in the gateway's `/readyz` probe (which only checks state DB reachability).
+Verify the proxy endpoint and port with your infrastructure team. Proxy unavailability will appear in the gateway's startup logs and connection-attempt logs, or the proxy's own health endpoint — not in the gateway's `/readyz` probe (which only checks state DB reachability and the shutdown flag).
 
 ## Upgrades
 
@@ -105,7 +105,7 @@ Verify the proxy endpoint and port with your infrastructure team. Proxy unavaila
 ## Observability
 
 - `/healthz` (liveness) — always returns 200 if the binary is up.
-- `/readyz` (readiness) — 200 only when state DB connects, IdP discovery succeeded, and every configured DB has at least one healthy pool connection.
+- `/readyz` (readiness) — 200 only when the state DB is reachable (and the gateway is not shutting down).
 - `/metrics` (Prometheus): per-tool latency histograms, per-database connection counts, auth failures, audit write latency.
 - Structured JSON logs to stdout.
 
