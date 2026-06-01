@@ -38,7 +38,7 @@ Your team deploys it once. Developers add one URL to their AI agent's MCP config
 | If you're… | Read |
 |---|---|
 | 💡 Trying to understand what this is | [`docs/initial-idea/01-overview.md`](docs/initial-idea/01-overview.md) |
-| 🛠️ A developer whose org already runs it | [`docs/usage/claude-code.md`](docs/usage/claude-code.md) |
+| 🛠️ A developer whose org already runs it | [`docs/usage/first-query.md`](docs/usage/first-query.md) (5-min walkthrough) → [`docs/usage/claude-code.md`](docs/usage/claude-code.md) (reference) |
 | 🏗️ A platform/SRE deploying it | [`docs/deployment/quickstart.md`](docs/deployment/quickstart.md) |
 | 🤖 Adding it to a non-Claude MCP client | [`docs/usage/other-agents.md`](docs/usage/other-agents.md) |
 | 📦 Cutting a release | [`docs/deployment/releasing.md`](docs/deployment/releasing.md) |
@@ -104,7 +104,7 @@ Multi-arch (amd64 + arm64). Built reproducibly from a `v*` git tag — see [`doc
 claude mcp add --transport http db-gateway --scope project https://db.internal.acme.com
 ```
 
-That's the whole client-side setup. First call triggers SSO. See [`docs/usage/claude-code.md`](docs/usage/claude-code.md) for the rest.
+That's the whole client-side setup. First call triggers SSO. Walk through it end-to-end in [`docs/usage/first-query.md`](docs/usage/first-query.md), or jump to the full reference in [`docs/usage/claude-code.md`](docs/usage/claude-code.md).
 
 ---
 
