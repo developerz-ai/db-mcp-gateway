@@ -1,6 +1,10 @@
 # Connecting Claude Code
 
-This is the quickstart for engineers whose org has already deployed the gateway. If you're standing one up, see [../deployment/quickstart.md](../deployment/quickstart.md) first.
+This is the reference for engineers whose org has already deployed the gateway. **Brand new?** Run through the 5-minute [first-query walkthrough](first-query.md) — it covers install → SSO → first real query end-to-end. Come back here for the full surface (scope flags, troubleshooting, pre-configured OAuth, removal).
+
+If you're standing the gateway up, see [../deployment/quickstart.md](../deployment/quickstart.md) first.
+
+> Every `https://db.internal.acme.com` below is a placeholder. Your platform team gives you the real one — same shape, different domain.
 
 ## Prerequisites
 
@@ -65,38 +69,9 @@ In a Claude Code session, ask the agent to list databases:
 What databases can I see through db-gateway?
 ```
 
-The agent will call `list_servers` / `list_databases` and show you what your group has access to. If you see nothing, you're authenticated but not in any group that has grants — talk to your platform team about adding you to one.
+The agent calls `list_servers` / `list_databases` and shows what your group has access to. Empty list = authenticated but no grants — see [first-query.md → I see no servers](first-query.md#i-see-no-servers).
 
-### Your first query, end to end
-
-A real transcript. You stay in natural language; the agent picks the tools and the gateway audits every call under your SSO identity.
-
-```text
-You:    Which staging databases can I reach, and what's in the users table?
-
-Claude: [calls list_servers]        → staging (postgres)
-        [calls list_databases]      → staging/app
-        [calls describe_schema staging/app, table=users]
-
-        staging/app.users has:
-        | column     | type        |
-        |------------|-------------|
-        | id         | bigint      |
-        | email      | text        |
-        | created_at | timestamptz |
-        | status     | text        |
-
-You:    How many signed up in the last 7 days?
-
-Claude: [calls run_query staging/app]
-          select count(*) from users where created_at > now() - interval '7 days';
-
-        → 412
-
-        (returned in 38 ms; logged to the audit trail as your user)
-```
-
-Behind the scenes each step is a gateway tool call: `describe_schema` and `run_query` are gated by your group's grants, capped by the grant's `row_limit` / `statement_timeout_ms`, and written to the audit log before the result comes back.
+For a full first-query walkthrough — including reading your own audit row — see [first-query.md](first-query.md).
 
 ## Daily use
 
@@ -129,13 +104,16 @@ Just type the reason. Be specific — *future you*, on an audit review, will tha
 
 ## Troubleshooting
 
+Quick reference. The deeper explanations + corporate-proxy / popup-blocker / `reason_required` cases live in [first-query.md → Gotchas](first-query.md#gotchas).
+
 | Symptom | Likely cause |
 |---|---|
-| `401` on every call, login URL loops | Browser callback got blocked. Copy the callback URL from the address bar into the prompt Claude Code shows. |
+| [`401` on every call, login URL loops](first-query.md#the-browser-popup-blocker-ate-the-sso-redirect) | Browser callback got blocked. Copy the callback URL from the address bar into the prompt Claude Code shows. |
 | `forbidden` on a query that used to work | You were removed from a group, or the group's grant was changed. Permissions are reviewed in git — check the gateway's config repo. |
-| `timeout` on `run_query` | The query was slow. Ask the agent to `explain` first, or narrow the query. The timeout is set by your operators and can't be bypassed. |
-| `row_limit_exceeded` | Result was clipped. Add a tighter `WHERE` or `LIMIT`, or aggregate. |
-| Gateway tools missing from `/mcp` | Either the gateway URL is wrong, the gateway is down, or your token expired silently. `/mcp` → reconnect. |
+| [`timeout` on `run_query`](first-query.md#timeout-on-run_query) | Query was slow. Ask the agent to `explain` first, or narrow it. Operator-set; not bypassable. |
+| [`row_limit_exceeded` (or `truncated: true`)](first-query.md#row_limit_exceeded-or-truncated-true-in-the-response) | Result was clipped. Add a tighter `WHERE`/`LIMIT`, or aggregate. |
+| Gateway tools missing from `/mcp` | Either the gateway URL is wrong, the gateway is down, or your token expired silently. `/mcp` → *Reconnect*. |
+| TLS / cert error instead of `401` | Corporate proxy is intercepting. See [first-query.md → Corporate proxy / VPN](first-query.md#corporate-proxy--vpn). |
 
 ## Removing the server
 
@@ -157,6 +135,7 @@ claude mcp add --transport http \
 
 ## See also
 
+- [First-query walkthrough](first-query.md) — 5-minute happy path + the full gotchas list
 - [Other MCP-aware agents](other-agents.md) — Cursor, Continue, etc.
 - [Permissions model](../initial-idea/06-permissions.md) — what `forbidden` actually means
 - [MCP tool surface](../initial-idea/03-mcp-tools.md) — every tool the gateway exposes

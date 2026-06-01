@@ -352,7 +352,7 @@ curl -s https://db.internal.acme.com/metrics | head
 # …
 ```
 
-Then add the gateway to your own Claude Code and try a query — see [../usage/claude-code.md](../usage/claude-code.md).
+Then add the gateway to your own Claude Code and try a query — start with the 5-minute [first-query walkthrough](../usage/first-query.md), or jump to the full [Claude Code reference](../usage/claude-code.md).
 
 ## 6. Hand it to the team
 
@@ -363,6 +363,8 @@ claude mcp add --transport http db-gateway --scope project https://db.internal.a
 ```
 
 Commit the resulting `.mcp.json` to whichever repo they should have access from. First call triggers SSO.
+
+Point them at [../usage/first-query.md](../usage/first-query.md) — 5-minute happy path that takes them from `mcp add` to a real query against a real DB with their own audit row.
 
 ## Day-2
 
