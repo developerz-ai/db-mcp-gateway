@@ -84,6 +84,30 @@ Two paths must be open:
 
 Run the gateway in the network segment that already reaches the DBs. Most installs put it next to existing internal tools.
 
+## Connection pooling and proxies
+
+Some deployments front target databases with a connection pool proxy (e.g. pgcat) for improved resource utilization, especially in shared multi-tenant clusters.
+
+When using a proxy:
+- The gateway's `config.servers[*].host` points to the proxy's service endpoint, not the database directly.
+- The proxy handles connection pooling and may provide a different port than the database's native port.
+- **TLS behavior depends on network scope**: if the gateway → proxy → database legs are all cluster-internal (Kubernetes mesh traffic), TLS can be `insecure` and the gateway defers TLS termination to its public ingress (Traefik, etc.). This reduces CPU overhead on internal traffic.
+- When TLS is `insecure`, the gateway logs a loud `WARN` every minute as a safety reminder that plaintext traffic is in use.
+
+Example (Kubernetes with pgcat):
+```yaml
+servers:
+  - name: worker-db
+    kind: postgres
+    description: "Shared CNPG cluster on worker-db, fronted by pgcat"
+    host: pgcat.pgcat.svc.cluster.local  # in-cluster proxy
+    port: 6432                            # pgcat's pool port
+    tls: insecure                         # mesh traffic, TLS at ingress
+    databases: [...]
+```
+
+Verify the proxy's service DNS and port with your cluster admin before deploying. Connection failures to the proxy will appear in the gateway's startup readiness check (`/readyz`).
+
 ## Upgrades
 
 - Containers: tag-pinned pulls; the operator bumps the tag and redeploys.
