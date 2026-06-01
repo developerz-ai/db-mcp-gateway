@@ -86,27 +86,15 @@ Run the gateway in the network segment that already reaches the DBs. Most instal
 
 ## Connection pooling and proxies
 
-Some deployments front target databases with a connection pool proxy (e.g. pgcat) for improved resource utilization, especially in shared multi-tenant clusters.
+Rule: When fronting databases with a connection pool proxy (e.g. pgcat), route the gateway through the proxy endpoint and set TLS based on network scope.
 
-When using a proxy:
-- The gateway's `config.servers[*].host` points to the proxy's service endpoint, not the database directly.
-- The proxy handles connection pooling and may provide a different port than the database's native port.
-- **TLS behavior depends on network scope**: if the gateway → proxy → database legs are all cluster-internal (Kubernetes mesh traffic), TLS can be `insecure` and the gateway defers TLS termination to its public ingress (Traefik, etc.). This reduces CPU overhead on internal traffic.
-- When TLS is `insecure`, the gateway logs a loud `WARN` every minute as a safety reminder that plaintext traffic is in use.
+| Scenario | `config.servers[*].host` | `port` | `tls` | Notes |
+|---|---|---|---|---|
+| Direct to Postgres (no proxy) | `prod-rw.db.example.com` | `5432` | `required` | Standard database connection. |
+| Via cluster-internal proxy (Kubernetes) | `pgcat.pgcat.svc.cluster.local` | `6432` | `insecure` | Gateway → proxy → DB legs are mesh traffic; TLS terminates at gateway's public ingress (Traefik). Logs `WARN` every minute (`tls: insecure` is loud by design). |
+| Via cloud-managed proxy (RDS Proxy) | `prod-proxy.proxy.us-east-1.rds.amazonaws.com` | `5432` | `required` | Encryption in-transit expected; network isolation managed by cloud provider. |
 
-Example (Kubernetes with pgcat):
-```yaml
-servers:
-  - name: worker-db
-    kind: postgres
-    description: "Shared CNPG cluster on worker-db, fronted by pgcat"
-    host: pgcat.pgcat.svc.cluster.local  # in-cluster proxy
-    port: 6432                            # pgcat's pool port
-    tls: insecure                         # mesh traffic, TLS at ingress
-    databases: [...]
-```
-
-Verify the proxy's service DNS and port with your cluster admin before deploying. Connection failures to the proxy will appear in the gateway's startup readiness check (`/readyz`).
+Verify the proxy endpoint and port with your infrastructure team. Gateway startup logs will show connection attempts; proxy unavailability will be visible in the logs or the proxy's own health endpoint — not in the gateway's `/readyz` probe (which only checks state DB and IdP connectivity).
 
 ## Upgrades
 
