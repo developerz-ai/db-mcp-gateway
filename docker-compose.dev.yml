@@ -9,7 +9,11 @@ services:
       POSTGRES_PASSWORD: ${STATE_DB_PASSWORD:-gateway-dev-only}
       POSTGRES_DB: ${STATE_DB_NAME:-gateway}
     ports:
-      - "${STATE_DB_PORT:-5433}:5432"
+      # Bind to localhost only. These are local dev databases and must never be
+      # reachable off-box: a host-wide (0.0.0.0) publish on a public-IP dev host
+      # exposes Postgres to internet scanners — and Docker publishes ports via its
+      # own iptables chain that bypasses UFW, so a host firewall won't save you.
+      - "127.0.0.1:${STATE_DB_PORT:-5433}:5432"
     volumes:
       - state-db-data:/var/lib/postgresql/data
     healthcheck:
@@ -25,7 +29,8 @@ services:
       POSTGRES_PASSWORD: ${TARGET_DB_PASSWORD:-app-dev-only}
       POSTGRES_DB: ${TARGET_DB_NAME:-app}
     ports:
-      - "${TARGET_DB_PORT:-5434}:5432"
+      # Bind to localhost only (see state-db above).
+      - "127.0.0.1:${TARGET_DB_PORT:-5434}:5432"
     volumes:
       - target-db-data:/var/lib/postgresql/data
     healthcheck:
