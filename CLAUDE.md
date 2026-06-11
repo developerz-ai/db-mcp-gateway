@@ -104,6 +104,8 @@ The bar: idiomatic, boring, readable Rust. No spaghetti, no premature abstractio
 
 GitHub Actions on Blacksmith — `blacksmith-2vcpu-ubuntu-2404` default. Postgres as a service. Workflows in `.github/workflows/`. `bin/ci` reproduces it locally.
 
+- CI runs on Blacksmith (`blacksmith-2vcpu-ubuntu-2404`). Every workflow declares a `concurrency` group with cancel-in-progress, and every job sets `timeout-minutes`. The CI image job pushes a moving tag (Image Updater newest-wins, so `cancel-in-progress: true` is deliberate); the release workflow is hard `cancel-in-progress: false`.
+
 ## Security review required
 
 Touching any of these requires a `(security review required)` label on the PR:
