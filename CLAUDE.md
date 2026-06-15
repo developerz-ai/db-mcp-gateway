@@ -21,7 +21,7 @@ Spec: `docs/initial-idea/`. Behavior change → update spec in the same PR.
 2. Every DB call traces to an SSO-verified identity → audit row.
 3. Read-only by default. Writes require explicit per-grant opt-in AND a target-DB role with write privileges. Gateway will NOT provision write grants.
 4. Audit is synchronous. Audit write fails → request fails. No best-effort audit.
-5. Permissions in YAML, reviewed by PR. No in-band admin UI.
+5. Permissions in YAML (reviewed by PR) **or** via SSO-gated admin API (writes audited synchronously to `permissions_audit`). No in-band admin UI. See [12-dynamic-permissions](docs/initial-idea/12-dynamic-permissions.md).
 
 ## Stack
 
