@@ -43,7 +43,7 @@ CREATE TABLE permissions_databases (
     deleted_at  TIMESTAMPTZ,
 
     CONSTRAINT permissions_databases_db_type_check
-        CHECK (db_type IN ('postgres', 'mongo'))
+        CHECK (db_type IN ('postgres', 'mysql'))
 );
 
 CREATE UNIQUE INDEX permissions_databases_server_db_name_live_idx
@@ -58,6 +58,7 @@ CREATE UNIQUE INDEX permissions_databases_server_db_name_live_idx
 CREATE TABLE permissions_grants (
     id                UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id           UUID        NOT NULL REFERENCES permissions_users(id),
+    server            TEXT,
     database_id       UUID        REFERENCES permissions_databases(id),
     db_name_wildcard  BOOLEAN     NOT NULL DEFAULT false,
     action            TEXT        NOT NULL,
@@ -71,9 +72,9 @@ CREATE TABLE permissions_grants (
 
     CONSTRAINT permissions_grants_target_xor_wildcard_check
         CHECK (
-            (database_id IS NOT NULL AND db_name_wildcard = false)
+            (database_id IS NOT NULL AND db_name_wildcard = false AND server IS NULL)
             OR
-            (database_id IS NULL     AND db_name_wildcard = true)
+            (database_id IS NULL     AND db_name_wildcard = true AND server IS NOT NULL)
         )
 );
 
