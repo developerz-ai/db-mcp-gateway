@@ -8,6 +8,7 @@
 //! (S3/GCS/OTLP/Kafka per spec 07) are out of scope for #8 and land in
 //! follow-up issues.
 
+pub mod permissions;
 pub mod pruner;
 
 use chrono::{DateTime, Utc};
