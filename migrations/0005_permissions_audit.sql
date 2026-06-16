@@ -36,7 +36,13 @@ CREATE TABLE permissions_audit (
         CHECK (action IN ('create', 'update', 'delete')),
 
     CONSTRAINT permissions_audit_target_type_check
-        CHECK (target_type IN ('user', 'database', 'grant'))
+        CHECK (target_type IN ('user', 'database', 'grant')),
+
+    CONSTRAINT permissions_audit_actor_email_not_empty
+        CHECK (length(actor_email) > 0),
+
+    CONSTRAINT permissions_audit_request_id_not_empty
+        CHECK (length(request_id) > 0)
 );
 
 -- Operator queries from spec 12: "show me the timeline of all changes",

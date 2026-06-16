@@ -218,3 +218,47 @@ async fn check_constraint_rejects_unknown_action_via_raw_insert() {
         "expected action CHECK violation, got {msg}"
     );
 }
+
+#[tokio::test]
+async fn check_constraint_rejects_empty_actor_email() {
+    // Empty actor_email bypasses the audit identity contract. The DB CHECK
+    // prevents this even if the writer mistakenly passes an empty string.
+    let p = pool().await;
+    let target = Uuid::new_v4();
+    let err = sqlx::query(
+        "INSERT INTO permissions_audit \
+         (actor_id, actor_email, action, target_type, target_id, request_id) \
+         VALUES ($1, '', 'create', 'user', $1, 'req-x')",
+    )
+    .bind(target)
+    .execute(&p)
+    .await
+    .expect_err("CHECK must reject empty actor_email");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("permissions_audit_actor_email_not_empty"),
+        "expected actor_email NOT-EMPTY CHECK violation, got {msg}"
+    );
+}
+
+#[tokio::test]
+async fn check_constraint_rejects_empty_request_id() {
+    // Empty request_id breaks the per-request tracing contract. The DB CHECK
+    // prevents this even if the writer mistakenly passes an empty string.
+    let p = pool().await;
+    let target = Uuid::new_v4();
+    let err = sqlx::query(
+        "INSERT INTO permissions_audit \
+         (actor_id, actor_email, action, target_type, target_id, before, after, request_id) \
+         VALUES ($1, 'admin@example.com', 'create', 'user', $1, NULL, '{}'::jsonb, '')",
+    )
+    .bind(target)
+    .execute(&p)
+    .await
+    .expect_err("CHECK must reject empty request_id");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("permissions_audit_request_id_not_empty"),
+        "expected request_id NOT-EMPTY CHECK violation, got {msg}"
+    );
+}
