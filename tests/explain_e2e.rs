@@ -98,6 +98,7 @@ async fn boot_gateway() -> BootedGateway {
             pool_registry: PoolRegistry::new(),
             shutdown: Default::default(),
             metrics: None,
+            permissions_cache: None,
         },
     );
     tokio::spawn(async move {

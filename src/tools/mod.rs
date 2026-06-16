@@ -23,6 +23,7 @@ use sqlx::PgPool;
 use tracing::info_span;
 
 use crate::auth::Identity;
+use crate::authz::PermissionsCache;
 use crate::config::ConfigFile;
 use crate::exec::PoolRegistry;
 use crate::transport::jsonrpc::{ErrorObject, Response};
@@ -54,11 +55,16 @@ struct CallParams {
 /// `user`, `server`, `database`. For tools that don't address a specific
 /// server/db (e.g. `list_servers`) those fields render empty; per-DB tools
 /// (`run_query`) fill them from the call arguments.
+// Per-request fan-out — every arg is a distinct slice of request state owned
+// by AppState. Bundling into a ToolContext would lengthen call sites without
+// reducing what each handler needs to know.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_call(
     id: Value,
     identity: Option<&Identity>,
     config: &ConfigFile,
     registry: &PoolRegistry,
+    permissions_cache: Option<&PermissionsCache>,
     state_db: Option<&PgPool>,
     request_ctx: &RequestContext,
     params: Option<Value>,
@@ -94,10 +100,28 @@ pub async fn dispatch_call(
 
     match call.name.as_str() {
         LIST_SERVERS => {
-            list_servers::run(id, identity, config, state_db, request_ctx, call.arguments).await
+            list_servers::run(
+                id,
+                identity,
+                config,
+                permissions_cache,
+                state_db,
+                request_ctx,
+                call.arguments,
+            )
+            .await
         }
         LIST_DATABASES => {
-            list_databases::run(id, identity, config, state_db, request_ctx, call.arguments).await
+            list_databases::run(
+                id,
+                identity,
+                config,
+                permissions_cache,
+                state_db,
+                request_ctx,
+                call.arguments,
+            )
+            .await
         }
         DESCRIBE_SCHEMA => {
             describe_schema::run(
@@ -105,6 +129,7 @@ pub async fn dispatch_call(
                 identity,
                 config,
                 registry,
+                permissions_cache,
                 state_db,
                 request_ctx,
                 call.arguments,
@@ -117,6 +142,7 @@ pub async fn dispatch_call(
                 identity,
                 config,
                 registry,
+                permissions_cache,
                 state_db,
                 request_ctx,
                 call.arguments,
@@ -129,6 +155,7 @@ pub async fn dispatch_call(
                 identity,
                 config,
                 registry,
+                permissions_cache,
                 state_db,
                 request_ctx,
                 call.arguments,
@@ -141,6 +168,7 @@ pub async fn dispatch_call(
                 identity,
                 config,
                 registry,
+                permissions_cache,
                 state_db,
                 request_ctx,
                 call.arguments,

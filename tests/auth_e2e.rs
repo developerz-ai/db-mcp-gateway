@@ -106,6 +106,7 @@ async fn login_via_mock_idp_then_call_tool() {
             state_db: Some(pool),
             shutdown: Default::default(),
             metrics: None,
+            permissions_cache: None,
         },
     );
     tokio::spawn(async move {

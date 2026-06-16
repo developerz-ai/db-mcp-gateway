@@ -6,10 +6,23 @@
 //! `Decision::Allow { constraints }` (merged most-restrictively across every
 //! matching grant) or `Decision::Deny`.
 //!
+//! `evaluate_effective` / `can_see_server_effective` (since #49) fold a
+//! per-identity slice of DB-loaded grants into the same merge engine. The
+//! YAML and DB sources are symmetric — neither source is privileged, the
+//! most-restrictive constraint always wins on overlap.
+//!
 //! Security-required (see CLAUDE.md). The contract: a request is allowed iff
 //! *some* grant matches. Absence of a matching grant denies — no implicit
 //! upgrade from group membership alone (spec 06 §Evaluation). Most-restrictive
 //! merging means being in two groups never *upgrades* your access.
+
+pub mod cache;
+pub mod effective;
+pub mod loader;
+
+pub use cache::PermissionsCache;
+pub use effective::{can_see_server_effective, evaluate_effective};
+pub use loader::{LoadError, load_db_grants_for};
 
 use crate::auth::Identity;
 use crate::config::{Action, Constraints, Grant, Permission, Server};
@@ -36,13 +49,7 @@ pub fn can_see_server(identity: &Identity, server: &Server, permissions: &[Permi
         .iter()
         .filter(|perm| identity.groups.iter().any(|g| g == &perm.group))
         .flat_map(|perm| perm.grants.iter())
-        .any(|grant| {
-            let server_match = grant.server == "*" || grant.server == server.name;
-            if !server_match {
-                return false;
-            }
-            grant.database == "*" || server.databases.iter().any(|db| db.name == grant.database)
-        })
+        .any(|grant| grant_can_see(grant, server))
 }
 
 /// Per-call authz check. The action passed is what the *tool* needs; matching
@@ -55,28 +62,26 @@ pub fn evaluate(
     database: &str,
     permissions: &[Permission],
 ) -> Decision {
-    let matching: Vec<&Grant> = permissions
-        .iter()
-        .filter(|p| identity.groups.iter().any(|g| g == &p.group))
-        .flat_map(|p| p.grants.iter())
-        .filter(|g| {
-            (g.server == "*" || g.server == server)
-                && (g.database == "*" || g.database == database)
-                && g.action.includes(action)
-        })
-        .collect();
+    evaluate_effective(identity, action, server, database, permissions, &[])
+}
 
-    if matching.is_empty() {
-        return Decision::Deny;
+/// Helper: check if a grant allows viewing a server (used by both
+/// can_see_server variants). Verifies server name matches and database
+/// exists on that server.
+pub fn grant_can_see(grant: &Grant, server: &Server) -> bool {
+    let server_match = grant.server == "*" || grant.server == server.name;
+    if !server_match {
+        return false;
     }
+    grant.database == "*" || server.databases.iter().any(|db| db.name == grant.database)
+}
 
-    let merged = matching
-        .iter()
-        .map(|g| &g.constraints)
-        .fold(Constraints::default(), |acc, c| merge(&acc, c));
-    Decision::Allow {
-        constraints: merged,
-    }
+/// Helper: check if a grant applies to an action on a server/database pair.
+/// Used by both evaluate variants.
+pub fn grant_applies(grant: &Grant, action: Action, server: &str, database: &str) -> bool {
+    (grant.server == "*" || grant.server == server)
+        && (grant.database == "*" || grant.database == database)
+        && grant.action.includes(action)
 }
 
 /// Merge two `Constraints` most-restrictively. Pure — same inputs, same
