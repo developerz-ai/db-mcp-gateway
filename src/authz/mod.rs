@@ -6,10 +6,21 @@
 //! `Decision::Allow { constraints }` (merged most-restrictively across every
 //! matching grant) or `Decision::Deny`.
 //!
+//! `evaluate_effective` / `can_see_server_effective` (since #49) fold a
+//! per-identity slice of DB-loaded grants into the same merge engine. The
+//! YAML and DB sources are symmetric — neither source is privileged, the
+//! most-restrictive constraint always wins on overlap.
+//!
 //! Security-required (see CLAUDE.md). The contract: a request is allowed iff
 //! *some* grant matches. Absence of a matching grant denies — no implicit
 //! upgrade from group membership alone (spec 06 §Evaluation). Most-restrictive
 //! merging means being in two groups never *upgrades* your access.
+
+pub mod cache;
+pub mod loader;
+
+pub use cache::PermissionsCache;
+pub use loader::{LoadError, load_db_grants_for};
 
 use crate::auth::Identity;
 use crate::config::{Action, Constraints, Grant, Permission, Server};
@@ -36,13 +47,29 @@ pub fn can_see_server(identity: &Identity, server: &Server, permissions: &[Permi
         .iter()
         .filter(|perm| identity.groups.iter().any(|g| g == &perm.group))
         .flat_map(|perm| perm.grants.iter())
-        .any(|grant| {
-            let server_match = grant.server == "*" || grant.server == server.name;
-            if !server_match {
-                return false;
-            }
-            grant.database == "*" || server.databases.iter().any(|db| db.name == grant.database)
-        })
+        .any(|grant| grant_can_see(grant, server))
+}
+
+/// `can_see_server` extended with a per-identity DB-grant slice (#49).
+/// Symmetric merge: a server is visible if YAML *or* DB grants make it so.
+pub fn can_see_server_effective(
+    identity: &Identity,
+    server: &Server,
+    yaml_permissions: &[Permission],
+    db_grants_for_identity: &[Grant],
+) -> bool {
+    can_see_server(identity, server, yaml_permissions)
+        || db_grants_for_identity
+            .iter()
+            .any(|grant| grant_can_see(grant, server))
+}
+
+fn grant_can_see(grant: &Grant, server: &Server) -> bool {
+    let server_match = grant.server == "*" || grant.server == server.name;
+    if !server_match {
+        return false;
+    }
+    grant.database == "*" || server.databases.iter().any(|db| db.name == grant.database)
 }
 
 /// Per-call authz check. The action passed is what the *tool* needs; matching
@@ -55,28 +82,51 @@ pub fn evaluate(
     database: &str,
     permissions: &[Permission],
 ) -> Decision {
-    let matching: Vec<&Grant> = permissions
+    evaluate_effective(identity, action, server, database, permissions, &[])
+}
+
+/// `evaluate` extended with a per-identity DB-grant slice (#49).
+///
+/// YAML grants are group-keyed; DB grants are user-keyed and pre-resolved to
+/// this `identity` by the loader, so they bypass the group filter. Both sets
+/// feed the same most-restrictive merge — there is no priority between them.
+pub fn evaluate_effective(
+    identity: &Identity,
+    action: Action,
+    server: &str,
+    database: &str,
+    yaml_permissions: &[Permission],
+    db_grants_for_identity: &[Grant],
+) -> Decision {
+    let yaml_matches = yaml_permissions
         .iter()
         .filter(|p| identity.groups.iter().any(|g| g == &p.group))
         .flat_map(|p| p.grants.iter())
-        .filter(|g| {
-            (g.server == "*" || g.server == server)
-                && (g.database == "*" || g.database == database)
-                && g.action.includes(action)
-        })
-        .collect();
+        .filter(|g| grant_applies(g, action, server, database));
 
-    if matching.is_empty() {
-        return Decision::Deny;
-    }
-
-    let merged = matching
+    let db_matches = db_grants_for_identity
         .iter()
-        .map(|g| &g.constraints)
-        .fold(Constraints::default(), |acc, c| merge(&acc, c));
-    Decision::Allow {
-        constraints: merged,
+        .filter(|g| grant_applies(g, action, server, database));
+
+    let mut merged_some = false;
+    let mut merged = Constraints::default();
+    for c in yaml_matches.chain(db_matches).map(|g| &g.constraints) {
+        merged = merge(&merged, c);
+        merged_some = true;
     }
+    if merged_some {
+        Decision::Allow {
+            constraints: merged,
+        }
+    } else {
+        Decision::Deny
+    }
+}
+
+fn grant_applies(grant: &Grant, action: Action, server: &str, database: &str) -> bool {
+    (grant.server == "*" || grant.server == server)
+        && (grant.database == "*" || grant.database == database)
+        && grant.action.includes(action)
 }
 
 /// Merge two `Constraints` most-restrictively. Pure — same inputs, same

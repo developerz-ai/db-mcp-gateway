@@ -15,8 +15,8 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use crate::auth::Identity;
-use crate::authz::{self, Decision};
-use crate::config::{Action, ConfigFile, Database, Server};
+use crate::authz::{self, Decision, PermissionsCache, cache::load_or_empty};
+use crate::config::{Action, ConfigFile, Database, Grant, Server};
 use crate::exec::{self, ExecError, PoolRegistry};
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
@@ -61,11 +61,13 @@ struct DescribeSchemaResult {
     tables: Vec<TableView>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     id: Value,
     identity: &Identity,
     config: &ConfigFile,
     registry: &PoolRegistry,
+    permissions_cache: Option<&PermissionsCache>,
     state_db: Option<&PgPool>,
     request_ctx: &RequestContext,
     arguments: Option<Value>,
@@ -87,7 +89,16 @@ pub async fn run(
         sql: None,
         reason: None,
     };
-    let work = compute_outcome(id.clone(), identity, config, registry, &args);
+    let db_grants = match load_or_empty(permissions_cache, identity).await {
+        Ok(g) => g,
+        Err(err) => {
+            tracing::error!(%err, "permissions cache load failed");
+            let resp = error_outcome(id.clone(), "internal", "permissions_cache_load_failed");
+            let work = async move { resp };
+            return audit_dispatch(id, identity, state_db, request_ctx, header, work).await;
+        }
+    };
+    let work = compute_outcome(id.clone(), identity, config, registry, &db_grants, &args);
     audit_dispatch(id, identity, state_db, request_ctx, header, work).await
 }
 
@@ -96,18 +107,20 @@ async fn compute_outcome(
     identity: &Identity,
     config: &ConfigFile,
     registry: &PoolRegistry,
+    db_grants: &[Grant],
     args: &Arguments,
 ) -> Outcome {
     let Some((server, database)) = find_server_db(config, &args.server, &args.database) else {
         return forbidden(id);
     };
 
-    let decision = authz::evaluate(
+    let decision = authz::evaluate_effective(
         identity,
         Action::SchemaRead,
         &server.name,
         &database.name,
         &config.permissions,
+        db_grants,
     );
     let constraints = match decision {
         Decision::Allow { constraints } => constraints,

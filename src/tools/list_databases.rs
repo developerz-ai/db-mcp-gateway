@@ -12,8 +12,8 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use crate::auth::Identity;
-use crate::authz::{self, Decision};
-use crate::config::{Action, ConfigFile, Database};
+use crate::authz::{self, Decision, PermissionsCache, cache::load_or_empty};
+use crate::config::{Action, ConfigFile, Database, Grant};
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
 use super::audit_dispatch::{
@@ -44,6 +44,7 @@ pub async fn run(
     id: Value,
     identity: &Identity,
     config: &ConfigFile,
+    permissions_cache: Option<&PermissionsCache>,
     state_db: Option<&PgPool>,
     request_ctx: &RequestContext,
     arguments: Option<Value>,
@@ -65,7 +66,16 @@ pub async fn run(
         sql: None,
         reason: None,
     };
-    let work = compute_outcome(id.clone(), identity, config, &args);
+    let db_grants = match load_or_empty(permissions_cache, identity).await {
+        Ok(g) => g,
+        Err(err) => {
+            tracing::error!(%err, "permissions cache load failed");
+            let resp = error_outcome(id.clone(), "internal", "permissions_cache_load_failed");
+            let work = async move { resp };
+            return audit_dispatch(id, identity, state_db, request_ctx, header, work).await;
+        }
+    };
+    let work = compute_outcome(id.clone(), identity, config, &db_grants, &args);
     audit_dispatch(id, identity, state_db, request_ctx, header, work).await
 }
 
@@ -73,6 +83,7 @@ async fn compute_outcome(
     id: Value,
     identity: &Identity,
     config: &ConfigFile,
+    db_grants: &[Grant],
     args: &Arguments,
 ) -> Outcome {
     let Some(server) = config.servers.iter().find(|s| s.name == args.server) else {
@@ -84,12 +95,13 @@ async fn compute_outcome(
         .iter()
         .filter(|db| {
             matches!(
-                authz::evaluate(
+                authz::evaluate_effective(
                     identity,
                     Action::SchemaRead,
                     &server.name,
                     &db.name,
                     &config.permissions,
+                    db_grants,
                 ),
                 Decision::Allow { .. }
             )
@@ -163,7 +175,7 @@ permissions:
         let args = Arguments {
             server: server.to_string(),
         };
-        compute_outcome(Value::from(1), &identity(groups), &load(), &args).await
+        compute_outcome(Value::from(1), &identity(groups), &load(), &[], &args).await
     }
 
     fn payload(outcome: &Outcome) -> Value {

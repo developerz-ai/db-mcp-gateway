@@ -18,6 +18,7 @@ use sqlx::PgPool;
 
 use super::probes::ShutdownFlag;
 use crate::auth::{AuthConfig, OidcClient, SessionStore};
+use crate::authz::PermissionsCache;
 use crate::config::ConfigFile;
 use crate::exec::PoolRegistry;
 
@@ -42,6 +43,10 @@ pub struct AppState {
     /// Prometheus recorder handle. `None` in tests — installing the recorder
     /// is a process-wide singleton and would clash across test binaries.
     pub metrics: Option<PrometheusHandle>,
+    /// Per-user DB-grant cache (#49). `None` in tests that don't exercise the
+    /// resolver — dispatch falls through to YAML-only authz, which is the
+    /// same path the gateway took before #49.
+    pub permissions_cache: Option<PermissionsCache>,
 }
 
 impl AppState {
@@ -59,6 +64,7 @@ impl AppState {
             state_db: None,
             shutdown: ShutdownFlag::new(),
             metrics: None,
+            permissions_cache: None,
         }
     }
 }

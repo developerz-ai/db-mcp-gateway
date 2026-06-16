@@ -6,8 +6,10 @@ use std::sync::Arc;
 use clap::Parser;
 use db_mcp_gateway::audit;
 use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
+use db_mcp_gateway::authz::PermissionsCache;
 use db_mcp_gateway::config::{ConfigFile, TlsConfig};
 use db_mcp_gateway::exec::PoolRegistry;
+use db_mcp_gateway::state::permissions::pg::PgPermissionsRepo;
 use db_mcp_gateway::transport::probes::ShutdownFlag;
 use db_mcp_gateway::transport::tls;
 use db_mcp_gateway::transport::{AppState, AuthFacade, PendingFlows};
@@ -80,6 +82,10 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = ShutdownFlag::new();
     let sessions = SessionStore::new(state_db.clone());
     let oidc = OidcClient::new(auth_config.clone())?;
+    let permissions_cache = PermissionsCache::new(
+        Arc::new(PgPermissionsRepo::new(state_db.clone())),
+        std::time::Duration::from_secs(config.permissions_cache_ttl_seconds),
+    );
     let app_state = AppState {
         auth: Some(AuthFacade {
             config: Arc::new(auth_config),
@@ -92,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
         state_db: Some(state_db.clone()),
         shutdown: shutdown.clone(),
         metrics: Some(metrics_handle),
+        permissions_cache: Some(permissions_cache),
     };
 
     // Spawn the audit retention pruner. Ticks hourly, deletes rows older

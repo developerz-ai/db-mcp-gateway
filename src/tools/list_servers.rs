@@ -14,8 +14,8 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use crate::auth::Identity;
-use crate::authz;
-use crate::config::{ConfigFile, ServerKind};
+use crate::authz::{self, PermissionsCache, cache::load_or_empty};
+use crate::config::{ConfigFile, Grant, ServerKind};
 use crate::transport::jsonrpc::Response;
 
 use super::audit_dispatch::{
@@ -41,6 +41,7 @@ pub async fn run(
     id: Value,
     identity: &Identity,
     config: &ConfigFile,
+    permissions_cache: Option<&PermissionsCache>,
     state_db: Option<&PgPool>,
     request_ctx: &RequestContext,
     _arguments: Option<Value>,
@@ -52,16 +53,30 @@ pub async fn run(
         sql: None,
         reason: None,
     };
+    let db_grants = match load_or_empty(permissions_cache, identity).await {
+        Ok(g) => g,
+        Err(err) => {
+            tracing::error!(%err, "permissions cache load failed");
+            let resp = error_outcome(id.clone(), "internal", "permissions_cache_load_failed");
+            let work = async move { resp };
+            return audit_dispatch(id, identity, state_db, request_ctx, header, work).await;
+        }
+    };
     let work_id = id.clone();
-    let work = async move { compute_outcome(work_id, identity, config) };
+    let work = async move { compute_outcome(work_id, identity, config, &db_grants) };
     audit_dispatch(id, identity, state_db, request_ctx, header, work).await
 }
 
-fn compute_outcome(id: Value, identity: &Identity, config: &ConfigFile) -> Outcome {
+fn compute_outcome(
+    id: Value,
+    identity: &Identity,
+    config: &ConfigFile,
+    db_grants: &[Grant],
+) -> Outcome {
     let servers: Vec<SafeServerView> = config
         .servers
         .iter()
-        .filter(|s| authz::can_see_server(identity, s, &config.permissions))
+        .filter(|s| authz::can_see_server_effective(identity, s, &config.permissions, db_grants))
         .map(SafeServerView::from)
         .collect();
     let row_count = i64::try_from(servers.len()).unwrap_or(i64::MAX);
@@ -151,7 +166,7 @@ permissions:
     /// shape logic doesn't need the audit chokepoint (covered by integration
     /// tests against a real state DB).
     fn body_for(groups: &[&str]) -> String {
-        let outcome = compute_outcome(Value::from(1), &identity(groups), &load());
+        let outcome = compute_outcome(Value::from(1), &identity(groups), &load(), &[]);
         let json = serde_json::to_value(&outcome.response).unwrap();
         json["result"]["content"][0]["text"]
             .as_str()
@@ -185,7 +200,12 @@ permissions:
     /// reading audit_calls.row_count get the same answer.
     #[test]
     fn row_count_matches_visible_servers() {
-        let outcome = compute_outcome(Value::from(1), &identity(&["backend-engineers"]), &load());
+        let outcome = compute_outcome(
+            Value::from(1),
+            &identity(&["backend-engineers"]),
+            &load(),
+            &[],
+        );
         assert_eq!(outcome.code, "success");
         assert_eq!(outcome.row_count, Some(2));
         assert_eq!(outcome.truncated, Some(false));

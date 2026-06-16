@@ -23,6 +23,12 @@ const DEFAULT_STATE_DB_URL: &str = "postgres://gateway:gateway-dev-only@localhos
 const DEFAULT_STATE_DB_POOL_SIZE: u32 = 10;
 /// Spec 07 §Storage: "Hot — Gateway's state Postgres — 90 days (configurable)".
 const DEFAULT_AUDIT_RETENTION_DAYS: u32 = 90;
+/// Spec 12 §Cache: per-user DB-grant cache TTL. 60s keeps the request path off
+/// the state DB while bounding the window in which a revoked-but-not-yet-
+/// invalidated grant could still be honored. Admin API writes (#52–#54) call
+/// `PermissionsCache::invalidate` directly so the practical staleness is the
+/// in-flight request, not the TTL.
+const DEFAULT_PERMISSIONS_CACHE_TTL_SECONDS: u64 = 60;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -40,6 +46,8 @@ pub struct Config {
     /// the boot path reads and the SIGHUP handler reloads. `Disabled` is the
     /// dev-only escape — when set, the gateway serves plain HTTP.
     pub tls: TlsConfig,
+    /// Per-user TTL for the DB-grant resolver cache (#49).
+    pub permissions_cache_ttl_seconds: u64,
 }
 
 /// TLS state — present-and-on or explicitly-off-for-dev. Modeled as an enum
@@ -93,6 +101,7 @@ impl Default for Config {
             // cert+key or didn't explicitly opt out. `Default` is only used by
             // tests and `for_tests`; both run plain HTTP.
             tls: TlsConfig::Disabled,
+            permissions_cache_ttl_seconds: DEFAULT_PERMISSIONS_CACHE_TTL_SECONDS,
         }
     }
 }
@@ -118,6 +127,11 @@ pub enum ConfigError {
     },
     #[error("invalid AUDIT_RETENTION_DAYS `{0}`: must be greater than zero")]
     AuditRetentionZero(String),
+    #[error("invalid PERMISSIONS_CACHE_TTL_SECONDS `{value}`: {source}")]
+    PermissionsCacheTtl {
+        value: String,
+        source: std::num::ParseIntError,
+    },
     #[error(
         "TLS is required but not configured: set TLS_CERT_PATH and TLS_KEY_PATH, \
          or TLS_DISABLED=true for local dev (never in production)"
@@ -175,6 +189,15 @@ impl Config {
                 return Err(ConfigError::AuditRetentionZero(value));
             }
             config.audit_retention_days = parsed;
+        }
+        if let Ok(value) = std::env::var("PERMISSIONS_CACHE_TTL_SECONDS") {
+            config.permissions_cache_ttl_seconds =
+                value
+                    .parse()
+                    .map_err(|source| ConfigError::PermissionsCacheTtl {
+                        value: value.clone(),
+                        source,
+                    })?;
         }
 
         config.tls = tls_from_env()?;
