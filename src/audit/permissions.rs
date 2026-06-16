@@ -115,7 +115,13 @@ pub enum PermissionsAuditError {
 /// admin endpoints MUST propagate this error AND roll back the data change
 /// that triggered the audit. An unaudited admin write is a CLAUDE.md
 /// non-negotiable violation.
-pub async fn log(pool: &PgPool, row: &PermissionsAuditRow) -> Result<(), PermissionsAuditError> {
+///
+/// Accepts any `sqlx::Executor` (pool or transaction), enabling atomic
+/// execution with rollback capability when called within admin transactions.
+pub async fn log(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
+    row: &PermissionsAuditRow,
+) -> Result<(), PermissionsAuditError> {
     sqlx::query(
         "INSERT INTO permissions_audit \
          (actor_id, actor_email, action, target_type, target_id, before, after, request_id) \
@@ -129,7 +135,7 @@ pub async fn log(pool: &PgPool, row: &PermissionsAuditRow) -> Result<(), Permiss
     .bind(&row.before)
     .bind(&row.after)
     .bind(&row.request_id)
-    .execute(pool)
+    .execute(executor)
     .await
     .map_err(PermissionsAuditError::Write)?;
     Ok(())
