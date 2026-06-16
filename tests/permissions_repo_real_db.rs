@@ -104,11 +104,21 @@ async fn get_user_by_sub_skips_soft_deleted() {
         repo.get_user_by_sub(&sub).await.expect("get").is_some(),
         "live user should be found"
     );
+    let listed_before = repo.list_users().await.expect("list users before delete");
+    assert!(
+        listed_before.iter().any(|u| u.id == user.id),
+        "live user should appear in list_users"
+    );
     let deleted = repo.soft_delete_user(user.id).await.expect("delete");
     assert!(deleted, "delete should hit one row");
     assert!(
         repo.get_user_by_sub(&sub).await.expect("get").is_none(),
         "soft-deleted user must not surface"
+    );
+    let listed_after = repo.list_users().await.expect("list users after delete");
+    assert!(
+        !listed_after.iter().any(|u| u.id == user.id),
+        "soft-deleted user must not appear in list_users"
     );
     // Second delete is a no-op (row already deleted).
     assert!(

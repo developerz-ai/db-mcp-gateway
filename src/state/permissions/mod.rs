@@ -142,14 +142,16 @@ pub enum RepoError {
     UnknownAction(String),
     /// Row violates the XOR target check — should be impossible given the DB
     /// constraint, but surface it as an error rather than panicking.
-    #[error(
-        "grant row violates target/wildcard XOR (server={server:?}, database_id={database_id:?}, wildcard={wildcard})"
-    )]
+    #[error("grant row violates target/wildcard XOR invariant")]
     InvalidGrantTarget {
         server: Option<String>,
         database_id: Option<Uuid>,
         wildcard: bool,
     },
+    #[error("failed to encode groups JSON")]
+    EncodeGroups(#[source] serde_json::Error),
+    #[error("failed to decode groups JSON")]
+    DecodeGroups(#[source] serde_json::Error),
 }
 
 /// CRUD surface for the permissions store. Implementations: [`pg::PgPermissionsRepo`].
