@@ -262,3 +262,27 @@ async fn check_constraint_rejects_empty_request_id() {
         "expected request_id NOT-EMPTY CHECK violation, got {msg}"
     );
 }
+
+#[tokio::test]
+async fn log_accepts_transaction_executor_and_respects_rollback() {
+    // Verifies the new Executor trait bound allows transactions.
+    // A rolled-back transaction must not persist the audit row.
+    let p = pool().await;
+    let actor = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    let row = create_row(actor, target, "req-tx");
+
+    let mut tx = p.begin().await.expect("begin tx");
+    permissions::log(&mut *tx, &row)
+        .await
+        .expect("audit write in tx");
+    tx.rollback().await.expect("rollback");
+
+    let read_back = permissions::latest_for_target(&p, PermissionsAuditTargetType::User, target)
+        .await
+        .expect("readback");
+    assert!(
+        read_back.is_none(),
+        "rolled-back tx must not persist audit row"
+    );
+}
