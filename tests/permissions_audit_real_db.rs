@@ -227,8 +227,8 @@ async fn check_constraint_rejects_empty_actor_email() {
     let target = Uuid::new_v4();
     let err = sqlx::query(
         "INSERT INTO permissions_audit \
-         (actor_id, actor_email, action, target_type, target_id, request_id) \
-         VALUES ($1, '', 'create', 'user', $1, 'req-x')",
+         (actor_id, actor_email, action, target_type, target_id, before, after, request_id) \
+         VALUES ($1, '', 'create', 'user', $1, NULL, '{}'::jsonb, 'req-x')",
     )
     .bind(target)
     .execute(&p)
