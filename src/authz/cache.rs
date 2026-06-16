@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
@@ -39,6 +40,7 @@ pub struct PermissionsCache {
     repo: Arc<dyn PermissionsRepo>,
     ttl: Duration,
     inner: Arc<RwLock<HashMap<String, CacheEntry>>>,
+    revision: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for PermissionsCache {
@@ -57,6 +59,7 @@ impl PermissionsCache {
             repo,
             ttl,
             inner: Arc::new(RwLock::new(HashMap::new())),
+            revision: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -64,6 +67,10 @@ impl PermissionsCache {
     /// expiry. Fail-closed: a load error propagates — callers MUST treat
     /// the request as Deny (audit + return forbidden), never fall through
     /// to YAML-only.
+    ///
+    /// Uses a revision guard to prevent the invalidate/load race: if an
+    /// invalidation occurs between the load and insert, we retry to ensure
+    /// fresh data is cached.
     pub async fn get_for(&self, identity: &Identity) -> Result<Arc<Vec<Grant>>, LoadError> {
         {
             let map = self.inner.read().await;
@@ -73,17 +80,30 @@ impl PermissionsCache {
                 }
             }
         }
-        let grants = load_db_grants_for(self.repo.as_ref(), identity).await?;
-        let arc = Arc::new(grants);
-        let mut map = self.inner.write().await;
-        map.insert(
-            identity.user_sub.clone(),
-            CacheEntry {
-                loaded_at: Instant::now(),
-                grants: arc.clone(),
-            },
-        );
-        Ok(arc)
+        loop {
+            let rev_before = self.revision.load(Ordering::Acquire);
+            let grants = load_db_grants_for(self.repo.as_ref(), identity).await?;
+            // If the revision changed during the load, an invalidation occurred.
+            // Retry to ensure we insert fresh data.
+            if self.revision.load(Ordering::Acquire) != rev_before {
+                continue;
+            }
+            let arc = Arc::new(grants);
+            let mut map = self.inner.write().await;
+            // Double-check before inserting; another invalidation may have
+            // occurred after we released the read lock above.
+            if self.revision.load(Ordering::Acquire) == rev_before {
+                map.insert(
+                    identity.user_sub.clone(),
+                    CacheEntry {
+                        loaded_at: Instant::now(),
+                        grants: arc.clone(),
+                    },
+                );
+                return Ok(arc);
+            }
+            // Revision changed again; drop the lock and retry.
+        }
     }
 
     /// Drop the entry for `user_sub`. Admin API writes that touch this user's
@@ -91,6 +111,7 @@ impl PermissionsCache {
     /// so the next request reloads from the DB. Idempotent — a missing entry
     /// is a no-op.
     pub async fn invalidate(&self, user_sub: &str) {
+        self.revision.fetch_add(1, Ordering::AcqRel);
         let mut map = self.inner.write().await;
         map.remove(user_sub);
     }
@@ -100,6 +121,7 @@ impl PermissionsCache {
     /// user's wildcard grants) — narrower per-user invalidation isn't
     /// sufficient. Cheap; the next request for each user simply reloads.
     pub async fn invalidate_all(&self) {
+        self.revision.fetch_add(1, Ordering::AcqRel);
         let mut map = self.inner.write().await;
         map.clear();
     }
