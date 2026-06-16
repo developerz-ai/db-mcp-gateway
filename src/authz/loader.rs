@@ -65,7 +65,7 @@ pub async fn load_db_grants_for(
             GrantTarget::Wildcard { server } => (server.clone(), "*".to_string()),
         };
         let constraints: Constraints =
-            serde_json::from_value(grant.constraints.clone()).map_err(|source| {
+            serde_json::from_value(grant.constraints).map_err(|source| {
                 LoadError::DecodeConstraints {
                     grant_id: grant.id,
                     source,
