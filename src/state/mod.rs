@@ -1,8 +1,11 @@
 //! State DB pool + schema migrations.
 //!
-//! The gateway owns this Postgres. It stores sessions, audit rows, and the
-//! denylist. Migrations live in `migrations/` and are applied at boot via
-//! `sqlx::migrate!` — failure to migrate refuses to start the process.
+//! The gateway owns this Postgres. It stores sessions, audit rows, the
+//! denylist, and (since #47) the permissions store. Migrations live in
+//! `migrations/` and are applied at boot via `sqlx::migrate!` — failure to
+//! migrate refuses to start the process.
+
+pub mod permissions;
 
 use std::time::Duration;
 
