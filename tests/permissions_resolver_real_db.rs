@@ -48,7 +48,7 @@ fn identity_for(sub: &str, groups: &[&str]) -> Identity {
     }
 }
 
-async fn cleanup(pool: &PgPool, user_sub: &str, server: &str) {
+async fn cleanup(pool: &PgPool, user_sub: &str, server: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
         "DELETE FROM permissions_grants \
          WHERE user_id IN (SELECT id FROM permissions_users WHERE user_sub = $1) \
@@ -57,18 +57,16 @@ async fn cleanup(pool: &PgPool, user_sub: &str, server: &str) {
     .bind(user_sub)
     .bind(server)
     .execute(pool)
-    .await
-    .ok();
+    .await?;
     sqlx::query("DELETE FROM permissions_databases WHERE server = $1")
         .bind(server)
         .execute(pool)
-        .await
-        .ok();
+        .await?;
     sqlx::query("DELETE FROM permissions_users WHERE user_sub = $1")
         .bind(user_sub)
         .execute(pool)
-        .await
-        .ok();
+        .await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -101,7 +99,7 @@ async fn loader_projects_specific_grant_into_config_grant_shape() {
     assert_eq!(grants[0].constraints.row_limit, Some(500));
     assert_eq!(grants[0].constraints.statement_timeout_ms, Some(1000));
 
-    cleanup(&p, &sub, &server).await;
+    cleanup(&p, &sub, &server).await.expect("cleanup succeeds");
 }
 
 #[tokio::test]
@@ -138,7 +136,7 @@ async fn loader_drops_grants_whose_database_was_soft_deleted() {
         grants
     );
 
-    cleanup(&p, &sub, &server).await;
+    cleanup(&p, &sub, &server).await.expect("cleanup succeeds");
 }
 
 #[tokio::test]
@@ -184,7 +182,7 @@ async fn evaluate_effective_grants_via_db_with_no_yaml_match() {
     };
     assert_eq!(constraints.row_limit, Some(100));
 
-    cleanup(&p, &sub, &server).await;
+    cleanup(&p, &sub, &server).await.expect("cleanup succeeds");
 }
 
 #[tokio::test]
@@ -248,7 +246,7 @@ permissions:
         "DB tightening must win over a looser YAML grant"
     );
 
-    cleanup(&p, &sub, &server).await;
+    cleanup(&p, &sub, &server).await.expect("cleanup succeeds");
 }
 
 #[tokio::test]
@@ -293,7 +291,9 @@ servers:
         "DB grant on this server should make it visible even with no YAML match"
     );
 
-    cleanup(&p, &sub, &server_name).await;
+    cleanup(&p, &sub, &server_name)
+        .await
+        .expect("cleanup succeeds");
 }
 
 #[tokio::test]
@@ -356,5 +356,5 @@ async fn cache_hits_avoid_db_round_trip_and_invalidate_busts_it() {
     let third = cache.get_for(&id).await.expect("third load");
     assert_eq!(third.len(), 2, "post-invalidate must reload from DB");
 
-    cleanup(&p, &sub, &server).await;
+    cleanup(&p, &sub, &server).await.expect("cleanup succeeds");
 }
