@@ -40,8 +40,7 @@ impl PermissionsRepo for PgPermissionsRepo {
         // therefore inserts a new row — which is what we want: the old row is
         // the audit trail of the prior membership, the new row is today's.
         // Restoring a still-live soft-delete is not a flow we expose.
-        let groups_json =
-            serde_json::to_value(groups).map_err(RepoError::EncodeGroups)?;
+        let groups_json = serde_json::to_value(groups).map_err(RepoError::EncodeGroups)?;
         let row = sqlx::query(
             "INSERT INTO permissions_users (user_sub, user_email, groups) \
              VALUES ($1, $2, $3) \
