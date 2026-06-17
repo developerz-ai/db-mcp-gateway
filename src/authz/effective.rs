@@ -4,6 +4,8 @@
 //! versions with a per-identity DB-grant slice. Both sources merge
 //! most-restrictively — neither is privileged. This module encapsulates
 //! that logic and its tests.
+//!
+//! Resolver-level safety proofs live in [`super::effective_proptests`] (#50).
 
 use crate::auth::Identity;
 use crate::config::{Action, Constraints, Grant, Permission, Server};

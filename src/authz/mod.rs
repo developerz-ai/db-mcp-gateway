@@ -18,6 +18,8 @@
 
 pub mod cache;
 pub mod effective;
+#[cfg(test)]
+mod effective_proptests;
 pub mod loader;
 
 pub use cache::PermissionsCache;
