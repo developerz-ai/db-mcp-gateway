@@ -484,6 +484,13 @@ async fn create_grant_with_unknown_user_or_database_is_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let err: Value = resp.json().await.unwrap();
     assert_eq!(err["error"]["code"], "invalid_request");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid grant reference"),
+        "FK violation must surface a stable message; got {err}"
+    );
 
     h.cleanup().await;
 }

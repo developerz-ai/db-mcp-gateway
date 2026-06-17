@@ -156,11 +156,13 @@ The `databases` endpoints register a *logical* db reference; the connection stri
 
 The grants handlers validate at the API layer **before** the DB CHECKs would catch it, so client-correctable mistakes surface as stable `invalid_request` (400) rather than `internal` (500):
 
-- **XOR target.** Exactly one of `database_id` (→ `Specific`) or `(server, db_name_wildcard: true)` (→ `Wildcard`). Both set, neither set, or a mismatched flag → 400 at the handler, never reaches the DB CHECK.
-- **Action.** Unknown action strings → 400 before any SQL runs.
-- **FK violations.** `user_id` or `database_id` referencing a missing/soft-deleted row raises SQLSTATE `23503` from `permissions_grants` — mapped to 400 with a generic `invalid grant reference` message. The DB error text is never echoed (CLAUDE.md non-negotiable #1).
-- **CHECK violations.** Belt-and-suspenders mapping of SQLSTATE `23514` to 400 in case a future migration adds a CHECK the handler doesn't pre-validate.
-- **Anything else** (pool exhaustion, encoder bug, audit failure) → `internal` (500) with the `request_id` only in the body; the underlying error stays in the gateway's logs.
+| Rule | Trigger | Response |
+|---|---|---|
+| XOR target | both, neither, or mismatched `database_id` / `(server, db_name_wildcard: true)` | `invalid_request` (400) at handler, never reaches DB CHECK |
+| Action parse | unknown action string | `invalid_request` (400) before any SQL runs |
+| FK violation (`23503`) | `user_id` or `database_id` missing / soft-deleted | `invalid_request` (400), stable `invalid grant reference` message; DB error text never echoed (non-negotiable #1) |
+| CHECK violation (`23514`) | belt-and-suspenders for a future migration adding a CHECK the handler doesn't pre-validate | `invalid_request` (400) |
+| Anything else | pool exhaustion, encoder bug, audit failure | `internal` (500), body carries `request_id` only; underlying error stays in gateway logs |
 
 ### PATCH cannot change the target
 
@@ -172,9 +174,11 @@ The resolver caches `(user, server, db) → grants` per session. Admin API write
 
 Implementation notes the handler honors:
 
-- **Post-commit, fire-and-forget.** The invalidation hook runs **after** the data + audit tx commits. A pre-commit invalidation lets a concurrent reader re-warm with the still-stale grant; firing after commit means the next re-warm sees the new state.
-- **`user_sub`-keyed.** The cache key is the SSO subject; grants reference users by row id. The handler resolves `user_sub` through the same tx (so the lookup sees the same DB state the audit row records), then passes it to `PermissionsCache::invalidate`.
-- **YAML-only installs.** When the gateway runs without a state DB (resolver cache absent), invalidation is a no-op — the TTL is the safety net.
+| Rule | Behavior |
+|---|---|
+| Post-commit, fire-and-forget | Hook fires **after** the data + audit tx commits. Pre-commit lets a concurrent reader re-warm with the still-stale grant; post-commit guarantees the next re-warm sees the new state. |
+| `user_sub`-keyed | Cache key is the SSO subject; grants reference users by row id. Handler resolves `user_sub` through the same tx (lookup sees the same DB state the audit row records), then passes it to `PermissionsCache::invalidate`. |
+| YAML-only installs | No state DB → resolver cache absent → invalidation is a no-op. TTL is the safety net. |
 
 ## Wildcard grants
 
