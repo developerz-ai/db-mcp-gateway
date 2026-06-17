@@ -17,7 +17,7 @@
 //! grants — they cannot use absence-of-grant to revoke YAML's grants. The
 //! "absence is the deny" semantic from spec 06 §Evaluation means there is no
 //! `deny` token to encode. The closest meaningful property is
-//! [`absence_is_silent`]: appending a grant that doesn't apply to `(s, d, a)`
+//! [`appending_non_matching_grant_is_a_noop`]: appending a grant that doesn't apply to `(s, d, a)`
 //! cannot change the outcome. That's tested here.
 
 use super::{Decision, evaluate_effective, grant_applies};

@@ -5,7 +5,7 @@
 //! most-restrictively — neither is privileged. This module encapsulates
 //! that logic and its tests.
 //!
-//! Resolver-level safety proofs live in [`super::effective_proptests`] (#50).
+//! Resolver-level safety proofs live in `effective_proptests` (#50, test-only module).
 
 use crate::auth::Identity;
 use crate::config::{Action, Constraints, Grant, Permission, Server};
