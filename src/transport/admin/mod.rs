@@ -13,6 +13,7 @@
 //! Every write commits a `permissions_audit` row in the same transaction as
 //! the data write. Audit failure rolls back. CLAUDE.md non-negotiable #4.
 
+pub mod databases;
 pub mod error;
 pub mod middleware;
 pub mod users;
@@ -26,20 +27,23 @@ use sqlx::PgPool;
 
 use crate::state::permissions::PermissionsRepo;
 
+use self::databases::DatabasesState;
 use self::middleware::{AdminMiddlewareState, require_admin_group};
 use self::users::UsersState;
 
 /// Build the `/admin/v1/*` router. Returned router is unmounted; the caller
 /// (`transport::router`) merges it into the top-level app and stacks
 /// `bearer_auth` over it.
+///
+/// Each entity family is its own `Router<EntityState>` `.with_state(...)`-ed
+/// to its handlers, then merged. They share the single `require_admin_group`
+/// layer applied at the top.
 pub fn router(admin_group: String, repo: Arc<dyn PermissionsRepo>, state_db: PgPool) -> Router {
     let mw_state = AdminMiddlewareState {
         admin_group,
         repo: repo.clone(),
     };
-    let users_state = UsersState { repo, state_db };
-
-    Router::new()
+    let users_routes = Router::new()
         .route("/admin/v1/users", post(users::create).get(users::list))
         .route(
             "/admin/v1/users/:id",
@@ -47,6 +51,25 @@ pub fn router(admin_group: String, repo: Arc<dyn PermissionsRepo>, state_db: PgP
                 .patch(users::patch)
                 .delete(users::delete),
         )
+        .with_state(UsersState {
+            repo: repo.clone(),
+            state_db: state_db.clone(),
+        });
+    let databases_routes = Router::new()
+        .route(
+            "/admin/v1/databases",
+            post(databases::create).get(databases::list),
+        )
+        .route(
+            "/admin/v1/databases/:id",
+            get(databases::get_one)
+                .patch(databases::patch)
+                .delete(databases::delete),
+        )
+        .with_state(DatabasesState { repo, state_db });
+
+    Router::new()
+        .merge(users_routes)
+        .merge(databases_routes)
         .route_layer(axum_mw::from_fn_with_state(mw_state, require_admin_group))
-        .with_state(users_state)
 }

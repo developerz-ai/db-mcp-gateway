@@ -178,6 +178,31 @@ impl PermissionsRepo for PgPermissionsRepo {
         rows.iter().map(database_from_row).collect()
     }
 
+    async fn update_database(
+        &self,
+        id: Uuid,
+        server: Option<&str>,
+        db_name: Option<&str>,
+        db_type: Option<DbType>,
+    ) -> Result<Option<PermissionsDatabase>, RepoError> {
+        let row = sqlx::query(
+            "UPDATE permissions_databases \
+             SET server = COALESCE($2, server), \
+                 db_name = COALESCE($3, db_name), \
+                 db_type = COALESCE($4, db_type), \
+                 updated_at = now() \
+             WHERE id = $1 AND deleted_at IS NULL \
+             RETURNING id, server, db_name, db_type, created_at, updated_at, deleted_at",
+        )
+        .bind(id)
+        .bind(server)
+        .bind(db_name)
+        .bind(db_type.map(|t| t.as_db_str()))
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| database_from_row(&r)).transpose()
+    }
+
     async fn soft_delete_database(&self, id: Uuid) -> Result<bool, RepoError> {
         let res = sqlx::query(
             "UPDATE permissions_databases SET deleted_at = now() \
