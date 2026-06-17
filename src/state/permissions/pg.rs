@@ -263,6 +263,67 @@ impl PermissionsRepo for PgPermissionsRepo {
         rows.iter().map(grant_from_row).collect()
     }
 
+    async fn get_grant(&self, id: Uuid) -> Result<Option<PermissionsGrant>, RepoError> {
+        let row = sqlx::query(
+            "SELECT id, user_id, server, database_id, db_name_wildcard, action, \
+                    constraints, created_at, updated_at, revoked_at \
+             FROM permissions_grants \
+             WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| grant_from_row(&r)).transpose()
+    }
+
+    async fn list_grants(
+        &self,
+        user_id: Option<Uuid>,
+        database_id: Option<Uuid>,
+    ) -> Result<Vec<PermissionsGrant>, RepoError> {
+        // Optional filters via `IS NULL OR =` so we don't dynamically build SQL.
+        // sqlx binds NULL for absent filters; both branches of each OR collapse
+        // at the planner level so the index on (user_id) / (database_id) is
+        // still used when the filter is set.
+        let rows = sqlx::query(
+            "SELECT id, user_id, server, database_id, db_name_wildcard, action, \
+                    constraints, created_at, updated_at, revoked_at \
+             FROM permissions_grants \
+             WHERE revoked_at IS NULL \
+               AND ($1::uuid IS NULL OR user_id = $1) \
+               AND ($2::uuid IS NULL OR database_id = $2) \
+             ORDER BY created_at",
+        )
+        .bind(user_id)
+        .bind(database_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(grant_from_row).collect()
+    }
+
+    async fn update_grant(
+        &self,
+        id: Uuid,
+        action: Option<GrantAction>,
+        constraints: Option<JsonValue>,
+    ) -> Result<Option<PermissionsGrant>, RepoError> {
+        let row = sqlx::query(
+            "UPDATE permissions_grants \
+             SET action = COALESCE($2, action), \
+                 constraints = COALESCE($3, constraints), \
+                 updated_at = now() \
+             WHERE id = $1 AND revoked_at IS NULL \
+             RETURNING id, user_id, server, database_id, db_name_wildcard, action, \
+                       constraints, created_at, updated_at, revoked_at",
+        )
+        .bind(id)
+        .bind(action.map(|a| a.as_db_str()))
+        .bind(constraints)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| grant_from_row(&r)).transpose()
+    }
+
     async fn revoke_grant(&self, id: Uuid) -> Result<bool, RepoError> {
         let res = sqlx::query(
             "UPDATE permissions_grants SET revoked_at = now() \

@@ -152,9 +152,33 @@ The `databases` endpoints register a *logical* db reference; the connection stri
 
 `db_name_wildcard: true` + `database_id: null` is the `db_name = "*"` form (see §Wildcard).
 
+### Validation + error semantics
+
+The grants handlers validate at the API layer **before** the DB CHECKs would catch it, so client-correctable mistakes surface as stable `invalid_request` (400) rather than `internal` (500):
+
+| Rule | Trigger | Response |
+|---|---|---|
+| XOR target | both, neither, or mismatched `database_id` / `(server, db_name_wildcard: true)` | `invalid_request` (400) at handler, never reaches DB CHECK |
+| Action parse | unknown action string | `invalid_request` (400) before any SQL runs |
+| FK violation (`23503`) | `user_id` or `database_id` missing / soft-deleted | `invalid_request` (400), stable `invalid grant reference` message; DB error text never echoed (non-negotiable #1) |
+| CHECK violation (`23514`) | belt-and-suspenders for a future migration adding a CHECK the handler doesn't pre-validate | `invalid_request` (400) |
+| Anything else | pool exhaustion, encoder bug, audit failure | `internal` (500), body carries `request_id` only; underlying error stays in gateway logs |
+
+### PATCH cannot change the target
+
+`PATCH /admin/v1/grants/:id` accepts `action` and `constraints` only. The XOR target (`Specific` vs `Wildcard`) is the grant's identity — re-targeting is DELETE + POST. Bodies carrying `database_id` / `server` / `db_name_wildcard` are rejected at the parse layer (`deny_unknown_fields` → 400).
+
 ### Cache invalidation
 
 The resolver caches `(user, server, db) → grants` per session. Admin API writes publish a tiny invalidation event over an in-process channel; the next tool call recomputes. No restart needed. Cache TTL is also short (default 60s) so a missed invalidation self-heals.
+
+Implementation notes the handler honors:
+
+| Rule | Behavior |
+|---|---|
+| Post-commit, fire-and-forget | Hook fires **after** the data + audit tx commits. Pre-commit lets a concurrent reader re-warm with the still-stale grant; post-commit guarantees the next re-warm sees the new state. |
+| `user_sub`-keyed | Cache key is the SSO subject; grants reference users by row id. Handler resolves `user_sub` through the same tx (lookup sees the same DB state the audit row records), then passes it to `PermissionsCache::invalidate`. |
+| YAML-only installs | No state DB → resolver cache absent → invalidation is a no-op. TTL is the safety net. |
 
 ## Wildcard grants
 

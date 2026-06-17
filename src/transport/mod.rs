@@ -91,7 +91,12 @@ pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError
             .ok_or(TransportError::AdminDepsMissing {
                 missing: "state_db",
             })?;
-        let admin_router = admin::router(admin_cfg.group.clone(), repo, state_db);
+        let admin_router = admin::router(
+            admin_cfg.group.clone(),
+            repo,
+            state_db,
+            state.permissions_cache.clone(),
+        );
         let admin_gated = admin_router.route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware::bearer_auth,
