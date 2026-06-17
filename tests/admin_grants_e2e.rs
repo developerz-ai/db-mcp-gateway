@@ -437,6 +437,57 @@ async fn unknown_action_is_rejected() {
     h.cleanup().await;
 }
 
+/// FK violations on `tx_create_grant` must surface as `invalid_request` (400)
+/// — they're client-correctable input errors (typo'd `user_id`, deleted
+/// `database_id`), not gateway faults. Anything else is an `internal` (500).
+#[tokio::test]
+async fn create_grant_with_unknown_user_or_database_is_400() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
+    let (user_id, db_id, _) = seed_target_user_and_db(&mut h).await;
+
+    // Unknown user_id → FK violation on permissions_grants.user_id.
+    let resp = client()
+        .post(format!("{}/admin/v1/grants", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&json!({
+            "user_id": Uuid::new_v4(),
+            "database_id": db_id,
+            "action": "query_read",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err: Value = resp.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "invalid_request");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid grant reference"),
+        "FK violation must surface a stable message; got {err}"
+    );
+
+    // Unknown database_id → FK violation on permissions_grants.database_id.
+    let resp = client()
+        .post(format!("{}/admin/v1/grants", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&json!({
+            "user_id": user_id,
+            "database_id": Uuid::new_v4(),
+            "action": "query_read",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err: Value = resp.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "invalid_request");
+
+    h.cleanup().await;
+}
+
 #[tokio::test]
 async fn patch_attempting_to_change_target_is_rejected() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;

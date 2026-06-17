@@ -3,7 +3,7 @@
 use serde_json::{Value as JsonValue, json};
 
 use crate::config::Constraints;
-use crate::state::permissions::{GrantAction, GrantTarget, PermissionsGrant};
+use crate::state::permissions::{GrantAction, GrantTarget, PermissionsGrant, RepoError};
 
 use super::super::error::AdminError;
 use super::dto::CreateGrantRequest;
@@ -114,4 +114,40 @@ pub(super) fn internal<E>(stage: &'static str, _err: E, request_id: &str) -> Adm
         "admin grants endpoint failed"
     );
     AdminError::internal().with_request_id(request_id)
+}
+
+/// Map [`tx_create_grant`](super::sql::tx_create_grant) failures so DB-level
+/// constraint violations come back as stable `invalid_request` (400) instead
+/// of `internal` (500). The constraints we care about:
+///
+/// - `23503` foreign_key_violation — `user_id` or `database_id` references
+///   a row that does not exist or has been soft-deleted.
+/// - `23514` check_violation — the XOR target / action CHECKs from migration
+///   `0004_permissions.sql`. The handler pre-validates both, so this branch
+///   is belt-and-suspenders for direct API misuse and future schema CHECKs.
+///
+/// No `23505` (unique_violation) mapping: `permissions_grants` has no UNIQUE
+/// index, so it cannot raise this. Stays in the `_` arm if a future migration
+/// adds one — failing closed is fine until we have a stable message for it.
+///
+/// Anything else (pool exhaustion, encoder bug, etc.) stays `internal`. The
+/// error string is intentionally not echoed — same redaction as
+/// [`internal`] above.
+pub(super) fn map_create_grant_error(err: RepoError, request_id: &str) -> AdminError {
+    if let RepoError::Sqlx(sqlx::Error::Database(db_err)) = &err {
+        match db_err.code().as_deref() {
+            Some("23503") => {
+                return AdminError::invalid(
+                    "invalid grant reference: user or database does not exist",
+                )
+                .with_request_id(request_id);
+            }
+            Some("23514") => {
+                return AdminError::invalid("grant violates target/action constraints")
+                    .with_request_id(request_id);
+            }
+            _ => {}
+        }
+    }
+    internal("create_grant", err, request_id)
 }

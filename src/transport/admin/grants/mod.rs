@@ -54,7 +54,7 @@ use sql::{
 };
 use validation::{
     constraints_to_json, grant_payload, internal, invalid_body, invalid_id, invalid_query,
-    parse_action, parse_grant_target,
+    map_create_grant_error, parse_action, parse_grant_target,
 };
 
 /// Shared state cloned into every grants-route handler. The `cache` field is
@@ -95,7 +95,7 @@ pub async fn create(
 
     let grant = tx_create_grant(&mut tx, body.user_id, target, action, constraints)
         .await
-        .map_err(|err| internal("create_grant", err, &actor.request_id))?;
+        .map_err(|err| map_create_grant_error(err, &actor.request_id))?;
 
     // Resolve the user_sub through the tx so the cache hook below can see
     // the same DB state the audit row records.
