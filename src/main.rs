@@ -110,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
     // mid-flight just rolls back; no half-state.
     spawn_audit_pruner(state_db, config.audit_retention_days);
 
-    let app = transport::router(&config, app_state);
+    let app = transport::router(&config, app_state)?;
 
     let handle = axum_server::Handle::new();
     let shutdown_for_signal = shutdown.clone();

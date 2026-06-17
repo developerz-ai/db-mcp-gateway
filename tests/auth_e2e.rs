@@ -109,7 +109,8 @@ async fn login_via_mock_idp_then_call_tool() {
             permissions_cache: None,
             permissions_repo: None,
         },
-    );
+    )
+    .expect("router builds");
     tokio::spawn(async move {
         let _ = axum::serve(
             listener,

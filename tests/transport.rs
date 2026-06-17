@@ -20,7 +20,7 @@ async fn spawn_gateway() -> String {
         mcp_path: "/mcp".to_string(),
         ..Config::default()
     };
-    let app = transport::router(&config, AppState::for_tests());
+    let app = transport::router(&config, AppState::for_tests()).expect("router builds");
     let listener = tokio::net::TcpListener::bind(config.bind).await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

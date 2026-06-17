@@ -8,6 +8,11 @@
 //!     bootstrap to a CLI subcommand; an already-admin caller (group claim
 //!     present) gets their row auto-provisioned here.
 //!  3. Stash `AdminActor` in request extensions for handlers to read.
+//!
+//! Every response — denial or success — carries the per-request id so a
+//! failing client paste can be joined to the matching tracing span. The id
+//! is extracted from `x-request-id` if the caller supplied one (gateways /
+//! ingress meshes commonly do); otherwise we mint a UUID.
 
 use std::sync::Arc;
 
@@ -53,18 +58,51 @@ pub async fn require_admin_group(
     mut req: Request,
     next: Next,
 ) -> Response {
+    // Resolve the request id up-front so EVERY exit path (401, 403, upsert
+    // failure, handler success) carries the same id. Lifting this above the
+    // identity check was a deliberate fix: previously the 401/403 responses
+    // dropped through with no correlation id, blinding ops on the most
+    // common failure modes.
+    let request_id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
     let Some(identity) = req.extensions().get::<Identity>().cloned() else {
         // `bearer_auth` either ran and rejected (so we're not here), or wasn't
         // mounted at all. Either way, no identity means we treat it as 401.
-        return AdminError::Unauthorized.into_response();
+        //
+        // No `permissions_audit` row: that table records permission *changes*
+        // (action ∈ create/update/delete) and requires a real `actor_id` (FK
+        // to `permissions_users`). An anonymous denial has neither — its
+        // forensic trail lives in the structured tracing line below + the
+        // gateway's request log (spec 07).
+        tracing::warn!(
+            request_id = %request_id,
+            "admin endpoint denied: no identity (401)"
+        );
+        return AdminError::unauthorized()
+            .with_request_id(request_id)
+            .into_response();
     };
 
     if !identity.groups.iter().any(|g| g == &state.admin_group) {
+        // Authenticated but not in the admin group: structured tracing carries
+        // the user_sub + request_id for ops triage. We deliberately don't
+        // upsert into `permissions_users` here — doing so would let any
+        // non-admin caller seed a row by hitting `/admin/*`, which is a
+        // (small) write amplification + pollution risk.
         tracing::warn!(
             user_sub = %identity.user_sub,
-            "admin endpoint denied: caller missing admin group"
+            request_id = %request_id,
+            "admin endpoint denied: caller missing admin group (403)"
         );
-        return AdminError::Forbidden.into_response();
+        return AdminError::forbidden()
+            .with_request_id(request_id)
+            .into_response();
     }
 
     // Upsert keeps the admin's `permissions_users` row in sync with the JWT.
@@ -77,18 +115,12 @@ pub async fn require_admin_group(
     {
         Ok(u) => u,
         Err(err) => {
-            tracing::error!(%err, user_sub = %identity.user_sub, "admin actor upsert failed");
-            return AdminError::Internal.into_response();
+            tracing::error!(%err, user_sub = %identity.user_sub, request_id = %request_id, "admin actor upsert failed");
+            return AdminError::internal()
+                .with_request_id(request_id)
+                .into_response();
         }
     };
-
-    let request_id = req
-        .headers()
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     req.extensions_mut().insert(AdminActor {
         id: user.id,

@@ -571,6 +571,54 @@ servers:
         );
     }
 
+    /// Spec 12 §"Admin API": when `admin.enabled` is true, `admin.group`
+    /// must be non-empty — otherwise every authenticated caller would be an
+    /// admin. Boot-time rejection (not a silent default) is the contract.
+    #[test]
+    fn rejects_admin_enabled_with_blank_group() {
+        let yaml = r#"
+admin:
+  enabled: true
+  group: "   "
+"#;
+        let err = ConfigFile::from_yaml_str(yaml).expect_err("blank admin group must reject");
+        let ConfigFileError::Invalid(msg) = err else {
+            panic!("expected Invalid, got {err:?}");
+        };
+        assert!(msg.contains("admin.group"), "{msg}");
+        assert!(msg.contains("non-empty"), "{msg}");
+    }
+
+    /// Mirror of the rejection test: `enabled: false` is the YAML-only
+    /// install default and must parse cleanly regardless of `group` shape
+    /// (the group string is ignored when the feature is off).
+    #[test]
+    fn accepts_admin_disabled_regardless_of_group() {
+        let yaml = r#"
+admin:
+  enabled: false
+  group: ""
+"#;
+        ConfigFile::from_yaml_str(yaml).expect("disabled admin parses even with blank group");
+
+        let yaml_with_group = r#"
+admin:
+  enabled: false
+  group: some-group
+"#;
+        ConfigFile::from_yaml_str(yaml_with_group)
+            .expect("disabled admin parses with any group string");
+    }
+
+    /// The omitted-block path: no `admin:` at all. Absent ≡ disabled and
+    /// the `/admin/*` surface stays 404 at the router layer.
+    #[test]
+    fn accepts_omitted_admin_block() {
+        let yaml = "servers: []\npermissions: []\n";
+        let cfg = ConfigFile::from_yaml_str(yaml).expect("omitted admin block is valid");
+        assert!(cfg.admin.is_none());
+    }
+
     /// A misspelled enum variant (action name) yields the same kind of
     /// expected-vs-got message serde gives for unknown variants — surfaces
     /// before the runtime can reach a confused authz miss.

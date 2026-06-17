@@ -88,14 +88,14 @@ pub async fn create(
     Extension(actor): Extension<AdminActor>,
     Json(body): Json<CreateUserRequest>,
 ) -> Result<impl IntoResponse, AdminError> {
-    let user_sub = trimmed_non_empty(&body.user_sub, "user_sub")?;
-    let user_email = trimmed_non_empty(&body.user_email, "user_email")?;
+    let user_sub = trimmed_non_empty(&body.user_sub, "user_sub", &actor.request_id)?;
+    let user_email = trimmed_non_empty(&body.user_email, "user_email", &actor.request_id)?;
 
     let mut tx = state
         .state_db
         .begin()
         .await
-        .map_err(|err| internal("begin tx", err))?;
+        .map_err(|err| internal("begin tx", err, &actor.request_id))?;
 
     // Read + write share the SAME transaction so the audit write (below) can
     // roll back both halves atomically. Hitting the pool directly for the
@@ -103,11 +103,11 @@ pub async fn create(
     // committed even if the audit step fails. CLAUDE.md non-negotiable #4.
     let before = tx_get_user_by_sub(&mut tx, &user_sub)
         .await
-        .map_err(|err| internal("get_user_by_sub", err))?;
+        .map_err(|err| internal("get_user_by_sub", err, &actor.request_id))?;
 
     let user = tx_upsert_user(&mut tx, &user_sub, &user_email, &body.groups)
         .await
-        .map_err(|err| internal("upsert_user", err))?;
+        .map_err(|err| internal("upsert_user", err, &actor.request_id))?;
 
     let action = if before.is_some() {
         PermissionsAuditAction::Update
@@ -126,11 +126,11 @@ pub async fn create(
     };
     permissions::log(&mut *tx, &audit_row)
         .await
-        .map_err(|err| internal("audit log", err))?;
+        .map_err(|err| internal("audit log", err, &actor.request_id))?;
 
     tx.commit()
         .await
-        .map_err(|err| internal("commit tx", err))?;
+        .map_err(|err| internal("commit tx", err, &actor.request_id))?;
 
     let status = if before.is_some() {
         StatusCode::OK
@@ -142,27 +142,27 @@ pub async fn create(
 
 pub async fn list(
     State(state): State<UsersState>,
-    Extension(_actor): Extension<AdminActor>,
+    Extension(actor): Extension<AdminActor>,
 ) -> Result<Json<Vec<UserResponse>>, AdminError> {
     let users = state
         .repo
         .list_users()
         .await
-        .map_err(|err| internal("list_users", err))?;
+        .map_err(|err| internal("list_users", err, &actor.request_id))?;
     Ok(Json(users.into_iter().map(UserResponse::from).collect()))
 }
 
 pub async fn get_one(
     State(state): State<UsersState>,
-    Extension(_actor): Extension<AdminActor>,
+    Extension(actor): Extension<AdminActor>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<UserResponse>, AdminError> {
     let user = state
         .repo
         .get_user(id)
         .await
-        .map_err(|err| internal("get_user", err))?
-        .ok_or(AdminError::NotFound)?;
+        .map_err(|err| internal("get_user", err, &actor.request_id))?
+        .ok_or_else(|| AdminError::not_found().with_request_id(&actor.request_id))?;
     Ok(Json(UserResponse::from(user)))
 }
 
@@ -173,12 +173,13 @@ pub async fn patch(
     Json(body): Json<UpdateUserRequest>,
 ) -> Result<Json<UserResponse>, AdminError> {
     if body.user_email.is_none() && body.groups.is_none() {
-        return Err(AdminError::Invalid(
-            "PATCH body must set at least one of user_email, groups".to_string(),
-        ));
+        return Err(
+            AdminError::invalid("PATCH body must set at least one of user_email, groups")
+                .with_request_id(&actor.request_id),
+        );
     }
     let user_email = match body.user_email.as_deref() {
-        Some(e) => Some(trimmed_non_empty(e, "user_email")?),
+        Some(e) => Some(trimmed_non_empty(e, "user_email", &actor.request_id)?),
         None => None,
     };
 
@@ -186,19 +187,19 @@ pub async fn patch(
         .state_db
         .begin()
         .await
-        .map_err(|err| internal("begin tx", err))?;
+        .map_err(|err| internal("begin tx", err, &actor.request_id))?;
 
     let before = tx_get_user_by_id(&mut tx, id)
         .await
-        .map_err(|err| internal("get_user", err))?
-        .ok_or(AdminError::NotFound)?;
+        .map_err(|err| internal("get_user", err, &actor.request_id))?
+        .ok_or_else(|| AdminError::not_found().with_request_id(&actor.request_id))?;
 
     let after = tx_update_user(&mut tx, id, user_email.as_deref(), body.groups.as_deref())
         .await
-        .map_err(|err| internal("update_user", err))?
+        .map_err(|err| internal("update_user", err, &actor.request_id))?
         // Race: someone soft-deleted the user between our read and our write.
         // Surface as 404 — the PATCH didn't apply.
-        .ok_or(AdminError::NotFound)?;
+        .ok_or_else(|| AdminError::not_found().with_request_id(&actor.request_id))?;
 
     let audit_row = PermissionsAuditRow {
         actor_id: actor.id,
@@ -212,11 +213,11 @@ pub async fn patch(
     };
     permissions::log(&mut *tx, &audit_row)
         .await
-        .map_err(|err| internal("audit log", err))?;
+        .map_err(|err| internal("audit log", err, &actor.request_id))?;
 
     tx.commit()
         .await
-        .map_err(|err| internal("commit tx", err))?;
+        .map_err(|err| internal("commit tx", err, &actor.request_id))?;
 
     Ok(Json(UserResponse::from(after)))
 }
@@ -230,18 +231,18 @@ pub async fn delete(
         .state_db
         .begin()
         .await
-        .map_err(|err| internal("begin tx", err))?;
+        .map_err(|err| internal("begin tx", err, &actor.request_id))?;
 
     let before = tx_get_user_by_id(&mut tx, id)
         .await
-        .map_err(|err| internal("get_user", err))?
-        .ok_or(AdminError::NotFound)?;
+        .map_err(|err| internal("get_user", err, &actor.request_id))?
+        .ok_or_else(|| AdminError::not_found().with_request_id(&actor.request_id))?;
 
     let deleted = tx_soft_delete_user(&mut tx, id)
         .await
-        .map_err(|err| internal("soft_delete_user", err))?;
+        .map_err(|err| internal("soft_delete_user", err, &actor.request_id))?;
     if !deleted {
-        return Err(AdminError::NotFound);
+        return Err(AdminError::not_found().with_request_id(&actor.request_id));
     }
 
     let audit_row = PermissionsAuditRow {
@@ -256,18 +257,18 @@ pub async fn delete(
     };
     permissions::log(&mut *tx, &audit_row)
         .await
-        .map_err(|err| internal("audit log", err))?;
+        .map_err(|err| internal("audit log", err, &actor.request_id))?;
 
     tx.commit()
         .await
-        .map_err(|err| internal("commit tx", err))?;
+        .map_err(|err| internal("commit tx", err, &actor.request_id))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn trimmed_non_empty(value: &str, field: &str) -> Result<String, AdminError> {
+fn trimmed_non_empty(value: &str, field: &str, request_id: &str) -> Result<String, AdminError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        Err(AdminError::Invalid(format!("{field} must be non-empty")))
+        Err(AdminError::invalid(format!("{field} must be non-empty")).with_request_id(request_id))
     } else {
         Ok(trimmed.to_string())
     }
@@ -404,7 +405,7 @@ fn user_from_row_admin(row: &sqlx::postgres::PgRow) -> Result<PermissionsUser, R
     })
 }
 
-fn internal<E: std::fmt::Display>(stage: &'static str, err: E) -> AdminError {
-    tracing::error!(stage, %err, "admin users endpoint failed");
-    AdminError::Internal
+fn internal<E: std::fmt::Display>(stage: &'static str, err: E, request_id: &str) -> AdminError {
+    tracing::error!(stage, %err, %request_id, "admin users endpoint failed");
+    AdminError::internal().with_request_id(request_id)
 }

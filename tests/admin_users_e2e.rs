@@ -160,7 +160,8 @@ async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
             permissions_cache: None,
             permissions_repo: Some(repo),
         },
-    );
+    )
+    .expect("router builds");
     tokio::spawn(async move {
         let _ = axum::serve(
             listener,
@@ -680,6 +681,106 @@ async fn audit_write_failure_rolls_back_user_write() {
     );
 
     // Cleanup admin seed.
+    let _ = sqlx::query("DELETE FROM permissions_users WHERE user_sub = $1")
+        .bind(&admin_sub)
+        .execute(&pool)
+        .await;
+}
+
+/// `admin.enabled = false` keeps the entire `/admin/*` surface unmounted —
+/// the request hits axum's default 404, not the admin error JSON. Belt-and-
+/// suspenders for YAML-only installs that explicitly opt out (spec 12
+/// §"Admin API"). Pairs with the enabled-path coverage above.
+#[tokio::test]
+async fn admin_disabled_returns_404_on_admin_routes() {
+    let pool = pool().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    let auth_config = AuthConfig {
+        issuer: "http://idp.invalid".to_string(),
+        client_id: "test".to_string(),
+        client_secret: "test".to_string(),
+        audience: "test".to_string(),
+        redirect_url: format!("{base_url}/auth/callback"),
+        ..AuthConfig::default()
+    };
+    let sessions = SessionStore::new(pool.clone());
+    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient builds");
+
+    // Same YAML as the enabled tests but with admin block explicitly disabled.
+    let mut config_file = ConfigFile::from_yaml_str("servers: []\npermissions: []\n").unwrap();
+    config_file.admin = Some(AdminBlock {
+        enabled: false,
+        group: ADMIN_GROUP.to_string(),
+    });
+
+    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
+    let config = Config {
+        bind: addr,
+        ..Config::default()
+    };
+    let app = transport::router(
+        &config,
+        AppState {
+            auth: Some(AuthFacade {
+                config: Arc::new(auth_config.clone()),
+                sessions: sessions.clone(),
+                oidc,
+                flows: PendingFlows::default(),
+            }),
+            config: Arc::new(config_file),
+            pool_registry: PoolRegistry::new(),
+            state_db: Some(pool.clone()),
+            shutdown: Default::default(),
+            metrics: None,
+            permissions_cache: None,
+            permissions_repo: Some(repo),
+        },
+    )
+    .expect("router builds");
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+
+    // Mint an admin-group bearer so we can prove the 404 is from "unmounted
+    // route", not "auth failed" — otherwise this test would also pass on a
+    // broken build that left the surface mounted but rejected the caller.
+    let admin_sub = format!("admin-disabled-{}", Uuid::new_v4().simple());
+    let jwt = mint_session(
+        &sessions,
+        &auth_config.session_signing_key,
+        &admin_sub,
+        "admin@example.com",
+        &[ADMIN_GROUP.to_string()],
+    )
+    .await;
+
+    for path in [
+        "/admin/v1/users",
+        "/admin/v1/users/00000000-0000-0000-0000-000000000000",
+    ] {
+        let resp = client()
+            .get(format!("{base_url}{path}"))
+            .bearer_auth(&jwt)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{path} must be unmounted when admin.enabled=false"
+        );
+    }
+
+    // Cleanup any row the admin's bearer would have created (none, since
+    // the admin upsert lives behind the middleware — but defensive cleanup
+    // keeps the test independent of that contract).
     let _ = sqlx::query("DELETE FROM permissions_users WHERE user_sub = $1")
         .bind(&admin_sub)
         .execute(&pool)

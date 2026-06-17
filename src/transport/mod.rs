@@ -7,6 +7,7 @@
 
 pub mod admin;
 pub mod app_state;
+pub mod errors;
 pub mod jsonrpc;
 pub mod probes;
 pub mod protocol;
@@ -30,13 +31,19 @@ use axum::{Extension, Json, Router};
 use serde_json::Value;
 
 pub use app_state::{AppState, AuthFacade, PendingFlows};
+pub use errors::TransportError;
 
 use crate::auth::Identity;
 use crate::config::Config;
 use crate::tools;
 
 /// Build the axum router, mounting the MCP endpoint and the auth routes.
-pub fn router(config: &Config, state: AppState) -> Router {
+///
+/// Returns `Err` when the runtime state can't satisfy the configured router —
+/// e.g. `admin.enabled = true` but `permissions_repo` / `state_db` are absent
+/// from `AppState`. Previously these wiring gaps silently dropped the
+/// `/admin/*` surface; now they refuse boot per spec 08 §"no half-loaded state".
+pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError> {
     let path = normalize_path(&config.mcp_path);
 
     // Bearer-gated routes: /mcp POST and /auth/logout (needs a session to
@@ -68,9 +75,22 @@ pub fn router(config: &Config, state: AppState) -> Router {
     // unauthenticated callers get 401, non-admin callers get 403.
     if let Some(admin_cfg) = state.config.admin.as_ref()
         && admin_cfg.enabled
-        && let (Some(repo), Some(state_db)) =
-            (state.permissions_repo.clone(), state.state_db.clone())
     {
+        // Fail fast — admin is opted in, so a missing dep is a wiring bug,
+        // not a feature toggle. Reporting *which* dep is missing keeps
+        // operator diagnosis to one log line.
+        let repo = state
+            .permissions_repo
+            .clone()
+            .ok_or(TransportError::AdminDepsMissing {
+                missing: "permissions_repo",
+            })?;
+        let state_db = state
+            .state_db
+            .clone()
+            .ok_or(TransportError::AdminDepsMissing {
+                missing: "state_db",
+            })?;
         let admin_router = admin::router(admin_cfg.group.clone(), repo, state_db);
         let admin_gated = admin_router.route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -79,7 +99,7 @@ pub fn router(config: &Config, state: AppState) -> Router {
         router = router.merge(admin_gated);
     }
 
-    router
+    Ok(router)
 }
 
 /// axum routes require a leading slash; tolerate config that omits it.
