@@ -15,6 +15,7 @@
 
 pub mod databases;
 pub mod error;
+pub mod grants;
 pub mod middleware;
 pub mod users;
 
@@ -25,9 +26,11 @@ use axum::middleware as axum_mw;
 use axum::routing::{get, post};
 use sqlx::PgPool;
 
+use crate::authz::PermissionsCache;
 use crate::state::permissions::PermissionsRepo;
 
 use self::databases::DatabasesState;
+use self::grants::GrantsState;
 use self::middleware::{AdminMiddlewareState, require_admin_group};
 use self::users::UsersState;
 
@@ -38,7 +41,17 @@ use self::users::UsersState;
 /// Each entity family is its own `Router<EntityState>` `.with_state(...)`-ed
 /// to its handlers, then merged. They share the single `require_admin_group`
 /// layer applied at the top.
-pub fn router(admin_group: String, repo: Arc<dyn PermissionsRepo>, state_db: PgPool) -> Router {
+///
+/// `cache` threads through to the grants handlers so a grant change fires a
+/// per-user cache invalidation post-commit — spec 12 §"Cache invalidation"
+/// and #54's acceptance criterion. `None` when the gateway runs without a
+/// resolver cache (YAML-only installs); invalidation then is a no-op.
+pub fn router(
+    admin_group: String,
+    repo: Arc<dyn PermissionsRepo>,
+    state_db: PgPool,
+    cache: Option<PermissionsCache>,
+) -> Router {
     let mw_state = AdminMiddlewareState {
         admin_group,
         repo: repo.clone(),
@@ -66,10 +79,27 @@ pub fn router(admin_group: String, repo: Arc<dyn PermissionsRepo>, state_db: PgP
                 .patch(databases::patch)
                 .delete(databases::delete),
         )
-        .with_state(DatabasesState { repo, state_db });
+        .with_state(DatabasesState {
+            repo: repo.clone(),
+            state_db: state_db.clone(),
+        });
+    let grants_routes = Router::new()
+        .route("/admin/v1/grants", post(grants::create).get(grants::list))
+        .route(
+            "/admin/v1/grants/:id",
+            get(grants::get_one)
+                .patch(grants::patch)
+                .delete(grants::delete),
+        )
+        .with_state(GrantsState {
+            repo,
+            state_db,
+            cache,
+        });
 
     Router::new()
         .merge(users_routes)
         .merge(databases_routes)
+        .merge(grants_routes)
         .route_layer(axum_mw::from_fn_with_state(mw_state, require_admin_group))
 }

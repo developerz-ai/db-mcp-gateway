@@ -228,5 +228,31 @@ pub trait PermissionsRepo: Send + Sync + std::fmt::Debug {
     async fn list_grants_for_user(&self, user_id: Uuid)
     -> Result<Vec<PermissionsGrant>, RepoError>;
 
+    /// Admin API lookup. Returns one grant by id, or `None` when missing /
+    /// revoked. Used by `GET /admin/v1/grants/:id` and the PATCH/DELETE
+    /// read-before-write that captures `before` for the audit row.
+    async fn get_grant(&self, id: Uuid) -> Result<Option<PermissionsGrant>, RepoError>;
+
+    /// Admin list with optional filters. Empty filter set returns every live
+    /// grant. `database_id` filter matches only `Specific` grants on that
+    /// database — wildcard grants share no `database_id` column so a wildcard
+    /// is never "for" a single database in this filter's sense.
+    async fn list_grants(
+        &self,
+        user_id: Option<Uuid>,
+        database_id: Option<Uuid>,
+    ) -> Result<Vec<PermissionsGrant>, RepoError>;
+
+    /// Partial update used by `PATCH /admin/v1/grants/:id`. The target
+    /// (Specific vs Wildcard) is the grant's identity and is NOT mutable
+    /// via PATCH — change targets by DELETE + POST. Returns the post-update
+    /// row, or `None` when the grant is missing / revoked.
+    async fn update_grant(
+        &self,
+        id: Uuid,
+        action: Option<GrantAction>,
+        constraints: Option<JsonValue>,
+    ) -> Result<Option<PermissionsGrant>, RepoError>;
+
     async fn revoke_grant(&self, id: Uuid) -> Result<bool, RepoError>;
 }
