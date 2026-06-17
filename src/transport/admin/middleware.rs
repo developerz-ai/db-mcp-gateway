@@ -115,7 +115,17 @@ pub async fn require_admin_group(
     {
         Ok(u) => u,
         Err(err) => {
-            tracing::error!(%err, user_sub = %identity.user_sub, request_id = %request_id, "admin actor upsert failed");
+            // Same shape as users::internal — log only the error TYPE, never
+            // the Display text. A `sqlx::Error::Database` `Display` embeds PG
+            // `detail`/`constraint`, which on `permissions_users` would leak
+            // user emails and group names. CLAUDE.md non-negotiable #1.
+            let error_type = std::any::type_name_of_val(&err);
+            tracing::error!(
+                error_type,
+                user_sub = %identity.user_sub,
+                request_id = %request_id,
+                "admin actor upsert failed"
+            );
             return AdminError::internal()
                 .with_request_id(request_id)
                 .into_response();

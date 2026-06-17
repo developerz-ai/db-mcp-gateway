@@ -14,7 +14,7 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde_json::json;
+use serde_json::{Value as JsonValue, json};
 
 /// Admin-API failure modes. Variants map 1:1 to stable JSON error codes:
 /// `forbidden`, `unauthorized`, `not_found`, `invalid_request`, `internal`.
@@ -114,16 +114,20 @@ impl AdminError {
 
 impl IntoResponse for AdminError {
     fn into_response(self) -> Response {
-        let mut err = json!({ "code": self.code(), "message": self.message() });
+        // Build the object directly so the error path stays panic-free —
+        // `json!({...})` + `as_object_mut().expect(...)` would panic if the
+        // macro ever returned a non-object value. CLAUDE.md: no expect/unwrap
+        // outside main/tests.
+        let mut err = serde_json::Map::with_capacity(3);
+        err.insert("code".to_string(), json!(self.code()));
+        err.insert("message".to_string(), json!(self.message()));
         if let Some(rid) = self.request_id.as_deref() {
             // Top-level `request_id` mirrors the audit-row column and the
             // tracing span field of the same name — operators paste it once
             // and grep all three.
-            err.as_object_mut()
-                .expect("constructed above as object")
-                .insert("request_id".to_string(), json!(rid));
+            err.insert("request_id".to_string(), json!(rid));
         }
-        let body = json!({ "error": err });
+        let body = json!({ "error": JsonValue::Object(err) });
         (self.status(), Json(body)).into_response()
     }
 }

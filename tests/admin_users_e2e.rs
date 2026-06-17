@@ -687,6 +687,87 @@ async fn audit_write_failure_rolls_back_user_write() {
         .await;
 }
 
+/// Malformed JSON body must surface as the stable admin-error envelope
+/// (`invalid_request` + `request_id`), not Axum's default 400/422. Belt-and-
+/// suspenders for the contract the docs sell: every admin failure carries a
+/// stable code AND a request_id, so an operator can paste the id into Loki
+/// and grep all three places (response, log, audit). Pairs with the fallible
+/// extractor change in `src/transport/admin/users.rs`.
+#[tokio::test]
+async fn malformed_json_returns_invalid_request_envelope() {
+    let (h, auth_cfg, sessions) = spawn_gateway().await;
+    let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    let jwt = mint_session(
+        &sessions,
+        &auth_cfg.session_signing_key,
+        &admin_sub,
+        "admin@example.com",
+        &[ADMIN_GROUP.to_string()],
+    )
+    .await;
+
+    let resp = client()
+        .post(format!("{}/admin/v1/users", h.base_url))
+        .bearer_auth(&jwt)
+        .header("content-type", "application/json")
+        .body("{not valid json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "invalid_request");
+    assert!(
+        body["error"]["request_id"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "every admin error envelope must carry request_id"
+    );
+
+    // Defensive: middleware upserts the admin actor row before the handler
+    // sees the body, so clean it up.
+    let _ = sqlx::query("DELETE FROM permissions_users WHERE user_sub = $1")
+        .bind(&admin_sub)
+        .execute(&h.pool)
+        .await;
+}
+
+/// Invalid UUID in `:id` must also produce the stable admin-error envelope.
+#[tokio::test]
+async fn invalid_path_id_returns_invalid_request_envelope() {
+    let (h, auth_cfg, sessions) = spawn_gateway().await;
+    let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    let jwt = mint_session(
+        &sessions,
+        &auth_cfg.session_signing_key,
+        &admin_sub,
+        "admin@example.com",
+        &[ADMIN_GROUP.to_string()],
+    )
+    .await;
+
+    let resp = client()
+        .get(format!("{}/admin/v1/users/not-a-uuid", h.base_url))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "invalid_request");
+    assert!(
+        body["error"]["request_id"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "every admin error envelope must carry request_id"
+    );
+
+    let _ = sqlx::query("DELETE FROM permissions_users WHERE user_sub = $1")
+        .bind(&admin_sub)
+        .execute(&h.pool)
+        .await;
+}
+
 /// `admin.enabled = false` keeps the entire `/admin/*` surface unmounted —
 /// the request hits axum's default 404, not the admin error JSON. Belt-and-
 /// suspenders for YAML-only installs that explicitly opt out (spec 12

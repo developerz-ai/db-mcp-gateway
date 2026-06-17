@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use axum::Json;
+use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -86,8 +87,12 @@ pub struct UpdateUserRequest {
 pub async fn create(
     State(state): State<UsersState>,
     Extension(actor): Extension<AdminActor>,
-    Json(body): Json<CreateUserRequest>,
+    // Fallible extractor: rejection (malformed/non-JSON body) returns the
+    // stable admin error JSON with a `request_id`, not Axum's default 400/422
+    // body that lacks our `code`/`request_id` contract.
+    body: Result<Json<CreateUserRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, AdminError> {
+    let Json(body) = body.map_err(|_| invalid_body(&actor.request_id))?;
     let user_sub = trimmed_non_empty(&body.user_sub, "user_sub", &actor.request_id)?;
     let user_email = trimmed_non_empty(&body.user_email, "user_email", &actor.request_id)?;
 
@@ -155,8 +160,9 @@ pub async fn list(
 pub async fn get_one(
     State(state): State<UsersState>,
     Extension(actor): Extension<AdminActor>,
-    Path(id): Path<Uuid>,
+    id: Result<Path<Uuid>, PathRejection>,
 ) -> Result<Json<UserResponse>, AdminError> {
+    let Path(id) = id.map_err(|_| invalid_id(&actor.request_id))?;
     let user = state
         .repo
         .get_user(id)
@@ -169,9 +175,11 @@ pub async fn get_one(
 pub async fn patch(
     State(state): State<UsersState>,
     Extension(actor): Extension<AdminActor>,
-    Path(id): Path<Uuid>,
-    Json(body): Json<UpdateUserRequest>,
+    id: Result<Path<Uuid>, PathRejection>,
+    body: Result<Json<UpdateUserRequest>, JsonRejection>,
 ) -> Result<Json<UserResponse>, AdminError> {
+    let Path(id) = id.map_err(|_| invalid_id(&actor.request_id))?;
+    let Json(body) = body.map_err(|_| invalid_body(&actor.request_id))?;
     if body.user_email.is_none() && body.groups.is_none() {
         return Err(
             AdminError::invalid("PATCH body must set at least one of user_email, groups")
@@ -225,8 +233,9 @@ pub async fn patch(
 pub async fn delete(
     State(state): State<UsersState>,
     Extension(actor): Extension<AdminActor>,
-    Path(id): Path<Uuid>,
+    id: Result<Path<Uuid>, PathRejection>,
 ) -> Result<StatusCode, AdminError> {
+    let Path(id) = id.map_err(|_| invalid_id(&actor.request_id))?;
     let mut tx = state
         .state_db
         .begin()
@@ -263,6 +272,19 @@ pub async fn delete(
         .await
         .map_err(|err| internal("commit tx", err, &actor.request_id))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Map a `JsonRejection` (malformed/missing body, bad content-type) onto the
+/// stable admin-error envelope so clients see `invalid_request` + `request_id`
+/// instead of Axum's default 400/422.
+fn invalid_body(request_id: &str) -> AdminError {
+    AdminError::invalid("invalid JSON body").with_request_id(request_id)
+}
+
+/// Map a `PathRejection` (malformed UUID in `:id`) onto the stable admin-error
+/// envelope.
+fn invalid_id(request_id: &str) -> AdminError {
+    AdminError::invalid("invalid user id").with_request_id(request_id)
 }
 
 fn trimmed_non_empty(value: &str, field: &str, request_id: &str) -> Result<String, AdminError> {
@@ -405,7 +427,19 @@ fn user_from_row_admin(row: &sqlx::postgres::PgRow) -> Result<PermissionsUser, R
     })
 }
 
-fn internal<E: std::fmt::Display>(stage: &'static str, err: E, request_id: &str) -> AdminError {
-    tracing::error!(stage, %err, %request_id, "admin users endpoint failed");
+/// Build an `internal` admin error and trace the failure.
+///
+/// We log only `stage`, `error_type`, and `request_id` — never `%err`. A
+/// PostgreSQL error's `Display` impl embeds `detail`/`constraint` text, which
+/// on `permissions_users` carries user emails and group names. CLAUDE.md
+/// non-negotiable #1 forbids leaking that into logs.
+fn internal<E>(stage: &'static str, _err: E, request_id: &str) -> AdminError {
+    let error_type = std::any::type_name::<E>();
+    tracing::error!(
+        stage,
+        error_type,
+        %request_id,
+        "admin users endpoint failed"
+    );
     AdminError::internal().with_request_id(request_id)
 }
