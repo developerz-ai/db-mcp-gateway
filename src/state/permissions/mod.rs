@@ -203,6 +203,17 @@ pub trait PermissionsRepo: Send + Sync + std::fmt::Debug {
 
     async fn list_databases(&self) -> Result<Vec<PermissionsDatabase>, RepoError>;
 
+    /// Partial update used by `PATCH /admin/v1/databases/:id`. `None` means
+    /// "leave field unchanged". Returns the post-update row, or `None` when
+    /// the database is missing / soft-deleted (callers translate to 404).
+    async fn update_database(
+        &self,
+        id: Uuid,
+        server: Option<&str>,
+        db_name: Option<&str>,
+        db_type: Option<DbType>,
+    ) -> Result<Option<PermissionsDatabase>, RepoError>;
+
     async fn soft_delete_database(&self, id: Uuid) -> Result<bool, RepoError>;
 
     async fn create_grant(
