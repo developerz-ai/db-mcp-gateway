@@ -160,7 +160,7 @@ pub enum RepoError {
 /// resolver (#49) needs. Trait stays dumb — no constraint merging, no
 /// wildcard expansion. That belongs above this layer.
 #[async_trait]
-pub trait PermissionsRepo: Send + Sync {
+pub trait PermissionsRepo: Send + Sync + std::fmt::Debug {
     /// Idempotent upsert keyed on `user_sub`. Refreshes the cached email +
     /// groups every call so the admin listing stays in sync with the JWT. A
     /// soft-deleted prior row stays as an audit trail; a fresh log-in inserts
@@ -174,7 +174,21 @@ pub trait PermissionsRepo: Send + Sync {
 
     async fn get_user_by_sub(&self, user_sub: &str) -> Result<Option<PermissionsUser>, RepoError>;
 
+    /// Uuid-keyed read used by the admin API (GET /admin/v1/users/:id and the
+    /// PATCH read-before-write that captures `before` for the audit row).
+    async fn get_user(&self, id: Uuid) -> Result<Option<PermissionsUser>, RepoError>;
+
     async fn list_users(&self) -> Result<Vec<PermissionsUser>, RepoError>;
+
+    /// Partial update used by `PATCH /admin/v1/users/:id`. `None` means
+    /// "leave field unchanged". Returns the post-update row, or `None` when
+    /// the user is missing / soft-deleted (callers translate to 404).
+    async fn update_user(
+        &self,
+        id: Uuid,
+        user_email: Option<&str>,
+        groups: Option<&[String]>,
+    ) -> Result<Option<PermissionsUser>, RepoError>;
 
     async fn soft_delete_user(&self, id: Uuid) -> Result<bool, RepoError>;
 

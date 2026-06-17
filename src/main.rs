@@ -82,8 +82,10 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = ShutdownFlag::new();
     let sessions = SessionStore::new(state_db.clone());
     let oidc = OidcClient::new(auth_config.clone())?;
+    let permissions_repo: std::sync::Arc<dyn db_mcp_gateway::state::permissions::PermissionsRepo> =
+        Arc::new(PgPermissionsRepo::new(state_db.clone()));
     let permissions_cache = PermissionsCache::new(
-        Arc::new(PgPermissionsRepo::new(state_db.clone())),
+        permissions_repo.clone(),
         std::time::Duration::from_secs(config.permissions_cache_ttl_seconds),
     );
     let app_state = AppState {
@@ -99,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
         shutdown: shutdown.clone(),
         metrics: Some(metrics_handle),
         permissions_cache: Some(permissions_cache),
+        permissions_repo: Some(permissions_repo),
     };
 
     // Spawn the audit retention pruner. Ticks hourly, deletes rows older
@@ -107,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
     // mid-flight just rolls back; no half-state.
     spawn_audit_pruner(state_db, config.audit_retention_days);
 
-    let app = transport::router(&config, app_state);
+    let app = transport::router(&config, app_state)?;
 
     let handle = axum_server::Handle::new();
     let shutdown_for_signal = shutdown.clone();

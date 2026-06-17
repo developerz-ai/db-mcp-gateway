@@ -99,8 +99,10 @@ async fn boot_gateway() -> BootedGateway {
             shutdown: Default::default(),
             metrics: None,
             permissions_cache: None,
+            permissions_repo: None,
         },
-    );
+    )
+    .expect("router builds");
     tokio::spawn(async move {
         let _ = axum::serve(
             listener,
