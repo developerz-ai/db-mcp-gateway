@@ -70,6 +70,48 @@ impl PermissionsRepo for PgPermissionsRepo {
         row.map(|r| user_from_row(&r)).transpose()
     }
 
+    async fn get_user(&self, id: Uuid) -> Result<Option<PermissionsUser>, RepoError> {
+        let row = sqlx::query(
+            "SELECT id, user_sub, user_email, groups, created_at, updated_at, deleted_at \
+             FROM permissions_users \
+             WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| user_from_row(&r)).transpose()
+    }
+
+    async fn update_user(
+        &self,
+        id: Uuid,
+        user_email: Option<&str>,
+        groups: Option<&[String]>,
+    ) -> Result<Option<PermissionsUser>, RepoError> {
+        // COALESCE keeps the partial-update contract: a `None` argument leaves
+        // the column untouched. `updated_at` always bumps so a no-op PATCH
+        // still reflects an admin action (`before == after` audit row is
+        // intentional — operators want to know that someone *looked*).
+        let groups_json = match groups {
+            Some(g) => Some(serde_json::to_value(g).map_err(RepoError::EncodeGroups)?),
+            None => None,
+        };
+        let row = sqlx::query(
+            "UPDATE permissions_users \
+             SET user_email = COALESCE($2, user_email), \
+                 groups = COALESCE($3, groups), \
+                 updated_at = now() \
+             WHERE id = $1 AND deleted_at IS NULL \
+             RETURNING id, user_sub, user_email, groups, created_at, updated_at, deleted_at",
+        )
+        .bind(id)
+        .bind(user_email)
+        .bind(groups_json)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| user_from_row(&r)).transpose()
+    }
+
     async fn list_users(&self) -> Result<Vec<PermissionsUser>, RepoError> {
         let rows = sqlx::query(
             "SELECT id, user_sub, user_email, groups, created_at, updated_at, deleted_at \

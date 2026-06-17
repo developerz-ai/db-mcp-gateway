@@ -5,6 +5,7 @@
 //! bearer-auth middleware on /mcp POST. DB execution and audit live elsewhere.
 //! See docs/initial-idea/02-architecture.md.
 
+pub mod admin;
 pub mod app_state;
 pub mod jsonrpc;
 pub mod probes;
@@ -59,7 +60,26 @@ pub fn router(config: &Config, state: AppState) -> Router {
         .route("/readyz", get(probes::readyz))
         .route("/metrics", get(probes::metrics));
 
-    open.merge(gated).with_state(state)
+    let mut router = open.merge(gated).with_state(state.clone());
+
+    // Spec 12: when `admin.enabled` is false (or absent), the entire `/admin/*`
+    // surface stays unmounted — a request to it returns axum's default 404.
+    // The admin router is gated by `bearer_auth` AND `require_admin_group`;
+    // unauthenticated callers get 401, non-admin callers get 403.
+    if let Some(admin_cfg) = state.config.admin.as_ref()
+        && admin_cfg.enabled
+        && let (Some(repo), Some(state_db)) =
+            (state.permissions_repo.clone(), state.state_db.clone())
+    {
+        let admin_router = admin::router(admin_cfg.group.clone(), repo, state_db);
+        let admin_gated = admin_router.route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware::bearer_auth,
+        ));
+        router = router.merge(admin_gated);
+    }
+
+    router
 }
 
 /// axum routes require a leading slash; tolerate config that omits it.

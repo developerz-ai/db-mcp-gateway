@@ -18,6 +18,22 @@ pub struct ConfigFile {
     pub servers: Vec<Server>,
     #[serde(default)]
     pub permissions: Vec<Permission>,
+    /// Spec 12 §"Admin API". Absent or `enabled: false` → entire `/admin/*`
+    /// route returns 404. Belt-and-suspenders for YAML-only installs.
+    #[serde(default)]
+    pub admin: Option<AdminBlock>,
+}
+
+/// Admin API gating. Mirrors spec 12 §"Admin API" YAML schema.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminBlock {
+    #[serde(default)]
+    pub enabled: bool,
+    /// SSO group claim that authorizes `/admin/v1/*` calls. Required when
+    /// `enabled = true`; an empty value is a boot error (every authenticated
+    /// user would otherwise be an admin).
+    pub group: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -163,6 +179,15 @@ impl ConfigFile {
     }
 
     fn validate(&self) -> Result<(), ConfigFileError> {
+        if let Some(admin) = &self.admin
+            && admin.enabled
+            && admin.group.trim().is_empty()
+        {
+            return Err(ConfigFileError::Invalid(
+                "admin.group must be non-empty when admin.enabled is true".to_string(),
+            ));
+        }
+
         let mut server_names: HashSet<&str> = HashSet::new();
         for server in &self.servers {
             if !server_names.insert(&server.name) {

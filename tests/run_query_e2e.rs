@@ -125,6 +125,7 @@ async fn boot_gateway() -> BootedGateway {
             shutdown: Default::default(),
             metrics: None,
             permissions_cache: None,
+            permissions_repo: None,
         },
     );
     tokio::spawn(async move {

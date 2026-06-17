@@ -21,6 +21,7 @@ use crate::auth::{AuthConfig, OidcClient, SessionStore};
 use crate::authz::PermissionsCache;
 use crate::config::ConfigFile;
 use crate::exec::PoolRegistry;
+use crate::state::permissions::PermissionsRepo;
 
 /// `state → nonce` from /auth/login lives here until /auth/callback consumes
 /// (and removes) it. TTL-bounded so a wedged login can't accumulate.
@@ -47,6 +48,11 @@ pub struct AppState {
     /// resolver — dispatch falls through to YAML-only authz, which is the
     /// same path the gateway took before #49.
     pub permissions_cache: Option<PermissionsCache>,
+    /// Permissions store handle. `Some` whenever the admin API (#52) is
+    /// mounted; the admin handlers read/write through this. The cache uses
+    /// its own clone so cache-only paths don't need the repo in `AppState`.
+    /// `None` in tests that don't exercise the admin surface.
+    pub permissions_repo: Option<Arc<dyn PermissionsRepo>>,
 }
 
 impl AppState {
@@ -59,12 +65,14 @@ impl AppState {
             config: Arc::new(ConfigFile {
                 servers: Vec::new(),
                 permissions: Vec::new(),
+                admin: None,
             }),
             pool_registry: PoolRegistry::new(),
             state_db: None,
             shutdown: ShutdownFlag::new(),
             metrics: None,
             permissions_cache: None,
+            permissions_repo: None,
         }
     }
 }

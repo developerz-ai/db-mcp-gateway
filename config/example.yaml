@@ -63,6 +63,13 @@ servers:
         password: ${FILE:/run/secrets/staging-app-ro-password}
         # pool: { max_connections: 5 }    # planned — see comment above
 
+# Spec 12 §"Admin API". Default off — turn on only when you need the
+# SSO-gated runtime CRUD over `/admin/v1/*`. Required when on:
+#   group — the SSO claim that authorizes admin calls.
+# admin:
+#   enabled: true
+#   group: db-mcp-gateway-admins
+
 permissions:
   - group: backend-engineers
     grants:
