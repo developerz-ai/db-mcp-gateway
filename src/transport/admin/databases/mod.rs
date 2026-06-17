@@ -17,6 +17,17 @@
 //!   other unknown field is rejected at the parse layer with `400
 //!   invalid_request` — the handler never sees the field, so it can't accidentally
 //!   log or echo it. This is the headline acceptance criterion from #53.
+//!
+//! ## File layout
+//!
+//! Split across submodules to keep each file under the CLAUDE.md 300-LOC
+//! ceiling: [`dto`] for request/response shapes, [`sql`] for the tx-scoped
+//! SQL helpers, [`validation`] for input parsing + error mapping. This file
+//! owns only the route handlers and the audit payload builder.
+
+mod dto;
+mod sql;
+mod validation;
 
 use std::sync::Arc;
 
@@ -25,19 +36,22 @@ use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::audit::permissions::{
     self, PermissionsAuditAction, PermissionsAuditRow, PermissionsAuditTargetType,
 };
-use crate::state::permissions::{DbType, PermissionsDatabase, PermissionsRepo, RepoError};
+use crate::state::permissions::{PermissionsDatabase, PermissionsRepo};
 
 use super::error::AdminError;
 use super::middleware::AdminActor;
+
+pub use dto::{CreateDatabaseRequest, DatabaseResponse, UpdateDatabaseRequest};
+
+use sql::{tx_create_database, tx_get_database_by_id, tx_soft_delete_database, tx_update_database};
+use validation::{internal, invalid_body, invalid_id, parse_db_type, trimmed_non_empty};
 
 /// Shared state cloned into every databases-route handler.
 #[derive(Clone)]
@@ -53,56 +67,6 @@ impl std::fmt::Debug for DatabasesState {
             .field("state_db", &"<PgPool>")
             .finish()
     }
-}
-
-/// Public response shape. The storage struct never carries credentials by
-/// design (migration `0004_permissions.sql` has no DSN/role/password column),
-/// so this DTO cannot leak one. Kept as a dedicated type so a future schema
-/// change can't quietly widen the admin surface.
-#[derive(Debug, Serialize)]
-pub struct DatabaseResponse {
-    pub id: Uuid,
-    pub server: String,
-    pub db_name: String,
-    pub db_type: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-impl From<PermissionsDatabase> for DatabaseResponse {
-    fn from(d: PermissionsDatabase) -> Self {
-        Self {
-            id: d.id,
-            server: d.server,
-            db_name: d.db_name,
-            db_type: d.db_type.as_db_str().to_string(),
-            created_at: d.created_at,
-            updated_at: d.updated_at,
-        }
-    }
-}
-
-/// `deny_unknown_fields` is the security primitive. Any extra field (`dsn`,
-/// `connection_string`, `password`, `role`, …) → 400 at parse time. The
-/// handler never sees the unknown field; it can't be logged or echoed.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CreateDatabaseRequest {
-    pub server: String,
-    pub db_name: String,
-    pub db_type: String,
-}
-
-/// Partial-update DTO. Same `deny_unknown_fields` discipline as create.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UpdateDatabaseRequest {
-    #[serde(default)]
-    pub server: Option<String>,
-    #[serde(default)]
-    pub db_name: Option<String>,
-    #[serde(default)]
-    pub db_type: Option<String>,
 }
 
 pub async fn create(
@@ -285,38 +249,6 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn invalid_body(request_id: &str) -> AdminError {
-    AdminError::invalid("invalid JSON body").with_request_id(request_id)
-}
-
-fn invalid_id(request_id: &str) -> AdminError {
-    AdminError::invalid("invalid database id").with_request_id(request_id)
-}
-
-fn trimmed_non_empty(value: &str, field: &str, request_id: &str) -> Result<String, AdminError> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        Err(AdminError::invalid(format!("{field} must be non-empty")).with_request_id(request_id))
-    } else {
-        Ok(trimmed.to_string())
-    }
-}
-
-/// Reject anything outside the `permissions_databases.db_type` CHECK (currently
-/// `postgres` | `mysql`). `mongo` is intentionally rejected — spec 12
-/// §"Storage backends" excludes mongo from the permissions store; it appears
-/// only as a query target (#57–#58). Surfacing the rejection here keeps the
-/// error code stable (`invalid_request`) instead of a 500 from the eventual
-/// DB CHECK violation.
-fn parse_db_type(value: &str, request_id: &str) -> Result<DbType, AdminError> {
-    DbType::parse(value.trim()).map_err(|_| {
-        AdminError::invalid(format!(
-            "db_type `{value}` not supported (allowed: postgres, mysql)"
-        ))
-        .with_request_id(request_id)
-    })
-}
-
 fn database_payload(d: &PermissionsDatabase) -> JsonValue {
     json!({
         "id": d.id,
@@ -325,115 +257,5 @@ fn database_payload(d: &PermissionsDatabase) -> JsonValue {
         "db_type": d.db_type.as_db_str(),
         "created_at": d.created_at,
         "updated_at": d.updated_at,
-    })
-}
-
-/// Same logging discipline as [`super::users::internal`]: we log `stage` +
-/// `error_type` + `request_id` but NEVER the underlying error string. A sqlx
-/// error's `Display` impl can quote constraint-violation detail that, on
-/// `permissions_databases`, would include the offending `server`/`db_name`
-/// values — and could in principle echo back content from a future column
-/// we haven't anticipated. CLAUDE.md non-negotiable #1.
-fn internal<E>(stage: &'static str, _err: E, request_id: &str) -> AdminError {
-    let error_type = std::any::type_name::<E>();
-    tracing::error!(
-        stage,
-        error_type,
-        %request_id,
-        "admin databases endpoint failed"
-    );
-    AdminError::internal().with_request_id(request_id)
-}
-
-// ----- Transactional SQL helpers -----
-//
-// Same rationale as [`super::users`]: the data write MUST share the tx with
-// the audit log so an audit failure rolls back both. The [`PermissionsRepo`]
-// trait stays pool-backed (resolver hot path doesn't need transactions); the
-// admin handlers inline the SQL here.
-
-async fn tx_create_database(
-    tx: &mut Transaction<'_, Postgres>,
-    server: &str,
-    db_name: &str,
-    db_type: DbType,
-) -> Result<PermissionsDatabase, RepoError> {
-    let row = sqlx::query(
-        "INSERT INTO permissions_databases (server, db_name, db_type) \
-         VALUES ($1, $2, $3) \
-         RETURNING id, server, db_name, db_type, created_at, updated_at, deleted_at",
-    )
-    .bind(server)
-    .bind(db_name)
-    .bind(db_type.as_db_str())
-    .fetch_one(&mut **tx)
-    .await?;
-    database_from_row_admin(&row)
-}
-
-async fn tx_get_database_by_id(
-    tx: &mut Transaction<'_, Postgres>,
-    id: Uuid,
-) -> Result<Option<PermissionsDatabase>, RepoError> {
-    let row = sqlx::query(
-        "SELECT id, server, db_name, db_type, created_at, updated_at, deleted_at \
-         FROM permissions_databases \
-         WHERE id = $1 AND deleted_at IS NULL",
-    )
-    .bind(id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    row.map(|r| database_from_row_admin(&r)).transpose()
-}
-
-async fn tx_update_database(
-    tx: &mut Transaction<'_, Postgres>,
-    id: Uuid,
-    server: Option<&str>,
-    db_name: Option<&str>,
-    db_type: Option<DbType>,
-) -> Result<Option<PermissionsDatabase>, RepoError> {
-    let row = sqlx::query(
-        "UPDATE permissions_databases \
-         SET server = COALESCE($2, server), \
-             db_name = COALESCE($3, db_name), \
-             db_type = COALESCE($4, db_type), \
-             updated_at = now() \
-         WHERE id = $1 AND deleted_at IS NULL \
-         RETURNING id, server, db_name, db_type, created_at, updated_at, deleted_at",
-    )
-    .bind(id)
-    .bind(server)
-    .bind(db_name)
-    .bind(db_type.map(|t| t.as_db_str()))
-    .fetch_optional(&mut **tx)
-    .await?;
-    row.map(|r| database_from_row_admin(&r)).transpose()
-}
-
-async fn tx_soft_delete_database(
-    tx: &mut Transaction<'_, Postgres>,
-    id: Uuid,
-) -> Result<bool, RepoError> {
-    let res = sqlx::query(
-        "UPDATE permissions_databases SET deleted_at = now() \
-         WHERE id = $1 AND deleted_at IS NULL",
-    )
-    .bind(id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(res.rows_affected() > 0)
-}
-
-fn database_from_row_admin(row: &sqlx::postgres::PgRow) -> Result<PermissionsDatabase, RepoError> {
-    let db_type_str: String = row.try_get("db_type")?;
-    Ok(PermissionsDatabase {
-        id: row.try_get("id")?,
-        server: row.try_get("server")?,
-        db_name: row.try_get("db_name")?,
-        db_type: DbType::parse(&db_type_str)?,
-        created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
-        updated_at: row.try_get::<DateTime<Utc>, _>("updated_at")?,
-        deleted_at: row.try_get::<Option<DateTime<Utc>>, _>("deleted_at")?,
     })
 }
