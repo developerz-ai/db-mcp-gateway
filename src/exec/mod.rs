@@ -11,6 +11,7 @@
 //! and enforced on the per-adapter side; see [`pg`] for the Pg pattern.
 
 pub mod adapter;
+pub mod mongo;
 pub mod pg;
 pub mod sql_guard;
 
@@ -22,6 +23,7 @@ use tokio::sync::RwLock;
 use crate::config::{Database, Server, ServerKind};
 
 pub use adapter::{AdapterKind, DbAdapter, ExecError, ExecQuery, ExecResult};
+pub use mongo::MongoAdapter;
 pub use pg::PgAdapter;
 
 /// Composite key for the registry: `(server.name, database.name)`.
@@ -84,6 +86,7 @@ impl AdapterRegistry {
 
         let adapter: Arc<dyn DbAdapter> = match server.kind {
             ServerKind::Postgres => Arc::new(PgAdapter::open(server, database).await?),
+            ServerKind::Mongo => Arc::new(MongoAdapter::open(server, database).await?),
             other => return Err(ExecError::UnsupportedAdapter(other)),
         };
         writer.insert(key, adapter.clone());

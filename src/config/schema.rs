@@ -41,6 +41,11 @@ pub enum ServerKind {
     Postgres,
     Mysql,
     Mssql,
+    /// Document-store target — wired in #57. Permissions/storage backends
+    /// are still pg-or-mysql only (spec 12 §"Storage backends" excludes
+    /// mongo); `Mongo` here is exclusively a *query target* kind, dispatched
+    /// to `MongoAdapter` by [`crate::exec::AdapterRegistry`].
+    Mongo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]

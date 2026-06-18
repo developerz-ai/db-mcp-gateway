@@ -20,6 +20,7 @@ use crate::config::ServerKind;
 #[serde(rename_all = "lowercase")]
 pub enum AdapterKind {
     Postgres,
+    Mongo,
 }
 
 /// A single query against the adapter. `binds` are positional text values
@@ -62,6 +63,21 @@ pub enum ExecError {
     #[error("SQL rejected by the DB")]
     Sql,
 
+    /// Gateway-side policy rejection — defense-in-depth on top of the
+    /// least-privilege DB role. Today this fires only from
+    /// `MongoAdapter::execute`, which runs the read-only rejector before
+    /// dispatching the command (#57). The pg path performs the same check
+    /// in the tool layer (`sql_guard::is_read_only` → `forbidden_sql`)
+    /// before ever calling `execute`, so this variant exists for adapters
+    /// whose policy check is intrinsic to dispatch. Tools map it to the
+    /// `forbidden_sql` outcome code per spec 03 / 07.
+    ///
+    /// The carried string is the operator-facing rejection reason — the
+    /// `RejectReason::Display` rendering — and is safe to surface (no
+    /// command values, no credentials). See `mongo::rejector::RejectReason`.
+    #[error("operation rejected by gateway policy: {0}")]
+    Forbidden(String),
+
     #[error("password reference `{kind}:{reference}` could not be resolved")]
     PasswordUnresolved {
         kind: &'static str,
@@ -69,11 +85,23 @@ pub enum ExecError {
     },
 
     /// The configured `server.kind` has no adapter wired in yet. Today this
-    /// covers `mysql` / `mssql` (and `mongo` until #57 lands). The error
-    /// carries the `ServerKind` so operators can read the boot-time log and
-    /// the corresponding YAML stanza without a second lookup.
+    /// covers `mysql` / `mssql`. The error carries the `ServerKind` so
+    /// operators can read the boot-time log and the corresponding YAML
+    /// stanza without a second lookup.
     #[error("no adapter is registered for server kind `{0:?}`")]
     UnsupportedAdapter(ServerKind),
+
+    /// The adapter is registered but the requested operation is not yet
+    /// implemented. Today this fires only on `MongoAdapter::execute` — the
+    /// scaffold from #57 runs the read-only rejector but defers actual
+    /// query execution to #58. The error carries the responsible
+    /// `AdapterKind` and the operation name so operators see exactly which
+    /// gap was hit.
+    #[error("adapter `{adapter:?}` has not implemented `{op}` yet")]
+    NotImplemented {
+        adapter: AdapterKind,
+        op: &'static str,
+    },
 }
 
 /// Per-`(server, database)` storage adapter. One instance per logical DB —

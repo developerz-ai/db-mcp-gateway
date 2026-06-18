@@ -17,6 +17,7 @@ use sqlx::PgPool;
 
 use crate::audit::{self, AuditRow};
 use crate::auth::Identity;
+use crate::exec::ExecError;
 use crate::transport::jsonrpc::{ErrorObject, Response};
 use crate::transport::protocol::{CallToolResult, TextContent};
 
@@ -241,6 +242,64 @@ pub fn error_outcome(id: Value, code: &'static str, message: &str) -> Outcome {
         truncated: None,
         error_message: Some(message.to_string()),
     }
+}
+
+/// Per-tool wording for the user-facing strings inside
+/// [`outcome_from_exec_error`]. Each tool defines a const of these so the
+/// shared mapping can stay one function while error messages keep their
+/// tool-specific shape. Spec 03 error *codes* are NOT configurable here —
+/// they're fixed by the shared mapping below.
+#[derive(Debug)]
+pub struct ToolErrorMessages {
+    /// Message for `ExecError::Timeout`. Per-tool because EXPLAIN says
+    /// "EXPLAIN exceeded …" while `run_query` says "query exceeded …".
+    pub timeout: &'static str,
+    /// Message for `ExecError::Sql`. Per-tool because `describe_schema`
+    /// surfaces "catalog query was rejected" while `run_query` says
+    /// "the target DB rejected the SQL".
+    pub sql_rejected: &'static str,
+    /// Prefix for `ExecError::Forbidden(reason)`. The final message is
+    /// `"<prefix> rejected by gateway: <reason>"`. Per-tool because the
+    /// noun changes: "query" / "EXPLAIN" / "sample" / "catalog query".
+    pub forbidden_prefix: &'static str,
+}
+
+/// Map an `ExecError` to the spec 03 outcome code + a user-facing message,
+/// then build the matching `Outcome` with `elapsed_ms` filled from the
+/// `started` wall clock so error paths still carry duration into the
+/// audit row.
+///
+/// The four tool-specific call sites used to duplicate this match in 5
+/// arms × 4 files = 20 arms total; adding `ExecError::NotImplemented` in
+/// #57 made that pain visible. Per-tool wording rides in
+/// [`ToolErrorMessages`] so the shared mapping stays one function.
+pub fn outcome_from_exec_error(
+    id: Value,
+    err: ExecError,
+    started: Instant,
+    messages: &ToolErrorMessages,
+) -> Outcome {
+    let owned;
+    let (code, message): (&str, &str) = match err {
+        ExecError::Timeout => ("timeout", messages.timeout),
+        ExecError::Connection | ExecError::Unavailable => {
+            ("unavailable", "target database is unreachable")
+        }
+        ExecError::Sql => ("syntax_error", messages.sql_rejected),
+        ExecError::Forbidden(reason) => {
+            owned = format!(
+                "{prefix} rejected by gateway: {reason}",
+                prefix = messages.forbidden_prefix,
+            );
+            ("forbidden_sql", owned.as_str())
+        }
+        ExecError::PasswordUnresolved { .. }
+        | ExecError::UnsupportedAdapter(_)
+        | ExecError::NotImplemented { .. } => ("internal", "server-side configuration error"),
+    };
+    let mut outcome = error_outcome(id, code, message);
+    outcome.elapsed_ms = Some(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
+    outcome
 }
 
 /// Shortcut for the success shape with row/truncation metadata.

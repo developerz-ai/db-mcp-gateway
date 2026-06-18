@@ -16,14 +16,20 @@ use sqlx::PgPool;
 use crate::auth::Identity;
 use crate::authz::{self, Decision, PermissionsCache, cache::load_or_empty};
 use crate::config::{Action, ConfigFile, Database, Grant, Server};
-use crate::exec::{AdapterRegistry, ExecError, ExecQuery};
+use crate::exec::{AdapterRegistry, ExecQuery};
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
 use super::audit_dispatch::{
-    AuditHeader, Outcome, RequestContext, audit_dispatch, error_outcome, success_outcome,
+    AuditHeader, Outcome, RequestContext, ToolErrorMessages, audit_dispatch, error_outcome,
+    outcome_from_exec_error, success_outcome,
 };
 
 const TOOL_NAME: &str = "sample_table";
+const ERROR_MESSAGES: ToolErrorMessages = ToolErrorMessages {
+    timeout: "query exceeded the configured statement_timeout",
+    sql_rejected: "the target DB rejected the SQL",
+    forbidden_prefix: "sample",
+};
 const DEFAULT_SCHEMA: &str = "public";
 /// Hard floor on rows sampled when no grant constraint and no caller limit
 /// apply. `sample_table` exists for "peek at the shape of the data" — small
@@ -145,7 +151,7 @@ async fn compute_outcome(
     let started = Instant::now();
     let adapter = match registry.get_or_open(server, database).await {
         Ok(a) => a,
-        Err(err) => return outcome_from_exec_error(id, err, started),
+        Err(err) => return outcome_from_exec_error(id, err, started, &ERROR_MESSAGES),
     };
 
     let query = ExecQuery {
@@ -171,7 +177,7 @@ async fn compute_outcome(
             };
             success_outcome(id, text, Some(elapsed), Some(row_count), Some(truncated))
         }
-        Err(err) => outcome_from_exec_error(id, err, started),
+        Err(err) => outcome_from_exec_error(id, err, started, &ERROR_MESSAGES),
     }
 }
 
@@ -218,22 +224,6 @@ fn effective_row_limit(caller: Option<u32>, grant: Option<u32>) -> u32 {
         Some(grant_cap) => caller.min(grant_cap),
         None => caller,
     }
-}
-
-fn outcome_from_exec_error(id: Value, err: ExecError, started: Instant) -> Outcome {
-    let (code, message) = match err {
-        ExecError::Timeout => ("timeout", "query exceeded the configured statement_timeout"),
-        ExecError::Connection | ExecError::Unavailable => {
-            ("unavailable", "target database is unreachable")
-        }
-        ExecError::Sql => ("syntax_error", "the target DB rejected the SQL"),
-        ExecError::PasswordUnresolved { .. } | ExecError::UnsupportedAdapter(_) => {
-            ("internal", "server-side configuration error")
-        }
-    };
-    let mut outcome = error_outcome(id, code, message);
-    outcome.elapsed_ms = Some(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
-    outcome
 }
 
 #[cfg(test)]

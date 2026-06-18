@@ -109,6 +109,7 @@ fn kind_label(kind: ServerKind) -> &'static str {
         ServerKind::Postgres => "postgres",
         ServerKind::Mysql => "mysql",
         ServerKind::Mssql => "mssql",
+        ServerKind::Mongo => "mongo",
     }
 }
 
