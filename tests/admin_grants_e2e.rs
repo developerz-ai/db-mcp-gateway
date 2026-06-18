@@ -26,7 +26,7 @@ use std::time::Duration;
 use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore, jwt};
 use db_mcp_gateway::authz::PermissionsCache;
 use db_mcp_gateway::config::{AdminBlock, Config, ConfigFile};
-use db_mcp_gateway::exec::PoolRegistry;
+use db_mcp_gateway::exec::AdapterRegistry;
 use db_mcp_gateway::state;
 use db_mcp_gateway::state::permissions::{DbType, PermissionsRepo, pg::PgPermissionsRepo};
 use db_mcp_gateway::transport::{self, AppState, AuthFacade, PendingFlows};
@@ -180,7 +180,7 @@ async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
                 flows: PendingFlows::default(),
             }),
             config: Arc::new(config_file),
-            pool_registry: PoolRegistry::new(),
+            adapter_registry: AdapterRegistry::new(),
             state_db: Some(pool.clone()),
             shutdown: Default::default(),
             metrics: None,

@@ -4,7 +4,7 @@
 //! proves the happy-path SQL works against a live Postgres.
 
 use db_mcp_gateway::config::{Database, Password, Server, ServerKind, Tls};
-use db_mcp_gateway::exec::{PoolRegistry, run_query};
+use db_mcp_gateway::exec::{DbAdapter, ExecError, ExecQuery, ExecResult, PgAdapter};
 
 const TARGET_HOST: &str = "localhost";
 const TARGET_PORT: u16 = 5434;
@@ -33,11 +33,20 @@ fn database() -> Database {
     }
 }
 
-async fn pool() -> sqlx::PgPool {
-    PoolRegistry::new()
-        .get_or_open(&server(), &database())
+async fn adapter() -> PgAdapter {
+    PgAdapter::open(&server(), &database())
         .await
         .expect("target-db reachable; run `bin/dev up`")
+}
+
+async fn run(a: &PgAdapter, sql: &str) -> Result<ExecResult, ExecError> {
+    a.execute(ExecQuery {
+        sql,
+        binds: &[],
+        statement_timeout_ms: None,
+        row_limit: 10,
+    })
+    .await
 }
 
 fn fresh_schema_name() -> String {
@@ -47,31 +56,27 @@ fn fresh_schema_name() -> String {
 /// The exact same SQL `sample_table` would build, once identifiers have
 /// passed the regex check. Confirms identifier interpolation + LIMIT
 /// interpolation produce a query Postgres actually accepts and that the
-/// row-cap/truncation semantics carry through from `exec::run_query`.
+/// row-cap/truncation semantics carry through from the adapter.
 #[tokio::test]
 async fn sample_returns_rows_with_truncation_flag() {
-    let p = pool().await;
+    let a = adapter().await;
     let schema = fresh_schema_name();
 
-    run_query(&p, &format!("CREATE SCHEMA \"{schema}\""), None, 10)
+    run(&a, &format!("CREATE SCHEMA \"{schema}\""))
         .await
         .expect("create schema");
-    run_query(
-        &p,
+    run(
+        &a,
         &format!("CREATE TABLE \"{schema}\".\"events\" (id int, name text)"),
-        None,
-        10,
     )
     .await
     .expect("create events");
-    run_query(
-        &p,
+    run(
+        &a,
         &format!(
             "INSERT INTO \"{schema}\".\"events\" \
              SELECT g, 'event-' || g FROM generate_series(1, 100) g"
         ),
-        None,
-        10,
     )
     .await
     .expect("seed events");
@@ -79,11 +84,17 @@ async fn sample_returns_rows_with_truncation_flag() {
     // Cap at 5 rows; mirror the LIMIT+1 trick `sample_table` uses so the
     // gateway-side truncation flag fires when more rows exist.
     let sql = format!("SELECT * FROM \"{schema}\".\"events\" LIMIT 6");
-    let result = run_query(&p, &sql, None, 5)
+    let result = a
+        .execute(ExecQuery {
+            sql: &sql,
+            binds: &[],
+            statement_timeout_ms: None,
+            row_limit: 5,
+        })
         .await
         .expect("sample SELECT runs");
 
-    let _ = run_query(&p, &format!("DROP SCHEMA \"{schema}\" CASCADE"), None, 10).await;
+    let _ = run(&a, &format!("DROP SCHEMA \"{schema}\" CASCADE")).await;
 
     assert_eq!(result.rows.len(), 5);
     assert!(
@@ -99,35 +110,29 @@ async fn sample_returns_rows_with_truncation_flag() {
 /// table name.
 #[tokio::test]
 async fn quoted_identifiers_are_case_sensitive() {
-    let p = pool().await;
+    let a = adapter().await;
     let schema = fresh_schema_name();
 
-    run_query(&p, &format!("CREATE SCHEMA \"{schema}\""), None, 10)
+    run(&a, &format!("CREATE SCHEMA \"{schema}\""))
         .await
         .expect("create schema");
-    run_query(
-        &p,
+    run(
+        &a,
         &format!("CREATE TABLE \"{schema}\".\"MixedCase\" (x int)"),
-        None,
-        10,
     )
     .await
     .expect("create MixedCase");
-    run_query(
-        &p,
+    run(
+        &a,
         &format!("INSERT INTO \"{schema}\".\"MixedCase\" VALUES (1), (2), (3)"),
-        None,
-        10,
     )
     .await
     .expect("seed");
 
     let sql = format!("SELECT * FROM \"{schema}\".\"MixedCase\" LIMIT 10");
-    let result = run_query(&p, &sql, None, 10)
-        .await
-        .expect("quoted identifier query runs");
+    let result = run(&a, &sql).await.expect("quoted identifier query runs");
 
-    let _ = run_query(&p, &format!("DROP SCHEMA \"{schema}\" CASCADE"), None, 10).await;
+    let _ = run(&a, &format!("DROP SCHEMA \"{schema}\" CASCADE")).await;
 
     assert_eq!(result.rows.len(), 3);
 }

@@ -17,7 +17,7 @@ use sqlx::PgPool;
 use crate::auth::Identity;
 use crate::authz::{self, Decision, PermissionsCache, cache::load_or_empty};
 use crate::config::{Action, ConfigFile, Database, Grant, Server};
-use crate::exec::{self, ExecError, PoolRegistry};
+use crate::exec::{AdapterRegistry, ExecError, ExecQuery, ExecResult};
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
 use super::audit_dispatch::{
@@ -66,7 +66,7 @@ pub async fn run(
     id: Value,
     identity: &Identity,
     config: &ConfigFile,
-    registry: &PoolRegistry,
+    registry: &AdapterRegistry,
     permissions_cache: Option<&PermissionsCache>,
     state_db: Option<&PgPool>,
     request_ctx: &RequestContext,
@@ -106,7 +106,7 @@ async fn compute_outcome(
     id: Value,
     identity: &Identity,
     config: &ConfigFile,
-    registry: &PoolRegistry,
+    registry: &AdapterRegistry,
     db_grants: &[Grant],
     args: &Arguments,
 ) -> Outcome {
@@ -133,19 +133,18 @@ async fn compute_outcome(
     // Wall clock starts before pool open so error paths still carry
     // `duration_ms` into the audit row — spec 07 requires it on every call.
     let started = Instant::now();
-    let pool = match registry.get_or_open(server, database).await {
-        Ok(p) => p,
+    let adapter = match registry.get_or_open(server, database).await {
+        Ok(a) => a,
         Err(err) => return outcome_from_exec_error(id, err, started),
     };
 
-    let result = exec::run_query_with_string_binds(
-        &pool,
-        &sql,
-        &binds,
-        constraints.statement_timeout_ms,
-        MAX_CATALOG_ROWS,
-    )
-    .await;
+    let query = ExecQuery {
+        sql: &sql,
+        binds: &binds,
+        statement_timeout_ms: constraints.statement_timeout_ms,
+        row_limit: MAX_CATALOG_ROWS,
+    };
+    let result = adapter.execute(query).await;
 
     match result {
         Ok(exec_result) => {
@@ -214,7 +213,7 @@ fn build_catalog_query<'a>(schema: &'a str, table: Option<&'a str>) -> (String, 
 
 /// Group `information_schema.columns` rows by `(schema, table_name)` into the
 /// nested `tables` shape clients want.
-fn assemble_tables(result: &exec::ExecResult) -> Result<DescribeSchemaResult, ()> {
+fn assemble_tables(result: &ExecResult) -> Result<DescribeSchemaResult, ()> {
     let mut tables: Vec<TableView> = Vec::new();
     for row in &result.rows {
         // Expected columns by index:
@@ -255,7 +254,9 @@ fn outcome_from_exec_error(id: Value, err: ExecError, started: Instant) -> Outco
             ("unavailable", "target database is unreachable")
         }
         ExecError::Sql => ("syntax_error", "catalog query was rejected"),
-        ExecError::PasswordUnresolved { .. } => ("internal", "server-side configuration error"),
+        ExecError::PasswordUnresolved { .. } | ExecError::UnsupportedAdapter(_) => {
+            ("internal", "server-side configuration error")
+        }
     };
     let mut outcome = error_outcome(id, code, message);
     outcome.elapsed_ms = Some(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
@@ -307,7 +308,7 @@ mod tests {
                 Value::from("NO"),
             ],
         ];
-        let exec_result = exec::ExecResult {
+        let exec_result = ExecResult {
             columns: vec![
                 "table_schema".into(),
                 "table_name".into(),

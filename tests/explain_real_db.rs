@@ -3,7 +3,7 @@
 //! the tool's `extract_plan` expects.
 
 use db_mcp_gateway::config::{Database, Password, Server, ServerKind, Tls};
-use db_mcp_gateway::exec::{PoolRegistry, run_query};
+use db_mcp_gateway::exec::{DbAdapter, ExecQuery, PgAdapter};
 
 const TARGET_HOST: &str = "localhost";
 const TARGET_PORT: u16 = 5434;
@@ -32,9 +32,8 @@ fn database() -> Database {
     }
 }
 
-async fn pool() -> sqlx::PgPool {
-    PoolRegistry::new()
-        .get_or_open(&server(), &database())
+async fn adapter() -> PgAdapter {
+    PgAdapter::open(&server(), &database())
         .await
         .expect("target-db reachable; run `bin/dev up`")
 }
@@ -45,8 +44,14 @@ async fn pool() -> sqlx::PgPool {
 /// the version path; the tool's `extract_plan` handles both.
 #[tokio::test]
 async fn explain_returns_parseable_json_plan() {
-    let p = pool().await;
-    let result = run_query(&p, "EXPLAIN (FORMAT JSON) SELECT 1", None, 10)
+    let a = adapter().await;
+    let result = a
+        .execute(ExecQuery {
+            sql: "EXPLAIN (FORMAT JSON) SELECT 1",
+            binds: &[],
+            statement_timeout_ms: None,
+            row_limit: 10,
+        })
         .await
         .expect("EXPLAIN runs");
     assert_eq!(result.rows.len(), 1);

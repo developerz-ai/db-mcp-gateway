@@ -1,397 +1,92 @@
-//! Execution layer: per-`(server, database)` Postgres pools and the query path
-//! that enforces `statement_timeout`, row caps, and cancellation.
+//! Execution layer: per-`(server, database)` adapters that enforce
+//! `statement_timeout`, row caps, and cancellation.
 //!
-//! Security-required (see CLAUDE.md). Two non-negotiables:
+//! The trait surface lives in [`adapter`]; the Postgres impl in [`pg`].
+//! Tools consume an `Arc<dyn DbAdapter>` from [`AdapterRegistry`] and never
+//! see backend-specific types — that's the whole point of #56's refactor:
+//! mongo (#57) and mysql (#59) slot in here without touching `src/tools/`.
 //!
-//! 1. The connection password (literal, env-resolved, or backend-resolved) is
-//!    NEVER embedded in `Display` for any error or in any tracing field on
-//!    the request path. The DSN we build is fed to `sqlx` and dropped.
-//! 2. The DB-side `statement_timeout` is set via `SET LOCAL` inside the
-//!    per-query transaction, so a single misuse can't outlive its tx. We also
-//!    wrap the query in `tokio::time::timeout` as belt-and-suspenders — if
-//!    the DB ignores `SET LOCAL`, the future still completes.
+//! Security-required (see CLAUDE.md). The non-negotiables — no credentials
+//! in errors/logs, DB-side `statement_timeout` set per-tx — are documented
+//! and enforced on the per-adapter side; see [`pg`] for the Pg pattern.
 
+pub mod adapter;
+pub mod pg;
 pub mod sql_guard;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use futures::StreamExt;
-use metrics::gauge;
-use serde::Serialize;
-use serde_json::Value;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow, PgSslMode};
-use sqlx::{Column, Executor, PgPool, Row};
 use tokio::sync::RwLock;
 
-use crate::config::{Database, Password, Server, Tls};
+use crate::config::{Database, Server, ServerKind};
 
-const DEFAULT_POOL_MAX_CONNECTIONS: u32 = 5;
-const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Extra slack on top of the DB-side `statement_timeout` so the Tokio guard
-/// doesn't preempt before Postgres has a chance to surface its own cancel.
-const TOKIO_TIMEOUT_SLACK_MS: u64 = 500;
+pub use adapter::{AdapterKind, DbAdapter, ExecError, ExecQuery, ExecResult};
+pub use pg::PgAdapter;
 
-/// Per-DB Postgres pool registry. One pool per `(server, database)` so a slow
-/// query on DB A can never block DB B.
+/// Composite key for the registry: `(server.name, database.name)`.
+type AdapterKey = (String, String);
+/// Concrete map type behind the `RwLock`. Extracted to satisfy clippy's
+/// type-complexity lint and to give the `Debug` impl a name to reach for.
+type AdapterMap = HashMap<AdapterKey, Arc<dyn DbAdapter>>;
+
+/// Per-`(server, database)` adapter registry. Hands out `Arc<dyn DbAdapter>`
+/// keyed on `(server.name, database.name)` so a slow query on DB A can never
+/// block DB B (each adapter owns its own pool).
+///
+/// Dispatch is on `server.kind`: today only `Postgres` is wired; other
+/// `ServerKind` variants return `ExecError::UnsupportedAdapter` until their
+/// adapters land (#57 mongo, #59 mysql).
 #[derive(Clone, Default)]
-pub struct PoolRegistry {
-    inner: Arc<RwLock<HashMap<(String, String), PgPool>>>,
+pub struct AdapterRegistry {
+    inner: Arc<RwLock<AdapterMap>>,
 }
 
-impl std::fmt::Debug for PoolRegistry {
+impl std::fmt::Debug for AdapterRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // PgPool's Debug exposes the connection URL with password. Never let
-        // a derived/auto Debug leak that — print structural info only.
-        f.debug_struct("PoolRegistry")
-            .field("pools", &"<RwLock<HashMap<(server, db), PgPool>>>")
+        // Adapter `Debug` impls already redact connection strings, but go
+        // through one extra layer of `dyn` indirection just in case a future
+        // impl regresses — print structural info only.
+        f.debug_struct("AdapterRegistry")
+            .field(
+                "adapters",
+                &"<RwLock<HashMap<(server, db), Arc<dyn DbAdapter>>>>",
+            )
             .finish()
     }
 }
 
-impl PoolRegistry {
+impl AdapterRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Returns the pool for `(server.name, database.name)`, opening it if
-    /// needed. Lazy: a misconfigured DB only errors on first use, not at boot.
+    /// Returns the adapter for `(server.name, database.name)`, opening it if
+    /// needed. Lazy: a misconfigured DB only errors on first use, not at
+    /// boot.
     pub async fn get_or_open(
         &self,
         server: &Server,
         database: &Database,
-    ) -> Result<PgPool, ExecError> {
+    ) -> Result<Arc<dyn DbAdapter>, ExecError> {
         let key = (server.name.clone(), database.name.clone());
 
-        if let Some(pool) = self.inner.read().await.get(&key).cloned() {
-            return Ok(pool);
+        if let Some(adapter) = self.inner.read().await.get(&key).cloned() {
+            return Ok(adapter);
         }
 
         // Re-check under the write lock — another task may have opened it
         // while we were waiting on the upgrade.
         let mut writer = self.inner.write().await;
-        if let Some(pool) = writer.get(&key).cloned() {
-            return Ok(pool);
+        if let Some(adapter) = writer.get(&key).cloned() {
+            return Ok(adapter);
         }
 
-        let password = resolve_password(&database.password)?;
-        let opts = build_connect_options(server, database, &password);
-        let pool = PgPoolOptions::new()
-            .max_connections(DEFAULT_POOL_MAX_CONNECTIONS)
-            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-            .connect_with(opts)
-            .await
-            .map_err(|_| ExecError::Connection)?;
-
-        // Single label `db = "<server>/<database>"` — bounded cardinality
-        // (declared in config, no user input). Live connection count would
-        // need a polling task; reporting the configured max is the cheap
-        // first signal for "pool exists for this db".
-        gauge!("pool_size", "db" => format!("{}/{}", server.name, database.name))
-            .set(DEFAULT_POOL_MAX_CONNECTIONS as f64);
-        writer.insert(key, pool.clone());
-        Ok(pool)
-    }
-}
-
-fn build_connect_options(server: &Server, database: &Database, password: &str) -> PgConnectOptions {
-    PgConnectOptions::new()
-        .host(&server.host)
-        .port(server.port)
-        .username(&database.role)
-        .password(password)
-        .database(&database.name)
-        .ssl_mode(match server.tls {
-            Tls::Required => PgSslMode::Require,
-            Tls::Insecure => PgSslMode::Disable,
-        })
-}
-
-/// Adapt `Password::resolve` into `ExecError`. The boot-time walk in
-/// `ConfigFile::resolve_secrets` already failed fast on every unresolvable
-/// ref — but pools are opened lazily, so a `${FILE:…}` mount that disappears
-/// after boot (rotation gone wrong) still needs a structured error here.
-fn resolve_password(password: &Password) -> Result<String, ExecError> {
-    use crate::config::SecretError;
-    password.resolve().map_err(|err| match err {
-        SecretError::EnvNotSet(name) | SecretError::EnvNotUtf8(name) => {
-            ExecError::PasswordUnresolved {
-                kind: "env",
-                reference: name,
-            }
-        }
-        SecretError::FileUnreadable { path, .. } | SecretError::FileEmpty(path) => {
-            ExecError::PasswordUnresolved {
-                kind: "file",
-                reference: path.display().to_string(),
-            }
-        }
-        // Keep the stable `(kind, reference)` tool-facing shape: `kind` is the
-        // category, the scheme goes into `reference`. Emitting `kind: "vault"`
-        // would force tool callers to match on every supported backend name.
-        SecretError::BackendNotImplemented(scheme) => ExecError::PasswordUnresolved {
-            kind: "backend",
-            reference: scheme,
-        },
-        // Malformed refs are caught at YAML parse time, never reach here —
-        // but stay structured rather than panic if invariants drift. No
-        // payload is available (and intentionally so: the raw token could
-        // be a typo'd plaintext password — see `SecretError::Malformed`).
-        SecretError::Malformed => ExecError::PasswordUnresolved {
-            kind: "malformed",
-            reference: String::new(),
-        },
-    })
-}
-
-/// Typed execution errors. `Display` carries no secrets, hostnames, or
-/// connection strings; details for operators live in `tracing` events and
-/// the chained `source()`.
-#[derive(Debug, thiserror::Error)]
-pub enum ExecError {
-    #[error("connection to target DB failed")]
-    Connection,
-
-    #[error("DB unavailable")]
-    Unavailable,
-
-    #[error("query exceeded the configured statement_timeout")]
-    Timeout,
-
-    #[error("SQL rejected by the DB")]
-    Sql,
-
-    #[error("password reference `{kind}:{reference}` could not be resolved")]
-    PasswordUnresolved {
-        kind: &'static str,
-        reference: String,
-    },
-}
-
-#[derive(Debug, Serialize)]
-pub struct ExecResult {
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<Value>>,
-    /// True if the query produced more rows than `row_limit` allowed; the
-    /// remaining rows were not pulled from the DB.
-    pub truncated: bool,
-    pub elapsed_ms: u64,
-}
-
-/// Run `sql` against `pool` with the given statement timeout + row cap.
-///
-/// - Wraps the query in a transaction so `SET LOCAL statement_timeout` is
-///   scoped per-query.
-/// - Streams rows; stops after `row_limit` and marks `truncated = true`.
-/// - Cancellation safety: dropping this future drops the transaction →
-///   sqlx releases the connection → Postgres cancels the in-flight query.
-///   Tested by the integration suite (#4 acceptance).
-pub async fn run_query(
-    pool: &PgPool,
-    sql: &str,
-    statement_timeout_ms: Option<u32>,
-    row_limit: u32,
-) -> Result<ExecResult, ExecError> {
-    run_query_with_string_binds(pool, sql, &[], statement_timeout_ms, row_limit).await
-}
-
-/// Like `run_query` but accepts text bind values for `$1`, `$2`, …
-///
-/// Used by tools that build parameterised SQL (e.g. `describe_schema` queries
-/// `information_schema.columns WHERE table_schema = $1`). Constrained to
-/// `&str` binds because that's all the tool surface needs today; richer
-/// types can land with the first tool that needs them.
-pub async fn run_query_with_string_binds(
-    pool: &PgPool,
-    sql: &str,
-    binds: &[&str],
-    statement_timeout_ms: Option<u32>,
-    row_limit: u32,
-) -> Result<ExecResult, ExecError> {
-    // Belt-and-suspenders: a Tokio-side deadline so even a misapplied
-    // SET LOCAL (or a DB that ignores it) still bounds the call.
-    if let Some(ms) = statement_timeout_ms {
-        let budget = Duration::from_millis(u64::from(ms) + TOKIO_TIMEOUT_SLACK_MS);
-        match tokio::time::timeout(
-            budget,
-            run_query_inner(pool, sql, binds, statement_timeout_ms, row_limit),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_elapsed) => Err(ExecError::Timeout),
-        }
-    } else {
-        run_query_inner(pool, sql, binds, statement_timeout_ms, row_limit).await
-    }
-}
-
-async fn run_query_inner(
-    pool: &PgPool,
-    sql: &str,
-    binds: &[&str],
-    statement_timeout_ms: Option<u32>,
-    row_limit: u32,
-) -> Result<ExecResult, ExecError> {
-    let started = Instant::now();
-    let mut tx = pool.begin().await.map_err(|_| ExecError::Unavailable)?;
-
-    if let Some(ms) = statement_timeout_ms {
-        // `ms` is u32, so the SQL fragment is purely a number — no injection
-        // risk from interpolation.
-        let stmt = format!("SET LOCAL statement_timeout = {ms}");
-        tx.execute(stmt.as_str()).await.map_err(classify)?;
-    }
-
-    let limit = row_limit as usize;
-    let mut columns: Vec<String> = Vec::new();
-    let mut rows: Vec<Vec<Value>> = Vec::new();
-    let mut truncated = false;
-
-    {
-        let mut query = sqlx::query(sql);
-        for bind in binds {
-            query = query.bind(*bind);
-        }
-        let mut stream = query.fetch(&mut *tx);
-        while let Some(row_result) = stream.next().await {
-            let row = row_result.map_err(classify)?;
-            if columns.is_empty() {
-                columns = row.columns().iter().map(|c| c.name().to_string()).collect();
-            }
-            if rows.len() >= limit {
-                truncated = true;
-                break;
-            }
-            rows.push(decode_row(&row));
-        }
-        // Stream is dropped here so the borrow on `tx` ends and we can commit.
-    }
-
-    tx.commit().await.map_err(classify)?;
-
-    Ok(ExecResult {
-        columns,
-        rows,
-        truncated,
-        elapsed_ms: started.elapsed().as_millis() as u64,
-    })
-}
-
-fn classify(err: sqlx::Error) -> ExecError {
-    // Postgres `statement_timeout` raises SQLSTATE `57014` (`query_canceled`).
-    if let sqlx::Error::Database(db) = &err
-        && let Some(code) = db.code()
-        && code == "57014"
-    {
-        return ExecError::Timeout;
-    }
-    if matches!(err, sqlx::Error::PoolTimedOut | sqlx::Error::Io(_)) {
-        return ExecError::Unavailable;
-    }
-    ExecError::Sql
-}
-
-fn decode_row(row: &PgRow) -> Vec<Value> {
-    (0..row.columns().len())
-        .map(|i| decode_value(row, i))
-        .collect()
-}
-
-/// Best-effort value decode for the common Postgres types. Real schema-aware
-/// type handling (timestamps, arrays) arrives with the tools that need them
-/// — for now anything we can't recognise serialises as `null`.
-fn decode_value(row: &PgRow, idx: usize) -> Value {
-    // JSON / JSONB first — these come back as opaque types that don't
-    // decode as String. Without this, an `EXPLAIN (FORMAT JSON)` plan or
-    // any `jsonb` column would surface to clients as `null`.
-    if let Ok(json) = row.try_get::<sqlx::types::Json<Value>, _>(idx) {
-        return json.0;
-    }
-    // NULL has no concrete type to probe against; let it fall through to the
-    // Option-of-string check which is the most permissive null detection.
-    if let Ok(None) = row.try_get::<Option<String>, _>(idx) {
-        return Value::Null;
-    }
-    if let Ok(v) = row.try_get::<i64, _>(idx) {
-        return Value::from(v);
-    }
-    if let Ok(v) = row.try_get::<i32, _>(idx) {
-        return Value::from(v);
-    }
-    if let Ok(v) = row.try_get::<f64, _>(idx) {
-        return Value::from(v);
-    }
-    if let Ok(v) = row.try_get::<bool, _>(idx) {
-        return Value::from(v);
-    }
-    if let Ok(v) = row.try_get::<String, _>(idx) {
-        return Value::from(v);
-    }
-    Value::Null
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolve_password_handles_each_form() {
-        assert_eq!(
-            resolve_password(&Password::Literal("hunter2".into())).unwrap(),
-            "hunter2"
-        );
-
-        let env_name = "DB_MCP_EXEC_TEST_PW";
-        // SAFETY: test sets and clears a unique env var; nothing else reads it.
-        unsafe {
-            std::env::set_var(env_name, "from-env");
-        }
-        assert_eq!(
-            resolve_password(&Password::EnvVar(env_name.into())).unwrap(),
-            "from-env"
-        );
-        unsafe {
-            std::env::remove_var(env_name);
-        }
-        assert!(matches!(
-            resolve_password(&Password::EnvVar(env_name.into())),
-            Err(ExecError::PasswordUnresolved { kind: "env", .. })
-        ));
-
-        // `kind: "backend"` keeps the tool-facing shape stable across
-        // backends; the scheme rides along in `reference` so operators can
-        // still tell vault from aws-sm in logs.
-        match resolve_password(&Password::SecretBackend {
-            scheme: "vault".into(),
-            reference: "secret/path".into(),
-        }) {
-            Err(ExecError::PasswordUnresolved { kind, reference }) => {
-                assert_eq!(kind, "backend");
-                assert_eq!(reference, "vault");
-            }
-            other => panic!("expected PasswordUnresolved {{ kind: backend, .. }}, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn exec_error_display_carries_no_secrets() {
-        let e = ExecError::PasswordUnresolved {
-            kind: "env",
-            reference: "MY_VAR".into(),
+        let adapter: Arc<dyn DbAdapter> = match server.kind {
+            ServerKind::Postgres => Arc::new(PgAdapter::open(server, database).await?),
+            other => return Err(ExecError::UnsupportedAdapter(other)),
         };
-        let s = format!("{e}");
-        // Reference name is operationally useful and not itself a secret.
-        assert!(s.contains("MY_VAR"));
-        // Other variants must not leak details.
-        assert_eq!(
-            format!("{}", ExecError::Connection),
-            "connection to target DB failed"
-        );
-        assert_eq!(
-            format!("{}", ExecError::Timeout),
-            "query exceeded the configured statement_timeout"
-        );
+        writer.insert(key, adapter.clone());
+        Ok(adapter)
     }
 }

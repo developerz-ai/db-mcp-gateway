@@ -7,7 +7,7 @@
 //! full agent → MCP → exec path.
 
 use db_mcp_gateway::config::{Database, Password, Server, ServerKind, Tls};
-use db_mcp_gateway::exec::{ExecError, PoolRegistry, run_query};
+use db_mcp_gateway::exec::{DbAdapter, ExecError, ExecQuery, PgAdapter};
 
 const TARGET_HOST: &str = "localhost";
 const TARGET_PORT: u16 = 5434;
@@ -36,18 +36,30 @@ fn database() -> Database {
     }
 }
 
-async fn pool() -> sqlx::PgPool {
-    let registry = PoolRegistry::new();
-    registry
-        .get_or_open(&server(), &database())
+async fn adapter() -> PgAdapter {
+    PgAdapter::open(&server(), &database())
         .await
         .expect("target-db reachable; run `bin/dev up`")
 }
 
+fn query<'a>(sql: &'a str, timeout_ms: Option<u32>, row_limit: u32) -> ExecQuery<'a> {
+    ExecQuery {
+        sql,
+        binds: &[],
+        statement_timeout_ms: timeout_ms,
+        row_limit,
+    }
+}
+
 #[tokio::test]
 async fn quick_query_succeeds_with_columns_and_rows() {
-    let p = pool().await;
-    let result = run_query(&p, "SELECT 1::int8 AS n, 'hi'::text AS greeting", None, 100)
+    let a = adapter().await;
+    let result = a
+        .execute(query(
+            "SELECT 1::int8 AS n, 'hi'::text AS greeting",
+            None,
+            100,
+        ))
         .await
         .expect("simple SELECT runs");
     assert_eq!(
@@ -62,8 +74,13 @@ async fn quick_query_succeeds_with_columns_and_rows() {
 
 #[tokio::test]
 async fn row_limit_truncates_and_flags() {
-    let p = pool().await;
-    let result = run_query(&p, "SELECT generate_series(1, 1000)::int8 AS n", None, 10)
+    let a = adapter().await;
+    let result = a
+        .execute(query(
+            "SELECT generate_series(1, 1000)::int8 AS n",
+            None,
+            10,
+        ))
         .await
         .expect("series query runs");
     assert_eq!(result.rows.len(), 10);
@@ -75,8 +92,9 @@ async fn row_limit_truncates_and_flags() {
 /// raw sqlx error and never the underlying SQLSTATE string.
 #[tokio::test]
 async fn statement_timeout_kills_slow_query() {
-    let p = pool().await;
-    let err = run_query(&p, "SELECT pg_sleep(2)", Some(200), 10)
+    let a = adapter().await;
+    let err = a
+        .execute(query("SELECT pg_sleep(2)", Some(200), 10))
         .await
         .expect_err("pg_sleep(2) must exceed 200ms timeout");
     assert!(
@@ -97,9 +115,20 @@ async fn statement_timeout_kills_slow_query() {
 /// MCP layer can return the right error code to the agent.
 #[tokio::test]
 async fn syntax_error_classifies_as_sql() {
-    let p = pool().await;
-    let err = run_query(&p, "SELECT not_a_real_function()", None, 10)
+    let a = adapter().await;
+    let err = a
+        .execute(query("SELECT not_a_real_function()", None, 10))
         .await
         .expect_err("undefined function must fail");
     assert!(matches!(err, ExecError::Sql), "got {err:?}");
+}
+
+/// Adapter's `kind()` reports `Postgres` and `health()` round-trips a
+/// `SELECT 1`. Cheap but worth pinning so a future refactor doesn't quietly
+/// regress the trait surface.
+#[tokio::test]
+async fn pg_adapter_reports_kind_and_health() {
+    let a = adapter().await;
+    assert_eq!(a.kind(), db_mcp_gateway::exec::AdapterKind::Postgres);
+    a.health().await.expect("health check round-trips");
 }
