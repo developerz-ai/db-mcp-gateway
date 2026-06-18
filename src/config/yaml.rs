@@ -205,6 +205,21 @@ impl ConfigFile {
                     )));
                 }
                 validate_role(&db.role).map_err(ConfigFileError::Invalid)?;
+                // `Some("")` would silently override the `None → name` fallback
+                // and force mongo to authenticate against an empty `authSource`,
+                // surfacing as a cryptic runtime auth failure instead of a boot
+                // error. Mirrors the `admin.group` non-empty rule above — every
+                // optional-string field that *means something when present*
+                // gets the same trim check.
+                if let Some(auth_db) = &db.auth_database
+                    && auth_db.trim().is_empty()
+                {
+                    return Err(ConfigFileError::Invalid(format!(
+                        "database `{}` in server `{}` has empty `auth_database`; \
+                         omit the field to fall back to `name`, or set a non-blank value",
+                        db.name, server.name
+                    )));
+                }
             }
         }
 
@@ -617,6 +632,44 @@ admin:
         let yaml = "servers: []\npermissions: []\n";
         let cfg = ConfigFile::from_yaml_str(yaml).expect("omitted admin block is valid");
         assert!(cfg.admin.is_none());
+    }
+
+    /// `auth_database: ""` (or whitespace-only) would silently slip past
+    /// deserialization and then fail at query time against mongo's
+    /// authSource. Spec 08 says fields with meaning-when-present validate
+    /// at boot — same rule as `admin.group`.
+    #[test]
+    fn rejects_empty_auth_database() {
+        let yaml = r#"
+servers:
+  - name: s
+    kind: mongo
+    host: h
+    databases:
+      - { name: d, role: ro, password: x, auth_database: "   " }
+"#;
+        let err = ConfigFile::from_yaml_str(yaml).expect_err("blank auth_database must reject");
+        let ConfigFileError::Invalid(msg) = err else {
+            panic!("expected Invalid, got {err:?}");
+        };
+        assert!(msg.contains("auth_database"), "{msg}");
+        assert!(msg.contains("non-blank") || msg.contains("omit"), "{msg}");
+    }
+
+    /// Mirror: `None` (field omitted) is the spec-blessed fallback path
+    /// and must continue to parse cleanly.
+    #[test]
+    fn accepts_omitted_auth_database() {
+        let yaml = r#"
+servers:
+  - name: s
+    kind: mongo
+    host: h
+    databases:
+      - { name: d, role: ro, password: x }
+"#;
+        let cfg = ConfigFile::from_yaml_str(yaml).expect("omitted auth_database is valid");
+        assert!(cfg.servers[0].databases[0].auth_database.is_none());
     }
 
     /// A misspelled enum variant (action name) yields the same kind of

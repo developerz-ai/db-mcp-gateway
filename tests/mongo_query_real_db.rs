@@ -96,8 +96,38 @@ async fn seed(a: &MongoAdapter, collection: &str, count: usize) {
 }
 
 async fn drop_collection(collection: &str) {
-    use mongodb::Client;
+    let client = side_client();
+    let _ = client
+        .database(TARGET_DB)
+        .run_command(mongodb::bson::doc! { "drop": collection })
+        .await;
+}
+
+/// `listCollections` filtered by exact name — returns true iff mongo
+/// has that collection in `TARGET_DB`. Used by the rejector test to
+/// pin "the write never reached mongo" with server-side evidence, not
+/// just the gateway's error type.
+async fn collection_exists(collection: &str) -> bool {
+    use futures::StreamExt;
     use mongodb::bson::doc;
+    let client = side_client();
+    let mut cursor = client
+        .database(TARGET_DB)
+        .run_cursor_command(doc! {
+            "listCollections": 1,
+            "filter": { "name": collection },
+            "nameOnly": true,
+        })
+        .await
+        .expect("listCollections runs");
+    cursor.next().await.is_some()
+}
+
+/// Side-channel client for test setup/teardown — bypasses the rejector
+/// so we can seed, drop, and inspect collections. NEVER use this path
+/// in production code: it has root-equivalent access.
+fn side_client() -> mongodb::Client {
+    use mongodb::Client;
     use mongodb::options::{ClientOptions, Credential, ServerAddress};
     let credential = Credential::builder()
         .username(TARGET_USER.to_string())
@@ -112,11 +142,7 @@ async fn drop_collection(collection: &str) {
         .credential(credential)
         .default_database(TARGET_DB.to_string())
         .build();
-    let client = Client::with_options(options).expect("drop client");
-    let _ = client
-        .database(TARGET_DB)
-        .run_command(doc! { "drop": collection })
-        .await;
+    Client::with_options(options).expect("side client builds")
 }
 
 /// `find` returns documents row-by-row in the `[document]` shape the
@@ -304,26 +330,46 @@ async fn max_time_ms_surfaces_as_typed_timeout() {
     let sql = format!(
         r#"{{"aggregate":"{coll}","pipeline":[{{"$sort":{{"i":1}}}},{{"$group":{{"_id":"$role","ns":{{"$push":"$i"}}}}}}],"cursor":{{}}}}"#,
     );
-    let result = a
-        .execute(ExecQuery {
-            sql: &sql,
-            binds: &[],
-            statement_timeout_ms: Some(1),
-            row_limit: 10000,
-        })
-        .await;
+
+    // Bounded-retry strict: a single run on a fast box can squeak past the
+    // 1ms budget before mongo notices. Five back-to-back runs against a
+    // 5k-doc sort+group pipeline shouldn't all win — if none of them trips
+    // `MaxTimeMSExpired`, the typed-mapping contract is unverified and we
+    // fail the test. That's the regression we care about; the old `Ok(_)`
+    // arm let the assertion no-op.
+    let mut saw_timeout = false;
+    let mut last_other: Option<ExecError> = None;
+    for _ in 0..5 {
+        let result = a
+            .execute(ExecQuery {
+                sql: &sql,
+                binds: &[],
+                statement_timeout_ms: Some(1),
+                row_limit: 10000,
+            })
+            .await;
+        match result {
+            Err(ExecError::Timeout) => {
+                saw_timeout = true;
+                break;
+            }
+            Err(other) => {
+                last_other = Some(other);
+                break;
+            }
+            Ok(_) => {}
+        }
+    }
 
     drop_collection(&coll).await;
 
-    match result {
-        Err(ExecError::Timeout) => {} // expected
-        // A very fast box could finish before mongo notices the budget.
-        // In that case the test is a no-op; the typed-mapping assertion
-        // only matters when mongo *does* trip. Keep the assertion narrow
-        // so a fast box doesn't false-fail.
-        Ok(_) => eprintln!("warning: aggregate finished before maxTimeMS kicked"),
-        Err(other) => panic!("expected Timeout or Ok, got {other:?}"),
+    if let Some(other) = last_other {
+        panic!("expected Timeout or transient success, got {other:?}");
     }
+    assert!(
+        saw_timeout,
+        "expected ExecError::Timeout within 5 attempts; mongo never tripped MaxTimeMSExpired"
+    );
 }
 
 /// Rejected write commands surface as `ExecError::Forbidden`, NOT
@@ -345,5 +391,48 @@ async fn rejected_write_command_does_not_reach_mongo() {
         .await
         .expect_err("insert is denied by the rejector");
     assert!(matches!(err, ExecError::Forbidden(_)), "got {err:?}");
-    // Collection was never created — no cleanup needed.
+
+    // Prove the "never reached mongo" half of the contract: the
+    // collection mongo would have auto-created on a successful insert
+    // doesn't exist server-side. Without this, the test only checks
+    // the gateway's error mapping — a regression that *did* forward
+    // the insert but happened to also error out could still pass.
+    assert!(
+        !collection_exists(&coll).await,
+        "rejector let `{coll}` reach mongo: collection was created"
+    );
+}
+
+/// `auth_database: None` means "use `database.name` as the auth source"
+/// (spec 12 §"least-privilege per-db user"). The dev container's root
+/// user lives in `admin` — not `app` — so falling back to "app" produces
+/// an authentication failure on the first wire-level operation. Any
+/// error here is fine; what matters is that a successful query is
+/// impossible, which is only true when the override field is honored on
+/// construction. Pins the public-behavior contract CodeRabbit flagged.
+///
+/// The `Some(...)` override path is exercised by every other test in
+/// this file — `adapter()` builds `Database { auth_database:
+/// Some("admin"), .. }` and queries against `app` succeed. Together the
+/// two arms pin both branches end-to-end.
+#[tokio::test]
+async fn auth_database_none_falls_back_to_database_name() {
+    let mut db = database();
+    db.auth_database = None;
+    let s = server();
+    let a = MongoAdapter::open(&s, &db).await.expect("client builds");
+
+    let sql = r#"{"count":"missing","query":{}}"#;
+    let result = a
+        .execute(ExecQuery {
+            sql,
+            binds: &[],
+            statement_timeout_ms: None,
+            row_limit: 10,
+        })
+        .await;
+    assert!(
+        result.is_err(),
+        "expected auth failure when fallback points at user-less `app`; got {result:?}"
+    );
 }

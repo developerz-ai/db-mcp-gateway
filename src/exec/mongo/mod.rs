@@ -176,14 +176,25 @@ impl DbAdapter for MongoAdapter {
                 let n = response
                     .get_i64("n")
                     .or_else(|_| response.get_i32("n").map(i64::from));
-                let value = match n {
-                    Ok(v) => Value::from(v),
-                    Err(_) => Value::Null,
+                // `row_limit == 0` is a valid grant constraint (authz
+                // proptests generate it) and the exec invariant is
+                // "never emit more rows than configured" — the cursor
+                // arms above honor it implicitly via `rows.len() >= limit`
+                // / `.take(limit)`; the scalar arm has to do it explicitly
+                // because its result shape is fixed at one row.
+                let (rows, truncated) = if query.row_limit == 0 {
+                    (Vec::new(), true)
+                } else {
+                    let value = match n {
+                        Ok(v) => Value::from(v),
+                        Err(_) => Value::Null,
+                    };
+                    (vec![vec![value]], false)
                 };
                 Ok(ExecResult {
                     columns: vec!["count".to_string()],
-                    rows: vec![vec![value]],
-                    truncated: false,
+                    rows,
+                    truncated,
                     elapsed_ms: started.elapsed().as_millis() as u64,
                 })
             }
