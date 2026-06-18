@@ -22,6 +22,13 @@ pub struct ConfigFile {
     /// route returns 404. Belt-and-suspenders for YAML-only installs.
     #[serde(default)]
     pub admin: Option<AdminBlock>,
+    /// Spec 12 §"Storage backends" (#59). Absent → use the state DB
+    /// (Postgres) as the permissions store too — the default. Present
+    /// with `driver: mysql` connects to a separate mysql pool via
+    /// `PERMISSIONS_DB_DSN` env. The state DB itself (sessions, audit
+    /// rows) stays Postgres regardless.
+    #[serde(default)]
+    pub permissions_store: Option<PermissionsStoreBlock>,
 }
 
 /// Admin API gating. Mirrors spec 12 §"Admin API" YAML schema.
@@ -34,6 +41,26 @@ pub struct AdminBlock {
     /// `enabled = true`; an empty value is a boot error (every authenticated
     /// user would otherwise be an admin).
     pub group: String,
+}
+
+/// Permissions storage backend selection. The DSN is **not** in YAML — it
+/// reads from `PERMISSIONS_DB_DSN` at startup, matching how `STATE_DB_URL`
+/// works. Keeping connection strings out of YAML keeps secrets out of the
+/// committed config and out of the boot-trace logs.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionsStoreBlock {
+    pub driver: PermissionsStoreDriver,
+}
+
+/// The two supported permissions-store backends. Spec 12 §"Storage
+/// backends" explicitly excludes mongo (flexible schema is a liability
+/// for an authz store).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionsStoreDriver {
+    Pg,
+    Mysql,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -185,6 +212,22 @@ impl ConfigFile {
         {
             return Err(ConfigFileError::Invalid(
                 "admin.group must be non-empty when admin.enabled is true".to_string(),
+            ));
+        }
+
+        // #59 scope: mysql is wired for the resolver hot path only. The
+        // admin handlers use raw pg `RETURNING` + `JSONB` operations
+        // that haven't been ported. Boot fails fast rather than running
+        // with a half-wired admin surface.
+        if let (Some(store), Some(admin)) = (&self.permissions_store, &self.admin)
+            && store.driver == PermissionsStoreDriver::Mysql
+            && admin.enabled
+        {
+            return Err(ConfigFileError::Invalid(
+                "permissions_store.driver = mysql is not supported with admin.enabled = true. \
+                 #59 wires mysql for the resolver hot path only; full admin parity is tracked \
+                 in a future issue. Either set admin.enabled = false or use driver = pg."
+                    .to_string(),
             ));
         }
 
@@ -632,6 +675,58 @@ admin:
         let yaml = "servers: []\npermissions: []\n";
         let cfg = ConfigFile::from_yaml_str(yaml).expect("omitted admin block is valid");
         assert!(cfg.admin.is_none());
+        assert!(cfg.permissions_store.is_none());
+    }
+
+    /// #59 boot-gate: mysql permissions store + admin.enabled is rejected
+    /// with a message pointing at the scope decision. Resolver-only mysql
+    /// support is intentional; admin handlers use raw pg `RETURNING` and
+    /// haven't been ported.
+    #[test]
+    fn rejects_mysql_store_with_admin_enabled() {
+        let yaml = r#"
+permissions_store:
+  driver: mysql
+admin:
+  enabled: true
+  group: admins
+"#;
+        let err = ConfigFile::from_yaml_str(yaml).expect_err("mysql + admin combo must reject");
+        let ConfigFileError::Invalid(msg) = err else {
+            panic!("expected Invalid, got {err:?}");
+        };
+        assert!(msg.contains("mysql"), "{msg}");
+        assert!(msg.contains("admin.enabled"), "{msg}");
+        assert!(msg.contains("#59"), "{msg}");
+    }
+
+    /// Mysql store + admin disabled is the supported config: resolver
+    /// reads grants from mysql; YAML or pre-seeded tables manage them.
+    #[test]
+    fn accepts_mysql_store_with_admin_disabled() {
+        let yaml = r#"
+permissions_store:
+  driver: mysql
+"#;
+        let cfg = ConfigFile::from_yaml_str(yaml).expect("mysql + no admin parses");
+        assert_eq!(
+            cfg.permissions_store.as_ref().map(|s| s.driver),
+            Some(PermissionsStoreDriver::Mysql)
+        );
+    }
+
+    /// Pg store + admin enabled is the default-functional config and
+    /// must keep working.
+    #[test]
+    fn accepts_pg_store_with_admin_enabled() {
+        let yaml = r#"
+permissions_store:
+  driver: pg
+admin:
+  enabled: true
+  group: admins
+"#;
+        ConfigFile::from_yaml_str(yaml).expect("pg + admin parses");
     }
 
     /// `auth_database: ""` (or whitespace-only) would silently slip past

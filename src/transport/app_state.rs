@@ -67,6 +67,7 @@ impl AppState {
                 servers: Vec::new(),
                 permissions: Vec::new(),
                 admin: None,
+                permissions_store: None,
             }),
             adapter_registry: AdapterRegistry::new(),
             state_db: None,

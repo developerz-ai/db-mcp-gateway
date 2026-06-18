@@ -9,8 +9,9 @@ pub mod permissions;
 
 use std::time::Duration;
 
-use sqlx::PgPool;
+use sqlx::mysql::MySqlPoolOptions;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::{MySqlPool, PgPool};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StateDbError {
@@ -31,6 +32,31 @@ pub async fn connect(url: &str, pool_size: u32) -> Result<PgPool, StateDbError> 
         .map_err(StateDbError::Connect)?;
 
     sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .map_err(StateDbError::Migrate)?;
+
+    Ok(pool)
+}
+
+/// Connect to a MySQL permissions store and run the mysql migrations.
+/// Used only when `permissions.store.driver = mysql` (#59); the state DB
+/// itself stays Postgres-only (audit_calls + sessions live there). The
+/// mysql migrations live under `migrations-mysql/` and create the
+/// `permissions_*` tables only — not the state-DB-only sessions / audit
+/// tables.
+pub async fn connect_permissions_mysql(
+    url: &str,
+    pool_size: u32,
+) -> Result<MySqlPool, StateDbError> {
+    let pool = MySqlPoolOptions::new()
+        .max_connections(pool_size)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(url)
+        .await
+        .map_err(StateDbError::Connect)?;
+
+    sqlx::migrate!("./migrations-mysql")
         .run(&pool)
         .await
         .map_err(StateDbError::Migrate)?;

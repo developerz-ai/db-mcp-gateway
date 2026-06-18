@@ -34,6 +34,25 @@ services:
       timeout: 3s
       retries: 10
 
+  # Mysql permissions store for #59. Optional — only opened when
+  # `permissions_store.driver = mysql` in YAML. State DB itself stays pg.
+  permissions-mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: ${PERMISSIONS_MYSQL_ROOT_PASSWORD:-mysql-dev-only}
+      MYSQL_DATABASE: ${PERMISSIONS_MYSQL_DB:-permissions}
+      MYSQL_USER: ${PERMISSIONS_MYSQL_USER:-permissions}
+      MYSQL_PASSWORD: ${PERMISSIONS_MYSQL_PASSWORD:-permissions-dev-only}
+    ports:
+      - "${PERMISSIONS_MYSQL_PORT:-3307}:3306"
+    volumes:
+      - permissions-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
   # Mongo target for #58 integration tests. The root user is what tests
   # connect as — production deployments wire a least-privilege read role
   # via spec 05; for the dev stack we lean on the rejector as the gateway
@@ -63,3 +82,4 @@ volumes:
   state-db-data:
   target-db-data:
   target-mongo-data:
+  permissions-mysql-data:

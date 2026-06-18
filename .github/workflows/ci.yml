@@ -66,6 +66,22 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      # MySQL permissions store for #59's parity tests. Optional in prod
+      # (only opened when `permissions_store.driver = mysql`), but CI
+      # always boots it so the mysql repo tests run on every push.
+      permissions-mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: mysql-dev-only
+          MYSQL_DATABASE: permissions
+          MYSQL_USER: permissions
+          MYSQL_PASSWORD: permissions-dev-only
+        ports: ["3307:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -u root -pmysql-dev-only"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
       # Mongo target for #58's adapter integration tests. Mirrors the
       # `target-mongo` service in docker-compose.dev.yml. The dev container
       # bootstraps a root user in `admin`, which is why the test fixtures
