@@ -21,6 +21,8 @@ pub mod effective;
 #[cfg(test)]
 mod effective_proptests;
 pub mod loader;
+#[cfg(test)]
+mod wildcard_proptests;
 
 pub use cache::PermissionsCache;
 pub use effective::{can_see_server_effective, evaluate_effective};
