@@ -17,14 +17,20 @@ use sqlx::PgPool;
 use crate::auth::Identity;
 use crate::authz::{self, Decision, PermissionsCache, cache::load_or_empty};
 use crate::config::{Action, ConfigFile, Database, Grant, Server};
-use crate::exec::{AdapterRegistry, ExecError, ExecQuery, ExecResult};
+use crate::exec::{AdapterRegistry, ExecQuery, ExecResult};
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
 use super::audit_dispatch::{
-    AuditHeader, Outcome, RequestContext, audit_dispatch, error_outcome, success_outcome,
+    AuditHeader, Outcome, RequestContext, ToolErrorMessages, audit_dispatch, error_outcome,
+    outcome_from_exec_error, success_outcome,
 };
 
 const TOOL_NAME: &str = "describe_schema";
+const ERROR_MESSAGES: ToolErrorMessages = ToolErrorMessages {
+    timeout: "catalog query exceeded statement_timeout",
+    sql_rejected: "catalog query was rejected",
+    forbidden_prefix: "catalog query",
+};
 const DEFAULT_SCHEMA: &str = "public";
 /// One Postgres database can hold tens of thousands of columns across all
 /// schemas. Cap the catalog query so a degenerate request can't dominate the
@@ -135,7 +141,7 @@ async fn compute_outcome(
     let started = Instant::now();
     let adapter = match registry.get_or_open(server, database).await {
         Ok(a) => a,
-        Err(err) => return outcome_from_exec_error(id, err, started),
+        Err(err) => return outcome_from_exec_error(id, err, started, &ERROR_MESSAGES),
     };
 
     let query = ExecQuery {
@@ -176,7 +182,7 @@ async fn compute_outcome(
                 Some(exec_result.truncated),
             )
         }
-        Err(err) => outcome_from_exec_error(id, err, started),
+        Err(err) => outcome_from_exec_error(id, err, started, &ERROR_MESSAGES),
     }
 }
 
@@ -245,27 +251,6 @@ fn assemble_tables(result: &ExecResult) -> Result<DescribeSchemaResult, ()> {
         }
     }
     Ok(DescribeSchemaResult { tables })
-}
-
-fn outcome_from_exec_error(id: Value, err: ExecError, started: Instant) -> Outcome {
-    let owned;
-    let (code, message): (&str, &str) = match err {
-        ExecError::Timeout => ("timeout", "catalog query exceeded statement_timeout"),
-        ExecError::Connection | ExecError::Unavailable => {
-            ("unavailable", "target database is unreachable")
-        }
-        ExecError::Sql => ("syntax_error", "catalog query was rejected"),
-        ExecError::Forbidden(reason) => {
-            owned = format!("catalog query rejected by gateway: {reason}");
-            ("forbidden_sql", owned.as_str())
-        }
-        ExecError::PasswordUnresolved { .. }
-        | ExecError::UnsupportedAdapter(_)
-        | ExecError::NotImplemented { .. } => ("internal", "server-side configuration error"),
-    };
-    let mut outcome = error_outcome(id, code, message);
-    outcome.elapsed_ms = Some(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
-    outcome
 }
 
 #[cfg(test)]
