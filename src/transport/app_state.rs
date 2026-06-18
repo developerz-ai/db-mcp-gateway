@@ -20,7 +20,7 @@ use super::probes::ShutdownFlag;
 use crate::auth::{AuthConfig, OidcClient, SessionStore};
 use crate::authz::PermissionsCache;
 use crate::config::ConfigFile;
-use crate::exec::PoolRegistry;
+use crate::exec::AdapterRegistry;
 use crate::state::permissions::PermissionsRepo;
 
 /// `state → nonce` from /auth/login lives here until /auth/callback consumes
@@ -34,7 +34,7 @@ pub struct AppState {
     /// tests don't care about tool dispatch.
     pub config: Arc<ConfigFile>,
     /// Per-`(server, database)` target Postgres pools. Lazy.
-    pub pool_registry: PoolRegistry,
+    pub adapter_registry: AdapterRegistry,
     /// Gateway's own state DB. Tools that audit (`run_query`) need it; tests
     /// that only exercise the wire protocol leave it `None`.
     pub state_db: Option<PgPool>,
@@ -67,7 +67,7 @@ impl AppState {
                 permissions: Vec::new(),
                 admin: None,
             }),
-            pool_registry: PoolRegistry::new(),
+            adapter_registry: AdapterRegistry::new(),
             state_db: None,
             shutdown: ShutdownFlag::new(),
             metrics: None,

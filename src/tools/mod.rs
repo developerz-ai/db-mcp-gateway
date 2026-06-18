@@ -25,7 +25,7 @@ use tracing::info_span;
 use crate::auth::Identity;
 use crate::authz::PermissionsCache;
 use crate::config::ConfigFile;
-use crate::exec::PoolRegistry;
+use crate::exec::AdapterRegistry;
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
 pub use audit_dispatch::RequestContext;
@@ -63,7 +63,7 @@ pub async fn dispatch_call(
     id: Value,
     identity: Option<&Identity>,
     config: &ConfigFile,
-    registry: &PoolRegistry,
+    registry: &AdapterRegistry,
     permissions_cache: Option<&PermissionsCache>,
     state_db: Option<&PgPool>,
     request_ctx: &RequestContext,

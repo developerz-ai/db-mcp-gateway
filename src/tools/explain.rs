@@ -17,7 +17,7 @@ use crate::auth::Identity;
 use crate::authz::{self, Decision, PermissionsCache, cache::load_or_empty};
 use crate::config::{Action, ConfigFile, Database, Grant, Server};
 use crate::exec::sql_guard;
-use crate::exec::{self, ExecError, PoolRegistry};
+use crate::exec::{AdapterRegistry, ExecError, ExecQuery};
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
 use super::audit_dispatch::{
@@ -49,7 +49,7 @@ pub async fn run(
     id: Value,
     identity: &Identity,
     config: &ConfigFile,
-    registry: &PoolRegistry,
+    registry: &AdapterRegistry,
     permissions_cache: Option<&PermissionsCache>,
     state_db: Option<&PgPool>,
     request_ctx: &RequestContext,
@@ -93,7 +93,7 @@ async fn compute_outcome(
     id: Value,
     identity: &Identity,
     config: &ConfigFile,
-    registry: &PoolRegistry,
+    registry: &AdapterRegistry,
     db_grants: &[Grant],
     args: &Arguments,
 ) -> Outcome {
@@ -131,12 +131,18 @@ async fn compute_outcome(
     // Wall clock starts before pool open so error paths still carry
     // `duration_ms` into the audit row — spec 07 requires it on every call.
     let started = Instant::now();
-    let pool = match registry.get_or_open(server, database).await {
-        Ok(p) => p,
+    let adapter = match registry.get_or_open(server, database).await {
+        Ok(a) => a,
         Err(err) => return outcome_from_exec_error(id, err, started),
     };
 
-    match exec::run_query(&pool, &sql, timeout_ms, EXPLAIN_RESULT_CAP).await {
+    let query = ExecQuery {
+        sql: &sql,
+        binds: &[],
+        statement_timeout_ms: timeout_ms,
+        row_limit: EXPLAIN_RESULT_CAP,
+    };
+    match adapter.execute(query).await {
         Ok(result) => {
             let elapsed = i64::try_from(result.elapsed_ms).unwrap_or(i64::MAX);
 
@@ -173,7 +179,7 @@ async fn compute_outcome(
 /// Depending on Postgres version + sqlx decoding, the cell arrives as either
 /// already-parsed JSON (array/object) or as a string containing the JSON
 /// text. Handle both — anything else is an unexpected shape.
-fn extract_plan(result: &exec::ExecResult) -> Result<Value, ()> {
+fn extract_plan(result: &crate::exec::ExecResult) -> Result<Value, ()> {
     let first_row = result.rows.first().ok_or(())?;
     let cell = first_row.first().ok_or(())?;
     match cell {
@@ -207,7 +213,9 @@ fn outcome_from_exec_error(id: Value, err: ExecError, started: Instant) -> Outco
             ("unavailable", "target database is unreachable")
         }
         ExecError::Sql => ("syntax_error", "the target DB rejected the SQL"),
-        ExecError::PasswordUnresolved { .. } => ("internal", "server-side configuration error"),
+        ExecError::PasswordUnresolved { .. } | ExecError::UnsupportedAdapter(_) => {
+            ("internal", "server-side configuration error")
+        }
     };
     let mut outcome = error_outcome(id, code, message);
     outcome.elapsed_ms = Some(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
@@ -220,7 +228,7 @@ mod tests {
 
     #[test]
     fn extract_plan_decodes_string_cell() {
-        let result = exec::ExecResult {
+        let result = crate::exec::ExecResult {
             columns: vec!["QUERY PLAN".to_string()],
             rows: vec![vec![Value::from(r#"[{"Plan":{"Node Type":"Seq Scan"}}]"#)]],
             truncated: false,
@@ -234,7 +242,7 @@ mod tests {
     fn extract_plan_passes_through_already_parsed_json() {
         // When sqlx decodes a `json` column directly, the cell is already a
         // Value::Array (or Object) — pass through without re-parsing.
-        let result = exec::ExecResult {
+        let result = crate::exec::ExecResult {
             columns: vec!["QUERY PLAN".to_string()],
             rows: vec![vec![serde_json::json!([{"Plan": {"Node Type": "Result"}}])]],
             truncated: false,
@@ -246,7 +254,7 @@ mod tests {
 
     #[test]
     fn extract_plan_errors_on_empty_or_unexpected_shape() {
-        let empty = exec::ExecResult {
+        let empty = crate::exec::ExecResult {
             columns: vec![],
             rows: vec![],
             truncated: false,
@@ -255,7 +263,7 @@ mod tests {
         assert!(extract_plan(&empty).is_err());
 
         // Wrong cell type (number)
-        let wrong = exec::ExecResult {
+        let wrong = crate::exec::ExecResult {
             columns: vec!["QUERY PLAN".to_string()],
             rows: vec![vec![Value::from(42)]],
             truncated: false,

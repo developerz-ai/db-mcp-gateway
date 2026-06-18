@@ -15,7 +15,7 @@ use crate::auth::Identity;
 use crate::authz::{self, Decision, PermissionsCache, cache::load_or_empty};
 use crate::config::{Action, ConfigFile, Database, Grant, Server};
 use crate::exec::sql_guard;
-use crate::exec::{self, ExecError, PoolRegistry};
+use crate::exec::{AdapterRegistry, ExecError, ExecQuery};
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
 use super::audit_dispatch::{
@@ -52,7 +52,7 @@ pub async fn run(
     id: Value,
     identity: &Identity,
     config: &ConfigFile,
-    registry: &PoolRegistry,
+    registry: &AdapterRegistry,
     permissions_cache: Option<&PermissionsCache>,
     state_db: Option<&PgPool>,
     request_ctx: &RequestContext,
@@ -94,7 +94,7 @@ async fn compute_outcome(
     id: Value,
     identity: &Identity,
     config: &ConfigFile,
-    registry: &PoolRegistry,
+    registry: &AdapterRegistry,
     db_grants: &[Grant],
     args: &Arguments,
 ) -> Outcome {
@@ -152,12 +152,18 @@ async fn compute_outcome(
     // unavailable, syntax_error) still surface `duration_ms` in the audit
     // row — spec 07 requires it for every tool invocation.
     let started = Instant::now();
-    let pool = match registry.get_or_open(server, database).await {
-        Ok(p) => p,
+    let adapter = match registry.get_or_open(server, database).await {
+        Ok(a) => a,
         Err(err) => return outcome_from_exec_error(id, err, started),
     };
 
-    match exec::run_query(&pool, &args.sql, timeout_ms, row_limit).await {
+    let query = ExecQuery {
+        sql: &args.sql,
+        binds: &[],
+        statement_timeout_ms: timeout_ms,
+        row_limit,
+    };
+    match adapter.execute(query).await {
         Ok(result) => {
             let elapsed = i64::try_from(result.elapsed_ms).unwrap_or(i64::MAX);
             let row_count = i64::try_from(result.rows.len()).unwrap_or(i64::MAX);
@@ -203,7 +209,9 @@ fn outcome_from_exec_error(id: Value, err: ExecError, started: Instant) -> Outco
             ("unavailable", "target database is unreachable")
         }
         ExecError::Sql => ("syntax_error", "the target DB rejected the SQL"),
-        ExecError::PasswordUnresolved { .. } => ("internal", "server-side configuration error"),
+        ExecError::PasswordUnresolved { .. } | ExecError::UnsupportedAdapter(_) => {
+            ("internal", "server-side configuration error")
+        }
     };
     let mut outcome = error_outcome(id, code, message);
     outcome.elapsed_ms = Some(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));

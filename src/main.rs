@@ -8,7 +8,7 @@ use db_mcp_gateway::audit;
 use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
 use db_mcp_gateway::authz::PermissionsCache;
 use db_mcp_gateway::config::{ConfigFile, TlsConfig};
-use db_mcp_gateway::exec::PoolRegistry;
+use db_mcp_gateway::exec::AdapterRegistry;
 use db_mcp_gateway::state::permissions::pg::PgPermissionsRepo;
 use db_mcp_gateway::transport::probes::ShutdownFlag;
 use db_mcp_gateway::transport::tls;
@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
             flows: PendingFlows::default(),
         }),
         config: Arc::new(config_file),
-        pool_registry: PoolRegistry::new(),
+        adapter_registry: AdapterRegistry::new(),
         state_db: Some(state_db.clone()),
         shutdown: shutdown.clone(),
         metrics: Some(metrics_handle),

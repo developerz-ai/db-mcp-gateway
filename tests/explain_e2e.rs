@@ -11,7 +11,7 @@ use std::time::Duration;
 use common::{MockUser, spawn_mock_idp};
 use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
 use db_mcp_gateway::config::{Config, ConfigFile};
-use db_mcp_gateway::exec::PoolRegistry;
+use db_mcp_gateway::exec::AdapterRegistry;
 use db_mcp_gateway::state;
 use db_mcp_gateway::transport::{self, AppState, AuthFacade, PendingFlows};
 use serde_json::{Value, json};
@@ -95,7 +95,7 @@ async fn boot_gateway() -> BootedGateway {
             }),
             config: Arc::new(config_file),
             state_db: Some(pool.clone()),
-            pool_registry: PoolRegistry::new(),
+            adapter_registry: AdapterRegistry::new(),
             shutdown: Default::default(),
             metrics: None,
             permissions_cache: None,

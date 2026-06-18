@@ -11,7 +11,7 @@ use std::time::Duration;
 use common::{MockUser, spawn_mock_idp};
 use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
 use db_mcp_gateway::config::{Config, ConfigFile};
-use db_mcp_gateway::exec::PoolRegistry;
+use db_mcp_gateway::exec::AdapterRegistry;
 use db_mcp_gateway::state;
 use db_mcp_gateway::transport::{self, AppState, AuthFacade, PendingFlows};
 use serde_json::{Value, json};
@@ -102,7 +102,7 @@ async fn login_via_mock_idp_then_call_tool() {
                 flows: PendingFlows::default(),
             }),
             config: Arc::new(config_file),
-            pool_registry: PoolRegistry::new(),
+            adapter_registry: AdapterRegistry::new(),
             state_db: Some(pool),
             shutdown: Default::default(),
             metrics: None,

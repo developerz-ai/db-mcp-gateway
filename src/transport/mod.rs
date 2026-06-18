@@ -170,7 +170,7 @@ async fn post_handler(
             id,
             identity.as_deref(),
             &state.config,
-            &state.pool_registry,
+            &state.adapter_registry,
             state.permissions_cache.as_ref(),
             state.state_db.as_ref(),
             &request_ctx,
