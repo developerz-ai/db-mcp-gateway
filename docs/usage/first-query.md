@@ -2,7 +2,7 @@
 
 A 5-minute walkthrough for a new engineer whose org has already deployed the gateway. Start to finish: install Claude Code → sign in → run a real query against a real DB → read your own audit row.
 
-If you're standing the gateway up, you want [../deployment/quickstart.md](../deployment/quickstart.md) instead. If you've already done a first query and want the day-to-day reference, jump back to [claude-code.md](claude-code.md).
+If you're standing the gateway up, you want [../deployment/quickstart.md](../deployment/quickstart.md) instead. If you've already done a first query and want the day-to-day reference, jump back to [claude-code.md](claude-code.md). For MongoDB targets the path is the same — see [multi-db.md](multi-db.md) for what changes at the `sql` field and which commands are allowed.
 
 > **Placeholder:** every `https://db.internal.acme.com` below is a stand-in. Your platform team will give you the real one (looks the same, different domain).
 

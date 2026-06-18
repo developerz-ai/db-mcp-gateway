@@ -24,6 +24,8 @@ Boot-time validation (issue #16):
 |---|---|---|---|
 | `servers` | list of [Server](#server) | no (defaults `[]`) | Target DBs the gateway can dispatch to. |
 | `permissions` | list of [Permission](#permission) | no (defaults `[]`) | Group→grant mapping. Empty list means no caller can reach anything. |
+| `admin` | [Admin](#admin) | no | `/admin/v1/*` surface gating — see [admin-api.md](admin-api.md). |
+| `permissions_store` | [PermissionsStore](#permissionsstore) | no | Storage backend for users/databases/grants. Absent → state DB (pg). |
 
 > Other top-level keys (`gateway:`, `auth:`, `logging:`) are accepted for
 > forward-compat with the full spec but not parsed. Their settings come from
@@ -36,7 +38,7 @@ Boot-time validation (issue #16):
 | Key | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `name` | string | **yes** | — | Stable identifier used in grants, audit, and `list_servers`. |
-| `kind` | `postgres` \| `mysql` \| `mssql` | **yes** | — | Only `postgres` is implemented today. |
+| `kind` | `postgres` \| `mongo` \| `mysql` \| `mssql` | **yes** | — | `postgres` and `mongo` work today (#56–#58); `mysql` / `mssql` parse but abort on first dispatch with `UnsupportedAdapter`. |
 | `host` | string | **yes** | — | DNS or IP of the target DB. |
 | `port` | u16 | no | `5432` | |
 | `tls` | `required` \| `insecure` | no | `required` | `insecure` logs a warning every minute when used in prod. |
@@ -50,9 +52,10 @@ Boot-time validation (issue #16):
 | Key | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `name` | string | **yes** | — | DB name on the target server. |
-| `role` | string | **yes** | — | Postgres role (`^[A-Za-z_][A-Za-z0-9_]*$`). Typo here is caught at boot. |
+| `role` | string | **yes** | — | Postgres role / mongo username (`^[A-Za-z_][A-Za-z0-9_]*$`). Typo here is caught at boot. |
 | `password` | [secret ref](#secret-references) | **yes** | — | `${ENV:…}` / `${FILE:…}` / `vault:…` / `aws-sm:…` / `gcp-sm:…` / inline literal. |
 | `description` | string | no | `""` | |
+| `auth_database` | string | no | `None` (falls back to `name`) | Mongo `authSource`. Set to `"admin"` when the role lives outside the target DB (container-bootstrapped users). Empty/whitespace is a boot error — omit to fall back. Ignored by pg. See [multi-db.md](../usage/multi-db.md). |
 
 > Spec also defines `sql_capture` and `pool:` on Database. Those aren't
 > enforced yet — they're commented out in `config/example.yaml` so the parser
@@ -66,6 +69,25 @@ Boot-time validation (issue #16):
 |---|---|---|---|---|
 | `group` | string | **yes** | — | Group claim from the IdP token (e.g. `engineers`, `oncall`). |
 | `grants` | list of [Grant](#grant) | no | `[]` | Empty means the group is recognized but grants nothing. |
+
+## Admin
+
+`#[serde(deny_unknown_fields)]`. Gates the `/admin/v1/*` surface — full reference at [admin-api.md](admin-api.md).
+
+| Key | Type | Required | Default | Notes |
+|---|---|---|---|---|
+| `enabled` | bool | no | `false` | When `false` (or `admin:` absent), `/admin/*` returns 404 — the route never mounts. |
+| `group` | string | **yes when `enabled: true`** | — | SSO group claim that authorizes admin calls. Empty/whitespace with `enabled: true` aborts boot (every authenticated user would otherwise be an admin). |
+
+## PermissionsStore
+
+`#[serde(deny_unknown_fields)]`. Selects the backend for users / databases / grants — see [admin-api.md §Storage backend](admin-api.md#storage-backend).
+
+| Key | Type | Required | Default | Notes |
+|---|---|---|---|---|
+| `driver` | `pg` \| `mysql` | **yes** | — | `pg` (default if the block is absent) shares the state DB. `mysql` opens a separate pool via `PERMISSIONS_DB_DSN` env at boot. |
+
+> **Boot-gate**: `driver: mysql` + `admin.enabled: true` is rejected — admin handlers haven't been ported to mysql. Use pg for the admin path, or mysql with YAML grants only.
 
 ## Grant
 
