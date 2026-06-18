@@ -249,6 +249,7 @@ pub fn error_outcome(id: Value, code: &'static str, message: &str) -> Outcome {
 /// shared mapping can stay one function while error messages keep their
 /// tool-specific shape. Spec 03 error *codes* are NOT configurable here —
 /// they're fixed by the shared mapping below.
+#[derive(Debug)]
 pub struct ToolErrorMessages {
     /// Message for `ExecError::Timeout`. Per-tool because EXPLAIN says
     /// "EXPLAIN exceeded …" while `run_query` says "query exceeded …".
