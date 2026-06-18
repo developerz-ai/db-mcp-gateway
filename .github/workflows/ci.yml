@@ -66,6 +66,22 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      # Mongo target for #58's adapter integration tests. Mirrors the
+      # `target-mongo` service in docker-compose.dev.yml. The dev container
+      # bootstraps a root user in `admin`, which is why the test fixtures
+      # set `Database.auth_database = Some("admin")`.
+      target-mongo:
+        image: mongo:7
+        env:
+          MONGO_INITDB_ROOT_USERNAME: app
+          MONGO_INITDB_ROOT_PASSWORD: app-dev-only
+          MONGO_INITDB_DATABASE: app
+        ports: ["27018:27017"]
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok'"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     env:
       DATABASE_URL: postgres://gateway:gateway@localhost:5432/gateway
       # Read by `Config::from_env` for the gateway's state DB pool. Kept
