@@ -81,10 +81,14 @@ CREATE TABLE permissions_grants (
             (database_id IS NULL     AND db_name_wildcard = TRUE  AND server IS NOT NULL)
         ),
 
-    -- Partial-index emulation: when revoked, set the live-key column to
-    -- NULL via the same generated-column trick — but for an index, not
-    -- a unique constraint. We can't do a partial index, but a regular
-    -- index over `(user_id, live_revoked_flag)` is still selective enough.
+    -- Plain composite indexes on (user_id, revoked_at) and
+    -- (database_id, revoked_at). MySQL has no partial-index support
+    -- (`WHERE revoked_at IS NULL`), so unlike pg these include both live
+    -- and revoked rows. Queries filtering `revoked_at IS NULL` still use
+    -- the index — just with lower selectivity than pg's partial index.
+    -- Acceptable: the revoked-row tail is small in practice and the
+    -- generated-column trick used for UNIQUE above doesn't help here
+    -- (we need range scans on user_id/database_id, not uniqueness).
     KEY permissions_grants_user_live_idx (user_id, revoked_at),
     KEY permissions_grants_database_live_idx (database_id, revoked_at)
 );
