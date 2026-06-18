@@ -53,6 +53,11 @@ pub struct AuditRow {
     /// Source IP of the request socket, formatted as a string (we store
     /// TEXT not INET — see migration 0003).
     pub ip: Option<String>,
+    /// Target backend kind — `"postgres"` or `"mongo"`. `None` for tools
+    /// that don't hit a target DB (`list_servers`). Added in migration
+    /// 0007 (#58) so operator queries can split mongo activity from pg
+    /// at the audit layer; spec 12 §"Mongo adapter" line 241.
+    pub db_type: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -69,8 +74,8 @@ pub async fn log(pool: &PgPool, row: &AuditRow) -> Result<(), AuditError> {
         "INSERT INTO audit_calls \
          (id, request_id, user_sub, user_email, groups, tool, server_name, database_name, \
           sql, reason, outcome, elapsed_ms, row_count, truncated, error_message, \
-          agent_client, ip) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+          agent_client, ip, db_type) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
     )
     .bind(Uuid::new_v4())
     .bind(&row.request_id)
@@ -89,6 +94,7 @@ pub async fn log(pool: &PgPool, row: &AuditRow) -> Result<(), AuditError> {
     .bind(&row.error_message)
     .bind(&row.agent_client)
     .bind(&row.ip)
+    .bind(&row.db_type)
     .execute(pool)
     .await
     .map_err(AuditError::Write)?;
@@ -107,7 +113,7 @@ pub async fn latest_for_user_tool(
     let row = sqlx::query(
         "SELECT request_id, user_sub, user_email, groups, tool, server_name, database_name, \
                 sql, reason, outcome, elapsed_ms, row_count, truncated, error_message, \
-                agent_client, ip, occurred_at \
+                agent_client, ip, db_type, occurred_at \
          FROM audit_calls WHERE user_sub = $1 AND tool = $2 \
          ORDER BY occurred_at DESC LIMIT 1",
     )
@@ -141,6 +147,7 @@ pub async fn latest_for_user_tool(
             error_message: r.get("error_message"),
             agent_client: r.get("agent_client"),
             ip: r.get("ip"),
+            db_type: r.get("db_type"),
         }
     }))
 }

@@ -94,6 +94,7 @@ pub async fn run(
         database: Some(&args.database),
         sql: None,
         reason: None,
+        db_type: super::db_type_for_server(config, &args.server),
     };
     let db_grants = match load_or_empty(permissions_cache, identity).await {
         Ok(g) => g,

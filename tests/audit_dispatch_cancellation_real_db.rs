@@ -1,0 +1,171 @@
+//! Cancellation drop-guard test for `audit_dispatch` (#58 acceptance).
+//!
+//! Headline contract: when an agent disconnects mid-query, axum drops
+//! the handler future, which drops the in-flight `audit_dispatch`
+//! future. The drop-guard inside `audit_dispatch` writes a
+//! `outcome = "cancelled"` audit row on a detached `tokio::spawn` so the
+//! audit record survives even though the parent future died. CLAUDE.md
+//! *§Cancellation safety*: "audit row outcome: cancelled."
+//!
+//! This test exercises the production code path:
+//!   1. Build a real `state_db` pool.
+//!   2. Call `audit_dispatch` with a `work` future that never resolves.
+//!   3. Spawn on a tokio task, give it a moment to reach `.await`.
+//!   4. Abort the task (drops the dispatch future).
+//!   5. Wait briefly for the detached audit-write spawn to land.
+//!   6. Assert the audit row exists with `outcome = "cancelled"`.
+
+use std::time::Duration;
+
+use db_mcp_gateway::audit;
+use db_mcp_gateway::auth::{Identity, SessionId};
+use db_mcp_gateway::state;
+use db_mcp_gateway::tools::audit_dispatch::{AuditHeader, RequestContext, audit_dispatch};
+use serde_json::Value;
+use uuid::Uuid;
+
+fn state_db_url() -> String {
+    std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
+        "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
+    })
+}
+
+async fn pool() -> sqlx::PgPool {
+    state::connect(&state_db_url(), 5)
+        .await
+        .expect("state DB up (run `bin/dev up`)")
+}
+
+fn identity(user_sub: &str) -> Identity {
+    Identity {
+        session_id: SessionId::new(),
+        user_sub: user_sub.to_string(),
+        user_email: "cancel-test@example.com".to_string(),
+        groups: vec!["test".to_string()],
+    }
+}
+
+/// The headline #58 acceptance test for cancellation. A dispatch future
+/// that never reaches `outcome` MUST still land a `cancelled` audit row.
+#[tokio::test]
+async fn dropped_dispatch_leaves_cancelled_audit_row() {
+    let p = pool().await;
+    let user = format!("cancel-test-{}", Uuid::new_v4().simple());
+    let id = Value::from(Uuid::new_v4().to_string());
+    let ctx = RequestContext::default();
+
+    // The hanging work future: `pending` never resolves, so the
+    // dispatch's `work.await` is the cancellation point.
+    let pool_for_dispatch = p.clone();
+    let id_in = id.clone();
+    let user_in = user.clone();
+    let task = tokio::spawn(async move {
+        let identity = identity(&user_in);
+        let header = AuditHeader {
+            tool: "run_query",
+            server: Some("mongo"),
+            database: Some("app"),
+            sql: Some(r#"{"find":"users","filter":{}}"#),
+            reason: None,
+            db_type: Some("mongo"),
+        };
+        let _ = audit_dispatch(
+            id_in,
+            &identity,
+            Some(&pool_for_dispatch),
+            &ctx,
+            header,
+            std::future::pending::<db_mcp_gateway::tools::audit_dispatch::Outcome>(),
+        )
+        .await;
+    });
+
+    // Let the dispatch reach the `work.await`. 50ms is plenty: the path
+    // before the await is pure local work (build the guard, no I/O).
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    task.abort();
+    // Wait for the abort to propagate AND for the drop-spawned audit
+    // write to complete. Two reasons we sleep more than the path
+    // demands: tokio's `abort` is async, and `audit::log` does a real
+    // INSERT round-trip on the state DB.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The cancelled row should be visible. `latest_for_user_tool` filters
+    // by (user_sub, tool) — we used a per-test user so no other row
+    // collides.
+    let row = audit::latest_for_user_tool(&p, &user, "run_query")
+        .await
+        .expect("audit query runs");
+    let row = row.expect("cancelled audit row was written");
+    assert_eq!(row.outcome, "cancelled");
+    assert_eq!(row.user_sub, user);
+    assert_eq!(row.tool, "run_query");
+    assert_eq!(row.server.as_deref(), Some("mongo"));
+    assert_eq!(row.database.as_deref(), Some("app"));
+    assert_eq!(row.db_type.as_deref(), Some("mongo"));
+    assert_eq!(
+        row.error_message.as_deref(),
+        Some("client disconnected before completion")
+    );
+
+    // Cleanup so reruns don't pile up cancellation rows for this user.
+    sqlx::query("DELETE FROM audit_calls WHERE user_sub = $1")
+        .bind(&user)
+        .execute(&p)
+        .await
+        .unwrap();
+}
+
+/// Counter-test: a dispatch that *does* complete writes the normal
+/// outcome — the guard must NOT fire when `disarm()` runs. Pins that
+/// `disarm` actually disarms (regression would be: cancelled row written
+/// every successful dispatch).
+#[tokio::test]
+async fn completed_dispatch_does_not_leave_cancelled_row() {
+    use db_mcp_gateway::tools::audit_dispatch::Outcome;
+    use db_mcp_gateway::transport::jsonrpc::Response;
+
+    let p = pool().await;
+    let user = format!("cancel-test-{}", Uuid::new_v4().simple());
+    let id = Value::from(Uuid::new_v4().to_string());
+    let ctx = RequestContext::default();
+
+    let identity = identity(&user);
+    let header = AuditHeader {
+        tool: "run_query",
+        server: Some("prod"),
+        database: Some("app"),
+        sql: Some("SELECT 1"),
+        reason: None,
+        db_type: Some("postgres"),
+    };
+    let id_for_outcome = id.clone();
+    let work = async move {
+        Outcome {
+            response: Response::result(id_for_outcome, &serde_json::json!({"ok":true})),
+            code: "success",
+            elapsed_ms: Some(7),
+            row_count: Some(1),
+            truncated: Some(false),
+            error_message: None,
+        }
+    };
+    let _ = audit_dispatch(id, &identity, Some(&p), &ctx, header, work).await;
+    // Give the detached write (audit::log) time to land.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let row = audit::latest_for_user_tool(&p, &user, "run_query")
+        .await
+        .expect("audit query runs")
+        .expect("audit row was written");
+    assert_eq!(
+        row.outcome, "success",
+        "completed dispatch must NOT mark cancelled"
+    );
+
+    sqlx::query("DELETE FROM audit_calls WHERE user_sub = $1")
+        .bind(&user)
+        .execute(&p)
+        .await
+        .unwrap();
+}

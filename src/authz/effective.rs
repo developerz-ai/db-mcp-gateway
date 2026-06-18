@@ -85,6 +85,7 @@ mod tests {
             role: "ro".to_string(),
             password: Password::Literal("pw".to_string()),
             description: String::new(),
+            auth_database: None,
         }
     }
 

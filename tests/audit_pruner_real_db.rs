@@ -39,6 +39,7 @@ fn audit_row(user_sub: &str, request_id: &str) -> AuditRow {
         error_message: None,
         agent_client: None,
         ip: None,
+        db_type: None,
     }
 }
 

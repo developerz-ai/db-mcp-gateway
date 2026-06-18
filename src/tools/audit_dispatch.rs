@@ -61,6 +61,10 @@ pub struct AuditHeader<'a> {
     pub database: Option<&'a str>,
     pub sql: Option<&'a str>,
     pub reason: Option<&'a str>,
+    /// Backend kind — `"postgres"` / `"mongo"` — derived from `server.kind`.
+    /// `None` for tools that don't dispatch to a target DB (`list_servers`).
+    /// Spec 12 line 241 / #58 acceptance.
+    pub db_type: Option<&'a str>,
 }
 
 /// Per-request context the transport layer captures (IP, agent client).
@@ -80,6 +84,69 @@ impl RequestContext {
             ip: addr.map(|a| a.ip()),
             agent_client: user_agent.map(str::to_string),
         }
+    }
+}
+
+/// Drop-fired guard that writes a `"cancelled"` audit row if the dispatch
+/// future is dropped before `disarm()` is called. The detached
+/// `tokio::spawn` lets the audit write outlive the cancellation.
+///
+/// Why this shape: when an agent disconnects, axum drops the handler
+/// future, which drops the in-flight `audit_dispatch` future mid-`.await`.
+/// Without a guard, the audit row is never written. We can't use async
+/// `Drop` (doesn't exist in Rust today), so we spawn the write on the
+/// runtime instead — the spawned task runs to completion independently
+/// of the parent future's lifecycle.
+///
+/// The future-drop chain handles server-side cleanup separately:
+/// `mongodb::Cursor` and `sqlx::Transaction` both kill their backend
+/// operation on drop. This guard's only job is the audit row.
+struct CancelledAuditGuard {
+    /// `Some` until `disarm()` is called. On `Drop` we spawn a detached
+    /// write of this row with `outcome = "cancelled"`.
+    row: Option<AuditRow>,
+    /// Cloned pool handle — needed inside the spawned task. `PgPool` is
+    /// `Arc`-internally so cloning is cheap.
+    state_db: Option<PgPool>,
+    /// Tool name kept separately for the metric counter emitted from the
+    /// drop path (audit row's `tool` field is moved into the spawn).
+    tool: &'static str,
+}
+
+impl CancelledAuditGuard {
+    fn disarm(mut self) {
+        self.row = None;
+        self.state_db = None;
+    }
+}
+
+impl Drop for CancelledAuditGuard {
+    fn drop(&mut self) {
+        let Some(mut row) = self.row.take() else {
+            return;
+        };
+        let Some(pool) = self.state_db.take() else {
+            return;
+        };
+        row.outcome = "cancelled".to_string();
+        // Distinct error_message so operators can tell a cancelled row
+        // from a forbidden one when scanning the table at speed.
+        row.error_message = Some("client disconnected before completion".to_string());
+        counter!(
+            METRIC_TOOL_CALLS,
+            "tool" => self.tool,
+            "outcome" => "cancelled",
+        )
+        .increment(1);
+        // Detached spawn. We can't await it; if it fails, there's no
+        // surface to report the failure to — the agent already disconnected.
+        // Operator sees the failure in tracing via audit::log's internal
+        // error path.
+        tokio::spawn(async move {
+            if let Err(err) = audit::log(&pool, &row).await {
+                tracing::error!(%err, "cancelled audit row write failed");
+            }
+        });
     }
 }
 
@@ -123,7 +190,39 @@ where
         );
     };
 
+    // Arm the cancellation guard BEFORE awaiting the work. If `work.await`
+    // is dropped (agent disconnect), the guard's `Drop` impl fires and
+    // spawns a detached `outcome = "cancelled"` audit write. CLAUDE.md
+    // *§Cancellation safety*: "audit row outcome: cancelled."
+    //
+    // The guard carries a pre-built row so the spawned task doesn't need
+    // to re-thread identity / context across the spawn boundary.
+    let cancel_guard = CancelledAuditGuard {
+        row: Some(AuditRow {
+            request_id: id.to_string(),
+            user_sub: identity.user_sub.clone(),
+            user_email: identity.user_email.clone(),
+            groups: identity.groups.clone(),
+            tool: header.tool.to_string(),
+            server: header.server.map(str::to_string),
+            database: header.database.map(str::to_string),
+            sql: header.sql.map(str::to_string),
+            reason: header.reason.map(str::to_string),
+            outcome: String::new(), // overwritten in Drop
+            elapsed_ms: None,       // unknown — work was cancelled
+            row_count: None,
+            truncated: None,
+            error_message: None, // set in Drop
+            agent_client: request_ctx.agent_client.clone(),
+            ip: request_ctx.ip.map(|i| i.to_string()),
+            db_type: header.db_type.map(str::to_string),
+        }),
+        state_db: Some(state_db.clone()),
+        tool: header.tool,
+    };
     let outcome = work.await;
+    // Work completed normally — release the guard so its Drop is a no-op.
+    cancel_guard.disarm();
 
     counter!(
         METRIC_TOOL_CALLS,
@@ -168,6 +267,7 @@ where
         error_message: outcome.error_message,
         agent_client: request_ctx.agent_client.clone(),
         ip: request_ctx.ip.map(|i| i.to_string()),
+        db_type: header.db_type.map(str::to_string),
     };
     let audit_started = Instant::now();
     let audit_result = audit::log(state_db, &row).await;

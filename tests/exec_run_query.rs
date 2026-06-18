@@ -33,6 +33,7 @@ fn database() -> Database {
         role: TARGET_USER.to_string(),
         password: Password::Literal(TARGET_PASSWORD.to_string()),
         description: String::new(),
+        auth_database: None,
     }
 }
 
