@@ -24,9 +24,35 @@ use tracing::info_span;
 
 use crate::auth::Identity;
 use crate::authz::PermissionsCache;
-use crate::config::ConfigFile;
+use crate::config::{ConfigFile, ServerKind};
 use crate::exec::AdapterRegistry;
 use crate::transport::jsonrpc::{ErrorObject, Response};
+
+/// Map a `ServerKind` to its audit-row string. Single source of truth so
+/// audit rows + the [`list_servers`] tool view never disagree about the
+/// label. Returned strings match the `audit_calls.db_type` values written
+/// in migration 0007.
+pub(crate) fn db_type_label(kind: ServerKind) -> &'static str {
+    match kind {
+        ServerKind::Postgres => "postgres",
+        ServerKind::Mysql => "mysql",
+        ServerKind::Mssql => "mssql",
+        ServerKind::Mongo => "mongo",
+    }
+}
+
+/// Look up the `db_type` label for a server by name. `None` when the
+/// server doesn't exist in config — caller's authz check will surface that
+/// downstream. Used in the per-DB tools' `AuditHeader` construction so the
+/// cancel-path audit row has the right `db_type` even when the work is
+/// dropped before `compute_outcome` runs.
+pub(crate) fn db_type_for_server(config: &ConfigFile, server_name: &str) -> Option<&'static str> {
+    config
+        .servers
+        .iter()
+        .find(|s| s.name == server_name)
+        .map(|s| db_type_label(s.kind))
+}
 
 pub use audit_dispatch::RequestContext;
 

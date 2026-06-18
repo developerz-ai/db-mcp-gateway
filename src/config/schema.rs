@@ -65,6 +65,14 @@ pub struct Database {
     pub password: Password,
     #[serde(default)]
     pub description: String,
+    /// Optional authentication database for backends where the role lives
+    /// somewhere other than the target database (mongo's `authSource`).
+    /// `None` falls back to `name` — the least-privilege per-db user
+    /// pattern. Operators set this to `"admin"` when bootstrapping with
+    /// the container's root user. Ignored by pg (which authenticates
+    /// against the connected database).
+    #[serde(default)]
+    pub auth_database: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

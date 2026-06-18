@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # bin/dev — local dev stack control.
-#   bin/dev up         start state-db + target-db
-#   bin/dev down       stop and remove containers
-#   bin/dev reset      down + remove volumes (fresh DBs)
-#   bin/dev logs [svc] follow logs
-#   bin/dev psql state psql into state-db
-#   bin/dev psql target psql into target-db
-#   bin/dev ps         compose ps
+#   bin/dev up           start state-db + target-db + target-mongo
+#   bin/dev down         stop and remove containers
+#   bin/dev reset        down + remove volumes (fresh DBs)
+#   bin/dev logs [svc]   follow logs
+#   bin/dev psql state   psql into state-db
+#   bin/dev psql target  psql into target-db
+#   bin/dev mongosh      mongosh into target-mongo
+#   bin/dev ps           compose ps
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -31,5 +32,12 @@ case "${1:-up}" in
       *) echo "unknown psql target: $target (use 'state' or 'target')" >&2; exit 2 ;;
     esac
     ;;
-  *) echo "usage: bin/dev {up|down|reset|logs [svc]|ps|psql state|psql target}" >&2; exit 2 ;;
+  mongosh)
+    exec "${COMPOSE[@]}" exec target-mongo mongosh \
+      --username "${TARGET_MONGO_USER:-app}" \
+      --password "${TARGET_MONGO_PASSWORD:-app-dev-only}" \
+      --authenticationDatabase admin \
+      "${TARGET_MONGO_DB:-app}"
+    ;;
+  *) echo "usage: bin/dev {up|down|reset|logs [svc]|ps|psql state|psql target|mongosh}" >&2; exit 2 ;;
 esac

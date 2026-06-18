@@ -82,6 +82,7 @@ pub async fn run(
         database: Some(&args.database),
         sql: Some(&args.sql),
         reason: args.reason.as_deref(),
+        db_type: super::db_type_for_server(config, &args.server),
     };
     let db_grants = match load_or_empty(permissions_cache, identity).await {
         Ok(g) => g,
@@ -133,12 +134,18 @@ async fn compute_outcome(
 
     // Defense-in-depth on top of the read-only role: reject writes / DDL /
     // multi-statement before they ever hit the pool. See exec::sql_guard.
-    if let Err(err) = sql_guard::is_read_only(&args.sql) {
-        return error_outcome(
-            id,
-            "forbidden_sql",
-            &format!("SQL rejected by gateway: {err}"),
-        );
+    //
+    // pg only: `sql_guard` is a SQL parser; mongo commands are JSON-shaped
+    // BSON, not SQL. `MongoAdapter::execute` runs its own read-only
+    // rejector (`src/exec/mongo/rejector.rs`) as the equivalent guard.
+    if matches!(server.kind, crate::config::ServerKind::Postgres) {
+        if let Err(err) = sql_guard::is_read_only(&args.sql) {
+            return error_outcome(
+                id,
+                "forbidden_sql",
+                &format!("SQL rejected by gateway: {err}"),
+            );
+        }
     }
 
     let row_limit = effective_row_limit(args.limit, constraints.row_limit);

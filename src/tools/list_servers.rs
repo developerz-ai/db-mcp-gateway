@@ -52,6 +52,7 @@ pub async fn run(
         database: None,
         sql: None,
         reason: None,
+        db_type: None,
     };
     let db_grants = match load_or_empty(permissions_cache, identity).await {
         Ok(g) => g,
@@ -105,12 +106,7 @@ impl From<&crate::config::Server> for SafeServerView {
 }
 
 fn kind_label(kind: ServerKind) -> &'static str {
-    match kind {
-        ServerKind::Postgres => "postgres",
-        ServerKind::Mysql => "mysql",
-        ServerKind::Mssql => "mssql",
-        ServerKind::Mongo => "mongo",
-    }
+    super::db_type_label(kind)
 }
 
 #[cfg(test)]
