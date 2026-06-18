@@ -221,12 +221,17 @@ fn effective_row_limit(caller: Option<u32>, grant: Option<u32>) -> u32 {
 }
 
 fn outcome_from_exec_error(id: Value, err: ExecError, started: Instant) -> Outcome {
-    let (code, message) = match err {
+    let owned;
+    let (code, message): (&str, &str) = match err {
         ExecError::Timeout => ("timeout", "query exceeded the configured statement_timeout"),
         ExecError::Connection | ExecError::Unavailable => {
             ("unavailable", "target database is unreachable")
         }
         ExecError::Sql => ("syntax_error", "the target DB rejected the SQL"),
+        ExecError::Forbidden(reason) => {
+            owned = format!("sample rejected by gateway: {reason}");
+            ("forbidden_sql", owned.as_str())
+        }
         ExecError::PasswordUnresolved { .. }
         | ExecError::UnsupportedAdapter(_)
         | ExecError::NotImplemented { .. } => ("internal", "server-side configuration error"),

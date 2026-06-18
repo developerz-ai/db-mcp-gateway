@@ -248,12 +248,17 @@ fn assemble_tables(result: &ExecResult) -> Result<DescribeSchemaResult, ()> {
 }
 
 fn outcome_from_exec_error(id: Value, err: ExecError, started: Instant) -> Outcome {
-    let (code, message) = match err {
+    let owned;
+    let (code, message): (&str, &str) = match err {
         ExecError::Timeout => ("timeout", "catalog query exceeded statement_timeout"),
         ExecError::Connection | ExecError::Unavailable => {
             ("unavailable", "target database is unreachable")
         }
         ExecError::Sql => ("syntax_error", "catalog query was rejected"),
+        ExecError::Forbidden(reason) => {
+            owned = format!("catalog query rejected by gateway: {reason}");
+            ("forbidden_sql", owned.as_str())
+        }
         ExecError::PasswordUnresolved { .. }
         | ExecError::UnsupportedAdapter(_)
         | ExecError::NotImplemented { .. } => ("internal", "server-side configuration error"),

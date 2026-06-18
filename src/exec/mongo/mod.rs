@@ -98,8 +98,13 @@ impl DbAdapter for MongoAdapter {
     /// "scaffold gap" marker so callers see a clear error rather than a
     /// generic failure. #58 replaces the `NotImplemented` branch with a
     /// `mongodb::Database::run_command` call.
+    ///
+    /// A rejected command maps to [`ExecError::Forbidden`] (→ tool code
+    /// `forbidden_sql`), matching the pg path's `sql_guard::is_read_only`
+    /// posture. Per spec 03, this is a policy denial, not a syntax error.
     async fn execute(&self, query: ExecQuery<'_>) -> Result<ExecResult, ExecError> {
-        rejector::validate_command(query.sql).map_err(|_| ExecError::Sql)?;
+        rejector::validate_command(query.sql)
+            .map_err(|err| ExecError::Forbidden(err.to_string()))?;
         Err(ExecError::NotImplemented {
             adapter: AdapterKind::Mongo,
             op: "execute",
@@ -161,5 +166,39 @@ mod tests {
             "leaked password: {rendered}"
         );
         assert!(!rendered.contains("the_user"), "leaked role: {rendered}");
+    }
+
+    /// A command the rejector blocks must surface as
+    /// [`ExecError::Forbidden`] (→ tool code `forbidden_sql`), not
+    /// [`ExecError::Sql`] (→ `syntax_error`). The distinction matters per
+    /// spec 03 — `syntax_error` is "DB rejected the SQL", whereas this is
+    /// gateway-side policy denial. The carried message must include the
+    /// reason so the tool layer can surface the operator-facing reason
+    /// without leaking command values.
+    #[tokio::test]
+    async fn rejected_command_maps_to_forbidden_not_sql() {
+        let s = server_for("localhost", 27017, Tls::Insecure);
+        let d = database_for("app", "the_user", "pw");
+        let adapter = MongoAdapter::open(&s, &d).await.expect("client constructs");
+
+        // `$where` is a denied operator at any depth; the rejector returns
+        // `DisallowedOperator("$where")`.
+        let query = ExecQuery {
+            sql: r#"{"find":"users","filter":{"$where":"true"}}"#,
+            binds: &[],
+            statement_timeout_ms: None,
+            row_limit: 10,
+        };
+        let err = adapter
+            .execute(query)
+            .await
+            .expect_err("denied command must error");
+        match err {
+            ExecError::Forbidden(reason) => assert!(
+                reason.contains("$where"),
+                "reason must name the denied operator, got: {reason}"
+            ),
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
     }
 }
