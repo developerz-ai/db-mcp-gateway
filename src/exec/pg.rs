@@ -128,7 +128,11 @@ fn build_connect_options(server: &Server, database: &Database, password: &str) -
 /// `ConfigFile::resolve_secrets` already failed fast on every unresolvable
 /// ref — but pools are opened lazily, so a `${FILE:…}` mount that disappears
 /// after boot (rotation gone wrong) still needs a structured error here.
-fn resolve_password(password: &Password) -> Result<String, ExecError> {
+///
+/// Visible to sibling adapters (`mongo::MongoAdapter::open`) — the
+/// resolution rules are identical regardless of backend, and the
+/// `ExecError` mapping is the same in every call site.
+pub(super) fn resolve_password(password: &Password) -> Result<String, ExecError> {
     use crate::config::SecretError;
     password.resolve().map_err(|err| match err {
         SecretError::EnvNotSet(name) | SecretError::EnvNotUtf8(name) => {

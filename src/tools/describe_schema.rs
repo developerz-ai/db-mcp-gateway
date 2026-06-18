@@ -254,9 +254,9 @@ fn outcome_from_exec_error(id: Value, err: ExecError, started: Instant) -> Outco
             ("unavailable", "target database is unreachable")
         }
         ExecError::Sql => ("syntax_error", "catalog query was rejected"),
-        ExecError::PasswordUnresolved { .. } | ExecError::UnsupportedAdapter(_) => {
-            ("internal", "server-side configuration error")
-        }
+        ExecError::PasswordUnresolved { .. }
+        | ExecError::UnsupportedAdapter(_)
+        | ExecError::NotImplemented { .. } => ("internal", "server-side configuration error"),
     };
     let mut outcome = error_outcome(id, code, message);
     outcome.elapsed_ms = Some(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));

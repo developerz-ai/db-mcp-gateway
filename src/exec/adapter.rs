@@ -20,6 +20,7 @@ use crate::config::ServerKind;
 #[serde(rename_all = "lowercase")]
 pub enum AdapterKind {
     Postgres,
+    Mongo,
 }
 
 /// A single query against the adapter. `binds` are positional text values
@@ -69,11 +70,23 @@ pub enum ExecError {
     },
 
     /// The configured `server.kind` has no adapter wired in yet. Today this
-    /// covers `mysql` / `mssql` (and `mongo` until #57 lands). The error
-    /// carries the `ServerKind` so operators can read the boot-time log and
-    /// the corresponding YAML stanza without a second lookup.
+    /// covers `mysql` / `mssql`. The error carries the `ServerKind` so
+    /// operators can read the boot-time log and the corresponding YAML
+    /// stanza without a second lookup.
     #[error("no adapter is registered for server kind `{0:?}`")]
     UnsupportedAdapter(ServerKind),
+
+    /// The adapter is registered but the requested operation is not yet
+    /// implemented. Today this fires only on `MongoAdapter::execute` — the
+    /// scaffold from #57 runs the read-only rejector but defers actual
+    /// query execution to #58. The error carries the responsible
+    /// `AdapterKind` and the operation name so operators see exactly which
+    /// gap was hit.
+    #[error("adapter `{adapter:?}` has not implemented `{op}` yet")]
+    NotImplemented {
+        adapter: AdapterKind,
+        op: &'static str,
+    },
 }
 
 /// Per-`(server, database)` storage adapter. One instance per logical DB —
