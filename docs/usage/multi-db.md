@@ -143,7 +143,7 @@ Pinned by `tests/audit_dispatch_cancellation_real_db.rs`.
 Same envelope as pg. Two mongo-specific fields:
 
 - `db_type = "mongo"` (column added in migration 0007).
-- `sql` carries the BSON command as JSON text — the same string the agent sent. Future redaction policy (spec 07 §"SQL capture") will apply equivalently to both backends; today the full command is stored.
+- `sql` carries the BSON command as JSON text — the same string the agent sent. Future redaction policy (spec 07 § SQL capture policies) will apply equivalently to both backends; today the full command is stored.
 
 ```sql
 -- "Show me all mongo activity in the last hour"

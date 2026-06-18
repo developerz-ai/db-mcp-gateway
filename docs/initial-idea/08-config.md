@@ -70,6 +70,15 @@ permissions:
           statement_timeout_ms: 5000
           row_limit: 1000
 
+# Optional. Absent ⇒ /admin/v1/* returns 404, YAML-only permissions path.
+admin:
+  enabled: true
+  group: db-admins           # SSO group claim authorising admin calls
+
+# Optional. Absent ⇒ pg (state DB) backs users/databases/grants.
+permissions_store:
+  driver: pg                 # or 'mysql' — see boot-gate below
+
 logging:
   hot_retention_days: 90
   archive:
@@ -96,6 +105,8 @@ logging:
 - Every `permissions[*].grants[*].server` / `database` must exist in `servers`, or be the literal `"*"`.
 - Every server's `tls` must be `required` when `env: production` unless explicitly `tls: insecure` (which logs a warning every minute).
 - Role names must match `^[a-zA-Z_][a-zA-Z0-9_]*$`. Catch typos before they become connection failures.
+- `admin.enabled` defaults to `false` — absent or false leaves `/admin/v1/*` unmounted (404). When `enabled: true`, `admin.group` is required and must be non-empty/non-whitespace, else boot aborts (every authenticated caller would otherwise be an admin). Full surface in [12-dynamic-permissions.md](12-dynamic-permissions.md).
+- `permissions_store.driver: mysql` combined with `admin.enabled: true` is rejected at boot — admin handlers are pg-only today. Use `driver: pg` (the default when the block is absent) for the admin path, or `mysql` with YAML grants only.
 
 ## Hot reload
 
