@@ -89,6 +89,12 @@ impl DbAdapter for PgAdapter {
                 Err(_elapsed) => Err(ExecError::Timeout),
             }
         } else {
+            // `None` is the spec-06 "no constraint from this side" — every
+            // matching grant declined to cap. Policy lives in authz: tightening
+            // this into a gateway-wide floor belongs in `authz::effective`
+            // (so YAML and DB grants both flow through the same merge) rather
+            // than buried in the per-adapter path. Until then, the read-only
+            // role + row cap remain the bounds; this fall-through is deliberate.
             run_query_inner(&self.pool, &query).await
         }
     }

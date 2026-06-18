@@ -33,7 +33,8 @@ pub struct AppState {
     /// Loaded `servers:` + `permissions:` from the YAML config. Empty when
     /// tests don't care about tool dispatch.
     pub config: Arc<ConfigFile>,
-    /// Per-`(server, database)` target Postgres pools. Lazy.
+    /// Per-`(server, database)` `DbAdapter` registry. Lazy; opens the
+    /// backend-specific adapter (today only `PgAdapter`) on first use.
     pub adapter_registry: AdapterRegistry,
     /// Gateway's own state DB. Tools that audit (`run_query`) need it; tests
     /// that only exercise the wire protocol leave it `None`.
