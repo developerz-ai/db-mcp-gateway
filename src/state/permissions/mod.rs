@@ -9,6 +9,7 @@
 //! Surface is kept minimal: dumb CRUD only. Wildcard expansion, YAML/DB merge,
 //! and constraint reconciliation all live one layer up in the resolver.
 
+pub mod mysql;
 pub mod pg;
 
 use async_trait::async_trait;

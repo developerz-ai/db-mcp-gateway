@@ -82,8 +82,38 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = ShutdownFlag::new();
     let sessions = SessionStore::new(state_db.clone());
     let oidc = OidcClient::new(auth_config.clone())?;
+    // Spec 12 §"Storage backends" / #59: pick the permissions repo based on
+    // YAML config. Default (None) is the pg path — the permissions tables
+    // live in the same state DB as sessions / audit_calls. Mysql opens a
+    // separate pool keyed by `PERMISSIONS_DB_DSN`.
     let permissions_repo: std::sync::Arc<dyn db_mcp_gateway::state::permissions::PermissionsRepo> =
-        Arc::new(PgPermissionsRepo::new(state_db.clone()));
+        match config_file
+            .permissions_store
+            .as_ref()
+            .map(|s| s.driver)
+            .unwrap_or(db_mcp_gateway::config::PermissionsStoreDriver::Pg)
+        {
+            db_mcp_gateway::config::PermissionsStoreDriver::Pg => {
+                Arc::new(PgPermissionsRepo::new(state_db.clone()))
+            }
+            db_mcp_gateway::config::PermissionsStoreDriver::Mysql => {
+                let dsn = std::env::var("PERMISSIONS_DB_DSN").map_err(|_| {
+                    anyhow::anyhow!(
+                        "permissions_store.driver = mysql requires PERMISSIONS_DB_DSN env"
+                    )
+                })?;
+                let pool = db_mcp_gateway::state::connect_permissions_mysql(
+                    &dsn,
+                    config.state_db.pool_size,
+                )
+                .await?;
+                tracing::info!(
+                    pool_size = config.state_db.pool_size,
+                    "mysql permissions store connected, migrations applied"
+                );
+                Arc::new(db_mcp_gateway::state::permissions::mysql::MysqlPermissionsRepo::new(pool))
+            }
+        };
     let permissions_cache = PermissionsCache::new(
         permissions_repo.clone(),
         std::time::Duration::from_secs(config.permissions_cache_ttl_seconds),
