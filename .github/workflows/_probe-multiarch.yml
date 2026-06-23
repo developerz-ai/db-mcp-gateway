@@ -1,0 +1,97 @@
+name: _probe-multiarch
+
+# TEMPORARY — pre-merge validation of the native arm64 matrix in ci.yml/release.yml.
+# Runs the real image build on both native runners to a scratch tag, merges, and
+# inspects (must show linux/amd64 + linux/arm64). Proves the `-2404-arm` runner
+# label resolves and the digest→manifest mechanics work before the real build job
+# (which is gated to push-on-main and so can't run on a PR). DELETE before the PR
+# is finalized; also delete the scratch `:ci-probe` tag from GHCR.
+on:
+  push:
+    branches: ["ci/native-arm64-runners"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: blacksmith-2vcpu-ubuntu-2404
+          - platform: linux/arm64
+            runner: blacksmith-2vcpu-ubuntu-2404-arm
+    steps:
+      - name: runner identity
+        run: 'echo "runner=${{ matrix.runner }} kernel-arch=$(uname -m)"'
+      - name: prepare platform pair
+        run: |
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: log in to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build & push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=probe-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=probe-${{ env.PLATFORM_PAIR }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+      - name: export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+      - name: upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [build]
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: probe-digests-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - name: log in to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: create scratch manifest list & push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create -t "ghcr.io/${{ github.repository }}:ci-probe" \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+      - name: inspect (expect linux/amd64 + linux/arm64)
+        run: docker buildx imagetools inspect "ghcr.io/${{ github.repository }}:ci-probe"
