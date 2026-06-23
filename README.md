@@ -29,7 +29,7 @@ Your team deploys it once. Developers add one URL to their AI agent's MCP config
 
 ## 🚧 Status
 
-**Phase 0 — skeleton.** Repo bootstrapped, docs describe the target, CI green. Implementation lands per `docs/initial-idea/11-roadmap.md`. Not yet a thing you can `docker pull` and use.
+**v0.1.0 — first public release.** In production use. Pull it: `docker pull ghcr.io/developerz-ai/db-mcp-gateway:0.1.0` — multi-arch (`linux/amd64`, `linux/arm64`). Targets: PostgreSQL and MongoDB (MySQL/MSSQL config parses but isn't dispatchable yet). Pre-1.0, so a minor release may change the config schema, MCP tool surface, or audit log shape — see [`docs/deployment/releasing.md`](docs/deployment/releasing.md) for the compatibility policy.
 
 ---
 
