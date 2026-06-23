@@ -40,7 +40,7 @@ jobs:
         run: |
           platform="${{ matrix.platform }}"
           echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # Build context is `.`; keep the checkout token out of the build
           # workspace (matches ci.yml's image-publish checkout).
@@ -129,7 +129,13 @@ jobs:
     timeout-minutes: 15
     needs: [merge]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - name: derive image version
+        id: ver
+        # Tag is vX.Y.Z; the published image tags drop the leading v
+        # (docker/metadata-action semver pattern), so strip it for the body —
+        # otherwise the notes point at ghcr...:vX.Y.Z, which does not exist.
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       - name: create github release
         uses: softprops/action-gh-release@v2
         with:
@@ -138,7 +144,7 @@ jobs:
             Container images for this release are published to GitHub Container Registry:
 
             ```
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.version }}
             ```
 
             See `docs/deployment/quickstart.md` for setup.
