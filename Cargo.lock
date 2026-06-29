@@ -647,12 +647,13 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "db-mcp-gateway"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "axum",
  "axum-server",
+ "base64",
  "chrono",
  "clap",
  "futures",
@@ -668,6 +669,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "sqlparser",
  "sqlx",
  "tempfile",

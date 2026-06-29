@@ -1,6 +1,6 @@
 [package]
 name = "db-mcp-gateway"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Self-hosted MCP gateway for credentialled, audited, read-only database access by AI agents"
@@ -49,6 +49,10 @@ mongodb = { version = "3.7", default-features = false, features = ["rustls-tls-a
 jsonwebtoken = "9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 url = "2"
+# PKCE S256 for the MCP OAuth bridge: base64url-no-pad(sha256(verifier))
+# compared against the client's code_challenge.
+sha2 = "0.10"
+base64 = "0.22"
 
 # errors + tracing
 thiserror = "2"

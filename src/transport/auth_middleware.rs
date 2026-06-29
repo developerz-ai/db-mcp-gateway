@@ -7,8 +7,8 @@
 
 use axum::Json;
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
+use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
@@ -17,6 +17,7 @@ use crate::auth::{AuthError, Identity, SessionId, SessionStore, jwt};
 
 use super::app_state::{AppState, AuthFacade};
 use super::auth_routes::{LOGIN_URL, auth_error_fields};
+use super::oauth;
 
 pub async fn bearer_auth(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     let Some(auth) = state.auth.as_ref() else {
@@ -27,12 +28,12 @@ pub async fn bearer_auth(State(state): State<AppState>, mut req: Request, next: 
 
     let token = match bearer_token(&req) {
         Ok(t) => t.to_string(),
-        Err(err) => return unauthorized(err),
+        Err(err) => return unauthorized(&state, &req, err),
     };
 
     let identity = match resolve_identity(auth, &token).await {
         Ok(id) => id,
-        Err(err) => return unauthorized(err),
+        Err(err) => return unauthorized(&state, &req, err),
     };
 
     tracing::debug!(user_sub = %identity.user_sub, session = ?identity.session_id, "request authenticated");
@@ -62,7 +63,7 @@ async fn lookup(sessions: &SessionStore, id: SessionId) -> Result<Identity, Auth
     sessions.lookup(id).await
 }
 
-fn unauthorized(err: AuthError) -> Response {
+fn unauthorized(state: &AppState, req: &Request, err: AuthError) -> Response {
     // Only the typed reason — never embed the token or the underlying error
     // string. `login_url` is stable; agents redirect users there.
     let (category, code) = auth_error_fields(&err);
@@ -70,5 +71,19 @@ fn unauthorized(err: AuthError) -> Response {
         "error": { "category": category, "code": code },
         "login_url": LOGIN_URL,
     });
-    (StatusCode::UNAUTHORIZED, Json(body)).into_response()
+    let mut response = (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+    // RFC 9728 §5.1 / MCP Authorization spec: point spec-compliant clients at
+    // the protected-resource metadata so they can discover the authorization
+    // server and run the OAuth flow. Without this header, a client like Claude
+    // Code falls back to probing `/.well-known/*` blindly and reports an
+    // opaque discovery error on the 404s.
+    let base = oauth::base_url(state, req.headers());
+    let www = format!(
+        "Bearer resource_metadata=\"{}\"",
+        oauth::resource_metadata_url(&base)
+    );
+    if let Ok(value) = HeaderValue::from_str(&www) {
+        response.headers_mut().insert(WWW_AUTHENTICATE, value);
+    }
+    response
 }

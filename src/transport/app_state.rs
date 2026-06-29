@@ -54,6 +54,10 @@ pub struct AppState {
     /// its own clone so cache-only paths don't need the repo in `AppState`.
     /// `None` in tests that don't exercise the admin surface.
     pub permissions_repo: Option<Arc<dyn PermissionsRepo>>,
+    /// The path the MCP endpoint is mounted at (e.g. `/mcp`), copied from the
+    /// runtime `Config`. The OAuth metadata handlers need it to advertise the
+    /// canonical resource URI (`<base><mcp_path>`) per RFC 8707.
+    pub mcp_path: Arc<str>,
 }
 
 impl AppState {
@@ -75,6 +79,7 @@ impl AppState {
             metrics: None,
             permissions_cache: None,
             permissions_repo: None,
+            mcp_path: Arc::from("/mcp"),
         }
     }
 }
@@ -85,6 +90,26 @@ pub struct AuthFacade {
     pub sessions: SessionStore,
     pub oidc: OidcClient,
     pub flows: PendingFlows,
+    /// One-time authorization codes minted by the MCP OAuth bridge
+    /// (`/authorize` → IdP → `/auth/callback` → here), redeemed at `/token`.
+    /// Unused by the bespoke `/auth/login` JSON flow.
+    pub codes: AuthCodes,
+}
+
+/// Context an MCP OAuth-bridge `/authorize` request stashes across the IdP
+/// round-trip. Recovered at `/auth/callback` (keyed by the OIDC `state`) so the
+/// gateway can mint an authorization code and 302 back to the *client's* own
+/// redirect URI — the loopback Claude Code listens on.
+#[derive(Debug, Clone)]
+pub struct OAuthBridge {
+    /// The MCP client's registered redirect URI (loopback or https).
+    pub client_redirect_uri: String,
+    /// The MCP client's `state` — echoed back verbatim on the final redirect.
+    pub client_state: String,
+    /// PKCE challenge (S256). Verified against `code_verifier` at `/token`.
+    pub code_challenge: String,
+    /// RFC 8707 `resource` the client bound the request to (audit/diagnostics).
+    pub resource: Option<String>,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -93,33 +118,108 @@ pub struct PendingFlows {
 }
 
 #[derive(Debug, Clone)]
-struct PendingFlow {
-    nonce: String,
+pub struct PendingFlow {
+    pub nonce: String,
+    /// `Some` for an MCP OAuth-bridge login; `None` for the bespoke
+    /// `/auth/login` flow that returns the session token as JSON.
+    pub bridge: Option<OAuthBridge>,
     expires_at: Instant,
 }
 
 impl PendingFlows {
     pub async fn insert(&self, state: String, nonce: String) {
+        self.insert_flow(state, nonce, None).await;
+    }
+
+    /// Insert a flow carrying MCP OAuth-bridge context (the client redirect /
+    /// state / PKCE challenge to honor once the IdP round-trip completes).
+    pub async fn insert_bridge(&self, state: String, nonce: String, bridge: OAuthBridge) {
+        self.insert_flow(state, nonce, Some(bridge)).await;
+    }
+
+    async fn insert_flow(&self, state: String, nonce: String, bridge: Option<OAuthBridge>) {
         let mut map = self.inner.lock().await;
         Self::gc(&mut map);
         map.insert(
             state,
             PendingFlow {
                 nonce,
+                bridge,
                 expires_at: Instant::now() + FLOW_TTL,
             },
         );
     }
 
-    /// Remove and return the nonce for a given state, if still live.
-    pub async fn take(&self, state: &str) -> Option<String> {
+    /// Remove and return the pending flow for a given state, if still live.
+    pub async fn take(&self, state: &str) -> Option<PendingFlow> {
         let mut map = self.inner.lock().await;
         Self::gc(&mut map);
-        map.remove(state).map(|flow| flow.nonce)
+        map.remove(state)
     }
 
     fn gc(map: &mut HashMap<String, PendingFlow>) {
         let now = Instant::now();
         map.retain(|_, flow| flow.expires_at > now);
+    }
+}
+
+/// TTL for a minted authorization code. Codes are one-time and redeemed
+/// immediately by the client, so this is deliberately tight (OAuth 2.1
+/// recommends ≤ 10 min; we use 1).
+const CODE_TTL: Duration = Duration::from_secs(60);
+
+/// One-time authorization codes for the MCP OAuth bridge. A code maps to the
+/// already-issued session bearer plus the PKCE challenge to verify at `/token`.
+#[derive(Clone, Default, Debug)]
+pub struct AuthCodes {
+    inner: Arc<Mutex<HashMap<String, AuthCode>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthCode {
+    /// The gateway session JWT handed back as the OAuth `access_token`.
+    pub access_token: String,
+    /// Seconds until the session expires — surfaced as `expires_in`.
+    pub expires_in_seconds: u64,
+    /// PKCE S256 challenge the redeeming `code_verifier` must satisfy.
+    pub code_challenge: String,
+    /// Redirect URI from `/authorize`; `/token` must present the same value.
+    pub redirect_uri: String,
+    expires_at: Instant,
+}
+
+impl AuthCodes {
+    pub async fn insert(
+        &self,
+        code: String,
+        access_token: String,
+        expires_in_seconds: u64,
+        code_challenge: String,
+        redirect_uri: String,
+    ) {
+        let mut map = self.inner.lock().await;
+        Self::gc(&mut map);
+        map.insert(
+            code,
+            AuthCode {
+                access_token,
+                expires_in_seconds,
+                code_challenge,
+                redirect_uri,
+                expires_at: Instant::now() + CODE_TTL,
+            },
+        );
+    }
+
+    /// Remove and return a code (one-time use), if still live.
+    pub async fn take(&self, code: &str) -> Option<AuthCode> {
+        let mut map = self.inner.lock().await;
+        Self::gc(&mut map);
+        map.remove(code)
+    }
+
+    fn gc(map: &mut HashMap<String, AuthCode>) {
+        let now = Instant::now();
+        map.retain(|_, code| code.expires_at > now);
     }
 }

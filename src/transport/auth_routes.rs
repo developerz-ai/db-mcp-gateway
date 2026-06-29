@@ -7,7 +7,7 @@
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::auth::{AuthError, Identity, jwt};
 
 use super::app_state::AppState;
+use super::oauth;
 
 #[derive(Debug, Serialize)]
 pub struct LoginResponse {
@@ -49,16 +50,32 @@ pub struct CallbackResponse {
 pub async fn callback(
     State(state): State<AppState>,
     Query(params): Query<CallbackParams>,
-) -> Result<Json<CallbackResponse>, AuthError> {
-    let auth = state.auth.as_ref().ok_or(AuthError::Discovery)?;
-    let nonce = auth
-        .flows
-        .take(&params.state)
-        .await
-        .ok_or(AuthError::InvalidState)?;
+) -> Response {
+    let Some(auth) = state.auth.as_ref() else {
+        return AuthError::Discovery.into_response();
+    };
+    let Some(flow) = auth.flows.take(&params.state).await else {
+        return AuthError::InvalidState.into_response();
+    };
 
-    let verified = auth.oidc.exchange_and_verify(&params.code, &nonce).await?;
-    let session = auth
+    // MCP OAuth-bridge login (`/authorize` initiated it): hand off so the
+    // gateway mints an authorization code and 302s back to the client's
+    // loopback redirect instead of returning the token as JSON.
+    if let Some(bridge) = flow.bridge {
+        return oauth::complete_bridge_login(&state, bridge, &params.code, &flow.nonce).await;
+    }
+
+    // Bespoke flow: the agent POSTed `/auth/login` and polls here for the
+    // session token as JSON.
+    let verified = match auth
+        .oidc
+        .exchange_and_verify(&params.code, &flow.nonce)
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => return err.into_response(),
+    };
+    let session = match auth
         .sessions
         .create(
             &verified.sub,
@@ -67,17 +84,25 @@ pub async fn callback(
             auth.config.session_ttl,
             None,
         )
-        .await?;
-    let token = jwt::issue(
+        .await
+    {
+        Ok(s) => s,
+        Err(err) => return err.into_response(),
+    };
+    let token = match jwt::issue(
         &auth.config.session_signing_key,
         session.id,
         &verified.sub,
         auth.config.session_ttl,
-    )?;
-    Ok(Json(CallbackResponse {
+    ) {
+        Ok(t) => t,
+        Err(err) => return err.into_response(),
+    };
+    Json(CallbackResponse {
         session_token: token,
         expires_in_seconds: auth.config.session_ttl.as_secs(),
-    }))
+    })
+    .into_response()
 }
 
 pub async fn logout(

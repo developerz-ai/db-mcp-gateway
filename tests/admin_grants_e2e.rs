@@ -178,6 +178,7 @@ async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
                 sessions: sessions.clone(),
                 oidc,
                 flows: PendingFlows::default(),
+                codes: db_mcp_gateway::transport::AuthCodes::default(),
             }),
             config: Arc::new(config_file),
             adapter_registry: AdapterRegistry::new(),
@@ -186,6 +187,7 @@ async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
             metrics: None,
             permissions_cache: Some(cache.clone()),
             permissions_repo: Some(repo.clone()),
+            mcp_path: std::sync::Arc::from("/mcp"),
         },
     )
     .expect("router builds");

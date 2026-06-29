@@ -92,6 +92,7 @@ async fn boot_gateway() -> BootedGateway {
                 sessions,
                 oidc,
                 flows: PendingFlows::default(),
+                codes: db_mcp_gateway::transport::AuthCodes::default(),
             }),
             config: Arc::new(config_file),
             state_db: Some(pool.clone()),
@@ -100,6 +101,7 @@ async fn boot_gateway() -> BootedGateway {
             metrics: None,
             permissions_cache: None,
             permissions_repo: None,
+            mcp_path: std::sync::Arc::from("/mcp"),
         },
     )
     .expect("router builds");

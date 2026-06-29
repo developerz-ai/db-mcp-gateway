@@ -16,6 +16,7 @@ pub mod tls;
 mod auth_middleware;
 mod auth_routes;
 mod dispatch;
+mod oauth;
 mod sse;
 
 use std::net::SocketAddr;
@@ -30,7 +31,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde_json::Value;
 
-pub use app_state::{AppState, AuthFacade, PendingFlows};
+pub use app_state::{AppState, AuthCodes, AuthFacade, PendingFlows};
 pub use errors::TransportError;
 
 use crate::auth::Identity;
@@ -56,10 +57,35 @@ pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError
             auth_middleware::bearer_auth,
         ));
 
+    // RFC 9728 §3.1: clients may key the protected-resource metadata by the
+    // resource's path, so serve it at both the bare well-known and the
+    // `mcp_path`-suffixed well-known (e.g. `/.well-known/oauth-protected-resource/mcp`).
+    let prm_suffixed = format!("/.well-known/oauth-protected-resource{path}");
+
     let open = Router::new()
         .route(&path, get(sse::handler))
         .route("/auth/login", post(auth_routes::login))
         .route("/auth/callback", get(auth_routes::callback))
+        // MCP OAuth bridge (RFC 9728 / 8414 / 7591 + PKCE). These let
+        // spec-compliant clients (Claude Code, …) discover + complete OAuth
+        // with no manual credential wiring. See `transport::oauth`.
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth::protected_resource_metadata),
+        )
+        .route(&prm_suffixed, get(oauth::protected_resource_metadata))
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth::authorization_server_metadata),
+        )
+        // Alias for clients that only probe OIDC discovery.
+        .route(
+            "/.well-known/openid-configuration",
+            get(oauth::authorization_server_metadata),
+        )
+        .route("/authorize", get(oauth::authorize))
+        .route("/token", post(oauth::token))
+        .route("/register", post(oauth::register))
         // Ops endpoints: k8s probes + Prometheus scraper. Unauthenticated by
         // design — probes don't carry a bearer, and exposed bodies are
         // generic strings + Prometheus exposition only (no DB internals).

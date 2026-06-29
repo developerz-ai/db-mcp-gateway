@@ -192,6 +192,18 @@ In your IdP, create an OIDC app for the gateway:
 
 Note the `client_id` and `client_secret`.
 
+> **MCP OAuth — what a reverse proxy / WAF must allow.** Since v0.2.0 the
+> gateway speaks the MCP Authorization spec (OAuth 2.1 + PKCE) so clients like
+> Claude Code authenticate with no manual credential wiring: a `401` on `/mcp`
+> carries a `WWW-Authenticate` header, and the client discovers + completes the
+> flow against endpoints the gateway serves itself. If you front the gateway
+> with a proxy or WAF, these **unauthenticated** paths must reach it:
+> `/.well-known/oauth-protected-resource` (+ the `<mcp_path>`-suffixed variant),
+> `/.well-known/oauth-authorization-server`, `/.well-known/openid-configuration`,
+> `GET /authorize`, `POST /token`, and `POST /register`. The gateway is the
+> authorization server — it brokers the IdP login internally, so do **not** put
+> a second OAuth/SSO layer (e.g. an access proxy) in front of `/mcp`.
+
 ## 3. Configure the gateway
 
 Drop `config.yml` somewhere — full target shape below. **Heads-up:** the running binary reads only `servers:` and `permissions:` from this file; the `gateway:` / `auth:` / `logging:` blocks shown here are the planned shape but are accepted-but-ignored today and come from environment variables (see the env table above). Unknown keys *inside* `servers`/`databases`/`permissions`/`grants`/`constraints` abort boot ([#16](https://github.com/developerz-ai/db-mcp-gateway/issues/16)). `databases[*].password` accepts `${ENV:NAME}`, `${FILE:/path}`, or a `vault:`/`aws-sm:`/`gcp-sm:` ref — all resolved at boot.
