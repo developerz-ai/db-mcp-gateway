@@ -36,7 +36,7 @@ use serde_json::Value;
 pub use app_state::{AppState, AuthFacade};
 pub use client_registry::ClientRegistry;
 pub use errors::TransportError;
-pub use oauth_state::{AuthCodes, PendingFlows, RefreshTokens};
+pub use oauth_state::{AuthCodes, GrantIdentity, PendingFlows, RefreshTokens};
 
 use crate::auth::Identity;
 use crate::config::Config;
