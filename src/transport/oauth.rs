@@ -543,8 +543,11 @@ async fn token_refresh(auth: &AuthFacade, form: TokenForm) -> Response {
         );
     };
     // Carry the chain's original birth time so rotation renews the token value
-    // but never extends the absolute TTL (the chain still dies REFRESH_TTL after
-    // the first mint, forcing a fresh `/authorize` login).
+    // but never extends the absolute TTL. `entry.identity` (groups included) is
+    // the one frozen at the original browser login, so this same cap also bounds
+    // how long a since-revoked group keeps minting sessions (O3b): the chain dies
+    // REFRESH_TTL after the first mint, forcing a fresh `/authorize` that
+    // re-reads groups from the IdP.
     let issued_at = entry.issued_at;
     issue_token_response(auth, entry.identity, Some(issued_at)).await
 }

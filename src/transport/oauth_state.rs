@@ -190,11 +190,33 @@ impl AuthCodes {
 }
 
 /// Absolute lifetime of a refresh-token *chain*, measured from the first token's
-/// mint and **never extended by rotation**. Long enough that a developer rarely
-/// re-does the browser login, short enough to bound a leaked (and silently
-/// rotated) chain's usefulness — without this cap, a continuously rotated chain
-/// would live forever.
-const REFRESH_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
+/// mint and **never extended by rotation**. Three constraints set it; the
+/// tightest wins:
+///
+/// 1. **Stale groups (O3b).** A refresh re-mints a session from the IdP identity
+///    frozen at the *original* browser login ([`GrantIdentity`], groups
+///    included), so a group change at the IdP (off-boarding, role downgrade)
+///    can't reach the gateway while the chain lives. This cap is that staleness
+///    window: once it elapses, silent refresh stops and a fresh `/authorize`
+///    login re-reads `groups`. Keep it below the org's group-review /
+///    deprovisioning cadence.
+/// 2. Bounds a leaked (and silently rotated) chain's usefulness.
+/// 3. Without any cap, a continuously rotated chain would live forever.
+///
+/// One day: spans a working day of silent renewals, yet a revoked group reaches
+/// the gateway within an operational window. The fuller fix — re-validating the
+/// identity against the IdP on every refresh — needs an IdP refresh token
+/// (`offline_access`) the bridge doesn't currently hold, and is deferred; see
+/// `docs/initial-idea/04-auth-sso.md`.
+const REFRESH_TTL: Duration = Duration::from_secs(24 * 3600);
+
+/// Whether a refresh chain born at `issued_at` has reached [`REFRESH_TTL`] as of
+/// `now`. A pure boundary so the absolute cap is unit-testable without sleeping
+/// a day or building a past `Instant` (`Instant - Duration` can underflow the
+/// monotonic clock on a freshly-booted process). `saturating_*` never panics.
+fn chain_expired(issued_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(issued_at) >= REFRESH_TTL
+}
 
 /// Refresh-token store: hashed token → the verified identity it renews. Rotated
 /// on every redemption (the old token is removed, a new one issued), per OAuth
@@ -249,7 +271,7 @@ impl RefreshTokens {
 
     fn gc(map: &mut HashMap<[u8; 32], RefreshToken>) {
         let now = Instant::now();
-        map.retain(|_, t| t.issued_at + REFRESH_TTL > now);
+        map.retain(|_, t| !chain_expired(t.issued_at, now));
     }
 }
 
@@ -305,6 +327,45 @@ mod tests {
         let after = Instant::now();
         let fresh = store.take("fresh").await.expect("token is live");
         assert!(fresh.issued_at >= before && fresh.issued_at <= after);
+    }
+
+    #[test]
+    fn refresh_chain_ttl_bounds_group_staleness_within_a_day() {
+        // O3b: the chain's `groups` are frozen at the original login, so
+        // REFRESH_TTL is the worst-case window a since-revoked group keeps
+        // minting sessions. Guard against a regression back to a multi-week cap.
+        assert!(REFRESH_TTL <= Duration::from_secs(24 * 3600));
+    }
+
+    #[test]
+    fn chain_is_dead_once_it_reaches_the_absolute_ttl() {
+        // Offset off a single base instant so the future `now` never underflows
+        // the monotonic clock on a young process.
+        let born = Instant::now();
+        assert!(!chain_expired(born, born), "a fresh chain is live");
+        assert!(
+            !chain_expired(born, born + REFRESH_TTL - Duration::from_secs(1)),
+            "inside the window the chain still renews"
+        );
+        assert!(
+            chain_expired(born, born + REFRESH_TTL),
+            "at the cap the chain is dead — no more stale-group minting"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_refresh_chain_is_gc_dropped_and_not_returned() {
+        let store = RefreshTokens::default();
+        // Born a full TTL ago → already past the cap. checked_sub guards the
+        // (theoretical) young-clock underflow; skip rather than panic if so.
+        let Some(stale_birth) = Instant::now().checked_sub(REFRESH_TTL) else {
+            return;
+        };
+        store.insert_rotated("stale", identity(), stale_birth).await;
+        assert!(
+            store.take("stale").await.is_none(),
+            "a chain at/over REFRESH_TTL must not renew"
+        );
     }
 
     #[tokio::test]

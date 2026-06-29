@@ -125,7 +125,7 @@ The code is consumed on first use (replay → `invalid_grant`).
 
 Refresh tokens rotate: presenting one consumes it and a new pair is returned. A replayed (already-rotated) token → `invalid_grant`.
 
-Rotation does **not** extend the token's lifetime. A chain has an **absolute TTL** (30 days) measured from the *first* token's mint; the original `issued_at` is carried verbatim through every rotation, so a continuously refreshed chain still expires on schedule and forces a fresh `/authorize` login. Refresh tokens (and the short-lived authorization codes) are stored **hashed** (SHA-256) — the in-memory store holds only digests, so a memory dump or a stray log of flow state can't be replayed as a live token.
+Rotation does **not** extend the token's lifetime. A chain has an **absolute TTL** (24 hours) measured from the *first* token's mint; the original `issued_at` is carried verbatim through every rotation, so a continuously refreshed chain still expires on schedule and forces a fresh `/authorize` login. The cap is deliberately short because a refresh re-mints the session from the IdP identity — **groups included** — that was frozen at the original login; until the chain dies, a group change at the IdP (off-boarding, role downgrade) can't reach the gateway. One day keeps that staleness within a normal deprovisioning window while still spanning a working day of silent renewals. (Re-validating the identity against the IdP on each refresh would lift the cap but needs an IdP refresh token / `offline_access` the bridge doesn't yet hold — deferred.) Refresh tokens (and the short-lived authorization codes) are stored **hashed** (SHA-256) — the in-memory store holds only digests, so a memory dump or a stray log of flow state can't be replayed as a live token.
 
 **Token response** (both grant types, `Cache-Control: no-store`):
 
@@ -163,7 +163,7 @@ All MCP OAuth bridge flow state — client registrations, pending IdP round-trip
 - Signed JWT (HS256), gateway-issued — not the IdP's ID token directly; we re-sign so we can revoke.
 - Short TTL (default 8 hours; `expires_in` in the token response reflects the actual value).
 - **Bespoke flow:** refresh by re-running SSO. No long-lived refresh token on the developer's machine.
-- **OAuth bridge flow:** a rotating opaque refresh token is returned at `/token`. Presenting it issues a new access+refresh pair and consumes the old refresh token (replay → `invalid_grant`). Rotation never extends the chain: an absolute 30-day TTL runs from the first token's mint, after which the client must re-authenticate via `/authorize`. Refresh tokens are stored hashed, in-memory, and lost on restart.
+- **OAuth bridge flow:** a rotating opaque refresh token is returned at `/token`. Presenting it issues a new access+refresh pair and consumes the old refresh token (replay → `invalid_grant`). Rotation never extends the chain: an absolute 24-hour TTL runs from the first token's mint, after which the client must re-authenticate via `/authorize`. The cap is short on purpose — refresh re-uses the groups frozen at login, so it doubles as the staleness bound for a revoked group (see the `/token` section above). Refresh tokens are stored hashed, in-memory, and lost on restart.
 - Revocation: server-side denylist in state DB. Logout writes to the denylist; every request checks.
 
 ## Group resolution
