@@ -6,16 +6,16 @@
 //! The contract: `is_read_only(sql)` parses the SQL with the Postgres
 //! dialect and accepts only:
 //!
-//! - a single `SELECT` (with or without CTEs)
-//! - a single `EXPLAIN` wrapping one of the above
+//! - a single `SELECT` (with or without CTEs), recursively read-only
+//! - a single non-`ANALYZE` `EXPLAIN` wrapping one of the above
 //!
 //! Everything else — multiple statements, `SELECT ... FOR UPDATE/SHARE`,
-//! `INSERT/UPDATE/DELETE/DROP/...`, DDL, `GRANT/REVOKE`, transaction
-//! control, anything we don't recognise — is rejected with a typed error.
-//! Conservative on purpose: better to reject a legitimate exotic SELECT than
-//! quietly allow a write through.
+//! `SELECT ... INTO`, a write hidden in a CTE or subquery, `EXPLAIN ANALYZE`
+//! (which executes), DDL, `GRANT/REVOKE`, transaction control, anything we
+//! don't recognise — is rejected with a typed error. Conservative on purpose:
+//! better to reject a legitimate exotic SELECT than quietly allow a write.
 
-use sqlparser::ast::{Query, Statement};
+use sqlparser::ast::{Query, SetExpr, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
 
@@ -29,6 +29,12 @@ pub enum GuardError {
     NotAllowed(&'static str),
     #[error("SELECT ... FOR UPDATE/SHARE is not allowed (acquires write locks)")]
     Locking,
+    #[error("write statement `{0}` is not allowed inside a read-only query")]
+    WriteInReadPath(&'static str),
+    #[error("SELECT ... INTO is not allowed (it materializes a table)")]
+    SelectInto,
+    #[error("EXPLAIN ANALYZE is not allowed (it executes the query)")]
+    ExplainAnalyze,
 }
 
 pub fn is_read_only(sql: &str) -> Result<(), GuardError> {
@@ -51,6 +57,9 @@ pub fn is_read_only(sql: &str) -> Result<(), GuardError> {
 fn check_statement(stmt: &Statement) -> Result<(), GuardError> {
     match stmt {
         Statement::Query(query) => check_query(query),
+        // EXPLAIN ANALYZE *executes* its target (so it would run a writable CTE),
+        // unlike plain EXPLAIN which only plans — reject it outright.
+        Statement::Explain { analyze: true, .. } => Err(GuardError::ExplainAnalyze),
         Statement::Explain { statement, .. } => check_statement(statement),
         Statement::ExplainTable { .. } => Ok(()), // `\d table` analog; read-only
         // Explicitly call out the families we reject so the error message is
@@ -88,7 +97,29 @@ fn check_query(query: &Query) -> Result<(), GuardError> {
     if !query.locks.is_empty() {
         return Err(GuardError::Locking);
     }
-    Ok(())
+    // A data-modifying CTE (`WITH x AS (INSERT ... RETURNING ...)`) hides the
+    // write behind a SELECT body — walk each CTE's inner query too.
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            check_query(&cte.query)?;
+        }
+    }
+    check_set_expr(&query.body)
+}
+
+fn check_set_expr(body: &SetExpr) -> Result<(), GuardError> {
+    match body {
+        // `SELECT ... INTO new_table` materializes a table — DDL, not a read.
+        SetExpr::Select(select) if select.into.is_some() => Err(GuardError::SelectInto),
+        SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) => Ok(()),
+        SetExpr::Query(inner) => check_query(inner),
+        SetExpr::SetOperation { left, right, .. } => {
+            check_set_expr(left)?;
+            check_set_expr(right)
+        }
+        SetExpr::Insert(_) => Err(GuardError::WriteInReadPath("INSERT")),
+        SetExpr::Update(_) => Err(GuardError::WriteInReadPath("UPDATE")),
+    }
 }
 
 #[cfg(test)]
@@ -140,7 +171,48 @@ mod tests {
     fn explain_wrapping_select_allowed() {
         ok("EXPLAIN SELECT 1");
         ok("EXPLAIN (FORMAT JSON) SELECT * FROM users");
-        ok("EXPLAIN ANALYZE SELECT 1"); // ANALYZE *executes* — gate by audit + ANALYZE is itself a SELECT-shaped run
+    }
+
+    #[test]
+    fn explain_analyze_rejected() {
+        // ANALYZE *executes* the target, so it must not reach the DB — even when
+        // the target is a plain SELECT, and especially for a writable CTE.
+        rejected("EXPLAIN ANALYZE SELECT 1", GuardError::ExplainAnalyze);
+        rejected(
+            "EXPLAIN ANALYZE WITH x AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM x",
+            GuardError::ExplainAnalyze,
+        );
+    }
+
+    #[test]
+    fn writable_cte_rejected() {
+        rejected(
+            "WITH x AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM x",
+            GuardError::WriteInReadPath("INSERT"),
+        );
+        rejected(
+            "WITH x AS (UPDATE t SET a = 1 RETURNING id) SELECT * FROM x",
+            GuardError::WriteInReadPath("UPDATE"),
+        );
+    }
+
+    #[test]
+    fn select_into_rejected() {
+        rejected("SELECT * INTO new_table FROM t", GuardError::SelectInto);
+    }
+
+    #[test]
+    fn write_nested_in_body_rejected() {
+        // Write buried in a parenthesised subquery used as the outer body,
+        // and a write in a CTE nested inside another CTE — both must recurse.
+        rejected(
+            "(WITH x AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM x)",
+            GuardError::WriteInReadPath("INSERT"),
+        );
+        rejected(
+            "WITH a AS (WITH b AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM b) SELECT * FROM a",
+            GuardError::WriteInReadPath("INSERT"),
+        );
     }
 
     #[test]

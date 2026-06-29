@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use jsonwebtoken::{DecodingKey, Validation};
 use serde::Deserialize;
 use tokio::sync::RwLock;
-use url::Url;
+use url::{Host, Url};
 
 use super::config::AuthConfig;
 use super::errors::AuthError;
@@ -91,8 +91,13 @@ impl OidcClient {
         // `Client::new()` is NOT acceptable — that uses the default redirect
         // policy (up to 10 hops in reqwest 0.12) and would silently re-open
         // the very SSRF surface this client is supposed to close.
+        // Bound every IdP round-trip so a hung/slow IdP can't pin a request
+        // task open indefinitely (T3). connect_timeout caps the TCP/TLS dial;
+        // timeout caps the whole request.
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
             .build()
             .map_err(|_| AuthError::HttpClient)?;
         Ok(Self {
@@ -206,6 +211,10 @@ impl OidcClient {
         if let Some(d) = self.discovery.read().await.as_ref() {
             return Ok(d.clone());
         }
+        // The configured issuer must be https (else discovery, code exchange,
+        // and client_secret travel in plaintext — A4). Loopback http is allowed
+        // for local dev / mock IdPs.
+        require_secure_url(&self.config.issuer)?;
         let url = format!(
             "{}/.well-known/openid-configuration",
             self.config.issuer.trim_end_matches('/')
@@ -227,6 +236,13 @@ impl OidcClient {
         if doc.issuer.trim_end_matches('/') != self.config.issuer.trim_end_matches('/') {
             return Err(AuthError::Discovery);
         }
+
+        // A discovery doc can repoint us at http endpoints even when the issuer
+        // is https; reject any non-https (non-loopback) endpoint before we ever
+        // POST the code + client_secret to it (A4).
+        require_secure_url(&doc.authorization_endpoint)?;
+        require_secure_url(&doc.token_endpoint)?;
+        require_secure_url(&doc.jwks_uri)?;
 
         *self.discovery.write().await = Some(doc.clone());
         Ok(doc)
@@ -280,5 +296,48 @@ impl OidcClient {
             fetched_at: Instant::now(),
         });
         Ok(key)
+    }
+}
+
+/// Require an OIDC URL to use `https`, permitting `http` only for loopback
+/// hosts (localhost / 127.0.0.0/8 / ::1) so dev and mock IdPs keep working.
+/// Surfaced as `Discovery` since it gates the discovery / token-exchange URLs.
+fn require_secure_url(raw: &str) -> Result<(), AuthError> {
+    let url = Url::parse(raw).map_err(|_| AuthError::Discovery)?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback(&url) => Ok(()),
+        _ => Err(AuthError::Discovery),
+    }
+}
+
+fn is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn https_url_accepted() {
+        assert!(require_secure_url("https://idp.example.com/").is_ok());
+    }
+
+    #[test]
+    fn http_non_loopback_rejected() {
+        assert!(require_secure_url("http://idp.example.com/").is_err());
+    }
+
+    #[test]
+    fn http_loopback_allowed() {
+        assert!(require_secure_url("http://localhost:8443/").is_ok());
+        assert!(require_secure_url("http://127.0.0.1:8443/").is_ok());
+        assert!(require_secure_url("http://[::1]:8443/").is_ok());
     }
 }

@@ -134,6 +134,17 @@ async fn main() -> anyhow::Result<()> {
         permissions_repo: Some(permissions_repo),
     };
 
+    // Fail closed: a release binary must never serve with auth unwired.
+    // `bearer_auth` deliberately passes through when `state.auth` is `None`
+    // (the test bootstrap relies on it), so the only thing standing between a
+    // wiring regression and an unauthenticated DB-query surface is this guard
+    // on the production serve path. Integration tests build the router via
+    // `transport::router(...)` directly and never reach `main`, so this never
+    // trips them (sec qa 2026-06-29 A2).
+    if app_state.auth.is_none() {
+        anyhow::bail!("refusing to start: AppState.auth is None — auth facade not wired");
+    }
+
     // Spawn the audit retention pruner. Ticks hourly, deletes rows older
     // than `audit_retention_days`. The tokio runtime drops the task on
     // graceful shutdown — DELETE is the only DB call, so cancelling

@@ -8,7 +8,10 @@
 //! 2. The DB-side `statement_timeout` is set via `SET LOCAL` inside the
 //!    per-query transaction, so a single misuse can't outlive its tx. We also
 //!    wrap the query in `tokio::time::timeout` as belt-and-suspenders — if
-//!    the DB ignores `SET LOCAL`, the future still completes.
+//!    the DB ignores `SET LOCAL`, the future still completes. A timeout is
+//!    ALWAYS applied: a grant that declines to cap falls back to the
+//!    gateway ceiling (`DEFAULT_STATEMENT_TIMEOUT_MS`) so no query can pin a
+//!    pool connection indefinitely.
 
 use std::time::{Duration, Instant};
 
@@ -28,6 +31,25 @@ const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Extra slack on top of the DB-side `statement_timeout` so the Tokio guard
 /// doesn't preempt before Postgres has a chance to surface its own cancel.
 const TOKIO_TIMEOUT_SLACK_MS: u64 = 500;
+/// Gateway-wide ceiling on a single query's wall-clock budget. When a grant
+/// declines to set `statement_timeout_ms` (spec-06 "no constraint from this
+/// side"), a query would otherwise run unbounded and pin a pool connection
+/// indefinitely — five such queries starve every other user of this
+/// `(server, database)`. So the gateway always imposes this floor. A grant
+/// may only *tighten* it (most-restrictive-wins): it can never raise the
+/// budget above this ceiling. 30s is generous for an interactive read yet
+/// short enough that a runaway query frees its connection promptly.
+const DEFAULT_STATEMENT_TIMEOUT_MS: u32 = 30_000;
+
+/// Effective per-query timeout in milliseconds. The grant value wins when
+/// present (it may be more restrictive) but is clamped to the gateway
+/// ceiling so it can only tighten, never loosen:
+/// `effective = min(grant.unwrap_or(CEILING), CEILING)`.
+fn effective_timeout_ms(grant: Option<u32>) -> u32 {
+    grant
+        .unwrap_or(DEFAULT_STATEMENT_TIMEOUT_MS)
+        .min(DEFAULT_STATEMENT_TIMEOUT_MS)
+}
 
 /// Per-`(server, database)` Postgres adapter. Wraps a `PgPool`; one instance
 /// per logical DB so a slow query on DB A can never block DB B.
@@ -80,22 +102,18 @@ impl DbAdapter for PgAdapter {
     }
 
     async fn execute(&self, query: ExecQuery<'_>) -> Result<ExecResult, ExecError> {
+        // A timeout is ALWAYS applied: the grant value when present (it may be
+        // tighter), else the gateway ceiling. `None` would otherwise leave the
+        // query unbounded and pin a pool connection — see S4. Both the
+        // DB-side `SET LOCAL` and this Tokio guard use the same effective
+        // value (computed again inside `run_query_inner`).
+        let effective_ms = effective_timeout_ms(query.statement_timeout_ms);
         // Belt-and-suspenders: a Tokio-side deadline so even a misapplied
         // SET LOCAL (or a DB that ignores it) still bounds the call.
-        if let Some(ms) = query.statement_timeout_ms {
-            let budget = Duration::from_millis(u64::from(ms) + TOKIO_TIMEOUT_SLACK_MS);
-            match tokio::time::timeout(budget, run_query_inner(&self.pool, &query)).await {
-                Ok(result) => result,
-                Err(_elapsed) => Err(ExecError::Timeout),
-            }
-        } else {
-            // `None` is the spec-06 "no constraint from this side" — every
-            // matching grant declined to cap. Policy lives in authz: tightening
-            // this into a gateway-wide floor belongs in `authz::effective`
-            // (so YAML and DB grants both flow through the same merge) rather
-            // than buried in the per-adapter path. Until then, the read-only
-            // role + row cap remain the bounds; this fall-through is deliberate.
-            run_query_inner(&self.pool, &query).await
+        let budget = Duration::from_millis(u64::from(effective_ms) + TOKIO_TIMEOUT_SLACK_MS);
+        match tokio::time::timeout(budget, run_query_inner(&self.pool, &query)).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(ExecError::Timeout),
         }
     }
 
@@ -169,12 +187,12 @@ async fn run_query_inner(pool: &PgPool, query: &ExecQuery<'_>) -> Result<ExecRes
     let started = Instant::now();
     let mut tx = pool.begin().await.map_err(|_| ExecError::Unavailable)?;
 
-    if let Some(ms) = query.statement_timeout_ms {
-        // `ms` is u32, so the SQL fragment is purely a number — no injection
-        // risk from interpolation.
-        let stmt = format!("SET LOCAL statement_timeout = {ms}");
-        tx.execute(stmt.as_str()).await.map_err(classify)?;
-    }
+    // Always set a DB-side cap — the grant value clamped to the gateway
+    // ceiling, never `None` (see S4). `ms` is u32, so the SQL fragment is
+    // purely a number — no injection risk from interpolation.
+    let ms = effective_timeout_ms(query.statement_timeout_ms);
+    let stmt = format!("SET LOCAL statement_timeout = {ms}");
+    tx.execute(stmt.as_str()).await.map_err(classify)?;
 
     let limit = query.row_limit as usize;
     let mut columns: Vec<String> = Vec::new();
@@ -267,6 +285,17 @@ fn decode_value(row: &PgRow, idx: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_timeout_clamps_and_defaults() {
+        // No grant constraint → gateway ceiling, never unbounded.
+        assert_eq!(effective_timeout_ms(None), DEFAULT_STATEMENT_TIMEOUT_MS);
+        assert_eq!(effective_timeout_ms(None), 30_000);
+        // A tighter grant wins (most-restrictive-wins).
+        assert_eq!(effective_timeout_ms(Some(5_000)), 5_000);
+        // A looser grant is clamped down to the ceiling — it can only tighten.
+        assert_eq!(effective_timeout_ms(Some(60_000)), 30_000);
+    }
 
     #[test]
     fn resolve_password_handles_each_form() {
