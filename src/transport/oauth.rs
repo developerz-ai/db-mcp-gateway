@@ -27,6 +27,8 @@
 //! tokens issued for us") is satisfied structurally — no other party can mint
 //! a valid-signature bearer.
 
+use std::time::Instant;
+
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::header::{CACHE_CONTROL, HOST, PRAGMA};
@@ -386,7 +388,7 @@ pub(super) async fn complete_bridge_login(
     let auth_code = random_token();
     auth.codes
         .insert(
-            auth_code.clone(),
+            &auth_code,
             GrantIdentity {
                 sub: verified.sub,
                 email: verified.email,
@@ -519,7 +521,8 @@ async fn token_authorization_code(auth: &AuthFacade, form: TokenForm) -> Respons
         );
     }
 
-    issue_token_response(auth, entry.identity).await
+    // Fresh authorization → fresh refresh-token chain (no carried birth time).
+    issue_token_response(auth, entry.identity, None).await
 }
 
 async fn token_refresh(auth: &AuthFacade, form: TokenForm) -> Response {
@@ -539,13 +542,25 @@ async fn token_refresh(auth: &AuthFacade, form: TokenForm) -> Response {
             "refresh token is invalid or expired",
         );
     };
-    issue_token_response(auth, entry.identity).await
+    // Carry the chain's original birth time so rotation renews the token value
+    // but never extends the absolute TTL (the chain still dies REFRESH_TTL after
+    // the first mint, forcing a fresh `/authorize` login).
+    let issued_at = entry.issued_at;
+    issue_token_response(auth, entry.identity, Some(issued_at)).await
 }
 
 /// Mint a fresh session for `identity`, issue the session JWT as the access
 /// token, mint+store a rotating refresh token, and render the OAuth token
 /// response (with `Cache-Control: no-store`).
-async fn issue_token_response(auth: &AuthFacade, identity: GrantIdentity) -> Response {
+///
+/// `chain_issued_at` is `None` for a fresh authorization (the new refresh token
+/// starts its own chain) and `Some(birth)` for a rotation (the new token
+/// inherits the chain's original mint time so the absolute TTL doesn't slide).
+async fn issue_token_response(
+    auth: &AuthFacade,
+    identity: GrantIdentity,
+    chain_issued_at: Option<Instant>,
+) -> Response {
     let session = match auth
         .sessions
         .create(
@@ -582,7 +597,14 @@ async fn issue_token_response(auth: &AuthFacade, identity: GrantIdentity) -> Res
         }
     };
     let refresh_token = random_token();
-    auth.refresh.insert(refresh_token.clone(), identity).await;
+    match chain_issued_at {
+        Some(issued_at) => {
+            auth.refresh
+                .insert_rotated(&refresh_token, identity, issued_at)
+                .await
+        }
+        None => auth.refresh.insert(&refresh_token, identity).await,
+    }
 
     let body = json!({
         "access_token": access_token,

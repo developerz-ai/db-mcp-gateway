@@ -12,7 +12,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+
+/// Hash a bearer secret (authorization code or refresh token) for at-rest
+/// storage. The store is keyed by this digest, never the raw secret, so a memory
+/// dump or a stray `Debug` of the map can't be replayed as a live token; lookups
+/// hash the presented value and match digests. SHA-256 is preimage-resistant, so
+/// the stored digest can't be turned back into a usable token.
+fn hash_secret(secret: &str) -> [u8; 32] {
+    Sha256::digest(secret.as_bytes()).into()
+}
 
 /// `state → nonce` from /auth/login lives here until /auth/callback consumes
 /// (and removes) it. TTL-bounded so a wedged login can't accumulate.
@@ -126,7 +136,7 @@ pub struct GrantIdentity {
 /// leaves no orphan session.
 #[derive(Clone, Default, Debug)]
 pub struct AuthCodes {
-    inner: Arc<Mutex<HashMap<String, AuthCode>>>,
+    inner: Arc<Mutex<HashMap<[u8; 32], AuthCode>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -146,7 +156,7 @@ pub struct AuthCode {
 impl AuthCodes {
     pub async fn insert(
         &self,
-        code: String,
+        code: &str,
         identity: GrantIdentity,
         code_challenge: String,
         redirect_uri: String,
@@ -155,7 +165,7 @@ impl AuthCodes {
         let mut map = self.inner.lock().await;
         Self::gc(&mut map);
         map.insert(
-            code,
+            hash_secret(code),
             AuthCode {
                 identity,
                 code_challenge,
@@ -170,43 +180,62 @@ impl AuthCodes {
     pub async fn take(&self, code: &str) -> Option<AuthCode> {
         let mut map = self.inner.lock().await;
         Self::gc(&mut map);
-        map.remove(code)
+        map.remove(&hash_secret(code))
     }
 
-    fn gc(map: &mut HashMap<String, AuthCode>) {
+    fn gc(map: &mut HashMap<[u8; 32], AuthCode>) {
         let now = Instant::now();
         map.retain(|_, code| code.expires_at > now);
     }
 }
 
-/// Lifetime of a refresh token. Long enough that a developer rarely re-does the
-/// browser login, short enough to bound a leaked token's usefulness.
+/// Absolute lifetime of a refresh-token *chain*, measured from the first token's
+/// mint and **never extended by rotation**. Long enough that a developer rarely
+/// re-does the browser login, short enough to bound a leaked (and silently
+/// rotated) chain's usefulness — without this cap, a continuously rotated chain
+/// would live forever.
 const REFRESH_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
 
-/// Refresh-token store: token → the verified identity it renews. Rotated on
-/// every redemption (the old token is removed, a new one issued), per OAuth 2.1
-/// §4.3.1 for public clients. In-memory like the other flow state — see the
+/// Refresh-token store: hashed token → the verified identity it renews. Rotated
+/// on every redemption (the old token is removed, a new one issued), per OAuth
+/// 2.1 §4.3.1 for public clients. In-memory like the other flow state — see the
 /// deployment note on single-replica / sticky routing for the auth dance.
 #[derive(Clone, Default, Debug)]
 pub struct RefreshTokens {
-    inner: Arc<Mutex<HashMap<String, RefreshToken>>>,
+    inner: Arc<Mutex<HashMap<[u8; 32], RefreshToken>>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RefreshToken {
     pub identity: GrantIdentity,
-    expires_at: Instant,
+    /// When the rotation *chain* this token belongs to was first minted. Carried
+    /// verbatim across rotations (see [`RefreshTokens::insert_rotated`]) so the
+    /// chain expires an absolute [`REFRESH_TTL`] after the first token — rotation
+    /// renews the opaque value but never the deadline.
+    pub issued_at: Instant,
 }
 
 impl RefreshTokens {
-    pub async fn insert(&self, token: String, identity: GrantIdentity) {
+    /// Insert a token that starts a fresh chain (birth = now). Used when the
+    /// token is minted off an authorization-code redemption, not a rotation.
+    pub async fn insert(&self, token: &str, identity: GrantIdentity) {
+        self.store(token, identity, Instant::now()).await;
+    }
+
+    /// Insert a rotated token, carrying the chain's original `issued_at` forward
+    /// so the absolute TTL is measured from the first mint, not this rotation.
+    pub async fn insert_rotated(&self, token: &str, identity: GrantIdentity, issued_at: Instant) {
+        self.store(token, identity, issued_at).await;
+    }
+
+    async fn store(&self, token: &str, identity: GrantIdentity, issued_at: Instant) {
         let mut map = self.inner.lock().await;
         Self::gc(&mut map);
         map.insert(
-            token,
+            hash_secret(token),
             RefreshToken {
                 identity,
-                expires_at: Instant::now() + REFRESH_TTL,
+                issued_at,
             },
         );
     }
@@ -215,11 +244,84 @@ impl RefreshTokens {
     pub async fn take(&self, token: &str) -> Option<RefreshToken> {
         let mut map = self.inner.lock().await;
         Self::gc(&mut map);
-        map.remove(token)
+        map.remove(&hash_secret(token))
     }
 
-    fn gc(map: &mut HashMap<String, RefreshToken>) {
+    fn gc(map: &mut HashMap<[u8; 32], RefreshToken>) {
         let now = Instant::now();
-        map.retain(|_, t| t.expires_at > now);
+        map.retain(|_, t| t.issued_at + REFRESH_TTL > now);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity() -> GrantIdentity {
+        GrantIdentity {
+            sub: "u1".into(),
+            email: "u1@example.com".into(),
+            groups: vec!["eng".into()],
+        }
+    }
+
+    #[test]
+    fn hash_secret_is_not_the_raw_input_and_is_deterministic() {
+        let h = hash_secret("super-secret-token");
+        assert_ne!(h.as_slice(), b"super-secret-token");
+        assert_eq!(h, hash_secret("super-secret-token"));
+        assert_ne!(hash_secret("a"), hash_secret("b"));
+    }
+
+    #[tokio::test]
+    async fn refresh_round_trips_by_raw_token_and_is_consumed_once() {
+        let store = RefreshTokens::default();
+        store.insert("raw-token", identity()).await;
+
+        // Lookup hashes the presented value, so the raw token resolves...
+        let entry = store.take("raw-token").await.expect("token is live");
+        assert_eq!(entry.identity.sub, "u1");
+        // ...and rotation/redemption consumes it (replay finds nothing).
+        assert!(store.take("raw-token").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_rotation_carries_birth_time_and_never_extends_it() {
+        let store = RefreshTokens::default();
+
+        // A rotated token must store the *passed* chain birth verbatim, not
+        // `Instant::now()` — that's what keeps the absolute TTL from sliding.
+        let birth = Instant::now();
+        store.insert_rotated("rotated", identity(), birth).await;
+        let entry = store.take("rotated").await.expect("token is live");
+        assert_eq!(
+            entry.issued_at, birth,
+            "rotation must not reset the chain clock"
+        );
+
+        // A fresh insert, by contrast, stamps ~now.
+        let before = Instant::now();
+        store.insert("fresh", identity()).await;
+        let after = Instant::now();
+        let fresh = store.take("fresh").await.expect("token is live");
+        assert!(fresh.issued_at >= before && fresh.issued_at <= after);
+    }
+
+    #[tokio::test]
+    async fn auth_code_round_trips_by_raw_code_and_is_consumed_once() {
+        let store = AuthCodes::default();
+        store
+            .insert(
+                "raw-code",
+                identity(),
+                "challenge".into(),
+                "https://app/cb".into(),
+                "client-1".into(),
+            )
+            .await;
+
+        let entry = store.take("raw-code").await.expect("code is live");
+        assert_eq!(entry.client_id, "client-1");
+        assert!(store.take("raw-code").await.is_none());
     }
 }
