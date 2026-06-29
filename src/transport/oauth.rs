@@ -39,7 +39,8 @@ use uuid::Uuid;
 
 use crate::auth::{jwt, pkce};
 
-use super::app_state::{AppState, AuthFacade, GrantIdentity, OAuthBridge};
+use super::app_state::{AppState, AuthFacade};
+use super::oauth_state::{GrantIdentity, OAuthBridge};
 
 /// The single scope the gateway advertises. Authorization is by IdP `groups`
 /// claim against the permissions YAML, not OAuth scopes — so one umbrella
@@ -191,10 +192,20 @@ pub async fn register(State(state): State<AppState>, Json(req): Json<RegisterReq
         );
     }
     let client_id = format!("mcp-{}", Uuid::new_v4().simple());
-    state
+    // The registry is bounded and fails closed at capacity (never evicts a live
+    // client, since /register is unauthenticated). At the cap, refuse rather
+    // than displacing a legitimate client mid-/authorize.
+    if !state
         .client_registry
         .insert(client_id.clone(), req.redirect_uris.clone())
-        .await;
+        .await
+    {
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "client registration capacity reached; retry later",
+        );
+    }
     let mut body = json!({
         "client_id": client_id,
         "redirect_uris": req.redirect_uris,
@@ -634,8 +645,11 @@ fn redirect_uri_matches(registered: &str, requested: &str) -> bool {
     is_http_loopback(&reg)
         && is_http_loopback(&req)
         && reg.host() == req.host()
+        && reg.username() == req.username()
+        && reg.password() == req.password()
         && reg.path() == req.path()
         && reg.query() == req.query()
+        && reg.fragment() == req.fragment()
 }
 
 fn build_redirect(base: &str, params: &[(&str, &str)]) -> Option<String> {
@@ -722,6 +736,20 @@ mod tests {
         assert!(!redirect_uri_matches(
             "https://localhost/cb",
             "http://localhost:9/cb"
+        ));
+        // Loopback port-flex is the *only* carve-out: userinfo and fragment must
+        // still match exactly, not just host/path/query.
+        assert!(!redirect_uri_matches(
+            "http://127.0.0.1:1111/cb",
+            "http://user@127.0.0.1:2222/cb"
+        ));
+        assert!(!redirect_uri_matches(
+            "http://user:pass@127.0.0.1:1111/cb",
+            "http://user:other@127.0.0.1:2222/cb"
+        ));
+        assert!(!redirect_uri_matches(
+            "http://127.0.0.1:1111/cb",
+            "http://127.0.0.1:2222/cb#frag"
         ));
     }
 

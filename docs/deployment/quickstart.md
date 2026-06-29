@@ -199,7 +199,7 @@ Note the `client_id` and `client_secret`.
 > endpoints the gateway serves itself. If you front the gateway with a proxy or
 > WAF, the following **unauthenticated** paths must reach it:
 >
-> ```
+> ```text
 > GET  /.well-known/oauth-protected-resource        (also the <mcp-path>-suffixed variant)
 > GET  /.well-known/oauth-authorization-server
 > GET  /.well-known/openid-configuration
@@ -407,7 +407,7 @@ Point them at [../usage/first-query.md](../usage/first-query.md) — 5-minute ha
 - [ ] At least one streaming sink (OTLP / syslog) into your existing SIEM, in addition to the hot retention table.
 - [ ] Archive sink configured if your compliance window > 90 days.
 - [ ] Operator runbook for `revoke-session` and `replay-audit` documented somewhere your oncall can find it at 2am.
-- [ ] Two replicas behind a load balancer for HA.
+- [ ] Two replicas behind a load balancer for HA. The OAuth bridge keeps its login-flow state in-process, so pin `/register`, `/authorize`, `/auth/callback`, and `/token` with sticky routing (or run a single replica); steady-state `/mcp` traffic needs no stickiness. See [../initial-idea/02-architecture.md](../initial-idea/02-architecture.md#ha).
 
 ## Helm / Kubernetes
 

@@ -154,7 +154,7 @@ POST /register
 
 Do **not** add a second OAuth/SSO layer in front of `/mcp`. The gateway is the authorization server and brokers the IdP login internally.
 
-In-memory registry state is single-replica (see deployment notes); a restart drops it and a compliant client simply re-registers on the next `invalid_client`.
+All MCP OAuth bridge flow state — client registrations, pending IdP round-trips, one-time authorization codes, and rotating refresh tokens — is **in-process**, not in the state DB. A restart drops it (a compliant client re-registers on the next `invalid_client`), and under HA the bridge must run **single-replica** or behind **sticky routing** so every step of one client's dance hits the same replica. See [02-architecture §HA](02-architecture.md#ha). Already-authenticated `/mcp` traffic is unaffected — those sessions live in the state DB.
 
 ## Session tokens
 
