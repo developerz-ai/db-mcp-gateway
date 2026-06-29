@@ -39,6 +39,23 @@ fn client() -> reqwest::Client {
         .unwrap()
 }
 
+/// Register a DCR client with one redirect URI; return its `client_id`.
+async fn register_client(base: &str, redirect_uri: &str) -> String {
+    let body: Value = client()
+        .post(format!("{base}/register"))
+        .json(&json!({ "redirect_uris": [redirect_uri], "client_name": "test" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    body["client_id"]
+        .as_str()
+        .expect("registration returns a client_id")
+        .to_string()
+}
+
 #[tokio::test]
 async fn protected_resource_metadata_names_this_gateway_as_its_auth_server() {
     let base = spawn_gateway().await;
@@ -106,10 +123,12 @@ async fn dynamic_client_registration_issues_a_client_id() {
 #[tokio::test]
 async fn authorize_rejects_a_request_without_pkce() {
     let base = spawn_gateway().await;
-    // response_type=code but no code_challenge → invalid_request.
+    let redirect = "http://127.0.0.1:9/cb";
+    let client_id = register_client(&base, redirect).await;
+    // Registered client + matching redirect, but no code_challenge → PKCE error.
     let resp = client()
         .get(format!(
-            "{base}/authorize?response_type=code&redirect_uri=http://127.0.0.1:9/cb"
+            "{base}/authorize?response_type=code&client_id={client_id}&redirect_uri={redirect}"
         ))
         .send()
         .await
@@ -120,11 +139,32 @@ async fn authorize_rejects_a_request_without_pkce() {
 }
 
 #[tokio::test]
-async fn authorize_rejects_an_untrusted_redirect_uri() {
+async fn authorize_rejects_an_unregistered_client() {
     let base = spawn_gateway().await;
+    // Well-formed PKCE request, but the client_id was never registered.
     let resp = client()
         .get(format!(
-            "{base}/authorize?response_type=code&redirect_uri=http://evil.example.com/cb\
+            "{base}/authorize?response_type=code&client_id=mcp-never-registered\
+             &redirect_uri=http://127.0.0.1:9/cb\
+             &code_challenge=abc&code_challenge_method=S256"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_client");
+}
+
+#[tokio::test]
+async fn authorize_rejects_a_redirect_uri_the_client_did_not_register() {
+    let base = spawn_gateway().await;
+    // Client registered a loopback URI, then asks to be sent somewhere else.
+    let client_id = register_client(&base, "http://127.0.0.1:9/cb").await;
+    let resp = client()
+        .get(format!(
+            "{base}/authorize?response_type=code&client_id={client_id}\
+             &redirect_uri=https://evil.example.com/cb\
              &code_challenge=abc&code_challenge_method=S256"
         ))
         .send()
@@ -133,6 +173,21 @@ async fn authorize_rejects_an_untrusted_redirect_uri() {
     assert_eq!(resp.status(), 400);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"], "invalid_request");
+}
+
+#[tokio::test]
+async fn registration_rejects_an_unusable_redirect_uri() {
+    let base = spawn_gateway().await;
+    // Non-loopback http is neither https nor loopback → rejected at /register.
+    let resp = client()
+        .post(format!("{base}/register"))
+        .json(&json!({ "redirect_uris": ["http://evil.example.com/cb"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_redirect_uri");
 }
 
 #[tokio::test]

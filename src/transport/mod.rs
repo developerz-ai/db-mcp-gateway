@@ -31,7 +31,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde_json::Value;
 
-pub use app_state::{AppState, AuthCodes, AuthFacade, PendingFlows, RefreshTokens};
+pub use app_state::{AppState, AuthCodes, AuthFacade, ClientRegistry, PendingFlows, RefreshTokens};
 pub use errors::TransportError;
 
 use crate::auth::Identity;

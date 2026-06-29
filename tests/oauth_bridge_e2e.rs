@@ -98,6 +98,7 @@ async fn mcp_oauth_bridge_full_flow() {
             permissions_cache: None,
             permissions_repo: None,
             mcp_path: std::sync::Arc::from("/mcp"),
+            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
         },
     )
     .expect("router builds");
@@ -140,12 +141,30 @@ async fn mcp_oauth_bridge_full_flow() {
         "WWW-Authenticate must point at the PRM: {www}"
     );
 
+    // 0b. Register (RFC 7591 DCR): get a client_id and pin our loopback redirect
+    //     as the allowlisted URI. /authorize requires a registered client.
+    let registration: Value = client
+        .post(format!("{gateway_url}/register"))
+        .json(&json!({ "redirect_uris": [CLIENT_REDIRECT], "client_name": "e2e" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .expect("registration succeeds")
+        .json()
+        .await
+        .unwrap();
+    let client_id = registration["client_id"]
+        .as_str()
+        .expect("registration returns a client_id")
+        .to_string();
+
     // 1. /authorize (PKCE S256) → 302 into the IdP login.
     let authorize = client
         .get(format!("{gateway_url}/authorize"))
         .query(&[
             ("response_type", "code"),
-            ("client_id", "mcp-test"),
+            ("client_id", client_id.as_str()),
             ("redirect_uri", CLIENT_REDIRECT),
             ("code_challenge", PKCE_CHALLENGE),
             ("code_challenge_method", "S256"),

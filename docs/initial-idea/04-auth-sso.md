@@ -36,6 +36,18 @@ OIDC. The gateway is an OIDC *Relying Party*, not an IdP. Supported IdPs (anythi
 
 This is **device-code-like**, not the classic web redirect, because agents don't have a browser. The pattern is borrowed from `gh auth login` and `gcloud auth login`.
 
+## MCP OAuth bridge
+
+Spec-compliant MCP clients (Claude Code, Cursor) don't speak the bespoke flow above; on a `401` they follow the MCP Authorization spec (RFC 9728/8414 discovery → RFC 7591 Dynamic Client Registration → OAuth 2.1 `authorize`/`token` with PKCE). The gateway fronts these endpoints and drives the same OIDC login underneath (see `src/transport/oauth.rs`).
+
+**Redirect-URI allowlist (exact match).** The gateway will not send an authorization code to an arbitrary host:
+
+- `POST /register` records the client's `redirect_uris` (each must be HTTPS or an HTTP loopback address) under a generated `client_id`. Registration is **required** — it is what pins the client's redirect allowlist. The registry is in-memory and bounded (TTL + hard cap) because the endpoint is unauthenticated.
+- `GET /authorize` requires the `client_id` and rejects the request unless the requested `redirect_uri` **exactly matches** one the client registered. Per RFC 8252 §7.3 the only tolerated difference is the port of a loopback URI (a native client binds an ephemeral port at request time); scheme, host, and path must match exactly. There is no `https://*` acceptance and no prefix/substring matching.
+- The final `302` carries the code to that same registry-matched URI; the value is fixed at `/authorize` and re-presented (and re-checked) at `/token`.
+
+In-memory registry state is single-replica (see deployment notes); a restart drops it and a compliant client simply re-registers on the next `invalid_client`.
+
 ## Session tokens
 
 - Signed JWT, gateway-issued (not the IdP's ID token directly — we re-sign so we can revoke).

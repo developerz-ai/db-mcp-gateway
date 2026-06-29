@@ -58,6 +58,11 @@ pub struct AppState {
     /// runtime `Config`. The OAuth metadata handlers need it to advertise the
     /// canonical resource URI (`<base><mcp_path>`) per RFC 8707.
     pub mcp_path: Arc<str>,
+    /// Dynamic-Client-Registration registry: `client_id` → registered redirect
+    /// URIs. `/authorize` matches the requested `redirect_uri` against this set
+    /// exactly (OAuth 2.1 redirect allowlist). Always present and independent of
+    /// `auth`, so `/register` persists even on the auth-less test bootstrap.
+    pub client_registry: ClientRegistry,
 }
 
 impl AppState {
@@ -80,6 +85,7 @@ impl AppState {
             permissions_cache: None,
             permissions_repo: None,
             mcp_path: Arc::from("/mcp"),
+            client_registry: ClientRegistry::default(),
         }
     }
 }
@@ -295,5 +301,73 @@ impl RefreshTokens {
     fn gc(map: &mut HashMap<String, RefreshToken>) {
         let now = Instant::now();
         map.retain(|_, t| t.expires_at > now);
+    }
+}
+
+/// TTL for a Dynamic-Client-Registration entry. A client registers, then walks
+/// `/authorize` → `/token` right away and only re-authorizes on a full browser
+/// re-login (refresh covers the common renewal), so the entry need only outlive
+/// that. In-memory like every other flow store here (see the single-replica
+/// deployment note); a restart drops it and a spec-compliant client simply
+/// re-registers on the next `invalid_client`.
+const CLIENT_TTL: Duration = Duration::from_secs(24 * 3600);
+
+/// Hard cap on registered clients. `/register` is unauthenticated (open DCR per
+/// RFC 7591), so the map needs a ceiling or a flood could exhaust memory. At the
+/// cap we evict the soonest-to-expire entry to admit the new one: bounded memory
+/// that still self-heals as TTLs lapse.
+const CLIENT_CAP: usize = 10_000;
+
+/// Bounded registry of Dynamic-Client-Registration clients: `client_id` → its
+/// registered redirect URIs. `/authorize` matches the requested `redirect_uri`
+/// against this set exactly, so a client can only be sent an authorization code
+/// at a URI it pre-registered (OAuth 2.1 redirect allowlist / RFC 8252).
+#[derive(Clone, Default, Debug)]
+pub struct ClientRegistry {
+    inner: Arc<Mutex<HashMap<String, RegisteredClient>>>,
+}
+
+#[derive(Debug, Clone)]
+struct RegisteredClient {
+    redirect_uris: Vec<String>,
+    expires_at: Instant,
+}
+
+impl ClientRegistry {
+    /// Record a freshly registered client's redirect URIs (validated by the
+    /// caller). Evicts expired entries first; if still at the cap, drops the
+    /// soonest-to-expire entry so a new registration always lands.
+    pub async fn insert(&self, client_id: String, redirect_uris: Vec<String>) {
+        let mut map = self.inner.lock().await;
+        Self::gc(&mut map);
+        if map.len() >= CLIENT_CAP && !map.contains_key(&client_id) {
+            if let Some(victim) = map
+                .iter()
+                .min_by_key(|(_, c)| c.expires_at)
+                .map(|(id, _)| id.clone())
+            {
+                map.remove(&victim);
+            }
+        }
+        map.insert(
+            client_id,
+            RegisteredClient {
+                redirect_uris,
+                expires_at: Instant::now() + CLIENT_TTL,
+            },
+        );
+    }
+
+    /// The registered redirect URIs for `client_id`, if the registration is
+    /// still live. `None` means "unknown client" — `/authorize` rejects it.
+    pub async fn redirect_uris(&self, client_id: &str) -> Option<Vec<String>> {
+        let mut map = self.inner.lock().await;
+        Self::gc(&mut map);
+        map.get(client_id).map(|c| c.redirect_uris.clone())
+    }
+
+    fn gc(map: &mut HashMap<String, RegisteredClient>) {
+        let now = Instant::now();
+        map.retain(|_, c| c.expires_at > now);
     }
 }

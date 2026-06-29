@@ -12,9 +12,10 @@
 //! 2. `GET /.well-known/oauth-protected-resource` → the resource's metadata,
 //!    naming this gateway as its own authorization server.
 //! 3. `GET /.well-known/oauth-authorization-server` → AS metadata (RFC 8414).
-//! 4. (optional) `POST /register` → Dynamic Client Registration (RFC 7591).
+//! 4. `POST /register` → Dynamic Client Registration (RFC 7591); pins the
+//!    client's redirect-URI allowlist so step 5 can match against it.
 //! 5. `GET /authorize` (PKCE) → we drive the IdP login, then 302 back to the
-//!    client's loopback redirect with a one-time authorization code.
+//!    client's *registered* redirect with a one-time authorization code.
 //! 6. `POST /token` (PKCE verifier) → we hand back the gateway session JWT as
 //!    the OAuth `access_token`.
 //!
@@ -155,13 +156,27 @@ pub struct RegisterRequest {
     client_name: Option<String>,
 }
 
-/// `POST /register` — accept any public client and hand back a generated
-/// `client_id`. We don't persist a client registry: the real protections are
-/// PKCE + the IdP login + the loopback/https redirect-URI check at
-/// `/authorize`, none of which depend on a recognized `client_id`. This keeps
-/// the friction-free DCR the MCP spec wants without a stateful client store.
-pub async fn register(Json(req): Json<RegisterRequest>) -> Response {
+/// `POST /register` — Dynamic Client Registration (RFC 7591). Accept any public
+/// client, validate its redirect URIs (loopback or https), persist them under a
+/// generated `client_id`, and hand the id back. `/authorize` later requires the
+/// requested `redirect_uri` to exactly match one registered here, so DCR is the
+/// step that pins a client's redirect allowlist. The store is bounded (TTL+cap)
+/// because this endpoint is unauthenticated.
+pub async fn register(State(state): State<AppState>, Json(req): Json<RegisterRequest>) -> Response {
+    // RFC 7591 §3.2.1: reject unusable redirect URIs at registration so the
+    // /authorize allowlist only ever holds loopback/https targets.
+    if req.redirect_uris.is_empty() || !req.redirect_uris.iter().all(|u| is_valid_redirect_uri(u)) {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_redirect_uri",
+            "redirect_uris must be non-empty; each loopback or https",
+        );
+    }
     let client_id = format!("mcp-{}", Uuid::new_v4().simple());
+    state
+        .client_registry
+        .insert(client_id.clone(), req.redirect_uris.clone())
+        .await;
     let mut body = json!({
         "client_id": client_id,
         "redirect_uris": req.redirect_uris,
@@ -186,7 +201,6 @@ pub struct AuthorizeParams {
     code_challenge: Option<String>,
     code_challenge_method: Option<String>,
     state: Option<String>,
-    #[allow(dead_code)]
     client_id: Option<String>,
     #[allow(dead_code)]
     scope: Option<String>,
@@ -207,12 +221,32 @@ pub async fn authorize(
             "only response_type=code is supported",
         );
     }
-    // Open-redirect guard (MCP spec §Open Redirection): only loopback or https.
-    let Some(redirect_uri) = p.redirect_uri.filter(|u| is_valid_redirect_uri(u)) else {
+    // Exact-match redirect allowlist (OAuth 2.1 §redirect_uri / RFC 8252): the
+    // client must have pre-registered via /register, and the requested
+    // redirect_uri must match one of its registered URIs. Replaces the old
+    // accept-any-https check, which let a code be sent to an arbitrary host.
+    let Some(client_id) = p.client_id.as_deref().filter(|c| !c.is_empty()) else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
-            "redirect_uri is required and must be loopback or https",
+            "client_id is required",
+        );
+    };
+    let Some(registered) = state.client_registry.redirect_uris(client_id).await else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client",
+            "unknown client_id; register via /register first",
+        );
+    };
+    let Some(redirect_uri) = p
+        .redirect_uri
+        .filter(|u| registered.iter().any(|r| redirect_uri_matches(r, u)))
+    else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "redirect_uri must exactly match a registered redirect URI",
         );
     };
     // PKCE is mandatory (OAuth 2.1 §7.5.2). Only S256 — never plain.
@@ -330,8 +364,9 @@ pub(super) async fn complete_bridge_login(
         ],
     ) {
         Some(url) => Redirect::to(&url).into_response(),
-        // Redirect URI was validated at /authorize, so this is unreachable in
-        // practice; fail closed with a 400 rather than an open redirect.
+        // The 302 target is the registry-matched URI stashed at /authorize, so
+        // this is unreachable in practice; fail closed with a 400 rather than an
+        // open redirect.
         None => oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
@@ -512,22 +547,49 @@ async fn issue_token_response(auth: &AuthFacade, identity: GrantIdentity) -> Res
 // Helpers.
 // ---------------------------------------------------------------------------
 
-/// Redirect URIs must be a loopback address or HTTPS (MCP spec §Communication
-/// Security / §Open Redirection). Anything else is rejected before we trust it.
+/// A redirect URI the gateway will *record* at registration: HTTPS (any host)
+/// or an HTTP loopback address (MCP spec §Communication Security). Anything else
+/// is rejected up front so the `/authorize` allowlist only holds safe targets.
+/// This is the registration gate; `/authorize` additionally requires an exact
+/// match against a registered URI (see [`redirect_uri_matches`]).
 fn is_valid_redirect_uri(raw: &str) -> bool {
-    let Ok(url) = Url::parse(raw) else {
+    match Url::parse(raw) {
+        Ok(url) => url.scheme() == "https" || is_http_loopback(&url),
+        Err(_) => false,
+    }
+}
+
+/// An `http://` URL whose host is a loopback address (`localhost`, `127.0.0.0/8`,
+/// or `::1`).
+fn is_http_loopback(url: &Url) -> bool {
+    if url.scheme() != "http" {
         return false;
-    };
-    match url.scheme() {
-        "https" => true,
-        "http" => {
-            matches!(url.host(),
-            Some(Host::Domain(d)) if d.eq_ignore_ascii_case("localhost"))
-                || matches!(url.host(), Some(Host::Ipv4(ip)) if ip.is_loopback())
-                || matches!(url.host(), Some(Host::Ipv6(ip)) if ip.is_loopback())
-        }
+    }
+    match url.host() {
+        Some(Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
         _ => false,
     }
+}
+
+/// Match a requested redirect URI against a registered one. OAuth 2.1 mandates
+/// exact string comparison; RFC 8252 §7.3 adds one carve-out — a native client
+/// binds an ephemeral loopback port at request time, so for loopback URIs every
+/// component *except the port* must match. A loopback URI targets the user's own
+/// machine, so port-flexibility there leaks nothing to a third party.
+fn redirect_uri_matches(registered: &str, requested: &str) -> bool {
+    if registered == requested {
+        return true;
+    }
+    let (Ok(reg), Ok(req)) = (Url::parse(registered), Url::parse(requested)) else {
+        return false;
+    };
+    is_http_loopback(&reg)
+        && is_http_loopback(&req)
+        && reg.host() == req.host()
+        && reg.path() == req.path()
+        && reg.query() == req.query()
 }
 
 fn build_redirect(base: &str, params: &[(&str, &str)]) -> Option<String> {
@@ -576,6 +638,45 @@ mod tests {
         assert!(!is_valid_redirect_uri("http://evil.example.com/cb"));
         assert!(!is_valid_redirect_uri("ftp://localhost/cb"));
         assert!(!is_valid_redirect_uri("not a url"));
+    }
+
+    #[test]
+    fn redirect_match_is_exact_except_loopback_port() {
+        // https: exact string match only.
+        assert!(redirect_uri_matches(
+            "https://app.example.com/cb",
+            "https://app.example.com/cb"
+        ));
+        assert!(!redirect_uri_matches(
+            "https://app.example.com/cb",
+            "https://evil.example.com/cb"
+        ));
+        assert!(!redirect_uri_matches(
+            "https://app.example.com/cb",
+            "https://app.example.com/other"
+        ));
+        // Loopback: port may vary (RFC 8252 §7.3); host + path must still match.
+        assert!(redirect_uri_matches(
+            "http://127.0.0.1:1111/cb",
+            "http://127.0.0.1:2222/cb"
+        ));
+        assert!(redirect_uri_matches(
+            "http://localhost/cb",
+            "http://localhost:54321/cb"
+        ));
+        assert!(!redirect_uri_matches(
+            "http://127.0.0.1:1111/cb",
+            "http://127.0.0.1:2222/evil"
+        ));
+        // Port-flex does not bridge distinct loopback hosts or schemes.
+        assert!(!redirect_uri_matches(
+            "http://localhost/cb",
+            "http://127.0.0.1/cb"
+        ));
+        assert!(!redirect_uri_matches(
+            "https://localhost/cb",
+            "http://localhost:9/cb"
+        ));
     }
 
     #[test]

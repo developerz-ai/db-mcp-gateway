@@ -145,6 +145,7 @@ async fn boot_gateway() -> BootedGateway {
             permissions_cache: None,
             permissions_repo: None,
             mcp_path: std::sync::Arc::from("/mcp"),
+            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
         },
     )
     .expect("router builds");
