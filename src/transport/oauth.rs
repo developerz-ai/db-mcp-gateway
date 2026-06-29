@@ -27,6 +27,8 @@
 //! tokens issued for us") is satisfied structurally — no other party can mint
 //! a valid-signature bearer.
 
+use std::time::Instant;
+
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::header::{CACHE_CONTROL, HOST, PRAGMA};
@@ -37,7 +39,7 @@ use serde_json::json;
 use url::{Host, Url};
 use uuid::Uuid;
 
-use crate::auth::{jwt, pkce};
+use crate::auth::{SessionId, jwt, pkce};
 
 use super::app_state::{AppState, AuthFacade};
 use super::oauth_state::{GrantIdentity, OAuthBridge};
@@ -154,6 +156,7 @@ pub async fn authorization_server_metadata(
         "authorization_endpoint": format!("{base}/authorize"),
         "token_endpoint": format!("{base}/token"),
         "registration_endpoint": format!("{base}/register"),
+        "revocation_endpoint": format!("{base}/revoke"),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
@@ -386,7 +389,7 @@ pub(super) async fn complete_bridge_login(
     let auth_code = random_token();
     auth.codes
         .insert(
-            auth_code.clone(),
+            &auth_code,
             GrantIdentity {
                 sub: verified.sub,
                 email: verified.email,
@@ -519,7 +522,8 @@ async fn token_authorization_code(auth: &AuthFacade, form: TokenForm) -> Respons
         );
     }
 
-    issue_token_response(auth, entry.identity).await
+    // Fresh authorization → fresh refresh-token chain (no carried birth time).
+    issue_token_response(auth, entry.identity, None).await
 }
 
 async fn token_refresh(auth: &AuthFacade, form: TokenForm) -> Response {
@@ -539,13 +543,28 @@ async fn token_refresh(auth: &AuthFacade, form: TokenForm) -> Response {
             "refresh token is invalid or expired",
         );
     };
-    issue_token_response(auth, entry.identity).await
+    // Carry the chain's original birth time so rotation renews the token value
+    // but never extends the absolute TTL. `entry.identity` (groups included) is
+    // the one frozen at the original browser login, so this same cap also bounds
+    // how long a since-revoked group keeps minting sessions (O3b): the chain dies
+    // REFRESH_TTL after the first mint, forcing a fresh `/authorize` that
+    // re-reads groups from the IdP.
+    let issued_at = entry.issued_at;
+    issue_token_response(auth, entry.identity, Some(issued_at)).await
 }
 
 /// Mint a fresh session for `identity`, issue the session JWT as the access
 /// token, mint+store a rotating refresh token, and render the OAuth token
 /// response (with `Cache-Control: no-store`).
-async fn issue_token_response(auth: &AuthFacade, identity: GrantIdentity) -> Response {
+///
+/// `chain_issued_at` is `None` for a fresh authorization (the new refresh token
+/// starts its own chain) and `Some(birth)` for a rotation (the new token
+/// inherits the chain's original mint time so the absolute TTL doesn't slide).
+async fn issue_token_response(
+    auth: &AuthFacade,
+    identity: GrantIdentity,
+    chain_issued_at: Option<Instant>,
+) -> Response {
     let session = match auth
         .sessions
         .create(
@@ -582,7 +601,14 @@ async fn issue_token_response(auth: &AuthFacade, identity: GrantIdentity) -> Res
         }
     };
     let refresh_token = random_token();
-    auth.refresh.insert(refresh_token.clone(), identity).await;
+    match chain_issued_at {
+        Some(issued_at) => {
+            auth.refresh
+                .insert_rotated(&refresh_token, identity, issued_at)
+                .await
+        }
+        None => auth.refresh.insert(&refresh_token, identity).await,
+    }
 
     let body = json!({
         "access_token": access_token,
@@ -596,6 +622,78 @@ async fn issue_token_response(auth: &AuthFacade, identity: GrantIdentity) -> Res
         StatusCode::OK,
         [(CACHE_CONTROL, "no-store"), (PRAGMA, "no-cache")],
         Json(body),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Revocation endpoint (RFC 7009).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct RevokeForm {
+    token: Option<String>,
+    /// RFC 7009 §2.1 advisory hint (`access_token` | `refresh_token`). We probe
+    /// both stores regardless of the hint, so it's accepted for compliance but
+    /// not acted on.
+    #[allow(dead_code)]
+    token_type_hint: Option<String>,
+}
+
+/// `POST /revoke` — RFC 7009 OAuth 2.0 Token Revocation. A client presents a
+/// `token` it wants invalidated (its own refresh token on sign-out, or a session
+/// access token). We probe both stores: an opaque refresh token is dropped from
+/// the rotation store — which ends the chain, since rotation keeps exactly one
+/// live token per chain — and a session JWT has its backing session row revoked
+/// so the bearer stops working immediately (RFC 7009 §2.1: kill the access token
+/// too, not just the refresh token).
+///
+/// Per RFC 7009 §2.2 the response is `200` for any well-formed request — an
+/// unknown, expired, forged, or already-revoked token included — so a caller
+/// can't probe token validity here. A missing `token` is the lone malformed case
+/// → `invalid_request` (400).
+pub async fn revoke(
+    State(state): State<AppState>,
+    axum::Form(form): axum::Form<RevokeForm>,
+) -> Response {
+    let Some(token) = form.token.as_deref().filter(|t| !t.is_empty()) else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "token is required",
+        );
+    };
+    let Some(auth) = state.auth.as_ref() else {
+        return oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "auth not configured",
+        );
+    };
+
+    // Refresh token: removing the presented token ends the chain (only the
+    // latest token in a rotated chain is ever live).
+    let refresh_revoked = auth.refresh.take(token).await.is_some();
+
+    // Access token: a verifiable session JWT → revoke its session row. A forged
+    // or expired JWT fails verification and is silently ignored.
+    let session_revoked = match jwt::verify(&auth.config.session_signing_key, token) {
+        Ok(claims) => auth
+            .sessions
+            .revoke(SessionId::from(claims.sid))
+            .await
+            .is_ok(),
+        Err(_) => false,
+    };
+
+    // Outcome flags only — never the token itself (it would leak a live secret).
+    tracing::debug!(refresh_revoked, session_revoked, "token revocation");
+
+    // RFC 7009 §2.2: always 200 for a well-formed request. `no-store` mirrors the
+    // token endpoint so an intermediary can't cache the response.
+    (
+        StatusCode::OK,
+        [(CACHE_CONTROL, "no-store"), (PRAGMA, "no-cache")],
     )
         .into_response()
 }

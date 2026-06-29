@@ -36,7 +36,7 @@ use serde_json::Value;
 pub use app_state::{AppState, AuthFacade};
 pub use client_registry::ClientRegistry;
 pub use errors::TransportError;
-pub use oauth_state::{AuthCodes, PendingFlows, RefreshTokens};
+pub use oauth_state::{AuthCodes, GrantIdentity, PendingFlows, RefreshTokens};
 
 use crate::auth::Identity;
 use crate::config::Config;
@@ -89,6 +89,9 @@ pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError
         )
         .route("/authorize", get(oauth::authorize))
         .route("/token", post(oauth::token))
+        // RFC 7009 token revocation. Unauthenticated like /token — the presented
+        // token is itself the credential; you can only revoke one you hold.
+        .route("/revoke", post(oauth::revoke))
         .route("/register", post(oauth::register))
         // Ops endpoints: k8s probes + Prometheus scraper. Unauthenticated by
         // design — probes don't carry a bearer, and exposed bodies are

@@ -122,6 +122,11 @@ pub async fn logout(
 ) -> Result<StatusCode, AuthError> {
     let auth = state.auth.as_ref().ok_or(AuthError::Discovery)?;
     auth.sessions.revoke(identity.session_id).await?;
+    // Revoking the session row alone leaves this identity's refresh-token chains
+    // live, so a logged-out user could silently mint a fresh session via the
+    // refresh grant. Purge them so logout actually ends the ability to renew (O4).
+    let purged = auth.refresh.purge_for_sub(&identity.user_sub).await;
+    tracing::debug!(user_sub = %identity.user_sub, purged, "logout purged refresh tokens");
     Ok(StatusCode::NO_CONTENT)
 }
 

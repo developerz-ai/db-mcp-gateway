@@ -12,7 +12,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+
+/// Hash a bearer secret (authorization code or refresh token) for at-rest
+/// storage. The store is keyed by this digest, never the raw secret, so a memory
+/// dump or a stray `Debug` of the map can't be replayed as a live token; lookups
+/// hash the presented value and match digests. SHA-256 is preimage-resistant, so
+/// the stored digest can't be turned back into a usable token.
+fn hash_secret(secret: &str) -> [u8; 32] {
+    Sha256::digest(secret.as_bytes()).into()
+}
 
 /// `state → nonce` from /auth/login lives here until /auth/callback consumes
 /// (and removes) it. TTL-bounded so a wedged login can't accumulate.
@@ -126,7 +136,7 @@ pub struct GrantIdentity {
 /// leaves no orphan session.
 #[derive(Clone, Default, Debug)]
 pub struct AuthCodes {
-    inner: Arc<Mutex<HashMap<String, AuthCode>>>,
+    inner: Arc<Mutex<HashMap<[u8; 32], AuthCode>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -146,7 +156,7 @@ pub struct AuthCode {
 impl AuthCodes {
     pub async fn insert(
         &self,
-        code: String,
+        code: &str,
         identity: GrantIdentity,
         code_challenge: String,
         redirect_uri: String,
@@ -155,7 +165,7 @@ impl AuthCodes {
         let mut map = self.inner.lock().await;
         Self::gc(&mut map);
         map.insert(
-            code,
+            hash_secret(code),
             AuthCode {
                 identity,
                 code_challenge,
@@ -170,43 +180,84 @@ impl AuthCodes {
     pub async fn take(&self, code: &str) -> Option<AuthCode> {
         let mut map = self.inner.lock().await;
         Self::gc(&mut map);
-        map.remove(code)
+        map.remove(&hash_secret(code))
     }
 
-    fn gc(map: &mut HashMap<String, AuthCode>) {
+    fn gc(map: &mut HashMap<[u8; 32], AuthCode>) {
         let now = Instant::now();
         map.retain(|_, code| code.expires_at > now);
     }
 }
 
-/// Lifetime of a refresh token. Long enough that a developer rarely re-does the
-/// browser login, short enough to bound a leaked token's usefulness.
-const REFRESH_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
+/// Absolute lifetime of a refresh-token *chain*, measured from the first token's
+/// mint and **never extended by rotation**. Three constraints set it; the
+/// tightest wins:
+///
+/// 1. **Stale groups (O3b).** A refresh re-mints a session from the IdP identity
+///    frozen at the *original* browser login ([`GrantIdentity`], groups
+///    included), so a group change at the IdP (off-boarding, role downgrade)
+///    can't reach the gateway while the chain lives. This cap is that staleness
+///    window: once it elapses, silent refresh stops and a fresh `/authorize`
+///    login re-reads `groups`. Keep it below the org's group-review /
+///    deprovisioning cadence.
+/// 2. Bounds a leaked (and silently rotated) chain's usefulness.
+/// 3. Without any cap, a continuously rotated chain would live forever.
+///
+/// One day: spans a working day of silent renewals, yet a revoked group reaches
+/// the gateway within an operational window. The fuller fix — re-validating the
+/// identity against the IdP on every refresh — needs an IdP refresh token
+/// (`offline_access`) the bridge doesn't currently hold, and is deferred; see
+/// `docs/initial-idea/04-auth-sso.md`.
+const REFRESH_TTL: Duration = Duration::from_secs(24 * 3600);
 
-/// Refresh-token store: token → the verified identity it renews. Rotated on
-/// every redemption (the old token is removed, a new one issued), per OAuth 2.1
-/// §4.3.1 for public clients. In-memory like the other flow state — see the
+/// Whether a refresh chain born at `issued_at` has reached [`REFRESH_TTL`] as of
+/// `now`. A pure boundary so the absolute cap is unit-testable without sleeping
+/// a day or building a past `Instant` (`Instant - Duration` can underflow the
+/// monotonic clock on a freshly-booted process). `saturating_*` never panics.
+fn chain_expired(issued_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(issued_at) >= REFRESH_TTL
+}
+
+/// Refresh-token store: hashed token → the verified identity it renews. Rotated
+/// on every redemption (the old token is removed, a new one issued), per OAuth
+/// 2.1 §4.3.1 for public clients. In-memory like the other flow state — see the
 /// deployment note on single-replica / sticky routing for the auth dance.
 #[derive(Clone, Default, Debug)]
 pub struct RefreshTokens {
-    inner: Arc<Mutex<HashMap<String, RefreshToken>>>,
+    inner: Arc<Mutex<HashMap<[u8; 32], RefreshToken>>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RefreshToken {
     pub identity: GrantIdentity,
-    expires_at: Instant,
+    /// When the rotation *chain* this token belongs to was first minted. Carried
+    /// verbatim across rotations (see [`RefreshTokens::insert_rotated`]) so the
+    /// chain expires an absolute [`REFRESH_TTL`] after the first token — rotation
+    /// renews the opaque value but never the deadline.
+    pub issued_at: Instant,
 }
 
 impl RefreshTokens {
-    pub async fn insert(&self, token: String, identity: GrantIdentity) {
+    /// Insert a token that starts a fresh chain (birth = now). Used when the
+    /// token is minted off an authorization-code redemption, not a rotation.
+    pub async fn insert(&self, token: &str, identity: GrantIdentity) {
+        self.store(token, identity, Instant::now()).await;
+    }
+
+    /// Insert a rotated token, carrying the chain's original `issued_at` forward
+    /// so the absolute TTL is measured from the first mint, not this rotation.
+    pub async fn insert_rotated(&self, token: &str, identity: GrantIdentity, issued_at: Instant) {
+        self.store(token, identity, issued_at).await;
+    }
+
+    async fn store(&self, token: &str, identity: GrantIdentity, issued_at: Instant) {
         let mut map = self.inner.lock().await;
         Self::gc(&mut map);
         map.insert(
-            token,
+            hash_secret(token),
             RefreshToken {
                 identity,
-                expires_at: Instant::now() + REFRESH_TTL,
+                issued_at,
             },
         );
     }
@@ -215,11 +266,162 @@ impl RefreshTokens {
     pub async fn take(&self, token: &str) -> Option<RefreshToken> {
         let mut map = self.inner.lock().await;
         Self::gc(&mut map);
-        map.remove(token)
+        map.remove(&hash_secret(token))
     }
 
-    fn gc(map: &mut HashMap<String, RefreshToken>) {
+    /// Drop every refresh token belonging to `sub`, returning how many were
+    /// removed. Logout calls this: revoking the session row alone leaves this
+    /// identity's refresh chains live, so a logged-out user could silently mint a
+    /// fresh session via the refresh grant. A chain carries no stable session id
+    /// (each rotation mints a new session), so `sub` is the only handle spanning
+    /// it — hence purge-by-identity rather than per-token. (O4)
+    pub async fn purge_for_sub(&self, sub: &str) -> usize {
+        let mut map = self.inner.lock().await;
+        let before = map.len();
+        map.retain(|_, t| t.identity.sub != sub);
+        before - map.len()
+    }
+
+    fn gc(map: &mut HashMap<[u8; 32], RefreshToken>) {
         let now = Instant::now();
-        map.retain(|_, t| t.expires_at > now);
+        map.retain(|_, t| !chain_expired(t.issued_at, now));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity() -> GrantIdentity {
+        GrantIdentity {
+            sub: "u1".into(),
+            email: "u1@example.com".into(),
+            groups: vec!["eng".into()],
+        }
+    }
+
+    #[test]
+    fn hash_secret_is_not_the_raw_input_and_is_deterministic() {
+        let h = hash_secret("super-secret-token");
+        assert_ne!(h.as_slice(), b"super-secret-token");
+        assert_eq!(h, hash_secret("super-secret-token"));
+        assert_ne!(hash_secret("a"), hash_secret("b"));
+    }
+
+    #[tokio::test]
+    async fn refresh_round_trips_by_raw_token_and_is_consumed_once() {
+        let store = RefreshTokens::default();
+        store.insert("raw-token", identity()).await;
+
+        // Lookup hashes the presented value, so the raw token resolves...
+        let entry = store.take("raw-token").await.expect("token is live");
+        assert_eq!(entry.identity.sub, "u1");
+        // ...and rotation/redemption consumes it (replay finds nothing).
+        assert!(store.take("raw-token").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_rotation_carries_birth_time_and_never_extends_it() {
+        let store = RefreshTokens::default();
+
+        // A rotated token must store the *passed* chain birth verbatim, not
+        // `Instant::now()` — that's what keeps the absolute TTL from sliding.
+        let birth = Instant::now();
+        store.insert_rotated("rotated", identity(), birth).await;
+        let entry = store.take("rotated").await.expect("token is live");
+        assert_eq!(
+            entry.issued_at, birth,
+            "rotation must not reset the chain clock"
+        );
+
+        // A fresh insert, by contrast, stamps ~now.
+        let before = Instant::now();
+        store.insert("fresh", identity()).await;
+        let after = Instant::now();
+        let fresh = store.take("fresh").await.expect("token is live");
+        assert!(fresh.issued_at >= before && fresh.issued_at <= after);
+    }
+
+    #[test]
+    fn refresh_chain_ttl_bounds_group_staleness_within_a_day() {
+        // O3b: the chain's `groups` are frozen at the original login, so
+        // REFRESH_TTL is the worst-case window a since-revoked group keeps
+        // minting sessions. Guard against a regression back to a multi-week cap.
+        assert!(REFRESH_TTL <= Duration::from_secs(24 * 3600));
+    }
+
+    #[test]
+    fn chain_is_dead_once_it_reaches_the_absolute_ttl() {
+        // Offset off a single base instant so the future `now` never underflows
+        // the monotonic clock on a young process.
+        let born = Instant::now();
+        assert!(!chain_expired(born, born), "a fresh chain is live");
+        assert!(
+            !chain_expired(born, born + REFRESH_TTL - Duration::from_secs(1)),
+            "inside the window the chain still renews"
+        );
+        assert!(
+            chain_expired(born, born + REFRESH_TTL),
+            "at the cap the chain is dead — no more stale-group minting"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_refresh_chain_is_gc_dropped_and_not_returned() {
+        let store = RefreshTokens::default();
+        // Born a full TTL ago → already past the cap. checked_sub guards the
+        // (theoretical) young-clock underflow; skip rather than panic if so.
+        let Some(stale_birth) = Instant::now().checked_sub(REFRESH_TTL) else {
+            return;
+        };
+        store.insert_rotated("stale", identity(), stale_birth).await;
+        assert!(
+            store.take("stale").await.is_none(),
+            "a chain at/over REFRESH_TTL must not renew"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_for_sub_drops_only_that_identitys_chains() {
+        let store = RefreshTokens::default();
+        // Two live chains for u1 (e.g. two devices), one for u2.
+        store.insert("u1-a", identity()).await;
+        store.insert("u1-b", identity()).await;
+        store
+            .insert(
+                "u2-a",
+                GrantIdentity {
+                    sub: "u2".into(),
+                    ..identity()
+                },
+            )
+            .await;
+
+        let removed = store.purge_for_sub("u1").await;
+        assert_eq!(removed, 2, "both of u1's chains are purged");
+        assert!(store.take("u1-a").await.is_none());
+        assert!(store.take("u1-b").await.is_none());
+        // A different identity's chain is left intact.
+        assert!(store.take("u2-a").await.is_some());
+        // Purging an identity with no tokens is a no-op.
+        assert_eq!(store.purge_for_sub("nobody").await, 0);
+    }
+
+    #[tokio::test]
+    async fn auth_code_round_trips_by_raw_code_and_is_consumed_once() {
+        let store = AuthCodes::default();
+        store
+            .insert(
+                "raw-code",
+                identity(),
+                "challenge".into(),
+                "https://app/cb".into(),
+                "client-1".into(),
+            )
+            .await;
+
+        let entry = store.take("raw-code").await.expect("code is live");
+        assert_eq!(entry.client_id, "client-1");
+        assert!(store.take("raw-code").await.is_none());
     }
 }
