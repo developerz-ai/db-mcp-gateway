@@ -151,6 +151,8 @@ async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
                 sessions: sessions.clone(),
                 oidc,
                 flows: PendingFlows::default(),
+                codes: db_mcp_gateway::transport::AuthCodes::default(),
+                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
             }),
             config: Arc::new(config_file),
             adapter_registry: AdapterRegistry::new(),
@@ -159,6 +161,7 @@ async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
             metrics: None,
             permissions_cache: None,
             permissions_repo: Some(repo),
+            mcp_path: std::sync::Arc::from("/mcp"),
         },
     )
     .expect("router builds");
@@ -810,6 +813,8 @@ async fn admin_disabled_returns_404_on_admin_routes() {
                 sessions: sessions.clone(),
                 oidc,
                 flows: PendingFlows::default(),
+                codes: db_mcp_gateway::transport::AuthCodes::default(),
+                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
             }),
             config: Arc::new(config_file),
             adapter_registry: AdapterRegistry::new(),
@@ -818,6 +823,7 @@ async fn admin_disabled_returns_404_on_admin_routes() {
             metrics: None,
             permissions_cache: None,
             permissions_repo: Some(repo),
+            mcp_path: std::sync::Arc::from("/mcp"),
         },
     )
     .expect("router builds");

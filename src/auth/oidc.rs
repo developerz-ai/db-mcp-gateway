@@ -115,7 +115,12 @@ impl OidcClient {
     /// Build the IdP authorization URL the agent should send the user to.
     /// `state` and `nonce` are caller-supplied (the route hands them out and
     /// remembers them across the redirect).
-    pub async fn authorize_url(&self, state: &str, nonce: &str) -> Result<Url, AuthError> {
+    pub async fn authorize_url(
+        &self,
+        state: &str,
+        nonce: &str,
+        code_challenge: &str,
+    ) -> Result<Url, AuthError> {
         let discovery = self.discover().await?;
         let mut url =
             Url::parse(&discovery.authorization_endpoint).map_err(|_| AuthError::Discovery)?;
@@ -125,16 +130,21 @@ impl OidcClient {
             .append_pair("redirect_uri", &self.config.redirect_url)
             .append_pair("scope", SCOPES)
             .append_pair("state", state)
-            .append_pair("nonce", nonce);
+            .append_pair("nonce", nonce)
+            .append_pair("code_challenge", code_challenge)
+            .append_pair("code_challenge_method", "S256");
         Ok(url)
     }
 
     /// Exchange an authorization code for an ID token, verify it, and pluck
-    /// the subject, email, and groups claim.
+    /// the subject, email, and groups claim. `code_verifier` proves the PKCE
+    /// challenge sent at `authorize_url` (RFC 7636) — IdPs that mandate PKCE
+    /// reject the exchange without it.
     pub async fn exchange_and_verify(
         &self,
         code: &str,
         expected_nonce: &str,
+        code_verifier: &str,
     ) -> Result<VerifiedIdentity, AuthError> {
         let discovery = self.discover().await?;
 
@@ -147,6 +157,7 @@ impl OidcClient {
                 ("redirect_uri", &self.config.redirect_url),
                 ("client_id", &self.config.client_id),
                 ("client_secret", &self.config.client_secret),
+                ("code_verifier", code_verifier),
             ])
             .send()
             .await

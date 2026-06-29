@@ -100,6 +100,8 @@ async fn login_via_mock_idp_then_call_tool() {
                 sessions,
                 oidc,
                 flows: PendingFlows::default(),
+                codes: db_mcp_gateway::transport::AuthCodes::default(),
+                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
             }),
             config: Arc::new(config_file),
             adapter_registry: AdapterRegistry::new(),
@@ -108,6 +110,7 @@ async fn login_via_mock_idp_then_call_tool() {
             metrics: None,
             permissions_cache: None,
             permissions_repo: None,
+            mcp_path: std::sync::Arc::from("/mcp"),
         },
     )
     .expect("router builds");

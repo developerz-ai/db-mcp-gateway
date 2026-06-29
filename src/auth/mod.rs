@@ -9,6 +9,7 @@ pub mod config;
 pub mod errors;
 pub mod jwt;
 pub mod oidc;
+pub mod pkce;
 pub mod session;
 
 pub use config::AuthConfig;
