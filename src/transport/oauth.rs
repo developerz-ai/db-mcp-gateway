@@ -70,13 +70,25 @@ fn is_loopback_host(host: &str) -> bool {
 /// The gateway's external base URL. Authoritative source is the configured
 /// `OIDC_REDIRECT_URL` origin — the one URL we *know* the public edge resolves
 /// to (the IdP redirects a real browser there). Falls back to the request
-/// `Host` header when auth isn't wired (tests).
-pub(crate) fn base_url(state: &AppState, headers: &HeaderMap) -> String {
-    if let Some(auth) = state.auth.as_ref()
-        && let Some(origin) = origin_of(&auth.config.redirect_url)
-    {
-        return origin;
+/// `Host` header when auth isn't wired (tests). Fails closed (500) if auth is
+/// configured but the `OIDC_REDIRECT_URL` is unparseable.
+pub(crate) fn base_url(state: &AppState, headers: &HeaderMap) -> Result<String, Box<Response>> {
+    if let Some(auth) = state.auth.as_ref() {
+        match origin_of(&auth.config.redirect_url) {
+            Some(origin) => return Ok(origin),
+            None => {
+                // Configured redirect_url is not parseable; fail closed rather
+                // than falling back to the untrusted Host header.
+                return Err(Box::new(oauth_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "configured redirect_url is invalid",
+                )));
+            }
+        }
     }
+
+    // Auth not configured; fall back to Host header (tests only).
     let host = headers
         .get(HOST)
         .and_then(|v| v.to_str().ok())
@@ -92,7 +104,7 @@ pub(crate) fn base_url(state: &AppState, headers: &HeaderMap) -> String {
                 "https".to_string()
             }
         });
-    format!("{scheme}://{host}")
+    Ok(format!("{scheme}://{host}"))
 }
 
 /// RFC 9728 Protected Resource Metadata URL for a given base.
@@ -112,7 +124,10 @@ pub async fn protected_resource_metadata(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
-    let base = base_url(&state, &headers);
+    let base = match base_url(&state, &headers) {
+        Ok(b) => b,
+        Err(e) => return *e,
+    };
     let resource = format!("{}{}", base, state.mcp_path);
     Json(json!({
         "resource": resource,
@@ -129,7 +144,10 @@ pub async fn authorization_server_metadata(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
-    let base = base_url(&state, &headers);
+    let base = match base_url(&state, &headers) {
+        Ok(b) => b,
+        Err(e) => return *e,
+    };
     Json(json!({
         "issuer": base,
         "authorization_endpoint": format!("{base}/authorize"),
