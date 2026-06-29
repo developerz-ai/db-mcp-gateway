@@ -179,6 +179,7 @@ async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
                 oidc,
                 flows: PendingFlows::default(),
                 codes: db_mcp_gateway::transport::AuthCodes::default(),
+                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
             }),
             config: Arc::new(config_file),
             adapter_registry: AdapterRegistry::new(),

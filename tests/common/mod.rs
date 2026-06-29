@@ -46,8 +46,10 @@ struct MockIdpState {
     client_id: String,
     client_secret: String,
     user: MockUser,
-    /// `code → nonce`, populated by /authorize and consumed by /token.
-    codes: Arc<Mutex<HashMap<String, String>>>,
+    /// `code → (nonce, pkce_challenge)`, populated by /authorize and consumed
+    /// by /token. Storing the challenge lets /token enforce PKCE — proving the
+    /// gateway (as an OAuth client) actually sends a verifier.
+    codes: Arc<Mutex<HashMap<String, (String, String)>>>,
 }
 
 pub async fn spawn_mock_idp(client_id: &str, client_secret: &str, user: MockUser) -> MockIdpHandle {
@@ -104,6 +106,10 @@ struct AuthorizeQuery {
     response_type: String,
     client_id: String,
     #[serde(default)]
+    code_challenge: Option<String>,
+    #[serde(default)]
+    code_challenge_method: Option<String>,
+    #[serde(default)]
     _scope: Option<String>,
 }
 
@@ -116,8 +122,17 @@ async fn authorize(
     if q.response_type != "code" || q.client_id != s.client_id {
         return Err(StatusCode::BAD_REQUEST);
     }
+    // PKCE S256 is mandatory (mirrors equipo's /authorize). The gateway, acting
+    // as an OAuth client, MUST send a challenge — absence is a regression.
+    let challenge = match (q.code_challenge, q.code_challenge_method.as_deref()) {
+        (Some(c), Some("S256")) if !c.is_empty() => c,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
     let code = Uuid::new_v4().simple().to_string();
-    s.codes.lock().await.insert(code.clone(), q.nonce);
+    s.codes
+        .lock()
+        .await
+        .insert(code.clone(), (q.nonce, challenge));
     let target = format!("{}?code={}&state={}", q.redirect_uri, code, q.state);
     Ok(Redirect::temporary(&target))
 }
@@ -128,6 +143,8 @@ struct TokenForm {
     grant_type: String,
     client_id: String,
     client_secret: String,
+    #[serde(default)]
+    code_verifier: Option<String>,
     #[serde(default)]
     _redirect_uri: Option<String>,
 }
@@ -142,12 +159,21 @@ async fn token(
     {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    let nonce = s
+    let (nonce, challenge) = s
         .codes
         .lock()
         .await
         .remove(&form.code)
         .ok_or(StatusCode::BAD_REQUEST)?;
+    // Enforce PKCE: the gateway must present a verifier matching the challenge
+    // it sent at /authorize (RFC 7636). A missing/bad verifier is rejected.
+    let verifier = form
+        .code_verifier
+        .as_deref()
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    if !db_mcp_gateway::auth::pkce::verify(verifier, &challenge) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let id_token = sign_id_token(&s.issuer, &s.client_id, &s.user, &nonce);
     Ok(Json(json!({
         "access_token": "test-access",

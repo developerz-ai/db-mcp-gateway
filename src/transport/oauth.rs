@@ -31,17 +31,14 @@ use axum::extract::{Query, State};
 use axum::http::header::{CACHE_CONTROL, HOST, PRAGMA};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use url::{Host, Url};
 use uuid::Uuid;
 
-use crate::auth::jwt;
+use crate::auth::{jwt, pkce};
 
-use super::app_state::{AppState, OAuthBridge};
+use super::app_state::{AppState, AuthFacade, GrantIdentity, OAuthBridge};
 
 /// The single scope the gateway advertises. Authorization is by IdP `groups`
 /// claim against the permissions YAML, not OAuth scopes — so one umbrella
@@ -138,7 +135,7 @@ pub async fn authorization_server_metadata(
         "token_endpoint": format!("{base}/token"),
         "registration_endpoint": format!("{base}/register"),
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
         "scopes_supported": [MCP_SCOPE],
@@ -244,10 +241,17 @@ pub async fn authorize(
 
     // Drive the IdP login. We reuse the gateway's own registered redirect
     // (`OIDC_REDIRECT_URL` → /auth/callback); the bridge context recovered
-    // there tells the callback to mint a code instead of returning JSON.
+    // there tells the callback to mint a code instead of returning JSON. The
+    // gateway runs its *own* PKCE against the IdP (separate from the client's
+    // `code_challenge` above) since IdPs increasingly require it.
     let csrf_state = random_token();
     let nonce = random_token();
-    let idp_url = match auth.oidc.authorize_url(&csrf_state, &nonce).await {
+    let (idp_verifier, idp_challenge) = pkce::generate();
+    let idp_url = match auth
+        .oidc
+        .authorize_url(&csrf_state, &nonce, &idp_challenge)
+        .await
+    {
         Ok(url) => url,
         Err(_) => {
             return oauth_error(
@@ -261,6 +265,7 @@ pub async fn authorize(
         .insert_bridge(
             csrf_state,
             nonce,
+            idp_verifier,
             OAuthBridge {
                 client_redirect_uri: redirect_uri,
                 client_state: p.state.unwrap_or_default(),
@@ -285,47 +290,33 @@ pub(super) async fn complete_bridge_login(
     bridge: OAuthBridge,
     code: &str,
     nonce: &str,
+    idp_verifier: &str,
 ) -> Response {
     let Some(auth) = state.auth.as_ref() else {
         return redirect_with_error(&bridge, "server_error");
     };
 
-    let verified = match auth.oidc.exchange_and_verify(code, nonce).await {
+    let verified = match auth
+        .oidc
+        .exchange_and_verify(code, nonce, idp_verifier)
+        .await
+    {
         Ok(v) => v,
         Err(_) => return redirect_with_error(&bridge, "access_denied"),
     };
 
-    let session = match auth
-        .sessions
-        .create(
-            &verified.sub,
-            &verified.email,
-            &verified.groups,
-            auth.config.session_ttl,
-            None,
-        )
-        .await
-    {
-        Ok(s) => s,
-        Err(_) => return redirect_with_error(&bridge, "server_error"),
-    };
-
-    let access_token = match jwt::issue(
-        &auth.config.session_signing_key,
-        session.id,
-        &verified.sub,
-        auth.config.session_ttl,
-    ) {
-        Ok(t) => t,
-        Err(_) => return redirect_with_error(&bridge, "server_error"),
-    };
-
+    // Don't mint a session yet — only stash the verified identity. The session
+    // + access/refresh tokens are issued when the code is redeemed at `/token`,
+    // so an abandoned login leaves no orphan session row.
     let auth_code = random_token();
     auth.codes
         .insert(
             auth_code.clone(),
-            access_token,
-            auth.config.session_ttl.as_secs(),
+            GrantIdentity {
+                sub: verified.sub,
+                email: verified.email,
+                groups: verified.groups,
+            },
             bridge.code_challenge.clone(),
             bridge.client_redirect_uri.clone(),
         )
@@ -356,26 +347,33 @@ pub(super) async fn complete_bridge_login(
 #[derive(Debug, Deserialize)]
 pub struct TokenForm {
     grant_type: Option<String>,
+    // authorization_code grant:
     code: Option<String>,
     redirect_uri: Option<String>,
     code_verifier: Option<String>,
+    // refresh_token grant:
+    refresh_token: Option<String>,
     #[allow(dead_code)]
     client_id: Option<String>,
 }
 
-/// `POST /token` — redeem a one-time authorization code. Verifies the PKCE
-/// `code_verifier` against the stored S256 challenge and that the
-/// `redirect_uri` matches the one from `/authorize`, then returns the gateway
-/// session JWT as the bearer access token.
+/// `POST /token` — redeem an authorization code or a refresh token. For
+/// `authorization_code`, verifies the PKCE `code_verifier` against the stored
+/// S256 challenge and the `redirect_uri` match; for `refresh_token`, rotates
+/// the token. Both mint a fresh gateway session and return the session JWT as
+/// the bearer access token plus a new refresh token.
 pub async fn token(
     State(state): State<AppState>,
     axum::Form(form): axum::Form<TokenForm>,
 ) -> Response {
-    if form.grant_type.as_deref() != Some("authorization_code") {
+    // Validate the grant before touching auth state so a malformed request is a
+    // clean 400 regardless of wiring.
+    let grant = form.grant_type.as_deref();
+    if grant != Some("authorization_code") && grant != Some("refresh_token") {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
-            "only authorization_code is supported",
+            "supported grant types: authorization_code, refresh_token",
         );
     }
     let Some(auth) = state.auth.as_ref() else {
@@ -385,6 +383,14 @@ pub async fn token(
             "auth not configured",
         );
     };
+    if grant == Some("refresh_token") {
+        token_refresh(auth, form).await
+    } else {
+        token_authorization_code(auth, form).await
+    }
+}
+
+async fn token_authorization_code(auth: &AuthFacade, form: TokenForm) -> Response {
     let (Some(code), Some(verifier)) = (form.code.as_deref(), form.code_verifier.as_deref()) else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -413,7 +419,7 @@ pub async fn token(
         );
     }
 
-    if !verify_pkce(verifier, &entry.code_challenge) {
+    if !pkce::verify(verifier, &entry.code_challenge) {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
@@ -421,10 +427,76 @@ pub async fn token(
         );
     }
 
+    issue_token_response(auth, entry.identity).await
+}
+
+async fn token_refresh(auth: &AuthFacade, form: TokenForm) -> Response {
+    let Some(token) = form.refresh_token.as_deref() else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "refresh_token is required",
+        );
+    };
+    // Rotation: take() consumes the presented token; `issue_token_response`
+    // mints a fresh one. A replayed (already-rotated) token finds nothing.
+    let Some(entry) = auth.refresh.take(token).await else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "refresh token is invalid or expired",
+        );
+    };
+    issue_token_response(auth, entry.identity).await
+}
+
+/// Mint a fresh session for `identity`, issue the session JWT as the access
+/// token, mint+store a rotating refresh token, and render the OAuth token
+/// response (with `Cache-Control: no-store`).
+async fn issue_token_response(auth: &AuthFacade, identity: GrantIdentity) -> Response {
+    let session = match auth
+        .sessions
+        .create(
+            &identity.sub,
+            &identity.email,
+            &identity.groups,
+            auth.config.session_ttl,
+            None,
+        )
+        .await
+    {
+        Ok(s) => s,
+        Err(_) => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "could not create session",
+            );
+        }
+    };
+    let access_token = match jwt::issue(
+        &auth.config.session_signing_key,
+        session.id,
+        &identity.sub,
+        auth.config.session_ttl,
+    ) {
+        Ok(t) => t,
+        Err(_) => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "could not issue token",
+            );
+        }
+    };
+    let refresh_token = random_token();
+    auth.refresh.insert(refresh_token.clone(), identity).await;
+
     let body = json!({
-        "access_token": entry.access_token,
+        "access_token": access_token,
         "token_type": "Bearer",
-        "expires_in": entry.expires_in_seconds,
+        "expires_in": auth.config.session_ttl.as_secs(),
+        "refresh_token": refresh_token,
         "scope": MCP_SCOPE,
     });
     // OAuth 2.1 §Token Response: token responses must not be cached.
@@ -439,25 +511,6 @@ pub async fn token(
 // ---------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------
-
-/// PKCE S256 check: `base64url-no-pad(SHA256(verifier)) == challenge`, compared
-/// in constant time so a mismatch can't be probed byte-by-byte via timing.
-fn verify_pkce(verifier: &str, challenge: &str) -> bool {
-    let digest = Sha256::digest(verifier.as_bytes());
-    let computed = URL_SAFE_NO_PAD.encode(digest);
-    ct_eq(computed.as_bytes(), challenge.as_bytes())
-}
-
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
 
 /// Redirect URIs must be a loopback address or HTTPS (MCP spec §Communication
 /// Security / §Open Redirection). Anything else is rejected before we trust it.
@@ -513,15 +566,6 @@ fn random_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pkce_s256_round_trip() {
-        // RFC 7636 Appendix B test vector.
-        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
-        assert!(verify_pkce(verifier, challenge));
-        assert!(!verify_pkce("wrong-verifier", challenge));
-    }
 
     #[test]
     fn redirect_uri_rules() {

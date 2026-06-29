@@ -12,7 +12,7 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::auth::{AuthError, Identity, jwt};
+use crate::auth::{AuthError, Identity, jwt, pkce};
 
 use super::app_state::AppState;
 use super::oauth;
@@ -27,8 +27,12 @@ pub async fn login(State(state): State<AppState>) -> Result<Json<LoginResponse>,
     let auth = state.auth.as_ref().ok_or(AuthError::Discovery)?;
     let csrf_state = random_token();
     let nonce = random_token();
-    let url = auth.oidc.authorize_url(&csrf_state, &nonce).await?;
-    auth.flows.insert(csrf_state.clone(), nonce).await;
+    let (verifier, challenge) = pkce::generate();
+    let url = auth
+        .oidc
+        .authorize_url(&csrf_state, &nonce, &challenge)
+        .await?;
+    auth.flows.insert(csrf_state.clone(), nonce, verifier).await;
     Ok(Json(LoginResponse {
         login_url: url.to_string(),
         state: csrf_state,
@@ -62,14 +66,21 @@ pub async fn callback(
     // gateway mints an authorization code and 302s back to the client's
     // loopback redirect instead of returning the token as JSON.
     if let Some(bridge) = flow.bridge {
-        return oauth::complete_bridge_login(&state, bridge, &params.code, &flow.nonce).await;
+        return oauth::complete_bridge_login(
+            &state,
+            bridge,
+            &params.code,
+            &flow.nonce,
+            &flow.idp_verifier,
+        )
+        .await;
     }
 
     // Bespoke flow: the agent POSTed `/auth/login` and polls here for the
     // session token as JSON.
     let verified = match auth
         .oidc
-        .exchange_and_verify(&params.code, &flow.nonce)
+        .exchange_and_verify(&params.code, &flow.nonce, &flow.idp_verifier)
         .await
     {
         Ok(v) => v,

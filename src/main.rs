@@ -12,7 +12,7 @@ use db_mcp_gateway::exec::AdapterRegistry;
 use db_mcp_gateway::state::permissions::pg::PgPermissionsRepo;
 use db_mcp_gateway::transport::probes::ShutdownFlag;
 use db_mcp_gateway::transport::tls;
-use db_mcp_gateway::transport::{AppState, AuthCodes, AuthFacade, PendingFlows};
+use db_mcp_gateway::transport::{AppState, AuthCodes, AuthFacade, PendingFlows, RefreshTokens};
 use db_mcp_gateway::{config::Config, state, transport};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use sqlx::PgPool;
@@ -125,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
             oidc,
             flows: PendingFlows::default(),
             codes: AuthCodes::default(),
+            refresh: RefreshTokens::default(),
         }),
         config: Arc::new(config_file),
         adapter_registry: AdapterRegistry::new(),

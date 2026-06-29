@@ -88,6 +88,7 @@ async fn mcp_oauth_bridge_full_flow() {
                 oidc,
                 flows: PendingFlows::default(),
                 codes: AuthCodes::default(),
+                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
             }),
             config: Arc::new(config_file),
             adapter_registry: AdapterRegistry::new(),
@@ -218,6 +219,11 @@ async fn mcp_oauth_bridge_full_flow() {
         .expect("access_token string")
         .to_string();
     assert!(!access_token.is_empty());
+    let refresh_token = token["refresh_token"]
+        .as_str()
+        .expect("refresh_token string")
+        .to_string();
+    assert!(!refresh_token.is_empty());
 
     // 5. The access token is a working MCP bearer: list_servers sees `prod`.
     let resp: Value = client
@@ -253,6 +259,55 @@ async fn mcp_oauth_bridge_full_flow() {
     assert_eq!(replay.status(), 400);
     assert_eq!(
         replay.json::<Value>().await.unwrap()["error"],
+        "invalid_grant"
+    );
+
+    // 7. Refresh: the refresh_token mints a fresh access token (+ rotated
+    //    refresh) with no browser round-trip, and the new bearer works.
+    let refreshed: Value = client
+        .post(format!("{gateway_url}/token"))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .expect("refresh succeeds")
+        .json()
+        .await
+        .unwrap();
+    let new_access = refreshed["access_token"]
+        .as_str()
+        .expect("refreshed access_token");
+    let new_refresh = refreshed["refresh_token"]
+        .as_str()
+        .expect("rotated refresh_token");
+    assert_ne!(new_refresh, refresh_token, "refresh token must rotate");
+    let ok = client
+        .post(format!("{gateway_url}/mcp"))
+        .bearer_auth(new_access)
+        .json(&json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                      "params": {"name": "list_servers"}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(ok.status().is_success(), "refreshed bearer works");
+
+    // 8. Rotation invalidates the old refresh token (OAuth 2.1 public client).
+    let reused = client
+        .post(format!("{gateway_url}/token"))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reused.status(), 400);
+    assert_eq!(
+        reused.json::<Value>().await.unwrap()["error"],
         "invalid_grant"
     );
 }
