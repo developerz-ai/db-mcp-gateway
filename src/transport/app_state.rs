@@ -112,6 +112,9 @@ pub struct AuthFacade {
 /// redirect URI — the loopback Claude Code listens on.
 #[derive(Debug, Clone)]
 pub struct OAuthBridge {
+    /// The client_id from `/register` — carried through so `/token` can verify
+    /// the presenter matches the registrant.
+    pub client_id: String,
     /// The MCP client's registered redirect URI (loopback or https).
     pub client_redirect_uri: String,
     /// The MCP client's `state` — echoed back verbatim on the final redirect.
@@ -222,6 +225,9 @@ pub struct AuthCode {
     pub code_challenge: String,
     /// Redirect URI from `/authorize`; `/token` must present the same value.
     pub redirect_uri: String,
+    /// Registered client_id from `/authorize`; `/token` verifies the presenter
+    /// matches the registrant (OAuth 2.1 §4.1.3 for public clients).
+    pub client_id: String,
     expires_at: Instant,
 }
 
@@ -232,6 +238,7 @@ impl AuthCodes {
         identity: GrantIdentity,
         code_challenge: String,
         redirect_uri: String,
+        client_id: String,
     ) {
         let mut map = self.inner.lock().await;
         Self::gc(&mut map);
@@ -241,6 +248,7 @@ impl AuthCodes {
                 identity,
                 code_challenge,
                 redirect_uri,
+                client_id,
                 expires_at: Instant::now() + CODE_TTL,
             },
         );

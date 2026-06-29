@@ -330,6 +330,7 @@ pub async fn authorize(
             nonce,
             idp_verifier,
             OAuthBridge {
+                client_id: client_id.to_owned(),
                 client_redirect_uri: redirect_uri,
                 client_state,
                 code_challenge,
@@ -382,6 +383,7 @@ pub(super) async fn complete_bridge_login(
             },
             bridge.code_challenge.clone(),
             bridge.client_redirect_uri.clone(),
+            bridge.client_id.clone(),
         )
         .await;
 
@@ -417,7 +419,9 @@ pub struct TokenForm {
     code_verifier: Option<String>,
     // refresh_token grant:
     refresh_token: Option<String>,
-    #[allow(dead_code)]
+    /// RFC 6749 §3.2.1: public clients SHOULD send `client_id`; when present,
+    /// verify it matches the registered client that obtained the authorization
+    /// code (prevents code-injection across clients).
     client_id: Option<String>,
 }
 
@@ -471,6 +475,19 @@ async fn token_authorization_code(auth: &AuthFacade, form: TokenForm) -> Respons
             "authorization code is invalid or expired",
         );
     };
+
+    // client_id, when sent, must match the registrant (RFC 6749 §3.2.1).
+    // Public clients aren't authenticated by secret, but binding the code to
+    // its originating client_id prevents cross-client code-injection.
+    if let Some(sent) = form.client_id.as_deref()
+        && sent != entry.client_id
+    {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "client_id mismatch",
+        );
+    }
 
     // redirect_uri, when sent, must match the authorize-time value (OAuth 2.1).
     if let Some(sent) = form.redirect_uri.as_deref()
