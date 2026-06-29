@@ -21,6 +21,10 @@ jobs:
   # Native per-arch build (amd64 + arm64), each pushed by digest, then merged
   # into one manifest list under the semver + :latest tags. Native arm64 runners
   # replace the single-runner QEMU build that timed out at 30 min (see ci.yml).
+  # Release compiles are CPU-bound: amd64 runs on an 8-vCPU runner; arm64 stays
+  # on 2-vCPU (no larger arm runner is provisioned for the org — bumping to an
+  # unavailable size would hang the release). gha layer cache (cache-from/to
+  # below) already memoises the dependency build across runs.
   build:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -32,7 +36,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: blacksmith-2vcpu-ubuntu-2404
+            runner: blacksmith-8vcpu-ubuntu-2404
           - platform: linux/arm64
             runner: blacksmith-2vcpu-ubuntu-2404-arm
     steps:
