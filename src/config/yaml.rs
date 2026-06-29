@@ -71,18 +71,19 @@ pub enum ConfigFileError {
         #[source]
         source: std::io::Error,
     },
-    /// `Display` is the operator-facing line and we want it self-contained:
-    /// path, line:column (when serde_yaml supplies it), and the underlying
-    /// reason — including serde's `unknown field, expected one of …`
-    /// suggestion list. Chained via `source` so structured loggers still
-    /// walk the underlying `serde_yaml::Error`.
-    #[error("{path}{location}: {message}")]
+    /// `Display` deliberately omits the raw serde_yaml message: that text can
+    /// echo an offending scalar (e.g. a password mis-pasted into a typed field)
+    /// verbatim into the boot log. We surface only `path` + `:line:column` so
+    /// operators can find the offending line without the value being printed.
+    /// The full serde reason stays reachable via the `source` chain for callers
+    /// (tests, structured loggers) that opt into walking it.
+    #[error("{path}{location}: invalid configuration")]
     Parse {
         path: PathBuf,
         /// `:line:column` when serde_yaml knows it, empty otherwise.
         location: String,
-        /// Pre-rendered `source` text — keeps `Display` operator-friendly
-        /// without forcing every caller to walk the error chain.
+        /// Pre-rendered `source` text. Kept for callers that walk the error
+        /// chain; never rendered by `Display` (see the variant doc comment).
         message: String,
         #[source]
         source: serde_yaml::Error,
@@ -268,6 +269,14 @@ impl ConfigFile {
 
         let mut group_names: HashSet<&str> = HashSet::new();
         for permission in &self.permissions {
+            // An empty/whitespace group name would silently grant this block to
+            // any identity carrying a blank group claim. Same meaning-when-present
+            // rule as `admin.group` and `auth_database` above — reject at boot.
+            if permission.group.trim().is_empty() {
+                return Err(ConfigFileError::Invalid(
+                    "permission group name must be non-empty".to_string(),
+                ));
+            }
             if !group_names.insert(&permission.group) {
                 return Err(ConfigFileError::Invalid(format!(
                     "duplicate permission group `{}`",
@@ -275,6 +284,21 @@ impl ConfigFile {
                 )));
             }
             for grant in &permission.grants {
+                // Empty/whitespace `server`/`database` would otherwise surface as
+                // a cryptic "unknown server ``" from the existence checks below;
+                // reject up front for a clear boot error. (`*` is the wildcard.)
+                if grant.server.trim().is_empty() {
+                    return Err(ConfigFileError::Invalid(format!(
+                        "permission group `{}` has a grant with an empty `server`",
+                        permission.group
+                    )));
+                }
+                if grant.database.trim().is_empty() {
+                    return Err(ConfigFileError::Invalid(format!(
+                        "permission group `{}` has a grant with an empty `database`",
+                        permission.group
+                    )));
+                }
                 if grant.server != "*" && !server_names.contains(grant.server.as_str()) {
                     return Err(ConfigFileError::Invalid(format!(
                         "permission group `{}` grants on unknown server `{}`",
@@ -450,6 +474,29 @@ permissions:
         assert!(msg.contains("dup"), "{msg}");
     }
 
+    /// AZ1: an empty (or whitespace-only) group name would grant this block to
+    /// any identity carrying a blank group claim. Reject at boot.
+    #[test]
+    fn rejects_empty_permission_group_name() {
+        let yaml = r#"
+servers:
+  - name: prod
+    kind: postgres
+    host: a
+    databases:
+      - { name: app, role: ro, password: x }
+permissions:
+  - group: "   "
+    grants:
+      - { server: prod, database: app, action: query_read }
+"#;
+        let err = ConfigFile::from_yaml_str(yaml).expect_err("blank group must reject");
+        let ConfigFileError::Invalid(msg) = err else {
+            panic!("expected Invalid, got {err:?}");
+        };
+        assert!(msg.contains("non-empty"), "{msg}");
+    }
+
     #[test]
     fn rejects_wildcard_server_grant_on_unknown_database() {
         let yaml = r#"
@@ -587,20 +634,32 @@ permissions:
 ";
         let err = ConfigFile::from_yaml_str(yaml).expect_err("typo must be rejected");
         let rendered = format!("{err}");
-        // Names the misspelled key, lists the right ones, and points at the line.
+        // Display points at the line but must NOT echo the raw serde text
+        // (which can carry an offending scalar). The misspelled key and the
+        // suggestion list live in the `source` chain only.
         assert!(
-            rendered.contains("statemnt_timeout_ms"),
-            "missing misspelled key: {rendered}"
-        );
-        assert!(
-            rendered.contains("statement_timeout_ms"),
-            "missing suggestion: {rendered}"
+            !rendered.contains("statemnt_timeout_ms"),
+            "Display must not echo raw serde text: {rendered}"
         );
         // serde_yaml reports the line of the offending key. Exact column varies
         // by serde_yaml version; assert just on a `:line:column` shape.
         assert!(
             rendered.contains(":14:") || rendered.contains(":13:"),
             "expected `:14:` or `:13:` line marker in: {rendered}"
+        );
+        // The full reason — misspelled key + suggestions — stays reachable for
+        // callers that walk the chain.
+        let ConfigFileError::Parse { source, .. } = err else {
+            panic!("expected Parse, got {err:?}");
+        };
+        let detail = source.to_string();
+        assert!(
+            detail.contains("statemnt_timeout_ms"),
+            "missing misspelled key in source: {detail}"
+        );
+        assert!(
+            detail.contains("statement_timeout_ms"),
+            "missing suggestion in source: {detail}"
         );
     }
 
@@ -622,10 +681,19 @@ servers:
 ";
         let err = ConfigFile::from_yaml_str(yaml).expect_err("typo must be rejected");
         let rendered = format!("{err}");
-        assert!(rendered.contains("descriptoin"), "missing key: {rendered}");
+        // Same contract: Display stays scalar-free, suggestions live in source.
         assert!(
-            rendered.contains("description"),
-            "missing suggestion: {rendered}"
+            !rendered.contains("descriptoin"),
+            "Display must not echo raw serde text: {rendered}"
+        );
+        let ConfigFileError::Parse { source, .. } = err else {
+            panic!("expected Parse, got {err:?}");
+        };
+        let detail = source.to_string();
+        assert!(detail.contains("descriptoin"), "missing key: {detail}");
+        assert!(
+            detail.contains("description"),
+            "missing suggestion: {detail}"
         );
     }
 
@@ -782,10 +850,49 @@ permissions:
 ";
         let err = ConfigFile::from_yaml_str(yaml).expect_err("typo must be rejected");
         let rendered = format!("{err}");
-        assert!(rendered.contains("query_reed"), "missing got: {rendered}");
         assert!(
-            rendered.contains("query_read"),
-            "missing expected: {rendered}"
+            !rendered.contains("query_reed"),
+            "Display must not echo raw serde text: {rendered}"
+        );
+        let ConfigFileError::Parse { source, .. } = err else {
+            panic!("expected Parse, got {err:?}");
+        };
+        let detail = source.to_string();
+        assert!(detail.contains("query_reed"), "missing got: {detail}");
+        assert!(detail.contains("query_read"), "missing expected: {detail}");
+    }
+
+    /// C4: the rendered `Display` of a parse error must never carry the raw
+    /// serde_yaml text — an offending scalar (potentially a secret) could ride
+    /// along. The reason stays reachable only via the `source` chain.
+    #[test]
+    fn parse_error_display_omits_raw_serde_text() {
+        // `port` wants u16; the string value is the kind of scalar serde would
+        // otherwise echo verbatim into its message.
+        let yaml = "\
+servers:
+  - name: prod
+    kind: postgres
+    host: a
+    port: \"sup3r-s3cret-looking-scalar\"
+";
+        let err = ConfigFile::from_yaml_str(yaml).expect_err("type mismatch must be rejected");
+        let rendered = format!("{err}");
+        assert!(
+            !rendered.contains("sup3r-s3cret-looking-scalar"),
+            "Display leaked the offending scalar: {rendered}"
+        );
+        assert!(
+            rendered.contains("invalid configuration"),
+            "Display should be the generic operator line: {rendered}"
+        );
+        // The scalar is still available for chain-walking callers.
+        let ConfigFileError::Parse { source, .. } = err else {
+            panic!("expected Parse, got {err:?}");
+        };
+        assert!(
+            source.to_string().contains("sup3r-s3cret-looking-scalar"),
+            "source should retain the full serde reason"
         );
     }
 }

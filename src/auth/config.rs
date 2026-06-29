@@ -54,6 +54,14 @@ pub enum AuthConfigError {
         value: String,
         source: std::num::ParseIntError,
     },
+    /// The committed dev signing key would be used to sign production session
+    /// JWTs (A1). The key is public in this repo, so anyone could mint a
+    /// valid-signature bearer. Message carries no key material.
+    #[error(
+        "SESSION_SIGNING_KEY is unset or equals the committed dev default; \
+         set a unique key, or enable OIDC_MOCK_MODE for local dev"
+    )]
+    DefaultSigningKey,
 }
 
 impl Default for AuthConfig {
@@ -111,8 +119,19 @@ impl AuthConfig {
             config.mock_mode = matches!(value.as_str(), "1" | "true" | "TRUE");
         }
 
+        reject_default_signing_key(&config)?;
         Ok(config)
     }
+}
+
+/// Refuse to boot a non-mock gateway still using the committed dev signing key.
+/// We reject only the *exact* default (no length check) so short test keys keep
+/// working; mock mode is exempt so CI / local dev needs no real key (A1).
+fn reject_default_signing_key(config: &AuthConfig) -> Result<(), AuthConfigError> {
+    if !config.mock_mode && config.session_signing_key == DEFAULT_DEV_SIGNING_KEY.as_bytes() {
+        return Err(AuthConfigError::DefaultSigningKey);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -125,5 +144,32 @@ mod tests {
         assert_eq!(config.groups_claim, "groups");
         assert_eq!(config.session_ttl, Duration::from_secs(8 * 3600));
         assert!(!config.mock_mode);
+    }
+
+    #[test]
+    fn default_signing_key_rejected_in_non_mock() {
+        let config = AuthConfig::default();
+        assert!(matches!(
+            reject_default_signing_key(&config),
+            Err(AuthConfigError::DefaultSigningKey)
+        ));
+    }
+
+    #[test]
+    fn default_signing_key_allowed_in_mock() {
+        let config = AuthConfig {
+            mock_mode: true,
+            ..AuthConfig::default()
+        };
+        assert!(reject_default_signing_key(&config).is_ok());
+    }
+
+    #[test]
+    fn custom_signing_key_allowed() {
+        let config = AuthConfig {
+            session_signing_key: b"a-unique-production-signing-key".to_vec(),
+            ..AuthConfig::default()
+        };
+        assert!(reject_default_signing_key(&config).is_ok());
     }
 }

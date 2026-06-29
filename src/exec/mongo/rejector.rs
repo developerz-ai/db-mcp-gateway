@@ -15,8 +15,8 @@
 //!     `find`, `aggregate`, `count`, `distinct` pass — matches issue #57
 //!     scope. Spec 12 §234 lists a broader allow set; the broader items
 //!     (`listCollections`, `listIndexes`, …) land with execution in #58.
-//!  2. The four denied operators — `$out`, `$merge`, `$function`,
-//!     `$where` — are rejected at *any* depth in the document tree.
+//!  2. The denied operators — `$out`, `$merge`, `$function`, `$where`,
+//!     `$accumulator` — are rejected at *any* depth in the document tree.
 //!     Anything else (an unknown `$op`, a write-shaped value, a top-level
 //!     `update` command, …) is rejected by virtue of failing the command
 //!     allow-list check at the top level.
@@ -37,15 +37,19 @@ const ALLOWED_COMMANDS: &[&str] = &["find", "aggregate", "count", "distinct"];
 
 /// Denied operator keys. Reject at any depth — an aggregation pipeline
 /// stage, a projection, a filter, an embedded subdocument: anywhere a `$`
-/// prefix appears. The four operators were chosen because each can drive
-/// a write or arbitrary JS execution:
+/// prefix appears. Each operator was chosen because it can drive a write
+/// or arbitrary JS execution:
 ///
 /// - `$out` — writes the pipeline output to a collection.
 /// - `$merge` — same, but with upsert semantics (mongo's `$out` successor).
 /// - `$function` — server-side JS evaluation (any side effect).
 /// - `$where` — JS predicate evaluation. Static analysis of arbitrary JS
 ///   for purity is impossible, so the conservative choice is reject all.
-const DENIED_OPERATORS: &[&str] = &["$out", "$merge", "$function", "$where"];
+/// - `$accumulator` — custom aggregation accumulator running server-side
+///   JS (`init`/`accumulate`/`merge`/`finalize`), reachable inside an
+///   allowed `aggregate` pipeline (e.g. nested in `$group`). Same JS
+///   execution risk class as `$function`/`$where`.
+const DENIED_OPERATORS: &[&str] = &["$out", "$merge", "$function", "$where", "$accumulator"];
 
 /// Why a command was rejected. `Display` is operator-facing and never
 /// carries any of the command's *values* — the structured rejection is the
@@ -205,6 +209,11 @@ mod tests {
                 "$where inside $lookup sub-pipeline denied",
                 r#"{"aggregate":"users","pipeline":[{"$lookup":{"from":"orders","let":{},"pipeline":[{"$match":{"$where":"true"}}],"as":"o"}}],"cursor":{}}"#,
                 Err(RejectReason::DisallowedOperator("$where")),
+            ),
+            (
+                "$accumulator nested in $group denied",
+                r#"{"aggregate":"users","pipeline":[{"$group":{"_id":null,"x":{"$accumulator":{"init":"function(){return 0}","accumulate":"function(s){return s}","accumulateArgs":[],"merge":"function(a,b){return a}","lang":"js"}}}}],"cursor":{}}"#,
+                Err(RejectReason::DisallowedOperator("$accumulator")),
             ),
             // --- malformed / empty inputs --------------------------------------
             (
