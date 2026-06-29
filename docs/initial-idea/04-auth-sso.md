@@ -56,6 +56,8 @@ Spec-compliant MCP clients (Claude Code, Cursor) don't speak the bespoke flow ab
 5. POST /token  (grant_type=authorization_code)      → PKCE verifier checked; returns
                                                        access_token + refresh_token
 6. POST /token  (grant_type=refresh_token)           → rotates; returns new pair
+7. POST /revoke                                      → RFC 7009; invalidate a refresh
+                                                       or access token (always 200)
 ```
 
 The access token is the same HS256 gateway session JWT the bespoke flow issues, so the bearer middleware, revocation, and audit are all unchanged.
@@ -65,7 +67,7 @@ The access token is the same HS256 gateway session JWT the bespoke flow issues, 
 | Endpoint | Auth | Purpose |
 |---|---|---|
 | `GET /.well-known/oauth-protected-resource[/<mcp-path>]` | none | RFC 9728 resource metadata; names this gateway as its AS |
-| `GET /.well-known/oauth-authorization-server` | none | RFC 8414 AS metadata (`authorization_endpoint`, `token_endpoint`, `registration_endpoint`, `code_challenge_methods_supported: ["S256"]`) |
+| `GET /.well-known/oauth-authorization-server` | none | RFC 8414 AS metadata (`authorization_endpoint`, `token_endpoint`, `registration_endpoint`, `revocation_endpoint`, `code_challenge_methods_supported: ["S256"]`) |
 | `GET /.well-known/openid-configuration` | none | Alias for the AS metadata above |
 
 The base URL for all metadata is derived from the configured `OIDC_REDIRECT_URL` origin. If that value is unparseable the gateway fails closed with `500` rather than trusting the `Host` header.
@@ -141,6 +143,22 @@ Rotation does **not** extend the token's lifetime. A chain has an **absolute TTL
 
 The access token is an HS256 gateway session JWT (same as the bespoke flow). Authorization is by IdP group membership against the permissions YAML, not by OAuth scope — `mcp` is the single umbrella scope advertised.
 
+### Revocation endpoint — `POST /revoke`
+
+RFC 7009 OAuth 2.0 Token Revocation. Accepts `application/x-www-form-urlencoded`. Unauthenticated like `/token` — the presented token is itself the credential, so a caller can only revoke a token it already holds.
+
+| Field | Requirement |
+|---|---|
+| `token` | the token to revoke — a refresh token or a session access token |
+| `token_type_hint` | optional (`access_token` \| `refresh_token`); accepted but advisory — the gateway probes both stores regardless |
+
+The gateway invalidates whichever the token matches:
+
+- **Refresh token** → dropped from the rotation store. Since a rotated chain keeps exactly one live token, this ends the whole chain.
+- **Access token** (session JWT) → its backing session row is revoked, so the bearer stops working on the next request (RFC 7009 §2.1 — kill the access token too, not just the refresh token).
+
+Per RFC 7009 §2.2 the response is **`200` for any well-formed request** — an unknown, expired, forged, or already-revoked token included — so the endpoint can't be used to probe token validity. A missing `token` is the lone malformed case → `invalid_request` (400). Responses carry `Cache-Control: no-store`.
+
 ### Proxy / WAF requirements
 
 If the gateway is fronted by a reverse proxy or WAF, the following paths must reach it **unauthenticated**:
@@ -151,6 +169,7 @@ If the gateway is fronted by a reverse proxy or WAF, the following paths must re
 /.well-known/openid-configuration
 GET  /authorize
 POST /token
+POST /revoke
 POST /register
 ```
 
@@ -164,7 +183,7 @@ All MCP OAuth bridge flow state — client registrations, pending IdP round-trip
 - Short TTL (default 8 hours; `expires_in` in the token response reflects the actual value).
 - **Bespoke flow:** refresh by re-running SSO. No long-lived refresh token on the developer's machine.
 - **OAuth bridge flow:** a rotating opaque refresh token is returned at `/token`. Presenting it issues a new access+refresh pair and consumes the old refresh token (replay → `invalid_grant`). Rotation never extends the chain: an absolute 24-hour TTL runs from the first token's mint, after which the client must re-authenticate via `/authorize`. The cap is short on purpose — refresh re-uses the groups frozen at login, so it doubles as the staleness bound for a revoked group (see the `/token` section above). Refresh tokens are stored hashed, in-memory, and lost on restart.
-- Revocation: server-side denylist in state DB. Logout writes to the denylist; every request checks.
+- Revocation: server-side, in the state DB. Logout (`POST /auth/logout`) revokes the session row **and** purges every refresh-token chain for that identity — otherwise a logged-out client could silently mint a fresh session via the refresh grant. Clients may also revoke a single token out-of-band via `POST /revoke` (RFC 7009). Every `/mcp` request re-checks the session, so a revocation takes effect on the next call.
 
 ## Group resolution
 

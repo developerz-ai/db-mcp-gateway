@@ -49,73 +49,13 @@ fn state_db_url() -> String {
 
 #[tokio::test]
 async fn mcp_oauth_bridge_full_flow() {
-    let pool = state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)");
-
     let user = MockUser {
         sub: format!("bridge-user-{}", uuid::Uuid::new_v4().simple()),
         email: "bridge@example.com".to_string(),
         groups: vec!["engineers".into()],
     };
-    let idp = spawn_mock_idp("test-client", "test-secret", user).await;
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let gateway_url = format!("http://{addr}");
-
-    let auth_config = AuthConfig {
-        issuer: idp.issuer.clone(),
-        client_id: idp.client_id.clone(),
-        client_secret: idp.client_secret.clone(),
-        audience: idp.client_id.clone(),
-        redirect_url: format!("{gateway_url}/auth/callback"),
-        ..AuthConfig::default()
-    };
-    let sessions = SessionStore::new(pool.clone());
-    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient http builder");
-    let config = Config {
-        bind: addr,
-        ..Config::default()
-    };
-    let config_file = ConfigFile::from_yaml_str(E2E_CONFIG_YAML).expect("e2e yaml is well-formed");
-    let app = transport::router(
-        &config,
-        AppState {
-            auth: Some(AuthFacade {
-                config: Arc::new(auth_config),
-                sessions,
-                oidc,
-                flows: PendingFlows::default(),
-                codes: AuthCodes::default(),
-                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
-            }),
-            config: Arc::new(config_file),
-            adapter_registry: AdapterRegistry::new(),
-            state_db: Some(pool),
-            shutdown: Default::default(),
-            metrics: None,
-            permissions_cache: None,
-            permissions_repo: None,
-            mcp_path: std::sync::Arc::from("/mcp"),
-            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
-        },
-    )
-    .expect("router builds");
-    tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await;
-    });
-
     // Don't auto-follow: we assert each hop of the OAuth dance explicitly.
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let (gateway_url, client) = spawn_bridge_gateway(user).await;
 
     // 0. The regression itself: an unauthenticated /mcp call must carry a
     //    WWW-Authenticate header pointing at the protected-resource metadata,
@@ -535,72 +475,12 @@ async fn missing_state_rejected() {
 /// port-flex rule at `/authorize`.
 #[tokio::test]
 async fn code_bound_to_client_redirect_challenge() {
-    let pool = state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)");
-
     let user = MockUser {
         sub: format!("bound-user-{}", uuid::Uuid::new_v4().simple()),
         email: "bound@example.com".to_string(),
         groups: vec!["engineers".into()],
     };
-    let idp = spawn_mock_idp("bound-client", "bound-secret", user).await;
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let gateway_url = format!("http://{addr}");
-
-    let auth_config = AuthConfig {
-        issuer: idp.issuer.clone(),
-        client_id: idp.client_id.clone(),
-        client_secret: idp.client_secret.clone(),
-        audience: idp.client_id.clone(),
-        redirect_url: format!("{gateway_url}/auth/callback"),
-        ..AuthConfig::default()
-    };
-    let sessions = SessionStore::new(pool.clone());
-    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient");
-    let config = Config {
-        bind: addr,
-        ..Config::default()
-    };
-    let config_file = ConfigFile::from_yaml_str(E2E_CONFIG_YAML).expect("e2e yaml");
-    let app = transport::router(
-        &config,
-        AppState {
-            auth: Some(AuthFacade {
-                config: Arc::new(auth_config),
-                sessions,
-                oidc,
-                flows: PendingFlows::default(),
-                codes: AuthCodes::default(),
-                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
-            }),
-            config: Arc::new(config_file),
-            adapter_registry: AdapterRegistry::new(),
-            state_db: Some(pool),
-            shutdown: Default::default(),
-            metrics: None,
-            permissions_cache: None,
-            permissions_repo: None,
-            mcp_path: std::sync::Arc::from("/mcp"),
-            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
-        },
-    )
-    .expect("router builds");
-    tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await;
-    });
-
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let (gateway_url, http) = spawn_bridge_gateway(user).await;
 
     let client_id = register_client(&http, &gateway_url, CLIENT_REDIRECT).await;
 
@@ -675,6 +555,247 @@ async fn code_bound_to_client_redirect_challenge() {
         wrong_client.json::<Value>().await.unwrap()["error"],
         "invalid_grant",
         "client_id mismatch must yield invalid_grant"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Revocation & logout (O4): logout purges this identity's refresh chains, and
+// RFC 7009 `/revoke` invalidates a presented refresh or access token.
+// ---------------------------------------------------------------------------
+
+/// Boot a full gateway (mock IdP + real state DB) wired for the OAuth bridge.
+/// Returns the gateway base URL and a non-redirect-following HTTP client.
+async fn spawn_bridge_gateway(user: MockUser) -> (String, reqwest::Client) {
+    let pool = state::connect(&state_db_url(), 5)
+        .await
+        .expect("state DB up (run `bin/dev up`)");
+    let idp = spawn_mock_idp("test-client", "test-secret", user).await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let gateway_url = format!("http://{addr}");
+
+    let auth_config = AuthConfig {
+        issuer: idp.issuer.clone(),
+        client_id: idp.client_id.clone(),
+        client_secret: idp.client_secret.clone(),
+        audience: idp.client_id.clone(),
+        redirect_url: format!("{gateway_url}/auth/callback"),
+        ..AuthConfig::default()
+    };
+    let sessions = SessionStore::new(pool.clone());
+    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient http builder");
+    let config = Config {
+        bind: addr,
+        ..Config::default()
+    };
+    let config_file = ConfigFile::from_yaml_str(E2E_CONFIG_YAML).expect("e2e yaml is well-formed");
+    let app = transport::router(
+        &config,
+        AppState {
+            auth: Some(AuthFacade {
+                config: Arc::new(auth_config),
+                sessions,
+                oidc,
+                flows: PendingFlows::default(),
+                codes: AuthCodes::default(),
+                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
+            }),
+            config: Arc::new(config_file),
+            adapter_registry: AdapterRegistry::new(),
+            state_db: Some(pool),
+            shutdown: Default::default(),
+            metrics: None,
+            permissions_cache: None,
+            permissions_repo: None,
+            mcp_path: std::sync::Arc::from("/mcp"),
+            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
+        },
+    )
+    .expect("router builds");
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    (gateway_url, client)
+}
+
+/// Run register → authorize → callback → token to obtain an `(access, refresh)`
+/// pair, exactly as a spec-compliant client would.
+async fn obtain_token_pair(http: &reqwest::Client, gateway_url: &str) -> (String, String) {
+    let client_id = register_client(http, gateway_url, CLIENT_REDIRECT).await;
+    let code = acquire_auth_code(http, gateway_url, &client_id, CLIENT_REDIRECT, "tok").await;
+    let token: Value = http
+        .post(format!("{gateway_url}/token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", CLIENT_REDIRECT),
+            ("code_verifier", PKCE_VERIFIER),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .expect("token exchange succeeds")
+        .json()
+        .await
+        .unwrap();
+    let access = token["access_token"]
+        .as_str()
+        .expect("access_token")
+        .to_string();
+    let refresh = token["refresh_token"]
+        .as_str()
+        .expect("refresh_token")
+        .to_string();
+    (access, refresh)
+}
+
+/// O4: logging out must purge the identity's refresh-token chains, not just
+/// revoke the current session row — otherwise a logged-out client could silently
+/// mint a fresh session via the refresh grant.
+#[tokio::test]
+async fn logout_purges_refresh_tokens() {
+    let user = MockUser {
+        sub: format!("logout-user-{}", uuid::Uuid::new_v4().simple()),
+        email: "logout@example.com".to_string(),
+        groups: vec!["engineers".into()],
+    };
+    let (gw, http) = spawn_bridge_gateway(user).await;
+    let (access, refresh) = obtain_token_pair(&http, &gw).await;
+
+    let logout = http
+        .post(format!("{gw}/auth/logout"))
+        .bearer_auth(&access)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // The refresh chain is gone: a silent renew now fails (pre-O4 it succeeded).
+    let renew = http
+        .post(format!("{gw}/token"))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(renew.status(), 400);
+    assert_eq!(
+        renew.json::<Value>().await.unwrap()["error"],
+        "invalid_grant",
+        "refresh token must not survive logout"
+    );
+}
+
+/// RFC 7009 `/revoke`: a presented refresh token is killed (no further renewal),
+/// a presented access token has its session revoked (bearer stops working), an
+/// unknown token still returns 200 (no validity probe), and a missing token is
+/// the lone 400.
+#[tokio::test]
+async fn revoke_endpoint_invalidates_refresh_and_access_tokens() {
+    let user = MockUser {
+        sub: format!("revoke-user-{}", uuid::Uuid::new_v4().simple()),
+        email: "revoke@example.com".to_string(),
+        groups: vec!["engineers".into()],
+    };
+    let (gw, http) = spawn_bridge_gateway(user).await;
+
+    // --- Refresh-token revocation ---
+    let (_access1, refresh1) = obtain_token_pair(&http, &gw).await;
+    let revoked = http
+        .post(format!("{gw}/revoke"))
+        .form(&[
+            ("token", refresh1.as_str()),
+            ("token_type_hint", "refresh_token"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), reqwest::StatusCode::OK);
+    let renew = http
+        .post(format!("{gw}/token"))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh1.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(renew.status(), 400);
+    assert_eq!(
+        renew.json::<Value>().await.unwrap()["error"],
+        "invalid_grant"
+    );
+
+    // --- Access-token revocation (RFC 7009 §2.1: kill the access token too) ---
+    let (access2, _refresh2) = obtain_token_pair(&http, &gw).await;
+    let mcp_call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": "list_servers"}});
+    let before = http
+        .post(format!("{gw}/mcp"))
+        .bearer_auth(&access2)
+        .json(&mcp_call)
+        .send()
+        .await
+        .unwrap();
+    assert!(before.status().is_success(), "bearer works before revoke");
+
+    let revoked_access = http
+        .post(format!("{gw}/revoke"))
+        .form(&[("token", access2.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked_access.status(), reqwest::StatusCode::OK);
+
+    let after = http
+        .post(format!("{gw}/mcp"))
+        .bearer_auth(&access2)
+        .json(&mcp_call)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        after.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "session revoked → bearer rejected"
+    );
+
+    // --- RFC 7009 §2.2: unknown token still 200; missing token → 400 ---
+    let unknown = http
+        .post(format!("{gw}/revoke"))
+        .form(&[("token", "not-a-real-token")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unknown.status(),
+        reqwest::StatusCode::OK,
+        "unknown token must not leak validity"
+    );
+    let missing = http
+        .post(format!("{gw}/revoke"))
+        .form(&[("token_type_hint", "refresh_token")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 400);
+    assert_eq!(
+        missing.json::<Value>().await.unwrap()["error"],
+        "invalid_request"
     );
 }
 

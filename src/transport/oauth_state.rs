@@ -269,6 +269,19 @@ impl RefreshTokens {
         map.remove(&hash_secret(token))
     }
 
+    /// Drop every refresh token belonging to `sub`, returning how many were
+    /// removed. Logout calls this: revoking the session row alone leaves this
+    /// identity's refresh chains live, so a logged-out user could silently mint a
+    /// fresh session via the refresh grant. A chain carries no stable session id
+    /// (each rotation mints a new session), so `sub` is the only handle spanning
+    /// it — hence purge-by-identity rather than per-token. (O4)
+    pub async fn purge_for_sub(&self, sub: &str) -> usize {
+        let mut map = self.inner.lock().await;
+        let before = map.len();
+        map.retain(|_, t| t.identity.sub != sub);
+        before - map.len()
+    }
+
     fn gc(map: &mut HashMap<[u8; 32], RefreshToken>) {
         let now = Instant::now();
         map.retain(|_, t| !chain_expired(t.issued_at, now));
@@ -366,6 +379,32 @@ mod tests {
             store.take("stale").await.is_none(),
             "a chain at/over REFRESH_TTL must not renew"
         );
+    }
+
+    #[tokio::test]
+    async fn purge_for_sub_drops_only_that_identitys_chains() {
+        let store = RefreshTokens::default();
+        // Two live chains for u1 (e.g. two devices), one for u2.
+        store.insert("u1-a", identity()).await;
+        store.insert("u1-b", identity()).await;
+        store
+            .insert(
+                "u2-a",
+                GrantIdentity {
+                    sub: "u2".into(),
+                    ..identity()
+                },
+            )
+            .await;
+
+        let removed = store.purge_for_sub("u1").await;
+        assert_eq!(removed, 2, "both of u1's chains are purged");
+        assert!(store.take("u1-a").await.is_none());
+        assert!(store.take("u1-b").await.is_none());
+        // A different identity's chain is left intact.
+        assert!(store.take("u2-a").await.is_some());
+        // Purging an identity with no tokens is a no-op.
+        assert_eq!(store.purge_for_sub("nobody").await, 0);
     }
 
     #[tokio::test]
