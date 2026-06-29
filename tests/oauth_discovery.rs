@@ -139,6 +139,28 @@ async fn authorize_rejects_a_request_without_pkce() {
 }
 
 #[tokio::test]
+async fn authorize_rejects_a_request_without_state() {
+    let base = spawn_gateway().await;
+    let redirect = "http://127.0.0.1:9/cb";
+    let client_id = register_client(&base, redirect).await;
+    // Registered client + matching redirect + valid PKCE, but no `state` → the
+    // gateway refuses rather than echoing an empty CSRF token back to the client.
+    let resp = client()
+        .get(format!(
+            "{base}/authorize?response_type=code&client_id={client_id}\
+             &redirect_uri={redirect}\
+             &code_challenge=abc&code_challenge_method=S256"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_request");
+    assert_eq!(body["error_description"], "state is required");
+}
+
+#[tokio::test]
 async fn authorize_rejects_an_unregistered_client() {
     let base = spawn_gateway().await;
     // Well-formed PKCE request, but the client_id was never registered.

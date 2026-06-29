@@ -264,6 +264,17 @@ pub async fn authorize(
             "code_challenge_method must be S256",
         );
     }
+    // `state` is the client's CSRF token; we echo it back verbatim on the 302.
+    // Require it (non-empty) rather than defaulting to "" — an absent `state`
+    // leaves the client with no value to bind its callback against. Mirrors the
+    // code_challenge rejection above.
+    let Some(client_state) = p.state.filter(|s| !s.is_empty()) else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "state is required",
+        );
+    };
 
     let Some(auth) = state.auth.as_ref() else {
         return oauth_error(
@@ -302,7 +313,7 @@ pub async fn authorize(
             idp_verifier,
             OAuthBridge {
                 client_redirect_uri: redirect_uri,
-                client_state: p.state.unwrap_or_default(),
+                client_state,
                 code_challenge,
                 resource: p.resource,
             },
