@@ -82,11 +82,13 @@ The gateway is the shared substrate for an *entire engineering org* hammering aw
 
 ### HA
 
-For organizations that need to survive a single gateway instance going down: run two replicas behind a load balancer. Session state is in the state DB, not in-process, so sessions follow the request to whichever replica picks it up. Sticky sessions are *not* required. The only singleton background task — audit retention pruning — uses an advisory lock in the state DB so only one replica runs it at a time.
+For organizations that need to survive a single gateway instance going down: run two replicas behind a load balancer. Session state is in the state DB, not in-process, so an **established** session (a Bearer JWT on `/mcp`) follows the request to whichever replica picks it up — sticky sessions are *not* required for the steady-state request path. The only singleton background task — audit retention pruning — uses an advisory lock in the state DB so only one replica runs it at a time.
+
+**One exception: the MCP OAuth bridge.** The bridge's short-lived flow state — pending IdP round-trips, one-time authorization codes, rotating refresh tokens, and dynamic client registrations — is in-process, not in the state DB (see [04-auth-sso](04-auth-sso.md)). A client that begins the dance (`/register` → `/authorize` → `/auth/callback` → `/token`) must reach the **same** replica for every step, or it sees `invalid_client` / `invalid_grant` from a replica that never saw the earlier step. Until that state moves to the state DB (roadmap), an HA deployment must either run the bridge on a **single replica** or pin the OAuth endpoints (`/register`, `/authorize`, `/auth/callback`, `/token`) with **sticky routing**. The bespoke `/auth/login` JSON flow has the same constraint for its login round-trip. This does not affect already-authenticated `/mcp` traffic.
 
 ## Statelessness
 
-The gateway process is stateless apart from in-memory caches (JWKS, sessions, decoded permissions). Restarting the binary loses nothing that isn't reloadable from config + state DB. Two replicas behind a load balancer is the path to HA; sticky sessions are not required because session state is in the state DB.
+The gateway process is stateless apart from in-memory caches (JWKS, sessions, decoded permissions) and the MCP OAuth bridge's in-process flow state (pending logins, auth codes, refresh tokens, client registrations). Restarting the binary loses nothing that isn't reloadable from config + state DB — an in-flight OAuth dance is the one thing a restart drops, and a spec-compliant client simply re-registers and retries. Two replicas behind a load balancer is the path to HA; sticky sessions are not required for the steady-state `/mcp` request path because session state is in the state DB, but the OAuth bridge login dance needs single-replica or sticky routing (see [HA](#ha) above).
 
 ## What's deliberately not here
 

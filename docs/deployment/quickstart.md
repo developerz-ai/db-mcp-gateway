@@ -192,17 +192,27 @@ In your IdP, create an OIDC app for the gateway:
 
 Note the `client_id` and `client_secret`.
 
-> **MCP OAuth — what a reverse proxy / WAF must allow.** Since v0.2.0 the
-> gateway speaks the MCP Authorization spec (OAuth 2.1 + PKCE) so clients like
-> Claude Code authenticate with no manual credential wiring: a `401` on `/mcp`
-> carries a `WWW-Authenticate` header, and the client discovers + completes the
-> flow against endpoints the gateway serves itself. If you front the gateway
-> with a proxy or WAF, these **unauthenticated** paths must reach it:
-> `/.well-known/oauth-protected-resource` (+ the `<mcp_path>`-suffixed variant),
-> `/.well-known/oauth-authorization-server`, `/.well-known/openid-configuration`,
-> `GET /authorize`, `POST /token`, and `POST /register`. The gateway is the
-> authorization server — it brokers the IdP login internally, so do **not** put
-> a second OAuth/SSO layer (e.g. an access proxy) in front of `/mcp`.
+> **MCP OAuth — what a reverse proxy / WAF must allow.** The gateway speaks the
+> MCP Authorization spec (OAuth 2.1 + PKCE) so clients like Claude Code
+> authenticate with zero manual credential wiring. A `401` on `/mcp` carries a
+> `WWW-Authenticate` header; the client discovers and completes the flow against
+> endpoints the gateway serves itself. If you front the gateway with a proxy or
+> WAF, the following **unauthenticated** paths must reach it:
+>
+> ```text
+> GET  /.well-known/oauth-protected-resource        (also the <mcp-path>-suffixed variant)
+> GET  /.well-known/oauth-authorization-server
+> GET  /.well-known/openid-configuration
+> GET  /authorize
+> POST /token
+> POST /register
+> ```
+>
+> The gateway **is** the authorization server — it brokers the IdP login
+> internally. Do **not** add a second OAuth/SSO layer (e.g. an access proxy) in
+> front of `/mcp`; that would break client auto-discovery. See
+> [../initial-idea/04-auth-sso.md](../initial-idea/04-auth-sso.md) for the full
+> OAuth bridge spec.
 
 ## 3. Configure the gateway
 
@@ -397,7 +407,7 @@ Point them at [../usage/first-query.md](../usage/first-query.md) — 5-minute ha
 - [ ] At least one streaming sink (OTLP / syslog) into your existing SIEM, in addition to the hot retention table.
 - [ ] Archive sink configured if your compliance window > 90 days.
 - [ ] Operator runbook for `revoke-session` and `replay-audit` documented somewhere your oncall can find it at 2am.
-- [ ] Two replicas behind a load balancer for HA.
+- [ ] Two replicas behind a load balancer for HA. The OAuth bridge keeps its login-flow state in-process, so pin `/register`, `/authorize`, `/auth/callback`, and `/token` with sticky routing (or run a single replica); steady-state `/mcp` traffic needs no stickiness. See [../initial-idea/02-architecture.md](../initial-idea/02-architecture.md#ha).
 
 ## Helm / Kubernetes
 

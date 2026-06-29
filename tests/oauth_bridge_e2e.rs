@@ -98,6 +98,7 @@ async fn mcp_oauth_bridge_full_flow() {
             permissions_cache: None,
             permissions_repo: None,
             mcp_path: std::sync::Arc::from("/mcp"),
+            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
         },
     )
     .expect("router builds");
@@ -140,12 +141,30 @@ async fn mcp_oauth_bridge_full_flow() {
         "WWW-Authenticate must point at the PRM: {www}"
     );
 
+    // 0b. Register (RFC 7591 DCR): get a client_id and pin our loopback redirect
+    //     as the allowlisted URI. /authorize requires a registered client.
+    let registration: Value = client
+        .post(format!("{gateway_url}/register"))
+        .json(&json!({ "redirect_uris": [CLIENT_REDIRECT], "client_name": "e2e" }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .expect("registration succeeds")
+        .json()
+        .await
+        .unwrap();
+    let client_id = registration["client_id"]
+        .as_str()
+        .expect("registration returns a client_id")
+        .to_string();
+
     // 1. /authorize (PKCE S256) → 302 into the IdP login.
     let authorize = client
         .get(format!("{gateway_url}/authorize"))
         .query(&[
             ("response_type", "code"),
-            ("client_id", "mcp-test"),
+            ("client_id", client_id.as_str()),
             ("redirect_uri", CLIENT_REDIRECT),
             ("code_challenge", PKCE_CHALLENGE),
             ("code_challenge_method", "S256"),
@@ -309,6 +328,353 @@ async fn mcp_oauth_bridge_full_flow() {
     assert_eq!(
         reused.json::<Value>().await.unwrap()["error"],
         "invalid_grant"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Security tests
+// ---------------------------------------------------------------------------
+
+/// Spawn a gateway with no auth and no state DB — sufficient to exercise
+/// `/register` and the `/authorize` parameter-validation rejection paths.
+async fn spawn_authless_gateway() -> (String, reqwest::Client) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind authless gateway");
+    let addr = listener.local_addr().unwrap();
+    let gateway_url = format!("http://{addr}");
+    let config = Config {
+        bind: addr,
+        ..Config::default()
+    };
+    let app = transport::router(&config, AppState::for_tests()).expect("router builds");
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    (gateway_url, client)
+}
+
+/// Register a public client with one redirect URI; return its `client_id`.
+async fn register_client(http: &reqwest::Client, gateway_url: &str, redirect_uri: &str) -> String {
+    let body: Value = http
+        .post(format!("{gateway_url}/register"))
+        .json(&json!({ "redirect_uris": [redirect_uri] }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .expect("registration succeeds")
+        .json()
+        .await
+        .unwrap();
+    body["client_id"]
+        .as_str()
+        .expect("registration returns client_id")
+        .to_string()
+}
+
+/// Drive the authorize → IdP → gateway-callback → client-redirect dance;
+/// return the one-time authorization code from the client's redirect URI.
+async fn acquire_auth_code(
+    http: &reqwest::Client,
+    gateway_url: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    state_param: &str,
+) -> String {
+    let resp = http
+        .get(format!("{gateway_url}/authorize"))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", client_id),
+            ("redirect_uri", redirect_uri),
+            ("code_challenge", PKCE_CHALLENGE),
+            ("code_challenge_method", "S256"),
+            ("state", state_param),
+            ("resource", &format!("{gateway_url}/mcp")),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_redirection(),
+        "/authorize should 302 to IdP, got {}",
+        resp.status()
+    );
+    let idp_redirect = http.get(location(&resp)).send().await.unwrap();
+    assert!(idp_redirect.status().is_redirection());
+    let callback = http.get(location(&idp_redirect)).send().await.unwrap();
+    assert!(callback.status().is_redirection());
+    let client_redirect = reqwest::Url::parse(&location(&callback)).unwrap();
+    client_redirect
+        .query_pairs()
+        .find(|(k, _)| k == "code")
+        .map(|(_, v)| v.into_owned())
+        .expect("authorization code in client redirect")
+}
+
+/// An `/authorize` request whose `redirect_uri` is not in the client's
+/// registered allowlist must be rejected with `invalid_request`, regardless of
+/// whether the URI is otherwise well-formed.
+///
+/// Specifically guards against:
+/// - loopback URI with a different path (port-flex carve-out ≠ path-flex)
+/// - external HTTPS host never registered by this client
+#[tokio::test]
+async fn attacker_redirect_uri_rejected() {
+    let (gw, http) = spawn_authless_gateway().await;
+    // CLIENT_REDIRECT = "http://127.0.0.1:54599/callback"
+    let client_id = register_client(&http, &gw, CLIENT_REDIRECT).await;
+
+    // Same host:port as CLIENT_REDIRECT but wrong path. RFC 8252 port-flex only
+    // allows the *port* to vary on loopback — path must still match exactly.
+    let wrong_path = http
+        .get(format!("{gw}/authorize"))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", &client_id),
+            ("redirect_uri", "http://127.0.0.1:54599/evil"),
+            ("code_challenge", PKCE_CHALLENGE),
+            ("code_challenge_method", "S256"),
+            ("state", "csrf-xyz"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_path.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        wrong_path.json::<Value>().await.unwrap()["error"],
+        "invalid_request",
+        "loopback URI with wrong path must be rejected"
+    );
+
+    // External HTTPS host: valid format but not in this client's allowlist.
+    let wrong_host = http
+        .get(format!("{gw}/authorize"))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", &client_id),
+            ("redirect_uri", "https://attacker.example.com/steal"),
+            ("code_challenge", PKCE_CHALLENGE),
+            ("code_challenge_method", "S256"),
+            ("state", "csrf-xyz"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_host.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        wrong_host.json::<Value>().await.unwrap()["error"],
+        "invalid_request",
+        "external https URI not in allowlist must be rejected"
+    );
+}
+
+/// `/authorize` without a `state` parameter (absent or empty) must return
+/// `invalid_request`. `state` is the client's CSRF token; accepting a missing
+/// one leaves the callback with no value to bind against, defeating the
+/// CSRF protection that state provides.
+#[tokio::test]
+async fn missing_state_rejected() {
+    let (gw, http) = spawn_authless_gateway().await;
+    let client_id = register_client(&http, &gw, CLIENT_REDIRECT).await;
+
+    // Completely absent `state`.
+    let absent = http
+        .get(format!("{gw}/authorize"))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", &client_id),
+            ("redirect_uri", CLIENT_REDIRECT),
+            ("code_challenge", PKCE_CHALLENGE),
+            ("code_challenge_method", "S256"),
+            // no state
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(absent.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = absent.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_request", "absent state: {body}");
+
+    // Explicitly empty `state` — treated the same as absent.
+    let empty = http
+        .get(format!("{gw}/authorize"))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", &client_id),
+            ("redirect_uri", CLIENT_REDIRECT),
+            ("code_challenge", PKCE_CHALLENGE),
+            ("code_challenge_method", "S256"),
+            ("state", ""),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        empty.json::<Value>().await.unwrap()["error"],
+        "invalid_request",
+        "empty state must also be rejected"
+    );
+}
+
+/// The authorization code issued by `/auth/callback` is bound to the exact
+/// `(client_id, redirect_uri, PKCE-challenge)` tuple recorded at `/authorize`.
+/// `/token` must return `invalid_grant` for any mismatch — even when the
+/// attacker supplies a loopback port that *would* match under the RFC 8252
+/// port-flex rule at `/authorize`.
+#[tokio::test]
+async fn code_bound_to_client_redirect_challenge() {
+    let pool = state::connect(&state_db_url(), 5)
+        .await
+        .expect("state DB up (run `bin/dev up`)");
+
+    let user = MockUser {
+        sub: format!("bound-user-{}", uuid::Uuid::new_v4().simple()),
+        email: "bound@example.com".to_string(),
+        groups: vec!["engineers".into()],
+    };
+    let idp = spawn_mock_idp("bound-client", "bound-secret", user).await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let gateway_url = format!("http://{addr}");
+
+    let auth_config = AuthConfig {
+        issuer: idp.issuer.clone(),
+        client_id: idp.client_id.clone(),
+        client_secret: idp.client_secret.clone(),
+        audience: idp.client_id.clone(),
+        redirect_url: format!("{gateway_url}/auth/callback"),
+        ..AuthConfig::default()
+    };
+    let sessions = SessionStore::new(pool.clone());
+    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient");
+    let config = Config {
+        bind: addr,
+        ..Config::default()
+    };
+    let config_file = ConfigFile::from_yaml_str(E2E_CONFIG_YAML).expect("e2e yaml");
+    let app = transport::router(
+        &config,
+        AppState {
+            auth: Some(AuthFacade {
+                config: Arc::new(auth_config),
+                sessions,
+                oidc,
+                flows: PendingFlows::default(),
+                codes: AuthCodes::default(),
+                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
+            }),
+            config: Arc::new(config_file),
+            adapter_registry: AdapterRegistry::new(),
+            state_db: Some(pool),
+            shutdown: Default::default(),
+            metrics: None,
+            permissions_cache: None,
+            permissions_repo: None,
+            mcp_path: std::sync::Arc::from("/mcp"),
+            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
+        },
+    )
+    .expect("router builds");
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let client_id = register_client(&http, &gateway_url, CLIENT_REDIRECT).await;
+
+    // Case 1: wrong redirect_uri at /token.
+    //
+    // The code is bound to CLIENT_REDIRECT ("…:54599/callback"). A different
+    // loopback port ("…:9999/callback") would satisfy the RFC 8252 port-flex
+    // rule at /authorize, but /token uses exact string comparison — so any
+    // deviation yields invalid_grant.
+    let code1 = acquire_auth_code(&http, &gateway_url, &client_id, CLIENT_REDIRECT, "s1").await;
+    let wrong_redirect = http
+        .post(format!("{gateway_url}/token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code1.as_str()),
+            ("redirect_uri", "http://127.0.0.1:9999/callback"),
+            ("code_verifier", PKCE_VERIFIER),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_redirect.status(), 400);
+    assert_eq!(
+        wrong_redirect.json::<Value>().await.unwrap()["error"],
+        "invalid_grant",
+        "redirect_uri mismatch must yield invalid_grant"
+    );
+
+    // Case 2: wrong PKCE verifier.
+    //
+    // The code was issued for PKCE_CHALLENGE (S256 of PKCE_VERIFIER). Any
+    // other verifier fails the SHA-256 comparison and yields invalid_grant.
+    let code2 = acquire_auth_code(&http, &gateway_url, &client_id, CLIENT_REDIRECT, "s2").await;
+    let wrong_verifier = http
+        .post(format!("{gateway_url}/token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code2.as_str()),
+            ("redirect_uri", CLIENT_REDIRECT),
+            ("code_verifier", "not-the-right-verifier-for-this-challenge"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_verifier.status(), 400);
+    assert_eq!(
+        wrong_verifier.json::<Value>().await.unwrap()["error"],
+        "invalid_grant",
+        "bad PKCE verifier must yield invalid_grant"
+    );
+
+    // Case 3: wrong client_id at /token.
+    //
+    // client_id is optional for public clients (RFC 6749 §3.2.1), but when
+    // sent it must match the code's originating client. Cross-client code
+    // injection must fail even when the attacker knows the verifier.
+    let code3 = acquire_auth_code(&http, &gateway_url, &client_id, CLIENT_REDIRECT, "s3").await;
+    let wrong_client = http
+        .post(format!("{gateway_url}/token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code3.as_str()),
+            ("redirect_uri", CLIENT_REDIRECT),
+            ("client_id", "mcp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            ("code_verifier", PKCE_VERIFIER),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_client.status(), 400);
+    assert_eq!(
+        wrong_client.json::<Value>().await.unwrap()["error"],
+        "invalid_grant",
+        "client_id mismatch must yield invalid_grant"
     );
 }
 

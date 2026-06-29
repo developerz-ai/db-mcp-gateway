@@ -77,7 +77,13 @@ fn unauthorized(state: &AppState, req: &Request, err: AuthError) -> Response {
     // server and run the OAuth flow. Without this header, a client like Claude
     // Code falls back to probing `/.well-known/*` blindly and reports an
     // opaque discovery error on the 404s.
-    let base = oauth::base_url(state, req.headers());
+    // If base_url fails (unparseable configured redirect_url), propagate its
+    // OAuth error response — a stable `server_error` body — rather than a bare
+    // 500, so the client sees the gateway is broken, not their credentials.
+    let base = match oauth::base_url(state, req.headers()) {
+        Ok(base) => base,
+        Err(response) => return *response,
+    };
     let www = format!(
         "Bearer resource_metadata=\"{}\"",
         oauth::resource_metadata_url(&base)

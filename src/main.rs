@@ -12,7 +12,9 @@ use db_mcp_gateway::exec::AdapterRegistry;
 use db_mcp_gateway::state::permissions::pg::PgPermissionsRepo;
 use db_mcp_gateway::transport::probes::ShutdownFlag;
 use db_mcp_gateway::transport::tls;
-use db_mcp_gateway::transport::{AppState, AuthCodes, AuthFacade, PendingFlows, RefreshTokens};
+use db_mcp_gateway::transport::{
+    AppState, AuthCodes, AuthFacade, ClientRegistry, PendingFlows, RefreshTokens,
+};
 use db_mcp_gateway::{config::Config, state, transport};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use sqlx::PgPool;
@@ -135,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
         permissions_cache: Some(permissions_cache),
         permissions_repo: Some(permissions_repo),
         mcp_path: Arc::from(config.mcp_path.as_str()),
+        client_registry: ClientRegistry::default(),
     };
 
     // Fail closed: a release binary must never serve with auth unwired.
