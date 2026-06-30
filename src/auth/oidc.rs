@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use jsonwebtoken::{DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use url::{Host, Url};
@@ -179,7 +179,7 @@ impl OidcClient {
         let kid = header.kid.ok_or(AuthError::IdToken)?;
         let key = self.decoding_key(&kid).await?;
 
-        let mut validation = Validation::new(header.alg);
+        let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[&self.config.issuer]);
         validation.set_audience(&[&self.config.audience]);
         validation.validate_exp = true;
