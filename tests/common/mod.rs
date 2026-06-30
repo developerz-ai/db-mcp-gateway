@@ -196,6 +196,7 @@ fn sign_id_token(issuer: &str, aud: &str, user: &MockUser, nonce: &str) -> Strin
         "iat": now,
         "nonce": nonce,
         "email": user.email,
+        "email_verified": true,
         "groups": user.groups,
     });
     let mut header = Header::new(Algorithm::RS256);

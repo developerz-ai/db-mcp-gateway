@@ -22,6 +22,14 @@ pub enum AuthError {
     #[error("ID token verification failed")]
     IdToken,
 
+    /// ID token carried no usable identity: the `email` claim was absent/empty,
+    /// or `email_verified` was not asserted true. Email is the audit/admin
+    /// identity, so an unverified — and at many IdPs user-settable — address is
+    /// refused. Kept distinct from `IdToken` so ops can tell a spoof attempt or
+    /// misconfigured IdP apart from a generic token-verification failure in logs.
+    #[error("ID token email is absent or unverified")]
+    EmailUnverified,
+
     /// CSRF `state` from the callback was unknown/expired/replayed. Kept
     /// distinct from `IdToken` so ops can tell the two apart in logs, even
     /// though both surface as the same HTTP code to the client.
