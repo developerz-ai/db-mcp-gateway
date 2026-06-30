@@ -60,6 +60,12 @@ url = "2"
 # compared against the client's code_challenge.
 sha2 = "0.10"
 base64 = "0.22"
+# DB-credential hygiene: keep resolved passwords in a heap buffer that zeroes
+# on drop and refuses to `Debug`-print in the clear. `secrecy::SecretString`
+# wraps the value end to end; `&str` is exposed only at the driver boundary.
+# `zeroize` is used directly to scrub the file-read buffer in `Password::resolve`.
+secrecy = "0.10"
+zeroize = "1"
 
 # errors + tracing
 thiserror = "2"

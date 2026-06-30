@@ -19,7 +19,9 @@
 
 use std::path::PathBuf;
 
+use secrecy::SecretString;
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 /// A secret reference as written in YAML. The variant tells us where the real
 /// value lives; we resolve eagerly at startup.
@@ -28,11 +30,17 @@ use serde::Deserialize;
 /// would print the password verbatim, violating the no-creds-in-logs rule.
 /// `EnvVar` / `File` / `SecretBackend` carry only references (env var names,
 /// file paths, vault paths) which are safe to print and useful for diagnostics.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// No `PartialEq`/`Eq`: `SecretString` deliberately omits them so passwords are
+/// never compared with `==` (non-constant-time, easy to leak). Tests match on
+/// the variant and compare the exposed inner explicitly.
+#[derive(Clone)]
 pub enum Password {
-    /// Literal value inline in the YAML. Rejected in `env: production` by
-    /// `Config::validate` (lands with issue #16's full validator).
-    Literal(String),
+    /// Literal value inline in the YAML, held in a `SecretString` so it zeroes
+    /// on drop and can't be `Debug`-printed in the clear. Rejected in
+    /// `env: production` by `Config::validate` (lands with issue #16's full
+    /// validator).
+    Literal(SecretString),
     /// `${ENV:VAR_NAME}` — resolve from process env at startup.
     EnvVar(String),
     /// `${FILE:/run/secrets/foo}` — read from a file at startup. Trailing
@@ -137,40 +145,46 @@ impl Password {
                 _ => {}
             }
         }
-        Ok(Password::Literal(s.to_string()))
+        Ok(Password::Literal(SecretString::from(s)))
     }
 
     /// Resolve the reference to a plaintext password.
     ///
     /// Called both at boot (`config::validate_secrets`) to fail fast and
     /// again at pool-open time so credential rotation through file mounts
-    /// works without a restart. The resolved value is moved into sqlx and
-    /// dropped — it is never logged, never stored, never sent to a client.
-    pub fn resolve(&self) -> Result<String, SecretError> {
+    /// works without a restart. The returned `SecretString` zeroes its heap
+    /// buffer on drop and refuses to `Debug`-print in the clear; callers
+    /// expose `&str` only at the driver boundary (`PgConnectOptions::password`,
+    /// mongo's `Credential`). It is never logged, never stored, never sent to a
+    /// client.
+    pub fn resolve(&self) -> Result<SecretString, SecretError> {
         match self {
             Password::Literal(s) => Ok(s.clone()),
             Password::EnvVar(name) => match std::env::var(name) {
-                Ok(v) => Ok(v),
+                Ok(v) => Ok(SecretString::from(v)),
                 Err(std::env::VarError::NotPresent) => Err(SecretError::EnvNotSet(name.clone())),
                 Err(std::env::VarError::NotUnicode(_)) => {
                     Err(SecretError::EnvNotUtf8(name.clone()))
                 }
             },
             Password::File(path) => {
-                let raw = std::fs::read_to_string(path).map_err(|source| {
+                // Read into a `Zeroizing` buffer so the full file contents —
+                // including any trailing bytes we trim away — are wiped from
+                // the heap on drop, not just the trimmed secret we hand back.
+                let raw = Zeroizing::new(std::fs::read_to_string(path).map_err(|source| {
                     SecretError::FileUnreadable {
                         path: path.clone(),
                         source,
                     }
-                })?;
+                })?);
                 // Sealed-secrets / `printf > file` / editors all leave a
                 // trailing newline — strip CR/LF on both ends but preserve
                 // anything an operator might have meaningfully padded with.
-                let trimmed = raw.trim_end_matches(['\n', '\r']).to_string();
+                let trimmed = raw.trim_end_matches(['\n', '\r']);
                 if trimmed.is_empty() {
                     return Err(SecretError::FileEmpty(path.clone()));
                 }
-                Ok(trimmed)
+                Ok(SecretString::from(trimmed))
             }
             Password::SecretBackend { scheme, .. } => {
                 Err(SecretError::BackendNotImplemented(scheme.clone()))
@@ -182,41 +196,41 @@ impl Password {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret;
     use std::io::Write;
+    use std::path::Path;
 
     #[test]
     fn classifies_each_form() {
-        assert_eq!(
+        // `Password` has no `PartialEq` (see the type doc) — match on the
+        // variant and compare the inner reference / exposed secret explicitly.
+        assert!(matches!(
             Password::parse("${ENV:STATE_DB_PW}").unwrap(),
-            Password::EnvVar("STATE_DB_PW".into())
-        );
-        assert_eq!(
+            Password::EnvVar(name) if name == "STATE_DB_PW"
+        ));
+        assert!(matches!(
             Password::parse("${FILE:/run/secrets/db-pw}").unwrap(),
-            Password::File(PathBuf::from("/run/secrets/db-pw"))
-        );
-        assert_eq!(
+            Password::File(path) if path == Path::new("/run/secrets/db-pw")
+        ));
+        assert!(matches!(
             Password::parse("vault:secret/prod/app_ro").unwrap(),
-            Password::SecretBackend {
-                scheme: "vault".into(),
-                reference: "secret/prod/app_ro".into()
-            }
-        );
-        assert_eq!(
+            Password::SecretBackend { scheme, reference }
+                if scheme == "vault" && reference == "secret/prod/app_ro"
+        ));
+        assert!(matches!(
             Password::parse("aws-sm:arn:aws:secretsmanager:...").unwrap(),
-            Password::SecretBackend {
-                scheme: "aws-sm".into(),
-                reference: "arn:aws:secretsmanager:...".into()
-            }
-        );
-        assert_eq!(
+            Password::SecretBackend { scheme, reference }
+                if scheme == "aws-sm" && reference == "arn:aws:secretsmanager:..."
+        ));
+        assert!(matches!(
             Password::parse("hunter2").unwrap(),
-            Password::Literal("hunter2".into())
-        );
+            Password::Literal(s) if s.expose_secret() == "hunter2"
+        ));
         // A bare colon in an unknown-scheme value stays literal.
-        assert_eq!(
+        assert!(matches!(
             Password::parse("not-a-scheme:hunter2").unwrap(),
-            Password::Literal("not-a-scheme:hunter2".into())
-        );
+            Password::Literal(s) if s.expose_secret() == "not-a-scheme:hunter2"
+        ));
     }
 
     /// Legacy `${VAR}` syntax (#15 deprecates it) and bogus `${…}` payloads
@@ -244,7 +258,7 @@ mod tests {
     /// `format!("{:?}", literal)` must never print the plaintext.
     #[test]
     fn debug_redacts_literal_plaintext() {
-        let literal = Password::Literal("hunter2".to_string());
+        let literal = Password::Literal("hunter2".into());
         let rendered = format!("{literal:?}");
         assert!(
             !rendered.contains("hunter2"),
@@ -271,8 +285,8 @@ mod tests {
 
     #[test]
     fn resolve_literal_returns_inline_value() {
-        let p = Password::Literal("hunter2".to_string());
-        assert_eq!(p.resolve().unwrap(), "hunter2");
+        let p = Password::Literal("hunter2".into());
+        assert_eq!(p.resolve().unwrap().expose_secret(), "hunter2");
     }
 
     #[test]
@@ -291,7 +305,7 @@ mod tests {
         unsafe {
             std::env::set_var(&name, "from-env");
         }
-        assert_eq!(p.resolve().unwrap(), "from-env");
+        assert_eq!(p.resolve().unwrap().expose_secret(), "from-env");
         unsafe {
             std::env::remove_var(&name);
         }
@@ -302,7 +316,7 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().expect("tempfile");
         writeln!(file, "hunter2").unwrap();
         let p = Password::File(file.path().to_path_buf());
-        assert_eq!(p.resolve().unwrap(), "hunter2");
+        assert_eq!(p.resolve().unwrap().expose_secret(), "hunter2");
     }
 
     #[test]

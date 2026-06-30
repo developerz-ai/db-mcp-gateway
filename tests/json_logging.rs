@@ -117,7 +117,7 @@ fn dispatch_log_line_matches_field_contract() {
 #[test]
 fn redacted_debug_does_not_leak_password() {
     use db_mcp_gateway::config::Password;
-    let password = Password::Literal("super-secret-value".to_string());
+    let password = Password::Literal("super-secret-value".into());
     let rendered = format!("{password:?}");
     assert!(!rendered.contains("super-secret-value"));
     assert!(rendered.contains("<redacted>"));
