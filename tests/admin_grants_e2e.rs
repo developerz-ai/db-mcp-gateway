@@ -161,6 +161,7 @@ async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
     config_file.admin = Some(AdminBlock {
         enabled: true,
         group: ADMIN_GROUP.to_string(),
+        session_max_age_secs: None,
     });
 
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
@@ -702,6 +703,7 @@ async fn live_grant_change_invalidates_cache_for_user() {
         user_sub: user_sub.clone(),
         user_email: "target@example.com".to_string(),
         groups: vec!["engineers".to_string()],
+        issued_at: chrono::Utc::now(),
     };
 
     // Pre-warm the cache for this user — observed grants: 0.

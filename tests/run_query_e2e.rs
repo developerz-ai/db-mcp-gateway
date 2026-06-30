@@ -464,6 +464,7 @@ async fn run_query_cache_backed_db_grant() {
         user_sub: user_sub.clone(),
         user_email: "cache-test@example.com".to_string(),
         groups: vec![], // Intentionally empty: no YAML grants.
+        issued_at: chrono::Utc::now(),
     };
 
     // Load grants via cache; this will populate the cache from the DB.
@@ -535,6 +536,7 @@ async fn concurrency_test_server(
             user_sub: "concurrency-test-user".into(),
             user_email: "concurrency@example.com".into(),
             groups: vec![],
+            issued_at: chrono::Utc::now(),
         });
         next.run(req).await
     }

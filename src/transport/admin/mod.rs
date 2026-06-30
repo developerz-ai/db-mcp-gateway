@@ -21,6 +21,7 @@ pub mod middleware;
 pub mod users;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::middleware as axum_mw;
@@ -47,13 +48,21 @@ use self::users::UsersState;
 /// per-user cache invalidation post-commit — spec 12 §"Cache invalidation"
 /// and #54's acceptance criterion. `None` when the gateway runs without a
 /// resolver cache (YAML-only installs); invalidation then is a no-op.
+///
+/// `max_session_age` maps to `admin.session_max_age_secs` in YAML: sessions
+/// older than this are rejected with `session_too_old` (403) to bound admin
+/// group staleness. `None` = no cap (rely on `session_ttl_hours` alone).
 pub fn router(
     admin_group: String,
     repo: Arc<dyn PermissionsRepo>,
     state_db: PgPool,
     cache: Option<PermissionsCache>,
+    max_session_age: Option<Duration>,
 ) -> Router {
-    let mw_state = AdminMiddlewareState { admin_group };
+    let mw_state = AdminMiddlewareState {
+        admin_group,
+        max_session_age,
+    };
     let users_routes = Router::new()
         .route("/admin/v1/users", post(users::create).get(users::list))
         .route(

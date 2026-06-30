@@ -122,6 +122,7 @@ async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
     config_file.admin = Some(AdminBlock {
         enabled: true,
         group: ADMIN_GROUP.to_string(),
+        session_max_age_secs: None,
     });
 
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));

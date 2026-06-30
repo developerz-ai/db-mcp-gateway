@@ -156,6 +156,7 @@ mod tests {
             user_email: "e@example.com".into(),
             groups: vec!["g".into()],
             agent_client: None,
+            issued_at: now,
             expires_at: now + ChronoDuration::seconds(active_for_secs),
             revoked_at: None,
         }

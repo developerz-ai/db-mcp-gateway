@@ -41,6 +41,19 @@ pub struct AdminBlock {
     /// `enabled = true`; an empty value is a boot error (every authenticated
     /// user would otherwise be an admin).
     pub group: String,
+    /// Maximum age (in seconds) of a session before admin access is denied.
+    /// When set, the admin middleware rejects sessions older than this limit
+    /// regardless of `session_ttl_hours` — the caller must re-authenticate.
+    ///
+    /// **Why this matters:** group memberships are snapshotted at login. A user
+    /// removed from the admin group in the IdP continues to pass the group check
+    /// until their session expires (up to `session_ttl_hours`, default 8 h). Setting
+    /// `session_max_age_secs` caps this window: e.g. `3600` (1 h) means a removed
+    /// admin can act for at most one hour before the gateway forces re-login.
+    ///
+    /// Absent / `null` means "no age cap — rely on `session_ttl_hours` alone".
+    #[serde(default)]
+    pub session_max_age_secs: Option<u64>,
 }
 
 /// Permissions storage backend selection. The DSN is **not** in YAML — it

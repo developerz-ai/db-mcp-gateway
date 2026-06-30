@@ -136,11 +136,15 @@ pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError
             .ok_or(TransportError::AdminDepsMissing {
                 missing: "state_db",
             })?;
+        let max_session_age = admin_cfg
+            .session_max_age_secs
+            .map(std::time::Duration::from_secs);
         let admin_router = admin::router(
             admin_cfg.group.clone(),
             repo,
             state_db,
             state.permissions_cache.clone(),
+            max_session_age,
         );
         let admin_gated = admin_router.route_layer(middleware::from_fn_with_state(
             state.clone(),

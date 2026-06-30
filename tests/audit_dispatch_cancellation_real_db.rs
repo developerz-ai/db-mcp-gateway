@@ -42,6 +42,7 @@ fn identity(user_sub: &str) -> Identity {
         user_sub: user_sub.to_string(),
         user_email: "cancel-test@example.com".to_string(),
         groups: vec!["test".to_string()],
+        issued_at: chrono::Utc::now(),
     }
 }
 
