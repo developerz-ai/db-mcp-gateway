@@ -1,12 +1,16 @@
 # 01 — SQL Execution & MCP Tools (Query Path)
 
+> **Remediation status (2026-06-30):** All findings in this report are closed.
+> S1/S2/S3/S4/S6/C3/AZ1 → **fixed @ f7fb7fc** (#86) · S5/T1/S7 → **fixed @ 7435daa** (#92).
+> Exploit payloads redacted below; originals in git history at `ac43a61`.
+
 Scope: `src/exec/{mod,adapter,pg,sql_guard}.rs`, `src/exec/mongo/{mod,rejector}.rs`, `src/tools/*`.
 
 This layer carries the highest-severity findings. The three High findings all defeat `sql_guard`, the AST-level read-only guard whose stated purpose (module doc, `sql_guard.rs:1-4`) is: *"if a DBA accidentally grants write privileges to the `*_ro` role, the gateway still refuses to send a write query."* They matter precisely when the target-DB role is over-privileged — i.e. when the primary defense has already failed.
 
 ---
 
-## S1 — Writable CTE bypasses the read-only guard — **High**
+## S1 — Writable CTE bypasses the read-only guard — **High** · `fixed @ f7fb7fc`
 
 **File:** `src/exec/sql_guard.rs:83-92`
 
@@ -27,29 +31,27 @@ Verified allowed:
 
 (`DELETE` inside a CTE happens to be a parse error in 0.52, so that one variant is incidentally rejected — do not rely on it.)
 
-**Exploit (via `run_query`):**
-```sql
-WITH x AS (INSERT INTO users(id,is_admin) VALUES (999,true) RETURNING id) SELECT * FROM x
-```
+**Exploit (via `run_query`):** [redacted — writable CTE INSERT payload; see `ac43a61` for original]
+
 If the `*_ro` role can write, this executes the INSERT. The guard — the layer designed for exactly this misconfiguration — does not stop it.
 
 **Fix:** Recurse the whole `Query`. Reject any `SetExpr::Insert(_) | SetExpr::Update(_)` (and `Delete` once the parser supports it) found in `query.body` **or** in each `query.with.cte_tables[].query`. Walk set-operation arms and subqueries. Permit only `SetExpr::Select | SetExpr::Query | SetExpr::SetOperation | SetExpr::Values | SetExpr::Table`. Add regression tests mirroring the exploit strings above.
 
 ---
 
-## S2 — `SELECT … INTO` bypasses the read-only guard — **High**
+## S2 — `SELECT … INTO` bypasses the read-only guard — **High** · `fixed @ f7fb7fc`
 
 **File:** `src/exec/sql_guard.rs:83-92`
 
 `Select` carries `into: Option<SelectInto>`; `check_query` never inspects it. Verified allowed: `SELECT * INTO new_table FROM users`. In Postgres this is DDL — it materializes a new table.
 
-**Exploit (via `run_query`):** `SELECT * INTO exfil_copy FROM secrets`
+**Exploit (via `run_query`):** [redacted — SELECT INTO exfiltration payload; see `ac43a61`]
 
 **Fix:** In the same query-tree walk (S1), reject any `Select` whose `into.is_some()`.
 
 ---
 
-## S3 — `EXPLAIN ANALYZE` executes; combined with S1 runs writes — **High**
+## S3 — `EXPLAIN ANALYZE` executes; combined with S1 runs writes — **High** · `fixed @ f7fb7fc`
 
 **File:** `src/exec/sql_guard.rs:54`
 
@@ -59,7 +61,7 @@ Statement::Explain { statement, .. } => check_statement(statement),
 
 The guard recurses into the EXPLAIN target but ignores the `analyze` flag. `EXPLAIN ANALYZE SELECT …` is intentionally allowed (test at `sql_guard.rs:143`), but `EXPLAIN ANALYZE` **executes** the plan. Combined with S1:
 
-Verified allowed: `EXPLAIN ANALYZE WITH x AS (INSERT INTO users VALUES (1) RETURNING id) SELECT * FROM x` — parsed as `Statement::Explain`, recursed, `Ok`. `run_query` sends it verbatim and ANALYZE executes the INSERT.
+Verified allowed: [redacted — EXPLAIN ANALYZE + writable CTE payload; see `ac43a61`] — parsed as `Statement::Explain`, recursed, `Ok`. `run_query` sends it verbatim and ANALYZE executes the INSERT.
 
 The `explain` tool itself wraps with `EXPLAIN (FORMAT JSON)` (no ANALYZE), so it is safe — this is a **`run_query`** problem: `run_query` lets the caller supply `EXPLAIN ANALYZE …` directly.
 
@@ -67,7 +69,7 @@ The `explain` tool itself wraps with `EXPLAIN (FORMAT JSON)` (no ANALYZE), so it
 
 ---
 
-## S4 — No statement-timeout floor → unbounded query pins a pool connection (DoS) — **Medium**
+## S4 — No statement-timeout floor → unbounded query pins a pool connection (DoS) — **Medium** · `fixed @ f7fb7fc`
 
 **File:** `src/exec/pg.rs:91-99`, `:172-177`
 
@@ -80,13 +82,13 @@ The `explain` tool itself wraps with `EXPLAIN (FORMAT JSON)` (no ANALYZE), so it
 
 When the merged grant's `statement_timeout_ms` is `None`, there is **neither** a `tokio::time::timeout` **nor** a `SET LOCAL statement_timeout`. The row cap doesn't help: it bounds rows *returned*, not a query that blocks before yielding any.
 
-**Exploit:** A grant with no `statement_timeout_ms` + `run_query` with `SELECT pg_sleep(1e9)` (or a heavy cartesian join). The streaming `.next().await` blocks indefinitely; each call pins one of `DEFAULT_POOL_MAX_CONNECTIONS = 5` connections. Five such calls starve every other user of that `(server, database)` — violating "one noisy user must not starve others."
+**Exploit:** A grant with no `statement_timeout_ms` + `run_query` with a long-running sleep or heavy cartesian join. The streaming `.next().await` blocks indefinitely; each call pins one of `DEFAULT_POOL_MAX_CONNECTIONS = 5` connections. Five such calls starve every other user of that `(server, database)` — violating "one noisy user must not starve others."
 
 **Fix:** Apply a gateway-wide default `statement_timeout` floor (the `pg.rs` comment nominates `authz::effective` as its home). At minimum, always wrap `run_query_inner` in a `tokio::time::timeout` using a configured ceiling even when the grant declined to set one.
 
 ---
 
-## S5 — Client disconnect does not `pg_cancel_backend`; query continues server-side — **Medium**
+## S5 — Client disconnect does not `pg_cancel_backend`; query continues server-side — **Medium** · `fixed @ 7435daa`
 
 **Files:** `src/exec/pg.rs:168-212`; inaccurate claim at `src/tools/audit_dispatch.rs:100-102`
 
@@ -98,7 +100,7 @@ The audit-row `outcome: cancelled` path works (`CancelledAuditGuard`); the **ser
 
 ---
 
-## S6 — Mongo rejector misses `$accumulator` (server-side JS) — **Medium**
+## S6 — Mongo rejector misses `$accumulator` (server-side JS) — **Medium** · `fixed @ f7fb7fc`
 
 **File:** `src/exec/mongo/rejector.rs:48`
 
@@ -108,23 +110,19 @@ const DENIED_OPERATORS: &[&str] = &["$out", "$merge", "$function", "$where"];
 
 The deny list blocks `$function` and `$where` JS, but **`$accumulator`** — an aggregation operator that runs arbitrary server-side JavaScript — is not listed. It is valid inside an allowed `aggregate` command, which the executor dispatches.
 
-**Exploit:**
-```json
-{"aggregate":"users","pipeline":[{"$group":{"_id":null,"x":{"$accumulator":{
-  "init":"function(){...}","accumulate":"function(){...}","accumulateArgs":[],
-  "merge":"function(){...}","lang":"js"}}}}],"cursor":{}}
-```
+**Exploit:** [redacted — `$accumulator` server-side JS payload; see `ac43a61`]
+
 Passes the rejector (`$accumulator` not denied, command is `aggregate`) and executes server-side JS — the same risk class `$function`/`$where` were added to close.
 
 **Fix:** Add `$accumulator` to `DENIED_OPERATORS`. Strongly consider switching to an **allow-list** of operators, or at minimum enumerate every JS-capable operator for the supported server versions. The deny-list approach is one new server operator away from the next bypass.
 
 ---
 
-## S7 — `pg_read_file` / `lo_export` pass the guard (function-blind) — **Low**
+## S7 — `pg_read_file` / `lo_export` pass the guard (function-blind) — **Low** · `fixed @ 7435daa`
 
 **File:** `src/exec/sql_guard.rs` (statement-level only)
 
-Verified allowed: `SELECT pg_read_file('/etc/passwd')`. The guard is read-only at the *statement* level and does not inspect called functions. These require elevated server roles (`pg_read_server_files`, superuser), so a correctly least-privileged `*_ro` role blocks them at the DB. Defense-in-depth limitation, not an independent vuln — but if the read-only role is over-privileged (the same precondition as S1–S3), they are reachable. Consider a function denylist if you want the guard to be a true second layer here.
+Verified allowed: [redacted — `pg_read_file` payload; see `ac43a61`]. The guard is read-only at the *statement* level and does not inspect called functions. These require elevated server roles (`pg_read_server_files`, superuser), so a correctly least-privileged `*_ro` role blocks them at the DB. Defense-in-depth limitation, not an independent vuln — but if the read-only role is over-privileged (the same precondition as S1–S3), they are reachable. Consider a function denylist if you want the guard to be a true second layer here.
 
 ---
 

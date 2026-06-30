@@ -1,12 +1,15 @@
 # 06 — Authorization (grant evaluation & constraint merge)
 
+> **Remediation status (2026-06-30):** All findings in this report are closed.
+> AZ1 → **fixed @ f7fb7fc** (#86).
+
 Scope: `src/authz/{mod,effective,cache,loader}.rs` + proptests, with supporting types in `config/schema.rs` and boot validation in `config/yaml.rs`.
 
 **No Critical, High, or Medium authorization vulnerability found.** The engine is fail-closed, the constraint merge is provably most-restrictive, wildcards match exactly (no over-matching), write actions are correctly gated, and the cache invalidation race is handled. Findings below are Low/informational and none are exploitable in the current call graph.
 
 ---
 
-## AZ1 — Empty-string `group` name accepted at boot — **Low**
+## AZ1 — Empty-string `group` name accepted at boot — **Low** · `fixed @ f7fb7fc`
 
 **File:** `src/config/yaml.rs:269-276` (and `schema.rs:88-97` accepts any `String` for `Grant.server/database/group`).
 
