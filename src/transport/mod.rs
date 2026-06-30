@@ -17,11 +17,13 @@ mod auth_middleware;
 mod auth_routes;
 mod client_registry;
 mod dispatch;
+mod limit;
 mod oauth;
 mod oauth_state;
 mod sse;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
@@ -53,9 +55,16 @@ pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError
 
     // Bearer-gated routes: /mcp POST and /auth/logout (needs a session to
     // revoke). SSE GET and /auth/{login,callback} stay open.
+    //
+    // Layer order matters: the last-applied layer is outermost (runs first), so
+    // `bearer_auth` runs before `limit::enforce` and the per-identity limiter
+    // sees the resolved `Identity`. The global cap sheds saturation with 503;
+    // the per-identity cap returns 429 (sec qa 2026-06-29 T1).
+    let limiter = Arc::new(limit::ConcurrencyLimiter::new());
     let gated = Router::new()
         .route(&path, post(post_handler))
         .route("/auth/logout", post(auth_routes::logout))
+        .route_layer(middleware::from_fn_with_state(limiter, limit::enforce))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware::bearer_auth,
