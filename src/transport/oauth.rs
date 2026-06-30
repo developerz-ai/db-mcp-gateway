@@ -29,6 +29,8 @@
 
 use std::time::Instant;
 
+use chrono::{Duration as ChronoDuration, Utc};
+
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::header::{CACHE_CONTROL, HOST, PRAGMA};
@@ -583,6 +585,16 @@ async fn issue_token_response(
     identity: GrantIdentity,
     chain_issued_at: Option<Instant>,
 ) -> Response {
+    // Preserve the original `/authorize` login time so `admin.session_max_age_secs`
+    // counts from the first login, not from this rotation. The refresh-token chain
+    // already carries the birth `Instant`; convert it to wall-clock by subtracting
+    // the elapsed monotonic time from `Utc::now()`. `None` on fresh authorizations:
+    // stamp `issued_at` as now (handled inside `SessionStore::create`).
+    let original_issued_at = chain_issued_at.map(|birth| {
+        let elapsed = Instant::now().saturating_duration_since(birth);
+        Utc::now() - ChronoDuration::from_std(elapsed).unwrap_or_default()
+    });
+
     let session = match auth
         .sessions
         .create(
@@ -591,6 +603,7 @@ async fn issue_token_response(
             &identity.groups,
             auth.config.session_ttl,
             None,
+            original_issued_at,
         )
         .await
     {

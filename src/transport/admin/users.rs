@@ -115,9 +115,17 @@ pub async fn create(
         .map_err(|err| internal("upsert_user", err, &actor.request_id))?;
 
     // Upsert the actor's own row in the same tx as the audit write (atomicity).
-    let actor_id = tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
-        .await
-        .map_err(|err| internal("upsert_actor", err, &actor.request_id))?;
+    // Guard: if the actor is mutating their own row, skip the upsert — the
+    // `tx_upsert_user` call above already wrote the correct state for that sub,
+    // and running `tx_upsert_actor` would overwrite it with the session snapshot
+    // (stale email/groups), clobbering the just-applied mutation.
+    let actor_id = if actor.sub == user_sub {
+        user.id
+    } else {
+        tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
+            .await
+            .map_err(|err| internal("upsert_actor", err, &actor.request_id))?
+    };
 
     let action = if before.is_some() {
         PermissionsAuditAction::Update
@@ -215,9 +223,15 @@ pub async fn patch(
         .ok_or_else(|| AdminError::not_found().with_request_id(&actor.request_id))?;
 
     // Upsert the actor's own row in the same tx as the audit write (atomicity).
-    let actor_id = tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
-        .await
-        .map_err(|err| internal("upsert_actor", err, &actor.request_id))?;
+    // Guard: if the actor is patching their own row, skip the upsert to avoid
+    // overwriting the freshly-patched state with the session snapshot.
+    let actor_id = if actor.sub == before.user_sub {
+        after.id
+    } else {
+        tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
+            .await
+            .map_err(|err| internal("upsert_actor", err, &actor.request_id))?
+    };
 
     let audit_row = PermissionsAuditRow {
         actor_id,
@@ -265,9 +279,16 @@ pub async fn delete(
     }
 
     // Upsert the actor's own row in the same tx as the audit write (atomicity).
-    let actor_id = tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
-        .await
-        .map_err(|err| internal("upsert_actor", err, &actor.request_id))?;
+    // Guard: if the actor is deleting their own row, skip the upsert — the
+    // DELETE already soft-deleted the row, and re-inserting via upsert would
+    // create a new active row that immediately cancels the soft-delete.
+    let actor_id = if actor.sub == before.user_sub {
+        before.id
+    } else {
+        tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
+            .await
+            .map_err(|err| internal("upsert_actor", err, &actor.request_id))?
+    };
 
     let audit_row = PermissionsAuditRow {
         actor_id,

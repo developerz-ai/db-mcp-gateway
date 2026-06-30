@@ -150,6 +150,12 @@ impl SessionStore {
     }
 
     /// Persist a new session row and warm the cache.
+    ///
+    /// `original_issued_at`: when `Some`, overrides the row's `issued_at` with
+    /// the caller's value instead of stamping `now()`. Used by the OAuth
+    /// refresh path to carry the original `/authorize` login time across token
+    /// rotations so `admin.session_max_age_secs` counts from the first login,
+    /// not from the latest refresh. Pass `None` for all fresh sessions.
     pub async fn create(
         &self,
         user_sub: &str,
@@ -157,9 +163,11 @@ impl SessionStore {
         groups: &[String],
         ttl: std::time::Duration,
         agent_client: Option<&str>,
+        original_issued_at: Option<DateTime<Utc>>,
     ) -> Result<Session, AuthError> {
         let id = SessionId::new();
         let now = Utc::now();
+        let issued_at = original_issued_at.unwrap_or(now);
         let expires_at = now + ChronoDuration::from_std(ttl).unwrap_or(ChronoDuration::hours(8));
         let groups_json = serde_json::to_value(groups).unwrap_or(serde_json::Value::Array(vec![]));
 
@@ -172,7 +180,7 @@ impl SessionStore {
         .bind(user_email)
         .bind(&groups_json)
         .bind(agent_client)
-        .bind(now)
+        .bind(issued_at)
         .bind(expires_at)
         .execute(&self.pool)
         .await?;
@@ -183,7 +191,7 @@ impl SessionStore {
             user_email: user_email.to_string(),
             groups: groups.to_vec(),
             agent_client: agent_client.map(str::to_string),
-            issued_at: now,
+            issued_at,
             expires_at,
             revoked_at: None,
         };

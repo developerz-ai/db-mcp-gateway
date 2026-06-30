@@ -64,6 +64,7 @@ async fn mint_session(
             groups,
             Duration::from_secs(600),
             Some("admin-grants-e2e/0.1"),
+            None,
         )
         .await
         .expect("create session");

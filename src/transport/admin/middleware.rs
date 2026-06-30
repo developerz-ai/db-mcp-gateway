@@ -146,10 +146,28 @@ pub async fn require_admin_group(
     // rejected here, forcing re-login regardless of remaining session TTL. The
     // next login picks up the current IdP group state.
     if let Some(max_age) = state.max_session_age {
-        let session_age = Utc::now()
+        // Fail closed on an unmeasurable age. A future (or corrupt) `issued_at`
+        // makes `signed_duration_since` negative, so `to_std()` errors; treat
+        // that as "reject" rather than "fresh". The old `unwrap_or(max_age)`
+        // fell back to exactly `max_age`, which is NOT `> max_age`, so a skewed
+        // clock or a forged future timestamp bypassed the cap entirely.
+        let session_age = match Utc::now()
             .signed_duration_since(identity.issued_at)
             .to_std()
-            .unwrap_or(max_age); // clock skew guard: treat negative duration as expired
+        {
+            Ok(age) => age,
+            Err(_) => {
+                tracing::warn!(
+                    user_sub = %identity.user_sub,
+                    request_id = %request_id,
+                    max_age_secs = max_age.as_secs(),
+                    "admin endpoint denied: session issued_at is in the future (403)"
+                );
+                return AdminError::session_too_old()
+                    .with_request_id(request_id)
+                    .into_response();
+            }
+        };
         if session_age > max_age {
             tracing::warn!(
                 user_sub = %identity.user_sub,
@@ -284,27 +302,25 @@ mod tests {
         );
     }
 
-    /// `issued_at` in the future (clock skew / NTP jump) is treated as
-    /// expired rather than panic-ing or allowing indefinitely.
+    /// `issued_at` in the future (clock skew / NTP jump / forged token) must
+    /// fail closed: the age is unmeasurable (`to_std()` errors on the negative
+    /// duration), so the middleware rejects with `session_too_old` (403) rather
+    /// than treating the session as fresh and bypassing the age cap.
     #[test]
-    fn future_issued_at_treated_as_expired() {
+    fn future_issued_at_fails_closed() {
         let identity = make_identity(&["admins"], -120); // issued 2 min in future
-        let max_age = Duration::from_secs(3600);
-        // signed_duration_since returns negative → to_std() returns Err → falls
-        // back to `max_age`, so the check `session_age > max_age` is false.
-        // The session is not rejected by the age gate (the skewed clock is
-        // benign — this is a safety net, not an attack vector).
-        let session_age = Utc::now()
+        // A future issued_at yields a negative duration, which `to_std()` can't
+        // represent → Err. The middleware maps that Err to a rejection.
+        let measured = Utc::now()
             .signed_duration_since(identity.issued_at)
-            .to_std()
-            .unwrap_or(max_age); // clock-skew guard
-        // unwrap_or(max_age) means session_age == max_age → NOT > max_age →
-        // passes. This is intentionally permissive: negative duration ≠ expired,
-        // it just means we can't measure age. A small clock skew is not an
-        // attack; revocation still applies.
+            .to_std();
         assert!(
-            session_age <= max_age,
-            "future issued_at should not trigger the age gate"
+            measured.is_err(),
+            "future issued_at should be unmeasurable, triggering fail-closed"
         );
+        let resp = AdminError::session_too_old()
+            .with_request_id("req-skew")
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }
