@@ -32,6 +32,12 @@ const DEFAULT_AUDIT_RETENTION_DAYS: u32 = 90;
 /// `PermissionsCache::invalidate` directly so the practical staleness is the
 /// in-flight request, not the TTL.
 const DEFAULT_PERMISSIONS_CACHE_TTL_SECONDS: u64 = 60;
+/// A3: freshness TTL for the in-memory session cache. A cache hit older than
+/// this re-reads the state DB, so a session revoked on another replica stops
+/// being honored within this window. Short — revocation is security-critical.
+/// `0` re-validates every request. Kept in sync with the test-facing default
+/// in `auth::session_cache`; this value is the operator override.
+const DEFAULT_SESSION_CACHE_TTL_SECONDS: u64 = 30;
 /// Matches `transport::limit::MAX_CONCURRENT_REQUESTS`. Exposed via `Config`
 /// so integration tests can boot with tight limits without touching the static.
 pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 512;
@@ -56,6 +62,9 @@ pub struct Config {
     pub tls: TlsConfig,
     /// Per-user TTL for the DB-grant resolver cache (#49).
     pub permissions_cache_ttl_seconds: u64,
+    /// Freshness TTL (seconds) for the session cache (A3). Bounds cross-replica
+    /// revocation staleness; `0` re-validates every request.
+    pub session_cache_ttl_seconds: u64,
     /// Process-wide ceiling on concurrent in-flight gated requests. Exposed so
     /// tests can boot with a tight global cap to exercise the 503 path without
     /// flooding the gateway; production code uses `DEFAULT_MAX_CONCURRENT_REQUESTS`.
@@ -118,6 +127,7 @@ impl Default for Config {
             // tests and `for_tests`; both run plain HTTP.
             tls: TlsConfig::Disabled,
             permissions_cache_ttl_seconds: DEFAULT_PERMISSIONS_CACHE_TTL_SECONDS,
+            session_cache_ttl_seconds: DEFAULT_SESSION_CACHE_TTL_SECONDS,
             max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
             max_concurrent_per_identity: DEFAULT_MAX_CONCURRENT_PER_IDENTITY,
         }
@@ -147,6 +157,11 @@ pub enum ConfigError {
     AuditRetentionZero(String),
     #[error("invalid PERMISSIONS_CACHE_TTL_SECONDS `{value}`: {source}")]
     PermissionsCacheTtl {
+        value: String,
+        source: std::num::ParseIntError,
+    },
+    #[error("invalid SESSION_CACHE_TTL_SECONDS `{value}`: {source}")]
+    SessionCacheTtl {
         value: String,
         source: std::num::ParseIntError,
     },
@@ -213,6 +228,16 @@ impl Config {
                 value
                     .parse()
                     .map_err(|source| ConfigError::PermissionsCacheTtl {
+                        value: value.clone(),
+                        source,
+                    })?;
+        }
+        // 0 is valid here — it means "re-validate every request" (no caching).
+        if let Ok(value) = std::env::var("SESSION_CACHE_TTL_SECONDS") {
+            config.session_cache_ttl_seconds =
+                value
+                    .parse()
+                    .map_err(|source| ConfigError::SessionCacheTtl {
                         value: value.clone(),
                         source,
                     })?;
@@ -298,6 +323,13 @@ mod tests {
         let config = Config::default();
         assert!(config.state_db.url.contains("localhost"));
         assert_eq!(config.state_db.pool_size, DEFAULT_STATE_DB_POOL_SIZE);
+    }
+
+    /// A3: the session cache freshness TTL bounds cross-replica revocation
+    /// staleness, so its default is a security-relevant value worth pinning.
+    #[test]
+    fn default_session_cache_ttl_is_thirty_seconds() {
+        assert_eq!(Config::default().session_cache_ttl_seconds, 30);
     }
 
     /// `AUDIT_RETENTION_DAYS=0` would let the pruner wipe every audit row on

@@ -11,8 +11,10 @@ pub mod jwt;
 pub mod oidc;
 pub mod pkce;
 pub mod session;
+pub mod session_cache;
 
 pub use config::AuthConfig;
 pub use errors::AuthError;
 pub use oidc::{OidcClient, VerifiedIdentity};
 pub use session::{Identity, Session, SessionId, SessionStore};
+pub use session_cache::SessionCacheConfig;

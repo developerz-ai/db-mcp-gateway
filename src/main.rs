@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use db_mcp_gateway::audit;
-use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
+use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionCacheConfig, SessionStore};
 use db_mcp_gateway::authz::PermissionsCache;
 use db_mcp_gateway::config::{ConfigFile, TlsConfig};
 use db_mcp_gateway::exec::AdapterRegistry;
@@ -84,7 +84,13 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let shutdown = ShutdownFlag::new();
-    let sessions = SessionStore::new(state_db.clone());
+    let sessions = SessionStore::with_cache_config(
+        state_db.clone(),
+        SessionCacheConfig {
+            ttl: std::time::Duration::from_secs(config.session_cache_ttl_seconds),
+            ..SessionCacheConfig::default()
+        },
+    );
     let oidc = OidcClient::new(auth_config.clone())?;
     // Spec 12 §"Storage backends" / #59: pick the permissions repo based on
     // YAML config. Default (None) is the pg path — the permissions tables
