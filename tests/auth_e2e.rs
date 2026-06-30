@@ -399,6 +399,79 @@ async fn unverified_email_is_rejected() {
     assert_eq!(body["error"]["code"], "oidc_email_unverified", "{body}");
 }
 
+/// A6 — ID token with an absent/empty `email` claim must be rejected at the
+/// callback with 502 Bad Gateway and error code `oidc_email_unverified`. The
+/// audit/admin identity is derived from `email`, so an empty value cannot mint
+/// an identity even when `email_verified` is true.
+#[tokio::test]
+async fn empty_email_is_rejected() {
+    let pool = state::connect(&state_db_url(), 5)
+        .await
+        .expect("state DB up (run `bin/dev up`)");
+
+    let user = MockUser {
+        sub: format!("empty-email-{}", uuid::Uuid::new_v4().simple()),
+        email: String::new(),
+        groups: vec![],
+    };
+    let idp = spawn_mock_idp_with_flags(
+        "test-client-empty-email",
+        "test-secret-empty-email",
+        user,
+        MockTokenFlags::default(),
+    )
+    .await;
+
+    let gw = spawn_gateway(pool, &idp).await;
+    let resp = drive_to_callback(&gw).await;
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_GATEWAY,
+        "empty email must yield 502"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "oidc_email_unverified", "{body}");
+}
+
+/// ID token with a future-dated `nbf` (not-before) claim must be rejected at the
+/// callback with 502 Bad Gateway and error code `oidc_id_token_invalid`. The
+/// gateway sets `Validation::validate_nbf`, so `jsonwebtoken` refuses the
+/// not-yet-valid token before any claim is trusted.
+#[tokio::test]
+async fn future_nbf_id_token_is_rejected() {
+    let pool = state::connect(&state_db_url(), 5)
+        .await
+        .expect("state DB up (run `bin/dev up`)");
+
+    let user = MockUser {
+        sub: format!("future-nbf-{}", uuid::Uuid::new_v4().simple()),
+        email: "future-nbf@example.com".to_string(),
+        groups: vec![],
+    };
+    let idp = spawn_mock_idp_with_flags(
+        "test-client-nbf",
+        "test-secret-nbf",
+        user,
+        MockTokenFlags {
+            future_nbf: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let gw = spawn_gateway(pool, &idp).await;
+    let resp = drive_to_callback(&gw).await;
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_GATEWAY,
+        "future-dated nbf must yield 502"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "oidc_id_token_invalid", "{body}");
+}
+
 /// A5 — ID token signed with HS256 must be rejected at the callback with
 /// 502 Bad Gateway and error code `oidc_id_token_invalid`.
 ///

@@ -183,6 +183,9 @@ impl OidcClient {
         validation.set_issuer(&[&self.config.issuer]);
         validation.set_audience(&[&self.config.audience]);
         validation.validate_exp = true;
+        // `jsonwebtoken` leaves `nbf` off by default; without this a future-dated
+        // ID token (not-yet-valid) would be accepted.
+        validation.validate_nbf = true;
 
         let data = jsonwebtoken::decode::<serde_json::Value>(id_token, &key, &validation)
             .map_err(|_| AuthError::IdToken)?;

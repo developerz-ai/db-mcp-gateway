@@ -45,6 +45,9 @@ pub struct MockTokenFlags {
     /// reject the resulting identity because unverified e-mail cannot be used
     /// as the audit/admin identity (A6).
     pub unverified_email: bool,
+    /// Emit a future-dated `nbf` (not-before) claim.  The gateway must reject
+    /// the token as not-yet-valid (`Validation::validate_nbf`).
+    pub future_nbf: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -229,7 +232,7 @@ fn sign_id_token(
         .expect("system clock past UNIX epoch")
         .as_secs();
     let email_verified = !flags.unverified_email;
-    let claims = json!({
+    let mut claims = json!({
         "iss": issuer,
         "sub": user.sub,
         "aud": aud,
@@ -240,6 +243,12 @@ fn sign_id_token(
         "email_verified": email_verified,
         "groups": user.groups,
     });
+    if flags.future_nbf {
+        // 10 minutes ahead — well past any clock-skew leeway, so the token is
+        // unambiguously not-yet-valid. `exp` stays an hour out, isolating the
+        // rejection to the `nbf` check.
+        claims["nbf"] = json!(now + 600);
+    }
     if flags.sign_with_hs256 {
         // HS256 token: the gateway fetches the RSA public key by kid, then calls
         // jsonwebtoken::decode with Algorithm::RS256 — the alg mismatch is caught

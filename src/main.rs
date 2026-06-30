@@ -226,7 +226,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Collapse a state-DB bring-up failure into a credential-free boot error.
+/// Collapse a boot-time database bring-up failure into a credential-free error.
 ///
 /// `StateDbError::Connect` wraps a `sqlx::Error` whose `Display` can embed the
 /// DSN — and therefore the password — when the URL is malformed or auth is
@@ -243,12 +243,12 @@ fn boot_db_error(store: &'static str, err: state::StateDbError) -> anyhow::Error
             tracing::error!(
                 store,
                 error_type = std::any::type_name_of_val(&source),
-                "state DB bring-up failed at connect"
+                "boot database bring-up failed at connect"
             );
             anyhow::anyhow!("{store}: failed to connect (see logs; DSN withheld)")
         }
         state::StateDbError::Migrate(source) => {
-            anyhow::Error::new(source).context(format!("{store}: state DB migrations failed"))
+            anyhow::Error::new(source).context(format!("{store}: migrations failed"))
         }
     }
 }

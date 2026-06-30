@@ -13,6 +13,13 @@ publish = false
 name = "db-mcp-gateway"
 path = "src/main.rs"
 
+[features]
+# Test-only helpers (e.g. `transport::test_router`, which mounts /mcp without
+# bearer auth). Off by default so the auth-bypassing harness never reaches the
+# normal library surface; this crate's integration tests enable it via the self
+# dev-dependency below.
+test-support = []
+
 [dependencies]
 # async runtime + http
 tokio = { version = "1", features = ["full"] }
@@ -69,6 +76,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
 [dev-dependencies]
+# Self dev-dependency: enables `test-support` for this crate's own integration
+# tests (feature unification) without exposing it to downstream consumers.
+db-mcp-gateway = { path = ".", features = ["test-support"] }
 proptest = "1"
 tempfile = "3"
 rcgen = "0.13"                # Self-signed certs for the TLS+SIGHUP integration test

@@ -154,9 +154,12 @@ pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError
 
 /// Build a minimal router for protocol-only testing (no bearer auth required).
 ///
-/// **Test use only.** Used by integration tests that exercise the MCP wire
-/// protocol without authentication. Skips the bearer_auth middleware, so
-/// requests don't need a valid bearer token.
+/// **Test use only.** Gated behind the `test-support` feature so the
+/// auth-bypassing harness never reaches the default public surface; this
+/// crate's own integration tests opt in via the self dev-dependency in
+/// `Cargo.toml`. Skips the bearer_auth middleware, so requests don't need a
+/// valid bearer token.
+#[cfg(feature = "test-support")]
 pub fn test_router(config: &Config, state: AppState) -> Router {
     let path = normalize_path(&config.mcp_path);
 

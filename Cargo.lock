@@ -656,6 +656,7 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
+ "db-mcp-gateway",
  "futures",
  "jsonwebtoken",
  "libc",
