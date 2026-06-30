@@ -98,9 +98,12 @@ impl RequestContext {
 /// runtime instead — the spawned task runs to completion independently
 /// of the parent future's lifecycle.
 ///
-/// The future-drop chain handles server-side cleanup separately:
-/// `mongodb::Cursor` and `sqlx::Transaction` both kill their backend
-/// operation on drop. This guard's only job is the audit row.
+/// Server-side query cancellation is handled separately, in the exec layer:
+/// `PgAdapter` captures the backend PID and fires `pg_cancel_backend` from a
+/// detached task on drop, because dropping a `sqlx::Transaction` only closes
+/// the socket — it does NOT stop the query already running on the backend.
+/// (Mongo relies on `maxTimeMS` plus cursor-drop.) This guard's only job is
+/// the audit row.
 struct CancelledAuditGuard {
     /// `Some` until `disarm()` is called. On `Drop` we spawn a detached
     /// write of this row with `outcome = "cancelled"`.

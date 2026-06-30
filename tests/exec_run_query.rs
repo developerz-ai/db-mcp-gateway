@@ -6,6 +6,11 @@
 //! `ExecError::Timeout` classification path. Slice 3's auth_e2e covers the
 //! full agent → MCP → exec path.
 
+use std::time::{Duration, Instant};
+
+use sqlx::postgres::PgPoolOptions;
+use uuid::Uuid;
+
 use db_mcp_gateway::config::{Database, Password, Server, ServerKind, Tls};
 use db_mcp_gateway::exec::{DbAdapter, ExecError, ExecQuery, PgAdapter};
 
@@ -132,4 +137,95 @@ async fn pg_adapter_reports_kind_and_health() {
     let a = adapter().await;
     assert_eq!(a.kind(), db_mcp_gateway::exec::AdapterKind::Postgres);
     a.health().await.expect("health check round-trips");
+}
+
+/// Separate pool to the SAME target DB, used to observe `pg_stat_activity`
+/// independently of the adapter under test.
+async fn probe_pool() -> sqlx::PgPool {
+    let url = format!(
+        "postgres://{TARGET_USER}:{TARGET_PASSWORD}@{TARGET_HOST}:{TARGET_PORT}/{TARGET_DB}"
+    );
+    PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .expect("target-db reachable; run `bin/dev up`")
+}
+
+/// Count `active` backends whose current query carries `marker`. The marker
+/// rides in a SQL comment, so it appears verbatim in `pg_stat_activity.query`
+/// — while this probe's own query keeps the marker in a bound param, so it
+/// never self-matches.
+async fn active_with_marker(probe: &sqlx::PgPool, marker: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND query LIKE $1",
+    )
+    .bind(format!("%{marker}%"))
+    .fetch_one(probe)
+    .await
+    .expect("pg_stat_activity query runs")
+}
+
+/// Poll until the active-backend count for `marker` equals `want`, or give up
+/// after `within`. Returns whether the target count was reached.
+async fn wait_for_active_count(
+    probe: &sqlx::PgPool,
+    marker: &str,
+    want: i64,
+    within: Duration,
+) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        if active_with_marker(probe, marker).await == want {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Cancellation safety (CLAUDE.md *§Cancellation safety*): when the query
+/// future is dropped (agent disconnect), the exec layer must fire
+/// `pg_cancel_backend` so the backend stops promptly — NOT linger until
+/// `statement_timeout`. Proven by watching `pg_stat_activity`: the slow query
+/// must vanish within seconds of the drop, far faster than its 30s
+/// sleep/timeout could account for on its own. Easy to regress: dropping the
+/// `sqlx::Transaction` alone leaves the query running on the backend.
+#[tokio::test]
+async fn dropped_query_future_cancels_backend() {
+    let a = adapter().await;
+    let probe = probe_pool().await;
+    // Unique marker so we match only THIS test's backend in pg_stat_activity.
+    let marker = format!("cancel-probe-{}", Uuid::new_v4().simple());
+    let sql = format!("SELECT pg_sleep(30) /* {marker} */");
+
+    let task = tokio::spawn(async move {
+        // Long DB-side timeout (clamped to the 30s ceiling) so the *cancel*,
+        // not statement_timeout, is what stops the query.
+        let q = ExecQuery {
+            sql: &sql,
+            binds: &[],
+            statement_timeout_ms: Some(30_000),
+            row_limit: 10,
+        };
+        let _ = a.execute(q).await;
+    });
+
+    // The backend must actually be running our query before we cancel it.
+    assert!(
+        wait_for_active_count(&probe, &marker, 1, Duration::from_secs(5)).await,
+        "slow query never became active — test setup failed"
+    );
+
+    // Drop the query future, as axum does when the agent disconnects.
+    task.abort();
+
+    // The detached pg_cancel_backend should clear the backend well within 5s
+    // — the 30s sleep/timeout cannot account for a faster disappearance.
+    assert!(
+        wait_for_active_count(&probe, &marker, 0, Duration::from_secs(5)).await,
+        "backend not cancelled within 5s — drop did not fire pg_cancel_backend"
+    );
 }
