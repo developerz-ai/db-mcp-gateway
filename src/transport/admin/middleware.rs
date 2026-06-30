@@ -3,52 +3,57 @@
 //! Runs *after* `bearer_auth`, so an `Identity` is already in extensions.
 //! Job:
 //!  1. Reject with 403 if the caller doesn't carry the configured admin group.
-//!  2. Upsert the calling admin into `permissions_users` so audit rows can
-//!     reference a real `actor_id`. Spec 12 §"Open questions" defers cold
-//!     bootstrap to a CLI subcommand; an already-admin caller (group claim
-//!     present) gets their row auto-provisioned here.
-//!  3. Stash `AdminActor` in request extensions for handlers to read.
+//!  2. Stash `AdminActor` in request extensions for handlers to read.
+//!
+//! The `permissions_users` upsert for the acting admin is intentionally absent
+//! here. Mutation handlers (POST / PATCH / DELETE) call [`tx_upsert_actor`]
+//! inside their own transaction so the actor-row write and the
+//! `permissions_audit` row are atomic. Read-only GETs never write to
+//! `permissions_users` at all — a GET does not produce an audit row and
+//! should not trigger a DB write.
 //!
 //! Every response — denial or success — carries the per-request id so a
 //! failing client paste can be joined to the matching tracing span. The id
 //! is extracted from `x-request-id` if the caller supplied one (gateways /
 //! ingress meshes commonly do); otherwise we mint a UUID.
 
-use std::sync::Arc;
-
 use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use serde_json::Value as JsonValue;
+use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::auth::Identity;
-use crate::state::permissions::PermissionsRepo;
+use crate::state::permissions::RepoError;
 
 use super::error::AdminError;
 
 /// What `require_admin_group` deposits on the request extensions for handlers.
-/// Carries the audit-row primary key (`actor_id`), the email for denormalized
-/// audit storage, and the per-request id threaded into every audit row.
+///
+/// `sub`, `email`, and `groups` carry the caller's identity so mutation
+/// handlers can call [`tx_upsert_actor`] inside their audited transaction
+/// without round-tripping back to the middleware. `id` is NOT stored here:
+/// it comes back from [`tx_upsert_actor`] only when a mutation actually runs.
 #[derive(Debug, Clone)]
 pub struct AdminActor {
-    pub id: Uuid,
+    pub sub: String,
     pub email: String,
+    pub groups: Vec<String>,
     pub request_id: String,
 }
 
-/// Cloned into each `/admin/v1/*` layer; carries the admin-group name + the
-/// repo handle the middleware needs to upsert the calling admin.
+/// Cloned into each `/admin/v1/*` layer; carries the admin-group name the
+/// middleware needs to gate access.
 #[derive(Clone)]
 pub struct AdminMiddlewareState {
     pub admin_group: String,
-    pub repo: Arc<dyn PermissionsRepo>,
 }
 
 impl std::fmt::Debug for AdminMiddlewareState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdminMiddlewareState")
             .field("admin_group", &self.admin_group)
-            .field("repo", &"<Arc<dyn PermissionsRepo>>")
             .finish()
     }
 }
@@ -58,11 +63,10 @@ pub async fn require_admin_group(
     mut req: Request,
     next: Next,
 ) -> Response {
-    // Resolve the request id up-front so EVERY exit path (401, 403, upsert
-    // failure, handler success) carries the same id. Lifting this above the
-    // identity check was a deliberate fix: previously the 401/403 responses
-    // dropped through with no correlation id, blinding ops on the most
-    // common failure modes.
+    // Resolve the request id up-front so EVERY exit path (401, 403, handler
+    // success) carries the same id. Lifting this above the identity check was
+    // a deliberate fix: previously the 401/403 responses dropped through with
+    // no correlation id, blinding ops on the most common failure modes.
     let request_id = req
         .headers()
         .get("x-request-id")
@@ -91,7 +95,7 @@ pub async fn require_admin_group(
 
     if !identity.groups.iter().any(|g| g == &state.admin_group) {
         // Authenticated but not in the admin group: structured tracing carries
-        // the user_sub + request_id for ops triage. We deliberately don't
+        // the user_sub + request_id for ops triage. We deliberately do not
         // upsert into `permissions_users` here — doing so would let any
         // non-admin caller seed a row by hitting `/admin/*`, which is a
         // (small) write amplification + pollution risk.
@@ -105,38 +109,48 @@ pub async fn require_admin_group(
             .into_response();
     }
 
-    // Upsert keeps the admin's `permissions_users` row in sync with the JWT.
-    // This is the only path that writes to that table for the admin
-    // themselves — spec 12 cold-start uses a CLI subcommand (out of #52).
-    let user = match state
-        .repo
-        .upsert_user(&identity.user_sub, &identity.user_email, &identity.groups)
-        .await
-    {
-        Ok(u) => u,
-        Err(err) => {
-            // Same shape as users::internal — log only the error TYPE, never
-            // the Display text. A `sqlx::Error::Database` `Display` embeds PG
-            // `detail`/`constraint`, which on `permissions_users` would leak
-            // user emails and group names. CLAUDE.md non-negotiable #1.
-            let error_type = std::any::type_name_of_val(&err);
-            tracing::error!(
-                error_type,
-                user_sub = %identity.user_sub,
-                request_id = %request_id,
-                "admin actor upsert failed"
-            );
-            return AdminError::internal()
-                .with_request_id(request_id)
-                .into_response();
-        }
-    };
-
     req.extensions_mut().insert(AdminActor {
-        id: user.id,
-        email: identity.user_email.clone(),
+        sub: identity.user_sub,
+        email: identity.user_email,
+        groups: identity.groups,
         request_id,
     });
 
     next.run(req).await
+}
+
+/// Upsert the calling admin's `permissions_users` row inside an already-open
+/// transaction. Returns the actor's `id` for use as `actor_id` in the
+/// accompanying `permissions_audit` row.
+///
+/// Mutation handlers (POST / PATCH / DELETE) call this before writing the
+/// audit row so both writes are atomic: if the audit write fails and the
+/// transaction rolls back, the actor-row upsert is also rolled back. Read
+/// handlers (GET) never call this — they produce no audit rows.
+///
+/// Keyed on `user_sub` with a soft-delete guard (`WHERE deleted_at IS NULL`).
+/// A soft-deleted prior row stays as an audit trail; the next mutation by the
+/// same admin inserts a fresh row rather than reviving the old one.
+pub(super) async fn tx_upsert_actor(
+    tx: &mut Transaction<'_, Postgres>,
+    sub: &str,
+    email: &str,
+    groups: &[String],
+) -> Result<Uuid, RepoError> {
+    let groups_json: JsonValue = serde_json::to_value(groups).map_err(RepoError::EncodeGroups)?;
+    let row = sqlx::query(
+        "INSERT INTO permissions_users (user_sub, user_email, groups) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (user_sub) WHERE deleted_at IS NULL \
+         DO UPDATE SET user_email = EXCLUDED.user_email, \
+                       groups     = EXCLUDED.groups, \
+                       updated_at = now() \
+         RETURNING id",
+    )
+    .bind(sub)
+    .bind(email)
+    .bind(&groups_json)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(row.try_get("id")?)
 }

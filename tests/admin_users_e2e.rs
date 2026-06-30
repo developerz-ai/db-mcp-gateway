@@ -608,14 +608,8 @@ async fn audit_write_failure_rolls_back_user_write() {
     let pool = pool().await;
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
 
-    // Seed an admin actor row so audit.actor_id refers to a real user. The
-    // bad actor's request_id is what trips the CHECK — actor_id stays valid.
     let admin_email = format!("admin-rollback-{}@example.com", Uuid::new_v4().simple());
     let admin_sub = format!("admin-rollback-{}", Uuid::new_v4().simple());
-    let admin = repo
-        .upsert_user(&admin_sub, &admin_email, &[ADMIN_GROUP.to_string()])
-        .await
-        .expect("seed admin");
 
     let target_sub = format!("target-rollback-{}", Uuid::new_v4().simple());
 
@@ -623,9 +617,14 @@ async fn audit_write_failure_rolls_back_user_write() {
         repo: repo.clone(),
         state_db: pool.clone(),
     };
+    // The handler calls tx_upsert_actor inside the transaction, so the actor
+    // row is not pre-seeded here. The empty request_id trips the CHECK on
+    // permissions_audit.request_id (migration 0005), causing the transaction
+    // — including the upserted actor row and the target user write — to roll back.
     let actor = AdminActor {
-        id: admin.id,
+        sub: admin_sub.clone(),
         email: admin_email.clone(),
+        groups: vec![ADMIN_GROUP.to_string()],
         // Empty — trips the CHECK on permissions_audit.request_id, forcing
         // the transaction to roll back.
         request_id: String::new(),

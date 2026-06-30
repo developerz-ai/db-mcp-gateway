@@ -7,8 +7,9 @@
 //!  1. `bearer_auth` (existing) — verifies the gateway-issued session JWT and
 //!     injects `Identity` into request extensions.
 //!  2. `require_admin_group` (this module) — confirms `Identity.groups` carries
-//!     the configured admin group, upserts the calling admin into
-//!     `permissions_users`, and stashes [`AdminActor`] for handlers.
+//!     the configured admin group and stashes [`AdminActor`] for handlers.
+//!     The `permissions_users` upsert is intentionally deferred to mutation
+//!     handlers so it runs inside the same transaction as the audit row.
 //!
 //! Every write commits a `permissions_audit` row in the same transaction as
 //! the data write. Audit failure rolls back. CLAUDE.md non-negotiable #4.
@@ -52,10 +53,7 @@ pub fn router(
     state_db: PgPool,
     cache: Option<PermissionsCache>,
 ) -> Router {
-    let mw_state = AdminMiddlewareState {
-        admin_group,
-        repo: repo.clone(),
-    };
+    let mw_state = AdminMiddlewareState { admin_group };
     let users_routes = Router::new()
         .route("/admin/v1/users", post(users::create).get(users::list))
         .route(
