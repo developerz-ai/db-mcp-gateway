@@ -14,7 +14,7 @@
 # Servers are the databases your org uses.
 servers:
   - name: prod
-    kind: postgres                    # postgres or mongodb
+    kind: postgres                    # postgres or mongo
     host: prod-db.internal            # hostname or IP
     port: 5432                        # default 5432 for postgres, 27017 for mongo
     tls: required                     # required | insecure (never in prod)
