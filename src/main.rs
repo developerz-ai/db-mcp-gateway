@@ -75,7 +75,9 @@ async fn main() -> anyhow::Result<()> {
         .install_recorder()
         .map_err(|err| anyhow::anyhow!("failed to install Prometheus recorder: {err}"))?;
 
-    let state_db = state::connect(&config.state_db.url, config.state_db.pool_size).await?;
+    let state_db = state::connect(&config.state_db.url, config.state_db.pool_size)
+        .await
+        .map_err(|err| boot_db_error("state DB", err))?;
     tracing::info!(
         pool_size = config.state_db.pool_size,
         "state DB connected, migrations applied"
@@ -108,7 +110,8 @@ async fn main() -> anyhow::Result<()> {
                     &dsn,
                     config.state_db.pool_size,
                 )
-                .await?;
+                .await
+                .map_err(|err| boot_db_error("mysql permissions store", err))?;
                 tracing::info!(
                     pool_size = config.state_db.pool_size,
                     "mysql permissions store connected, migrations applied"
@@ -221,6 +224,33 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Collapse a boot-time database bring-up failure into a credential-free error.
+///
+/// `StateDbError::Connect` wraps a `sqlx::Error` whose `Display` can embed the
+/// DSN — and therefore the password — when the URL is malformed or auth is
+/// rejected. `main` returns `anyhow::Result`, and a returned error is rendered
+/// to stderr through its source chain on process exit, so propagating that
+/// `#[source]` would print the credential. We log the error *type* only (same
+/// discipline as the admin handlers in `transport/admin/`) and return a
+/// source-free error. `Migrate` failures name only migration versions, never
+/// credentials, so they're surfaced in full for operator debugging. CLAUDE.md
+/// non-negotiable #1.
+fn boot_db_error(store: &'static str, err: state::StateDbError) -> anyhow::Error {
+    match err {
+        state::StateDbError::Connect(source) => {
+            tracing::error!(
+                store,
+                error_type = std::any::type_name_of_val(&source),
+                "boot database bring-up failed at connect"
+            );
+            anyhow::anyhow!("{store}: failed to connect (see logs; DSN withheld)")
+        }
+        state::StateDbError::Migrate(source) => {
+            anyhow::Error::new(source).context(format!("{store}: migrations failed"))
+        }
+    }
 }
 
 /// SIGHUP loop: every signal, re-read cert+key from the configured paths and

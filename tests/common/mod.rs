@@ -25,6 +25,30 @@ use uuid::Uuid;
 const TEST_KEY_PEM: &str = include_str!("../data/test_idp_key.pem");
 const TEST_JWK: &str = include_str!("../data/test_idp_pub.jwk.json");
 const TEST_KID: &str = "test-kid-1";
+/// Fixed HMAC secret used only when `MockTokenFlags::sign_with_hs256` is set.
+/// Never used in production; exists solely to mint an HS256 token the gateway
+/// must reject (A5 — algorithm pinned to RS256).
+const HS256_TEST_SECRET: &[u8] = b"test-hs256-secret-not-a-real-key";
+
+/// Controls what the mock IdP injects into the ID token.
+///
+/// `Default` (all-false) → normal behaviour: RS256-signed, email verified.
+/// Use [`spawn_mock_idp_with_flags`] to exercise non-default paths; the
+/// baseline [`spawn_mock_idp`] delegates here with the default flags.
+#[derive(Clone, Debug, Default)]
+pub struct MockTokenFlags {
+    /// Sign the ID token with HS256 instead of RS256.  Simulates an
+    /// algorithm-confusion attack; the gateway must reject it because
+    /// `Validation::new(Algorithm::RS256)` pins the allowed algorithm (A5).
+    pub sign_with_hs256: bool,
+    /// Emit `email_verified: false` in the ID token claims.  The gateway must
+    /// reject the resulting identity because unverified e-mail cannot be used
+    /// as the audit/admin identity (A6).
+    pub unverified_email: bool,
+    /// Emit a future-dated `nbf` (not-before) claim.  The gateway must reject
+    /// the token as not-yet-valid (`Validation::validate_nbf`).
+    pub future_nbf: bool,
+}
 
 #[derive(Clone, Debug)]
 pub struct MockUser {
@@ -50,9 +74,21 @@ struct MockIdpState {
     /// by /token. Storing the challenge lets /token enforce PKCE — proving the
     /// gateway (as an OAuth client) actually sends a verifier.
     codes: Arc<Mutex<HashMap<String, (String, String)>>>,
+    flags: MockTokenFlags,
 }
 
 pub async fn spawn_mock_idp(client_id: &str, client_secret: &str, user: MockUser) -> MockIdpHandle {
+    spawn_mock_idp_with_flags(client_id, client_secret, user, MockTokenFlags::default()).await
+}
+
+/// Like [`spawn_mock_idp`] but lets the caller inject token-level deviations
+/// (wrong algorithm, unverified email) to test gateway rejection paths.
+pub async fn spawn_mock_idp_with_flags(
+    client_id: &str,
+    client_secret: &str,
+    user: MockUser,
+    flags: MockTokenFlags,
+) -> MockIdpHandle {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock IdP");
@@ -64,6 +100,7 @@ pub async fn spawn_mock_idp(client_id: &str, client_secret: &str, user: MockUser
         client_secret: client_secret.to_string(),
         user,
         codes: Arc::new(Mutex::new(HashMap::new())),
+        flags,
     };
     let app = Router::new()
         .route("/.well-known/openid-configuration", get(discovery))
@@ -174,7 +211,7 @@ async fn token(
     if !db_mcp_gateway::auth::pkce::verify(verifier, &challenge) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let id_token = sign_id_token(&s.issuer, &s.client_id, &s.user, &nonce);
+    let id_token = sign_id_token(&s.issuer, &s.client_id, &s.user, &nonce, &s.flags);
     Ok(Json(json!({
         "access_token": "test-access",
         "token_type": "Bearer",
@@ -183,12 +220,19 @@ async fn token(
     })))
 }
 
-fn sign_id_token(issuer: &str, aud: &str, user: &MockUser, nonce: &str) -> String {
+fn sign_id_token(
+    issuer: &str,
+    aud: &str,
+    user: &MockUser,
+    nonce: &str,
+    flags: &MockTokenFlags,
+) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock past UNIX epoch")
         .as_secs();
-    let claims = json!({
+    let email_verified = !flags.unverified_email;
+    let mut claims = json!({
         "iss": issuer,
         "sub": user.sub,
         "aud": aud,
@@ -196,14 +240,35 @@ fn sign_id_token(issuer: &str, aud: &str, user: &MockUser, nonce: &str) -> Strin
         "iat": now,
         "nonce": nonce,
         "email": user.email,
+        "email_verified": email_verified,
         "groups": user.groups,
     });
-    let mut header = Header::new(Algorithm::RS256);
-    header.kid = Some(TEST_KID.to_string());
-    jsonwebtoken::encode(
-        &header,
-        &claims,
-        &EncodingKey::from_rsa_pem(TEST_KEY_PEM.as_bytes()).expect("static test key parses"),
-    )
-    .expect("ID token encoding never fails for our static inputs")
+    if flags.future_nbf {
+        // 10 minutes ahead — well past any clock-skew leeway, so the token is
+        // unambiguously not-yet-valid. `exp` stays an hour out, isolating the
+        // rejection to the `nbf` check.
+        claims["nbf"] = json!(now + 600);
+    }
+    if flags.sign_with_hs256 {
+        // HS256 token: the gateway fetches the RSA public key by kid, then calls
+        // jsonwebtoken::decode with Algorithm::RS256 — the alg mismatch is caught
+        // before any crypto, exercising the A5 pin.
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some(TEST_KID.to_string());
+        jsonwebtoken::encode(
+            &header,
+            &claims,
+            &EncodingKey::from_secret(HS256_TEST_SECRET),
+        )
+        .expect("HS256 encoding never fails for our static inputs")
+    } else {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(TEST_KID.to_string());
+        jsonwebtoken::encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(TEST_KEY_PEM.as_bytes()).expect("static test key parses"),
+        )
+        .expect("ID token encoding never fails for our static inputs")
+    }
 }

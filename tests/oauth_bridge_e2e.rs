@@ -280,6 +280,11 @@ async fn mcp_oauth_bridge_full_flow() {
 /// Spawn a gateway with no auth and no state DB — sufficient to exercise
 /// `/register` and the `/authorize` parameter-validation rejection paths.
 async fn spawn_authless_gateway() -> (String, reqwest::Client) {
+    use db_mcp_gateway::config::ConfigFile;
+    use db_mcp_gateway::exec::AdapterRegistry;
+    use db_mcp_gateway::transport::ClientRegistry;
+    use std::sync::Arc;
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind authless gateway");
@@ -289,7 +294,24 @@ async fn spawn_authless_gateway() -> (String, reqwest::Client) {
         bind: addr,
         ..Config::default()
     };
-    let app = transport::router(&config, AppState::for_tests()).expect("router builds");
+    let state = AppState {
+        auth: None,
+        config: Arc::new(ConfigFile {
+            servers: Vec::new(),
+            permissions: Vec::new(),
+            admin: None,
+            permissions_store: None,
+        }),
+        adapter_registry: AdapterRegistry::new(),
+        state_db: None,
+        shutdown: Default::default(),
+        metrics: None,
+        permissions_cache: None,
+        permissions_repo: None,
+        mcp_path: Arc::from("/mcp"),
+        client_registry: ClientRegistry::default(),
+    };
+    let app = transport::router(&config, state).expect("router builds");
     tokio::spawn(async move {
         let _ = axum::serve(
             listener,

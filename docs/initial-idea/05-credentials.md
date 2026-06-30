@@ -66,3 +66,4 @@ Credentials are re-read from their source on `SIGHUP` (config reload). Live conn
 - No "share my session credential with my coworker" — there's nothing to share.
 - No connection-string export tool. Ever.
 - No "let me see what credential you're using" admin endpoint. Logs show role name (not password) and only to operators.
+- No DSN in a boot failure. A driver connect error can quote the URL it was handed (and thus the password); the gateway logs the error *type* only and exits with a credential-free message. Same discipline as the admin handlers.

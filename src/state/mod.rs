@@ -15,6 +15,11 @@ use sqlx::{MySqlPool, PgPool};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StateDbError {
+    /// State DB connect failed. The `#[source]` `sqlx::Error` can embed the DSN
+    /// — and therefore the password — in its `Display` on a malformed-URL or
+    /// auth failure. NEVER render this variant's source into a log, response, or
+    /// process-exit message; log its *type* and emit a generic error instead
+    /// (see `boot_db_error` in `main.rs`). CLAUDE.md non-negotiable #1.
     #[error("failed to connect to state DB")]
     Connect(#[source] sqlx::Error),
     #[error("failed to run state DB migrations")]

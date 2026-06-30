@@ -152,6 +152,24 @@ pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError
     Ok(router)
 }
 
+/// Build a minimal router for protocol-only testing (no bearer auth required).
+///
+/// **Test use only.** Gated behind the `test-support` feature so the
+/// auth-bypassing harness never reaches the default public surface; this
+/// crate's own integration tests opt in via the self dev-dependency in
+/// `Cargo.toml`. Skips the bearer_auth middleware, so requests don't need a
+/// valid bearer token.
+#[cfg(feature = "test-support")]
+pub fn test_router(config: &Config, state: AppState) -> Router {
+    let path = normalize_path(&config.mcp_path);
+
+    // MCP endpoints without bearer auth for protocol-only tests.
+    Router::new()
+        .route(&path, post(post_handler))
+        .route(&path, get(sse::handler))
+        .with_state(state)
+}
+
 /// axum routes require a leading slash; tolerate config that omits it.
 fn normalize_path(path: &str) -> String {
     if path.starts_with('/') {

@@ -199,7 +199,7 @@ Cached for the session TTL. Group changes in the IdP take effect at the next log
 
 | Field | Source |
 |---|---|
-| `user_email` | OIDC `email` claim |
+| `user_email` | OIDC `email` claim — required, and only trusted when the token also asserts `email_verified == true` (see Failure modes) |
 | `user_id` | OIDC `sub` |
 | `groups` | snapshot at token issue time |
 | `session_id` | gateway-issued, links to login event |
@@ -215,5 +215,7 @@ Cached for the session TTL. Group changes in the IdP take effect at the next log
 | User removed from IdP | Token still valid until TTL; revoke explicitly via admin command if needed |
 | Group changed mid-session | Old group snapshot applies until re-login (documented; reduces every-request IdP load) |
 | Token leaked | Revoke via admin command; user re-runs login |
+| ID token has no `email`, or `email_verified` is not `true` | Login rejected (`oidc_email_unverified`). Email is the audit/admin identity, so an absent or unverified — often user-settable — address is never minted into a session |
+| ID token is expired (`exp`) or not yet valid (`nbf`) | Login rejected (`oidc_id_token_invalid`). Both claims are enforced; a future-dated `nbf` token is refused before any claim is trusted |
 
 Local accounts, password auth, and "admin bypass" are explicitly out of scope. The gateway has no users of its own.

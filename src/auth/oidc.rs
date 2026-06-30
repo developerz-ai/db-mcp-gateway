@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use jsonwebtoken::{DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use url::{Host, Url};
@@ -179,10 +179,13 @@ impl OidcClient {
         let kid = header.kid.ok_or(AuthError::IdToken)?;
         let key = self.decoding_key(&kid).await?;
 
-        let mut validation = Validation::new(header.alg);
+        let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[&self.config.issuer]);
         validation.set_audience(&[&self.config.audience]);
         validation.validate_exp = true;
+        // `jsonwebtoken` leaves `nbf` off by default; without this a future-dated
+        // ID token (not-yet-valid) would be accepted.
+        validation.validate_nbf = true;
 
         let data = jsonwebtoken::decode::<serde_json::Value>(id_token, &key, &validation)
             .map_err(|_| AuthError::IdToken)?;
@@ -200,11 +203,21 @@ impl OidcClient {
             .and_then(|v| v.as_str())
             .ok_or(AuthError::IdToken)?
             .to_string();
+        // Email is the audit/admin identity: persisted to `permissions_users`
+        // and stamped on every audit row. Many IdPs let a user set an arbitrary
+        // address that stays `email_verified: false`, so trusting an unverified
+        // value would feed a spoofable identity into the audit trail (A6).
+        // Require the claim present AND `email_verified == true` before minting
+        // an identity from it.
         let email = claims
             .get("email")
             .and_then(|v| v.as_str())
-            .unwrap_or_default()
+            .filter(|s| !s.is_empty())
+            .ok_or(AuthError::EmailUnverified)?
             .to_string();
+        if !claim_is_true(claims.get("email_verified")) {
+            return Err(AuthError::EmailUnverified);
+        }
         let groups = claims
             .get(self.config.groups_claim.as_str())
             .and_then(|v| v.as_array())
@@ -301,11 +314,13 @@ impl OidcClient {
                 by_kid.insert(jwk_kid, key);
             }
         }
-        let key = by_kid.get(kid).cloned().ok_or(AuthError::IdToken)?;
+        // Write cache before lookup to prevent refetch amplification when a key is
+        // unknown: subsequent requests for the same unknown kid use the cached JWKS set.
         *self.jwks.write().await = Some(JwksCache {
-            keys: by_kid,
+            keys: by_kid.clone(),
             fetched_at: Instant::now(),
         });
+        let key = by_kid.get(kid).cloned().ok_or(AuthError::IdToken)?;
         Ok(key)
     }
 }
@@ -319,6 +334,18 @@ fn require_secure_url(raw: &str) -> Result<(), AuthError> {
         "https" => Ok(()),
         "http" if is_loopback(&url) => Ok(()),
         _ => Err(AuthError::Discovery),
+    }
+}
+
+/// Interpret an OIDC boolean-ish claim. OIDC Core §5.1 types `email_verified`
+/// as a JSON boolean, but some IdPs (older Google, Azure AD) emit the string
+/// `"true"`. Accept either; everything else — `false`, a number, null, absent —
+/// is treated as not-true.
+fn claim_is_true(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => s.eq_ignore_ascii_case("true"),
+        _ => false,
     }
 }
 
@@ -350,5 +377,27 @@ mod tests {
         assert!(require_secure_url("http://localhost:8443/").is_ok());
         assert!(require_secure_url("http://127.0.0.1:8443/").is_ok());
         assert!(require_secure_url("http://[::1]:8443/").is_ok());
+    }
+
+    #[test]
+    fn email_verified_bool_true_is_true() {
+        assert!(claim_is_true(Some(&serde_json::json!(true))));
+    }
+
+    #[test]
+    fn email_verified_string_true_is_true() {
+        // Older Google / Azure AD emit the string form; accept it case-insensitively.
+        assert!(claim_is_true(Some(&serde_json::json!("true"))));
+        assert!(claim_is_true(Some(&serde_json::json!("TRUE"))));
+    }
+
+    #[test]
+    fn email_verified_false_or_absent_is_not_true() {
+        assert!(!claim_is_true(Some(&serde_json::json!(false))));
+        assert!(!claim_is_true(Some(&serde_json::json!("false"))));
+        assert!(!claim_is_true(Some(&serde_json::json!("yes"))));
+        assert!(!claim_is_true(Some(&serde_json::json!(1))));
+        assert!(!claim_is_true(Some(&serde_json::Value::Null)));
+        assert!(!claim_is_true(None));
     }
 }
