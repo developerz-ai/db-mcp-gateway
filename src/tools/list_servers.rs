@@ -139,7 +139,7 @@ servers:
     databases:
       - { name: app, role: ro, password: stagingpw }
   - name: analytics
-    kind: mysql
+    kind: mongo
     description: Analytics
     host: an.db.internal
     databases:

@@ -105,6 +105,7 @@ logging:
 - Every `permissions[*].grants[*].server` / `database` must exist in `servers`, or be the literal `"*"`.
 - Every server's `tls` must be `required` when `env: production` unless explicitly `tls: insecure` (which logs a warning every minute).
 - Role names must match `^[a-zA-Z_][a-zA-Z0-9_]*$`. Catch typos before they become connection failures.
+- Every server's `kind` must have a query adapter wired (today `postgres` and `mongo`). A `mysql`/`mssql` target is rejected at boot rather than parsing clean and failing every query at runtime — these kinds are reserved for the roadmap adapters and only become valid when their adapters land.
 - `admin.enabled` defaults to `false` — absent or false leaves `/admin/v1/*` unmounted (404). When `enabled: true`, `admin.group` is required and must be non-empty/non-whitespace, else boot aborts (every authenticated caller would otherwise be an admin). Full surface in [12-dynamic-permissions.md](12-dynamic-permissions.md).
 - `permissions_store.driver: mysql` combined with `admin.enabled: true` is rejected at boot — admin handlers are pg-only today. Use `driver: pg` (the default when the block is absent) for the admin path, or `mysql` with YAML grants only.
 

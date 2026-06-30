@@ -36,7 +36,7 @@ servers:
     databases:
       - { name: app, role: ro, password: stagingpw }
   - name: analytics
-    kind: mysql
+    kind: mongo
     description: E2E analytics
     host: analytics.example.invalid
     databases:
