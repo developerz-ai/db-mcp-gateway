@@ -11,6 +11,7 @@
 //! parse time, not silently turned into a literal password.
 
 use db_mcp_gateway::config::{ConfigFile, ConfigFileError, Password, SecretError};
+use db_mcp_gateway::state;
 use std::io::Write;
 
 fn yaml_with_password(reference: &str) -> String {
@@ -140,5 +141,48 @@ fn unimplemented_backend_aborts_boot() {
     match cfg.resolve_secrets() {
         Err(SecretError::BackendNotImplemented(scheme)) => assert_eq!(scheme, "vault"),
         other => panic!("expected BackendNotImplemented(vault), got {other:?}"),
+    }
+}
+
+/// C1 — A malformed / unreachable `STATE_DB_URL` must not leak the DSN or
+/// password into the error message that the gateway would log or surface.
+///
+/// `StateDbError::Connect` wraps a `sqlx::Error` whose `Display` / `Debug`
+/// *can* include the connection string on some sqlx versions. The gateway
+/// intercepts the error in `boot_db_error` (main.rs) and emits only a
+/// type-name + fixed string; this test verifies the public `Display` of
+/// `StateDbError` itself is already safe, so no accidental `.to_string()`
+/// call downstream can leak the credential.
+#[tokio::test]
+async fn malformed_state_db_url_leaks_no_dsn() {
+    // Port 59999 is almost certainly not listening; the connection is refused
+    // immediately rather than timing out, keeping the test fast.
+    // "sentinelpassword" is the canary: if it appears in any formatted error
+    // output the test fails.
+    let url = "postgres://gateway:sentinelpassword@127.0.0.1:59999/gateway";
+    let err = state::connect(url, 1)
+        .await
+        .expect_err("connection to port 59999 must fail");
+
+    // Must be the Connect variant, not Migrate (credentials only matter at connect).
+    assert!(
+        matches!(err, state::StateDbError::Connect(_)),
+        "expected StateDbError::Connect, got {err:?}"
+    );
+
+    // Display is the string operators see in logs and error responses.
+    let display = format!("{err}");
+    // Debug is reachable via `{err:?}` in tracing macros or panic messages.
+    let debug = format!("{err:?}");
+
+    for forbidden in ["sentinelpassword", "59999", "gateway:sentinelpassword"] {
+        assert!(
+            !display.contains(forbidden),
+            "DSN leaked in Display — `{forbidden}` found: {display}"
+        );
+        assert!(
+            !debug.contains(forbidden),
+            "DSN leaked in Debug — `{forbidden}` found: {debug}"
+        );
     }
 }
