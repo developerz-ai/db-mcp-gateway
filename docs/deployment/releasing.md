@@ -13,19 +13,19 @@ GHCR is used because this is an open-source project — public images are free, 
 
 ```bash
 # 1. Bump version in Cargo.toml
-sed -i 's/^version = .*/version = "0.1.0"/' Cargo.toml
+sed -i 's/^version = .*/version = "X.Y.Z"/' Cargo.toml
 cargo update -w
 git add Cargo.toml Cargo.lock
-git commit -m "release: 0.1.0"
+git commit -m "release: X.Y.Z"
 
 # 2. Tag and push
-git tag -a v0.1.0 -m "v0.1.0"
-git push origin main v0.1.0
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin main vX.Y.Z
 ```
 
 Watch the workflow at `https://github.com/developerz-ai/db-mcp-gateway/actions`. When it finishes:
 
-- `ghcr.io/developerz-ai/db-mcp-gateway:0.1.0` is pullable.
+- `ghcr.io/developerz-ai/db-mcp-gateway:X.Y.Z` is pullable.
 - `ghcr.io/developerz-ai/db-mcp-gateway:latest` points at it.
 - A GitHub Release exists with the changelog.
 
