@@ -32,9 +32,15 @@ Args: `server`, `database`, `table`, optional `limit` (default 10, capped). Retu
 
 Args: `server`, `database`, `sql`, optional `limit`, optional `reason`. Executes under the read-only role with statement timeout. Returns rows + truncation flag + execution stats. The primary tool.
 
+**Statement-timeout ceiling:** every query is subject to a hard 30 s ceiling regardless of the per-grant `statement_timeout_ms` value. A grant may set a shorter timeout; it may not exceed 30 s — the gateway clamps it. The timeout is enforced both DB-side (`SET LOCAL statement_timeout`) and by a Tokio guard as belt-and-suspenders. A query that exceeds it returns `timeout`.
+
+**`EXPLAIN ANALYZE` is rejected.** `EXPLAIN ANALYZE` executes the query and can therefore run write-containing CTEs on a read-only role, defeating the read-only guarantee. The sql guard rejects it before the query reaches the DB; the caller receives `forbidden_sql`.
+
 ### `explain`
 
 Args: `server`, `database`, `sql`. Returns `EXPLAIN` (or vendor equivalent) without executing. Lets the agent estimate cost before running expensive queries.
+
+**`EXPLAIN ANALYZE` is rejected** — same reason as in `run_query`. Use plain `EXPLAIN` instead.
 
 ### `get_query_history`
 
@@ -42,20 +48,36 @@ Args: optional `database`, optional `since`, optional `limit`. Returns *the call
 
 ## Errors
 
-Errors are structured JSON, not free-text strings. Categories:
+Errors are structured JSON, not free-text strings. Shape: `{ "error": { "category": "<code>", "code": "<detail>" } }`.
 
-| Code | When |
-|---|---|
-| `unauthenticated` | Token missing/expired — agent triggers re-login |
-| `forbidden` | Authenticated but permission denied for this server/db/action |
-| `reason_required` | Policy requires a reason for this call; none provided |
-| `timeout` | Statement timeout fired |
-| `row_limit_exceeded` | Result truncated at configured cap |
-| `syntax_error` | DB rejected the SQL |
-| `unavailable` | DB unreachable or pool exhausted |
-| `internal` | Bug. Has a request ID that matches a server-side log line |
+| Code | HTTP | When |
+|---|---|---|
+| `unauthenticated` | 401 | Token missing/expired — agent triggers re-login |
+| `forbidden` | 403 | Authenticated but permission denied for this server/db/action |
+| `forbidden_sql` | 403 | SQL rejected before reaching the DB: write statement, `EXPLAIN ANALYZE`, or dangerous function (`pg_read_file`, `lo_export`, …) |
+| `reason_required` | 400 | Policy requires a reason for this call; none provided |
+| `timeout` | 408 | Statement timeout fired (30 s ceiling) |
+| `row_limit_exceeded` | 200 | Result truncated at configured cap (flag in response, not an error response) |
+| `syntax_error` | 400 | DB rejected the SQL |
+| `unavailable` | 503 | DB unreachable or pool exhausted |
+| `rate_limited` | 429 | Calling identity has too many concurrent in-flight requests (per-identity cap). `Retry-After: 1` header is set. |
+| `service_overloaded` | 503 | Gateway-wide concurrency ceiling reached. `Retry-After: 1` header is set. |
+| `internal` | 500 | Bug. Has a request ID that matches a server-side log line |
 
 Every error includes a `request_id` the user can paste back to ops.
+
+## Resource safety
+
+Two independent concurrency caps protect the query path:
+
+| Limit | Default | Response when exceeded |
+|---|---|---|
+| **Global** (process-wide) | 512 concurrent requests | `503` `service_overloaded` |
+| **Per-identity** (per SSO `sub`) | 16 concurrent requests | `429` `rate_limited` |
+
+Both caps are checked on the bearer-gated router *after* authentication. A per-identity permit is held for the full lifetime of the request. The global cap is checked first to keep the per-identity map lookup cheap on a saturated gateway.
+
+The 30 s statement-timeout ceiling (see `run_query` above) is the complementary per-query bound: it limits how long one request can hold its permits.
 
 ## What we don't expose
 
