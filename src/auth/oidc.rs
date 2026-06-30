@@ -311,11 +311,13 @@ impl OidcClient {
                 by_kid.insert(jwk_kid, key);
             }
         }
-        let key = by_kid.get(kid).cloned().ok_or(AuthError::IdToken)?;
+        // Write cache before lookup to prevent refetch amplification when a key is
+        // unknown: subsequent requests for the same unknown kid use the cached JWKS set.
         *self.jwks.write().await = Some(JwksCache {
-            keys: by_kid,
+            keys: by_kid.clone(),
             fetched_at: Instant::now(),
         });
+        let key = by_kid.get(kid).cloned().ok_or(AuthError::IdToken)?;
         Ok(key)
     }
 }
