@@ -72,6 +72,18 @@ The access token is the same HS256 gateway session JWT the bespoke flow issues, 
 
 The base URL for all metadata is derived from the configured `OIDC_REDIRECT_URL` origin. If that value is unparseable the gateway fails closed with `500` rather than trusting the `Host` header.
 
+### HTTPS requirement for production
+
+The gateway's OIDC configuration must use **HTTPS in production**. The `external_url` (or `OIDC_REDIRECT_URL` in env-based config) **must be an HTTPS URL** for any production deployment:
+
+- OAuth flows carry authorization codes and tokens in redirects and form posts; an unencrypted channel (HTTP) exposes them to network sniffing.
+- IdPs typically reject non-HTTPS `redirect_uri` values as a security requirement.
+- Clients (MCP editors, IdP servers) may log or cache these URLs; plain HTTP leaks credentials to anyone on the network path.
+
+**Dev exception:** `http://localhost` and `http://127.0.0.1` are permitted for local development (the loopback guarantee). This mirrors OAuth 2.1 / RFC 8252 treatment of localhost redirects.
+
+Operators should enforce this at deployment time (reverse-proxy validation, network policy, or gateway-level checks). A misconfigured non-HTTPS `external_url` in production is a credential-transport risk.
+
 ### Dynamic Client Registration — `POST /register`
 
 Accepts JSON. Required field: `redirect_uris` (non-empty array). Optional: `client_name`.
