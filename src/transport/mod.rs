@@ -17,7 +17,7 @@ mod auth_middleware;
 mod auth_routes;
 mod client_registry;
 mod dispatch;
-mod limit;
+pub mod limit;
 mod oauth;
 mod oauth_state;
 mod sse;
@@ -60,7 +60,10 @@ pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError
     // `bearer_auth` runs before `limit::enforce` and the per-identity limiter
     // sees the resolved `Identity`. The global cap sheds saturation with 503;
     // the per-identity cap returns 429 (sec qa 2026-06-29 T1).
-    let limiter = Arc::new(limit::ConcurrencyLimiter::new());
+    let limiter = Arc::new(limit::ConcurrencyLimiter::with_caps(
+        config.max_concurrent_requests,
+        config.max_concurrent_per_identity,
+    ));
     let gated = Router::new()
         .route(&path, post(post_handler))
         .route("/auth/logout", post(auth_routes::logout))

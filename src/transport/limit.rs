@@ -66,6 +66,13 @@ impl ConcurrencyLimiter {
         )
     }
 
+    /// Limiter with caller-supplied global and per-identity caps. Exposed so
+    /// integration tests can build tight-limit routers to exercise 429/503
+    /// without saturating the production constants.
+    pub fn with_caps(global: usize, per_identity: usize) -> Self {
+        Self::with_limits(global, per_identity, MAX_TRACKED_IDENTITIES)
+    }
+
     fn with_limits(global: usize, per_identity: usize, max_tracked: usize) -> Self {
         Self {
             global: Arc::new(Semaphore::new(global)),

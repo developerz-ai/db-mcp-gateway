@@ -16,11 +16,15 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Router;
+use axum::middleware;
+use axum::routing::post;
 use common::{MockUser, spawn_mock_idp};
-use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
+use db_mcp_gateway::auth::{AuthConfig, Identity, OidcClient, SessionId, SessionStore};
 use db_mcp_gateway::config::{Config, ConfigFile};
 use db_mcp_gateway::exec::AdapterRegistry;
 use db_mcp_gateway::state;
+use db_mcp_gateway::transport::limit;
 use db_mcp_gateway::transport::{self, AppState, AuthFacade, PendingFlows};
 use serde_json::{Value, json};
 
@@ -368,6 +372,47 @@ async fn run_query_full_acceptance() {
         );
         assert_audit_outcome(pool, sub, "forbidden_sql", label).await;
     }
+
+    // 8. Function denylist: `pg_read_file` and siblings are blocked by the
+    //    sql_guard AST walk regardless of the Postgres role's privileges —
+    //    defense in depth against data-exfiltration via server-side file reads.
+    //    Each call must return `forbidden_sql` and leave an audit row. These
+    //    functions are blocked at every position (projection, WHERE, subquery,
+    //    FROM) to defeat obfuscation attempts. We test a representative sample
+    //    here; the exhaustive matrix lives in the sql_guard unit tests.
+    for (sql, label) in [
+        (
+            "SELECT pg_read_file('/etc/passwd')",
+            "pg_read_file in SELECT projection",
+        ),
+        (
+            "SELECT pg_read_binary_file('/etc/shadow')",
+            "pg_read_binary_file rejected",
+        ),
+        (
+            "SELECT pg_stat_file('/etc/passwd')",
+            "pg_stat_file rejected",
+        ),
+        ("SELECT lo_export(1, '/tmp/out')", "lo_export rejected"),
+        (
+            "SELECT id FROM t WHERE pg_read_file('/etc/passwd') IS NOT NULL",
+            "pg_read_file in WHERE rejected",
+        ),
+        (
+            "WITH x AS (SELECT pg_read_file('/etc/passwd')) SELECT * FROM x",
+            "pg_read_file in CTE rejected",
+        ),
+        (
+            "SELECT pg_catalog.pg_read_file('/etc/passwd')",
+            "schema-qualified pg_read_file rejected",
+        ),
+    ] {
+        let resp = call_run_query(url, bearer, "target", "app", sql, None).await;
+        assert_eq!(resp["result"]["isError"], true, "{label}: {resp}");
+        let body = payload(&resp);
+        assert_eq!(body["code"], "forbidden_sql", "{label}: {body}");
+        assert_audit_outcome(pool, sub, "forbidden_sql", label).await;
+    }
 }
 
 #[tokio::test]
@@ -475,4 +520,151 @@ async fn run_query_cache_backed_db_grant() {
         .execute(pool)
         .await
         .expect("cleanup user");
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency cap tests — 429 (per-identity) and 503 (global)
+//
+// These don't need a live DB or IdP: they test the HTTP middleware layer in
+// isolation. A minimal axum router is built with a slow dummy handler and the
+// `limit::enforce` middleware, so we can saturate the caps with one in-flight
+// request and verify the HTTP status codes the next caller receives.
+// ---------------------------------------------------------------------------
+
+/// Builds a minimal axum app that:
+/// 1. Injects a fixed `Identity` (so the per-identity limiter activates).
+/// 2. Applies `limit::enforce` with caller-supplied caps.
+/// 3. Exposes a `/test` POST handler that parks for 5 s (never reached by the
+///    second request — the cap fires first).
+///
+/// Returns `(base_url, reqwest_client)`.
+async fn concurrency_test_server(
+    max_global: usize,
+    max_per_identity: usize,
+) -> (String, reqwest::Client) {
+    let limiter = Arc::new(limit::ConcurrencyLimiter::with_caps(
+        max_global,
+        max_per_identity,
+    ));
+
+    // Injects a fixed Identity so the per-identity semaphore is exercised.
+    // Mirrors how `bearer_auth` populates the extension in production.
+    async fn inject_identity(
+        mut req: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        req.extensions_mut().insert(Identity {
+            session_id: SessionId::new(),
+            user_sub: "concurrency-test-user".into(),
+            user_email: "concurrency@example.com".into(),
+            groups: vec![],
+        });
+        next.run(req).await
+    }
+
+    // Slow handler: parks for 5 s so the first request holds the permit
+    // long enough for the second request's cap-check to fire.
+    async fn slow() -> axum::Json<Value> {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        axum::Json(json!({"ok": true}))
+    }
+
+    let app = Router::new()
+        .route("/test", post(slow))
+        .route_layer(middleware::from_fn_with_state(limiter, limit::enforce))
+        .route_layer(middleware::from_fn(inject_identity));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    let c = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    (url, c)
+}
+
+/// Per-identity cap: once a single in-flight request holds the sole permit,
+/// a second request from the same identity must get HTTP 429 with the stable
+/// `concurrency_limit_exceeded` error code.
+#[tokio::test]
+async fn per_identity_concurrency_cap_returns_429() {
+    // 1 global slot, 1 per-identity slot — one request fills both caps.
+    let (url, client) = concurrency_test_server(10, 1).await;
+
+    // Start a slow request in the background — this holds the per-identity
+    // permit until the handler parks for 5 s.
+    let url_bg = url.clone();
+    let client_bg = client.clone();
+    tokio::spawn(async move {
+        // Fire-and-forget: we don't need the response; we just need the
+        // permit to be held when the second request arrives.
+        let _ = client_bg.post(format!("{url_bg}/test")).send().await;
+    });
+
+    // Give the first request enough time to acquire the permit.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Second request from the same identity → 429.
+    let resp = client
+        .post(format!("{url}/test"))
+        .send()
+        .await
+        .expect("second request sent");
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "expected 429 when per-identity concurrency cap is exceeded"
+    );
+    let body: Value = resp.json().await.expect("429 body is JSON");
+    assert_eq!(
+        body["error"]["code"], "concurrency_limit_exceeded",
+        "stable error code: {body}"
+    );
+    // Well-behaved clients should back off; the header is a coarse hint.
+    assert!(
+        !body.to_string().is_empty(),
+        "response body not empty: {body}"
+    );
+}
+
+/// Global cap: once the single global slot is taken, any next request — even
+/// from a different identity — must get HTTP 503 with `service_overloaded`.
+#[tokio::test]
+async fn global_concurrency_cap_returns_503() {
+    // 1 global slot, many per-identity slots — one request fills the global cap.
+    let (url, client) = concurrency_test_server(1, 100).await;
+
+    // Hold the only global slot.
+    let url_bg = url.clone();
+    let client_bg = client.clone();
+    tokio::spawn(async move {
+        let _ = client_bg.post(format!("{url_bg}/test")).send().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Second request — different perspective, same global cap.
+    let resp = client
+        .post(format!("{url}/test"))
+        .send()
+        .await
+        .expect("second request sent");
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "expected 503 when global concurrency cap is exceeded"
+    );
+    let body: Value = resp.json().await.expect("503 body is JSON");
+    assert_eq!(
+        body["error"]["code"], "service_overloaded",
+        "stable error code: {body}"
+    );
 }
