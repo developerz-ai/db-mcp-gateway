@@ -48,6 +48,24 @@ pub enum ServerKind {
     Mongo,
 }
 
+impl ServerKind {
+    /// Whether a query adapter is wired for this kind today. Mirrors the
+    /// dispatch in [`crate::exec::AdapterRegistry::get_or_open`]: config
+    /// validation rejects servers whose kind returns `false` at boot, so the
+    /// registry's `UnsupportedAdapter` arm is a defense-in-depth backstop a
+    /// validated config never reaches. Keep the two in sync — `mysql`/`mssql`
+    /// flip to `true` only when their adapters land (roadmap §"More adapters").
+    ///
+    /// Exhaustive on purpose: a new variant must declare its dispatchability
+    /// here rather than silently inheriting "supported".
+    pub fn has_adapter(self) -> bool {
+        match self {
+            ServerKind::Postgres | ServerKind::Mongo => true,
+            ServerKind::Mysql | ServerKind::Mssql => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Tls {
@@ -157,6 +175,16 @@ mod tests {
         assert!(Action::HistoryRead.includes(Action::HistoryRead));
         assert!(!Action::QueryWrite.includes(Action::HistoryRead));
         assert!(!Action::HistoryRead.includes(Action::SchemaRead));
+    }
+
+    /// The dispatchable set must match `exec::AdapterRegistry::get_or_open`.
+    /// Pin it here so flipping a kind's support is a deliberate, reviewed edit.
+    #[test]
+    fn has_adapter_matches_wired_dispatch() {
+        assert!(ServerKind::Postgres.has_adapter());
+        assert!(ServerKind::Mongo.has_adapter());
+        assert!(!ServerKind::Mysql.has_adapter());
+        assert!(!ServerKind::Mssql.has_adapter());
     }
 
     #[test]

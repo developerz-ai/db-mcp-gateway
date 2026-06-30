@@ -48,6 +48,7 @@ async fn create_session(store: &SessionStore, user_sub: &str) -> db_mcp_gateway:
             &["engineers".to_string()],
             Duration::from_secs(3600),
             None,
+            None,
         )
         .await
         .expect("create session")

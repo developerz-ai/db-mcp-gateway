@@ -41,6 +41,19 @@ pub struct AdminBlock {
     /// `enabled = true`; an empty value is a boot error (every authenticated
     /// user would otherwise be an admin).
     pub group: String,
+    /// Maximum age (in seconds) of a session before admin access is denied.
+    /// When set, the admin middleware rejects sessions older than this limit
+    /// regardless of `session_ttl_hours` — the caller must re-authenticate.
+    ///
+    /// **Why this matters:** group memberships are snapshotted at login. A user
+    /// removed from the admin group in the IdP continues to pass the group check
+    /// until their session expires (up to `session_ttl_hours`, default 8 h). Setting
+    /// `session_max_age_secs` caps this window: e.g. `3600` (1 h) means a removed
+    /// admin can act for at most one hour before the gateway forces re-login.
+    ///
+    /// Absent / `null` means "no age cap — rely on `session_ttl_hours` alone".
+    #[serde(default)]
+    pub session_max_age_secs: Option<u64>,
 }
 
 /// Permissions storage backend selection. The DSN is **not** in YAML — it
@@ -238,6 +251,19 @@ impl ConfigFile {
                 return Err(ConfigFileError::Invalid(format!(
                     "duplicate server name `{}`",
                     server.name
+                )));
+            }
+            // The lazy `AdapterRegistry` (src/exec/mod.rs) dispatches only
+            // postgres + mongo today; a `mysql`/`mssql` target parses, boots
+            // clean, then fails every query with `UnsupportedAdapter`. Reject
+            // at boot instead — spec 08 "errors at this stage refuse to start".
+            // `ServerKind::has_adapter` is the shared source of truth with the
+            // registry's dispatch match.
+            if !server.kind.has_adapter() {
+                return Err(ConfigFileError::Invalid(format!(
+                    "server `{}` has kind `{:?}`, which has no query adapter yet \
+                     (supported kinds: postgres, mongo)",
+                    server.name, server.kind
                 )));
             }
             let mut db_names: HashSet<&str> = HashSet::new();
@@ -833,6 +859,50 @@ servers:
 "#;
         let cfg = ConfigFile::from_yaml_str(yaml).expect("omitted auth_database is valid");
         assert!(cfg.servers[0].databases[0].auth_database.is_none());
+    }
+
+    /// A `mysql`/`mssql` server kind parses (the enum has the variants) but has
+    /// no query adapter wired (`exec::AdapterRegistry` dispatches pg + mongo
+    /// only). Reject at boot instead of failing every query at runtime with
+    /// `UnsupportedAdapter`. Spec 08 §"Resolution order": validation errors
+    /// refuse to start.
+    #[test]
+    fn rejects_undispatchable_server_kind() {
+        for kind in ["mysql", "mssql"] {
+            let yaml = format!(
+                "\
+servers:
+  - name: legacy
+    kind: {kind}
+    host: h
+"
+            );
+            let err = match ConfigFile::from_yaml_str(&yaml) {
+                Err(err) => err,
+                Ok(_) => panic!("kind `{kind}` must be rejected at boot"),
+            };
+            let ConfigFileError::Invalid(msg) = err else {
+                panic!("expected Invalid for kind `{kind}`, got {err:?}");
+            };
+            assert!(msg.contains("legacy"), "{msg}");
+            assert!(msg.contains("no query adapter"), "{msg}");
+        }
+    }
+
+    /// Mirror: `mongo` IS a wired query target (#57), so it must keep passing
+    /// validation — guards against the boot-gate over-rejecting.
+    #[test]
+    fn accepts_mongo_server_kind() {
+        let yaml = r#"
+servers:
+  - name: docs
+    kind: mongo
+    host: h
+    databases:
+      - { name: app, role: ro, password: x }
+"#;
+        let cfg = ConfigFile::from_yaml_str(yaml).expect("mongo target is dispatchable");
+        assert_eq!(cfg.servers.len(), 1);
     }
 
     /// A misspelled enum variant (action name) yields the same kind of

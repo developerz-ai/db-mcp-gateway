@@ -81,6 +81,7 @@ fn test_identity(user_sub: &str) -> Identity {
         user_sub: user_sub.to_string(),
         user_email: "cancel-real-db@example.com".to_string(),
         groups: vec!["test".to_string()],
+        issued_at: chrono::Utc::now(),
     }
 }
 

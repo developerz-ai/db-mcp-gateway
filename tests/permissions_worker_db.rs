@@ -34,6 +34,7 @@ fn identity_in(group: &str) -> Identity {
         user_sub: format!("test-{group}"),
         user_email: format!("{group}@developerz.ai"),
         groups: vec![group.to_string()],
+        issued_at: chrono::Utc::now(),
     }
 }
 

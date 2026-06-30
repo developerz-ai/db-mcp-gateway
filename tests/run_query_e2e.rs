@@ -61,27 +61,11 @@ servers:
       - name: app
         role: app
         password: app-dev-only
-  - name: mysql-target
-    kind: mysql
-    description: No adapter yet — exercises ExecError::UnsupportedAdapter
-    host: localhost
-    port: 3306
-    tls: insecure
-    databases:
-      - name: app
-        role: app
-        password: ignored-no-adapter
 
 permissions:
   - group: engineers
     grants:
       - server: target
-        database: app
-        action: query_read
-        constraints:
-          statement_timeout_ms: 200
-          row_limit: 50
-      - server: mysql-target
         database: app
         action: query_read
         constraints:
@@ -333,18 +317,11 @@ async fn run_query_full_acceptance() {
     assert_eq!(payload(&resp)["code"], "forbidden");
     assert_audit_outcome(pool, sub, "forbidden", "bogus server").await;
 
-    // 6. Unsupported backend: grant exists for a `kind: mysql` server, but no
-    //    `MysqlAdapter` is wired yet (#59). The registry must surface
-    //    `ExecError::UnsupportedAdapter`, which the tool maps to the stable
-    //    `internal` code with the generic "server-side configuration error"
-    //    message — never the raw enum debug. Audit row records `internal`.
-    //    Pins the contract so #57 / #59 can't quietly widen it.
-    let resp = call_run_query(url, bearer, "mysql-target", "app", "SELECT 1", None).await;
-    assert_eq!(resp["result"]["isError"], true, "{resp}");
-    let body = payload(&resp);
-    assert_eq!(body["code"], "internal", "{body}");
-    assert_eq!(body["message"], "server-side configuration error", "{body}");
-    assert_audit_outcome(pool, sub, "internal", "unsupported backend").await;
+    // 6. Unsupported backend is no longer reachable here: config validation now
+    //    rejects an undispatchable `kind` (mysql/mssql) at boot, so a running
+    //    gateway can never hold such a server. The boot-rejection contract lives
+    //    in `config::yaml` tests; the `UnsupportedAdapter` → `internal` tool
+    //    mapping (defense-in-depth) is pinned in `tools::audit_dispatch` tests.
 
     // 7. AST guard: write/DDL/multi-statement SQL must be rejected with
     //    `forbidden_sql` *before* reaching the DB. The audit row records
@@ -487,6 +464,7 @@ async fn run_query_cache_backed_db_grant() {
         user_sub: user_sub.clone(),
         user_email: "cache-test@example.com".to_string(),
         groups: vec![], // Intentionally empty: no YAML grants.
+        issued_at: chrono::Utc::now(),
     };
 
     // Load grants via cache; this will populate the cache from the DB.
@@ -558,6 +536,7 @@ async fn concurrency_test_server(
             user_sub: "concurrency-test-user".into(),
             user_email: "concurrency@example.com".into(),
             groups: vec![],
+            issued_at: chrono::Utc::now(),
         });
         next.run(req).await
     }

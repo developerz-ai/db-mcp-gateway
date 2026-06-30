@@ -46,7 +46,7 @@ use crate::audit::permissions::{
 use crate::state::permissions::{PermissionsDatabase, PermissionsRepo};
 
 use super::error::AdminError;
-use super::middleware::AdminActor;
+use super::middleware::{AdminActor, tx_upsert_actor};
 
 pub use dto::{CreateDatabaseRequest, DatabaseResponse, UpdateDatabaseRequest};
 
@@ -89,8 +89,13 @@ pub async fn create(
         .await
         .map_err(|err| internal("create_database", err, &actor.request_id))?;
 
+    // Upsert the actor's own row in the same tx as the audit write (atomicity).
+    let actor_id = tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
+        .await
+        .map_err(|err| internal("upsert_actor", err, &actor.request_id))?;
+
     let audit_row = PermissionsAuditRow {
-        actor_id: actor.id,
+        actor_id,
         actor_email: actor.email.clone(),
         action: PermissionsAuditAction::Create,
         target_type: PermissionsAuditTargetType::Database,
@@ -184,8 +189,13 @@ pub async fn patch(
         // Surface as 404 — the PATCH didn't apply.
         .ok_or_else(|| AdminError::not_found().with_request_id(&actor.request_id))?;
 
+    // Upsert the actor's own row in the same tx as the audit write (atomicity).
+    let actor_id = tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
+        .await
+        .map_err(|err| internal("upsert_actor", err, &actor.request_id))?;
+
     let audit_row = PermissionsAuditRow {
-        actor_id: actor.id,
+        actor_id,
         actor_email: actor.email.clone(),
         action: PermissionsAuditAction::Update,
         target_type: PermissionsAuditTargetType::Database,
@@ -229,8 +239,13 @@ pub async fn delete(
         return Err(AdminError::not_found().with_request_id(&actor.request_id));
     }
 
+    // Upsert the actor's own row in the same tx as the audit write (atomicity).
+    let actor_id = tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
+        .await
+        .map_err(|err| internal("upsert_actor", err, &actor.request_id))?;
+
     let audit_row = PermissionsAuditRow {
-        actor_id: actor.id,
+        actor_id,
         actor_email: actor.email.clone(),
         action: PermissionsAuditAction::Delete,
         target_type: PermissionsAuditTargetType::Database,

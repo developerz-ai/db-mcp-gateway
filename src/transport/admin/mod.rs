@@ -7,8 +7,9 @@
 //!  1. `bearer_auth` (existing) — verifies the gateway-issued session JWT and
 //!     injects `Identity` into request extensions.
 //!  2. `require_admin_group` (this module) — confirms `Identity.groups` carries
-//!     the configured admin group, upserts the calling admin into
-//!     `permissions_users`, and stashes [`AdminActor`] for handlers.
+//!     the configured admin group and stashes [`AdminActor`] for handlers.
+//!     The `permissions_users` upsert is intentionally deferred to mutation
+//!     handlers so it runs inside the same transaction as the audit row.
 //!
 //! Every write commits a `permissions_audit` row in the same transaction as
 //! the data write. Audit failure rolls back. CLAUDE.md non-negotiable #4.
@@ -20,6 +21,7 @@ pub mod middleware;
 pub mod users;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::middleware as axum_mw;
@@ -46,15 +48,20 @@ use self::users::UsersState;
 /// per-user cache invalidation post-commit — spec 12 §"Cache invalidation"
 /// and #54's acceptance criterion. `None` when the gateway runs without a
 /// resolver cache (YAML-only installs); invalidation then is a no-op.
+///
+/// `max_session_age` maps to `admin.session_max_age_secs` in YAML: sessions
+/// older than this are rejected with `session_too_old` (403) to bound admin
+/// group staleness. `None` = no cap (rely on `session_ttl_hours` alone).
 pub fn router(
     admin_group: String,
     repo: Arc<dyn PermissionsRepo>,
     state_db: PgPool,
     cache: Option<PermissionsCache>,
+    max_session_age: Option<Duration>,
 ) -> Router {
     let mw_state = AdminMiddlewareState {
         admin_group,
-        repo: repo.clone(),
+        max_session_age,
     };
     let users_routes = Router::new()
         .route("/admin/v1/users", post(users::create).get(users::list))

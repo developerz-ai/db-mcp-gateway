@@ -66,9 +66,19 @@ servers:
 # Spec 12 §"Admin API". Default off — turn on only when you need the
 # SSO-gated runtime CRUD over `/admin/v1/*`. Required when on:
 #   group — the SSO claim that authorizes admin calls.
+#
+# session_max_age_secs (optional, default: no cap):
+#   Reject admin requests from sessions older than this limit, forcing
+#   re-authentication. Caps the window where a user removed from the admin
+#   group in the IdP can still reach `/admin/*`. Group membership is frozen at
+#   login time, so without this cap a removed admin retains access until their
+#   full session expires (auth.oidc.session_ttl_hours, default 8 h). Example:
+#   3600 = admin access expires 1 h after login regardless of session TTL.
+#   Absent / omitted = no cap (rely on session_ttl_hours + explicit revocation).
 # admin:
 #   enabled: true
 #   group: db-mcp-gateway-admins
+#   session_max_age_secs: 3600   # optional: tighten admin group staleness bound
 
 permissions:
   - group: backend-engineers

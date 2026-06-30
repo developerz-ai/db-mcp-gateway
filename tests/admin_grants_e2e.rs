@@ -64,6 +64,7 @@ async fn mint_session(
             groups,
             Duration::from_secs(600),
             Some("admin-grants-e2e/0.1"),
+            None,
         )
         .await
         .expect("create session");
@@ -161,6 +162,7 @@ async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
     config_file.admin = Some(AdminBlock {
         enabled: true,
         group: ADMIN_GROUP.to_string(),
+        session_max_age_secs: None,
     });
 
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
@@ -702,6 +704,7 @@ async fn live_grant_change_invalidates_cache_for_user() {
         user_sub: user_sub.clone(),
         user_email: "target@example.com".to_string(),
         groups: vec!["engineers".to_string()],
+        issued_at: chrono::Utc::now(),
     };
 
     // Pre-warm the cache for this user — observed grants: 0.
@@ -770,7 +773,13 @@ async fn non_admin_gets_403_and_no_writes() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["error"]["code"], "forbidden",
+        "403 must carry stable code; got {body}"
+    );
 
+    // No grant row.
     let n: i64 = sqlx::query("SELECT COUNT(*) FROM permissions_grants WHERE user_id = $1")
         .bind(user_id)
         .fetch_one(&h.pool)
@@ -779,6 +788,34 @@ async fn non_admin_gets_403_and_no_writes() {
         .try_get(0)
         .unwrap();
     assert_eq!(n, 0, "non-admin 403 must not insert any grant");
+
+    // No `permissions_audit` row for this caller. The middleware records the
+    // denial via structured tracing (spec 07) but must NOT write to
+    // `permissions_audit` — that table requires a real actor_id FK, and
+    // upsert-on-deny would let any caller seed a row by probing /admin/*.
+    let audit_n: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM permissions_audit WHERE actor_email = 'rando@example.com'",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert_eq!(audit_n, 0, "non-admin 403 must not write any audit row");
+
+    // No `permissions_users` row for the non-admin caller.
+    let user_exists: bool =
+        sqlx::query("SELECT EXISTS (SELECT 1 FROM permissions_users WHERE user_sub = $1)")
+            .bind(&nonadmin_sub)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert!(
+        !user_exists,
+        "non-admin 403 must not seed a permissions_users row for the caller"
+    );
 
     h.cleanup().await;
 }

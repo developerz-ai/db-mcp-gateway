@@ -121,6 +121,7 @@ mod tests {
             user_sub: "u".to_string(),
             user_email: "u@example.com".to_string(),
             groups: groups.iter().map(|g| g.to_string()).collect(),
+            issued_at: chrono::Utc::now(),
         }
     }
 
@@ -139,7 +140,7 @@ servers:
     databases:
       - { name: app, role: ro, password: stagingpw }
   - name: analytics
-    kind: mysql
+    kind: mongo
     description: Analytics
     host: an.db.internal
     databases:

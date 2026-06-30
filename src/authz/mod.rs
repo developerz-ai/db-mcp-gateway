@@ -122,6 +122,7 @@ mod tests {
             user_sub: "test-sub".to_string(),
             user_email: "test@example.com".to_string(),
             groups: groups.iter().map(|g| g.to_string()).collect(),
+            issued_at: chrono::Utc::now(),
         }
     }
 

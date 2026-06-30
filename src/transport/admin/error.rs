@@ -17,13 +17,18 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value as JsonValue, json};
 
 /// Admin-API failure modes. Variants map 1:1 to stable JSON error codes:
-/// `forbidden`, `unauthorized`, `not_found`, `invalid_request`, `internal`.
+/// `forbidden`, `unauthorized`, `not_found`, `invalid_request`, `internal`,
+/// `session_too_old`.
 #[derive(Debug)]
 pub enum AdminErrorKind {
     /// Caller authenticated but is not in the configured admin group.
     Forbidden,
     /// Caller did not pass `bearer_auth` (or middleware ran without `auth`).
     Unauthorized,
+    /// Session was issued too long ago — admin requires a fresher login so that
+    /// group membership changes from the IdP take effect within the configured
+    /// `admin.session_max_age_secs` window.
+    SessionTooOld,
     /// The requested entity does not exist (or is soft-deleted).
     NotFound,
     /// Request body fails validation (empty fields, malformed UUID, etc.).
@@ -58,6 +63,10 @@ impl AdminError {
         Self::new(AdminErrorKind::Unauthorized)
     }
 
+    pub const fn session_too_old() -> Self {
+        Self::new(AdminErrorKind::SessionTooOld)
+    }
+
     pub const fn not_found() -> Self {
         Self::new(AdminErrorKind::NotFound)
     }
@@ -83,6 +92,7 @@ impl AdminError {
         match &self.kind {
             AdminErrorKind::Forbidden => StatusCode::FORBIDDEN,
             AdminErrorKind::Unauthorized => StatusCode::UNAUTHORIZED,
+            AdminErrorKind::SessionTooOld => StatusCode::FORBIDDEN,
             AdminErrorKind::NotFound => StatusCode::NOT_FOUND,
             AdminErrorKind::Invalid(_) => StatusCode::BAD_REQUEST,
             AdminErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
@@ -93,6 +103,7 @@ impl AdminError {
         match &self.kind {
             AdminErrorKind::Forbidden => "forbidden",
             AdminErrorKind::Unauthorized => "unauthorized",
+            AdminErrorKind::SessionTooOld => "session_too_old",
             AdminErrorKind::NotFound => "not_found",
             AdminErrorKind::Invalid(_) => "invalid_request",
             AdminErrorKind::Internal => "internal",
@@ -103,6 +114,9 @@ impl AdminError {
         match &self.kind {
             AdminErrorKind::Forbidden => "admin group required".to_string(),
             AdminErrorKind::Unauthorized => "authentication required".to_string(),
+            AdminErrorKind::SessionTooOld => {
+                "session is too old for admin operations; re-authenticate".to_string()
+            }
             AdminErrorKind::NotFound => "not found".to_string(),
             // The constructor of `Invalid` is responsible for not embedding
             // sensitive values — strings here are field-name level only.

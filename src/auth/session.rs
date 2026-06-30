@@ -52,6 +52,11 @@ pub struct Identity {
     pub user_sub: String,
     pub user_email: String,
     pub groups: Vec<String>,
+    /// When the gateway issued this session. Groups are frozen at this instant
+    /// — a group change in the IdP takes effect only at the *next* login.
+    /// Admin middleware uses this to enforce a `session_max_age_secs` bound so
+    /// operators can cap how long a stale admin-group snapshot is trusted.
+    pub issued_at: DateTime<Utc>,
 }
 
 impl std::fmt::Debug for Identity {
@@ -61,6 +66,7 @@ impl std::fmt::Debug for Identity {
             .field("user_sub", &self.user_sub)
             .field("user_email", &"<redacted>")
             .field("groups", &self.groups)
+            .field("issued_at", &self.issued_at)
             .finish()
     }
 }
@@ -74,6 +80,8 @@ pub struct Session {
     pub user_email: String,
     pub groups: Vec<String>,
     pub agent_client: Option<String>,
+    /// Wall-clock instant the gateway inserted this row (DB `DEFAULT now()`).
+    pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
 }
@@ -86,6 +94,7 @@ impl std::fmt::Debug for Session {
             .field("user_email", &"<redacted>")
             .field("groups", &self.groups)
             .field("agent_client", &self.agent_client)
+            .field("issued_at", &self.issued_at)
             .field("expires_at", &self.expires_at)
             .field("revoked_at", &self.revoked_at)
             .finish()
@@ -99,6 +108,7 @@ impl Session {
             user_sub: self.user_sub.clone(),
             user_email: self.user_email.clone(),
             groups: self.groups.clone(),
+            issued_at: self.issued_at,
         }
     }
 
@@ -140,6 +150,12 @@ impl SessionStore {
     }
 
     /// Persist a new session row and warm the cache.
+    ///
+    /// `original_issued_at`: when `Some`, overrides the row's `issued_at` with
+    /// the caller's value instead of stamping `now()`. Used by the OAuth
+    /// refresh path to carry the original `/authorize` login time across token
+    /// rotations so `admin.session_max_age_secs` counts from the first login,
+    /// not from the latest refresh. Pass `None` for all fresh sessions.
     pub async fn create(
         &self,
         user_sub: &str,
@@ -147,9 +163,11 @@ impl SessionStore {
         groups: &[String],
         ttl: std::time::Duration,
         agent_client: Option<&str>,
+        original_issued_at: Option<DateTime<Utc>>,
     ) -> Result<Session, AuthError> {
         let id = SessionId::new();
         let now = Utc::now();
+        let issued_at = original_issued_at.unwrap_or(now);
         let expires_at = now + ChronoDuration::from_std(ttl).unwrap_or(ChronoDuration::hours(8));
         let groups_json = serde_json::to_value(groups).unwrap_or(serde_json::Value::Array(vec![]));
 
@@ -162,7 +180,7 @@ impl SessionStore {
         .bind(user_email)
         .bind(&groups_json)
         .bind(agent_client)
-        .bind(now)
+        .bind(issued_at)
         .bind(expires_at)
         .execute(&self.pool)
         .await?;
@@ -173,6 +191,7 @@ impl SessionStore {
             user_email: user_email.to_string(),
             groups: groups.to_vec(),
             agent_client: agent_client.map(str::to_string),
+            issued_at,
             expires_at,
             revoked_at: None,
         };
@@ -195,7 +214,8 @@ impl SessionStore {
         }
 
         let row = sqlx::query_as::<_, SessionRow>(
-            "SELECT id, user_sub, user_email, groups, agent_client, expires_at, revoked_at \
+            "SELECT id, user_sub, user_email, groups, agent_client, \
+             issued_at, expires_at, revoked_at \
              FROM sessions WHERE id = $1",
         )
         .bind(Uuid::from(id))
@@ -240,6 +260,7 @@ struct SessionRow {
     user_email: String,
     groups: serde_json::Value,
     agent_client: Option<String>,
+    issued_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     revoked_at: Option<DateTime<Utc>>,
 }
@@ -252,6 +273,7 @@ impl From<SessionRow> for Session {
             user_email: row.user_email,
             groups: serde_json::from_value(row.groups).unwrap_or_default(),
             agent_client: row.agent_client,
+            issued_at: row.issued_at,
             expires_at: row.expires_at,
             revoked_at: row.revoked_at,
         }
@@ -269,6 +291,7 @@ mod tests {
             user_email: "e@example.com".into(),
             groups: vec!["a".into(), "b".into()],
             agent_client: Some("claude-code/0.x".into()),
+            issued_at: Utc::now(),
             expires_at: Utc::now() + ChronoDuration::hours(1),
             revoked_at: None,
         }
@@ -292,6 +315,7 @@ mod tests {
         };
         assert!(!revoked.is_active(now));
         let expired = Session {
+            issued_at: now - ChronoDuration::hours(2),
             expires_at: now - ChronoDuration::seconds(1),
             ..base
         };

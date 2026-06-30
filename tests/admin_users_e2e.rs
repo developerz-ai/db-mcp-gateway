@@ -67,6 +67,7 @@ async fn mint_session(
             groups,
             Duration::from_secs(600),
             Some("admin-e2e/0.1"),
+            None,
         )
         .await
         .expect("create session");
@@ -135,6 +136,7 @@ async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
     config_file.admin = Some(AdminBlock {
         enabled: true,
         group: ADMIN_GROUP.to_string(),
+        session_max_age_secs: None,
     });
 
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
@@ -596,6 +598,58 @@ async fn list_excludes_soft_deleted() {
     h.cleanup().await;
 }
 
+/// ADM1: a read-only GET must NOT create a `permissions_users` row for the
+/// acting admin. Previously the middleware unconditionally upserted the actor
+/// row; after ADM1 that upsert moved inside mutation transactions (POST /
+/// PATCH / DELETE). A GET handler never opens one, so a brand-new admin sub
+/// that only ever GETs should remain absent from `permissions_users`.
+#[tokio::test]
+async fn get_does_not_write_user_row() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    // Use a unique sub that has NEVER been written via a mutation.
+    let admin_sub = format!("admin-get-only-{}", uuid::Uuid::new_v4().simple());
+    // Track for cleanup (in case we regress and accidentally insert the row).
+    h.track(admin_sub.clone());
+
+    let jwt = mint_session(
+        &sessions,
+        &auth_cfg.session_signing_key,
+        &admin_sub,
+        "admin-get@example.com",
+        &[ADMIN_GROUP.to_string()],
+    )
+    .await;
+
+    // List call — read-only GET. Must succeed for an admin.
+    let resp = client()
+        .get(format!("{}/admin/v1/users", h.base_url))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "GET list must succeed for admin"
+    );
+
+    // The GET must NOT have written a `permissions_users` row for this admin.
+    let exists: bool =
+        sqlx::query("SELECT EXISTS (SELECT 1 FROM permissions_users WHERE user_sub = $1)")
+            .bind(&admin_sub)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert!(
+        !exists,
+        "GET must not create a permissions_users row for the admin actor"
+    );
+
+    h.cleanup().await;
+}
+
 /// Audit write must fail the request AND roll back the data write. The
 /// production middleware always provides a non-empty `request_id`, so to
 /// exercise the rollback path we bypass that middleware and inject an
@@ -608,14 +662,8 @@ async fn audit_write_failure_rolls_back_user_write() {
     let pool = pool().await;
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
 
-    // Seed an admin actor row so audit.actor_id refers to a real user. The
-    // bad actor's request_id is what trips the CHECK — actor_id stays valid.
     let admin_email = format!("admin-rollback-{}@example.com", Uuid::new_v4().simple());
     let admin_sub = format!("admin-rollback-{}", Uuid::new_v4().simple());
-    let admin = repo
-        .upsert_user(&admin_sub, &admin_email, &[ADMIN_GROUP.to_string()])
-        .await
-        .expect("seed admin");
 
     let target_sub = format!("target-rollback-{}", Uuid::new_v4().simple());
 
@@ -623,9 +671,14 @@ async fn audit_write_failure_rolls_back_user_write() {
         repo: repo.clone(),
         state_db: pool.clone(),
     };
+    // The handler calls tx_upsert_actor inside the transaction, so the actor
+    // row is not pre-seeded here. The empty request_id trips the CHECK on
+    // permissions_audit.request_id (migration 0005), causing the transaction
+    // — including the upserted actor row and the target user write — to roll back.
     let actor = AdminActor {
-        id: admin.id,
+        sub: admin_sub.clone(),
         email: admin_email.clone(),
+        groups: vec![ADMIN_GROUP.to_string()],
         // Empty — trips the CHECK on permissions_audit.request_id, forcing
         // the transaction to roll back.
         request_id: String::new(),
@@ -799,6 +852,7 @@ async fn admin_disabled_returns_404_on_admin_routes() {
     config_file.admin = Some(AdminBlock {
         enabled: false,
         group: ADMIN_GROUP.to_string(),
+        session_max_age_secs: None,
     });
 
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));

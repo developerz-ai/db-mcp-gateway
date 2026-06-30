@@ -3,52 +3,86 @@
 //! Runs *after* `bearer_auth`, so an `Identity` is already in extensions.
 //! Job:
 //!  1. Reject with 403 if the caller doesn't carry the configured admin group.
-//!  2. Upsert the calling admin into `permissions_users` so audit rows can
-//!     reference a real `actor_id`. Spec 12 §"Open questions" defers cold
-//!     bootstrap to a CLI subcommand; an already-admin caller (group claim
-//!     present) gets their row auto-provisioned here.
+//!  2. Reject with 403 (`session_too_old`) if the session was issued longer ago
+//!     than `max_session_age` (when configured). Group memberships are frozen at
+//!     login time; `max_session_age` caps how long a stale admin-group snapshot
+//!     is trusted — a removed admin must re-authenticate within this window.
 //!  3. Stash `AdminActor` in request extensions for handlers to read.
+//!
+//! ## Admin group propagation
+//!
+//! Group membership is a snapshot from the IdP, written into the session at
+//! login and never refreshed. A gateway-side DB re-read (bypassing the 30 s
+//! session cache) still returns the same frozen groups — the source of truth is
+//! the session row, not the IdP. Implications:
+//!
+//! - **Granting** the admin group: takes effect at the user's next login.
+//! - **Revoking** the admin group: the user retains access until their session
+//!   expires (`auth.oidc.session_ttl_hours`, default 8 h) **or** an operator
+//!   explicitly revokes the session via `POST /revoke` (RFC 7009) or
+//!   `DELETE /auth/logout`.
+//! - Set `admin.session_max_age_secs` to shorten the exposure window for admin
+//!   routes specifically (e.g. `3600` = 1 h). A user with a session older than
+//!   this limit is forced to re-login, at which point IdP group state applies.
+//!
+//! The `permissions_users` upsert for the acting admin is intentionally absent
+//! here. Mutation handlers (POST / PATCH / DELETE) call [`tx_upsert_actor`]
+//! inside their own transaction so the actor-row write and the
+//! `permissions_audit` row are atomic. Read-only GETs never write to
+//! `permissions_users` at all — a GET does not produce an audit row and
+//! should not trigger a DB write.
 //!
 //! Every response — denial or success — carries the per-request id so a
 //! failing client paste can be joined to the matching tracing span. The id
 //! is extracted from `x-request-id` if the caller supplied one (gateways /
 //! ingress meshes commonly do); otherwise we mint a UUID.
 
-use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use chrono::Utc;
+use serde_json::Value as JsonValue;
+use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::auth::Identity;
-use crate::state::permissions::PermissionsRepo;
+use crate::state::permissions::RepoError;
 
 use super::error::AdminError;
 
 /// What `require_admin_group` deposits on the request extensions for handlers.
-/// Carries the audit-row primary key (`actor_id`), the email for denormalized
-/// audit storage, and the per-request id threaded into every audit row.
+///
+/// `sub`, `email`, and `groups` carry the caller's identity so mutation
+/// handlers can call [`tx_upsert_actor`] inside their audited transaction
+/// without round-tripping back to the middleware. `id` is NOT stored here:
+/// it comes back from [`tx_upsert_actor`] only when a mutation actually runs.
 #[derive(Debug, Clone)]
 pub struct AdminActor {
-    pub id: Uuid,
+    pub sub: String,
     pub email: String,
+    pub groups: Vec<String>,
     pub request_id: String,
 }
 
-/// Cloned into each `/admin/v1/*` layer; carries the admin-group name + the
-/// repo handle the middleware needs to upsert the calling admin.
+/// Cloned into each `/admin/v1/*` layer; carries the admin-group name the
+/// middleware needs to gate access.
 #[derive(Clone)]
 pub struct AdminMiddlewareState {
     pub admin_group: String,
-    pub repo: Arc<dyn PermissionsRepo>,
+    /// When set, sessions older than this are rejected with `session_too_old`
+    /// (403) even if the group check would pass. Forces re-login so that IdP
+    /// group changes propagate within this bound. `None` = no age cap (rely on
+    /// `session_ttl_hours`). Set via `admin.session_max_age_secs` in YAML.
+    pub max_session_age: Option<Duration>,
 }
 
 impl std::fmt::Debug for AdminMiddlewareState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdminMiddlewareState")
             .field("admin_group", &self.admin_group)
-            .field("repo", &"<Arc<dyn PermissionsRepo>>")
+            .field("max_session_age", &self.max_session_age)
             .finish()
     }
 }
@@ -58,11 +92,10 @@ pub async fn require_admin_group(
     mut req: Request,
     next: Next,
 ) -> Response {
-    // Resolve the request id up-front so EVERY exit path (401, 403, upsert
-    // failure, handler success) carries the same id. Lifting this above the
-    // identity check was a deliberate fix: previously the 401/403 responses
-    // dropped through with no correlation id, blinding ops on the most
-    // common failure modes.
+    // Resolve the request id up-front so EVERY exit path (401, 403, handler
+    // success) carries the same id. Lifting this above the identity check was
+    // a deliberate fix: previously the 401/403 responses dropped through with
+    // no correlation id, blinding ops on the most common failure modes.
     let request_id = req
         .headers()
         .get("x-request-id")
@@ -91,7 +124,7 @@ pub async fn require_admin_group(
 
     if !identity.groups.iter().any(|g| g == &state.admin_group) {
         // Authenticated but not in the admin group: structured tracing carries
-        // the user_sub + request_id for ops triage. We deliberately don't
+        // the user_sub + request_id for ops triage. We deliberately do not
         // upsert into `permissions_users` here — doing so would let any
         // non-admin caller seed a row by hitting `/admin/*`, which is a
         // (small) write amplification + pollution risk.
@@ -105,38 +138,189 @@ pub async fn require_admin_group(
             .into_response();
     }
 
-    // Upsert keeps the admin's `permissions_users` row in sync with the JWT.
-    // This is the only path that writes to that table for the admin
-    // themselves — spec 12 cold-start uses a CLI subcommand (out of #52).
-    let user = match state
-        .repo
-        .upsert_user(&identity.user_sub, &identity.user_email, &identity.groups)
-        .await
-    {
-        Ok(u) => u,
-        Err(err) => {
-            // Same shape as users::internal — log only the error TYPE, never
-            // the Display text. A `sqlx::Error::Database` `Display` embeds PG
-            // `detail`/`constraint`, which on `permissions_users` would leak
-            // user emails and group names. CLAUDE.md non-negotiable #1.
-            let error_type = std::any::type_name_of_val(&err);
-            tracing::error!(
-                error_type,
+    // Session age check — enforces `admin.session_max_age_secs` when configured.
+    //
+    // Groups are frozen at login; a removed admin retains access until their
+    // session expires or is explicitly revoked. `max_session_age` caps that
+    // window for admin routes specifically: a session older than this limit is
+    // rejected here, forcing re-login regardless of remaining session TTL. The
+    // next login picks up the current IdP group state.
+    if let Some(max_age) = state.max_session_age {
+        // Fail closed on an unmeasurable age. A future (or corrupt) `issued_at`
+        // makes `signed_duration_since` negative, so `to_std()` errors; treat
+        // that as "reject" rather than "fresh". The old `unwrap_or(max_age)`
+        // fell back to exactly `max_age`, which is NOT `> max_age`, so a skewed
+        // clock or a forged future timestamp bypassed the cap entirely.
+        let session_age = match Utc::now()
+            .signed_duration_since(identity.issued_at)
+            .to_std()
+        {
+            Ok(age) => age,
+            Err(_) => {
+                tracing::warn!(
+                    user_sub = %identity.user_sub,
+                    request_id = %request_id,
+                    max_age_secs = max_age.as_secs(),
+                    "admin endpoint denied: session issued_at is in the future (403)"
+                );
+                return AdminError::session_too_old()
+                    .with_request_id(request_id)
+                    .into_response();
+            }
+        };
+        if session_age > max_age {
+            tracing::warn!(
                 user_sub = %identity.user_sub,
                 request_id = %request_id,
-                "admin actor upsert failed"
+                session_age_secs = session_age.as_secs(),
+                max_age_secs = max_age.as_secs(),
+                "admin endpoint denied: session too old for admin operations (403)"
             );
-            return AdminError::internal()
+            return AdminError::session_too_old()
                 .with_request_id(request_id)
                 .into_response();
         }
-    };
+    }
 
     req.extensions_mut().insert(AdminActor {
-        id: user.id,
-        email: identity.user_email.clone(),
+        sub: identity.user_sub,
+        email: identity.user_email,
+        groups: identity.groups,
         request_id,
     });
 
     next.run(req).await
+}
+
+/// Upsert the calling admin's `permissions_users` row inside an already-open
+/// transaction. Returns the actor's `id` for use as `actor_id` in the
+/// accompanying `permissions_audit` row.
+///
+/// Mutation handlers (POST / PATCH / DELETE) call this before writing the
+/// audit row so both writes are atomic: if the audit write fails and the
+/// transaction rolls back, the actor-row upsert is also rolled back. Read
+/// handlers (GET) never call this — they produce no audit rows.
+///
+/// Keyed on `user_sub` with a soft-delete guard (`WHERE deleted_at IS NULL`).
+/// A soft-deleted prior row stays as an audit trail; the next mutation by the
+/// same admin inserts a fresh row rather than reviving the old one.
+pub(super) async fn tx_upsert_actor(
+    tx: &mut Transaction<'_, Postgres>,
+    sub: &str,
+    email: &str,
+    groups: &[String],
+) -> Result<Uuid, RepoError> {
+    let groups_json: JsonValue = serde_json::to_value(groups).map_err(RepoError::EncodeGroups)?;
+    let row = sqlx::query(
+        "INSERT INTO permissions_users (user_sub, user_email, groups) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (user_sub) WHERE deleted_at IS NULL \
+         DO UPDATE SET user_email = EXCLUDED.user_email, \
+                       groups     = EXCLUDED.groups, \
+                       updated_at = now() \
+         RETURNING id",
+    )
+    .bind(sub)
+    .bind(email)
+    .bind(&groups_json)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(row.try_get("id")?)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use chrono::Utc;
+
+    use super::*;
+    use crate::auth::SessionId;
+
+    /// Build an `Identity` with the given group list and `issued_at` offset from
+    /// now. Positive = issued N seconds ago; negative = issued in the future
+    /// (used to exercise the clock-skew guard).
+    fn make_identity(groups: &[&str], issued_secs_ago: i64) -> Identity {
+        let now = Utc::now();
+        Identity {
+            session_id: SessionId::new(),
+            user_sub: "u".to_string(),
+            user_email: "u@example.com".to_string(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            issued_at: now - chrono::Duration::seconds(issued_secs_ago),
+        }
+    }
+
+    #[test]
+    fn session_too_old_renders_403_with_stable_code() {
+        let err = AdminError::session_too_old().with_request_id("req-1");
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn session_too_old_body_has_stable_code() {
+        let resp = AdminError::session_too_old()
+            .with_request_id("req-1")
+            .into_response();
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "session_too_old");
+        assert_eq!(body["error"]["request_id"], "req-1");
+    }
+
+    /// Young-enough session passes the age gate.
+    #[test]
+    fn fresh_session_passes_age_gate() {
+        let identity = make_identity(&["admins"], 30); // 30 s old
+        let max_age = Duration::from_secs(3600); // 1 h limit
+        let age = Utc::now()
+            .signed_duration_since(identity.issued_at)
+            .to_std()
+            .unwrap();
+        assert!(
+            age <= max_age,
+            "30 s session should pass a 3600 s age limit"
+        );
+    }
+
+    /// Session older than `max_session_age` must be rejected.
+    #[test]
+    fn stale_session_exceeds_age_gate() {
+        let identity = make_identity(&["admins"], 7201); // 2 h + 1 s old
+        let max_age = Duration::from_secs(3600); // 1 h limit
+        let age = Utc::now()
+            .signed_duration_since(identity.issued_at)
+            .to_std()
+            .unwrap();
+        assert!(
+            age > max_age,
+            "7201 s session should exceed a 3600 s age limit"
+        );
+    }
+
+    /// `issued_at` in the future (clock skew / NTP jump / forged token) must
+    /// fail closed: the age is unmeasurable (`to_std()` errors on the negative
+    /// duration), so the middleware rejects with `session_too_old` (403) rather
+    /// than treating the session as fresh and bypassing the age cap.
+    #[test]
+    fn future_issued_at_fails_closed() {
+        let identity = make_identity(&["admins"], -120); // issued 2 min in future
+        // A future issued_at yields a negative duration, which `to_std()` can't
+        // represent → Err. The middleware maps that Err to a rejection.
+        let measured = Utc::now()
+            .signed_duration_since(identity.issued_at)
+            .to_std();
+        assert!(
+            measured.is_err(),
+            "future issued_at should be unmeasurable, triggering fail-closed"
+        );
+        let resp = AdminError::session_too_old()
+            .with_request_id("req-skew")
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
 }

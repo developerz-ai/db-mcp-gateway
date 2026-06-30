@@ -45,6 +45,7 @@ fn identity_for(sub: &str, groups: &[&str]) -> Identity {
         user_sub: sub.to_string(),
         user_email: format!("{sub}@example.com"),
         groups: groups.iter().map(|g| g.to_string()).collect(),
+        issued_at: chrono::Utc::now(),
     }
 }
 

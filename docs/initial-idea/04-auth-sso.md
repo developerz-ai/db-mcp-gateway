@@ -194,7 +194,40 @@ Group membership comes from one of:
 - SCIM sync to the state DB (for IdPs that don't expose groups in tokens)
 - Directory API lookup at token-issue time (Google Workspace fallback)
 
-Cached for the session TTL. Group changes in the IdP take effect at the next login.
+Groups are **snapshotted at login** into the session row. Cached for the session TTL; a
+gateway-side DB re-read (e.g. bypassing the 30 s session cache) still returns the same
+frozen snapshot — the session row is the source of truth, not the IdP.
+
+Group changes in the IdP take effect at the next login (session expiry or explicit revocation).
+
+### Admin group propagation
+
+The admin group check (`admin.group`) runs on every `/admin/v1/*` request using the groups
+frozen at login time.
+
+| Event | When it takes effect |
+|---|---|
+| Grant admin group in IdP | Next login (existing sessions are unaffected) |
+| Revoke admin group in IdP | Next login **or** explicit session revocation (`POST /revoke`) |
+| Explicit session revoke by operator | Immediately on the revoking replica; within `SESSION_CACHE_TTL_SECONDS` (≤ 30 s) on other replicas |
+
+**Exposure window:** a user removed from the admin group in the IdP can still call
+`/admin/*` for up to `auth.oidc.session_ttl_hours` (default 8 h) unless their session is
+explicitly revoked.
+
+**Mitigation — `admin.session_max_age_secs`:** set this in the admin config block to cap
+the exposure window for admin routes specifically. Sessions older than this limit are
+rejected with `403 session_too_old`, forcing re-login. The next login picks up the current
+IdP group state. Example: `session_max_age_secs: 3600` means a removed admin loses access
+within 1 h, regardless of the global `session_ttl_hours`.
+
+Recommended values by risk tolerance:
+
+| Risk tolerance | `session_max_age_secs` |
+|---|---|
+| Default / low-risk | absent (rely on session TTL + manual revoke) |
+| Standard | `3600` (1 h) |
+| High-security | `900` (15 min) |
 
 ## What lands in the audit log per request
 

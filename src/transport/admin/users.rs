@@ -24,7 +24,7 @@ use crate::audit::permissions::{
 use crate::state::permissions::{PermissionsRepo, PermissionsUser, RepoError};
 
 use super::error::AdminError;
-use super::middleware::AdminActor;
+use super::middleware::{AdminActor, tx_upsert_actor};
 
 /// Shared state cloned into every users-route handler.
 #[derive(Clone)]
@@ -114,13 +114,26 @@ pub async fn create(
         .await
         .map_err(|err| internal("upsert_user", err, &actor.request_id))?;
 
+    // Upsert the actor's own row in the same tx as the audit write (atomicity).
+    // Guard: if the actor is mutating their own row, skip the upsert — the
+    // `tx_upsert_user` call above already wrote the correct state for that sub,
+    // and running `tx_upsert_actor` would overwrite it with the session snapshot
+    // (stale email/groups), clobbering the just-applied mutation.
+    let actor_id = if actor.sub == user_sub {
+        user.id
+    } else {
+        tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
+            .await
+            .map_err(|err| internal("upsert_actor", err, &actor.request_id))?
+    };
+
     let action = if before.is_some() {
         PermissionsAuditAction::Update
     } else {
         PermissionsAuditAction::Create
     };
     let audit_row = PermissionsAuditRow {
-        actor_id: actor.id,
+        actor_id,
         actor_email: actor.email.clone(),
         action,
         target_type: PermissionsAuditTargetType::User,
@@ -209,8 +222,19 @@ pub async fn patch(
         // Surface as 404 — the PATCH didn't apply.
         .ok_or_else(|| AdminError::not_found().with_request_id(&actor.request_id))?;
 
+    // Upsert the actor's own row in the same tx as the audit write (atomicity).
+    // Guard: if the actor is patching their own row, skip the upsert to avoid
+    // overwriting the freshly-patched state with the session snapshot.
+    let actor_id = if actor.sub == before.user_sub {
+        after.id
+    } else {
+        tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
+            .await
+            .map_err(|err| internal("upsert_actor", err, &actor.request_id))?
+    };
+
     let audit_row = PermissionsAuditRow {
-        actor_id: actor.id,
+        actor_id,
         actor_email: actor.email.clone(),
         action: PermissionsAuditAction::Update,
         target_type: PermissionsAuditTargetType::User,
@@ -254,8 +278,20 @@ pub async fn delete(
         return Err(AdminError::not_found().with_request_id(&actor.request_id));
     }
 
+    // Upsert the actor's own row in the same tx as the audit write (atomicity).
+    // Guard: if the actor is deleting their own row, skip the upsert — the
+    // DELETE already soft-deleted the row, and re-inserting via upsert would
+    // create a new active row that immediately cancels the soft-delete.
+    let actor_id = if actor.sub == before.user_sub {
+        before.id
+    } else {
+        tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
+            .await
+            .map_err(|err| internal("upsert_actor", err, &actor.request_id))?
+    };
+
     let audit_row = PermissionsAuditRow {
-        actor_id: actor.id,
+        actor_id,
         actor_email: actor.email.clone(),
         action: PermissionsAuditAction::Delete,
         target_type: PermissionsAuditTargetType::User,

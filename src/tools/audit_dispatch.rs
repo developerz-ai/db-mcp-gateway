@@ -460,6 +460,36 @@ mod tests {
         assert!(outcome.row_count.is_none());
     }
 
+    /// Defense-in-depth backstop: an undispatchable `kind` is now rejected at
+    /// boot (`config::yaml` validation), so a validated config never reaches
+    /// `UnsupportedAdapter`. If an internal caller ever does, the tool must
+    /// still map it to the stable `internal` code with a generic message —
+    /// never the raw `ServerKind` debug, which could hint at backend topology.
+    #[test]
+    fn unsupported_adapter_maps_to_internal_without_leaking_kind() {
+        use crate::config::ServerKind;
+
+        let messages = ToolErrorMessages {
+            timeout: "t",
+            sql_rejected: "s",
+            forbidden_prefix: "query",
+        };
+        let outcome = outcome_from_exec_error(
+            Value::from(1),
+            ExecError::UnsupportedAdapter(ServerKind::Mysql),
+            Instant::now(),
+            &messages,
+        );
+        assert_eq!(outcome.code, "internal");
+        assert_eq!(
+            outcome.error_message.as_deref(),
+            Some("server-side configuration error")
+        );
+        // The backend identity must not ride along into the client-facing text.
+        let msg = outcome.error_message.unwrap_or_default().to_lowercase();
+        assert!(!msg.contains("mysql"), "{msg}");
+    }
+
     #[test]
     fn success_outcome_carries_row_metadata() {
         let outcome = success_outcome(

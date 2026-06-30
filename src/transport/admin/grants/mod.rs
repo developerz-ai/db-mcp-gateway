@@ -45,7 +45,7 @@ use crate::authz::PermissionsCache;
 use crate::state::permissions::PermissionsRepo;
 
 use super::error::AdminError;
-use super::middleware::AdminActor;
+use super::middleware::{AdminActor, tx_upsert_actor};
 
 pub use dto::{CreateGrantRequest, GrantResponse, ListGrantsQuery, UpdateGrantRequest};
 
@@ -103,8 +103,13 @@ pub async fn create(
         .await
         .map_err(|err| internal("user_sub_for_id", err, &actor.request_id))?;
 
+    // Upsert the actor's own row in the same tx as the audit write (atomicity).
+    let actor_id = tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
+        .await
+        .map_err(|err| internal("upsert_actor", err, &actor.request_id))?;
+
     let audit_row = PermissionsAuditRow {
-        actor_id: actor.id,
+        actor_id,
         actor_email: actor.email.clone(),
         action: PermissionsAuditAction::Create,
         target_type: PermissionsAuditTargetType::Grant,
@@ -197,8 +202,13 @@ pub async fn patch(
         .await
         .map_err(|err| internal("user_sub_for_id", err, &actor.request_id))?;
 
+    // Upsert the actor's own row in the same tx as the audit write (atomicity).
+    let actor_id = tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
+        .await
+        .map_err(|err| internal("upsert_actor", err, &actor.request_id))?;
+
     let audit_row = PermissionsAuditRow {
-        actor_id: actor.id,
+        actor_id,
         actor_email: actor.email.clone(),
         action: PermissionsAuditAction::Update,
         target_type: PermissionsAuditTargetType::Grant,
@@ -248,8 +258,13 @@ pub async fn delete(
         .await
         .map_err(|err| internal("user_sub_for_id", err, &actor.request_id))?;
 
+    // Upsert the actor's own row in the same tx as the audit write (atomicity).
+    let actor_id = tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
+        .await
+        .map_err(|err| internal("upsert_actor", err, &actor.request_id))?;
+
     let audit_row = PermissionsAuditRow {
-        actor_id: actor.id,
+        actor_id,
         actor_email: actor.email.clone(),
         action: PermissionsAuditAction::Delete,
         target_type: PermissionsAuditTargetType::Grant,
