@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures::StreamExt;
 use metrics::gauge;
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow, PgSslMode};
 use sqlx::{Column, Executor, PgPool, Row};
@@ -129,12 +130,18 @@ impl DbAdapter for PgAdapter {
     }
 }
 
-fn build_connect_options(server: &Server, database: &Database, password: &str) -> PgConnectOptions {
+fn build_connect_options(
+    server: &Server,
+    database: &Database,
+    password: &SecretString,
+) -> PgConnectOptions {
     PgConnectOptions::new()
         .host(&server.host)
         .port(server.port)
         .username(&database.role)
-        .password(password)
+        // The sqlx boundary: the plaintext `&str` exists only for this builder
+        // call, then lives inside `PgConnectOptions` (fed to the pool, dropped).
+        .password(password.expose_secret())
         .database(&database.name)
         .ssl_mode(match server.tls {
             Tls::Required => PgSslMode::Require,
@@ -150,7 +157,7 @@ fn build_connect_options(server: &Server, database: &Database, password: &str) -
 /// Visible to sibling adapters (`mongo::MongoAdapter::open`) — the
 /// resolution rules are identical regardless of backend, and the
 /// `ExecError` mapping is the same in every call site.
-pub(super) fn resolve_password(password: &Password) -> Result<String, ExecError> {
+pub(super) fn resolve_password(password: &Password) -> Result<SecretString, ExecError> {
     use crate::config::SecretError;
     password.resolve().map_err(|err| match err {
         SecretError::EnvNotSet(name) | SecretError::EnvNotUtf8(name) => {
@@ -363,7 +370,9 @@ mod tests {
     #[test]
     fn resolve_password_handles_each_form() {
         assert_eq!(
-            resolve_password(&Password::Literal("hunter2".into())).unwrap(),
+            resolve_password(&Password::Literal("hunter2".into()))
+                .unwrap()
+                .expose_secret(),
             "hunter2"
         );
 
@@ -373,7 +382,9 @@ mod tests {
             std::env::set_var(env_name, "from-env");
         }
         assert_eq!(
-            resolve_password(&Password::EnvVar(env_name.into())).unwrap(),
+            resolve_password(&Password::EnvVar(env_name.into()))
+                .unwrap()
+                .expose_secret(),
             "from-env"
         );
         unsafe {

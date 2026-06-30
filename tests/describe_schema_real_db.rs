@@ -28,7 +28,7 @@ fn database() -> Database {
     Database {
         name: TARGET_DB.to_string(),
         role: TARGET_USER.to_string(),
-        password: Password::Literal(TARGET_PASSWORD.to_string()),
+        password: Password::Literal(TARGET_PASSWORD.into()),
         description: String::new(),
         auth_database: None,
     }

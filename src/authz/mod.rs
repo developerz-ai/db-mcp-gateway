@@ -129,7 +129,7 @@ mod tests {
         Database {
             name: name.to_string(),
             role: "ro".to_string(),
-            password: Password::Literal("pw".to_string()),
+            password: Password::Literal("pw".into()),
             description: String::new(),
             auth_database: None,
         }

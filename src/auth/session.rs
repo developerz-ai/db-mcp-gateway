@@ -1,19 +1,19 @@
 //! Sessions: the authoritative identity for an authenticated request.
 //!
-//! `SessionStore` fronts the state DB with an in-memory cache. Every lookup
-//! goes through here so revocation is honored: logout removes from cache AND
-//! sets `revoked_at` in the DB; lookup checks both.
+//! `SessionStore` fronts the state DB with an in-memory cache so revocation is
+//! honored: logout sets `revoked_at` and evicts the cache; lookup checks both.
+//! The cache is bounded with a freshness TTL — see
+//! [`session_cache`](super::session_cache) for the cross-replica staleness bound.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use super::errors::AuthError;
+use super::session_cache::{SessionCache, SessionCacheConfig};
 
 /// Newtype over the session row UUID. Construct via `new()` or `from(Uuid)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -43,12 +43,9 @@ impl From<SessionId> for Uuid {
     }
 }
 
-/// Per-request identity. Cloned cheaply (groups is small, strings are short).
-/// What `auth::middleware` attaches to the request extensions for handlers and
-/// the audit layer to read.
-///
-/// Manual `Debug` redacts `user_email` (PII). The audit writer reads the field
-/// directly; nothing else should log it.
+/// Per-request identity, cloned cheaply. `auth::middleware` attaches it to
+/// request extensions for handlers and the audit layer. Manual `Debug` redacts
+/// `user_email` (PII); the audit writer reads it directly, nothing else should.
 #[derive(Clone)]
 pub struct Identity {
     pub session_id: SessionId,
@@ -110,29 +107,35 @@ impl Session {
     }
 }
 
-/// Cache + DB. Cheap to clone — internal `Arc` shares the same map and pool.
+/// Cache + DB. Cheap to clone — internal `Arc` shares the same cache and pool.
 #[derive(Clone)]
 pub struct SessionStore {
     pool: PgPool,
-    cache: Arc<RwLock<HashMap<SessionId, Session>>>,
+    cache: Arc<SessionCache>,
 }
 
 impl std::fmt::Debug for SessionStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Hand-rolled: `PgPool` Debug leaks the connection string, and reading
-        // the cache here would need an async lock. Print structural info only.
+        // Hand-rolled: `PgPool` Debug leaks the DSN; the cache needs an async read.
         f.debug_struct("SessionStore")
             .field("pool", &"<PgPool>")
-            .field("cache", &"<RwLock<HashMap<SessionId, Session>>>")
+            .field("cache", &"<SessionCache>")
             .finish()
     }
 }
 
 impl SessionStore {
+    /// Store with default cache tuning; production overrides via
+    /// [`Self::with_cache_config`] (TTL from `SESSION_CACHE_TTL_SECONDS`).
     pub fn new(pool: PgPool) -> Self {
+        Self::with_cache_config(pool, SessionCacheConfig::default())
+    }
+
+    /// Store with explicit cache tuning.
+    pub fn with_cache_config(pool: PgPool, config: SessionCacheConfig) -> Self {
         Self {
             pool,
-            cache: Arc::new(RwLock::new(HashMap::new())),
+            cache: Arc::new(SessionCache::new(config)),
         }
     }
 
@@ -173,10 +176,9 @@ impl SessionStore {
             expires_at,
             revoked_at: None,
         };
-        self.cache.write().await.insert(id, session.clone());
-        // `active_sessions` drifts on natural TTL expiry — only explicit
-        // revoke decrements. Operators reading this should treat it as a
-        // floor on real session count, not an exact number.
+        self.cache.insert(id, session.clone()).await;
+        // `active_sessions` only decrements on explicit revoke (natural expiry
+        // drifts it up), so treat it as a floor on session count, not exact.
         metrics::gauge!("active_sessions").increment(1.0);
         Ok(session)
     }
@@ -185,10 +187,10 @@ impl SessionStore {
     /// row exists but is revoked/expired, `InvalidSession` if missing.
     pub async fn lookup(&self, id: SessionId) -> Result<Identity, AuthError> {
         let now = Utc::now();
-
-        if let Some(session) = self.cache.read().await.get(&id).cloned()
-            && session.is_active(now)
-        {
+        // Fresh, active cache hit skips the DB. A stale hit (older than the
+        // cache TTL) misses here and re-validates below — that re-read is what
+        // lets a revoke on another replica take effect within the TTL.
+        if let Some(session) = self.cache.get(id, now).await {
             return Ok(session.identity());
         }
 
@@ -201,15 +203,15 @@ impl SessionStore {
         .await?;
 
         let Some(row) = row else {
-            self.cache.write().await.remove(&id);
+            self.cache.remove(id).await;
             return Err(AuthError::InvalidSession);
         };
         let session: Session = row.into();
         if !session.is_active(now) {
-            self.cache.write().await.remove(&id);
+            self.cache.remove(id).await;
             return Err(AuthError::RevokedSession);
         }
-        self.cache.write().await.insert(id, session.clone());
+        self.cache.insert(id, session.clone()).await;
         Ok(session.identity())
     }
 
@@ -221,10 +223,9 @@ impl SessionStore {
         .bind(Uuid::from(id))
         .execute(&self.pool)
         .await?;
-        self.cache.write().await.remove(&id);
-        // Only decrement on real revocation — the `AND revoked_at IS NULL`
-        // guard makes a double-logout a no-op at the DB, and we mirror that
-        // here so the gauge can't go negative on idempotent revoke calls.
+        self.cache.remove(id).await;
+        // Decrement only on a real revoke — the `AND revoked_at IS NULL` guard
+        // makes a double-logout a DB no-op, so the gauge can't go negative.
         if result.rows_affected() > 0 {
             metrics::gauge!("active_sessions").decrement(1.0);
         }
@@ -245,12 +246,11 @@ struct SessionRow {
 
 impl From<SessionRow> for Session {
     fn from(row: SessionRow) -> Self {
-        let groups: Vec<String> = serde_json::from_value(row.groups).unwrap_or_default();
         Self {
             id: SessionId::from(row.id),
             user_sub: row.user_sub,
             user_email: row.user_email,
-            groups,
+            groups: serde_json::from_value(row.groups).unwrap_or_default(),
             agent_client: row.agent_client,
             expires_at: row.expires_at,
             revoked_at: row.revoked_at,
@@ -262,9 +262,8 @@ impl From<SessionRow> for Session {
 mod tests {
     use super::*;
 
-    #[test]
-    fn identity_clone_carries_fields() {
-        let session = Session {
+    fn base_session() -> Session {
+        Session {
             id: SessionId::new(),
             user_sub: "sub".into(),
             user_email: "e@example.com".into(),
@@ -272,8 +271,12 @@ mod tests {
             agent_client: Some("claude-code/0.x".into()),
             expires_at: Utc::now() + ChronoDuration::hours(1),
             revoked_at: None,
-        };
-        let identity = session.identity();
+        }
+    }
+
+    #[test]
+    fn identity_clone_carries_fields() {
+        let identity = base_session().identity();
         assert_eq!(identity.user_sub, "sub");
         assert_eq!(identity.groups, vec!["a".to_string(), "b".to_string()]);
     }
@@ -281,15 +284,7 @@ mod tests {
     #[test]
     fn revoked_or_expired_is_inactive() {
         let now = Utc::now();
-        let base = Session {
-            id: SessionId::new(),
-            user_sub: "s".into(),
-            user_email: "e".into(),
-            groups: vec![],
-            agent_client: None,
-            expires_at: now + ChronoDuration::hours(1),
-            revoked_at: None,
-        };
+        let base = base_session();
         assert!(base.is_active(now));
         let revoked = Session {
             revoked_at: Some(now),

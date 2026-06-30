@@ -28,6 +28,7 @@ use mongodb::Client;
 use mongodb::bson::{Bson, Document};
 use mongodb::error::{Error as MongoError, ErrorKind};
 use mongodb::options::{ClientOptions, Credential, ServerAddress, Tls as MongoTls, TlsOptions};
+use secrecy::ExposeSecret;
 use serde_json::Value;
 
 use crate::config::{Database, Server, Tls};
@@ -81,7 +82,9 @@ impl MongoAdapter {
         //     pattern, common in dev / quickstart setups).
         let credential = Credential::builder()
             .username(database.role.clone())
-            .password(password)
+            // The driver boundary: expose the plaintext only here, where mongo's
+            // `Credential` takes ownership of its own `String` copy.
+            .password(password.expose_secret().to_owned())
             .source(Some(
                 database
                     .auth_database
@@ -310,7 +313,7 @@ mod tests {
         Database {
             name: name.to_string(),
             role: role.to_string(),
-            password: Password::Literal(password.to_string()),
+            password: Password::Literal(password.into()),
             description: String::new(),
             auth_database: None,
         }

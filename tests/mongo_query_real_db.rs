@@ -34,7 +34,7 @@ fn database() -> Database {
     Database {
         name: TARGET_DB.to_string(),
         role: TARGET_USER.to_string(),
-        password: Password::Literal(TARGET_PASSWORD.to_string()),
+        password: Password::Literal(TARGET_PASSWORD.into()),
         description: String::new(),
         // The dev container's root user lives in `admin` — see
         // docker-compose.dev.yml `target-mongo`. Production deployments
