@@ -29,8 +29,28 @@ async fn metrics_endpoint_renders_emitted_counters() {
     // Emit a probe metric so we have something deterministic to look for.
     counter!("tool_calls", "tool" => "list_servers", "outcome" => "success").increment(1);
 
-    let mut state = AppState::for_tests();
-    state.metrics = Some(handle);
+    use db_mcp_gateway::config::ConfigFile;
+    use db_mcp_gateway::exec::AdapterRegistry;
+    use db_mcp_gateway::transport::ClientRegistry;
+    use std::sync::Arc;
+
+    let state = AppState {
+        auth: None,
+        config: Arc::new(ConfigFile {
+            servers: Vec::new(),
+            permissions: Vec::new(),
+            admin: None,
+            permissions_store: None,
+        }),
+        adapter_registry: AdapterRegistry::new(),
+        state_db: None,
+        shutdown: Default::default(),
+        metrics: Some(handle),
+        permissions_cache: None,
+        permissions_repo: None,
+        mcp_path: Arc::from("/mcp"),
+        client_registry: ClientRegistry::default(),
+    };
     let app = Router::new()
         .route("/metrics", get(probes::metrics))
         .with_state(state);

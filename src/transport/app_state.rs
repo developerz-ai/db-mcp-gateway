@@ -62,7 +62,7 @@ pub struct AppState {
 impl AppState {
     /// Test helper: empty config, no auth, no state DB, empty pool registry.
     /// Production code never uses this.
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(test)]
     pub fn for_tests() -> Self {
         Self {
             auth: None,

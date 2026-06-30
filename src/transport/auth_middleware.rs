@@ -21,9 +21,11 @@ use super::oauth;
 
 pub async fn bearer_auth(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     let Some(auth) = state.auth.as_ref() else {
-        // Test bootstrap: no auth wired. Production main never builds AppState
-        // this way.
-        return next.run(req).await;
+        // Fail closed: no auth facade wired. Production main guards against this
+        // (sec ref main.rs); if somehow auth isn't set, reject the request rather
+        // than allow it through.
+        let err = AuthError::MissingBearer;
+        return unauthorized(&state, &req, err);
     };
 
     let token = match bearer_token(&req) {
