@@ -15,7 +15,10 @@
 //! don't recognise — is rejected with a typed error. Conservative on purpose:
 //! better to reject a legitimate exotic SELECT than quietly allow a write.
 
-use sqlparser::ast::{Query, SetExpr, Statement};
+use sqlparser::ast::{
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Query, Select, SelectItem,
+    SetExpr, Statement, TableFactor, TableWithJoins,
+};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
 
@@ -35,7 +38,32 @@ pub enum GuardError {
     SelectInto,
     #[error("EXPLAIN ANALYZE is not allowed (it executes the query)")]
     ExplainAnalyze,
+    /// Stable error code: `GUARD_DENIED_FUNCTION`.
+    #[error("function `{0}` is not allowed (high-privilege server-side function)")]
+    DeniedFunction(&'static str),
 }
+
+/// Functions that the gateway always blocks, regardless of the Postgres role's
+/// privileges. These access the server filesystem or trigger network I/O —
+/// primary data-exfiltration / credential-theft vectors:
+///
+/// - `pg_read_file` / `pg_read_binary_file` — read arbitrary server-side files
+///   (e.g. `pg_hba.conf`, `.pgpass`). A read-only role that is accidentally
+///   granted execute on these can exfiltrate credentials without any writes.
+/// - `pg_ls_dir` / `pg_stat_file` — enumerate and stat server filesystem paths;
+///   information-gathering step for targeted file reads.
+/// - `lo_export` — writes a large object to a server-side path (filesystem write
+///   from inside a SELECT body — the read-only role boundary does not stop it if
+///   execute is granted).
+/// - `lo_import` — reads a file into a large object; symmetric to `lo_export`.
+const DENIED_FUNCTIONS: &[&str] = &[
+    "pg_read_file",
+    "pg_read_binary_file",
+    "pg_ls_dir",
+    "pg_stat_file",
+    "lo_export",
+    "lo_import",
+];
 
 pub fn is_read_only(sql: &str) -> Result<(), GuardError> {
     let dialect = PostgreSqlDialect {};
@@ -111,7 +139,8 @@ fn check_set_expr(body: &SetExpr) -> Result<(), GuardError> {
     match body {
         // `SELECT ... INTO new_table` materializes a table — DDL, not a read.
         SetExpr::Select(select) if select.into.is_some() => Err(GuardError::SelectInto),
-        SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) => Ok(()),
+        SetExpr::Select(select) => check_select(select),
+        SetExpr::Values(_) | SetExpr::Table(_) => Ok(()),
         SetExpr::Query(inner) => check_query(inner),
         SetExpr::SetOperation { left, right, .. } => {
             check_set_expr(left)?;
@@ -119,6 +148,185 @@ fn check_set_expr(body: &SetExpr) -> Result<(), GuardError> {
         }
         SetExpr::Insert(_) => Err(GuardError::WriteInReadPath("INSERT")),
         SetExpr::Update(_) => Err(GuardError::WriteInReadPath("UPDATE")),
+    }
+}
+
+/// Walk the expressions inside a SELECT node to catch denied function calls
+/// in the projection, FROM, WHERE, HAVING, and GROUP BY clauses.
+fn check_select(select: &Select) -> Result<(), GuardError> {
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                check_expr(e)?;
+            }
+            // Wildcards contain no callable expressions.
+            SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(..) => {}
+        }
+    }
+    // FROM clause — catches set-returning functions like `pg_ls_dir('/tmp')`
+    // used directly as a table source.
+    for twj in &select.from {
+        check_table_with_joins(twj)?;
+    }
+    if let Some(where_expr) = &select.selection {
+        check_expr(where_expr)?;
+    }
+    if let GroupByExpr::Expressions(exprs, _) = &select.group_by {
+        for expr in exprs {
+            check_expr(expr)?;
+        }
+    }
+    if let Some(having) = &select.having {
+        check_expr(having)?;
+    }
+    Ok(())
+}
+
+fn check_table_with_joins(twj: &TableWithJoins) -> Result<(), GuardError> {
+    check_table_factor(&twj.relation)?;
+    for join in &twj.joins {
+        check_table_factor(&join.relation)?;
+    }
+    Ok(())
+}
+
+fn check_table_factor(factor: &TableFactor) -> Result<(), GuardError> {
+    match factor {
+        // Plain table reference or table-valued function like `pg_ls_dir('/tmp')`.
+        // The Postgres dialect parses `FROM func(args)` as `Table { args: Some(...) }`.
+        TableFactor::Table { name, args, .. } => {
+            let fn_name = name.0.last().map(|i| i.value.as_str()).unwrap_or("");
+            if let Some(&denied) = DENIED_FUNCTIONS
+                .iter()
+                .find(|&&d| d.eq_ignore_ascii_case(fn_name))
+            {
+                return Err(GuardError::DeniedFunction(denied));
+            }
+            // Walk any function arguments (e.g. `generate_series(1, pg_read_file('x'))`)
+            if let Some(tfa) = args {
+                for arg in &tfa.args {
+                    let arg_expr = match arg {
+                        FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => arg,
+                    };
+                    if let FunctionArgExpr::Expr(e) = arg_expr {
+                        check_expr(e)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        // `TABLE(<expr>)` syntax.
+        TableFactor::TableFunction { expr, .. } => check_expr(expr),
+        // Subquery in the FROM clause.
+        TableFactor::Derived { subquery, .. } => check_query(subquery),
+        // All other variants (UNNEST, NestedJoin, Pivot, etc.) contain no
+        // directly callable functions that could be denied — fall through.
+        _ => Ok(()),
+    }
+}
+
+/// Recursively walk an expression node, rejecting any call to a denied
+/// function and recursing into subqueries so that nested attacks are caught.
+fn check_expr(expr: &Expr) -> Result<(), GuardError> {
+    match expr {
+        Expr::Function(f) => {
+            // Match on the last identifier component so that schema-qualified
+            // calls (`pg_catalog.pg_read_file(...)`) are caught too.
+            let fn_name = f.name.0.last().map(|i| i.value.as_str()).unwrap_or("");
+            if let Some(&denied) = DENIED_FUNCTIONS
+                .iter()
+                .find(|&&d| d.eq_ignore_ascii_case(fn_name))
+            {
+                return Err(GuardError::DeniedFunction(denied));
+            }
+            check_function_args(&f.args)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            check_expr(left)?;
+            check_expr(right)
+        }
+        Expr::UnaryOp { expr, .. } => check_expr(expr),
+        Expr::Nested(e) => check_expr(e),
+        // CAST / TRY_CAST / etc.
+        Expr::Cast { expr, .. } => check_expr(expr),
+        // IS NULL / IS NOT NULL / IS TRUE / …
+        Expr::IsNull(e)
+        | Expr::IsNotNull(e)
+        | Expr::IsTrue(e)
+        | Expr::IsNotTrue(e)
+        | Expr::IsFalse(e)
+        | Expr::IsNotFalse(e)
+        | Expr::IsUnknown(e)
+        | Expr::IsNotUnknown(e) => check_expr(e),
+        Expr::InList { expr, list, .. } => {
+            check_expr(expr)?;
+            for e in list {
+                check_expr(e)?;
+            }
+            Ok(())
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            check_expr(expr)?;
+            check_query(subquery)
+        }
+        Expr::Subquery(q) => check_query(q),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            check_expr(expr)?;
+            check_expr(low)?;
+            check_expr(high)
+        }
+        // LIKE / ILIKE / SIMILAR TO — walk both operands.
+        Expr::Like { expr, pattern, .. }
+        | Expr::ILike { expr, pattern, .. }
+        | Expr::SimilarTo { expr, pattern, .. } => {
+            check_expr(expr)?;
+            check_expr(pattern)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                check_expr(o)?;
+            }
+            for c in conditions {
+                check_expr(c)?;
+            }
+            for r in results {
+                check_expr(r)?;
+            }
+            if let Some(e) = else_result {
+                check_expr(e)?;
+            }
+            Ok(())
+        }
+        // Leaf nodes: identifiers, literals, typed strings, wildcards, etc.
+        _ => Ok(()),
+    }
+}
+
+/// Walk the argument list of a function call so that denied functions passed
+/// as arguments to wrapper functions are also rejected.
+fn check_function_args(args: &FunctionArguments) -> Result<(), GuardError> {
+    match args {
+        FunctionArguments::None => Ok(()),
+        // Some dialects allow bare subquery as the sole argument.
+        FunctionArguments::Subquery(q) => check_query(q),
+        FunctionArguments::List(list) => {
+            for arg in &list.args {
+                let arg_expr = match arg {
+                    FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => arg,
+                };
+                if let FunctionArgExpr::Expr(e) = arg_expr {
+                    check_expr(e)?;
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -285,6 +493,107 @@ mod tests {
         assert!(matches!(is_read_only(""), Err(GuardError::Parse)));
         assert!(matches!(is_read_only("   "), Err(GuardError::Parse)));
     }
+
+    // --- Function denylist ---
+
+    fn rejected_denied(sql: &str, fn_name: &str) {
+        match is_read_only(sql) {
+            Err(GuardError::DeniedFunction(got)) => {
+                assert_eq!(got, fn_name, "wrong denied function for `{sql}`");
+            }
+            other => panic!("expected DeniedFunction({fn_name}) for `{sql}`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pg_read_file_in_projection_rejected() {
+        rejected_denied("SELECT pg_read_file('/etc/passwd')", "pg_read_file");
+    }
+
+    #[test]
+    fn pg_read_binary_file_rejected() {
+        rejected_denied(
+            "SELECT pg_read_binary_file('/etc/shadow')",
+            "pg_read_binary_file",
+        );
+    }
+
+    #[test]
+    fn pg_ls_dir_rejected() {
+        rejected_denied("SELECT * FROM pg_ls_dir('/tmp')", "pg_ls_dir");
+    }
+
+    #[test]
+    fn pg_stat_file_rejected() {
+        rejected_denied("SELECT pg_stat_file('/etc/passwd')", "pg_stat_file");
+    }
+
+    #[test]
+    fn lo_export_rejected() {
+        rejected_denied("SELECT lo_export(1234, '/tmp/out')", "lo_export");
+    }
+
+    #[test]
+    fn lo_import_rejected() {
+        rejected_denied("SELECT lo_import('/etc/passwd')", "lo_import");
+    }
+
+    #[test]
+    fn denied_function_in_where_clause_rejected() {
+        rejected_denied(
+            "SELECT id FROM t WHERE pg_read_file('/etc/passwd') IS NOT NULL",
+            "pg_read_file",
+        );
+    }
+
+    #[test]
+    fn denied_function_in_subquery_rejected() {
+        rejected_denied(
+            "SELECT id FROM t WHERE id IN (SELECT length(pg_read_file('/etc/passwd')))",
+            "pg_read_file",
+        );
+    }
+
+    #[test]
+    fn denied_function_in_cte_rejected() {
+        rejected_denied(
+            "WITH x AS (SELECT pg_read_file('/etc/passwd') AS data) SELECT data FROM x",
+            "pg_read_file",
+        );
+    }
+
+    #[test]
+    fn schema_qualified_denied_function_rejected() {
+        // Attackers may try to qualify the name to confuse a naive denylist.
+        rejected_denied(
+            "SELECT pg_catalog.pg_read_file('/etc/passwd')",
+            "pg_read_file",
+        );
+    }
+
+    #[test]
+    fn denied_function_case_insensitive() {
+        // SQL identifiers are case-insensitive; the guard must be too.
+        rejected_denied("SELECT PG_READ_FILE('/etc/passwd')", "pg_read_file");
+    }
+
+    #[test]
+    fn denied_function_in_having_rejected() {
+        rejected_denied(
+            "SELECT id FROM t GROUP BY id HAVING pg_read_file('/etc/passwd') IS NOT NULL",
+            "pg_read_file",
+        );
+    }
+
+    #[test]
+    fn safe_functions_allowed() {
+        // Ensure the denylist doesn't block ordinary aggregate/window functions.
+        ok("SELECT now()");
+        ok("SELECT count(*) FROM users");
+        ok("SELECT sum(amount) FROM orders GROUP BY user_id");
+        ok("SELECT lower(email) FROM users");
+        ok("SELECT coalesce(name, 'unknown') FROM t");
+    }
 }
 
 #[cfg(test)]
@@ -323,6 +632,18 @@ mod proptests {
         .prop_map(|s| s.to_string())
     }
 
+    fn arbitrary_denied_function() -> impl Strategy<Value = String> {
+        proptest::sample::select(&[
+            "SELECT pg_read_file('/etc/passwd')",
+            "SELECT pg_read_binary_file('/etc/shadow')",
+            "SELECT pg_ls_dir('/tmp')",
+            "SELECT pg_stat_file('/etc/passwd')",
+            "SELECT lo_export(1, '/tmp/x')",
+            "SELECT lo_import('/etc/passwd')",
+        ])
+        .prop_map(|s| s.to_string())
+    }
+
     proptest! {
         #[test]
         fn never_panics_on_arbitrary_strings(s in ".{0,200}") {
@@ -354,6 +675,14 @@ mod proptests {
             prop_assert!(
                 matches!(got, Err(GuardError::MultiStatement(_)) | Err(GuardError::NotAllowed(_)) | Err(GuardError::Parse)),
                 "wrongly handled: `{combined}` → {got:?}"
+            );
+        }
+
+        #[test]
+        fn denied_functions_always_rejected(sql in arbitrary_denied_function()) {
+            prop_assert!(
+                matches!(is_read_only(&sql), Err(GuardError::DeniedFunction(_))),
+                "wrongly allowed: {sql}"
             );
         }
     }

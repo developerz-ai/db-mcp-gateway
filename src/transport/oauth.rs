@@ -338,7 +338,8 @@ pub async fn authorize(
             );
         }
     };
-    auth.flows
+    if auth
+        .flows
         .insert_bridge(
             csrf_state,
             nonce,
@@ -351,7 +352,15 @@ pub async fn authorize(
                 resource: p.resource,
             },
         )
-        .await;
+        .await
+        .is_err()
+    {
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "gateway temporarily overloaded; try again",
+        );
+    }
 
     Redirect::to(idp_url.as_str()).into_response()
 }
@@ -387,7 +396,8 @@ pub(super) async fn complete_bridge_login(
     // + access/refresh tokens are issued when the code is redeemed at `/token`,
     // so an abandoned login leaves no orphan session row.
     let auth_code = random_token();
-    auth.codes
+    if auth
+        .codes
         .insert(
             &auth_code,
             GrantIdentity {
@@ -399,7 +409,15 @@ pub(super) async fn complete_bridge_login(
             bridge.client_redirect_uri.clone(),
             bridge.client_id.clone(),
         )
-        .await;
+        .await
+        .is_err()
+    {
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "gateway temporarily overloaded; try again",
+        );
+    }
 
     match build_redirect(
         &bridge.client_redirect_uri,
@@ -601,13 +619,20 @@ async fn issue_token_response(
         }
     };
     let refresh_token = random_token();
-    match chain_issued_at {
+    let refresh_result = match chain_issued_at {
         Some(issued_at) => {
             auth.refresh
                 .insert_rotated(&refresh_token, identity, issued_at)
                 .await
         }
         None => auth.refresh.insert(&refresh_token, identity).await,
+    };
+    if refresh_result.is_err() {
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "gateway temporarily overloaded; try again",
+        );
     }
 
     let body = json!({

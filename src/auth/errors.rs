@@ -42,4 +42,7 @@ pub enum AuthError {
 
     #[error("session JWT error")]
     Jwt(#[from] jsonwebtoken::errors::Error),
+
+    #[error("gateway overloaded; auth store full")]
+    StoreFull,
 }

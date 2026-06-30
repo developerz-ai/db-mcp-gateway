@@ -32,7 +32,10 @@ pub async fn login(State(state): State<AppState>) -> Result<Json<LoginResponse>,
         .oidc
         .authorize_url(&csrf_state, &nonce, &challenge)
         .await?;
-    auth.flows.insert(csrf_state.clone(), nonce, verifier).await;
+    auth.flows
+        .insert(csrf_state.clone(), nonce, verifier)
+        .await
+        .map_err(|_| AuthError::StoreFull)?;
     Ok(Json(LoginResponse {
         login_url: url.to_string(),
         state: csrf_state,
@@ -145,6 +148,8 @@ impl IntoResponse for AuthError {
             // serving — so this arm is only reachable if a future caller
             // constructs an `OidcClient` lazily. Treat it as internal.
             AuthError::HttpClient | AuthError::State(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            // Store full: gateway is overloaded, client should retry.
+            AuthError::StoreFull => StatusCode::SERVICE_UNAVAILABLE,
         };
         let (category, code) = auth_error_fields(&self);
         let mut body = serde_json::json!({
@@ -174,6 +179,7 @@ pub(crate) fn auth_error_fields(err: &AuthError) -> (&'static str, &'static str)
         AuthError::InvalidState => ("internal", "oidc_invalid_state"),
         AuthError::HttpClient => ("internal", "oidc_http_client_init_failed"),
         AuthError::State(_) => ("internal", "state_db_error"),
+        AuthError::StoreFull => ("overloaded", "auth_store_full"),
     }
 }
 

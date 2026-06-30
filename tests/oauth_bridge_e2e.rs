@@ -908,7 +908,8 @@ async fn refresh_chain_expires_past_absolute_ttl() {
     };
     refresh_store
         .insert_rotated(&refresh_token, stale_identity, stale_birth)
-        .await;
+        .await
+        .unwrap();
 
     // `/token` calls `take()`, which GC-drops any entry with
     // `now - issued_at >= REFRESH_TTL`. The entry is gone → `invalid_grant`.

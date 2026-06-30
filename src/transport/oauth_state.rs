@@ -15,6 +15,35 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
+/// Size cap on the pending flows map. A login produces one pending flow;
+/// this cap bounds resource exhaustion from abandoning many browser logins.
+const PENDING_FLOWS_MAX_SIZE: usize = 10_000;
+
+/// Size cap on the authorization codes map. Each code is one-time and
+/// redeemed immediately; this cap bounds memory from unused/leaked codes.
+const AUTH_CODES_MAX_SIZE: usize = 10_000;
+
+/// Size cap on the refresh tokens map. This cap bounds resource exhaustion
+/// from tokens belonging to many users or leaked tokens stored indefinitely.
+const REFRESH_TOKENS_MAX_SIZE: usize = 100_000;
+
+/// Error type for store operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreError {
+    /// The store has reached its size cap; new entries are rejected.
+    StoreFull,
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreError::StoreFull => write!(f, "auth store full"),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
 /// Hash a bearer secret (authorization code or refresh token) for at-rest
 /// storage. The store is keyed by this digest, never the raw secret, so a memory
 /// dump or a stray `Debug` of the map can't be replayed as a live token; lookups
@@ -66,8 +95,13 @@ pub struct PendingFlow {
 }
 
 impl PendingFlows {
-    pub async fn insert(&self, state: String, nonce: String, idp_verifier: String) {
-        self.insert_flow(state, nonce, idp_verifier, None).await;
+    pub async fn insert(
+        &self,
+        state: String,
+        nonce: String,
+        idp_verifier: String,
+    ) -> Result<(), StoreError> {
+        self.insert_flow(state, nonce, idp_verifier, None).await
     }
 
     /// Insert a flow carrying MCP OAuth-bridge context (the client redirect /
@@ -78,9 +112,9 @@ impl PendingFlows {
         nonce: String,
         idp_verifier: String,
         bridge: OAuthBridge,
-    ) {
+    ) -> Result<(), StoreError> {
         self.insert_flow(state, nonce, idp_verifier, Some(bridge))
-            .await;
+            .await
     }
 
     async fn insert_flow(
@@ -89,9 +123,12 @@ impl PendingFlows {
         nonce: String,
         idp_verifier: String,
         bridge: Option<OAuthBridge>,
-    ) {
+    ) -> Result<(), StoreError> {
         let mut map = self.inner.lock().await;
-        Self::gc(&mut map);
+        // Check size before inserting; reject if full.
+        if map.len() >= PENDING_FLOWS_MAX_SIZE {
+            return Err(StoreError::StoreFull);
+        }
         map.insert(
             state,
             PendingFlow {
@@ -101,16 +138,30 @@ impl PendingFlows {
                 expires_at: Instant::now() + FLOW_TTL,
             },
         );
+        Ok(())
     }
 
-    /// Remove and return the pending flow for a given state, if still live.
+    /// Remove and return the pending flow for a given state, if still live
+    /// (i.e., not yet expired past the flow TTL).
     pub async fn take(&self, state: &str) -> Option<PendingFlow> {
         let mut map = self.inner.lock().await;
-        Self::gc(&mut map);
-        map.remove(state)
+        if let Some(flow) = map.remove(state) {
+            // Check expiration before returning: if the flow has passed its TTL,
+            // reject it (treat as if it doesn't exist). The background GC task
+            // will clean up the rest.
+            if flow.expires_at > Instant::now() {
+                Some(flow)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }
 
-    fn gc(map: &mut HashMap<String, PendingFlow>) {
+    /// Remove all expired flows. Called periodically by a background task.
+    pub async fn gc_expired(&self) {
+        let mut map = self.inner.lock().await;
         let now = Instant::now();
         map.retain(|_, flow| flow.expires_at > now);
     }
@@ -161,9 +212,12 @@ impl AuthCodes {
         code_challenge: String,
         redirect_uri: String,
         client_id: String,
-    ) {
+    ) -> Result<(), StoreError> {
         let mut map = self.inner.lock().await;
-        Self::gc(&mut map);
+        // Check size before inserting; reject if full.
+        if map.len() >= AUTH_CODES_MAX_SIZE {
+            return Err(StoreError::StoreFull);
+        }
         map.insert(
             hash_secret(code),
             AuthCode {
@@ -174,16 +228,30 @@ impl AuthCodes {
                 expires_at: Instant::now() + CODE_TTL,
             },
         );
+        Ok(())
     }
 
-    /// Remove and return a code (one-time use), if still live.
+    /// Remove and return a code (one-time use), if still live (i.e., not yet
+    /// expired past the code TTL).
     pub async fn take(&self, code: &str) -> Option<AuthCode> {
         let mut map = self.inner.lock().await;
-        Self::gc(&mut map);
-        map.remove(&hash_secret(code))
+        if let Some(ac) = map.remove(&hash_secret(code)) {
+            // Check expiration before returning: if the code has passed its TTL,
+            // reject it (treat as if it doesn't exist). The background GC task
+            // will clean up the rest.
+            if ac.expires_at > Instant::now() {
+                Some(ac)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }
 
-    fn gc(map: &mut HashMap<[u8; 32], AuthCode>) {
+    /// Remove all expired codes. Called periodically by a background task.
+    pub async fn gc_expired(&self) {
+        let mut map = self.inner.lock().await;
         let now = Instant::now();
         map.retain(|_, code| code.expires_at > now);
     }
@@ -240,19 +308,32 @@ pub struct RefreshToken {
 impl RefreshTokens {
     /// Insert a token that starts a fresh chain (birth = now). Used when the
     /// token is minted off an authorization-code redemption, not a rotation.
-    pub async fn insert(&self, token: &str, identity: GrantIdentity) {
-        self.store(token, identity, Instant::now()).await;
+    pub async fn insert(&self, token: &str, identity: GrantIdentity) -> Result<(), StoreError> {
+        self.store(token, identity, Instant::now()).await
     }
 
     /// Insert a rotated token, carrying the chain's original `issued_at` forward
     /// so the absolute TTL is measured from the first mint, not this rotation.
-    pub async fn insert_rotated(&self, token: &str, identity: GrantIdentity, issued_at: Instant) {
-        self.store(token, identity, issued_at).await;
+    pub async fn insert_rotated(
+        &self,
+        token: &str,
+        identity: GrantIdentity,
+        issued_at: Instant,
+    ) -> Result<(), StoreError> {
+        self.store(token, identity, issued_at).await
     }
 
-    async fn store(&self, token: &str, identity: GrantIdentity, issued_at: Instant) {
+    async fn store(
+        &self,
+        token: &str,
+        identity: GrantIdentity,
+        issued_at: Instant,
+    ) -> Result<(), StoreError> {
         let mut map = self.inner.lock().await;
-        Self::gc(&mut map);
+        // Check size before inserting; reject if full.
+        if map.len() >= REFRESH_TOKENS_MAX_SIZE {
+            return Err(StoreError::StoreFull);
+        }
         map.insert(
             hash_secret(token),
             RefreshToken {
@@ -260,13 +341,25 @@ impl RefreshTokens {
                 issued_at,
             },
         );
+        Ok(())
     }
 
-    /// Remove and return a refresh token (rotation consumes it), if still live.
+    /// Remove and return a refresh token (rotation consumes it), if still live
+    /// (i.e., not yet expired past the absolute chain TTL).
     pub async fn take(&self, token: &str) -> Option<RefreshToken> {
         let mut map = self.inner.lock().await;
-        Self::gc(&mut map);
-        map.remove(&hash_secret(token))
+        if let Some(rt) = map.remove(&hash_secret(token)) {
+            // Check expiration before returning: if the chain has passed its
+            // absolute TTL, reject it (treat as if it doesn't exist). The
+            // background GC task will clean up the rest.
+            let now = Instant::now();
+            if chain_expired(rt.issued_at, now) {
+                return None;
+            }
+            Some(rt)
+        } else {
+            None
+        }
     }
 
     /// Drop every refresh token belonging to `sub`, returning how many were
@@ -282,7 +375,10 @@ impl RefreshTokens {
         before - map.len()
     }
 
-    fn gc(map: &mut HashMap<[u8; 32], RefreshToken>) {
+    /// Remove all expired refresh token chains. Called periodically by a
+    /// background task.
+    pub async fn gc_expired(&self) {
+        let mut map = self.inner.lock().await;
         let now = Instant::now();
         map.retain(|_, t| !chain_expired(t.issued_at, now));
     }
@@ -311,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_round_trips_by_raw_token_and_is_consumed_once() {
         let store = RefreshTokens::default();
-        store.insert("raw-token", identity()).await;
+        store.insert("raw-token", identity()).await.unwrap();
 
         // Lookup hashes the presented value, so the raw token resolves...
         let entry = store.take("raw-token").await.expect("token is live");
@@ -327,7 +423,10 @@ mod tests {
         // A rotated token must store the *passed* chain birth verbatim, not
         // `Instant::now()` — that's what keeps the absolute TTL from sliding.
         let birth = Instant::now();
-        store.insert_rotated("rotated", identity(), birth).await;
+        store
+            .insert_rotated("rotated", identity(), birth)
+            .await
+            .unwrap();
         let entry = store.take("rotated").await.expect("token is live");
         assert_eq!(
             entry.issued_at, birth,
@@ -336,7 +435,7 @@ mod tests {
 
         // A fresh insert, by contrast, stamps ~now.
         let before = Instant::now();
-        store.insert("fresh", identity()).await;
+        store.insert("fresh", identity()).await.unwrap();
         let after = Instant::now();
         let fresh = store.take("fresh").await.expect("token is live");
         assert!(fresh.issued_at >= before && fresh.issued_at <= after);
@@ -374,7 +473,11 @@ mod tests {
         let Some(stale_birth) = Instant::now().checked_sub(REFRESH_TTL) else {
             return;
         };
-        store.insert_rotated("stale", identity(), stale_birth).await;
+        store
+            .insert_rotated("stale", identity(), stale_birth)
+            .await
+            .unwrap();
+        // take() checks expiration and rejects expired tokens before returning.
         assert!(
             store.take("stale").await.is_none(),
             "a chain at/over REFRESH_TTL must not renew"
@@ -385,8 +488,8 @@ mod tests {
     async fn purge_for_sub_drops_only_that_identitys_chains() {
         let store = RefreshTokens::default();
         // Two live chains for u1 (e.g. two devices), one for u2.
-        store.insert("u1-a", identity()).await;
-        store.insert("u1-b", identity()).await;
+        store.insert("u1-a", identity()).await.unwrap();
+        store.insert("u1-b", identity()).await.unwrap();
         store
             .insert(
                 "u2-a",
@@ -395,7 +498,8 @@ mod tests {
                     ..identity()
                 },
             )
-            .await;
+            .await
+            .unwrap();
 
         let removed = store.purge_for_sub("u1").await;
         assert_eq!(removed, 2, "both of u1's chains are purged");
@@ -418,10 +522,151 @@ mod tests {
                 "https://app/cb".into(),
                 "client-1".into(),
             )
-            .await;
+            .await
+            .unwrap();
 
         let entry = store.take("raw-code").await.expect("code is live");
         assert_eq!(entry.client_id, "client-1");
         assert!(store.take("raw-code").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_flows_gc_removes_expired_entries() {
+        let store = PendingFlows::default();
+        store
+            .insert("flow1".into(), "nonce1".into(), "verifier1".into())
+            .await
+            .unwrap();
+        store
+            .insert("flow2".into(), "nonce2".into(), "verifier2".into())
+            .await
+            .unwrap();
+
+        // Both flows should exist.
+        assert!(store.take("flow1").await.is_some());
+        assert!(store.take("flow2").await.is_some());
+
+        // Re-insert and then run gc_expired.
+        store
+            .insert("flow3".into(), "nonce3".into(), "verifier3".into())
+            .await
+            .unwrap();
+        store.gc_expired().await;
+        // Flow3 is still within TTL, should exist after GC.
+        assert!(store.take("flow3").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn auth_codes_gc_removes_expired_entries() {
+        let store = AuthCodes::default();
+        store
+            .insert(
+                "code1",
+                identity(),
+                "ch".into(),
+                "uri".into(),
+                "client".into(),
+            )
+            .await
+            .unwrap();
+
+        // Code exists.
+        assert!(store.take("code1").await.is_some());
+
+        // Re-insert and run gc.
+        store
+            .insert(
+                "code2",
+                identity(),
+                "ch".into(),
+                "uri".into(),
+                "client".into(),
+            )
+            .await
+            .unwrap();
+        store.gc_expired().await;
+        // Code2 is still within TTL.
+        assert!(store.take("code2").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn refresh_tokens_gc_removes_expired_chains() {
+        let store = RefreshTokens::default();
+        store.insert("token1", identity()).await.unwrap();
+        store.insert("token2", identity()).await.unwrap();
+
+        // Both tokens exist.
+        assert!(store.take("token1").await.is_some());
+        assert!(store.take("token2").await.is_some());
+
+        // Run gc_expired.
+        store.gc_expired().await;
+        // Fresh tokens within TTL should still exist after GC.
+        store.insert("token3", identity()).await.unwrap();
+        assert!(store.take("token3").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn pending_flows_rejects_when_full() {
+        let store = PendingFlows::default();
+        // Fill to the limit.
+        for i in 0..PENDING_FLOWS_MAX_SIZE {
+            let state = format!("flow-{i}");
+            store
+                .insert(state, format!("nonce-{i}"), format!("verifier-{i}"))
+                .await
+                .unwrap();
+        }
+
+        // Next insert should fail.
+        let result = store
+            .insert("overflow".into(), "nonce".into(), "verifier".into())
+            .await;
+        assert_eq!(result, Err(StoreError::StoreFull));
+    }
+
+    #[tokio::test]
+    async fn auth_codes_rejects_when_full() {
+        let store = AuthCodes::default();
+        // Fill to the limit.
+        for i in 0..AUTH_CODES_MAX_SIZE {
+            let code = format!("code-{i}");
+            store
+                .insert(
+                    &code,
+                    identity(),
+                    "challenge".into(),
+                    "uri".into(),
+                    "client".into(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Next insert should fail.
+        let result = store
+            .insert(
+                "overflow",
+                identity(),
+                "challenge".into(),
+                "uri".into(),
+                "client".into(),
+            )
+            .await;
+        assert_eq!(result, Err(StoreError::StoreFull));
+    }
+
+    #[tokio::test]
+    async fn refresh_tokens_rejects_when_full() {
+        let store = RefreshTokens::default();
+        // Fill to the limit.
+        for i in 0..REFRESH_TOKENS_MAX_SIZE {
+            let token = format!("token-{i}");
+            store.insert(&token, identity()).await.unwrap();
+        }
+
+        // Next insert should fail.
+        let result = store.insert("overflow", identity()).await;
+        assert_eq!(result, Err(StoreError::StoreFull));
     }
 }

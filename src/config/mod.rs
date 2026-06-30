@@ -32,6 +32,11 @@ const DEFAULT_AUDIT_RETENTION_DAYS: u32 = 90;
 /// `PermissionsCache::invalidate` directly so the practical staleness is the
 /// in-flight request, not the TTL.
 const DEFAULT_PERMISSIONS_CACHE_TTL_SECONDS: u64 = 60;
+/// Matches `transport::limit::MAX_CONCURRENT_REQUESTS`. Exposed via `Config`
+/// so integration tests can boot with tight limits without touching the static.
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 512;
+/// Matches `transport::limit::MAX_CONCURRENT_PER_IDENTITY`.
+pub const DEFAULT_MAX_CONCURRENT_PER_IDENTITY: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -51,6 +56,14 @@ pub struct Config {
     pub tls: TlsConfig,
     /// Per-user TTL for the DB-grant resolver cache (#49).
     pub permissions_cache_ttl_seconds: u64,
+    /// Process-wide ceiling on concurrent in-flight gated requests. Exposed so
+    /// tests can boot with a tight global cap to exercise the 503 path without
+    /// flooding the gateway; production code uses `DEFAULT_MAX_CONCURRENT_REQUESTS`.
+    pub max_concurrent_requests: usize,
+    /// Per-identity ceiling on concurrent in-flight gated requests. Exposed so
+    /// tests can set this to 1 to exercise the 429 path with a single slow
+    /// in-flight request; production code uses `DEFAULT_MAX_CONCURRENT_PER_IDENTITY`.
+    pub max_concurrent_per_identity: usize,
 }
 
 /// TLS state — present-and-on or explicitly-off-for-dev. Modeled as an enum
@@ -105,6 +118,8 @@ impl Default for Config {
             // tests and `for_tests`; both run plain HTTP.
             tls: TlsConfig::Disabled,
             permissions_cache_ttl_seconds: DEFAULT_PERMISSIONS_CACHE_TTL_SECONDS,
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+            max_concurrent_per_identity: DEFAULT_MAX_CONCURRENT_PER_IDENTITY,
         }
     }
 }
