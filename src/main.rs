@@ -157,6 +157,18 @@ async fn main() -> anyhow::Result<()> {
     // mid-flight just rolls back; no half-state.
     spawn_audit_pruner(state_db, config.audit_retention_days);
 
+    // Spawn the OAuth state garbage collector. Ticks every 30 seconds to
+    // remove expired authorization codes, pending flows, and refresh tokens.
+    // This prevents unbounded memory growth from abandoned logins or leaked
+    // tokens.
+    if let Some(auth_facade) = app_state.auth.as_ref() {
+        spawn_oauth_state_gc(
+            auth_facade.flows.clone(),
+            auth_facade.codes.clone(),
+            auth_facade.refresh.clone(),
+        );
+    }
+
     let app = transport::router(&config, app_state)?;
 
     let handle = axum_server::Handle::new();
@@ -273,6 +285,31 @@ fn spawn_audit_pruner(pool: PgPool, ttl_days: u32) {
                 Ok(n) => tracing::info!(rows = n, ttl_days, "pruned old audit rows"),
                 Err(err) => tracing::error!(%err, "audit pruner run failed"),
             }
+        }
+    });
+}
+
+/// Background task: tick every 30 seconds and remove expired OAuth state
+/// (authorization codes, pending flows, refresh tokens). The task is
+/// detached — cancellation on graceful shutdown is safe because it's pure
+/// memory-local operations (no I/O).
+fn spawn_oauth_state_gc(
+    flows: transport::PendingFlows,
+    codes: transport::AuthCodes,
+    refresh: transport::RefreshTokens,
+) {
+    use std::time::Duration;
+    use tokio::time::{MissedTickBehavior, interval};
+
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(30));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            flows.gc_expired().await;
+            codes.gc_expired().await;
+            refresh.gc_expired().await;
+            tracing::debug!("oauth state gc completed");
         }
     });
 }
