@@ -597,6 +597,58 @@ async fn list_excludes_soft_deleted() {
     h.cleanup().await;
 }
 
+/// ADM1: a read-only GET must NOT create a `permissions_users` row for the
+/// acting admin. Previously the middleware unconditionally upserted the actor
+/// row; after ADM1 that upsert moved inside mutation transactions (POST /
+/// PATCH / DELETE). A GET handler never opens one, so a brand-new admin sub
+/// that only ever GETs should remain absent from `permissions_users`.
+#[tokio::test]
+async fn get_does_not_write_user_row() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    // Use a unique sub that has NEVER been written via a mutation.
+    let admin_sub = format!("admin-get-only-{}", uuid::Uuid::new_v4().simple());
+    // Track for cleanup (in case we regress and accidentally insert the row).
+    h.track(admin_sub.clone());
+
+    let jwt = mint_session(
+        &sessions,
+        &auth_cfg.session_signing_key,
+        &admin_sub,
+        "admin-get@example.com",
+        &[ADMIN_GROUP.to_string()],
+    )
+    .await;
+
+    // List call — read-only GET. Must succeed for an admin.
+    let resp = client()
+        .get(format!("{}/admin/v1/users", h.base_url))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "GET list must succeed for admin"
+    );
+
+    // The GET must NOT have written a `permissions_users` row for this admin.
+    let exists: bool =
+        sqlx::query("SELECT EXISTS (SELECT 1 FROM permissions_users WHERE user_sub = $1)")
+            .bind(&admin_sub)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert!(
+        !exists,
+        "GET must not create a permissions_users row for the admin actor"
+    );
+
+    h.cleanup().await;
+}
+
 /// Audit write must fail the request AND roll back the data write. The
 /// production middleware always provides a non-empty `request_id`, so to
 /// exercise the rollback path we bypass that middleware and inject an
