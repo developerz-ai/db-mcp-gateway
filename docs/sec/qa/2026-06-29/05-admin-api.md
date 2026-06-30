@@ -1,12 +1,15 @@
 # 05 — Admin API (SSO-gated permissions management)
 
+> **Remediation status (2026-06-30):** All findings in this report are closed.
+> ADM1/ADM2 → **fixed @ 36f6dd9** (#95).
+
 Scope: `src/transport/admin/{mod,middleware,error,users}.rs`, `admin/databases/*`, `admin/grants/*`.
 
 This surface is well-built. **No confirmed High/Critical vulnerability.** All mutations are parameterized, synchronously audited in-transaction, DTOs reject credential-bearing fields, and responses carry no credential columns. Findings are Low / hardening, plus a doc discrepancy.
 
 ---
 
-## ADM1 — Read GETs upsert `permissions_users` outside an audit transaction — **Low (authz impact needs verification)**
+## ADM1 — Read GETs upsert `permissions_users` outside an audit transaction — **Low** · `fixed @ 36f6dd9`
 
 **File:** `src/transport/admin/middleware.rs:111-113`
 
@@ -27,7 +30,7 @@ Impact is bounded: authz group matching uses the **live JWT groups**, not the st
 
 ---
 
-## ADM2 — Stale admin privilege from session-cached groups — **Low (revocation behavior needs verification)**
+## ADM2 — Stale admin privilege from session-cached groups — **Low** · `fixed @ 36f6dd9`
 
 **File:** `src/transport/admin/middleware.rs:92`
 

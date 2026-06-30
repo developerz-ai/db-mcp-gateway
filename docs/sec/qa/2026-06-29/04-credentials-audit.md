@@ -1,12 +1,15 @@
 # 04 — Credential Handling & Audit Integrity
 
+> **Remediation status (2026-06-30):** All findings in this report are closed.
+> C3/C4 → **fixed @ f7fb7fc** (#86) · C1/A5/A6 → **fixed @ bf7b280** (#93) · C2 → **fixed @ 73d7d99** (#94).
+
 Scope: `src/config/{mod,schema,secret,yaml}.rs`, `src/audit/{mod,permissions,pruner}.rs`, `src/transport/errors.rs`, `src/auth/errors.rs`, `src/transport/admin/error.rs`, `src/state/mod.rs`, plus the consumer sites that render these errors. (Note: `src/errors.rs` does not exist — errors are per-layer.)
 
 The top invariant — credentials never in any response/error/log — and synchronous, append-only audit are taken seriously and enforced. No unconditional credential leak or audit bypass found. One conditional boot-path leak needs a runtime check; the rest are defense-in-depth.
 
 ---
 
-## C1 — Boot DB-connect error may surface the DSN (with inline password) via the anyhow chain — **Medium (needs runtime verification)**
+## C1 — Boot DB-connect error may surface the DSN (with inline password) via the anyhow chain — **Medium** · `fixed @ bf7b280`
 
 **File:** `src/state/mod.rs:16-40`, `src/main.rs:31` + `:76` + `:100-109`
 
@@ -25,13 +28,13 @@ let state_db = state::connect(&config.state_db.url, config.state_db.pool_size).a
 
 Whether it leaks depends on the failure mode: a Postgres *auth* failure yields a server message without the password, but a *URL/config parse* failure (`sqlx::Error::Configuration`) can echo the connection string. The redaction effort on `StateDbConfig::Debug` is defeated on this path.
 
-**Verify:** feed a malformed `STATE_DB_URL` (e.g. password with a stray `%`, or a bad scheme) and inspect the stderr line `main` emits on exit. If the URL/password appears → confirmed Medium.
+**Confirmed via runtime repro** (bf7b280): a malformed `STATE_DB_URL` with a sentinel password echoed the credential through the anyhow chain. Now fixed.
 
 **Fix:** map `StateDbError::Connect` so it never carries the raw error to a chain-printing boundary — log the error *type name* only (the pattern already used at `admin/middleware.rs:118-122`) and return a generic anyhow message.
 
 ---
 
-## C2 — Secret plaintext never zeroized — **Low**
+## C2 — Secret plaintext never zeroized — **Low** · `fixed @ 73d7d99`
 
 **File:** `src/config/secret.rs:31`, `:149-151`
 
@@ -51,7 +54,7 @@ pub fn resolve(&self) -> Result<String, SecretError> {
 
 ---
 
-## C3 — `pruner::run_once` has no internal floor on `ttl_days` — **Low**
+## C3 — `pruner::run_once` has no internal floor on `ttl_days` — **Low** · `fixed @ f7fb7fc`
 
 **File:** `src/audit/pruner.rs:18-31`
 
@@ -69,7 +72,7 @@ With `ttl_days == 0` the predicate becomes `occurred_at < now()` — deletes *ev
 
 ---
 
-## C4 — serde_yaml parse error text + location echoed to boot log — **Low**
+## C4 — serde_yaml parse error text + location echoed to boot log — **Low** · `fixed @ f7fb7fc`
 
 **File:** `src/config/yaml.rs:79-110`
 

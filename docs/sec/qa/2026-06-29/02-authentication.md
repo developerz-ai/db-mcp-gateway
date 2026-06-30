@@ -1,12 +1,15 @@
 # 02 — Authentication
 
+> **Remediation status (2026-06-30):** All findings in this report are closed.
+> A1/A2/A4 → **fixed @ f7fb7fc** (#86) · A3 → **fixed @ 73d7d99** (#94) · A5/A6 → **fixed @ bf7b280** (#93).
+
 Scope: `src/auth/{mod,config,errors,jwt,oidc,session}.rs`, `src/transport/{auth_middleware,auth_routes}.rs`, admin auth gate. Library behavior verified against vendored `jsonwebtoken 9.3.1`.
 
 No remote auth bypass in the code as written. The two High items are fail-open / weak-default *design* issues that bite before the multi-replica Helm rollout; the rest are revocation/TLS/hardening gaps.
 
 ---
 
-## A1 — Committed default session signing key used silently when `SESSION_SIGNING_KEY` unset — **High**
+## A1 — Committed default session signing key used silently when `SESSION_SIGNING_KEY` unset — **High** · `fixed @ f7fb7fc`
 
 **File:** `src/auth/config.rs:12`, `:69`, `:107-109`
 
@@ -32,7 +35,7 @@ Any leaked `sid` (debug log, etc.) + the public default key = forgeable bearer u
 
 ---
 
-## A2 — `bearer_auth` fails open when the auth facade is absent — **High**
+## A2 — `bearer_auth` fails open when the auth facade is absent — **High** · `fixed @ f7fb7fc`
 
 **File:** `src/transport/auth_middleware.rs:21-26`
 
@@ -49,7 +52,7 @@ If `state.auth` is `None`, every gated route — including `/mcp` (`transport/mo
 
 ---
 
-## A3 — Session revocation not honored across replicas; cache has no TTL — **Medium**
+## A3 — Session revocation not honored across replicas; cache has no TTL — **Medium** · `fixed @ 73d7d99`
 
 **File:** `src/auth/session.rs:189-214`, `:217-232`
 
@@ -73,7 +76,7 @@ The module docstring claims "Every lookup goes through here so revocation is hon
 
 ---
 
-## A4 — No TLS enforcement on OIDC issuer / discovered endpoints — **Medium/Low**
+## A4 — No TLS enforcement on OIDC issuer / discovered endpoints — **Medium/Low** · `fixed @ f7fb7fc`
 
 **File:** `src/auth/oidc.rs:209-233`, `:129-155`
 
@@ -87,7 +90,7 @@ Neither the configured `issuer` nor the discovered `token_endpoint`/`jwks_uri`/`
 
 ---
 
-## A5 — ID-token algorithm taken from token header (RS/HS confusion shape) — **Low (not exploitable in 9.3.1)**
+## A5 — ID-token algorithm taken from token header (RS/HS confusion shape) — **Low (not exploitable in 9.3.1)** · `fixed @ bf7b280`
 
 **File:** `src/auth/oidc.rs:166`
 
@@ -101,7 +104,7 @@ The classic confusion anti-pattern. Verified **not exploitable in this build**: 
 
 ---
 
-## A6 — `email` optional, `email_verified` never checked — **Low**
+## A6 — `email` optional, `email_verified` never checked — **Low** · `fixed @ bf7b280`
 
 **File:** `src/auth/oidc.rs:187-191`
 

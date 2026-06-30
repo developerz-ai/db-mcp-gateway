@@ -1,12 +1,15 @@
 # 03 — Transport / MCP Protocol / TLS / DoS / Resource Safety
 
+> **Remediation status (2026-06-30):** All findings in this report are closed.
+> T2/T3 → **fixed @ f7fb7fc** (#86) · T1 → **fixed @ 7435daa** (#92).
+
 Scope: `src/transport/{mod,dispatch,jsonrpc,protocol,sse,tls,probes,app_state,auth_middleware,auth_routes}.rs`, `src/auth/oidc.rs`, `src/main.rs`, `src/lib.rs`. Dependency behavior verified against vendored `jsonwebtoken 9.3.1`, `axum 0.7.9`.
 
 No credential leak, no auth bypass, no request-path panic, no algorithm-confusion bypass. Every gap here is **DoS / resource exhaustion** — and the project's own "one noisy user must not starve others" rule is unmet on multiple axes.
 
 ---
 
-## T1 — No per-user / global rate or concurrency limit on the request path — **Medium**
+## T1 — No per-user / global rate or concurrency limit on the request path — **Medium** · `fixed @ 7435daa`
 
 **File:** `src/transport/mod.rs:46-108` (entire router). Confirmed by grep: the only `.layer`/`route_layer` calls in `src/` are the two `bearer_auth` middlewares and `require_admin_group`. No `tower::limit`, `ConcurrencyLimit`, `load_shed`, `buffer`, or governor anywhere.
 
@@ -23,7 +26,7 @@ No credential leak, no auth bypass, no request-path panic, no algorithm-confusio
 
 ---
 
-## T2 — Unauthenticated SSE endpoint, no connection cap — **Medium**
+## T2 — Unauthenticated SSE endpoint, no connection cap — **Medium** · `fixed @ f7fb7fc`
 
 **File:** `src/transport/mod.rs:59-60`, `src/transport/sse.rs:16-29`
 
@@ -43,7 +46,7 @@ Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 
 ---
 
-## T3 — OIDC discovery / JWKS / token-exchange HTTP client has no timeout — **Medium**
+## T3 — OIDC discovery / JWKS / token-exchange HTTP client has no timeout — **Medium** · `fixed @ f7fb7fc`
 
 **File:** `src/auth/oidc.rs:94-97` (client built once, reused at `:136-148`, `:213-223`, `:245-255`)
 
