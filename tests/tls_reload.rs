@@ -91,8 +91,8 @@ async fn sighup_reloads_tls_cert_without_dropping_listener() {
         use tokio::signal::unix::{SignalKind, signal};
         let mut hup = signal(SignalKind::hangup()).expect("install SIGHUP");
         while hup.recv().await.is_some() {
-            // Same call shape as main::reload_on_sighup; failures get swallowed
-            // here because the test wants the loop to keep running for retries.
+            // Same call shape as startup::spawn_reload_on_sighup; failures get
+            // swallowed here because the test wants the loop to keep running.
             let _ = db_mcp_gateway::transport::tls::reload(
                 &rustls_for_reload,
                 &reload_cert,

@@ -4,55 +4,23 @@
 //! `jsonwebtoken` for the crypto (signature, alg, exp) — the historically
 //! risky bits — and validate `iss` / `aud` / `nonce` / `kid` ourselves.
 
+mod helpers;
+mod types;
+
+use helpers::*;
+use types::*;
+
+pub use types::{DiscoveryDocument, VerifiedIdentity};
+
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
-use serde::Deserialize;
 use tokio::sync::RwLock;
-use url::{Host, Url};
 
 use super::config::AuthConfig;
 use super::errors::AuthError;
-
-const SCOPES: &str = "openid email profile groups";
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DiscoveryDocument {
-    pub issuer: String,
-    pub authorization_endpoint: String,
-    pub token_endpoint: String,
-    pub jwks_uri: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct Jwks {
-    keys: Vec<Jwk>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct Jwk {
-    kid: Option<String>,
-    kty: String,
-    #[serde(rename = "use")]
-    use_: Option<String>,
-    n: Option<String>,
-    e: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenResponse {
-    id_token: String,
-}
-
-/// Verified ID-token payload, narrowed to what the gateway actually uses.
-#[derive(Debug, Clone)]
-pub struct VerifiedIdentity {
-    pub sub: String,
-    pub email: String,
-    pub groups: Vec<String>,
-}
 
 /// OIDC Relying Party client. Cheap to clone; shares the inner cache.
 #[derive(Clone, Debug)]
@@ -63,28 +31,6 @@ pub struct OidcClient {
     jwks: Arc<RwLock<Option<JwksCache>>>,
 }
 
-/// JWKS with a fetched-at timestamp so we can rotate keys without a restart.
-#[derive(Clone)]
-struct JwksCache {
-    keys: HashMap<String, DecodingKey>,
-    fetched_at: Instant,
-}
-
-impl std::fmt::Debug for JwksCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `DecodingKey` from `jsonwebtoken` 9.x doesn't derive `Debug`. Print
-        // the count and freshness instead — opaque key material never belongs
-        // in a log line anyway.
-        f.debug_struct("JwksCache")
-            .field("keys", &self.keys.len())
-            .field("fetched_at", &self.fetched_at)
-            .finish()
-    }
-}
-
-/// JWKS cache lifetime. Keeps the IdP load low while bounding rotation lag.
-const JWKS_TTL: Duration = Duration::from_secs(3600);
-
 impl OidcClient {
     pub fn new(config: AuthConfig) -> Result<Self, AuthError> {
         // Token exchange must not follow redirects (SSRF guard). Fall back to
@@ -94,6 +40,7 @@ impl OidcClient {
         // Bound every IdP round-trip so a hung/slow IdP can't pin a request
         // task open indefinitely (T3). connect_timeout caps the TCP/TLS dial;
         // timeout caps the whole request.
+        use std::time::Duration;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(10))
@@ -120,10 +67,10 @@ impl OidcClient {
         state: &str,
         nonce: &str,
         code_challenge: &str,
-    ) -> Result<Url, AuthError> {
+    ) -> Result<url::Url, AuthError> {
         let discovery = self.discover().await?;
         let mut url =
-            Url::parse(&discovery.authorization_endpoint).map_err(|_| AuthError::Discovery)?;
+            url::Url::parse(&discovery.authorization_endpoint).map_err(|_| AuthError::Discovery)?;
         url.query_pairs_mut()
             .append_pair("response_type", "code")
             .append_pair("client_id", &self.config.client_id)
@@ -322,82 +269,5 @@ impl OidcClient {
         });
         let key = by_kid.get(kid).cloned().ok_or(AuthError::IdToken)?;
         Ok(key)
-    }
-}
-
-/// Require an OIDC URL to use `https`, permitting `http` only for loopback
-/// hosts (localhost / 127.0.0.0/8 / ::1) so dev and mock IdPs keep working.
-/// Surfaced as `Discovery` since it gates the discovery / token-exchange URLs.
-fn require_secure_url(raw: &str) -> Result<(), AuthError> {
-    let url = Url::parse(raw).map_err(|_| AuthError::Discovery)?;
-    match url.scheme() {
-        "https" => Ok(()),
-        "http" if is_loopback(&url) => Ok(()),
-        _ => Err(AuthError::Discovery),
-    }
-}
-
-/// Interpret an OIDC boolean-ish claim. OIDC Core §5.1 types `email_verified`
-/// as a JSON boolean, but some IdPs (older Google, Azure AD) emit the string
-/// `"true"`. Accept either; everything else — `false`, a number, null, absent —
-/// is treated as not-true.
-fn claim_is_true(value: Option<&serde_json::Value>) -> bool {
-    match value {
-        Some(serde_json::Value::Bool(b)) => *b,
-        Some(serde_json::Value::String(s)) => s.eq_ignore_ascii_case("true"),
-        _ => false,
-    }
-}
-
-fn is_loopback(url: &Url) -> bool {
-    match url.host() {
-        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-        Some(Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn https_url_accepted() {
-        assert!(require_secure_url("https://idp.example.com/").is_ok());
-    }
-
-    #[test]
-    fn http_non_loopback_rejected() {
-        assert!(require_secure_url("http://idp.example.com/").is_err());
-    }
-
-    #[test]
-    fn http_loopback_allowed() {
-        assert!(require_secure_url("http://localhost:8443/").is_ok());
-        assert!(require_secure_url("http://127.0.0.1:8443/").is_ok());
-        assert!(require_secure_url("http://[::1]:8443/").is_ok());
-    }
-
-    #[test]
-    fn email_verified_bool_true_is_true() {
-        assert!(claim_is_true(Some(&serde_json::json!(true))));
-    }
-
-    #[test]
-    fn email_verified_string_true_is_true() {
-        // Older Google / Azure AD emit the string form; accept it case-insensitively.
-        assert!(claim_is_true(Some(&serde_json::json!("true"))));
-        assert!(claim_is_true(Some(&serde_json::json!("TRUE"))));
-    }
-
-    #[test]
-    fn email_verified_false_or_absent_is_not_true() {
-        assert!(!claim_is_true(Some(&serde_json::json!(false))));
-        assert!(!claim_is_true(Some(&serde_json::json!("false"))));
-        assert!(!claim_is_true(Some(&serde_json::json!("yes"))));
-        assert!(!claim_is_true(Some(&serde_json::json!(1))));
-        assert!(!claim_is_true(Some(&serde_json::Value::Null)));
-        assert!(!claim_is_true(None));
     }
 }

@@ -1,10 +1,11 @@
 //! db-mcp-gateway — entry point: logging, config, signals, graceful shutdown.
 
+mod startup;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use db_mcp_gateway::audit;
 use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionCacheConfig, SessionStore};
 use db_mcp_gateway::authz::PermissionsCache;
 use db_mcp_gateway::config::{ConfigFile, TlsConfig};
@@ -17,8 +18,11 @@ use db_mcp_gateway::transport::{
 };
 use db_mcp_gateway::{config::Config, state, transport};
 use metrics_exporter_prometheus::PrometheusBuilder;
-use sqlx::PgPool;
 use tracing_subscriber::EnvFilter;
+
+use startup::{
+    install_shutdown_signal, spawn_audit_pruner, spawn_oauth_state_gc, spawn_reload_on_sighup,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "db-mcp-gateway", version, about)]
@@ -183,8 +187,11 @@ async fn main() -> anyhow::Result<()> {
     let handle = axum_server::Handle::new();
     let shutdown_for_signal = shutdown.clone();
     let handle_for_signal = handle.clone();
+    // Install signal handlers synchronously so a registration failure aborts
+    // boot instead of leaving the server unable to drain on `docker stop`.
+    let signal_fut = install_shutdown_signal(shutdown_for_signal)?;
     tokio::spawn(async move {
-        shutdown_signal(shutdown_for_signal).await;
+        signal_fut.await;
         // Drain in-flight requests, then close idle. The 30s window matches
         // the upper bound on `statement_timeout` defaults; longer queries get
         // SIGTERM-killed when the runtime tears down.
@@ -204,8 +211,9 @@ async fn main() -> anyhow::Result<()> {
                 cert_path = %cert_path.display(),
                 "db-mcp-gateway listening (TLS)"
             );
-            // Hot-reload runs forever; abort when the server stops.
-            tokio::spawn(reload_on_sighup(rustls.clone(), cert_path, key_path));
+            // Install the SIGHUP cert hot-reload handler; a registration
+            // failure fails boot rather than silently disabling `kill -HUP`.
+            spawn_reload_on_sighup(rustls.clone(), cert_path, key_path)?;
             axum_server::bind_rustls(config.bind, rustls)
                 .handle(handle)
                 .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
@@ -257,136 +265,6 @@ fn boot_db_error(store: &'static str, err: state::StateDbError) -> anyhow::Error
             anyhow::Error::new(source).context(format!("{store}: migrations failed"))
         }
     }
-}
-
-/// SIGHUP loop: every signal, re-read cert+key from the configured paths and
-/// hand them to the running `RustlsConfig`. Reload failure is logged loudly
-/// but never crashes the gateway — the old cert keeps serving until the next
-/// signal succeeds. Runs in its own task because `tokio::signal::unix::signal`
-/// is a long-lived stream.
-#[cfg(unix)]
-async fn reload_on_sighup(
-    rustls: axum_server::tls_rustls::RustlsConfig,
-    cert_path: std::path::PathBuf,
-    key_path: std::path::PathBuf,
-) {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut hup = match signal(SignalKind::hangup()) {
-        Ok(s) => s,
-        Err(error) => {
-            tracing::error!(%error, "failed to install SIGHUP handler — cert hot-reload disabled");
-            return;
-        }
-    };
-    while hup.recv().await.is_some() {
-        match tls::reload(&rustls, &cert_path, &key_path).await {
-            Ok(()) => tracing::info!(
-                cert_path = %cert_path.display(),
-                "TLS certificate reloaded"
-            ),
-            Err(error) => tracing::error!(
-                %error,
-                cert_path = %cert_path.display(),
-                "TLS certificate reload failed; keeping previous cert"
-            ),
-        }
-    }
-}
-
-#[cfg(not(unix))]
-async fn reload_on_sighup(
-    _rustls: axum_server::tls_rustls::RustlsConfig,
-    _cert_path: std::path::PathBuf,
-    _key_path: std::path::PathBuf,
-) {
-    // SIGHUP doesn't exist outside Unix; deployment targets are Linux only.
-    std::future::pending::<()>().await;
-}
-
-/// Background task: tick hourly and prune any audit row older than the
-/// configured TTL. The task is detached — `tokio::time::interval` survives
-/// missed ticks (DelayBehavior) and the runtime cancels it on graceful
-/// shutdown, which is safe because the only DB write is a single DELETE.
-fn spawn_audit_pruner(pool: PgPool, ttl_days: u32) {
-    use std::time::Duration;
-    use tokio::time::{MissedTickBehavior, interval};
-
-    tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(3600));
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            match audit::pruner::run_once(&pool, ttl_days).await {
-                Ok(0) => tracing::debug!("audit pruner: no expired rows"),
-                Ok(n) => tracing::info!(rows = n, ttl_days, "pruned old audit rows"),
-                Err(err) => tracing::error!(%err, "audit pruner run failed"),
-            }
-        }
-    });
-}
-
-/// Background task: tick every 30 seconds and remove expired OAuth state
-/// (authorization codes, pending flows, refresh tokens). The task is
-/// detached — cancellation on graceful shutdown is safe because it's pure
-/// memory-local operations (no I/O).
-fn spawn_oauth_state_gc(
-    flows: transport::PendingFlows,
-    codes: transport::AuthCodes,
-    refresh: transport::RefreshTokens,
-) {
-    use std::time::Duration;
-    use tokio::time::{MissedTickBehavior, interval};
-
-    tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(30));
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            flows.gc_expired().await;
-            codes.gc_expired().await;
-            refresh.gc_expired().await;
-            tracing::debug!("oauth state gc completed");
-        }
-    });
-}
-
-/// Resolve when the process receives Ctrl-C or (on Unix) SIGTERM, so containers
-/// drain cleanly on `docker stop`. Flips `shutdown` *before* axum starts
-/// draining, so `/healthz` and `/readyz` go 503 in time for k8s to pull the
-/// pod out of the Service endpoint set.
-async fn shutdown_signal(shutdown: ShutdownFlag) {
-    let ctrl_c = async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            // Handler install failed — don't let this resolve, or `select!` would
-            // shut the server down without any real signal.
-            tracing::error!(%error, "failed to install Ctrl-C handler");
-            std::future::pending::<()>().await;
-        }
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                signal.recv().await;
-            }
-            Err(error) => {
-                tracing::error!(%error, "failed to install SIGTERM handler");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-
-    shutdown.trigger();
-    tracing::info!("shutdown signal received");
 }
 
 #[cfg(test)]

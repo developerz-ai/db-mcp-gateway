@@ -191,3 +191,96 @@ async fn revoke_grant_hides_it_from_user_listing() {
         "revoked grant must not appear in live listing"
     );
 }
+
+/// A revoked grant is invisible to `get_grant` too, not just the listings —
+/// the admin read-before-write contract treats revoked as gone.
+#[tokio::test]
+async fn revoke_grant_hides_it_from_get() {
+    let r = repo().await;
+    let sub = unique_sub("mysql-getrevoke");
+    let user = r
+        .upsert_user(&sub, "a@example.com", &[])
+        .await
+        .expect("user upsert");
+    let grant = r
+        .create_grant(
+            user.id,
+            GrantTarget::Wildcard {
+                server: format!("srv-{}", Uuid::new_v4().simple()),
+            },
+            GrantAction::QueryRead,
+            json!({}),
+        )
+        .await
+        .expect("grant create");
+
+    assert!(r.get_grant(grant.id).await.expect("get ok").is_some());
+    assert!(r.revoke_grant(grant.id).await.expect("revoke ok"));
+    assert!(
+        r.get_grant(grant.id).await.expect("get ok").is_none(),
+        "revoked grant must not be returned by get_grant"
+    );
+}
+
+/// `list_grants(_, Some(db))` returns only `Specific` grants on that database:
+/// wildcard grants carry no `database_id` so the filter excludes them, and
+/// revoked rows drop out entirely.
+#[tokio::test]
+async fn list_grants_database_filter_excludes_wildcards_and_revoked() {
+    let r = repo().await;
+    let sub = unique_sub("mysql-listfilter");
+    let user = r
+        .upsert_user(&sub, "a@example.com", &[])
+        .await
+        .expect("user upsert");
+
+    let db_label = format!("appdb-{}", Uuid::new_v4().simple());
+    let db = r
+        .create_database(&db_label, "app", DbType::Postgres)
+        .await
+        .expect("db create");
+
+    let specific = r
+        .create_grant(
+            user.id,
+            GrantTarget::Specific { database_id: db.id },
+            GrantAction::QueryRead,
+            json!({}),
+        )
+        .await
+        .expect("specific grant");
+
+    // Wildcard grant on a server — shares no `database_id` column.
+    r.create_grant(
+        user.id,
+        GrantTarget::Wildcard {
+            server: format!("srv-{}", Uuid::new_v4().simple()),
+        },
+        GrantAction::SchemaRead,
+        json!({}),
+    )
+    .await
+    .expect("wildcard grant");
+
+    let filtered = r
+        .list_grants(Some(user.id), Some(db.id))
+        .await
+        .expect("list ok");
+    assert_eq!(
+        filtered.len(),
+        1,
+        "database_id filter must exclude wildcard grants"
+    );
+    assert_eq!(filtered[0].id, specific.id);
+
+    // Revoking the specific grant empties the filtered listing (live rows only).
+    assert!(r.revoke_grant(specific.id).await.expect("revoke ok"));
+    let after = r
+        .list_grants(Some(user.id), Some(db.id))
+        .await
+        .expect("list ok");
+    assert!(
+        after.is_empty(),
+        "revoked grant must not appear in list_grants"
+    );
+}
