@@ -125,3 +125,39 @@ The audit-write-failure line adds:
 | `audit_write_duration_ms` | integer | Wall-clock the failed audit insert took. `duration_ms` on the same line keeps the contract above — tool execution time, not audit latency. |
 
 Renames or removals of any field above are contract breaks. Additions are fine.
+
+## Error reporting (GlitchTip)
+
+Unhandled panics and unexpected errors are shipped to a **GlitchTip** instance (self-hosted Sentry-compatible) for error tracking. This is a third stream, distinct from the audit log and the stdout log, and it carries **no DB credentials** — see the scrubber contract below.
+
+### Initialization order
+
+Sentry inits **first** in `fn main`, *before* the tokio runtime is built. The init returns a guard (`ClientInitGuard`) bound to a variable that lives for the whole process; dropping it early stops event delivery, so it is held until `main` returns. Only then is the multi-thread runtime constructed and the async entry (`run()`) `block_on`'d. This guarantees a panic during runtime setup is still captured.
+
+### Configuration
+
+| Knob | Source | Notes |
+|---|---|---|
+| `dsn` | `SENTRY_DSN` env var | Unset / empty → client initializes **disabled**; the app runs normally and ships nothing. The DSN is never hardcoded. |
+| `environment` | `SENTRY_ENVIRONMENT` env var | Falls back to `development`. |
+| `release` | `CARGO_PKG_VERSION` | Pinned to the crate version at build time. |
+| `send_default_pii` | — | Hard-coded `false`. The gateway never sends PII. |
+
+**Error tracking only.** GlitchTip supports neither performance tracing nor profiling nor replay. `traces_sample_rate` is pinned to `0.0`; no spans or transactions are created. Adding tracing/profiling/replay options is a contract break against this section.
+
+### `before_send` scrubber (mandatory)
+
+Every outbound event passes through a `before_send` hook that redacts secrets. This is defense-in-depth on top of the typed-error discipline in the stdout contract — GlitchTip payloads cross the process boundary and must never carry a credential. The hook scrubs, replacing the secret portion with `***REDACTED***`:
+
+- database connection strings with embedded credentials — `postgres://user:pass@host`, `mysql://…`, `mongodb://…`, and any `scheme://user:pass@host` shape;
+- bare password-like values in `message`, exception `value`/`type`, and `extra`/`contexts`.
+
+Env keys whose values must never leak (the scrubber targets their shapes, not the values themselves):
+
+```
+STATE_DB_URL  TARGET_DB_URL  PERMISSIONS_DB_DSN  OIDC_CLIENT_SECRET  SESSION_SIGNING_KEY
+```
+
+### Runtime injection
+
+The DSN is injected at runtime via a Kubernetes sealed-secret (not baked into the image). Operator setup lives in [docs/deployment/](../deployment/). With no secret mounted, `SENTRY_DSN` is absent and the client is a no-op — a missing GlitchTip config must never prevent the gateway from serving traffic.
