@@ -7,7 +7,7 @@
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -62,7 +62,14 @@ pub async fn callback(
         return AuthError::Discovery.into_response();
     };
     let Some(flow) = auth.flows.take(&params.state).await else {
-        return AuthError::InvalidState.into_response();
+        // No live flow for this `state`. The browser landed here after the IdP
+        // round-trip, but our in-memory flow is gone: it expired (login took
+        // longer than FLOW_TTL), was already consumed (double submit / reload),
+        // or the pod restarted mid-login. This is a client-recoverable state on
+        // OUR side — not an upstream failure — so it must NOT be a 502 Bad
+        // Gateway (which reads as "the gateway is down" and hides the fix). Show
+        // a plain page telling the user to restart the login from their client.
+        return login_expired_response();
     };
 
     // MCP OAuth-bridge login (`/authorize` initiated it): hand off so the
@@ -144,8 +151,7 @@ impl IntoResponse for AuthError {
             AuthError::Discovery
             | AuthError::CodeExchange
             | AuthError::IdToken
-            | AuthError::EmailUnverified
-            | AuthError::InvalidState => StatusCode::BAD_GATEWAY,
+            | AuthError::EmailUnverified => StatusCode::BAD_GATEWAY,
             // `HttpClient` is a boot-time failure surface — main bails before
             // serving — so this arm is only reachable if a future caller
             // constructs an `OidcClient` lazily. Treat it as internal.
@@ -179,7 +185,6 @@ pub(crate) fn auth_error_fields(err: &AuthError) -> (&'static str, &'static str)
         AuthError::CodeExchange => ("internal", "oidc_code_exchange_failed"),
         AuthError::IdToken => ("internal", "oidc_id_token_invalid"),
         AuthError::EmailUnverified => ("internal", "oidc_email_unverified"),
-        AuthError::InvalidState => ("internal", "oidc_invalid_state"),
         AuthError::HttpClient => ("internal", "oidc_http_client_init_failed"),
         AuthError::State(_) => ("internal", "state_db_error"),
         AuthError::StoreFull => ("overloaded", "auth_store_full"),
@@ -189,4 +194,43 @@ pub(crate) fn auth_error_fields(err: &AuthError) -> (&'static str, &'static str)
 fn random_token() -> String {
     // 128 bits of entropy from a CSPRNG (uuid v4) is plenty for CSRF/nonce.
     Uuid::new_v4().simple().to_string()
+}
+
+/// The page shown at `/auth/callback` when the pending flow for the returned
+/// `state` is gone (expired / already consumed / pod restarted mid-login). A
+/// 400 with a short human-readable body — never a 502 — so the user learns to
+/// simply restart the login rather than reading it as a gateway outage.
+fn login_expired_response() -> Response {
+    const BODY: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<title>Login expired</title></head>\
+<body style=\"font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;line-height:1.5\">\
+<h1>Login session expired</h1>\
+<p>This sign-in took too long to complete, or was already used. Nothing is wrong \
+with the service.</p>\
+<p>Please start the connection again from your client (e.g. re-run the MCP \
+authorization) and complete the sign-in without long pauses.</p>\
+</body></html>";
+    (StatusCode::BAD_REQUEST, Html(BODY)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: a callback whose in-memory flow has expired/been consumed
+    // must render a client-recoverable 400 HTML page — never a 502 Bad Gateway,
+    // which reads as an origin outage and hid the real "just restart" fix.
+    #[test]
+    fn login_expired_is_400_html_not_502() {
+        let resp = login_expired_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_ne!(resp.status(), StatusCode::BAD_GATEWAY);
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(ct.starts_with("text/html"), "content-type was {ct}");
+    }
 }
