@@ -92,7 +92,7 @@ Each redirect URI must be **HTTPS** (any host) or **HTTP with a loopback host** 
 
 Returns `{ "client_id": "mcp-<uuid>", "redirect_uris": […], "token_endpoint_auth_method": "none" }`.
 
-The registry is in-memory and bounded (TTL + hard cap) because this endpoint is unauthenticated. A gateway restart drops all registrations; a compliant client simply re-registers on the next `invalid_client` response.
+The registry is persisted in the state DB (`oauth_clients`, migration 0008) and bounded (24h TTL + hard cap) because this endpoint is unauthenticated. Registrations **survive restarts and redeploys** and are shared across replicas, so a client that caches its `client_id` (most do) keeps working across a gateway rollout instead of hitting `invalid_client`. (Auth codes, pending logins, and refresh tokens remain in-process — see [State & persistence](#state--persistence) below.)
 
 ### Authorization endpoint — `GET /authorize`
 
@@ -187,7 +187,7 @@ POST /register
 
 Do **not** add a second OAuth/SSO layer in front of `/mcp`. The gateway is the authorization server and brokers the IdP login internally.
 
-All MCP OAuth bridge flow state — client registrations, pending IdP round-trips, one-time authorization codes, and rotating refresh tokens — is **in-process**, not in the state DB. A restart drops it (a compliant client re-registers on the next `invalid_client`), and under HA the bridge must run **single-replica** or behind **sticky routing** so every step of one client's dance hits the same replica. See [02-architecture §HA](02-architecture.md#ha). Already-authenticated `/mcp` traffic is unaffected — those sessions live in the state DB.
+The MCP OAuth bridge's short-lived flow state — pending IdP round-trips, one-time authorization codes, and rotating refresh tokens — is **in-process**, not in the state DB. A restart drops an in-flight login, and under HA the login endpoints (`/authorize`, `/auth/callback`, `/token`) must run **single-replica** or behind **sticky routing** so every step of one login hits the same replica. **Dynamic client registrations, by contrast, are persisted in the state DB** (`oauth_clients`) — they survive restarts/redeploys and are shared across replicas, so `/register` needs no sticky routing and a cached `client_id` no longer breaks with `invalid_client` after a rollout. See [02-architecture §HA](02-architecture.md#ha). Already-authenticated `/mcp` traffic is unaffected — those sessions live in the state DB.
 
 ## Session tokens
 

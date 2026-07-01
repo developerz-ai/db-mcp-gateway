@@ -184,7 +184,11 @@ impl ClientRegistry {
         }
 
         let uris = serde_json::to_value(redirect_uris).unwrap_or(serde_json::Value::Array(vec![]));
-        let expires_at = Utc::now() + ChronoDuration::from_std(CLIENT_TTL).unwrap();
+        // Infallible in practice (CLIENT_TTL is 24h), but avoid a hot-path panic
+        // — fall back to the equivalent literal, mirroring `SessionStore::create`.
+        let ttl =
+            ChronoDuration::from_std(CLIENT_TTL).unwrap_or_else(|_| ChronoDuration::hours(24));
+        let expires_at = Utc::now() + ttl;
         sqlx::query(
             "INSERT INTO oauth_clients (client_id, redirect_uris, expires_at) \
              VALUES ($1, $2, $3) \

@@ -87,3 +87,103 @@ async fn re_register_updates_redirect_uris() {
 
     cleanup(&pool, &client_id).await;
 }
+
+/// An expired registration is not returned by lookup and is swept by the
+/// insert-time GC (`DELETE ... WHERE expires_at <= now()`) — the DB-backed
+/// analogue of the in-memory store's TTL. We age the row directly rather than
+/// sleep out the 24h TTL.
+#[tokio::test]
+async fn expired_registration_is_swept_and_not_returned() {
+    let pool = pool().await;
+    let stale = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
+    cleanup(&pool, &stale).await;
+
+    let reg = ClientRegistry::with_db(pool.clone());
+    assert!(reg.insert(stale.clone(), vec!["https://a/cb".into()]).await);
+
+    // Backdate the whole row into the past — both columns, so the
+    // `expires_at > created_at` CHECK still holds while `expires_at <= now()`.
+    sqlx::query(
+        "UPDATE oauth_clients \
+         SET created_at = now() - interval '2 hours', expires_at = now() - interval '1 hour' \
+         WHERE client_id = $1",
+    )
+    .bind(&stale)
+    .execute(&pool)
+    .await
+    .expect("age the row");
+
+    // Lookup filters on `expires_at > now()`, so the stale row is invisible...
+    assert_eq!(
+        reg.redirect_uris(&stale).await,
+        None,
+        "an expired registration must not resolve"
+    );
+
+    // ...and the next insert's GC pass physically removes it.
+    let fresh = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
+    assert!(reg.insert(fresh.clone(), vec!["https://b/cb".into()]).await);
+    let still_there: bool =
+        sqlx::query_scalar("SELECT exists(SELECT 1 FROM oauth_clients WHERE client_id = $1)")
+            .bind(&stale)
+            .fetch_one(&pool)
+            .await
+            .expect("existence check");
+    assert!(!still_there, "GC must have deleted the expired row");
+
+    cleanup(&pool, &fresh).await;
+    cleanup(&pool, &stale).await;
+}
+
+/// The 10k hard cap, against the real SQL backend: at capacity a brand-new
+/// `client_id` is refused, but an already-registered one may still update (an
+/// upsert doesn't grow the table). Seeds the cap in one statement rather than
+/// 10k round-trips; the seeded rows carry a live TTL so the insert-time GC keeps
+/// them. Everything is namespaced under a unique prefix and cleaned up.
+#[tokio::test]
+async fn at_cap_rejects_new_but_updates_existing_real_db() {
+    let pool = pool().await;
+    let prefix = format!("capfill-{}-", uuid::Uuid::new_v4().simple());
+
+    // Fill to the 10k cap in a single INSERT. Even if the table holds other
+    // rows, this guarantees count(*) >= CLIENT_CAP for the duration.
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, redirect_uris, expires_at) \
+         SELECT $1 || g, '[\"https://seed/cb\"]'::jsonb, now() + interval '1 hour' \
+         FROM generate_series(1, 10000) g",
+    )
+    .bind(&prefix)
+    .execute(&pool)
+    .await
+    .expect("seed to cap");
+
+    let reg = ClientRegistry::with_db(pool.clone());
+
+    // At cap: a brand-new client is refused (fails closed as `false`).
+    let newcomer = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
+    assert!(
+        !reg.insert(newcomer.clone(), vec!["https://new/cb".into()])
+            .await,
+        "a new client must be rejected at the cap"
+    );
+    assert_eq!(reg.redirect_uris(&newcomer).await, None);
+
+    // But an already-registered client updating its URIs still succeeds — the
+    // upsert doesn't grow the table, so it bypasses the cap check.
+    let existing = format!("{prefix}1");
+    assert!(
+        reg.insert(existing.clone(), vec!["https://updated/cb".into()])
+            .await,
+        "an existing client must still update at the cap"
+    );
+    assert_eq!(
+        reg.redirect_uris(&existing).await,
+        Some(vec!["https://updated/cb".into()])
+    );
+
+    sqlx::query("DELETE FROM oauth_clients WHERE client_id LIKE $1")
+        .bind(format!("{prefix}%"))
+        .execute(&pool)
+        .await
+        .expect("cleanup seeded rows");
+}
