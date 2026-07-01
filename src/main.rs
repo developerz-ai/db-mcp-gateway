@@ -47,7 +47,21 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(run())
+    let result = runtime.block_on(run());
+
+    // `run()` returns `Err` for config-load / DB-connect / bind failures. Those
+    // are normal returns, not panics, so the sentry `panic` integration never
+    // sees them — without this capture they'd reach stderr and never GlitchTip.
+    // `anyhow::Error` is `AsRef<dyn StdError>`; the scrubber strips any
+    // credential before the event ships (CLAUDE.md non-negotiable #1). The guard
+    // flushes on drop after `main` returns.
+    if let Err(ref err) = result {
+        // `anyhow::Error` has two `AsRef<dyn StdError>` impls (± Send+Sync);
+        // bind to the concrete trait object so `capture_error`'s `E` resolves.
+        let err_ref: &(dyn std::error::Error + Send + Sync + 'static) = err.as_ref();
+        sentry::capture_error(err_ref);
+    }
+    result
 }
 
 async fn run() -> anyhow::Result<()> {

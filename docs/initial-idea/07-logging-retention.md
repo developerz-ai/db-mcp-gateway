@@ -154,7 +154,7 @@ Every outbound event passes through a `before_send` hook that redacts secrets. T
 
 Env keys whose values must never leak (the scrubber targets their shapes, not the values themselves):
 
-```
+```text
 STATE_DB_URL  TARGET_DB_URL  PERMISSIONS_DB_DSN  OIDC_CLIENT_SECRET  SESSION_SIGNING_KEY
 ```
 

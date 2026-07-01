@@ -114,6 +114,12 @@ fn scrub_event(
         if let Some(msg) = bc.message.as_mut() {
             *msg = scrub_str(msg);
         }
+        // `Breadcrumb::data` (`Map<String, Value>`) carries arbitrary nested
+        // JSON (HTTP method/url, query params, custom state). Same scrubber as
+        // `extra` / `Context::Other` — a secret in `data` must not slip past.
+        for value in bc.data.values_mut() {
+            scrub_json(value);
+        }
     }
 
     // `extra` and `Context::Other` hold arbitrary JSON; walk to every string leaf.
@@ -272,6 +278,64 @@ mod tests {
             ..Default::default()
         });
         assert!(!guard.is_enabled(), "client with no DSN must be disabled");
+    }
+
+    #[test]
+    fn scrubs_breadcrumb_data() {
+        // `Breadcrumb::data` is `Map<String, Value>` — arbitrary nested JSON.
+        // A connection string nested in there must be walked and redacted, not
+        // just the breadcrumb `message`.
+        let secret = "hunter2";
+        let mut bc = sentry::protocol::Breadcrumb {
+            message: Some(format!("connecting as password={secret}")),
+            ..sentry::protocol::Breadcrumb::default()
+        };
+        bc.data.insert(
+            "url".to_owned(),
+            serde_json::json!(format!("postgres://app:{secret}@db:5432/app")),
+        );
+        bc.data.insert(
+            "nested".to_owned(),
+            serde_json::json!({ "auth": format!("dsn: postgres://app:{secret}@db/x") }),
+        );
+
+        let mut event = sentry::protocol::Event::default();
+        event.breadcrumbs.values.push(bc);
+
+        let scrubbed = scrub_event(event).expect("scrubber always returns Some");
+        let out = &scrubbed.breadcrumbs.values[0];
+
+        // `message` redacted.
+        let msg = out.message.as_deref().expect("message preserved");
+        assert!(
+            !msg.contains(secret),
+            "secret leaked into breadcrumb message: {msg}"
+        );
+
+        // Each data value walked to its string leaves.
+        let url = out.data.get("url").expect("url preserved").to_string();
+        assert!(
+            url.contains("***REDACTED***"),
+            "breadcrumb data url redacted: {url}"
+        );
+        assert!(
+            !url.contains(secret),
+            "secret leaked into breadcrumb data url: {url}"
+        );
+
+        let nested = out
+            .data
+            .get("nested")
+            .expect("nested preserved")
+            .to_string();
+        assert!(
+            nested.contains("***REDACTED***"),
+            "nested breadcrumb data redacted: {nested}"
+        );
+        assert!(
+            !nested.contains(secret),
+            "secret leaked into nested breadcrumb data: {nested}"
+        );
     }
 
     /// [`init()`] reads `SENTRY_DSN` at runtime; unset or malformed → disabled
