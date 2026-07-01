@@ -37,3 +37,7 @@ config/*.local.yaml
 /coverage
 *.profraw
 *.profdata
+
+.claude-task-master/
+claudetm.log
+goal.txt

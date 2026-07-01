@@ -1,5 +1,6 @@
 //! db-mcp-gateway — entry point: logging, config, signals, graceful shutdown.
 
+mod sentry_scrub;
 mod startup;
 
 use std::path::PathBuf;
@@ -33,8 +34,23 @@ struct Cli {
     config: PathBuf,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // GlitchTip/Sentry initializes FIRST, before the tokio runtime exists, so a
+    // panic during runtime construction or `run()` is still captured. The guard
+    // flushes its send queue on drop — bind it to a named local (never `let _ = …`)
+    // so it outlives every path through `main`, including the `Err` returns here
+    // and inside `block_on` (drop runs after `block_on` resolves → 2s flush).
+    // CLAUDE.md non-negotiable #1: every outgoing event is credential-scrubbed
+    // via the before_send hook in `sentry_scrub`.
+    let _sentry_guard = sentry_scrub::init();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     // JSON-per-line on stdout for Loki (see docs/deployment/logging.md for
     // the field contract). `flatten_event` hoists `tracing::info!(k = v, …)`
     // fields to the top level so Alloy doesn't need a nested-field stage;
