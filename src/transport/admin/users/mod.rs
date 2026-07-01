@@ -105,6 +105,19 @@ pub(super) fn trimmed_non_empty(
     }
 }
 
+/// Validate + normalize each group name like the other string fields, so
+/// empty/whitespace-only entries can't reach `permissions_users.groups` —
+/// authz constraint-merge reads these later for grant evaluation.
+pub(super) fn validate_groups(
+    groups: &[String],
+    request_id: &str,
+) -> Result<Vec<String>, AdminError> {
+    groups
+        .iter()
+        .map(|g| trimmed_non_empty(g, "groups[]", request_id))
+        .collect()
+}
+
 pub(super) fn user_payload(u: &PermissionsUser) -> JsonValue {
     json!({
         "id": u.id,
@@ -131,4 +144,59 @@ pub(super) fn internal<E>(stage: &'static str, _err: E, request_id: &str) -> Adm
         "admin users endpoint failed"
     );
     AdminError::internal().with_request_id(request_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn trimmed_non_empty_rejects_blank() {
+        assert!(trimmed_non_empty("", "user_sub", "req-1").is_err());
+        assert!(trimmed_non_empty("   ", "user_sub", "req-1").is_err());
+        assert!(trimmed_non_empty("\t\n", "user_sub", "req-1").is_err());
+    }
+
+    #[test]
+    fn trimmed_non_empty_trims_and_returns() {
+        assert_eq!(
+            trimmed_non_empty("  alice  ", "user_sub", "req-1").unwrap(),
+            "alice"
+        );
+    }
+
+    #[test]
+    fn validate_groups_rejects_blank_member() {
+        assert!(validate_groups(&["ok".into(), "  ".into()], "req-1").is_err());
+    }
+
+    #[test]
+    fn validate_groups_trims_each_member() {
+        let out = validate_groups(&[" eng ".into(), "ops".into()], "req-1").unwrap();
+        assert_eq!(out, vec!["eng".to_string(), "ops".to_string()]);
+    }
+
+    #[test]
+    fn user_payload_serializes_expected_shape() {
+        let ts = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let user = PermissionsUser {
+            id: Uuid::nil(),
+            user_sub: "sub-123".into(),
+            user_email: "a@example.com".into(),
+            groups: vec!["engineers".into()],
+            created_at: ts,
+            updated_at: ts,
+            deleted_at: None,
+        };
+        let payload = user_payload(&user);
+        assert_eq!(payload["id"], json!(Uuid::nil()));
+        assert_eq!(payload["user_sub"], "sub-123");
+        assert_eq!(payload["user_email"], "a@example.com");
+        assert_eq!(payload["groups"], json!(["engineers"]));
+        assert_eq!(payload["created_at"], json!(ts));
+        assert_eq!(payload["updated_at"], json!(ts));
+        // Storage-only field must not widen the admin payload.
+        assert!(payload.get("deleted_at").is_none());
+    }
 }

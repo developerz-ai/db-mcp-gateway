@@ -127,7 +127,7 @@ Accepts `application/x-www-form-urlencoded`.
 | `code` | the one-time code from the `302` |
 | `code_verifier` | the raw PKCE verifier; gateway checks `BASE64URL(SHA256(verifier)) == stored_challenge` |
 | `client_id` | optional but recommended; if sent, must match the registrant |
-| `redirect_uri` | optional; if sent, must match the `redirect_uri` used at `/authorize` |
+| `redirect_uri` | required; must exactly match the `redirect_uri` used at `/authorize` (OAuth 2.1 §4.1.3). Missing → `invalid_request`; mismatch → `invalid_grant` |
 
 The code is consumed on first use (replay → `invalid_grant`).
 

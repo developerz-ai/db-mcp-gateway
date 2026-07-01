@@ -20,7 +20,9 @@ use db_mcp_gateway::{config::Config, state, transport};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tracing_subscriber::EnvFilter;
 
-use startup::{reload_on_sighup, shutdown_signal, spawn_audit_pruner, spawn_oauth_state_gc};
+use startup::{
+    install_shutdown_signal, spawn_audit_pruner, spawn_oauth_state_gc, spawn_reload_on_sighup,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "db-mcp-gateway", version, about)]
@@ -185,8 +187,11 @@ async fn main() -> anyhow::Result<()> {
     let handle = axum_server::Handle::new();
     let shutdown_for_signal = shutdown.clone();
     let handle_for_signal = handle.clone();
+    // Install signal handlers synchronously so a registration failure aborts
+    // boot instead of leaving the server unable to drain on `docker stop`.
+    let signal_fut = install_shutdown_signal(shutdown_for_signal)?;
     tokio::spawn(async move {
-        shutdown_signal(shutdown_for_signal).await;
+        signal_fut.await;
         // Drain in-flight requests, then close idle. The 30s window matches
         // the upper bound on `statement_timeout` defaults; longer queries get
         // SIGTERM-killed when the runtime tears down.
@@ -206,8 +211,9 @@ async fn main() -> anyhow::Result<()> {
                 cert_path = %cert_path.display(),
                 "db-mcp-gateway listening (TLS)"
             );
-            // Hot-reload runs forever; abort when the server stops.
-            tokio::spawn(reload_on_sighup(rustls.clone(), cert_path, key_path));
+            // Install the SIGHUP cert hot-reload handler; a registration
+            // failure fails boot rather than silently disabling `kill -HUP`.
+            spawn_reload_on_sighup(rustls.clone(), cert_path, key_path)?;
             axum_server::bind_rustls(config.bind, rustls)
                 .handle(handle)
                 .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())

@@ -48,85 +48,93 @@ pub(crate) fn spawn_oauth_state_gc(flows: PendingFlows, codes: AuthCodes, refres
     });
 }
 
-/// Resolve when the process receives Ctrl-C or (on Unix) SIGTERM, so containers
-/// drain cleanly on `docker stop`. Flips `shutdown` *before* axum starts
+/// Install the shutdown signal handlers and return a future that resolves on
+/// the first Ctrl-C or (on Unix) SIGTERM, so containers drain cleanly on
+/// `docker stop`. The awaited future flips `shutdown` *before* axum starts
 /// draining, so `/healthz` and `/readyz` go 503 in time for k8s to pull the
 /// pod out of the Service endpoint set.
-pub(crate) async fn shutdown_signal(shutdown: ShutdownFlag) {
-    let ctrl_c = async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            // Handler install failed — don't let this resolve, or `select!` would
-            // shut the server down without any real signal.
-            tracing::error!(%error, "failed to install Ctrl-C handler");
-            std::future::pending::<()>().await;
-        }
-    };
-
+///
+/// The SIGTERM handler is registered **synchronously** here so a registration
+/// failure surfaces as an `Err` the caller bubbles to `main`, failing boot —
+/// serving on while `docker stop` can't drain is a silent violation of the
+/// runtime contract (`docs/deployment/quickstart.md`). `tokio::signal::ctrl_c`
+/// exposes no separate install step, so its (rare) failure can only be caught
+/// when the future is polled; there we log and stall that arm so `select!`
+/// still waits for a real signal rather than shutting down spuriously.
+pub(crate) fn install_shutdown_signal(
+    shutdown: ShutdownFlag,
+) -> std::io::Result<impl std::future::Future<Output = ()>> {
     #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                signal.recv().await;
-            }
-            Err(error) => {
-                tracing::error!(%error, "failed to install SIGTERM handler");
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    Ok(async move {
+        let ctrl_c = async {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                tracing::error!(%error, "failed to install Ctrl-C handler");
                 std::future::pending::<()>().await;
             }
+        };
+
+        #[cfg(unix)]
+        let terminate = async {
+            terminate.recv().await;
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = terminate => {},
         }
-    };
 
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-
-    shutdown.trigger();
-    tracing::info!("shutdown signal received");
+        shutdown.trigger();
+        tracing::info!("shutdown signal received");
+    })
 }
 
-/// SIGHUP loop: every signal, re-read cert+key from the configured paths and
-/// hand them to the running `RustlsConfig`. Reload failure is logged loudly
+/// Install the SIGHUP handler and spawn the cert hot-reload loop: on every
+/// signal, re-read cert+key from the configured paths and hand them to the
+/// running `RustlsConfig`. Reload failure (bad file mid-swap) is logged loudly
 /// but never crashes the gateway — the old cert keeps serving until the next
-/// signal succeeds. Runs in its own task because `tokio::signal::unix::signal`
-/// is a long-lived stream.
+/// signal succeeds.
+///
+/// The handler is registered **synchronously** so a registration failure
+/// bubbles to `main` and fails boot, rather than serving on with a dead
+/// `kill -HUP` TLS reload path (`docs/deployment/quickstart.md`). The loop
+/// itself runs in a detached task because `signal(SIGHUP)` is a long-lived
+/// stream; the runtime cancels it on shutdown.
 #[cfg(unix)]
-pub(crate) async fn reload_on_sighup(
+pub(crate) fn spawn_reload_on_sighup(
     rustls: axum_server::tls_rustls::RustlsConfig,
     cert_path: std::path::PathBuf,
     key_path: std::path::PathBuf,
-) {
+) -> std::io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
-    let mut hup = match signal(SignalKind::hangup()) {
-        Ok(s) => s,
-        Err(error) => {
-            tracing::error!(%error, "failed to install SIGHUP handler — cert hot-reload disabled");
-            return;
+    let mut hup = signal(SignalKind::hangup())?;
+    tokio::spawn(async move {
+        while hup.recv().await.is_some() {
+            match tls::reload(&rustls, &cert_path, &key_path).await {
+                Ok(()) => tracing::info!(
+                    cert_path = %cert_path.display(),
+                    "TLS certificate reloaded"
+                ),
+                Err(error) => tracing::error!(
+                    %error,
+                    cert_path = %cert_path.display(),
+                    "TLS certificate reload failed; keeping previous cert"
+                ),
+            }
         }
-    };
-    while hup.recv().await.is_some() {
-        match tls::reload(&rustls, &cert_path, &key_path).await {
-            Ok(()) => tracing::info!(
-                cert_path = %cert_path.display(),
-                "TLS certificate reloaded"
-            ),
-            Err(error) => tracing::error!(
-                %error,
-                cert_path = %cert_path.display(),
-                "TLS certificate reload failed; keeping previous cert"
-            ),
-        }
-    }
+    });
+    Ok(())
 }
 
 #[cfg(not(unix))]
-pub(crate) async fn reload_on_sighup(
+pub(crate) fn spawn_reload_on_sighup(
     _rustls: axum_server::tls_rustls::RustlsConfig,
     _cert_path: std::path::PathBuf,
     _key_path: std::path::PathBuf,
-) {
+) -> std::io::Result<()> {
     // SIGHUP doesn't exist outside Unix; deployment targets are Linux only.
-    std::future::pending::<()>().await;
+    Ok(())
 }

@@ -65,6 +65,10 @@ pub(super) async fn update_database(
     db_name: Option<&str>,
     db_type: Option<DbType>,
 ) -> Result<Option<PermissionsDatabase>, RepoError> {
+    // One transaction so the reread returns exactly the row this UPDATE wrote —
+    // a concurrent patch or soft-delete can't slip in between (PATCH contract in
+    // `PermissionsRepo::update_database`).
+    let mut tx = pool.begin().await?;
     let res = sqlx::query(
         "UPDATE permissions_databases \
          SET server = COALESCE(?, server), \
@@ -77,12 +81,21 @@ pub(super) async fn update_database(
     .bind(db_name)
     .bind(db_type.map(|t| t.as_db_str()))
     .bind(id.to_string())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     if res.rows_affected() == 0 {
         return Ok(None);
     }
-    get_database(pool, id).await
+    let row = sqlx::query(
+        "SELECT id, server, db_name, db_type, created_at, updated_at, deleted_at \
+         FROM permissions_databases \
+         WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(id.to_string())
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    row.map(|r| database_from_row(&r)).transpose()
 }
 
 pub(super) async fn soft_delete_database(pool: &MySqlPool, id: Uuid) -> Result<bool, RepoError> {

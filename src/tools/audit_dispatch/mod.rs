@@ -6,13 +6,15 @@
 //! Extracted from the original `run_query` so each tool gets the same
 //! guarantees without re-implementing the chokepoint.
 
-pub mod outcome;
-pub mod types;
+mod outcome;
+mod types;
 
-pub use outcome::{
-    ToolErrorMessages, error_outcome, outcome_from_exec_error, success_outcome, tool_error,
-    tool_success,
-};
+pub use outcome::{ToolErrorMessages, outcome_from_exec_error, success_outcome, tool_success};
+// `error_outcome` turns an arbitrary caller-supplied string into both the client
+// payload and the audit row's `error_message`. Scope it to the tools that own
+// their per-tool wording; callers outside `src/tools/` must go through the
+// sanitized `outcome_from_exec_error` boundary instead.
+pub(in crate::tools) use outcome::error_outcome;
 pub use types::{AuditHeader, Outcome, RequestContext};
 
 use std::future::Future;

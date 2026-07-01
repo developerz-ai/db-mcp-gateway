@@ -11,7 +11,10 @@ use super::Outcome;
 /// Build a structured tool error response per spec 03 §Errors. `request_id`
 /// is duplicated inside the JSON body so agents that only read the tool
 /// payload still get it.
-pub fn tool_error(id: Value, code: &'static str, message: &str) -> Response {
+///
+/// Private to this module: takes an arbitrary `message`, so external callers
+/// build errors through `error_outcome` / `outcome_from_exec_error` instead.
+fn tool_error(id: Value, code: &'static str, message: &str) -> Response {
     let body = serde_json::json!({
         "request_id": id.clone(),
         "code": code,
@@ -40,7 +43,10 @@ pub fn tool_success(id: Value, text: String) -> Response {
 /// Shortcut for the common error-outcome shape: a typed tool_error response
 /// plus the matching audit fields (the message is mirrored into
 /// `error_message` so operators can read it from the audit row).
-pub fn error_outcome(id: Value, code: &'static str, message: &str) -> Outcome {
+///
+/// Scoped to `crate::tools`: the tools own their per-tool wording. Anything
+/// outside must route target-DB errors through [`outcome_from_exec_error`].
+pub(in crate::tools) fn error_outcome(id: Value, code: &'static str, message: &str) -> Outcome {
     Outcome {
         response: tool_error(id, code, message),
         code,

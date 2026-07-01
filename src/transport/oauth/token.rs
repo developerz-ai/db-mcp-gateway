@@ -95,10 +95,17 @@ async fn token_authorization_code(auth: &AuthFacade, form: TokenForm) -> Respons
         );
     }
 
-    // redirect_uri, when sent, must match the authorize-time value (OAuth 2.1).
-    if let Some(sent) = form.redirect_uri.as_deref()
-        && sent != entry.redirect_uri
-    {
+    // redirect_uri is required on code redemption and must exactly match the
+    // authorize-time value (OAuth 2.1 §4.1.3): `/authorize` always binds a
+    // redirect_uri to the code, so omitting it here can't be legitimate.
+    let Some(sent) = form.redirect_uri.as_deref() else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "redirect_uri is required",
+        );
+    };
+    if sent != entry.redirect_uri {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",

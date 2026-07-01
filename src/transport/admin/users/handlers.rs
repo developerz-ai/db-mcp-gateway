@@ -17,7 +17,7 @@ use super::tx::{
     tx_get_user_by_id, tx_get_user_by_sub, tx_soft_delete_user, tx_update_user, tx_upsert_user,
 };
 use super::{CreateUserRequest, UpdateUserRequest, UserResponse, UsersState};
-use super::{internal, invalid_body, invalid_id, trimmed_non_empty, user_payload};
+use super::{internal, invalid_body, invalid_id, trimmed_non_empty, user_payload, validate_groups};
 
 pub async fn create(
     State(state): State<UsersState>,
@@ -30,6 +30,7 @@ pub async fn create(
     let Json(body) = body.map_err(|_| invalid_body(&actor.request_id))?;
     let user_sub = trimmed_non_empty(&body.user_sub, "user_sub", &actor.request_id)?;
     let user_email = trimmed_non_empty(&body.user_email, "user_email", &actor.request_id)?;
+    let groups = validate_groups(&body.groups, &actor.request_id)?;
 
     let mut tx = state
         .state_db
@@ -45,7 +46,7 @@ pub async fn create(
         .await
         .map_err(|err| internal("get_user_by_sub", err, &actor.request_id))?;
 
-    let user = tx_upsert_user(&mut tx, &user_sub, &user_email, &body.groups)
+    let user = tx_upsert_user(&mut tx, &user_sub, &user_email, &groups)
         .await
         .map_err(|err| internal("upsert_user", err, &actor.request_id))?;
 
@@ -138,6 +139,10 @@ pub async fn patch(
         Some(e) => Some(trimmed_non_empty(e, "user_email", &actor.request_id)?),
         None => None,
     };
+    let groups = match body.groups.as_deref() {
+        Some(g) => Some(validate_groups(g, &actor.request_id)?),
+        None => None,
+    };
 
     let mut tx = state
         .state_db
@@ -150,7 +155,7 @@ pub async fn patch(
         .map_err(|err| internal("get_user", err, &actor.request_id))?
         .ok_or_else(|| AdminError::not_found().with_request_id(&actor.request_id))?;
 
-    let after = tx_update_user(&mut tx, id, user_email.as_deref(), body.groups.as_deref())
+    let after = tx_update_user(&mut tx, id, user_email.as_deref(), groups.as_deref())
         .await
         .map_err(|err| internal("update_user", err, &actor.request_id))?
         // Race: someone soft-deleted the user between our read and our write.

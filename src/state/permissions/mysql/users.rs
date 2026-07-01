@@ -81,6 +81,10 @@ pub(super) async fn update_user(
         Some(g) => Some(serde_json::to_value(g).map_err(RepoError::EncodeGroups)?),
         None => None,
     };
+    // One transaction so the reread returns exactly the row this UPDATE wrote —
+    // a concurrent login sync or delete can't slip in between (PATCH contract in
+    // `PermissionsRepo::update_user`).
+    let mut tx = pool.begin().await?;
     let res = sqlx::query(
         "UPDATE permissions_users \
          SET user_email = COALESCE(?, user_email), \
@@ -91,13 +95,22 @@ pub(super) async fn update_user(
     .bind(user_email)
     .bind(groups_json)
     .bind(id.to_string())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     if res.rows_affected() == 0 {
         return Ok(None);
     }
     // Re-read so callers (admin API audit) see the post-update row.
-    get_user(pool, id).await
+    let row = sqlx::query(
+        "SELECT id, user_sub, user_email, groups_json, created_at, updated_at, deleted_at \
+         FROM permissions_users \
+         WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(id.to_string())
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    row.map(|r| user_from_row(&r)).transpose()
 }
 
 pub(super) async fn list_users(pool: &MySqlPool) -> Result<Vec<PermissionsUser>, RepoError> {

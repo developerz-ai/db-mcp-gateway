@@ -196,11 +196,12 @@ pub async fn complete_bridge_login(
         .await
         .is_err()
     {
-        return oauth_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server_error",
-            "gateway temporarily overloaded; try again",
-        );
+        // The browser is sitting on /auth/callback and the client's loopback
+        // listener is waiting for a redirect. A raw 5xx here would hang it (see
+        // the always-redirect contract in this fn's docstring), so 302 back with
+        // a valid OAuth error code instead. `temporarily_unavailable` (RFC 6749
+        // §4.1.2.1) is the overload signal.
+        return redirect_with_error(&bridge, "temporarily_unavailable");
     }
 
     match build_redirect(

@@ -19,8 +19,22 @@ pub(super) fn origin_of(raw: &str) -> Option<String> {
 }
 
 pub(super) fn is_loopback_host(host: &str) -> bool {
-    let bare = host.split(':').next().unwrap_or(host);
-    match Host::parse(bare) {
+    // Strip the port without corrupting IPv6 literals. `split(':')` breaks both
+    // bracketed (`[::1]:8080` → `"["`) and bare (`::1` → `""`) IPv6 forms, so
+    // handle the bracketed case explicitly and keep bare `::1` intact.
+    let bare: std::borrow::Cow<'_, str> = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split(']').next() {
+            Some(ip) => format!("[{ip}]").into(),
+            None => return false,
+        }
+    } else if host.matches(':').count() > 1 {
+        // Bare IPv6 literal (more than one colon, no brackets): no port to
+        // strip, but `Host::parse` needs it bracketed.
+        format!("[{host}]").into()
+    } else {
+        host.split(':').next().unwrap_or(host).into()
+    };
+    match Host::parse(&bare) {
         Ok(Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
         Ok(Host::Ipv4(ip)) => ip.is_loopback(),
         Ok(Host::Ipv6(ip)) => ip.is_loopback(),
@@ -87,5 +101,24 @@ mod tests {
             origin_of("http://localhost:8443/auth/callback").as_deref(),
             Some("http://localhost:8443")
         );
+    }
+
+    #[test]
+    fn loopback_hosts_detected() {
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("localhost:8443"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("127.0.0.1:8443"));
+        // IPv6 loopback, both bracketed (with/without port) and bare.
+        assert!(is_loopback_host("[::1]"));
+        assert!(is_loopback_host("[::1]:8080"));
+        assert!(is_loopback_host("::1"));
+    }
+
+    #[test]
+    fn non_loopback_hosts_rejected() {
+        assert!(!is_loopback_host("db-mcp.example.com"));
+        assert!(!is_loopback_host("8.8.8.8"));
+        assert!(!is_loopback_host("[2001:db8::1]"));
     }
 }

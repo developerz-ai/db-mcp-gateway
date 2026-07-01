@@ -6,6 +6,7 @@ use crate::transport::jsonrpc::Response;
 
 /// Result of a tool's compute step. Carries the response to send back AND
 /// the audit fields the helper will persist.
+#[derive(Debug)]
 pub struct Outcome {
     pub response: Response,
     /// `"success"` or a spec 03 error code (`forbidden`, `timeout`,
@@ -28,6 +29,7 @@ pub struct Outcome {
 /// Audit context known up-front from the tool's arguments — before any work
 /// runs. `server`/`database` are `Some` for per-DB tools; `sql` is `Some` for
 /// query tools (`run_query`, `sample_table`'s generated SQL).
+#[derive(Debug, Clone, Copy)]
 pub struct AuditHeader<'a> {
     pub tool: &'static str,
     pub server: Option<&'a str>,
