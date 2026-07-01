@@ -177,9 +177,8 @@ fn secret_re() -> Option<&'static Regex> {
 
 #[cfg(test)]
 mod tests {
-    //! No network, no real DB. Exercises the scrubber (pure string work) and
-    //! the disabled-when-no-DSN contract. The DSN test is the sole touch-point
-    //! for the `SENTRY_DSN` env var in the suite, so it is parallel-safe.
+    //! No network, no real DB. Scrubber is pure string work; [`init`] is the
+    //! sole `SENTRY_DSN` touch-point in the suite → parallel-safe.
 
     use super::*;
 
@@ -199,26 +198,19 @@ mod tests {
         );
 
         let scrubbed = scrub_event(event).expect("scrubber always returns Some");
-
         let msg = scrubbed.message.as_deref().expect("message preserved");
         assert!(msg.contains("***REDACTED***"), "message redacted: {msg}");
         assert!(!msg.contains(secret), "password leaked into message: {msg}");
 
         let extra = scrubbed.extra.get("ctx").expect("extra preserved");
-        let extra_str = extra.to_string();
-        assert!(
-            extra_str.contains("***REDACTED***"),
-            "nested extra redacted: {extra_str}"
-        );
-        assert!(
-            !extra_str.contains(secret),
-            "password leaked into nested extra: {extra_str}"
-        );
+        let json = extra.to_string();
+        assert!(json.contains("***REDACTED***"), "nested extra redacted");
+        assert!(!json.contains(secret), "secret in nested extra");
     }
 
     #[test]
-    fn scrubs_password_assignment_and_various_schemes() {
-        // `key=value` form.
+    fn scrubs_password_assignment() {
+        // `key=value` form (the contract under test).
         let out = scrub_str("password=hunter2 ok");
         assert!(out.contains("***REDACTED***"), "{out}");
         assert!(!out.contains("hunter2"), "{out}");
@@ -271,20 +263,28 @@ mod tests {
         assert!(ex.ty.contains("***REDACTED***"));
     }
 
+    /// Raw sentry crate is a no-op with no DSN — the invariant [`init()`]
+    /// relies on (`is_enabled` gates on `options.dsn.is_some()`).
     #[test]
-    fn init_is_noop_without_valid_dsn() {
-        // Sole reader/writer of SENTRY_DSN in the suite → no parallel race.
+    fn client_disabled_when_dsn_unset() {
+        let guard = sentry::init(sentry::ClientOptions {
+            dsn: None,
+            ..Default::default()
+        });
+        assert!(!guard.is_enabled(), "client with no DSN must be disabled");
+    }
+
+    /// [`init()`] reads `SENTRY_DSN` at runtime; unset or malformed → disabled
+    /// (parsed via `.ok()`, no panic). Sole `SENTRY_DSN` touch-point in the suite.
+    #[test]
+    fn init_reads_sentry_dsn_env() {
         let saved = std::env::var("SENTRY_DSN").ok();
 
-        // Unset → disabled, no panic.
         unsafe { std::env::remove_var("SENTRY_DSN") };
-        let guard = init();
-        assert!(!guard.is_enabled(), "must be disabled when DSN unset");
+        assert!(!init().is_enabled(), "disabled when SENTRY_DSN unset");
 
-        // Malformed → still disabled, still no panic (parsed via `.ok()`).
         unsafe { std::env::set_var("SENTRY_DSN", "not-a-valid-dsn") };
-        let guard = init();
-        assert!(!guard.is_enabled(), "must be disabled on malformed DSN");
+        assert!(!init().is_enabled(), "disabled on malformed SENTRY_DSN");
 
         // Restore so state doesn't leak across the test-binary process.
         match saved {
