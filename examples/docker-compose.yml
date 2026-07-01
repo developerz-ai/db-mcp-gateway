@@ -1,0 +1,112 @@
+# Production-like gateway deployment with local Postgres state DB.
+# For development, use docker-compose.dev.yml in the repo root instead.
+#
+# Security: secrets come from your orchestrator (K8s secrets, Vault, etc.), not .env.
+# Never commit .env or secret values. See docs/deployment/quickstart.md#4-bring-it-up-with-docker-compose.
+#
+# Usage:
+#   # Copy examples/gateway.yaml → ./config.yml and edit
+#   cp examples/gateway.yaml ./config.yml
+#
+#   # Set environment variables before `docker compose up`:
+#   export STATE_DB_PW=...
+#   export SESSION_SIGNING_KEY=...   # unique per deploy; gateway refuses the dev default
+#   export OIDC_ISSUER=https://your-idp.example.com
+#   export OIDC_CLIENT_ID=...
+#   export OIDC_CLIENT_SECRET=...
+#   export PROD_APP_RO_PASSWORD=...
+#
+#   docker compose up -d
+#   docker compose logs -f gateway
+
+version: '3.8'
+
+services:
+  gateway:
+    image: ghcr.io/developerz-ai/db-mcp-gateway:1.0.0  # pin to a version in production
+    container_name: db-mcp-gateway
+    ports:
+      - "8443:8443"  # HTTPS MCP endpoint
+    environment:
+      # Config and logging
+      DB_MCP_GATEWAY_CONFIG: /etc/gateway/config.yml
+      RUST_LOG: info  # set to debug for verbose logs
+
+      # State DB (gateway's own Postgres for sessions + audit log)
+      STATE_DB_URL: postgres://gateway:${STATE_DB_PW}@state-db:5432/gateway
+
+      # OIDC / SSO (required for real deployments; see docs/deployment/quickstart.md#2-register-an-oidc-application)
+      OIDC_ISSUER: ${OIDC_ISSUER}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET}
+      OIDC_REDIRECT_URL: https://db.internal.acme.com/auth/callback  # must match IdP app redirect URI
+      OIDC_GROUPS_CLAIM: groups
+
+      # Session security: HMAC key for gateway-issued session JWTs. Injected from
+      # your orchestrator — the gateway refuses to boot on the committed dev default.
+      SESSION_SIGNING_KEY: ${SESSION_SIGNING_KEY}
+
+      # TLS: gateway terminates TLS in-process from the mounted cert + key below.
+      # Local dev only: drop these two and set `TLS_DISABLED: "true"` instead.
+      TLS_CERT_PATH: /etc/gateway/certs/tls.crt
+      TLS_KEY_PATH: /etc/gateway/certs/tls.key
+
+      # Target database passwords (referenced in config.yml via ${ENV:VAR_NAME})
+      PROD_APP_RO_PASSWORD: ${PROD_APP_RO_PASSWORD}
+      STAGING_APP_RO_PASSWORD: ${STAGING_APP_RO_PASSWORD}
+
+      # Optional: audit log retention and sinks (see docs/deployment/logging.md)
+      AUDIT_RETENTION_DAYS: "90"
+      SESSION_CACHE_TTL_SECONDS: "30"
+
+    volumes:
+      # Mount your config file (read-only)
+      - ./config.yml:/etc/gateway/config.yml:ro
+      # TLS cert + key (paths match TLS_CERT_PATH / TLS_KEY_PATH above)
+      - /etc/ssl/certs/gateway.crt:/etc/gateway/certs/tls.crt:ro
+      - /etc/ssl/private/gateway.key:/etc/gateway/certs/tls.key:ro
+
+    depends_on:
+      state-db:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8443/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    restart: unless-stopped
+    networks:
+      - gateway-net
+
+  # State DB: Postgres for gateway sessions + audit log.
+  # Keep this separate from your target databases.
+  state-db:
+    image: postgres:16-alpine
+    container_name: db-mcp-gateway-state
+    environment:
+      POSTGRES_DB: gateway
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: ${STATE_DB_PW}
+    volumes:
+      - state-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - gateway-net
+    # Security: state DB should be internal only, never exposed to the host network
+    # docker-compose will wire it via the gateway-net overlay
+
+volumes:
+  state-db-data:
+    driver: local
+
+networks:
+  gateway-net:
+    driver: bridge

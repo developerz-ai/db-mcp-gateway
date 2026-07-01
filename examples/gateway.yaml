@@ -1,0 +1,99 @@
+# Gateway configuration
+#
+# Servers and permissions only — gateway / auth / logging come from environment variables
+# until issue #10 lands YAML-based unified config. See docs/deployment/quickstart.md.
+#
+# Passwords accept:
+#   - ${ENV:VAR_NAME} — resolved from process environment at boot
+#   - ${FILE:/path/to/secret} — read from file at boot
+#   - vault:/path, aws-sm:path, gcp-sm:path — not yet implemented
+#
+# Unknown keys abort boot with line:column pointer (see issue #16).
+# Full schema: docs/deployment/config-reference.md
+
+# Servers are the databases your org uses.
+servers:
+  - name: prod
+    kind: postgres                    # postgres or mongo
+    host: prod-db.internal            # hostname or IP
+    port: 5432                        # default 5432 for postgres, 27017 for mongo
+    tls: required                     # required | insecure (never in prod)
+    databases:
+      # Each database needs a read-only role (created by your DBA).
+      # Example SQL for Postgres:
+      #   create role mcp_gateway_prod_app_ro with login password :'pw';
+      #   grant connect on database app to mcp_gateway_prod_app_ro;
+      #   grant usage on schema public to mcp_gateway_prod_app_ro;
+      #   grant select on all tables in schema public to mcp_gateway_prod_app_ro;
+      #   alter role mcp_gateway_prod_app_ro set statement_timeout = '30s';
+      - name: app
+        role: mcp_gateway_prod_app_ro     # read-only role on the target DB
+        password: ${ENV:PROD_APP_RO_PASSWORD}
+
+  - name: staging
+    kind: postgres
+    host: staging-db.internal
+    port: 5432
+    tls: required
+    databases:
+      - name: app
+        role: mcp_gateway_staging_app_ro
+        password: ${ENV:STAGING_APP_RO_PASSWORD}
+
+# Permissions tie (group from IdP) × (server × database) × (action) + optional constraints.
+#
+# Actions form a hierarchy:
+#   - schema_read: describe_schema, sample_table
+#   - query_read: everything in schema_read + run_query, explain
+#   - query_write: everything in query_read + write capability (if target DB role grants it)
+#   - history_read: separate grant for get_query_history
+#
+# Most restrictive value wins when multiple grants match a request.
+# See docs/initial-idea/06-permissions.md for constraint-merge rules.
+permissions:
+  # Backend engineers can read schema and query prod/staging
+  - group: backend-engineers
+    grants:
+      - server: prod
+        database: "*"                 # all databases on this server
+        action: query_read
+        constraints:
+          statement_timeout_ms: 5000  # query must complete in 5s
+          row_limit: 10000            # truncate results beyond 10k rows
+
+      - server: staging
+        database: "*"
+        action: query_read
+        constraints:
+          statement_timeout_ms: 10000
+          row_limit: 50000
+
+  # On-call engineers can query prod but must provide a reason for audit
+  - group: oncall
+    grants:
+      - server: prod
+        database: "*"
+        action: query_read
+        constraints:
+          require_reason: true        # agent must supply reason → audit log
+          statement_timeout_ms: 5000
+          row_limit: 1000
+
+  # Data analysts get read-only schema access (no query execution)
+  - group: data-analysts
+    grants:
+      - server: prod
+        database: "*"
+        action: schema_read
+      - server: staging
+        database: "*"
+        action: schema_read
+
+# Wildcard matching — cover many servers/databases at once
+#
+# Example (not in this config):
+#   - group: developers
+#     grants:
+#       - server: "*"                 # all servers
+#         database: "*"               # all databases
+#         action: schema_read         # schema reads only
