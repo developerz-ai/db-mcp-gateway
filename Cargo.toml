@@ -1,6 +1,6 @@
 [package]
 name = "db-mcp-gateway"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Self-hosted MCP gateway for credentialled, audited, read-only database access by AI agents"
