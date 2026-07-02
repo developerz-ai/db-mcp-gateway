@@ -12,6 +12,11 @@
 use db_mcp_gateway::transport::ClientRegistry;
 use sqlx::PgPool;
 
+/// These tests share one `oauth_clients` table, and the cap test fills it to
+/// `CLIENT_CAP` — a concurrent insert from any sibling test would be refused
+/// at the cap and flake. Serialize the whole file.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn state_db_url() -> String {
     std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
         "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
@@ -36,6 +41,7 @@ async fn cleanup(pool: &PgPool, client_id: &str) {
 /// *new* instance over the same pool — i.e. it survives a pod restart.
 #[tokio::test]
 async fn registration_survives_a_restart() {
+    let _serial = SERIAL.lock().await;
     let pool = pool().await;
     let client_id = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
     cleanup(&pool, &client_id).await;
@@ -67,6 +73,7 @@ async fn registration_survives_a_restart() {
 /// rather than erroring or duplicating the row.
 #[tokio::test]
 async fn re_register_updates_redirect_uris() {
+    let _serial = SERIAL.lock().await;
     let pool = pool().await;
     let client_id = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
     cleanup(&pool, &client_id).await;
@@ -94,6 +101,7 @@ async fn re_register_updates_redirect_uris() {
 /// sleep out the 24h TTL.
 #[tokio::test]
 async fn expired_registration_is_swept_and_not_returned() {
+    let _serial = SERIAL.lock().await;
     let pool = pool().await;
     let stale = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
     cleanup(&pool, &stale).await;
@@ -142,6 +150,7 @@ async fn expired_registration_is_swept_and_not_returned() {
 /// them. Everything is namespaced under a unique prefix and cleaned up.
 #[tokio::test]
 async fn at_cap_rejects_new_but_updates_existing_real_db() {
+    let _serial = SERIAL.lock().await;
     let pool = pool().await;
     let prefix = format!("capfill-{}-", uuid::Uuid::new_v4().simple());
 
