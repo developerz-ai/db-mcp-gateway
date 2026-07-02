@@ -96,6 +96,7 @@ regex = { version = "1", default-features = false }
 # tests (feature unification) without exposing it to downstream consumers.
 db-mcp-gateway = { path = ".", features = ["test-support"] }
 proptest = "1"
+serial_test = "3"            # Serialize real-DB tests that share one global table (cap, GC)
 tempfile = "3"
 rcgen = "0.13"                # Self-signed certs for the TLS+SIGHUP integration test
 libc = "0.2"                  # `raise(SIGHUP)` from the integration test (in-process signal)

@@ -8,8 +8,15 @@
 //!
 //! No mocking — these run against the real dev state DB (`bin/dev up`), same as
 //! the session-cache real-DB tests.
+//!
+//! All tests are `#[serial]`: they share one global `oauth_clients` table, and
+//! the cap test seeds it to the 10k `CLIENT_CAP`. Run in parallel, that seed
+//! makes every sibling test's `insert` of a brand-new `client_id` trip the cap
+//! check and fail closed (`false`) — a nondeterministic flake where the victim
+//! changes per run. Serializing keeps the shared table consistent.
 
 use db_mcp_gateway::transport::ClientRegistry;
+use serial_test::serial;
 use sqlx::PgPool;
 
 fn state_db_url() -> String {
@@ -35,6 +42,7 @@ async fn cleanup(pool: &PgPool, client_id: &str) {
 /// A client registered against one registry instance is still resolvable from a
 /// *new* instance over the same pool — i.e. it survives a pod restart.
 #[tokio::test]
+#[serial]
 async fn registration_survives_a_restart() {
     let pool = pool().await;
     let client_id = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
@@ -66,6 +74,7 @@ async fn registration_survives_a_restart() {
 /// Re-registering an existing `client_id` overwrites its redirect URIs (upsert),
 /// rather than erroring or duplicating the row.
 #[tokio::test]
+#[serial]
 async fn re_register_updates_redirect_uris() {
     let pool = pool().await;
     let client_id = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
@@ -93,6 +102,7 @@ async fn re_register_updates_redirect_uris() {
 /// analogue of the in-memory store's TTL. We age the row directly rather than
 /// sleep out the 24h TTL.
 #[tokio::test]
+#[serial]
 async fn expired_registration_is_swept_and_not_returned() {
     let pool = pool().await;
     let stale = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
@@ -141,6 +151,7 @@ async fn expired_registration_is_swept_and_not_returned() {
 /// 10k round-trips; the seeded rows carry a live TTL so the insert-time GC keeps
 /// them. Everything is namespaced under a unique prefix and cleaned up.
 #[tokio::test]
+#[serial]
 async fn at_cap_rejects_new_but_updates_existing_real_db() {
     let pool = pool().await;
     let prefix = format!("capfill-{}-", uuid::Uuid::new_v4().simple());
