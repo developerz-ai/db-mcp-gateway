@@ -190,7 +190,11 @@ async fn run() -> anyhow::Result<()> {
         permissions_cache: Some(permissions_cache),
         permissions_repo: Some(permissions_repo),
         mcp_path: Arc::from(config.mcp_path.as_str()),
-        client_registry: ClientRegistry::default(),
+        // Persist DCR registrations in the shared state DB so a restart /
+        // redeploy no longer drops them (the `invalid_client` wedge for clients
+        // that cache their `client_id`). `default()` — in-memory — is the
+        // auth-less test bootstrap only.
+        client_registry: ClientRegistry::with_db(state_db.clone()),
     };
 
     // Fail closed: a release binary must never serve with auth unwired.

@@ -55,7 +55,14 @@ fn hash_secret(secret: &str) -> [u8; 32] {
 
 /// `state → nonce` from /auth/login lives here until /auth/callback consumes
 /// (and removes) it. TTL-bounded so a wedged login can't accumulate.
-const FLOW_TTL: Duration = Duration::from_secs(5 * 60);
+///
+/// 15 min (was 5): a real browser SSO leg includes the IdP login form, a TOTP
+/// prompt, and — when the IdP's user store is briefly slow — multi-second
+/// backend waits. 5 min expired legitimate logins mid-flow, surfacing at
+/// /auth/callback as a missing flow. The store is still size-capped
+/// (`PENDING_FLOWS_MAX_SIZE`), so a longer TTL can't let abandoned flows grow
+/// unbounded.
+const FLOW_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// Context an MCP OAuth-bridge `/authorize` request stashes across the IdP
 /// round-trip. Recovered at `/auth/callback` (keyed by the OIDC `state`) so the

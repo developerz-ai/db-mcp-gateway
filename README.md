@@ -29,7 +29,7 @@ Your team deploys it once. Developers add one URL to their AI agent's MCP config
 
 ## 🚧 Status
 
-**v1.0.0 — stable.** In production use. Pull it: `docker pull ghcr.io/developerz-ai/db-mcp-gateway:1.0.0` — multi-arch (`linux/amd64`, `linux/arm64`). Targets: PostgreSQL and MongoDB (MySQL/MSSQL rejected at boot). See [`docs/deployment/releasing.md`](docs/deployment/releasing.md) for the compatibility policy.
+**v1.1.1 — stable.** In production use. Pull it: `docker pull ghcr.io/developerz-ai/db-mcp-gateway:1.1.1` — multi-arch (`linux/amd64`, `linux/arm64`). Targets: PostgreSQL and MongoDB (MySQL/MSSQL rejected at boot). See [`docs/deployment/releasing.md`](docs/deployment/releasing.md) for the compatibility policy.
 
 ---
 
@@ -91,7 +91,7 @@ docker pull ghcr.io/developerz-ai/db-mcp-gateway:latest
 Pinned to a version (recommended in prod):
 
 ```bash
-docker pull ghcr.io/developerz-ai/db-mcp-gateway:1.0.0
+docker pull ghcr.io/developerz-ai/db-mcp-gateway:1.1.1
 ```
 
 Multi-arch (amd64 + arm64). Built reproducibly from a `v*` git tag — see [`docs/deployment/releasing.md`](docs/deployment/releasing.md).
