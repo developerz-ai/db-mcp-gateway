@@ -44,9 +44,19 @@ fn main() -> anyhow::Result<()> {
     // via the before_send hook in `sentry_scrub`.
     let _sentry_guard = sentry_scrub::init();
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?;
+        .build()
+    {
+        Ok(rt) => rt,
+        // Thread-init/resource failures (rare) land here. The sentry client is
+        // already initialized above, so route the builder error through the same
+        // capture path as `run()` below instead of `?`-returning past it.
+        Err(err) => {
+            sentry::capture_error(&err);
+            return Err(err.into());
+        }
+    };
     let result = runtime.block_on(run());
 
     // `run()` returns `Err` for config-load / DB-connect / bind failures. Those

@@ -10,11 +10,16 @@
 //!
 //! Env keys whose **values** must never reach GlitchTip: `STATE_DB_URL`,
 //! `TARGET_DB_URL`, `PERMISSIONS_DB_DSN`, `OIDC_CLIENT_SECRET`,
-//! `SESSION_SIGNING_KEY`. URL-credential values are caught by the URL regex
-//! regardless of the key that carried them; `…_SECRET` / `…_DSN`-style
-//! assignments are caught by the secret-keyword regex. This is defense in
-//! depth on top of the gateway's primary rule (credentials never travel in
-//! errors/logs) — the scrubber exists for the day something slips past that.
+//! `SESSION_SIGNING_KEY`. These are matched by name against an explicit
+//! allowlist ([`SENSITIVE_KEY_PATTERN`]) and their entire value redacted — so a
+//! userinfo-less `STATE_DB_URL=postgres://db.internal/app` (whose internal
+//! hostname the URL regex would leave intact) and a `SESSION_SIGNING_KEY=…`
+//! (which matches neither `key`/`url`) are both covered. Beyond that,
+//! URL-credential values are caught by the URL regex regardless of the key that
+//! carried them, and `…_SECRET` / `…_DSN`-style assignments are caught by the
+//! secret-keyword regex. This is defense in depth on top of the gateway's
+//! primary rule (credentials never travel in errors/logs) — the scrubber exists
+//! for the day something slips past that.
 //!
 //! Error tracking **only**: [`init`] pins `traces_sample_rate` to `0.0`.
 //! GlitchTip cannot ingest transactions/spans/replay, so any perf data would
@@ -39,6 +44,16 @@ const URL_CREDS_PATTERN: &str = r"(\w[\w.+-]*://)[^/\s:@]+:[^/\s@]+@";
 /// is consumed whole.
 const SECRET_PATTERN: &str = r"(?i)(password|passwd|pwd|secret|token|dsn)\s*[:=]\s*\S+";
 
+/// Explicit allowlist of env names whose **values** must never reach GlitchTip
+/// (the file-header list). These keys carry hostnames or signing secrets that
+/// the other two regexes miss: a userinfo-less `STATE_DB_URL=…` leaks the
+/// internal hostname (URL regex only strips embedded `user:pass@`), and
+/// `SESSION_SIGNING_KEY=…` matches neither `key`/`url` nor a secret keyword.
+/// Match the key by name, redact the whole value. Leading `\b` is zero-width,
+/// so the replacement (`$1=…`) preserves the preceding char and won't fire on
+/// `MY_STATE_DB_URL` (`_`→`S` is not a word boundary).
+const SENSITIVE_KEY_PATTERN: &str = r"(?i)\b(STATE_DB_URL|TARGET_DB_URL|PERMISSIONS_DB_DSN|OIDC_CLIENT_SECRET|SESSION_SIGNING_KEY)\s*[:=]\s*\S+";
+
 /// Initialize the global GlitchTip client and return a guard that must live
 /// for the entire program (it flushes the send queue on drop).
 ///
@@ -53,8 +68,7 @@ const SECRET_PATTERN: &str = r"(?i)(password|passwd|pwd|secret|token|dsn)\s*[:=]
 pub(crate) fn init() -> ClientInitGuard {
     let dsn = std::env::var("SENTRY_DSN")
         .ok()
-        .filter(|raw| !raw.trim().is_empty())
-        .and_then(|raw| raw.parse::<Dsn>().ok());
+        .and_then(|raw| parse_dsn(&raw));
     let environment = std::env::var("SENTRY_ENVIRONMENT")
         .ok()
         .filter(|env| !env.is_empty())
@@ -82,6 +96,18 @@ pub(crate) fn init() -> ClientInitGuard {
     };
 
     sentry::init(opts)
+}
+
+/// Parse a raw DSN string the way [`init`] does: empty/whitespace/malformed →
+/// `None`. Pulled out of [`init`] so it can be unit-tested without touching the
+/// process-wide `SENTRY_DSN` env var (which would race with parallel tests —
+/// `std::env` is process-global, not thread-local).
+fn parse_dsn(raw: &str) -> Option<Dsn> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<Dsn>().ok()
 }
 
 /// `before_send`: scrub every credential-bearing string on the event, then
@@ -139,18 +165,23 @@ fn scrub_event(
 
 /// Redact connection-string credentials and secret assignments in `s`.
 ///
-/// Applied in two passes: URL userinfo first (so `dsn: postgres://u:p@h` loses
-/// `u:p` even though `dsn:…` also matches the secret regex), then `key=value`
-/// secrets. If a regex somehow fails to compile — impossible for these static
-/// literals, but the no-panic convention forbids `expect` — we fail **closed**:
-/// the whole string becomes [`REDACTED`] rather than risk shipping unscrubbed.
+/// Applied in three passes: URL userinfo first (so `dsn: postgres://u:p@h`
+/// loses `u:p` even though `dsn:…` also matches a later pass), then the
+/// sensitive-key allowlist (whole-value redact for the named env keys), then
+/// `key=value` secrets by keyword. If a regex somehow fails to compile —
+/// impossible for these static literals, but the no-panic convention forbids
+/// `expect` — we fail **closed**: the whole string becomes [`REDACTED`] rather
+/// than risk shipping unscrubbed.
 fn scrub_str(s: &str) -> String {
-    let (Some(url_re), Some(secret_re)) = (url_creds_re(), secret_re()) else {
+    let (Some(url_re), Some(key_re), Some(secret_re)) =
+        (url_creds_re(), sensitive_key_re(), secret_re())
+    else {
         return REDACTED.to_owned();
     };
     let after_url = url_re.replace_all(s, format!("$1{REDACTED}@"));
+    let after_key = key_re.replace_all(&after_url, format!("$1={REDACTED}"));
     secret_re
-        .replace_all(&after_url, format!("$1={REDACTED}"))
+        .replace_all(&after_key, format!("$1={REDACTED}"))
         .into_owned()
 }
 
@@ -181,10 +212,19 @@ fn secret_re() -> Option<&'static Regex> {
     RE.get_or_init(|| Regex::new(SECRET_PATTERN)).as_ref().ok()
 }
 
+/// See [`url_creds_re`].
+fn sensitive_key_re() -> Option<&'static Regex> {
+    static RE: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(SENSITIVE_KEY_PATTERN))
+        .as_ref()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
-    //! No network, no real DB. Scrubber is pure string work; [`init`] is the
-    //! sole `SENTRY_DSN` touch-point in the suite → parallel-safe.
+    //! No network, no real DB. Scrubber is pure string work, and DSN parsing
+    //! is exercised via the pure [`parse_dsn`] helper → no test mutates the
+    //! process env → parallel-safe.
 
     use super::*;
 
@@ -225,6 +265,39 @@ mod tests {
         let out = scrub_str("OIDC_CLIENT_SECRET: s3cr3t-value");
         assert!(out.contains("***REDACTED***"), "{out}");
         assert!(!out.contains("s3cr3t-value"), "{out}");
+
+        // Allowlisted env names: value redacted even with no `user:pass@`
+        // userinfo and no secret keyword. The internal hostname must not leak.
+        // (CodeRabbit: SESSION_SIGNING_KEY / STATE_DB_URL bypassed the old
+        // scrubber.)
+        let out = scrub_str("SESSION_SIGNING_KEY=jwt-hs256-base64-secret");
+        assert!(out.contains("***REDACTED***"), "{out}");
+        assert!(!out.contains("jwt-hs256-base64-secret"), "{out}");
+
+        let out = scrub_str("STATE_DB_URL=postgres://db.internal/app");
+        assert!(out.contains("***REDACTED***"), "{out}");
+        assert!(
+            !out.contains("db.internal"),
+            "internal hostname leaked: {out}"
+        );
+
+        // A userinfo-bearing STATE_DB_URL is also fully redacted (allowlist
+        // whole-value pass, not just the URL userinfo strip).
+        let out = scrub_str("STATE_DB_URL=postgres://app:s3cr3t@db.internal/app");
+        assert!(out.contains("***REDACTED***"), "{out}");
+        assert!(!out.contains("s3cr3t"), "{out}");
+        assert!(!out.contains("db.internal"), "{out}");
+
+        // `: value` separator, mixed case, and a sibling non-sensitive key
+        // left intact.
+        let out = scrub_str("state_db_url: postgres://db.internal/app ok=1");
+        assert!(out.contains("***REDACTED***"), "{out}");
+        assert!(out.contains("ok=1"), "benign sibling key clobbered: {out}");
+
+        // `MY_STATE_DB_URL` is not the allowlisted key — left alone by this
+        // pass (its value carries no creds here).
+        let out = scrub_str("MY_STATE_DB_URL=harmless");
+        assert!(!out.contains("***REDACTED***"), "false positive: {out}");
 
         // Each DB scheme family loses its userinfo, host stays.
         for raw in [
@@ -338,22 +411,13 @@ mod tests {
         );
     }
 
-    /// [`init()`] reads `SENTRY_DSN` at runtime; unset or malformed → disabled
-    /// (parsed via `.ok()`, no panic). Sole `SENTRY_DSN` touch-point in the suite.
+    /// `init()`'s DSN parsing, tested on a pure helper instead of mutating the
+    /// process-wide `SENTRY_DSN` (CodeRabbit: `set_var`/`remove_var` racy under
+    /// parallel test threads). Empty/whitespace/malformed → `None` (disabled).
     #[test]
-    fn init_reads_sentry_dsn_env() {
-        let saved = std::env::var("SENTRY_DSN").ok();
-
-        unsafe { std::env::remove_var("SENTRY_DSN") };
-        assert!(!init().is_enabled(), "disabled when SENTRY_DSN unset");
-
-        unsafe { std::env::set_var("SENTRY_DSN", "not-a-valid-dsn") };
-        assert!(!init().is_enabled(), "disabled on malformed SENTRY_DSN");
-
-        // Restore so state doesn't leak across the test-binary process.
-        match saved {
-            Some(v) => unsafe { std::env::set_var("SENTRY_DSN", v) },
-            None => unsafe { std::env::remove_var("SENTRY_DSN") },
-        }
+    fn parse_dsn_rejects_empty_and_malformed() {
+        assert_eq!(parse_dsn(""), None, "empty -> disabled");
+        assert_eq!(parse_dsn("   "), None, "whitespace -> disabled");
+        assert_eq!(parse_dsn("not-a-valid-dsn"), None, "malformed -> disabled");
     }
 }
