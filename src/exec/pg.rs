@@ -255,48 +255,61 @@ async fn run_query_inner(pool: &PgPool, query: &ExecQuery<'_>) -> Result<ExecRes
         armed: Some((pool.clone(), pid)),
     };
 
-    // Always set a DB-side cap — the grant value clamped to the gateway
-    // ceiling, never `None` (see S4). `ms` is u32, so the SQL fragment is
-    // purely a number — no injection risk from interpolation.
-    let ms = effective_timeout_ms(query.statement_timeout_ms);
-    let stmt = format!("SET LOCAL statement_timeout = {ms}");
-    tx.execute(stmt.as_str()).await.map_err(classify)?;
+    // Run the statement under the guard. By the time this block resolves — Ok
+    // OR Err — the backend has stopped executing our query, so we disarm
+    // before returning. The guard stays armed ONLY if this future is dropped
+    // while awaiting (agent disconnect / outer `tokio::time::timeout`): the
+    // one case where the backend is still running and must be cancelled.
+    // Disarming on every normal return prevents a stray `pg_cancel_backend(pid)`
+    // from cancelling an unrelated statement that later reuses this pooled
+    // backend (same PID) — a flake where a timeout's detached cancel landed
+    // mid-next-query and turned a healthy result into a spurious error.
+    let result: Result<ExecResult, ExecError> = async {
+        // Always set a DB-side cap — the grant value clamped to the gateway
+        // ceiling, never `None` (see S4). `ms` is u32, so the SQL fragment is
+        // purely a number — no injection risk from interpolation.
+        let ms = effective_timeout_ms(query.statement_timeout_ms);
+        let stmt = format!("SET LOCAL statement_timeout = {ms}");
+        tx.execute(stmt.as_str()).await.map_err(classify)?;
 
-    let limit = query.row_limit as usize;
-    let mut columns: Vec<String> = Vec::new();
-    let mut rows: Vec<Vec<Value>> = Vec::new();
-    let mut truncated = false;
+        let limit = query.row_limit as usize;
+        let mut columns: Vec<String> = Vec::new();
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        let mut truncated = false;
 
-    {
-        let mut sqlx_query = sqlx::query(query.sql);
-        for bind in query.binds {
-            sqlx_query = sqlx_query.bind(*bind);
-        }
-        let mut stream = sqlx_query.fetch(&mut *tx);
-        while let Some(row_result) = stream.next().await {
-            let row = row_result.map_err(classify)?;
-            if columns.is_empty() {
-                columns = row.columns().iter().map(|c| c.name().to_string()).collect();
+        {
+            let mut sqlx_query = sqlx::query(query.sql);
+            for bind in query.binds {
+                sqlx_query = sqlx_query.bind(*bind);
             }
-            if rows.len() >= limit {
-                truncated = true;
-                break;
+            let mut stream = sqlx_query.fetch(&mut *tx);
+            while let Some(row_result) = stream.next().await {
+                let row = row_result.map_err(classify)?;
+                if columns.is_empty() {
+                    columns = row.columns().iter().map(|c| c.name().to_string()).collect();
+                }
+                if rows.len() >= limit {
+                    truncated = true;
+                    break;
+                }
+                rows.push(decode_row(&row));
             }
-            rows.push(decode_row(&row));
+            // Stream is dropped here so the borrow on `tx` ends and we can commit.
         }
-        // Stream is dropped here so the borrow on `tx` ends and we can commit.
+
+        tx.commit().await.map_err(classify)?;
+
+        Ok(ExecResult {
+            columns,
+            rows,
+            truncated,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        })
     }
-
-    tx.commit().await.map_err(classify)?;
-    // Query ran to completion on this task — no orphaned backend to cancel.
+    .await;
+    // Statement finished (success or error) — no orphaned backend to cancel.
     cancel.disarm();
-
-    Ok(ExecResult {
-        columns,
-        rows,
-        truncated,
-        elapsed_ms: started.elapsed().as_millis() as u64,
-    })
+    result
 }
 
 fn classify(err: sqlx::Error) -> ExecError {

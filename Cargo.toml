@@ -81,11 +81,22 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
+# error tracking → GlitchTip (Sentry-protocol ingest). Error tracking ONLY:
+# no tracing/perf integration, no native-tls, no bare transport. reqwest
+# transport pinned to rustls to match the rest of the stack (aws-lc-rs) and
+# keep openssl out of the dep graph — see `cargo tree -i openssl-sys` (empty).
+# DSN is read from SENTRY_DSN at runtime; unset → disabled no-op client.
+sentry = { version = "0.48", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
+# credential-scrubbing regexes for the sentry `before_send` hook. No `unicode`
+# feature: DSN/password patterns are ASCII, keeping the dep light.
+regex = { version = "1", default-features = false }
+
 [dev-dependencies]
 # Self dev-dependency: enables `test-support` for this crate's own integration
 # tests (feature unification) without exposing it to downstream consumers.
 db-mcp-gateway = { path = ".", features = ["test-support"] }
 proptest = "1"
+serial_test = "3"            # Serialize real-DB tests that share one global table (cap, GC)
 tempfile = "3"
 rcgen = "0.13"                # Self-signed certs for the TLS+SIGHUP integration test
 libc = "0.2"                  # `raise(SIGHUP)` from the integration test (in-process signal)
