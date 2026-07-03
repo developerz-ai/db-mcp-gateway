@@ -150,7 +150,7 @@ Sentry inits **first** in `fn main`, *before* the tokio runtime is built. The in
 Every outbound event passes through a `before_send` hook that redacts secrets. This is defense-in-depth on top of the typed-error discipline in the stdout contract — GlitchTip payloads cross the process boundary and must never carry a credential. The hook scrubs, replacing the secret portion with `***REDACTED***`:
 
 - database connection strings with embedded credentials — `postgres://user:pass@host`, `mysql://…`, `mongodb://…`, and any `scheme://user:pass@host` shape;
-- bare password-like values in `message`, exception `value`/`type`, and `extra`/`contexts`.
+- bare password-like values in `message`, exception `value`/`type`, breadcrumb `message`/`data`, `tags`, `user`, `request`, and `extra`/`contexts`.
 
 Env keys whose values must never leak (the scrubber targets their shapes, not the values themselves):
 

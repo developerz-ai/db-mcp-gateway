@@ -118,7 +118,12 @@ fn parse_dsn(raw: &str) -> Option<Dsn> {
 /// - [`Event::message`] — the free-form message.
 /// - each `exception.values[].value` (the rendered error message) **and** the
 ///   exception `ty` (class name) — both per the goal "exception values/type".
-/// - each `breadcrumbs.values[].message`.
+/// - each `breadcrumbs.values[].message` plus every string leaf in its `data` map.
+/// - `tags` (every value), `user` (`id` / `email` / `username` string fields plus
+///   the forwards-compat `other` JSON map), and `request` (`url`, `method`,
+///   `data`, `query_string`, `cookies`, plus the `headers` / `env` string maps).
+///   `send_default_pii: false` only suppresses SDK *auto*-PII; anything manually
+///   attached to these fields must still be scrubbed.
 /// - every [`serde_json::Value::String`] reachable in `extra` (nested maps and
 ///   arrays walked recursively).
 /// - every value in `Context::Other` maps under `contexts`.
@@ -157,6 +162,58 @@ fn scrub_event(
             for value in map.values_mut() {
                 scrub_json(value);
             }
+        }
+    }
+
+    // `tags` is a flat string->string map. Operator-set tags can carry secrets;
+    // `send_default_pii: false` does not touch them. Scrub every value.
+    for value in event.tags.values_mut() {
+        *value = scrub_str(value);
+    }
+
+    // `user` and `request` hold *manually*-attached data (`send_default_pii`
+    // only suppresses SDK auto-PII), so scrub their free-text string fields with
+    // the same `scrub_str`, and any forwards-compat JSON map with `scrub_json`.
+    if let Some(user) = event.user.as_mut() {
+        if let Some(id) = user.id.as_mut() {
+            *id = scrub_str(id);
+        }
+        if let Some(email) = user.email.as_mut() {
+            *email = scrub_str(email);
+        }
+        if let Some(username) = user.username.as_mut() {
+            *username = scrub_str(username);
+        }
+        // `ip_address` is a typed IP, not free text — nothing to scrub.
+        for value in user.other.values_mut() {
+            scrub_json(value);
+        }
+    }
+
+    if let Some(req) = event.request.as_mut() {
+        // `url` is a typed `Url`, not a `String`: round-trip through the string
+        // scrubber and reparse. If the scrubbed form no longer parses, drop it
+        // (`ok()` -> `None`) rather than risk shipping an unscrubbed URL.
+        if let Some(url) = req.url.take() {
+            req.url = scrub_str(url.as_str()).parse().ok();
+        }
+        if let Some(method) = req.method.as_mut() {
+            *method = scrub_str(method);
+        }
+        if let Some(data) = req.data.as_mut() {
+            *data = scrub_str(data);
+        }
+        if let Some(query) = req.query_string.as_mut() {
+            *query = scrub_str(query);
+        }
+        if let Some(cookies) = req.cookies.as_mut() {
+            *cookies = scrub_str(cookies);
+        }
+        for value in req.headers.values_mut() {
+            *value = scrub_str(value);
+        }
+        for value in req.env.values_mut() {
+            *value = scrub_str(value);
         }
     }
 
@@ -408,6 +465,120 @@ mod tests {
         assert!(
             !nested.contains(secret),
             "secret leaked into nested breadcrumb data: {nested}"
+        );
+    }
+
+    #[test]
+    fn scrubs_tags_user_and_request() {
+        // Manually-attached tag/user/request data can carry secrets even with
+        // `send_default_pii: false` (that only drops SDK auto-PII). A secret
+        // placed in any of these fields must be redacted, not shipped.
+        let secret = "hunter2";
+        let mut event = sentry::protocol::Event::default();
+
+        // tags: flat string->string map.
+        event
+            .tags
+            .insert("db".to_owned(), format!("postgres://app:{secret}@db/app"));
+        event
+            .tags
+            .insert("note".to_owned(), format!("password={secret}"));
+
+        // user: string fields + the forwards-compat `other` map.
+        event.user = Some(sentry::protocol::User {
+            id: Some(format!("dsn=postgres://app:{secret}@db/app")),
+            email: Some(format!("token={secret}")),
+            username: Some(format!("secret={secret}")),
+            other: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert(
+                    "profile".to_owned(),
+                    serde_json::json!({ "url": format!("mysql://app:{secret}@h/db") }),
+                );
+                m
+            },
+            ..Default::default()
+        });
+
+        // request: string fields, the url, and the header/env string maps.
+        let mut request = sentry::protocol::Request {
+            url: format!("https://app:{secret}@host/path").parse().ok(),
+            method: Some("POST".to_owned()),
+            data: Some(format!("dsn: postgres://app:{secret}@db/x")),
+            query_string: Some(format!("token={secret}")),
+            cookies: Some(format!("session=abc; secret={secret}")),
+            ..Default::default()
+        };
+        request
+            .headers
+            .insert("Authorization".to_owned(), format!("secret={secret}"));
+        request.env.insert(
+            "STATE_DB_URL".to_owned(),
+            format!("postgres://app:{secret}@db/app"),
+        );
+        event.request = Some(request);
+
+        let scrubbed = scrub_event(event).expect("scrubber always returns Some");
+
+        // Serialize the whole event: proves no secret leaks through *any* of the
+        // newly-scrubbed fields, and that redaction actually fired.
+        let json = serde_json::to_string(&scrubbed).expect("event serializes");
+        assert!(
+            !json.contains(secret),
+            "secret leaked into tags/user/request: {json}"
+        );
+        assert!(
+            json.contains("***REDACTED***"),
+            "expected redaction marker in scrubbed event: {json}"
+        );
+
+        // Spot-check each field individually so a regression narrows to a field.
+        let scrubbed_tags = &scrubbed.tags;
+        assert!(!scrubbed_tags["db"].contains(secret), "tag value leaked");
+        assert!(!scrubbed_tags["note"].contains(secret), "tag value leaked");
+
+        let user = scrubbed.user.as_ref().expect("user preserved");
+        assert!(
+            !user.id.as_deref().unwrap().contains(secret),
+            "user.id leaked"
+        );
+        assert!(
+            !user.email.as_deref().unwrap().contains(secret),
+            "user.email leaked"
+        );
+        assert!(
+            !user.username.as_deref().unwrap().contains(secret),
+            "user.username leaked"
+        );
+        assert!(
+            !user.other["profile"].to_string().contains(secret),
+            "user.other leaked"
+        );
+
+        let req = scrubbed.request.as_ref().expect("request preserved");
+        // url either redacted in place or dropped — either way the secret is gone.
+        if let Some(url) = req.url.as_ref() {
+            assert!(!url.as_str().contains(secret), "request.url leaked: {url}");
+        }
+        assert!(
+            !req.data.as_deref().unwrap().contains(secret),
+            "request.data leaked"
+        );
+        assert!(
+            !req.query_string.as_deref().unwrap().contains(secret),
+            "request.query_string leaked"
+        );
+        assert!(
+            !req.cookies.as_deref().unwrap().contains(secret),
+            "request.cookies leaked"
+        );
+        assert!(
+            !req.headers["Authorization"].contains(secret),
+            "request header leaked"
+        );
+        assert!(
+            !req.env["STATE_DB_URL"].contains(secret),
+            "request env leaked"
         );
     }
 
