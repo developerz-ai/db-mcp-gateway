@@ -33,6 +33,9 @@ config/*.local.yaml
 # claudetm (claude-task-master) per-repo state — pid, task logs, etc.
 .claude-task-master/
 
+# CodeGraph local index (per-developer; indexing is opt-in)
+.codegraph/
+
 # Test / build artifacts
 /coverage
 *.profraw

@@ -81,6 +81,10 @@ struct BootedGateway {
 }
 
 async fn boot_gateway() -> BootedGateway {
+    boot_gateway_with(E2E_YAML, vec!["engineers".to_string()]).await
+}
+
+async fn boot_gateway_with(yaml: &str, groups: Vec<String>) -> BootedGateway {
     let pool = state::connect(&state_db_url(), 5)
         .await
         .expect("state DB up (run `bin/dev up`)");
@@ -89,7 +93,7 @@ async fn boot_gateway() -> BootedGateway {
     let user = MockUser {
         sub: user_sub.clone(),
         email: "rq-e2e@example.com".to_string(),
-        groups: vec!["engineers".to_string()],
+        groups,
     };
     let idp = spawn_mock_idp("test-client", "test-secret", user).await;
 
@@ -112,7 +116,7 @@ async fn boot_gateway() -> BootedGateway {
         bind: addr,
         ..Config::default()
     };
-    let config_file = ConfigFile::from_yaml_str(E2E_YAML).expect("e2e yaml is well-formed");
+    let config_file = ConfigFile::from_yaml_str(yaml).expect("e2e yaml is well-formed");
 
     let app = transport::router(
         &config,
@@ -390,6 +394,187 @@ async fn run_query_full_acceptance() {
         assert_eq!(body["code"], "forbidden_sql", "{label}: {body}");
         assert_audit_outcome(pool, sub, "forbidden_sql", label).await;
     }
+}
+
+/// Config granting the `writers` group `query_write` on `target/app`. The dev
+/// `app` role owns the DB, so it has the real write privileges a write grant
+/// requires (CLAUDE.md #3: writes need the grant AND a write-capable DB role).
+const WRITE_YAML: &str = r#"
+servers:
+  - name: target
+    kind: postgres
+    description: E2E target DB
+    host: localhost
+    port: 5434
+    tls: insecure
+    databases:
+      - name: app
+        role: app
+        password: app-dev-only
+        description: Local target-db
+
+permissions:
+  - group: writers
+    grants:
+      - server: target
+        database: app
+        action: query_write
+"#;
+
+/// End-to-end write path: a `query_write` grant lets INSERT/UPDATE/DELETE
+/// through the guard and the change actually commits — while schema mods stay
+/// blocked even with the write grant, and every dispatch leaves an audit row.
+#[tokio::test]
+async fn run_query_write_grant_commits_data_but_not_schema() {
+    let booted = boot_gateway_with(WRITE_YAML, vec!["writers".to_string()]).await;
+    let (url, bearer, pool, sub) = (
+        booted.url.as_str(),
+        booted.bearer.as_str(),
+        &booted.state_db,
+        booted.user_sub.as_str(),
+    );
+
+    // Scratch table created out-of-band (a plain SELECT/DML path can't do DDL).
+    // This is real-DB setup, not a mock of the query path.
+    let target = sqlx::PgPool::connect("postgres://app:app-dev-only@localhost:5434/app")
+        .await
+        .expect("target-db reachable; run `bin/dev up`");
+    let table = format!("write_e2e_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "CREATE TABLE \"{table}\" (id bigint PRIMARY KEY, note text)"
+    ))
+    .execute(&target)
+    .await
+    .expect("create scratch table");
+
+    // INSERT commits.
+    let resp = call_run_query(
+        url,
+        bearer,
+        "target",
+        "app",
+        &format!("INSERT INTO \"{table}\" (id, note) VALUES (1, 'hello')"),
+        None,
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], false, "insert: {resp}");
+    assert_audit_outcome(pool, sub, "success", "INSERT under write grant").await;
+
+    // The row is really there — read it back through the gateway.
+    let resp = call_run_query(
+        url,
+        bearer,
+        "target",
+        "app",
+        &format!("SELECT note FROM \"{table}\" WHERE id = 1"),
+        None,
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], false, "readback: {resp}");
+    assert_eq!(
+        payload(&resp)["rows"][0][0],
+        "hello",
+        "insert did not commit"
+    );
+
+    // UPDATE ... RETURNING commits and returns the new value.
+    let resp = call_run_query(
+        url,
+        bearer,
+        "target",
+        "app",
+        &format!("UPDATE \"{table}\" SET note = 'changed' WHERE id = 1 RETURNING note"),
+        None,
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], false, "update: {resp}");
+    assert_eq!(payload(&resp)["rows"][0][0], "changed");
+    assert_audit_outcome(pool, sub, "success", "UPDATE under write grant").await;
+
+    // DELETE commits.
+    let resp = call_run_query(
+        url,
+        bearer,
+        "target",
+        "app",
+        &format!("DELETE FROM \"{table}\" WHERE id = 1"),
+        None,
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], false, "delete: {resp}");
+    assert_audit_outcome(pool, sub, "success", "DELETE under write grant").await;
+
+    // Confirm the row is gone.
+    let resp = call_run_query(
+        url,
+        bearer,
+        "target",
+        "app",
+        &format!("SELECT count(*)::int8 AS n FROM \"{table}\""),
+        None,
+    )
+    .await;
+    assert_eq!(payload(&resp)["rows"][0][0], 0, "delete did not commit");
+
+    // Schema mods stay blocked *even with* the write grant — data only.
+    for (sql, label) in [
+        (
+            format!("DROP TABLE \"{table}\""),
+            "DROP blocked under write grant",
+        ),
+        (
+            format!("ALTER TABLE \"{table}\" ADD COLUMN x int"),
+            "ALTER blocked under write grant",
+        ),
+        (
+            format!("TRUNCATE \"{table}\""),
+            "TRUNCATE blocked under write grant",
+        ),
+        (
+            "CREATE TABLE nope (id int)".to_string(),
+            "CREATE blocked under write grant",
+        ),
+    ] {
+        let resp = call_run_query(url, bearer, "target", "app", &sql, None).await;
+        assert_eq!(resp["result"]["isError"], true, "{label}: {resp}");
+        assert_eq!(payload(&resp)["code"], "forbidden_sql", "{label}");
+        assert_audit_outcome(pool, sub, "forbidden_sql", label).await;
+    }
+
+    // Cleanup.
+    sqlx::query(&format!("DROP TABLE IF EXISTS \"{table}\""))
+        .execute(&target)
+        .await
+        .expect("drop scratch table");
+}
+
+/// A read-only (`query_read`) caller must NOT be able to write, even though the
+/// underlying dev role is write-capable — the guard is the gate.
+#[tokio::test]
+async fn run_query_read_grant_cannot_write() {
+    let booted = boot_gateway().await; // engineers → query_read only
+    let (url, bearer, pool, sub) = (
+        booted.url.as_str(),
+        booted.bearer.as_str(),
+        &booted.state_db,
+        booted.user_sub.as_str(),
+    );
+    let resp = call_run_query(
+        url,
+        bearer,
+        "target",
+        "app",
+        "INSERT INTO whatever (id) VALUES (1)",
+        None,
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], true, "{resp}");
+    assert_eq!(
+        payload(&resp)["code"],
+        "forbidden_sql",
+        "read grant must reject writes"
+    );
+    assert_audit_outcome(pool, sub, "forbidden_sql", "INSERT under read grant").await;
 }
 
 #[tokio::test]

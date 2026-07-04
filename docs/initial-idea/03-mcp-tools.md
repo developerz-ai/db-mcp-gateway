@@ -30,7 +30,9 @@ Args: `server`, `database`, `table`, optional `limit` (default 10, capped). Retu
 
 ### `run_query`
 
-Args: `server`, `database`, `sql`, optional `limit`, optional `reason`. Executes under the read-only role with statement timeout. Returns rows + truncation flag + execution stats. The primary tool.
+Args: `server`, `database`, `sql`, optional `limit`, optional `reason`. Executes under the caller's grant with statement timeout. Returns rows + truncation flag + execution stats. The primary tool.
+
+**Read vs. write is per-grant.** With a `query_read` grant the sql guard accepts only read-only statements (`SELECT` / `EXPLAIN`). A `query_write` grant on the target `(server, database)` additionally lets a single top-level `INSERT` / `UPDATE` / `DELETE` through — **data writes only**. Schema modification (`CREATE` / `ALTER` / `DROP` / `TRUNCATE`), `GRANT` / `REVOKE`, `COPY`, transaction control, and multi-statement bodies are rejected in **both** modes; the gateway never issues DDL. Writes also require the target-DB role to actually hold write privileges — the gateway does not provision them (see [06-permissions](06-permissions.md) and CLAUDE.md non-negotiable #3). Writes commit synchronously before the response returns, and every write is audited exactly like a read. Mongo targets remain read-only regardless of grant.
 
 **Statement-timeout ceiling:** every query is subject to a hard 30 s ceiling regardless of the per-grant `statement_timeout_ms` value. A grant may set a shorter timeout; it may not exceed 30 s — the gateway clamps it. The timeout is enforced both DB-side (`SET LOCAL statement_timeout`) and by a Tokio guard as belt-and-suspenders. A query that exceeds it returns `timeout`.
 
@@ -54,7 +56,7 @@ Errors are structured JSON, not free-text strings. Shape: `{ "error": { "categor
 |---|---|---|
 | `unauthenticated` | 401 | Token missing/expired — agent triggers re-login |
 | `forbidden` | 403 | Authenticated but permission denied for this server/db/action |
-| `forbidden_sql` | 403 | SQL rejected before reaching the DB: write statement, `EXPLAIN ANALYZE`, or dangerous function (`pg_read_file`, `lo_export`, …) |
+| `forbidden_sql` | 403 | SQL rejected before reaching the DB: statement not covered by the grant (a write without `query_write`, or a schema mod / `COPY` / multi-statement in any mode), `EXPLAIN ANALYZE`, or dangerous function (`pg_read_file`, `lo_export`, …) |
 | `reason_required` | 400 | Policy requires a reason for this call; none provided |
 | `timeout` | 408 | Statement timeout fired (30 s ceiling) |
 | `row_limit_exceeded` | 200 | Result truncated at configured cap (flag in response, not an error response) |
