@@ -1,26 +1,43 @@
-//! AST-level guard against non-read-only SQL. Defense in depth on top of the
-//! Postgres role being read-only — if a DBA accidentally grants write
-//! privileges to the `*_ro` role, the gateway still refuses to send a write
-//! query to the DB.
+//! AST-level guard for SQL sent to a target DB. Defense in depth on top of the
+//! Postgres role's privileges — if a DBA accidentally grants a role more than
+//! its grant's action warrants, the gateway still refuses to send the query.
 //!
-//! The contract: `is_read_only(sql)` parses the SQL with the Postgres
-//! dialect and accepts only:
+//! Two access levels, selected by the caller's authz decision:
 //!
-//! - a single `SELECT` (with or without CTEs), recursively read-only
-//! - a single non-`ANALYZE` `EXPLAIN` wrapping one of the above
+//! - [`Access::ReadOnly`] (the `query_read` default) accepts only:
+//!   - a single `SELECT` (with or without CTEs), recursively read-only
+//!   - a single non-`ANALYZE` `EXPLAIN` wrapping one of the above
+//! - [`Access::ReadWrite`] (requires a `query_write` grant) additionally
+//!   accepts a single top-level `INSERT` / `UPDATE` / `DELETE` — **data
+//!   writes only**. Schema modification stays blocked in *both* modes:
+//!   `CREATE` / `ALTER` / `DROP` / `TRUNCATE`, `GRANT` / `REVOKE`, `COPY`,
+//!   transaction control, and multiple statements are always rejected. A
+//!   write's read positions (its source `SELECT`, `VALUES`, `WHERE`,
+//!   assignments, `RETURNING`) are still walked for the denied
+//!   filesystem/network functions.
 //!
-//! Everything else — multiple statements, `SELECT ... FOR UPDATE/SHARE`,
-//! `SELECT ... INTO`, a write hidden in a CTE or subquery, `EXPLAIN ANALYZE`
-//! (which executes), DDL, `GRANT/REVOKE`, transaction control, anything we
-//! don't recognise — is rejected with a typed error. Conservative on purpose:
-//! better to reject a legitimate exotic SELECT than quietly allow a write.
+//! Anything not explicitly recognised — a write hidden in a CTE or subquery,
+//! `SELECT ... FOR UPDATE/SHARE`, `SELECT ... INTO`, `EXPLAIN ANALYZE` (which
+//! executes) — is rejected with a typed error. Conservative on purpose: better
+//! to reject a legitimate exotic statement than quietly send an unintended one.
 
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Query, Select, SelectItem,
-    SetExpr, Statement, TableFactor, TableWithJoins,
+    Assignment, Delete, Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments,
+    GroupByExpr, Insert, OnConflictAction, OnInsert, Query, Select, SelectItem, SetExpr, Statement,
+    TableFactor, TableWithJoins,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
+
+/// How much a query is allowed to do, decided upstream by the caller's grant
+/// (`query_read` → [`Access::ReadOnly`]; `query_write` → [`Access::ReadWrite`]).
+/// Only ever *widens* the read-only baseline to permit data writes — never
+/// relaxes the schema-modification or denied-function guards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    ReadOnly,
+    ReadWrite,
+}
 
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum GuardError {
@@ -65,7 +82,16 @@ const DENIED_FUNCTIONS: &[&str] = &[
     "lo_import",
 ];
 
+/// Read-only guard — the `query_read` default. Equivalent to
+/// `check_sql(sql, Access::ReadOnly)`.
 pub fn is_read_only(sql: &str) -> Result<(), GuardError> {
+    check_sql(sql, Access::ReadOnly)
+}
+
+/// Parse `sql` and enforce the guard at the given [`Access`] level. A single
+/// statement only — multiple statements are rejected in both modes so a write
+/// can never ride in behind a leading `SELECT`.
+pub fn check_sql(sql: &str, access: Access) -> Result<(), GuardError> {
     let dialect = PostgreSqlDialect {};
     let statements = Parser::parse_sql(&dialect, sql).map_err(|e| match e {
         ParserError::ParserError(_)
@@ -79,16 +105,35 @@ pub fn is_read_only(sql: &str) -> Result<(), GuardError> {
         n => return Err(GuardError::MultiStatement(n)),
     }
 
-    check_statement(&statements[0])
+    check_statement(&statements[0], access)
 }
 
-fn check_statement(stmt: &Statement) -> Result<(), GuardError> {
+fn check_statement(stmt: &Statement, access: Access) -> Result<(), GuardError> {
+    // Data writes ride the same denied-function / no-schema-mod rails as reads;
+    // they are only *reachable* under `Access::ReadWrite`. Guarded arms come
+    // first so read mode falls through to the explicit `NotAllowed` rejections.
     match stmt {
+        Statement::Insert(insert) if access == Access::ReadWrite => check_insert(insert),
+        Statement::Update {
+            table,
+            assignments,
+            from,
+            selection,
+            returning,
+        } if access == Access::ReadWrite => check_update(
+            table,
+            assignments,
+            from.as_ref(),
+            selection.as_ref(),
+            returning.as_deref(),
+        ),
+        Statement::Delete(delete) if access == Access::ReadWrite => check_delete(delete),
+
         Statement::Query(query) => check_query(query),
         // EXPLAIN ANALYZE *executes* its target (so it would run a writable CTE),
         // unlike plain EXPLAIN which only plans — reject it outright.
         Statement::Explain { analyze: true, .. } => Err(GuardError::ExplainAnalyze),
-        Statement::Explain { statement, .. } => check_statement(statement),
+        Statement::Explain { statement, .. } => check_statement(statement, access),
         Statement::ExplainTable { .. } => Ok(()), // `\d table` analog; read-only
         // Explicitly call out the families we reject so the error message is
         // useful — a single catch-all would say "Statement" for everything.
@@ -140,7 +185,17 @@ fn check_set_expr(body: &SetExpr) -> Result<(), GuardError> {
         // `SELECT ... INTO new_table` materializes a table — DDL, not a read.
         SetExpr::Select(select) if select.into.is_some() => Err(GuardError::SelectInto),
         SetExpr::Select(select) => check_select(select),
-        SetExpr::Values(_) | SetExpr::Table(_) => Ok(()),
+        // Walk `VALUES (…)` rows so a denied function can't hide in a literal
+        // list — reachable from `INSERT … VALUES` and bare `VALUES` bodies.
+        SetExpr::Values(values) => {
+            for row in &values.rows {
+                for expr in row {
+                    check_expr(expr)?;
+                }
+            }
+            Ok(())
+        }
+        SetExpr::Table(_) => Ok(()),
         SetExpr::Query(inner) => check_query(inner),
         SetExpr::SetOperation { left, right, .. } => {
             check_set_expr(left)?;
@@ -154,15 +209,7 @@ fn check_set_expr(body: &SetExpr) -> Result<(), GuardError> {
 /// Walk the expressions inside a SELECT node to catch denied function calls
 /// in the projection, FROM, WHERE, HAVING, and GROUP BY clauses.
 fn check_select(select: &Select) -> Result<(), GuardError> {
-    for item in &select.projection {
-        match item {
-            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                check_expr(e)?;
-            }
-            // Wildcards contain no callable expressions.
-            SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(..) => {}
-        }
-    }
+    check_select_items(&select.projection)?;
     // FROM clause — catches set-returning functions like `pg_ls_dir('/tmp')`
     // used directly as a table source.
     for twj in &select.from {
@@ -178,6 +225,113 @@ fn check_select(select: &Select) -> Result<(), GuardError> {
     }
     if let Some(having) = &select.having {
         check_expr(having)?;
+    }
+    Ok(())
+}
+
+/// Walk a projection / `RETURNING` list for denied function calls. Wildcards
+/// carry no callable expressions.
+fn check_select_items(items: &[SelectItem]) -> Result<(), GuardError> {
+    for item in items {
+        match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                check_expr(e)?;
+            }
+            SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(..) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Walk `SET col = <expr>` assignments (UPDATE, `ON CONFLICT DO UPDATE`,
+/// `ON DUPLICATE KEY UPDATE`) for denied functions in the assigned values.
+fn check_assignments(assignments: &[Assignment]) -> Result<(), GuardError> {
+    for a in assignments {
+        check_expr(&a.value)?;
+    }
+    Ok(())
+}
+
+/// `INSERT` under `Access::ReadWrite`. The write itself is permitted; every
+/// read position it carries is still guarded — the source query/`VALUES` must
+/// be read-only (no data-modifying CTE) and denied-function-free, and the
+/// `RETURNING` / `ON CONFLICT` clauses are walked too.
+fn check_insert(insert: &Insert) -> Result<(), GuardError> {
+    if let Some(source) = &insert.source {
+        check_query(source)?;
+    }
+    if let Some(returning) = &insert.returning {
+        check_select_items(returning)?;
+    }
+    if let Some(on) = &insert.on {
+        match on {
+            OnInsert::DuplicateKeyUpdate(assignments) => check_assignments(assignments)?,
+            OnInsert::OnConflict(on_conflict) => match &on_conflict.action {
+                OnConflictAction::DoNothing => {}
+                OnConflictAction::DoUpdate(do_update) => {
+                    check_assignments(&do_update.assignments)?;
+                    if let Some(selection) = &do_update.selection {
+                        check_expr(selection)?;
+                    }
+                }
+            },
+            // `OnInsert` is #[non_exhaustive]; an unrecognised ON clause can't
+            // be walked for denied functions, so reject rather than pass it on.
+            _ => return Err(GuardError::NotAllowed("unsupported ON clause")),
+        }
+    }
+    Ok(())
+}
+
+/// `UPDATE` under `Access::ReadWrite`. Assigned values, the optional `FROM`
+/// read source, the `WHERE` predicate, and `RETURNING` are all walked; the
+/// target table is a plain name that carries nothing callable.
+fn check_update(
+    table: &TableWithJoins,
+    assignments: &[Assignment],
+    from: Option<&TableWithJoins>,
+    selection: Option<&Expr>,
+    returning: Option<&[SelectItem]>,
+) -> Result<(), GuardError> {
+    check_table_with_joins(table)?;
+    check_assignments(assignments)?;
+    if let Some(from) = from {
+        check_table_with_joins(from)?;
+    }
+    if let Some(selection) = selection {
+        check_expr(selection)?;
+    }
+    if let Some(returning) = returning {
+        check_select_items(returning)?;
+    }
+    Ok(())
+}
+
+/// `DELETE` under `Access::ReadWrite`. Target/`USING` tables, the `WHERE`
+/// predicate, `RETURNING`, and the MySQL `ORDER BY` / `LIMIT` tail are walked.
+fn check_delete(delete: &Delete) -> Result<(), GuardError> {
+    let tables = match &delete.from {
+        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+    };
+    for twj in tables {
+        check_table_with_joins(twj)?;
+    }
+    if let Some(using) = &delete.using {
+        for twj in using {
+            check_table_with_joins(twj)?;
+        }
+    }
+    if let Some(selection) = &delete.selection {
+        check_expr(selection)?;
+    }
+    if let Some(returning) = &delete.returning {
+        check_select_items(returning)?;
+    }
+    for order in &delete.order_by {
+        check_expr(&order.expr)?;
+    }
+    if let Some(limit) = &delete.limit {
+        check_expr(limit)?;
     }
     Ok(())
 }
@@ -593,6 +747,143 @@ mod tests {
         ok("SELECT sum(amount) FROM orders GROUP BY user_id");
         ok("SELECT lower(email) FROM users");
         ok("SELECT coalesce(name, 'unknown') FROM t");
+    }
+
+    // --- Write mode (Access::ReadWrite) -------------------------------------
+
+    fn ok_write(sql: &str) {
+        let got = check_sql(sql, Access::ReadWrite);
+        assert!(
+            got.is_ok(),
+            "expected `{sql}` allowed for writes, got {got:?}"
+        );
+    }
+
+    fn rejected_write_not_allowed(sql: &str, kind: &str) {
+        match check_sql(sql, Access::ReadWrite) {
+            Err(GuardError::NotAllowed(got)) => assert_eq!(got, kind, "for `{sql}`"),
+            other => panic!("expected NotAllowed({kind}) for `{sql}`, got {other:?}"),
+        }
+    }
+
+    fn rejected_write(sql: &str, want: GuardError) {
+        let got = check_sql(sql, Access::ReadWrite);
+        assert_eq!(
+            got,
+            Err(want.clone()),
+            "expected `{sql}` rejected as {want:?}, got {got:?}"
+        );
+    }
+
+    fn rejected_write_denied(sql: &str, fn_name: &str) {
+        match check_sql(sql, Access::ReadWrite) {
+            Err(GuardError::DeniedFunction(got)) => assert_eq!(got, fn_name, "for `{sql}`"),
+            other => panic!("expected DeniedFunction({fn_name}) for `{sql}`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_mode_allows_data_writes() {
+        ok_write("INSERT INTO users (id, email) VALUES (1, 'a@b.c')");
+        ok_write("INSERT INTO archive SELECT * FROM users WHERE active = false");
+        ok_write("UPDATE users SET email = 'x@y.z' WHERE id = 1");
+        ok_write("DELETE FROM users WHERE id = 1");
+        ok_write("INSERT INTO t (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET id = 2");
+        ok_write("INSERT INTO t (id) VALUES (1) ON CONFLICT DO NOTHING");
+        ok_write("DELETE FROM users WHERE id = 1 RETURNING id, email");
+    }
+
+    #[test]
+    fn write_mode_still_allows_reads() {
+        // Read is a subset of read-write — a `query_write` caller can still SELECT.
+        ok_write("SELECT id, email FROM users WHERE id = 1");
+        ok_write("WITH x AS (SELECT 1) SELECT * FROM x");
+        ok_write("EXPLAIN SELECT 1");
+    }
+
+    #[test]
+    fn write_mode_still_blocks_schema_mods() {
+        // "write data, no schema mods" — DDL and privilege ops stay blocked
+        // even with a write grant.
+        rejected_write_not_allowed("TRUNCATE users", "TRUNCATE");
+        rejected_write_not_allowed("DROP TABLE users", "DROP");
+        rejected_write_not_allowed("CREATE TABLE t (id int)", "CREATE TABLE");
+        rejected_write_not_allowed("ALTER TABLE users ADD COLUMN x int", "ALTER TABLE");
+        rejected_write_not_allowed("GRANT SELECT ON users TO bob", "GRANT");
+        rejected_write_not_allowed("REVOKE SELECT ON users FROM bob", "REVOKE");
+        rejected_write_not_allowed("COPY users FROM '/tmp/foo'", "COPY");
+        rejected_write_not_allowed("BEGIN", "BEGIN/START");
+    }
+
+    #[test]
+    fn write_mode_still_rejects_multi_statement() {
+        // A write can't ride in behind another statement.
+        assert!(matches!(
+            check_sql("DELETE FROM users; DROP TABLE users", Access::ReadWrite),
+            Err(GuardError::MultiStatement(2))
+        ));
+        assert!(matches!(
+            check_sql(
+                "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)",
+                Access::ReadWrite
+            ),
+            Err(GuardError::MultiStatement(2))
+        ));
+    }
+
+    #[test]
+    fn write_mode_still_blocks_denied_functions() {
+        // Filesystem/network functions stay denied in every read position of a
+        // write statement.
+        rejected_write_denied(
+            "INSERT INTO t (data) VALUES (pg_read_file('/etc/passwd'))",
+            "pg_read_file",
+        );
+        rejected_write_denied(
+            "INSERT INTO t SELECT pg_read_file('/etc/passwd')",
+            "pg_read_file",
+        );
+        rejected_write_denied(
+            "UPDATE t SET data = pg_read_file('/etc/passwd') WHERE id = 1",
+            "pg_read_file",
+        );
+        rejected_write_denied(
+            "DELETE FROM t WHERE data = pg_read_file('/etc/passwd')",
+            "pg_read_file",
+        );
+        rejected_write_denied(
+            "DELETE FROM t WHERE id = 1 RETURNING pg_read_file('/etc/passwd')",
+            "pg_read_file",
+        );
+        rejected_write_denied(
+            "INSERT INTO t (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET data = pg_read_file('/x')",
+            "pg_read_file",
+        );
+    }
+
+    #[test]
+    fn write_mode_rejects_write_hidden_in_select_body() {
+        // Write mode widens to a *top-level* INSERT/UPDATE/DELETE only. A write
+        // buried in a SELECT's CTE stays rejected — the top-level statement is a
+        // Query, which is always walked read-only. Use a plain write instead.
+        rejected_write(
+            "WITH x AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM x",
+            GuardError::WriteInReadPath("INSERT"),
+        );
+        rejected_write(
+            "WITH x AS (UPDATE t SET a = 1 RETURNING id) SELECT * FROM x",
+            GuardError::WriteInReadPath("UPDATE"),
+        );
+    }
+
+    #[test]
+    fn read_mode_rejects_writes_write_mode_gates_them() {
+        // The same INSERT: rejected under ReadOnly, allowed under ReadWrite.
+        assert!(matches!(
+            check_sql("INSERT INTO t VALUES (1)", Access::ReadOnly),
+            Err(GuardError::NotAllowed("INSERT"))
+        ));
+        assert!(check_sql("INSERT INTO t VALUES (1)", Access::ReadWrite).is_ok());
     }
 }
 

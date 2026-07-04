@@ -109,6 +109,10 @@ async fn compute_outcome(
         return error_outcome(id, "forbidden", "no grants for this server/database");
     };
 
+    // Constraints come from the read-level merge: it matches *every* grant that
+    // applies to this (server, db) — `query_write` included, since it implies
+    // `query_read` — so the most-restrictive value across all of them always
+    // wins, and a write can never dodge a tighter read grant's caps.
     let decision = authz::evaluate_effective(
         identity,
         Action::QueryRead,
@@ -124,6 +128,26 @@ async fn compute_outcome(
         }
     };
 
+    // A separate `query_write` check decides whether data writes are permitted.
+    // Only `query_write` grants satisfy it (`query_read` does not imply write),
+    // so read-only callers stay on the read-only guard.
+    let writes_allowed = matches!(
+        authz::evaluate_effective(
+            identity,
+            Action::QueryWrite,
+            &server.name,
+            &database.name,
+            &config.permissions,
+            db_grants,
+        ),
+        Decision::Allow { .. }
+    );
+    let access = if writes_allowed {
+        sql_guard::Access::ReadWrite
+    } else {
+        sql_guard::Access::ReadOnly
+    };
+
     if constraints.require_reason && args.reason.as_deref().is_none_or(str::is_empty) {
         return error_outcome(
             id,
@@ -132,14 +156,18 @@ async fn compute_outcome(
         );
     }
 
-    // Defense-in-depth on top of the read-only role: reject writes / DDL /
-    // multi-statement before they ever hit the pool. See exec::sql_guard.
+    // Defense-in-depth on top of the DB role: reject anything the grant doesn't
+    // cover before it hits the pool. Read-only callers get `is_read_only`;
+    // `query_write` callers additionally get single-statement INSERT/UPDATE/
+    // DELETE — never schema mods. See exec::sql_guard.
     //
     // pg only: `sql_guard` is a SQL parser; mongo commands are JSON-shaped
     // BSON, not SQL. `MongoAdapter::execute` runs its own read-only
-    // rejector (`src/exec/mongo/rejector.rs`) as the equivalent guard.
+    // rejector (`src/exec/mongo/rejector.rs`) as the equivalent guard. Mongo
+    // writes are not offered here — a `query_write` grant on a mongo DB still
+    // hits the read-only rejector.
     if matches!(server.kind, crate::config::ServerKind::Postgres) {
-        if let Err(err) = sql_guard::is_read_only(&args.sql) {
+        if let Err(err) = sql_guard::check_sql(&args.sql, access) {
             return error_outcome(
                 id,
                 "forbidden_sql",

@@ -166,7 +166,9 @@ The result was clipped at the grant's `row_limit`. Add a `LIMIT`, a tighter `WHE
 
 ### "I want to write, not just read"
 
-By design, every grant defaults to read-only. Writes need (a) an explicit `query_write` grant in the YAML AND (b) a target-DB role with write privileges. Both are operator-side changes, behind a PR review. The gateway will never let an agent self-elevate.
+By design, every grant defaults to read-only. Writes need (a) an explicit `query_write` grant on that `(server, database)` AND (b) a target-DB role with write privileges. Both are operator-side changes, behind a PR review. The gateway will never let an agent self-elevate.
+
+A `query_write` grant permits **data writes only** — a single `INSERT`, `UPDATE`, or `DELETE` per call, run through `run_query` exactly like a read (same statement timeout, row cap, and synchronous audit). Schema changes stay blocked no matter what: `CREATE` / `ALTER` / `DROP` / `TRUNCATE`, `GRANT` / `REVOKE`, and multi-statement bodies are all rejected with `forbidden_sql`. The gateway never issues DDL.
 
 ### Token expired silently
 

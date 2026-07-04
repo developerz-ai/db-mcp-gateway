@@ -20,7 +20,7 @@ Your team deploys it once. Developers add one URL to their AI agent's MCP config
 
 - 🤖 **MCP tool surface** — `list_databases`, `describe_schema`, `sample_table`, `run_query`, `explain`, `get_query_history`.
 - 🔑 **OIDC SSO** — Okta, Google Workspace, Entra, Authentik, Keycloak. Browser-flow login from the agent (no embedded browser needed).
-- 🎯 **Per-database read-only roles** — statement timeouts and row caps enforced at the DB *and* gateway layer.
+- 🎯 **Read-only by default, writes opt-in per grant** — per-database least-privilege roles; a `query_write` grant permits data writes (INSERT/UPDATE/DELETE), never schema changes. Statement timeouts and row caps enforced at the DB *and* gateway layer.
 - 📋 **Permissions in YAML** — group × server × database × action, with per-grant constraints (`require_reason`, `row_limit`, `statement_timeout_ms`, allow/deny schemas, time windows).
 - 📊 **Synchronous audit log** — user, SQL, reason, row count, duration, outcome. Hot retention in Postgres, optional S3/GCS/Azure archive, OTLP/syslog/stdout sinks.
 - 🐳 **Boring deployment** — `docker pull` + one YAML file + one Postgres.

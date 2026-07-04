@@ -63,6 +63,22 @@ servers:
         password: ${FILE:/run/secrets/staging-app-ro-password}
         # pool: { max_connections: 5 }    # planned — see comment above
 
+  # Analytics server with a write-capable sandbox DB. The role below actually
+  # holds INSERT/UPDATE/DELETE on `sandbox` — writes need BOTH a `query_write`
+  # grant (see permissions) AND a write-privileged DB role. Grant this role only
+  # DML, never DDL: the gateway blocks schema changes, but least-privilege at
+  # the DB is the primary control.
+  - name: analytics
+    kind: postgres
+    host: analytics.db.internal
+    port: 5432
+    tls: required
+    databases:
+      - name: sandbox
+        role: mcp_gateway_analytics_sandbox_rw
+        password: vault:secret/analytics/db/sandbox_rw_password
+        description: "Scratch DB — data-platform writers land here"
+
 # Spec 12 §"Admin API". Default off — turn on only when you need the
 # SSO-gated runtime CRUD over `/admin/v1/*`. Required when on:
 #   group — the SSO claim that authorizes admin calls.
@@ -103,6 +119,20 @@ permissions:
         action: query_read
         constraints:
           row_limit: 10000
+
+  # Writes are opt-in per (server, database) via `action: query_write`. This
+  # permits single-statement INSERT / UPDATE / DELETE on the named DB only —
+  # data writes, never schema changes (CREATE/ALTER/DROP/TRUNCATE stay blocked).
+  # The target-DB role for that database must ALSO hold write privileges; the
+  # gateway does not provision them. `require_reason` is recommended so every
+  # mutation is justified in the audit log.
+  - group: data-platform-writers
+    grants:
+      - server: analytics
+        database: sandbox
+        action: query_write
+        constraints:
+          require_reason: true
 
 logging:
   hot_retention_days: 90

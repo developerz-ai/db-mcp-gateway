@@ -1,9 +1,9 @@
 [package]
 name = "db-mcp-gateway"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Self-hosted MCP gateway for credentialled, audited, read-only database access by AI agents"
+description = "Self-hosted MCP gateway for credentialled, audited, policy-scoped database access by AI agents — read-only by default, writes opt-in per grant"
 license = "MIT"
 repository = "https://github.com/developerz-ai/db-mcp-gateway"
 readme = "README.md"
