@@ -118,8 +118,13 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Prebuilt cargo-audit binary instead of `cargo install` (source compile
+      # every run). taiki-e/install-action pulls the release binary; the audit
+      # invocation and audit.toml ignore semantics below are unchanged.
       - name: install cargo-audit
-        run: cargo install --locked cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
       # RUSTSEC-2023-0071 (rsa via sqlx-mysql) is unreachable: we only enable
       # the postgres backend, sqlx-mysql is pulled in transitively but never
       # executed. See audit.toml for the long-form justification.
