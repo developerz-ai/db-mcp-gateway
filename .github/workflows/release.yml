@@ -27,7 +27,11 @@ jobs:
   # below) already memoises the dependency build across runs.
   build:
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    # arm64 is a 2-vCPU runner (no larger arm size provisioned). A release whose
+    # Cargo.lock changed busts the cached cargo layer and forces a cold full
+    # recompile there, which overran the old 30-min cap (v1.2.1). amd64 (8-vCPU)
+    # finishes in ~12m regardless, so a higher ceiling only affects cold arm64.
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
