@@ -13,11 +13,7 @@ use super::protocol::{EmptyResult, InitializeResult, ToolsListResult};
 /// for notifications (which by definition expect no reply). `tools/call` is
 /// not handled here — see `tools::dispatch_call` for the stateful path.
 pub fn dispatch(request: Request) -> Option<Response> {
-    let Request {
-        id,
-        method,
-        ..
-    } = request;
+    let Request { id, method, .. } = request;
     let is_notification = id.is_none();
     let response_id = || id.clone().unwrap_or(Value::Null);
 
