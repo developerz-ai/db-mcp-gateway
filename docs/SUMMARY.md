@@ -37,6 +37,7 @@
 - [Config](initial-idea/08-config.md)
 - [Deployment topology](initial-idea/09-deployment.md)
 - [Dynamic permissions](initial-idea/12-dynamic-permissions.md)
+- [Docs site + Pages contract](initial-idea/13-docs-site.md)
 
 # Project
 

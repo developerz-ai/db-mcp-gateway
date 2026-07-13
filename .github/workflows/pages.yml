@@ -63,6 +63,23 @@ jobs:
           # docs/sec/ (WIP notes not listed in SUMMARY.md). Strip both before
           # uploading so we don't ship the landing page twice or leak notes.
           rm -rf docs/site/docs/site docs/site/docs/sec
+      # Belt-and-braces: SUMMARY.md does not gate what mdBook publishes, so a
+      # stray .yaml/.env/.pem/... under docs/ would ride the recursive copy
+      # into the artifact. Refuse to upload if any lands. Contract lives in
+      # docs/initial-idea/13-docs-site.md.
+      - name: Guard Pages artifact against sensitive assets
+        run: |
+          set -euo pipefail
+          mapfile -t offenders < <(find docs/site -type f \
+            \( -iname '*.yaml' -o -iname '*.yml' \
+               -o -iname '*.env' -o -iname '.env.*' \
+               -o -iname '*.pem' -o -iname '*.key' \
+               -o -iname '*.toml' -o -iname '*.sql' \))
+          if (( ${#offenders[@]} > 0 )); then
+            printf '::error::Refusing to publish Pages artifact — sensitive/config asset(s) present:\n'
+            printf '  %s\n' "${offenders[@]}"
+            exit 1
+          fi
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:

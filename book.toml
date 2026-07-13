@@ -9,7 +9,10 @@ description = "Self-hosted MCP gateway for AI agents that need database access â
 authors = ["developerz-ai"]
 language = "en"
 src = "docs"
-# Files not listed in docs/SUMMARY.md are ignored, not built.
+# SUMMARY.md gates *rendering* only. mdBook still recursive-copies every
+# non-.md asset under src (= docs/) into build-dir. The Pages workflow
+# strips known offenders (docs/site/, docs/sec/) and fails on unexpected
+# sensitive/config assets before uploading. See docs/initial-idea/13-docs-site.md.
 
 [build]
 build-dir = "docs/site/docs"
