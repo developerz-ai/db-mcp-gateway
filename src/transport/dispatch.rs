@@ -16,7 +16,6 @@ pub fn dispatch(request: Request) -> Option<Response> {
     let Request {
         id,
         method,
-        params: _,
         ..
     } = request;
     let is_notification = id.is_none();
