@@ -25,9 +25,13 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
+    # Job-level permissions replace workflow-level (they do not merge), so
+    # contents: read must be repeated here for actions/checkout to keep repo
+    # read access alongside the Pages-deploy scopes.
     permissions:
+      contents: read
       pages: write
       id-token: write
     environment:
