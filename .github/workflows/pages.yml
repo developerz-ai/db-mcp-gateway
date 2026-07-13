@@ -63,6 +63,30 @@ jobs:
           # docs/sec/ (WIP notes not listed in SUMMARY.md). Strip both before
           # uploading so we don't ship the landing page twice or leak notes.
           rm -rf docs/site/docs/site docs/site/docs/sec
+      # Smoke-check the six public links off the landing page + the theme
+      # override CSS. A future doc rename that breaks a CTA fails the build
+      # here instead of shipping a dead link. Contract lives in
+      # docs/site/index.html header/quick-links.
+      - name: Smoke-check docs landing links + theme CSS
+        run: |
+          set -euo pipefail
+          for page in \
+            docs/deployment/quickstart.html \
+            docs/usage/first-query.html \
+            docs/usage/claude-code.html \
+            docs/usage/other-agents.html \
+            docs/comparison.html \
+            docs/benchmarks.html
+          do
+            if [[ ! -f "docs/site/$page" ]]; then
+              printf '::error::Missing landing-page target: docs/site/%s\n' "$page"
+              exit 1
+            fi
+          done
+          if ! find docs/site -type f -name 'db-mcp-overrides.css' | grep -q .; then
+            printf '::error::mdBook did not emit theme/db-mcp-overrides.css into the site\n'
+            exit 1
+          fi
       # Belt-and-braces: SUMMARY.md does not gate what mdBook publishes, so a
       # stray .yaml/.env/.pem/... under docs/ would ride the recursive copy
       # into the artifact. Refuse to upload if any lands. Contract lives in
