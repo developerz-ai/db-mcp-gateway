@@ -1,5 +1,7 @@
 # Summary
 
+<!-- This file is mdBook's index — the sidebar structure of /docs/. See book.toml at the repo root. -->
+
 [Introduction](initial-idea/01-overview.md)
 
 # Getting started
