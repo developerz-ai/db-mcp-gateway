@@ -15,7 +15,7 @@
 
   --sidebar-bg: #0d0d0f;
   --sidebar-fg: #a1a1aa;      /* zinc-400 */
-  --sidebar-non-existent: #52525b;
+  --sidebar-non-existant: #52525b;
   --sidebar-active: #10b981;  /* emerald-500 */
   --sidebar-spacer: #27272a;  /* zinc-800 */
 
@@ -56,7 +56,7 @@
 /* ── Typography — match the landing page (system-ui with Inter fallback). ── */
 :root.navy body,
 :root.navy .content {
-  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
 }
 :root.navy code,
