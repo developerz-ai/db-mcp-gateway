@@ -183,3 +183,11 @@
   padding: 8px 12px;
   font-size: 14px;
 }
+
+/* ── Hide the desktop prev/next chapter chevrons (left + right of content).
+ * The sidebar already gives the same navigation without cluttering the reading
+ * surface. Mobile bottom-bar nav (.mobile-nav-chapters) is left alone since
+ * it's the only chapter-nav path on small viewports. ── */
+:root.navy .nav-chapters {
+  display: none;
+}
