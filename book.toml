@@ -26,6 +26,9 @@ git-repository-icon = "fa-github"
 edit-url-template = "https://github.com/developerz-ai/db-mcp-gateway/edit/main/docs/{path}"
 site-url = "/db-mcp-gateway/docs/"
 no-section-label = true
+# Palette + typography override that matches the landing page (docs/site/index.html).
+# theme/ lives outside src (= docs/), so it isn't touched by mdBook's recursive-copy.
+additional-css = ["theme/db-mcp-overrides.css"]
 
 [output.html.search]
 enable = true
