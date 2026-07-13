@@ -3,6 +3,9 @@ name: pages
 # Publishes the static docs/marketing site in docs/site/ to GitHub Pages.
 # No build step — this is a Rust repo with no YARD/Jekyll pipeline, so we
 # upload docs/site/ as-is and let deploy-pages hand it to the CDN.
+#
+# One-time repo setting before the first run resolves:
+#   gh api -X PUT repos/developerz-ai/db-mcp-gateway/pages -f build_type=workflow
 on:
   push:
     branches: [main]
