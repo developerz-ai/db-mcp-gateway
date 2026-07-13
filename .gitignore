@@ -20,6 +20,9 @@ Cargo.lock.bak
 config/local.yaml
 config/*.local.yaml
 
+# mdBook build output — generated in CI, never committed.
+/docs/site/docs/
+
 # Editors
 .vscode/
 .idea/
