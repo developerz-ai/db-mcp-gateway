@@ -32,13 +32,16 @@ covers both without a separate merge step.
 | `docs/site/llms.txt` | `/llms.txt` | hand-authored |
 | `docs/SUMMARY.md` | sidebar structure | mdBook |
 | `docs/**/*.md` listed in `SUMMARY.md` | `/docs/**/*.html` | mdBook |
-| everything else under `docs/` | copied to `docs/site/docs/**` verbatim | mdBook recursive-copy |
+| everything else under `docs/` not removed by post-build guardrails | copied to `docs/site/docs/**` verbatim | mdBook recursive-copy |
 
 That last row is the gotcha. mdBook has no allowlist / ignore mechanism; it
 copies every non-`.md` file under `src` (= `docs/`) into `build-dir` (=
 `docs/site/docs/`) whether `SUMMARY.md` references it or not. See
-`rust-lang/mdBook#1187`, `#2246`. `SUMMARY.md` gates rendering only, not
-publishing.
+[mdBook `#1187`](https://github.com/rust-lang/mdBook/issues/1187) and
+[mdBook `#2246`](https://github.com/rust-lang/mdBook/issues/2246).
+`SUMMARY.md` gates rendering only, not publishing. The post-build guardrails
+below (`docs/site/docs/site`, `docs/site/docs/sec`) are stripped before upload
+so they never reach the final artifact.
 
 ## Guardrails
 
