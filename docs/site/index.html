@@ -11,181 +11,229 @@
   <meta property="og:description" content="Credentials never leave the gateway. Every query traces SSO user → group → grant → audit row. Permissions as code, reviewed by PR.">
   <meta property="og:url" content="https://developerz-ai.github.io/db-mcp-gateway/">
   <meta name="twitter:card" content="summary">
-  <meta name="theme-color" content="#0d1117">
+  <meta name="theme-color" content="#09090b">
   <meta name="color-scheme" content="dark">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%9B%A1%EF%B8%8F%3C/text%3E%3C/svg%3E">
-  <!-- Font Awesome — matches the wurk site's icon family. -->
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"
-        crossorigin="anonymous" referrerpolicy="no-referrer">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2310b981' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z'/%3E%3Cpath d='m9 12 2 2 4-4'/%3E%3C/svg%3E">
+  <!-- Type: system font stack. Self-contained single-file page — no external
+       font CDN to avoid leaking visitor IPs (GDPR) and to keep zero deps. -->
   <!-- Set early so scroll-reveal elements start hidden only when JS can reveal them (no-JS = visible). -->
   <script>document.documentElement.classList.add('js');</script>
   <style>
-    /* Slate palette — GitHub dark-dimmed lineage, same as the wurk site. */
+    /* ── shadcn/Vercel-inspired zinc palette. One accent (emerald) reserved
+       for primary CTA + brand marks. ── */
     :root {
-      --bg: #0d1117; --panel: #161b22; --panel-2: #21262d;
-      --line: rgba(255,255,255,0.08); --line-strong: #30363d;
-      --fg: #e6edf3; --muted: #8b949e;
-      --accent: #ffffff; --success: #3fb950; --danger: #e5534b; --warning: #d29922;
-      --code: #0d1117; --radius: 8px;
+      --bg: #09090b;             /* zinc-950 */
+      --panel: #18181b;          /* zinc-900 */
+      --panel-2: #27272a;        /* zinc-800 */
+      --line: rgba(255,255,255,0.06);
+      --line-strong: #27272a;    /* zinc-800 */
+      --fg: #fafafa;             /* zinc-50  */
+      --muted: #a1a1aa;          /* zinc-400 */
+      --muted-strong: #d4d4d8;   /* zinc-300 */
+      --accent: #10b981;         /* emerald-500 */
+      --accent-hover: #059669;   /* emerald-600 */
+      --accent-soft: rgba(16,185,129,0.14);
+      --danger: #ef4444;
+      --code: #0a0a0a;
+      --radius: 8px;
+      --radius-lg: 12px;
     }
     * { box-sizing: border-box; }
     html { scroll-behavior: smooth; }
     body {
       margin: 0; background: var(--bg); color: var(--fg);
-      font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font: 15.5px/1.65 'Inter', system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-feature-settings: "cv02", "cv03", "cv04", "cv11";
       -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
     }
     a { color: var(--fg); text-decoration: none; }
-    a:hover { text-decoration: underline; text-underline-offset: 2px; }
-    .wrap { max-width: 960px; margin: 0 auto; padding: 0 20px; }
-    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    a:hover { color: var(--accent); }
+    .wrap { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+    code, pre, kbd { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    code { font-size: 0.9em; padding: 1px 5px; background: var(--panel); border: 1px solid var(--line);
+      border-radius: 5px; color: var(--muted-strong); }
     pre {
       background: var(--code); border: 1px solid var(--line-strong); border-radius: var(--radius);
-      padding: 16px 18px; overflow-x: auto; font-size: 14px; line-height: 1.6; margin: 0;
+      padding: 18px 20px; overflow-x: auto; font-size: 13.5px; line-height: 1.65; margin: 0;
+      color: var(--muted-strong);
     }
-    .add { color: var(--success); } .del { color: var(--danger); } .cmt { color: var(--muted); }
+    pre code { background: transparent; border: none; padding: 0; color: inherit; font-size: inherit; }
+    .add { color: var(--accent); } .cmt { color: var(--muted); } .num { color: #f59e0b; }
 
     /* ── Copy-able code block ── */
     .codeblock { position: relative; }
     .copy-btn {
-      position: absolute; top: 8px; right: 8px;
+      position: absolute; top: 10px; right: 10px;
       display: inline-flex; align-items: center; gap: 6px;
-      padding: 5px 10px; font-size: 12px; font-weight: 600;
-      color: var(--muted); background: var(--panel-2);
-      border: 1px solid var(--line-strong); border-radius: 7px; cursor: pointer;
+      padding: 5px 10px; font-size: 12px; font-weight: 500;
+      color: var(--muted); background: var(--panel);
+      border: 1px solid var(--line-strong); border-radius: 6px; cursor: pointer;
       transition: color .15s, border-color .15s, background .15s; line-height: 1;
+      font-family: 'Inter', sans-serif;
     }
-    .copy-btn:hover { color: var(--fg); border-color: var(--accent); }
-    .copy-btn.copied { color: var(--success); border-color: var(--success); }
+    .copy-btn:hover { color: var(--fg); border-color: var(--muted); background: var(--panel-2); }
+    .copy-btn.copied { color: var(--accent); border-color: var(--accent); }
+    .copy-btn.failed { color: var(--danger); border-color: var(--danger); }
 
     /* ── Header ── */
-    header { border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 10;
-      background: color-mix(in oklch, var(--bg) 88%, transparent);
-      -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
-    nav { display: flex; align-items: center; gap: 20px; padding: 12px 0; }
-    nav .brand { display: inline-flex; align-items: center; gap: 10px;
-      font-weight: 800; font-size: 18px; letter-spacing: -0.02em; }
-    nav .brand .shield { font-size: 22px; line-height: 1; filter: drop-shadow(0 2px 6px rgba(0,0,0,0.45)); }
+    header {
+      border-bottom: 1px solid var(--line);
+      position: sticky; top: 0; z-index: 20;
+      background: rgba(9,9,11,0.75);
+      -webkit-backdrop-filter: saturate(180%) blur(12px); backdrop-filter: saturate(180%) blur(12px);
+    }
+    nav { display: flex; align-items: center; gap: 24px; padding: 14px 0; }
+    nav .brand {
+      display: inline-flex; align-items: center; gap: 10px;
+      font-weight: 600; font-size: 15px; letter-spacing: -0.01em;
+    }
+    nav .brand svg { width: 20px; height: 20px; color: var(--accent); }
+    nav .brand-name { color: var(--fg); }
     nav .spacer { flex: 1; }
-    nav a.navlink { color: var(--muted); font-size: 14px; }
-    nav a.navlink:hover { color: var(--fg); text-decoration: none; }
+    nav a.navlink { color: var(--muted); font-size: 14px; font-weight: 500; transition: color .15s; }
+    nav a.navlink:hover { color: var(--fg); }
+    nav .badge {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 2px 8px; font-size: 11px; font-weight: 500;
+      color: var(--accent); background: var(--accent-soft);
+      border: 1px solid rgba(16,185,129,0.28); border-radius: 999px;
+      font-family: 'JetBrains Mono', monospace;
+    }
 
     /* ── Hero ── */
-    .hero { padding: 64px 0 52px; text-align: center; animation: fade-up .5s ease both; }
-    .hero h1 { font-size: 56px; line-height: 1; margin: 0; letter-spacing: -0.03em; font-weight: 800;
-      display: inline-flex; align-items: center; gap: 14px; justify-content: center; }
-    .hero h1 .shield { font-size: 0.72em; }
-    .hero .strapline { font-size: 20px; font-weight: 600; margin: 14px 0 0; max-width: 780px; margin-left: auto; margin-right: auto; }
-    .hero .lede { font-size: 17px; color: var(--muted); max-width: 680px; margin: 12px auto 28px; }
-    .cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-bottom: 28px; }
+    .hero { padding: 96px 0 80px; text-align: center; animation: fade-up .55s ease both; }
+    .hero .eyebrow {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 5px 12px; margin-bottom: 24px;
+      font-size: 12.5px; font-weight: 500; color: var(--muted-strong);
+      background: var(--panel); border: 1px solid var(--line-strong);
+      border-radius: 999px;
+    }
+    .hero .eyebrow .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+      box-shadow: 0 0 0 3px rgba(16,185,129,0.16); }
+    .hero h1 {
+      font-size: 68px; line-height: 1.02; margin: 0; letter-spacing: -0.045em; font-weight: 700;
+      max-width: 820px; margin-left: auto; margin-right: auto;
+    }
+    .hero h1 .accent { color: var(--accent); }
+    .hero .lede {
+      font-size: 19px; color: var(--muted); max-width: 640px; line-height: 1.55;
+      margin: 20px auto 36px;
+    }
+    .cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-bottom: 44px; }
     .btn {
-      display: inline-flex; align-items: center; gap: 0.5rem;
-      padding: 11px 20px; border-radius: var(--radius); font-weight: 600; font-size: 15px;
-      border: 1px solid var(--line-strong); transition: background .15s, border-color .15s, transform .05s;
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 11px 20px; border-radius: var(--radius); font-weight: 500; font-size: 14.5px;
+      border: 1px solid transparent; transition: background .15s, border-color .15s, color .15s, transform .05s;
+      font-family: 'Inter', sans-serif;
     }
     .btn:hover { text-decoration: none; }
     .btn:active { transform: translateY(1px); }
-    .btn.primary { background: var(--accent); color: #0d1117; border-color: var(--accent); }
-    .btn.primary:hover { filter: brightness(0.94); }
-    .btn.ghost { background: var(--panel); color: var(--fg); }
-    .btn.ghost:hover { border-color: var(--accent); background: var(--panel-2); }
+    .btn.primary { background: var(--accent); color: #062018; border-color: var(--accent); }
+    .btn.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: #062018; }
+    .btn.ghost { background: transparent; color: var(--fg); border-color: var(--line-strong); }
+    .btn.ghost:hover { background: var(--panel); border-color: var(--muted); color: var(--fg); }
     .install { max-width: 620px; margin: 0 auto; text-align: left; }
 
     /* ── Sections ── */
-    section { padding: 48px 0; border-top: 1px solid var(--line); }
-    h2 { font-size: 28px; margin: 0 0 8px; letter-spacing: -0.02em; font-weight: 800; }
-    .section-lede { color: var(--muted); max-width: 720px; margin: 0 0 28px; font-size: 16px; }
-    .pillars { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
-    .pillar { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 22px 20px;
-      box-shadow: 0 1px 2px rgba(0,0,0,0.4); transition: transform .15s ease, border-color .15s ease; }
-    .pillar:hover { transform: translateY(-2px); border-color: var(--line-strong); }
-    .pillar .ic { display: inline-flex; align-items: center; justify-content: center;
-      width: 44px; height: 44px; border-radius: 11px; margin-bottom: 12px;
-      background: var(--panel-2); border: 1px solid var(--line-strong); color: var(--fg); font-size: 18px; }
-    .pillar h3 { margin: 0 0 6px; font-size: 17px; }
-    .pillar p { margin: 0; color: var(--muted); font-size: 14px; }
-
-    /* ── Feature grid ── */
-    .features-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
-    .feature {
-      position: relative; background: var(--panel); border: 1px solid var(--line);
-      border-radius: 14px; padding: 22px 22px 20px;
-      box-shadow: 0 1px 2px rgba(0,0,0,0.4);
-      transition: transform .15s ease, border-color .15s ease, box-shadow .15s ease;
+    section { padding: 72px 0; }
+    section + section { border-top: 1px solid var(--line); }
+    .section-head { max-width: 720px; margin: 0 auto 40px; text-align: center; }
+    .section-head .kicker {
+      display: inline-block; padding: 4px 10px; margin-bottom: 14px;
+      font-size: 11px; font-weight: 600; color: var(--accent);
+      background: var(--accent-soft); border-radius: 999px;
+      text-transform: uppercase; letter-spacing: 0.08em;
+      font-family: 'JetBrains Mono', monospace;
     }
-    .feature:hover { transform: translateY(-3px); border-color: var(--line-strong);
-      box-shadow: 0 10px 28px rgba(0,0,0,0.45); }
+    h2 { font-size: 36px; margin: 0 0 12px; letter-spacing: -0.03em; font-weight: 700; line-height: 1.15; }
+    .section-lede { color: var(--muted); font-size: 16.5px; margin: 0; line-height: 1.6; }
 
-    /* Monochrome cursor-tracking spotlight for pillar + feature cards. */
-    .pillar, .feature { position: relative; overflow: hidden; isolation: isolate; }
-    .pillar > *, .feature > * { position: relative; z-index: 1; }
-    .pillar::before, .feature::before {
-      content: ""; position: absolute; inset: 0; z-index: 0; border-radius: inherit;
-      background: radial-gradient(280px circle at var(--mx, 50%) var(--my, -30%),
-        rgba(255,255,255,0.11), rgba(255,255,255,0.04) 38%, transparent 62%);
-      opacity: 0; transition: opacity .3s ease; pointer-events: none;
+    /* ── Card grids (pillars + features) ── */
+    .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+    .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; }
+    .card {
+      position: relative; background: var(--panel); border: 1px solid var(--line-strong);
+      border-radius: var(--radius-lg); padding: 26px 24px 24px;
+      transition: border-color .18s ease, transform .18s ease, box-shadow .18s ease;
     }
-    .pillar::after, .feature::after {
-      content: ""; position: absolute; inset: 0; z-index: 0; border-radius: inherit;
-      padding: 1px; pointer-events: none; opacity: 0; transition: opacity .3s ease;
-      background: radial-gradient(360px circle at var(--mx, 50%) var(--my, -30%),
-        rgba(255,255,255,0.55), transparent 45%);
-      -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-      -webkit-mask-composite: xor; mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-      mask-composite: exclude;
+    .card:hover {
+      border-color: rgba(16,185,129,0.35);
+      box-shadow: 0 0 0 1px rgba(16,185,129,0.1), 0 12px 28px rgba(0,0,0,0.35);
+      transform: translateY(-2px);
     }
-    .pillar:hover::before, .pillar:hover::after,
-    .feature:hover::before, .feature:hover::after { opacity: 1; }
-
-    .feature__ic { display: inline-flex; align-items: center; justify-content: center;
-      width: 44px; height: 44px; border-radius: 11px; margin-bottom: 14px;
-      background: var(--panel-2); border: 1px solid var(--line-strong); color: var(--fg); font-size: 18px; }
-    .feature h3 { margin: 0 0 8px; font-size: 17px; letter-spacing: -0.01em; }
-    .feature p { margin: 0; color: var(--muted); font-size: 14px; }
-
-    /* ── Tables (quick-links) ── */
-    table { width: 100%; border-collapse: collapse; font-size: 14px;
-      background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
-    th, td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
-    tr:last-child td { border-bottom: none; }
-    th { color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.05em; }
-    td a { color: var(--fg); }
-    td a:hover { text-decoration: underline; }
+    .card .ic {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 40px; height: 40px; border-radius: 10px; margin-bottom: 16px;
+      background: rgba(16,185,129,0.09); border: 1px solid rgba(16,185,129,0.24);
+      color: var(--accent);
+    }
+    .card .ic svg { width: 20px; height: 20px; }
+    .card h3 { margin: 0 0 6px; font-size: 16.5px; font-weight: 600; letter-spacing: -0.015em; color: var(--fg); }
+    .card p { margin: 0; color: var(--muted); font-size: 14.5px; line-height: 1.6; }
+    .card p code { font-size: 12.5px; }
 
     /* ── Tech-stack strip ── */
-    .stack { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
-    .chip { display: inline-flex; align-items: center; gap: 8px;
+    .stack { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
+    .chip {
+      display: inline-flex; align-items: center; gap: 8px;
       padding: 8px 14px; background: var(--panel); border: 1px solid var(--line-strong);
-      border-radius: 999px; font-size: 13px; color: var(--fg); }
-    .chip .k { color: var(--muted); }
+      border-radius: 8px; font-size: 13px; color: var(--fg); font-weight: 500;
+    }
+    .chip .k { color: var(--muted); font-family: 'JetBrains Mono', monospace; font-size: 12px; }
 
-    /* ── Two-column ── */
-    .two { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-    .two h3 { font-size: 16px; margin: 0 0 10px; }
+    /* ── ASCII diagram wrapper ── */
+    .diagram {
+      background: var(--code); border: 1px solid var(--line-strong);
+      border-radius: var(--radius); padding: 22px 24px; overflow-x: auto;
+      max-width: 820px; margin: 0 auto;
+    }
+    .diagram pre { border: none; padding: 0; background: transparent; font-size: 12.5px; color: var(--fg); }
 
-    /* ── ASCII diagram wrapper — keep it wide but scrollable on mobile ── */
-    .diagram { background: var(--panel); border: 1px solid var(--line-strong);
-      border-radius: var(--radius); padding: 16px 18px; overflow-x: auto; }
-    .diagram pre { border: none; padding: 0; background: transparent; font-size: 13px; color: var(--fg); }
+    /* ── Table (quick-links) ── */
+    .quicklinks {
+      background: var(--panel); border: 1px solid var(--line-strong);
+      border-radius: var(--radius-lg); overflow: hidden;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 14.5px; }
+    th, td { text-align: left; padding: 14px 20px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    tr:last-child td { border-bottom: none; }
+    th {
+      color: var(--muted); font-weight: 500; text-transform: uppercase;
+      font-size: 11px; letter-spacing: 0.08em; background: rgba(255,255,255,0.02);
+      font-family: 'JetBrains Mono', monospace;
+    }
+    td a { color: var(--muted-strong); font-weight: 500; }
+    td a:hover { color: var(--accent); }
 
-    footer { border-top: 1px solid var(--line); padding: 32px 0 48px; color: var(--muted); font-size: 14px; }
-    footer a { color: var(--muted); } footer a:hover { color: var(--fg); }
+    /* ── Footer ── */
+    footer { border-top: 1px solid var(--line); padding: 40px 0; color: var(--muted); font-size: 13.5px; }
+    footer .foot { display: flex; align-items: center; gap: 22px; flex-wrap: wrap; }
+    footer .foot .spacer { flex: 1; }
+    footer a { color: var(--muted); }
+    footer a:hover { color: var(--fg); }
 
     /* ── Motion ── */
     @keyframes fade-up { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
     .js .reveal { opacity: 0; transform: translateY(18px); }
-    .reveal.in { opacity: 1; transform: none; transition: opacity .5s ease, transform .5s ease; }
+    .reveal.in { opacity: 1; transform: none; transition: opacity .55s ease, transform .55s ease; }
 
+    @media (max-width: 900px) {
+      .grid-3, .grid-2 { grid-template-columns: 1fr 1fr; }
+    }
     @media (max-width: 720px) {
-      .hero { padding: 40px 0 36px; }
-      .hero h1 { font-size: 38px; }
-      .pillars, .two, .features-grid { grid-template-columns: 1fr; }
+      .hero { padding: 64px 0 56px; }
+      .hero h1 { font-size: 44px; letter-spacing: -0.035em; }
+      .hero .lede { font-size: 17px; }
+      section { padding: 56px 0; }
+      h2 { font-size: 28px; }
+      .grid-3, .grid-2 { grid-template-columns: 1fr; }
       nav .navlink.hide { display: none; }
     }
     @media (prefers-reduced-motion: reduce) {
       .hero { animation: none; }
       .js .reveal { opacity: 1; transform: none; }
-      .pillar, .feature { transition: none; }
+      .card { transition: none; }
     }
   </style>
 </head>
@@ -193,111 +241,124 @@
   <header>
     <div class="wrap">
       <nav>
-        <span class="brand"><span class="shield" aria-hidden="true">🛡️</span> db-mcp-gateway</span>
+        <a class="brand" href="/">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+          <span class="brand-name">db-mcp-gateway</span>
+        </a>
         <span class="spacer"></span>
         <a class="navlink hide" href="#pillars">Pillars</a>
         <a class="navlink hide" href="#features">Features</a>
         <a class="navlink hide" href="#quickstart">Quickstart</a>
         <a class="navlink" href="https://github.com/developerz-ai/db-mcp-gateway/tree/main/docs">Docs</a>
-        <a class="navlink" href="https://github.com/developerz-ai/db-mcp-gateway">GitHub</a>
+        <a class="navlink" href="https://github.com/developerz-ai/db-mcp-gateway" aria-label="GitHub repository">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.36-3.88-1.36-.52-1.33-1.28-1.68-1.28-1.68-1.04-.72.08-.7.08-.7 1.15.08 1.76 1.19 1.76 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.72-1.55-2.55-.29-5.24-1.28-5.24-5.68 0-1.26.45-2.28 1.19-3.08-.12-.29-.52-1.47.11-3.07 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.79 0c2.21-1.49 3.18-1.18 3.18-1.18.63 1.6.23 2.78.11 3.07.74.8 1.19 1.82 1.19 3.08 0 4.41-2.7 5.38-5.27 5.66.41.36.78 1.06.78 2.13v3.16c0 .31.21.66.8.55A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>
+        </a>
       </nav>
     </div>
   </header>
 
   <main>
     <div class="wrap">
-      <section class="hero" style="border-top:none">
-        <h1><span class="shield" aria-hidden="true">🛡️</span> db-mcp-gateway</h1>
-        <p class="strapline">Self-hosted MCP gateway for AI agents that need database access — without ever handing out a database URL.</p>
+      <section class="hero">
+        <span class="eyebrow"><span class="dot"></span> v1.2.1 · public preview</span>
+        <h1>Give AI agents database access <span class="accent">without giving out the URL.</span></h1>
         <p class="lede">
-          Your team deploys it once. Developers add one URL to their AI agent's MCP config.
-          The gateway holds every credential, enforces SSO-driven permissions, and writes an
-          append-only audit log on every query.
+          A self-hosted MCP gateway that holds every credential, enforces SSO-driven permissions,
+          and writes an append-only audit row on every query. One binary, one YAML, one Postgres.
         </p>
         <div class="cta">
-          <a class="btn primary" href="https://github.com/developerz-ai/db-mcp-gateway"><i class="fa-brands fa-github" aria-hidden="true"></i> View on GitHub</a>
-          <a class="btn ghost" href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/deployment/quickstart.md"><i class="fa-solid fa-rocket" aria-hidden="true"></i> Quickstart</a>
+          <a class="btn primary" href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/deployment/quickstart.md">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+            Quickstart
+          </a>
+          <a class="btn ghost" href="https://github.com/developerz-ai/db-mcp-gateway">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.36-3.88-1.36-.52-1.33-1.28-1.68-1.28-1.68-1.04-.72.08-.7.08-.7 1.15.08 1.76 1.19 1.76 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.72-1.55-2.55-.29-5.24-1.28-5.24-5.68 0-1.26.45-2.28 1.19-3.08-.12-.29-.52-1.47.11-3.07 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.79 0c2.21-1.49 3.18-1.18 3.18-1.18.63 1.6.23 2.78.11 3.07.74.8 1.19 1.82 1.19 3.08 0 4.41-2.7 5.38-5.27 5.66.41.36.78 1.06.78 2.13v3.16c0 .31.21.66.8.55A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>
+            View on GitHub
+          </a>
         </div>
         <div class="install">
           <div class="codeblock">
             <button class="copy-btn" type="button" data-copy="docker pull ghcr.io/developerz-ai/db-mcp-gateway:1.2.1" aria-label="Copy to clipboard">
-              <i class="fa-regular fa-copy" aria-hidden="true"></i> Copy
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+              Copy
             </button>
-<pre><span class="cmt"># pinned release — multi-arch (linux/amd64, linux/arm64)</span>
+<pre><span class="cmt"># multi-arch (linux/amd64, linux/arm64) · MIT licensed</span>
 docker pull ghcr.io/developerz-ai/db-mcp-gateway:<span class="add">1.2.1</span></pre>
           </div>
         </div>
       </section>
 
-      <section id="pillars" class="reveal" style="border-top:none">
-        <div class="pillars">
-          <div class="pillar">
-            <span class="ic"><i class="fa-solid fa-key" aria-hidden="true"></i></span>
+      <section id="pillars" class="reveal">
+        <div class="section-head">
+          <span class="kicker">The three pillars</span>
+          <h2>Zero-trust database access, by design.</h2>
+          <p class="section-lede">Three invariants the gateway is built to enforce. Break any one and it's the wrong tool.</p>
+        </div>
+        <div class="grid-3">
+          <div class="card">
+            <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg></span>
             <h3>Credentials never leave the gateway</h3>
-            <p>No DB URL on a laptop, ever. No tool returns one. No log line contains one.</p>
+            <p>No DB URL on a laptop, ever. No tool returns one. No log line contains one. Not in errors, not in admin endpoints.</p>
           </div>
-          <div class="pillar">
-            <span class="ic"><i class="fa-solid fa-user-shield" aria-hidden="true"></i></span>
-            <h3>Identity end-to-end</h3>
-            <p>Every query traces SSO user → group → grant → audit row.</p>
+          <div class="card">
+            <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-8 8.5-4.5-1-8-3.5-8-8.5V6l8-3 8 3z"/><path d="m9 12 2 2 4-4"/></svg></span>
+            <h3>Identity, end-to-end</h3>
+            <p>Every query traces SSO user → group → grant → audit row. OIDC drives who, YAML drives what, audit records both.</p>
           </div>
-          <div class="pillar">
-            <span class="ic"><i class="fa-solid fa-code-branch" aria-hidden="true"></i></span>
+          <div class="card">
+            <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><path d="M6 21V9"/><circle cx="18" cy="18" r="3"/><path d="M18 3v12"/><path d="M12 3v18"/></svg></span>
             <h3>Config-as-code</h3>
-            <p>Permissions live in YAML, reviewed by PR. No in-band admin UI, by design.</p>
+            <p>Permissions live in YAML, reviewed by PR. No in-band admin UI — every grant change is a diff, an approver, a commit.</p>
           </div>
         </div>
       </section>
 
       <section id="features" class="reveal">
-        <h2>What's in the box</h2>
-        <p class="section-lede">
-          Everything platform teams need to make AI-agent database access safe by default —
-          zero-trust credentials, complete user attribution, per-grant safety limits, and
-          Git-reviewed permissions. No SaaS, no admin console, no extra moving parts.
-        </p>
-        <div class="features-grid">
-          <div class="feature">
-            <span class="feature__ic"><i class="fa-solid fa-lock" aria-hidden="true"></i></span>
+        <div class="section-head">
+          <span class="kicker">What&rsquo;s in the box</span>
+          <h2>Everything platform teams need. Nothing they don&rsquo;t.</h2>
+          <p class="section-lede">Zero-trust credentials, complete user attribution, per-grant safety limits, and Git-reviewed permissions. No SaaS, no admin console, no extra moving parts.</p>
+        </div>
+        <div class="grid-2">
+          <div class="card">
+            <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span>
             <h3>Zero-trust security</h3>
             <p>Database credentials never leave the gateway. No URLs, passwords, or connection strings reach AI agents or developer laptops.</p>
           </div>
-          <div class="feature">
-            <span class="feature__ic"><i class="fa-solid fa-fingerprint" aria-hidden="true"></i></span>
+          <div class="card">
+            <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/></svg></span>
             <h3>Complete user attribution</h3>
             <p>Every query logged with SSO user identity, SQL statement, reason, timestamp, and results. Full compliance audit trail.</p>
           </div>
-          <div class="feature">
-            <span class="feature__ic"><i class="fa-solid fa-shield-halved" aria-hidden="true"></i></span>
+          <div class="card">
+            <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M8 11h8"/><path d="M12 15V7"/></svg></span>
             <h3>Built-in safety</h3>
-            <p>Statement timeouts, row limits, read-only enforcement, and schema filtering prevent runaway queries and accidental data modification.</p>
+            <p>Statement timeouts, row limits, read-only enforcement, and schema filtering prevent runaway queries and accidental writes.</p>
           </div>
-          <div class="feature">
-            <span class="feature__ic"><i class="fa-solid fa-code-pull-request" aria-hidden="true"></i></span>
+          <div class="card">
+            <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7"/><path d="M6 9v12"/></svg></span>
             <h3>Git-based permissions</h3>
-            <p>Access control defined in YAML files, reviewed via PR, with complete change history. No admin UI to maintain.</p>
+            <p>Access control lives in YAML files, reviewed via PR, with complete change history. No admin UI to maintain.</p>
           </div>
-          <div class="feature">
-            <span class="feature__ic"><i class="fa-solid fa-robot" aria-hidden="true"></i></span>
+          <div class="card">
+            <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><line x1="8" y1="16" x2="8" y2="16"/><line x1="16" y1="16" x2="16" y2="16"/></svg></span>
             <h3>MCP-native tool surface</h3>
             <p>Purpose-built for AI agents: <code>list_databases</code>, <code>describe_schema</code>, <code>sample_table</code>, <code>run_query</code>, <code>explain</code>, <code>get_query_history</code>.</p>
           </div>
-          <div class="feature">
-            <span class="feature__ic"><i class="fa-solid fa-database" aria-hidden="true"></i></span>
+          <div class="card">
+            <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></svg></span>
             <h3>Multi-database</h3>
-            <p>PostgreSQL and MongoDB, unified security model and audit trail. MySQL / MSSQL rejected at boot — no partial-support surprises.</p>
+            <p>PostgreSQL and MongoDB with one grant surface. MySQL and MSSQL are rejected at boot — no partial-support surprises.</p>
           </div>
         </div>
       </section>
 
       <section id="mental-model" class="reveal">
-        <h2>One-minute mental model</h2>
-        <p class="section-lede">
-          The agent talks MCP over HTTPS to the gateway. The gateway resolves the SSO
-          identity, evaluates the YAML grant, opens a per-database read-only pool with
-          statement-timeout + row-cap applied, streams the result back, and — synchronously,
-          before the response goes out — writes an audit row.
-        </p>
+        <div class="section-head">
+          <span class="kicker">One-minute mental model</span>
+          <h2>Agent → gateway → target DB. Everything else is state.</h2>
+          <p class="section-lede">The agent talks MCP over HTTPS. The gateway resolves the SSO identity, evaluates the YAML grant, opens a read-only pool with statement-timeout + row-cap applied, streams the result back — and, synchronously, before the response goes out, writes an audit row.</p>
+        </div>
         <div class="diagram">
 <pre>┌─────────┐    MCP/HTTPS    ┌──────────────┐    pg wire    ┌──────────┐
 │ agent   │ ──────────────▶ │   gateway    │ ────────────▶ │ target   │
@@ -315,82 +376,98 @@ docker pull ghcr.io/developerz-ai/db-mcp-gateway:<span class="add">1.2.1</span><
       </section>
 
       <section id="stack" class="reveal">
-        <h2>Boring, on purpose</h2>
-        <p class="section-lede">
-          One binary, one config file, one state Postgres. No SaaS control plane, no
-          credential vault to run alongside it, no queue, no cache. It fits on a page.
-        </p>
+        <div class="section-head">
+          <span class="kicker">Boring, on purpose</span>
+          <h2>One binary. One config. One state Postgres.</h2>
+          <p class="section-lede">No SaaS control plane. No credential vault to run alongside. No queue, no cache. The whole architecture fits on one page.</p>
+        </div>
         <div class="stack">
-          <span class="chip"><span class="k">lang</span> Rust (stable)</span>
+          <span class="chip"><span class="k">lang</span> Rust · stable</span>
           <span class="chip"><span class="k">runtime</span> tokio</span>
           <span class="chip"><span class="k">http</span> axum</span>
           <span class="chip"><span class="k">db driver</span> sqlx</span>
           <span class="chip"><span class="k">config</span> serde + YAML</span>
           <span class="chip"><span class="k">state store</span> Postgres</span>
-          <span class="chip"><span class="k">distribution</span> ghcr.io/developerz-ai/db-mcp-gateway</span>
+          <span class="chip"><span class="k">image</span> ghcr.io/developerz-ai/db-mcp-gateway</span>
         </div>
       </section>
 
       <section id="quickstart" class="reveal">
-        <h2>Add it to Claude Code</h2>
-        <p class="section-lede">
-          One command on the client side. First tool call triggers the OIDC browser flow.
-          From there every query goes through the gateway.
-        </p>
-        <div class="codeblock">
-          <button class="copy-btn" type="button" data-copy="claude mcp add --transport http db-gateway --scope project https://db.internal.acme.com" aria-label="Copy to clipboard">
-            <i class="fa-regular fa-copy" aria-hidden="true"></i> Copy
-          </button>
-<pre>claude mcp add --transport http db-gateway \
-  --scope project https://db.internal.acme.com</pre>
+        <div class="section-head">
+          <span class="kicker">Client-side setup</span>
+          <h2>Add it to Claude Code with one command.</h2>
+          <p class="section-lede">First tool call triggers the OIDC browser flow. From there every query goes through the gateway.</p>
         </div>
-        <p style="color:var(--muted);margin-top:14px">
-          Walk through it end-to-end in the
-          <a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/first-query.md">5-minute first-query guide</a>,
+        <div class="install">
+          <div class="codeblock">
+            <button class="copy-btn" type="button" data-copy="claude mcp add --transport http db-gateway --scope project https://db.internal.acme.com" aria-label="Copy to clipboard">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+              Copy
+            </button>
+<pre>claude mcp add --transport http db-gateway \
+  --scope project <span class="add">https://db.internal.acme.com</span></pre>
+          </div>
+        </div>
+        <p style="color:var(--muted); font-size:14.5px; text-align:center; margin: 20px auto 0; max-width:640px">
+          Walk through it in the
+          <a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/first-query.md" style="color:var(--accent)">5-minute first-query guide</a>,
           or jump to the full reference in
-          <a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/claude-code.md">docs/usage/claude-code.md</a>.
+          <a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/claude-code.md" style="color:var(--accent)">docs/usage/claude-code.md</a>.
         </p>
       </section>
 
       <section id="quicklinks" class="reveal">
-        <h2>Quick links</h2>
-        <table>
-          <thead><tr><th>If you're…</th><th>Read</th></tr></thead>
-          <tbody>
-            <tr>
-              <td>A platform / SRE deploying it</td>
-              <td><a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/deployment/quickstart.md">docs/deployment/quickstart.md</a></td>
-            </tr>
-            <tr>
-              <td>A developer whose org already runs it</td>
-              <td><a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/first-query.md">docs/usage/first-query.md</a> → <a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/claude-code.md">docs/usage/claude-code.md</a></td>
-            </tr>
-            <tr>
-              <td>Adding it to a non-Claude MCP client</td>
-              <td><a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/other-agents.md">docs/usage/other-agents.md</a></td>
-            </tr>
-            <tr>
-              <td>Weighing it against alternatives</td>
-              <td><a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/comparison.md">docs/comparison.md</a></td>
-            </tr>
-            <tr>
-              <td>Looking for performance numbers</td>
-              <td><a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/benchmarks.md">docs/benchmarks.md</a></td>
-            </tr>
-          </tbody>
-        </table>
+        <div class="section-head">
+          <span class="kicker">Docs</span>
+          <h2>Read next.</h2>
+        </div>
+        <div class="quicklinks">
+          <table>
+            <thead><tr><th>If you&rsquo;re…</th><th>Read</th></tr></thead>
+            <tbody>
+              <tr>
+                <td>A platform / SRE deploying it</td>
+                <td><a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/deployment/quickstart.md">docs/deployment/quickstart.md</a></td>
+              </tr>
+              <tr>
+                <td>A developer whose org already runs it</td>
+                <td><a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/first-query.md">first-query.md</a> → <a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/claude-code.md">claude-code.md</a></td>
+              </tr>
+              <tr>
+                <td>Adding it to a non-Claude MCP client</td>
+                <td><a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/other-agents.md">docs/usage/other-agents.md</a></td>
+              </tr>
+              <tr>
+                <td>Weighing it against alternatives</td>
+                <td><a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/comparison.md">docs/comparison.md</a></td>
+              </tr>
+              <tr>
+                <td>Looking for performance numbers</td>
+                <td><a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/benchmarks.md">docs/benchmarks.md</a></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </section>
     </div>
   </main>
 
   <footer>
     <div class="wrap">
-      <p>
-        <a href="https://github.com/developerz-ai/db-mcp-gateway">GitHub</a> ·
-        <a href="https://github.com/developerz-ai/db-mcp-gateway/tree/main/docs">Docs</a> ·
+      <div class="foot">
+        <span class="brand" style="color:var(--muted); font-weight:500">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="display:inline-block; vertical-align:-3px; margin-right:6px"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+          db-mcp-gateway · MIT
+        </span>
+        <span class="spacer"></span>
+        <a href="https://github.com/developerz-ai/db-mcp-gateway">GitHub</a>
+        <a href="https://github.com/developerz-ai/db-mcp-gateway/tree/main/docs">Docs</a>
         <a href="https://github.com/developerz-ai/db-mcp-gateway/pkgs/container/db-mcp-gateway">GHCR image</a>
+        <a href="llms.txt">llms.txt</a>
+      </div>
+      <p style="margin: 18px 0 0; font-size:12.5px; line-height:1.55">
+        Model Context Protocol is a specification from Anthropic. db-mcp-gateway is an independent implementation, not affiliated with or endorsed by Anthropic.
       </p>
-      <p>MIT licensed. Model Context Protocol is a specification from Anthropic; db-mcp-gateway is an independent implementation, not affiliated with or endorsed by Anthropic.</p>
     </div>
   </footer>
 
@@ -423,8 +500,12 @@ docker pull ghcr.io/developerz-ai/db-mcp-gateway:<span class="add">1.2.1</span><
             btn.innerHTML = markup;
             setTimeout(function () { if (cls) btn.classList.remove(cls); btn.innerHTML = original; }, 1600);
           };
-          var done = function () { flash('<i class="fa-solid fa-check" aria-hidden="true"></i> Copied', 'copied'); };
-          var fail = function () { flash('<i class="fa-solid fa-xmark" aria-hidden="true"></i> Copy failed'); };
+          var done = function () {
+            flash('<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg> Copied', 'copied');
+          };
+          var fail = function () {
+            flash('<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg> Failed', 'failed');
+          };
           if (navigator.clipboard && navigator.clipboard.writeText) {
             navigator.clipboard.writeText(text).then(done, fail);
           } else {
@@ -436,20 +517,6 @@ docker pull ghcr.io/developerz-ai/db-mcp-gateway:<span class="add">1.2.1</span><
             document.body.removeChild(ta);
             (ok ? done : fail)();
           }
-        });
-      });
-    })();
-
-    // Monochrome cursor-tracking spotlight for pillar + feature cards.
-    // JS sets --mx/--my; CSS radial-gradient tracks them.
-    (function () {
-      if (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) return;
-      var cards = document.querySelectorAll('.pillar, .feature');
-      cards.forEach(function (card) {
-        card.addEventListener('pointermove', function (e) {
-          var r = card.getBoundingClientRect();
-          card.style.setProperty('--mx', (e.clientX - r.left) + 'px');
-          card.style.setProperty('--my', (e.clientY - r.top) + 'px');
         });
       });
     })();
