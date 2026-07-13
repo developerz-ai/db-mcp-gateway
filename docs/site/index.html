@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>db-mcp-gateway — Self-hosted MCP gateway for AI agents that need database access</title>
+  <meta name="description" content="Self-hosted MCP gateway. Give AI agents audited, SSO-gated database access without ever handing out a database URL. Rust, single Docker image, YAML permissions reviewed by PR.">
+  <link rel="canonical" href="https://developerz-ai.github.io/db-mcp-gateway/">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="db-mcp-gateway — SSO-gated, audited DB access for AI agents">
+  <meta property="og:description" content="Credentials never leave the gateway. Every query traces SSO user → group → grant → audit row. Permissions as code, reviewed by PR.">
+  <meta property="og:url" content="https://developerz-ai.github.io/db-mcp-gateway/">
+  <meta name="twitter:card" content="summary">
+  <meta name="theme-color" content="#0d1117">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%9B%A1%EF%B8%8F%3C/text%3E%3C/svg%3E">
+  <!-- Font Awesome — matches the wurk site's icon family. -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"
+        crossorigin="anonymous" referrerpolicy="no-referrer">
+  <!-- Set early so scroll-reveal elements start hidden only when JS can reveal them (no-JS = visible). -->
+  <script>document.documentElement.classList.add('js');</script>
+  <style>
+    /* Slate palette — GitHub dark-dimmed lineage, same as the wurk site. */
+    :root {
+      --bg: #0d1117; --panel: #161b22; --panel-2: #21262d;
+      --line: rgba(255,255,255,0.08); --line-strong: #30363d;
+      --fg: #e6edf3; --muted: #8b949e;
+      --accent: #ffffff; --success: #3fb950; --danger: #e5534b; --warning: #d29922;
+      --code: #0d1117; --radius: 8px;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0; background: var(--bg); color: var(--fg);
+      font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+    }
+    a { color: var(--fg); text-decoration: none; }
+    a:hover { text-decoration: underline; text-underline-offset: 2px; }
+    .wrap { max-width: 960px; margin: 0 auto; padding: 0 20px; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    pre {
+      background: var(--code); border: 1px solid var(--line-strong); border-radius: var(--radius);
+      padding: 16px 18px; overflow-x: auto; font-size: 14px; line-height: 1.6; margin: 0;
+    }
+    .add { color: var(--success); } .del { color: var(--danger); } .cmt { color: var(--muted); }
+
+    /* ── Copy-able code block ── */
+    .codeblock { position: relative; }
+    .copy-btn {
+      position: absolute; top: 8px; right: 8px;
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 5px 10px; font-size: 12px; font-weight: 600;
+      color: var(--muted); background: var(--panel-2);
+      border: 1px solid var(--line-strong); border-radius: 7px; cursor: pointer;
+      transition: color .15s, border-color .15s, background .15s; line-height: 1;
+    }
+    .copy-btn:hover { color: var(--fg); border-color: var(--accent); }
+    .copy-btn.copied { color: var(--success); border-color: var(--success); }
+
+    /* ── Header ── */
+    header { border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 10;
+      background: color-mix(in oklch, var(--bg) 88%, transparent);
+      -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
+    nav { display: flex; align-items: center; gap: 20px; padding: 12px 0; }
+    nav .brand { display: inline-flex; align-items: center; gap: 10px;
+      font-weight: 800; font-size: 18px; letter-spacing: -0.02em; }
+    nav .brand .shield { font-size: 22px; line-height: 1; filter: drop-shadow(0 2px 6px rgba(0,0,0,0.45)); }
+    nav .spacer { flex: 1; }
+    nav a.navlink { color: var(--muted); font-size: 14px; }
+    nav a.navlink:hover { color: var(--fg); text-decoration: none; }
+
+    /* ── Hero ── */
+    .hero { padding: 64px 0 52px; text-align: center; animation: fade-up .5s ease both; }
+    .hero h1 { font-size: 56px; line-height: 1; margin: 0; letter-spacing: -0.03em; font-weight: 800;
+      display: inline-flex; align-items: center; gap: 14px; justify-content: center; }
+    .hero h1 .shield { font-size: 0.72em; }
+    .hero .strapline { font-size: 20px; font-weight: 600; margin: 14px 0 0; max-width: 780px; margin-left: auto; margin-right: auto; }
+    .hero .lede { font-size: 17px; color: var(--muted); max-width: 680px; margin: 12px auto 28px; }
+    .cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-bottom: 28px; }
+    .btn {
+      display: inline-flex; align-items: center; gap: 0.5rem;
+      padding: 11px 20px; border-radius: var(--radius); font-weight: 600; font-size: 15px;
+      border: 1px solid var(--line-strong); transition: background .15s, border-color .15s, transform .05s;
+    }
+    .btn:hover { text-decoration: none; }
+    .btn:active { transform: translateY(1px); }
+    .btn.primary { background: var(--accent); color: #0d1117; border-color: var(--accent); }
+    .btn.primary:hover { filter: brightness(0.94); }
+    .btn.ghost { background: var(--panel); color: var(--fg); }
+    .btn.ghost:hover { border-color: var(--accent); background: var(--panel-2); }
+    .install { max-width: 620px; margin: 0 auto; text-align: left; }
+
+    /* ── Sections ── */
+    section { padding: 48px 0; border-top: 1px solid var(--line); }
+    h2 { font-size: 28px; margin: 0 0 8px; letter-spacing: -0.02em; font-weight: 800; }
+    .section-lede { color: var(--muted); max-width: 720px; margin: 0 0 28px; font-size: 16px; }
+    .pillars { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+    .pillar { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 22px 20px;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.4); transition: transform .15s ease, border-color .15s ease; }
+    .pillar:hover { transform: translateY(-2px); border-color: var(--line-strong); }
+    .pillar .ic { display: inline-flex; align-items: center; justify-content: center;
+      width: 44px; height: 44px; border-radius: 11px; margin-bottom: 12px;
+      background: var(--panel-2); border: 1px solid var(--line-strong); color: var(--fg); font-size: 18px; }
+    .pillar h3 { margin: 0 0 6px; font-size: 17px; }
+    .pillar p { margin: 0; color: var(--muted); font-size: 14px; }
+
+    /* ── Feature grid ── */
+    .features-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+    .feature {
+      position: relative; background: var(--panel); border: 1px solid var(--line);
+      border-radius: 14px; padding: 22px 22px 20px;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.4);
+      transition: transform .15s ease, border-color .15s ease, box-shadow .15s ease;
+    }
+    .feature:hover { transform: translateY(-3px); border-color: var(--line-strong);
+      box-shadow: 0 10px 28px rgba(0,0,0,0.45); }
+
+    /* Monochrome cursor-tracking spotlight for pillar + feature cards. */
+    .pillar, .feature { position: relative; overflow: hidden; isolation: isolate; }
+    .pillar > *, .feature > * { position: relative; z-index: 1; }
+    .pillar::before, .feature::before {
+      content: ""; position: absolute; inset: 0; z-index: 0; border-radius: inherit;
+      background: radial-gradient(280px circle at var(--mx, 50%) var(--my, -30%),
+        rgba(255,255,255,0.11), rgba(255,255,255,0.04) 38%, transparent 62%);
+      opacity: 0; transition: opacity .3s ease; pointer-events: none;
+    }
+    .pillar::after, .feature::after {
+      content: ""; position: absolute; inset: 0; z-index: 0; border-radius: inherit;
+      padding: 1px; pointer-events: none; opacity: 0; transition: opacity .3s ease;
+      background: radial-gradient(360px circle at var(--mx, 50%) var(--my, -30%),
+        rgba(255,255,255,0.55), transparent 45%);
+      -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+      -webkit-mask-composite: xor; mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+      mask-composite: exclude;
+    }
+    .pillar:hover::before, .pillar:hover::after,
+    .feature:hover::before, .feature:hover::after { opacity: 1; }
+
+    .feature__ic { display: inline-flex; align-items: center; justify-content: center;
+      width: 44px; height: 44px; border-radius: 11px; margin-bottom: 14px;
+      background: var(--panel-2); border: 1px solid var(--line-strong); color: var(--fg); font-size: 18px; }
+    .feature h3 { margin: 0 0 8px; font-size: 17px; letter-spacing: -0.01em; }
+    .feature p { margin: 0; color: var(--muted); font-size: 14px; }
+
+    /* ── Tables (quick-links) ── */
+    table { width: 100%; border-collapse: collapse; font-size: 14px;
+      background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+    th, td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    tr:last-child td { border-bottom: none; }
+    th { color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.05em; }
+    td a { color: var(--fg); }
+    td a:hover { text-decoration: underline; }
+
+    /* ── Tech-stack strip ── */
+    .stack { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
+    .chip { display: inline-flex; align-items: center; gap: 8px;
+      padding: 8px 14px; background: var(--panel); border: 1px solid var(--line-strong);
+      border-radius: 999px; font-size: 13px; color: var(--fg); }
+    .chip .k { color: var(--muted); }
+
+    /* ── Two-column ── */
+    .two { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    .two h3 { font-size: 16px; margin: 0 0 10px; }
+
+    /* ── ASCII diagram wrapper — keep it wide but scrollable on mobile ── */
+    .diagram { background: var(--panel); border: 1px solid var(--line-strong);
+      border-radius: var(--radius); padding: 16px 18px; overflow-x: auto; }
+    .diagram pre { border: none; padding: 0; background: transparent; font-size: 13px; color: var(--fg); }
+
+    footer { border-top: 1px solid var(--line); padding: 32px 0 48px; color: var(--muted); font-size: 14px; }
+    footer a { color: var(--muted); } footer a:hover { color: var(--fg); }
+
+    /* ── Motion ── */
+    @keyframes fade-up { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: translateY(0); } }
+    .js .reveal { opacity: 0; transform: translateY(18px); }
+    .reveal.in { opacity: 1; transform: none; transition: opacity .5s ease, transform .5s ease; }
+
+    @media (max-width: 720px) {
+      .hero { padding: 40px 0 36px; }
+      .hero h1 { font-size: 38px; }
+      .pillars, .two, .features-grid { grid-template-columns: 1fr; }
+      nav .navlink.hide { display: none; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .hero { animation: none; }
+      .js .reveal { opacity: 1; transform: none; }
+      .pillar, .feature { transition: none; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <nav>
+        <span class="brand"><span class="shield" aria-hidden="true">🛡️</span> db-mcp-gateway</span>
+        <span class="spacer"></span>
+        <a class="navlink hide" href="#pillars">Pillars</a>
+        <a class="navlink hide" href="#features">Features</a>
+        <a class="navlink hide" href="#quickstart">Quickstart</a>
+        <a class="navlink" href="https://github.com/developerz-ai/db-mcp-gateway/tree/main/docs">Docs</a>
+        <a class="navlink" href="https://github.com/developerz-ai/db-mcp-gateway">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <div class="wrap">
+      <section class="hero" style="border-top:none">
+        <h1><span class="shield" aria-hidden="true">🛡️</span> db-mcp-gateway</h1>
+        <p class="strapline">Self-hosted MCP gateway for AI agents that need database access — without ever handing out a database URL.</p>
+        <p class="lede">
+          Your team deploys it once. Developers add one URL to their AI agent's MCP config.
+          The gateway holds every credential, enforces SSO-driven permissions, and writes an
+          append-only audit log on every query.
+        </p>
+        <div class="cta">
+          <a class="btn primary" href="https://github.com/developerz-ai/db-mcp-gateway"><i class="fa-brands fa-github" aria-hidden="true"></i> View on GitHub</a>
+          <a class="btn ghost" href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/deployment/quickstart.md"><i class="fa-solid fa-rocket" aria-hidden="true"></i> Quickstart</a>
+        </div>
+        <div class="install">
+          <div class="codeblock">
+            <button class="copy-btn" type="button" data-copy="docker pull ghcr.io/developerz-ai/db-mcp-gateway:1.2.1" aria-label="Copy to clipboard">
+              <i class="fa-regular fa-copy" aria-hidden="true"></i> Copy
+            </button>
+<pre><span class="cmt"># pinned release — multi-arch (linux/amd64, linux/arm64)</span>
+docker pull ghcr.io/developerz-ai/db-mcp-gateway:<span class="add">1.2.1</span></pre>
+          </div>
+        </div>
+      </section>
+
+      <section id="pillars" class="reveal" style="border-top:none">
+        <div class="pillars">
+          <div class="pillar">
+            <span class="ic"><i class="fa-solid fa-key" aria-hidden="true"></i></span>
+            <h3>Credentials never leave the gateway</h3>
+            <p>No DB URL on a laptop, ever. No tool returns one. No log line contains one.</p>
+          </div>
+          <div class="pillar">
+            <span class="ic"><i class="fa-solid fa-user-shield" aria-hidden="true"></i></span>
+            <h3>Identity end-to-end</h3>
+            <p>Every query traces SSO user → group → grant → audit row.</p>
+          </div>
+          <div class="pillar">
+            <span class="ic"><i class="fa-solid fa-code-branch" aria-hidden="true"></i></span>
+            <h3>Config-as-code</h3>
+            <p>Permissions live in YAML, reviewed by PR. No in-band admin UI, by design.</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="features" class="reveal">
+        <h2>What's in the box</h2>
+        <p class="section-lede">
+          Everything platform teams need to make AI-agent database access safe by default —
+          zero-trust credentials, complete user attribution, per-grant safety limits, and
+          Git-reviewed permissions. No SaaS, no admin console, no extra moving parts.
+        </p>
+        <div class="features-grid">
+          <div class="feature">
+            <span class="feature__ic"><i class="fa-solid fa-lock" aria-hidden="true"></i></span>
+            <h3>Zero-trust security</h3>
+            <p>Database credentials never leave the gateway. No URLs, passwords, or connection strings reach AI agents or developer laptops.</p>
+          </div>
+          <div class="feature">
+            <span class="feature__ic"><i class="fa-solid fa-fingerprint" aria-hidden="true"></i></span>
+            <h3>Complete user attribution</h3>
+            <p>Every query logged with SSO user identity, SQL statement, reason, timestamp, and results. Full compliance audit trail.</p>
+          </div>
+          <div class="feature">
+            <span class="feature__ic"><i class="fa-solid fa-shield-halved" aria-hidden="true"></i></span>
+            <h3>Built-in safety</h3>
+            <p>Statement timeouts, row limits, read-only enforcement, and schema filtering prevent runaway queries and accidental data modification.</p>
+          </div>
+          <div class="feature">
+            <span class="feature__ic"><i class="fa-solid fa-code-pull-request" aria-hidden="true"></i></span>
+            <h3>Git-based permissions</h3>
+            <p>Access control defined in YAML files, reviewed via PR, with complete change history. No admin UI to maintain.</p>
+          </div>
+          <div class="feature">
+            <span class="feature__ic"><i class="fa-solid fa-robot" aria-hidden="true"></i></span>
+            <h3>MCP-native tool surface</h3>
+            <p>Purpose-built for AI agents: <code>list_databases</code>, <code>describe_schema</code>, <code>sample_table</code>, <code>run_query</code>, <code>explain</code>, <code>get_query_history</code>.</p>
+          </div>
+          <div class="feature">
+            <span class="feature__ic"><i class="fa-solid fa-database" aria-hidden="true"></i></span>
+            <h3>Multi-database</h3>
+            <p>PostgreSQL and MongoDB, unified security model and audit trail. MySQL / MSSQL rejected at boot — no partial-support surprises.</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="mental-model" class="reveal">
+        <h2>One-minute mental model</h2>
+        <p class="section-lede">
+          The agent talks MCP over HTTPS to the gateway. The gateway resolves the SSO
+          identity, evaluates the YAML grant, opens a per-database read-only pool with
+          statement-timeout + row-cap applied, streams the result back, and — synchronously,
+          before the response goes out — writes an audit row.
+        </p>
+        <div class="diagram">
+<pre>┌─────────┐    MCP/HTTPS    ┌──────────────┐    pg wire    ┌──────────┐
+│ agent   │ ──────────────▶ │   gateway    │ ────────────▶ │ target   │
+│ (Claude │   bearer: jwt   │              │  ro role per  │  DBs     │
+│  Code)  │ ◀────────────── │  authz+audit │ ◀──────────── │          │
+└─────────┘   tool result   └──────┬───────┘   result rows └──────────┘
+                                   │
+                                   ▼
+                            ┌──────────────┐
+                            │ state DB     │
+                            │ (sessions +  │
+                            │  audit log)  │
+                            └──────────────┘</pre>
+        </div>
+      </section>
+
+      <section id="stack" class="reveal">
+        <h2>Boring, on purpose</h2>
+        <p class="section-lede">
+          One binary, one config file, one state Postgres. No SaaS control plane, no
+          credential vault to run alongside it, no queue, no cache. It fits on a page.
+        </p>
+        <div class="stack">
+          <span class="chip"><span class="k">lang</span> Rust (stable)</span>
+          <span class="chip"><span class="k">runtime</span> tokio</span>
+          <span class="chip"><span class="k">http</span> axum</span>
+          <span class="chip"><span class="k">db driver</span> sqlx</span>
+          <span class="chip"><span class="k">config</span> serde + YAML</span>
+          <span class="chip"><span class="k">state store</span> Postgres</span>
+          <span class="chip"><span class="k">distribution</span> ghcr.io/developerz-ai/db-mcp-gateway</span>
+        </div>
+      </section>
+
+      <section id="quickstart" class="reveal">
+        <h2>Add it to Claude Code</h2>
+        <p class="section-lede">
+          One command on the client side. First tool call triggers the OIDC browser flow.
+          From there every query goes through the gateway.
+        </p>
+        <div class="codeblock">
+          <button class="copy-btn" type="button" data-copy="claude mcp add --transport http db-gateway --scope project https://db.internal.acme.com" aria-label="Copy to clipboard">
+            <i class="fa-regular fa-copy" aria-hidden="true"></i> Copy
+          </button>
+<pre>claude mcp add --transport http db-gateway \
+  --scope project https://db.internal.acme.com</pre>
+        </div>
+        <p style="color:var(--muted);margin-top:14px">
+          Walk through it end-to-end in the
+          <a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/first-query.md">5-minute first-query guide</a>,
+          or jump to the full reference in
+          <a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/claude-code.md">docs/usage/claude-code.md</a>.
+        </p>
+      </section>
+
+      <section id="quicklinks" class="reveal">
+        <h2>Quick links</h2>
+        <table>
+          <thead><tr><th>If you're…</th><th>Read</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>A platform / SRE deploying it</td>
+              <td><a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/deployment/quickstart.md">docs/deployment/quickstart.md</a></td>
+            </tr>
+            <tr>
+              <td>A developer whose org already runs it</td>
+              <td><a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/first-query.md">docs/usage/first-query.md</a> → <a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/claude-code.md">docs/usage/claude-code.md</a></td>
+            </tr>
+            <tr>
+              <td>Adding it to a non-Claude MCP client</td>
+              <td><a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/other-agents.md">docs/usage/other-agents.md</a></td>
+            </tr>
+            <tr>
+              <td>Weighing it against alternatives</td>
+              <td><a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/comparison.md">docs/comparison.md</a></td>
+            </tr>
+            <tr>
+              <td>Looking for performance numbers</td>
+              <td><a href="https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/benchmarks.md">docs/benchmarks.md</a></td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+    </div>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <p>
+        <a href="https://github.com/developerz-ai/db-mcp-gateway">GitHub</a> ·
+        <a href="https://github.com/developerz-ai/db-mcp-gateway/tree/main/docs">Docs</a> ·
+        <a href="https://github.com/developerz-ai/db-mcp-gateway/pkgs/container/db-mcp-gateway">GHCR image</a>
+      </p>
+      <p>MIT licensed. Model Context Protocol is a specification from Anthropic; db-mcp-gateway is an independent implementation, not affiliated with or endorsed by Anthropic.</p>
+    </div>
+  </footer>
+
+  <script>
+    // Progressive scroll-reveal: fade sections up as they enter the viewport.
+    (function () {
+      var els = document.querySelectorAll('.reveal');
+      if (!('IntersectionObserver' in window)) {
+        els.forEach(function (el) { el.classList.add('in'); });
+        return;
+      }
+      var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) {
+          if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+        });
+      }, { threshold: 0.12 });
+      els.forEach(function (el) { io.observe(el); });
+    })();
+
+    // Copy-to-clipboard on code blocks. Copies the button's data-copy text so
+    // the copied snippet is clean (no comments, no diff markers).
+    (function () {
+      var btns = document.querySelectorAll('.copy-btn');
+      btns.forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var text = btn.getAttribute('data-copy') || '';
+          var original = btn.innerHTML;
+          var flash = function (markup, cls) {
+            if (cls) btn.classList.add(cls);
+            btn.innerHTML = markup;
+            setTimeout(function () { if (cls) btn.classList.remove(cls); btn.innerHTML = original; }, 1600);
+          };
+          var done = function () { flash('<i class="fa-solid fa-check" aria-hidden="true"></i> Copied', 'copied'); };
+          var fail = function () { flash('<i class="fa-solid fa-xmark" aria-hidden="true"></i> Copy failed'); };
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(done, fail);
+          } else {
+            var ok = false;
+            var ta = document.createElement('textarea');
+            ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+            document.body.appendChild(ta); ta.select();
+            try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+            document.body.removeChild(ta);
+            (ok ? done : fail)();
+          }
+        });
+      });
+    })();
+
+    // Monochrome cursor-tracking spotlight for pillar + feature cards.
+    // JS sets --mx/--my; CSS radial-gradient tracks them.
+    (function () {
+      if (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) return;
+      var cards = document.querySelectorAll('.pillar, .feature');
+      cards.forEach(function (card) {
+        card.addEventListener('pointermove', function (e) {
+          var r = card.getBoundingClientRect();
+          card.style.setProperty('--mx', (e.clientX - r.left) + 'px');
+          card.style.setProperty('--my', (e.clientY - r.top) + 'px');
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
