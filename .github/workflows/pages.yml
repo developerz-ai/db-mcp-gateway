@@ -1,8 +1,8 @@
 name: pages
 
-# Publishes the static docs/marketing site in docs/site/ to GitHub Pages.
-# No build step — this is a Rust repo with no YARD/Jekyll pipeline, so we
-# upload docs/site/ as-is and let deploy-pages hand it to the CDN.
+# Publishes the docs site at docs/site/ to GitHub Pages, and renders the
+# in-site handbook at /docs/ from the Markdown under docs/ via mdBook
+# (per book.toml at the repo root; output lands in docs/site/docs/).
 #
 # One-time repo setting before the first run resolves:
 #   gh api -X PUT repos/developerz-ai/db-mcp-gateway/pages -f build_type=workflow
@@ -11,6 +11,7 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+      - "book.toml"
       - "README.md"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
@@ -41,6 +42,44 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+      # Prebuilt mdBook binary — avoids compiling from source (30s vs 3min).
+      # Pin the version so upgrades are deliberate.
+      - name: Install mdBook
+        env:
+          MDBOOK_VERSION: v0.4.44
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl --proto '=https' --tlsv1.2 -sSfL \
+            "https://github.com/rust-lang/mdBook/releases/download/${MDBOOK_VERSION}/mdbook-${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build docs handbook (mdBook → docs/site/docs/)
+        run: |
+          set -euo pipefail
+          mdbook build
+          # mdBook copies every non-.md file from src (docs/) into build-dir,
+          # including docs/site/* (recursive copy of the landing page) and
+          # docs/sec/ (WIP notes not listed in SUMMARY.md). Strip both before
+          # uploading so we don't ship the landing page twice or leak notes.
+          rm -rf docs/site/docs/site docs/site/docs/sec
+      # Belt-and-braces: SUMMARY.md does not gate what mdBook publishes, so a
+      # stray .yaml/.env/.pem/... under docs/ would ride the recursive copy
+      # into the artifact. Refuse to upload if any lands. Contract lives in
+      # docs/initial-idea/13-docs-site.md.
+      - name: Guard Pages artifact against sensitive assets
+        run: |
+          set -euo pipefail
+          mapfile -t offenders < <(find docs/site -type f \
+            \( -iname '*.yaml' -o -iname '*.yml' \
+               -o -iname '*.env' -o -iname '.env.*' \
+               -o -iname '*.pem' -o -iname '*.key' \
+               -o -iname '*.toml' -o -iname '*.sql' \))
+          if (( ${#offenders[@]} > 0 )); then
+            printf '::error::Refusing to publish Pages artifact — sensitive/config asset(s) present:\n'
+            printf '  %s\n' "${offenders[@]}"
+            exit 1
+          fi
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
