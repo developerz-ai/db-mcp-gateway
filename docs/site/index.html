@@ -14,11 +14,8 @@
   <meta name="theme-color" content="#09090b">
   <meta name="color-scheme" content="dark">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2310b981' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z'/%3E%3Cpath d='m9 12 2 2 4-4'/%3E%3C/svg%3E">
-  <!-- Type: Inter (display + body) + JetBrains Mono (code). Both are the
-       shadcn/Vercel-aesthetic defaults; hosted on Google Fonts. -->
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+  <!-- Type: system font stack. Self-contained single-file page — no external
+       font CDN to avoid leaking visitor IPs (GDPR) and to keep zero deps. -->
   <!-- Set early so scroll-reveal elements start hidden only when JS can reveal them (no-JS = visible). -->
   <script>document.documentElement.classList.add('js');</script>
   <style>
@@ -76,6 +73,7 @@
     }
     .copy-btn:hover { color: var(--fg); border-color: var(--muted); background: var(--panel-2); }
     .copy-btn.copied { color: var(--accent); border-color: var(--accent); }
+    .copy-btn.failed { color: var(--danger); border-color: var(--danger); }
 
     /* ── Header ── */
     header {
@@ -506,7 +504,7 @@ docker pull ghcr.io/developerz-ai/db-mcp-gateway:<span class="add">1.2.1</span><
             flash('<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg> Copied', 'copied');
           };
           var fail = function () {
-            flash('<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg> Failed');
+            flash('<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg> Failed', 'failed');
           };
           if (navigator.clipboard && navigator.clipboard.writeText) {
             navigator.clipboard.writeText(text).then(done, fail);
