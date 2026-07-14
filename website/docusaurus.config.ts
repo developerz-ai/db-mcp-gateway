@@ -26,6 +26,12 @@ const config: Config = {
   organizationName: GH_ORG,
   projectName: GH_REPO,
 
+  // Exposed to React components (e.g. homepage CTA) via `useDocusaurusContext`
+  // so org/repo changes stay in one place.
+  customFields: {
+    ghUrl: GH_URL,
+  },
+
   onBrokenLinks: 'throw',
   markdown: {
     hooks: {

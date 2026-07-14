@@ -1,6 +1,7 @@
 import type {ReactNode} from 'react';
 import clsx from 'clsx';
 import Link from '@docusaurus/Link';
+import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
 
@@ -14,6 +15,8 @@ import styles from './index.module.css';
 // Infima (no extra CSS needed for theme switching).
 
 function HomepageHeader(): ReactNode {
+  const {siteConfig} = useDocusaurusContext();
+  const ghUrl = siteConfig.customFields?.ghUrl as string;
   return (
     <header className={clsx('hero', styles.heroBanner)}>
       <div className="container">
@@ -35,7 +38,7 @@ function HomepageHeader(): ReactNode {
           </Link>
           <Link
             className="button button--secondary button--lg"
-            to="https://github.com/developerz-ai/db-mcp-gateway">
+            to={ghUrl}>
             View on GitHub
           </Link>
         </div>
