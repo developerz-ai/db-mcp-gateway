@@ -27,7 +27,7 @@ function HomepageHeader(): ReactNode {
           db-mcp-gateway
         </Heading>
         <p className="hero__subtitle">
-          Give AI agents database access — without ever handing out a database
+          Give AI agents database access, without ever handing out a database
           URL.
         </p>
         <div className={styles.buttons}>
@@ -50,7 +50,7 @@ function HomepageHeader(): ReactNode {
 export default function Home(): ReactNode {
   return (
     <Layout
-      title="db-mcp-gateway — SSO-gated, audited DB access for AI agents"
+      title="db-mcp-gateway · SSO-gated, audited DB access for AI agents"
       description="Self-hosted MCP gateway. Give AI agents audited, SSO-gated database access without ever handing out a database URL. Rust, single Docker image, YAML permissions reviewed by PR.">
       <HomepageHeader />
       <main>
