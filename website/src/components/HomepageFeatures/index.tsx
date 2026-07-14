@@ -6,8 +6,10 @@ import styles from './styles.module.css';
 // The three pillars from CLAUDE.md, pared down to react-redux's homepage
 // shape (three cards, one row). Wording tracks CLAUDE.md's "Non-negotiables
 // (MUST)" list so the landing and the internal contract stay in lockstep.
-// Icons use emoji so they render consistently across OSes without a custom
-// icon-font dependency (same choice as the 🛡️ navbar brand).
+//
+// Icons use emoji (not a custom icon-font or SVG bundle) so they render
+// consistently across OSes with zero extra asset weight. Same choice as the
+// 🛡️ navbar brand — one visual vocabulary across the landing surface.
 
 type FeatureItem = {
   icon: string;
