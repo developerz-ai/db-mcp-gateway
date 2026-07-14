@@ -111,9 +111,10 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 ## 🤖 MCP Integration
 
 ### Complete MCP Tool Surface
-- **What it does:** Six MCP tools cover all database interaction patterns
+- **What it does:** Seven MCP tools cover all database interaction patterns
 - **Tools included:**
-  - `list_databases` - Enumerate available databases
+  - `list_servers` - Enumerate target servers visible to the caller
+  - `list_databases` - Enumerate available databases on a server
   - `describe_schema` - Get table/column metadata with types
   - `sample_table` - Preview data with configurable sample size
   - `run_query` - Execute SQL with safety limits
@@ -142,7 +143,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 - **Testing benefit:** Easy to run locally for development and testing
 
 ### Health and Readiness Endpoints
-- **What it does:** `/healthz` endpoint for load balancer health checks
+- **What it does:** `/readyz` endpoint for load balancer health checks (state-DB reachable + not shutting down); `/healthz` is a plain liveness probe (200 if the binary is up)
 - **How it works:** Returns 200 if gateway can accept queries, 503 if database connection fails
 - **Operations benefit:** Standard load balancer integration for high availability
 

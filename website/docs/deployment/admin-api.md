@@ -54,7 +54,7 @@ Audit shape (one row per write):
 | `before` | Pre-write snapshot JSON. `NULL` on `create`. |
 | `after` | Post-write snapshot JSON. `NULL` on `delete`. |
 | `request_id` | Threaded from the HTTP request for join-back to operator dashboards |
-| `ts` | Server-side, monotonic |
+| `ts` | Server-side, assigned at write time (not monotonic — ordering uses `(ts, id)` as the tie-breaker). |
 
 Query examples (run as the state DB superuser):
 

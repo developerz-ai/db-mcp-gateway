@@ -179,7 +179,7 @@ Sessions are short-lived (8h by default). If you see `unauthenticated` after lun
 Either:
 
 - The gateway URL is wrong — re-add with the right one.
-- The gateway is down — `curl -s -o /dev/null -w '%{http_code}\n' https://db.internal.acme.com/healthz` should print `200`.
+- The gateway is down — `curl -s -o /dev/null -w '%{http_code}\n' https://db.internal.acme.com/readyz` should print `200` (checks state-DB reachability, not just liveness).
 - Claude Code hasn't reconnected — restart Claude Code or run `/mcp` → *Reconnect*.
 
 ## Where to go next
