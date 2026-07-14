@@ -1,0 +1,241 @@
+/*
+ * Docusaurus Infima overrides for db-mcp-gateway.
+ *
+ * Palette mirrors the shadcn/Vercel-inspired look of the landing page
+ * (src/pages/index.tsx) so a reader clicking "Docs" doesn't experience a
+ * visual break. Dark mode is the default (matches brand); light mode is
+ * styled too so the theme toggle in the navbar works properly.
+ *
+ * One accent (emerald-500) is reserved for CTAs, links, and the brand shield.
+ */
+
+:root {
+  --ifm-color-primary: #10b981;
+  --ifm-color-primary-dark: #0ea472;
+  --ifm-color-primary-darker: #0d9c6c;
+  --ifm-color-primary-darkest: #0a815a;
+  --ifm-color-primary-light: #26c48c;
+  --ifm-color-primary-lighter: #34c993;
+  --ifm-color-primary-lightest: #56d4a5;
+
+  --ifm-font-family-base: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto,
+    Helvetica, Arial, sans-serif;
+  --ifm-font-family-monospace: 'JetBrains Mono', ui-monospace, SFMono-Regular,
+    Menlo, Consolas, monospace;
+  --ifm-font-size-base: 15.5px;
+  --ifm-line-height-base: 1.65;
+  --ifm-heading-font-weight: 700;
+  --ifm-heading-line-height: 1.15;
+
+  --ifm-code-font-size: 90%;
+  --ifm-code-border-radius: 5px;
+  --ifm-code-padding-horizontal: 5px;
+  --ifm-code-padding-vertical: 1px;
+
+  --ifm-navbar-height: 60px;
+  --ifm-navbar-item-padding-horizontal: 14px;
+
+  --docusaurus-highlighted-code-line-bg: rgba(16, 185, 129, 0.12);
+}
+
+/* ── Dark (default) — zinc-950 background, emerald accent ── */
+[data-theme='dark'] {
+  --ifm-background-color: #09090b;
+  --ifm-background-surface-color: #0d0d0f;
+  --ifm-color-content: #fafafa;
+  --ifm-color-content-secondary: #a1a1aa;
+  --ifm-color-emphasis-0: #09090b;
+  --ifm-color-emphasis-100: #18181b;
+  --ifm-color-emphasis-200: #27272a;
+  --ifm-color-emphasis-300: #3f3f46;
+  --ifm-color-emphasis-500: #71717a;
+  --ifm-color-emphasis-600: #a1a1aa;
+  --ifm-color-emphasis-700: #d4d4d8;
+  --ifm-color-emphasis-800: #e4e4e7;
+  --ifm-color-emphasis-900: #fafafa;
+  --ifm-color-emphasis-1000: #ffffff;
+
+  --ifm-navbar-background-color: rgba(9, 9, 11, 0.75);
+  --ifm-navbar-shadow: inset 0 -1px 0 rgba(255, 255, 255, 0.06);
+  --ifm-footer-background-color: #0a0a0c;
+  --ifm-footer-color: #a1a1aa;
+  --ifm-footer-link-color: #a1a1aa;
+  --ifm-footer-title-color: #fafafa;
+  --ifm-toc-border-color: rgba(255, 255, 255, 0.06);
+  --ifm-hr-border-color: rgba(255, 255, 255, 0.06);
+
+  --ifm-code-background: #18181b;
+  --ifm-pre-background: #0a0a0a;
+  --ifm-blockquote-color: #d4d4d8;
+  --ifm-blockquote-border-color: rgba(16, 185, 129, 0.6);
+  --ifm-table-stripe-background: rgba(255, 255, 255, 0.02);
+  --ifm-table-border-color: #27272a;
+
+  --ifm-menu-color: #a1a1aa;
+  --ifm-menu-color-background-active: transparent;
+  --ifm-menu-color-background-hover: rgba(255, 255, 255, 0.03);
+  --ifm-menu-color-active: #10b981;
+}
+
+/* ── Light — clean shadcn light: zinc-50 bg, emerald accent, zinc text ── */
+[data-theme='light'] {
+  --ifm-background-color: #ffffff;
+  --ifm-background-surface-color: #fafafa;
+  --ifm-color-content: #18181b;
+  --ifm-color-content-secondary: #52525b;
+
+  --ifm-navbar-background-color: rgba(255, 255, 255, 0.85);
+  --ifm-navbar-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.06);
+  --ifm-footer-background-color: #fafafa;
+  --ifm-footer-color: #52525b;
+  --ifm-footer-link-color: #52525b;
+  --ifm-footer-title-color: #18181b;
+  --ifm-toc-border-color: rgba(0, 0, 0, 0.06);
+  --ifm-hr-border-color: rgba(0, 0, 0, 0.06);
+
+  --ifm-code-background: #f4f4f5;
+  --ifm-pre-background: #fafafa;
+  --ifm-blockquote-color: #3f3f46;
+  --ifm-blockquote-border-color: rgba(16, 185, 129, 0.75);
+  --ifm-table-stripe-background: rgba(0, 0, 0, 0.015);
+  --ifm-table-border-color: #e4e4e7;
+
+  --ifm-menu-color: #52525b;
+  --ifm-menu-color-background-active: transparent;
+  --ifm-menu-color-background-hover: rgba(0, 0, 0, 0.03);
+  --ifm-menu-color-active: #10b981;
+}
+
+/* ── Navbar ── */
+.navbar {
+  -webkit-backdrop-filter: saturate(180%) blur(12px);
+  backdrop-filter: saturate(180%) blur(12px);
+  border-bottom: 1px solid var(--ifm-toc-border-color);
+}
+.navbar__title {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.navbar__logo img {
+  width: 22px;
+  height: 22px;
+}
+
+/* GitHub navbar icon — swaps text label for GitHub mark. */
+.header-github-link:hover {
+  opacity: 0.7;
+}
+.header-github-link::before {
+  content: '';
+  width: 22px;
+  height: 22px;
+  display: flex;
+  background-color: var(--ifm-navbar-link-color);
+  mask-image: url("data:image/svg+xml;charset=utf-8,%3Csvg viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M12 .297a12 12 0 0 0-3.79 23.4c.6.1.82-.26.82-.577v-2.234c-3.338.724-4.043-1.61-4.043-1.61-.545-1.385-1.332-1.755-1.332-1.755-1.09-.744.082-.729.082-.729 1.204.084 1.837 1.236 1.837 1.236 1.07 1.834 2.807 1.303 3.492.997.108-.775.418-1.303.762-1.603-2.665-.303-5.467-1.332-5.467-5.93 0-1.311.469-2.381 1.235-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23a11.5 11.5 0 0 1 6 0c2.293-1.552 3.299-1.23 3.299-1.23.653 1.652.242 2.873.118 3.176.77.84 1.235 1.91 1.235 3.221 0 4.61-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.218.694.825.576A12 12 0 0 0 12 .297z'/%3E%3C/svg%3E");
+  mask-repeat: no-repeat;
+  mask-size: contain;
+}
+.header-github-link .navbar__label,
+.header-github-link span[class*='iconExternalLink'] {
+  display: none;
+}
+
+/* ── Sidebar — tighter, shadcn-ish ── */
+.menu__link {
+  font-size: 14px;
+  font-weight: 500;
+  transition: color 0.15s;
+}
+.menu__link--active {
+  font-weight: 500;
+}
+.menu__list-item-collapsible--active {
+  background: transparent;
+}
+.menu__caret,
+.menu__link--sublist-caret::after {
+  opacity: 0.6;
+}
+
+/* ── Content typography ── */
+.markdown h1 {
+  font-size: 34px;
+  letter-spacing: -0.02em;
+}
+.markdown h2 {
+  font-size: 24px;
+  letter-spacing: -0.02em;
+  margin-top: 40px;
+}
+.markdown h3 {
+  font-size: 18px;
+  letter-spacing: -0.015em;
+  margin-top: 24px;
+}
+.markdown a {
+  color: var(--ifm-color-primary);
+}
+.markdown a:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* ── Code — inline + fenced, matched to landing ── */
+.markdown code:not([class]) {
+  border: 1px solid var(--ifm-toc-border-color);
+  color: var(--ifm-color-content);
+}
+pre.prism-code,
+div[class*='codeBlock'] pre {
+  border: 1px solid var(--ifm-color-emphasis-200);
+  border-radius: 8px;
+  font-size: 13.5px;
+}
+
+/* ── Blockquote callouts ── */
+.markdown blockquote {
+  background: var(--ifm-color-emphasis-100);
+  border-left: 3px solid var(--ifm-blockquote-border-color);
+  border-radius: 6px;
+  color: var(--ifm-blockquote-color);
+  padding: 12px 16px;
+}
+
+/* ── Tables ── */
+.markdown table {
+  border: 1px solid var(--ifm-table-border-color);
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 14px;
+  display: table;
+  width: 100%;
+}
+.markdown table thead tr {
+  background: var(--ifm-color-emphasis-100);
+}
+.markdown table th {
+  color: var(--ifm-color-content-secondary);
+  font-weight: 500;
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+}
+
+/* ── Pagination cards (prev / next) ── */
+.pagination-nav__link {
+  border-color: var(--ifm-color-emphasis-200);
+  border-radius: 8px;
+  transition:
+    border-color 0.15s,
+    background 0.15s;
+}
+.pagination-nav__link:hover {
+  border-color: var(--ifm-color-primary);
+  background: rgba(16, 185, 129, 0.05);
+}
+
+/* ── TOC (right column) ── */
+.table-of-contents__link--active,
+.table-of-contents__link:hover {
+  color: var(--ifm-color-primary);
+}

@@ -160,4 +160,4 @@ STATE_DB_URL  TARGET_DB_URL  PERMISSIONS_DB_DSN  OIDC_CLIENT_SECRET  SESSION_SIG
 
 ### Runtime injection
 
-The DSN is injected at runtime via a Kubernetes sealed-secret (not baked into the image). Operator setup lives in [docs/deployment/](../deployment/). With no secret mounted, `SENTRY_DSN` is absent and the client is a no-op — a missing GlitchTip config must never prevent the gateway from serving traffic.
+The DSN is injected at runtime via a Kubernetes sealed-secret (not baked into the image). Operator setup lives in [deployment/logging](../deployment/logging.md). With no secret mounted, `SENTRY_DSN` is absent and the client is a no-op — a missing GlitchTip config must never prevent the gateway from serving traffic.
