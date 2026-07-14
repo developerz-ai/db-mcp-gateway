@@ -20,8 +20,10 @@ Cargo.lock.bak
 config/local.yaml
 config/*.local.yaml
 
-# mdBook build output — generated in CI, never committed.
-/docs/site/docs/
+# Docusaurus — build output + cache, generated in CI, never committed.
+/website/node_modules/
+/website/build/
+/website/.docusaurus/
 
 # Editors
 .vscode/

@@ -214,4 +214,4 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 - **What it does:** Agents cannot grant themselves additional permissions
 - **How it works:** Permission evaluation happens server-side, agents cannot modify gateway config
 - **Security benefit:** AI agents limited to defined grants, cannot escape constraints
-- **Operations benefit:** No risk of agent prompt injection leading to privilege escalation
+- **Operations benefit:** Prompt injection cannot expand the agent's server-side permissions or bypass grant constraints

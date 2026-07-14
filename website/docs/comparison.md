@@ -62,7 +62,7 @@ claude mcp add db-gateway https://db.internal.com
 - Development environments with no compliance requirements
 - Local development with personal databases
 - Teams already managing database access well
-- Latency-critical applications (<5ms overhead unacceptable)
+- Latency-critical applications (`<5ms` overhead unacceptable)
 
 **Choose db-mcp-gateway When:**
 - Production databases require compliance and audit
@@ -185,7 +185,7 @@ groups:
 | Feature | PgBouncer | db-mcp-gateway |
 |---------|-----------|----------------|
 | **Primary Goal** | Connection pooling efficiency | Security + compliance |
-| **Overhead** | <1ms | +5ms (security features) |
+| **Overhead** | `<1ms` | +5ms (security features) |
 | **User Tracking** | Connection name only | Full query attribution |
 | **Configuration** | INI files | YAML + git |
 | **Multi-Database** | PostgreSQL only | PG + MySQL + Mongo |
@@ -276,7 +276,7 @@ groups:
 
 ### Organizational Fit
 
-**Small Teams (<10 developers):**
+**Small Teams (`<10` developers):**
 - **Direct access** usually sufficient
 - **db-mcp-gateway** for compliance requirements or production access
 - **Avoid:** Complex enterprise platforms (Immuta, Collibra)
@@ -358,6 +358,6 @@ groups:
 - Pure performance optimization is the goal (use ProxySQL/PgBouncer)
 - Simple development environments without compliance needs (use direct access)
 - Enterprise-wide data governance beyond databases (use Immuta/Collibra)
-- Maximum performance is critical (<5ms overhead unacceptable)
+- Maximum performance is critical (`<5ms` overhead unacceptable)
 
 **The sweet spot:** Production databases + AI agents + compliance requirements + operational simplicity.

@@ -1,17 +1,15 @@
 name: pages
 
-# Publishes the docs site at docs/site/ to GitHub Pages, and renders the
-# in-site handbook at /docs/ from the Markdown under docs/ via mdBook
-# (per book.toml at the repo root; output lands in docs/site/docs/).
+# Publishes the Docusaurus site under website/ to GitHub Pages.
+# Landing page + docs handbook + llms.txt all ship from one build artifact.
 #
-# One-time repo setting before the first run resolves:
+# One-time repo setting (already applied, kept here for future re-installs):
 #   gh api -X PUT repos/developerz-ai/db-mcp-gateway/pages -f build_type=workflow
 on:
   push:
     branches: [main]
     paths:
-      - "docs/**"
-      - "book.toml"
+      - "website/**"
       - "README.md"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
@@ -38,63 +36,27 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
+    defaults:
+      run:
+        working-directory: website
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      # Prebuilt mdBook binary — avoids compiling from source (30s vs 3min).
-      # Pin the version so upgrades are deliberate.
-      - name: Install mdBook
-        env:
-          MDBOOK_VERSION: v0.4.44
-        run: |
-          set -euo pipefail
-          mkdir -p "$HOME/.local/bin"
-          curl --proto '=https' --tlsv1.2 -sSfL \
-            "https://github.com/rust-lang/mdBook/releases/download/${MDBOOK_VERSION}/mdbook-${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
-            | tar -xz -C "$HOME/.local/bin"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: Build docs handbook (mdBook → docs/site/docs/)
-        run: |
-          set -euo pipefail
-          mdbook build
-          # mdBook copies every non-.md file from src (docs/) into build-dir,
-          # including docs/site/* (recursive copy of the landing page) and
-          # docs/sec/ (WIP notes not listed in SUMMARY.md). Strip both before
-          # uploading so we don't ship the landing page twice or leak notes.
-          rm -rf docs/site/docs/site docs/site/docs/sec
-      # Smoke-check the six public links off the landing page + the theme
-      # override CSS. A future doc rename that breaks a CTA fails the build
-      # here instead of shipping a dead link. Contract lives in
-      # docs/site/index.html header/quick-links.
-      - name: Smoke-check docs landing links + theme CSS
-        run: |
-          set -euo pipefail
-          for page in \
-            docs/deployment/quickstart.html \
-            docs/usage/first-query.html \
-            docs/usage/claude-code.html \
-            docs/usage/other-agents.html \
-            docs/comparison.html \
-            docs/benchmarks.html
-          do
-            if [[ ! -f "docs/site/$page" ]]; then
-              printf '::error::Missing landing-page target: docs/site/%s\n' "$page"
-              exit 1
-            fi
-          done
-          if ! find docs/site -type f -name 'db-mcp-overrides.css' | grep -q .; then
-            printf '::error::mdBook did not emit theme/db-mcp-overrides.css into the site\n'
-            exit 1
-          fi
-      # Belt-and-braces: SUMMARY.md does not gate what mdBook publishes, so a
-      # stray .yaml/.env/.pem/... under docs/ would ride the recursive copy
-      # into the artifact. Refuse to upload if any lands. Contract lives in
-      # docs/initial-idea/13-docs-site.md.
+      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      # Belt-and-braces: the same denylist as the mdBook workflow. Refuse to
+      # publish if a sensitive/config asset lands in the artifact. Contract
+      # lives in website/docs/initial-idea/13-docs-site.md.
       - name: Guard Pages artifact against sensitive assets
         run: |
           set -euo pipefail
-          mapfile -t offenders < <(find docs/site -type f \
+          mapfile -t offenders < <(find build -type f \
             \( -iname '*.yaml' -o -iname '*.yml' \
                -o -iname '*.env' -o -iname '.env.*' \
                -o -iname '*.pem' -o -iname '*.key' \
@@ -107,6 +69,6 @@ jobs:
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
-          path: docs/site
+          path: website/build
       - id: deploy
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

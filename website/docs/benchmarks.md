@@ -13,7 +13,7 @@ Performance measurements and resource utilization for db-mcp-gateway across vari
 ## 📊 Gateway Overhead Benchmarks
 
 ### Query Latency Overhead
-**Target:** <5ms additional latency vs direct database connection
+**Target:** `<5ms` additional latency vs direct database connection
 
 **Methodology:** Measure time from gateway receiving MCP request to returning first byte, subtract pure database query time.
 
@@ -62,7 +62,7 @@ Concurrent Queries | p50 Latency | p95 Latency | p99 Latency | Target p95
 ## 🗄️ Database-Specific Performance
 
 ### PostgreSQL Performance
-**Target:** <10ms gateway overhead for PostgreSQL queries
+**Target:** `<10ms` gateway overhead for PostgreSQL queries
 
 **Expected Results:**
 ```
@@ -83,7 +83,7 @@ Schema introspection    | 5ms              | +DB time      | Cached metadata
 ---
 
 ### MySQL Performance
-**Target:** <12ms gateway overhead for MySQL queries
+**Target:** `<12ms` gateway overhead for MySQL queries
 
 **Expected Results:**
 ```
@@ -102,7 +102,7 @@ Schema introspection    | 6ms              | +DB time      | MySQL metadata quer
 ---
 
 ### MongoDB Performance
-**Target:** <15ms gateway overhead for MongoDB queries
+**Target:** `<15ms` gateway overhead for MongoDB queries
 
 **Expected Results:**
 ```
@@ -125,7 +125,7 @@ Collection introspection| 6ms             | +DB time      | List collections
 ## 💻 Resource Utilization
 
 ### Gateway Container Resources
-**Target:** <512MB RAM, <1 CPU core for moderate load (50 concurrent queries)
+**Target:** `<512MB` RAM, `<1` CPU core for moderate load (50 concurrent queries)
 
 **Expected Resource Usage:**
 ```
@@ -148,7 +148,7 @@ Idle                   | 1%        | 128MB     | 1 (maintenance)
 ---
 
 ### State Database Resources
-**Target:** <2 CPU cores, <4GB RAM for production workload
+**Target:** `<2` CPU cores, `<4GB` RAM for production workload
 
 **Expected State DB Load:**
 ```
@@ -214,7 +214,7 @@ Connections per DB | Pool Efficiency | Max Throughput | Idle Connection Cost
 ## 🔒 Security Feature Overhead
 
 ### JWT Validation Performance
-**Target:** <1ms per token validation
+**Target:** `<1ms` per token validation
 
 **Expected Results:**
 ```
@@ -234,7 +234,7 @@ Permission evaluation  | 0.3ms   | 99%+
 ---
 
 ### Audit Log Performance
-**Target:** <5ms per audit log write
+**Target:** `<5ms` per audit log write
 
 **Expected Results:**
 ```
@@ -301,19 +301,19 @@ db-mcp-gateway         | 5ms     | ✅            | ✅             | YAML
 ## 🎯 Performance Targets Summary
 
 **Primary Goals:**
-- **Gateway Overhead:** <5ms per query
+- **Gateway Overhead:** `<5ms` per query
 - **Concurrent Capacity:** 100+ simultaneous queries
-- **Resource Efficiency:** <512MB RAM, <1 CPU core per 50 concurrent queries
+- **Resource Efficiency:** `<512MB` RAM, `<1` CPU core per 50 concurrent queries
 - **Horizontal Scaling:** Linear performance improvement
 
 **Enterprise Features:**
-- **JWT Validation:** <1ms with 95%+ cache hit rate
-- **Audit Logging:** <5ms synchronous write, async archiving
-- **Multi-Database:** <15ms overhead for MongoDB, <10ms for PostgreSQL
+- **JWT Validation:** `<1ms` with 95%+ cache hit rate
+- **Audit Logging:** `<5ms` synchronous write, async archiving
+- **Multi-Database:** `<15ms` overhead for MongoDB, `<10ms` for PostgreSQL
 
 **Production Readiness:**
-- **Health Check Response:** <100ms
-- **Config Reload:** <1 second without query interruption
+- **Health Check Response:** `<100ms`
+- **Config Reload:** `<1` second without query interruption
 - **Graceful Degradation:** Continue serving queries if state DB is slow
 
 ---

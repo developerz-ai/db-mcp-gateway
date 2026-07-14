@@ -12,7 +12,7 @@
 
 ## Request path
 
-```
+```text
 ┌─────────────┐    MCP/HTTP+SSE     ┌─────────────────────┐    pg wire    ┌──────────────┐
 │ Agent       │ ──────────────────▶ │  Gateway (Rust)     │ ────────────▶ │ Target DB    │
 │ (Claude     │   Bearer: <sso-jwt> │                     │  role=ro_user │ (read-only   │
