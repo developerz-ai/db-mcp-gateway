@@ -4,7 +4,9 @@ import Heading from '@theme/Heading';
 import styles from './styles.module.css';
 
 // The three pillars from CLAUDE.md — same content as the old feature grid,
-// pared down to react-redux's homepage shape (three cards, one row).
+// pared down to react-redux's homepage shape (three cards, one row). The
+// wording tracks CLAUDE.md's "Non-negotiables (MUST)" list exactly so the
+// landing and the internal contract stay in lockstep.
 
 type FeatureItem = {
   title: string;
