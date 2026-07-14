@@ -2,7 +2,7 @@
 
 ## Identity flow
 
-```
+```text
 agent ──▶ gateway (no token / expired token)
                 │
                 └── 401 with login URL
@@ -42,7 +42,7 @@ Spec-compliant MCP clients (Claude Code, Cursor) don't speak the bespoke flow ab
 
 ### Flow
 
-```
+```text
 1. 401 → WWW-Authenticate: Bearer resource_metadata="<base>/.well-known/oauth-protected-resource"
 2. GET /.well-known/oauth-protected-resource         → names this gateway as its own AS
    GET /.well-known/oauth-authorization-server       → AS metadata (RFC 8414)
@@ -175,7 +175,7 @@ Per RFC 7009 §2.2 the response is **`200` for any well-formed request** — an 
 
 If the gateway is fronted by a reverse proxy or WAF, the following paths must reach it **unauthenticated**:
 
-```
+```text
 /.well-known/oauth-protected-resource
 /.well-known/oauth-authorization-server
 /.well-known/openid-configuration
