@@ -26,6 +26,12 @@ const config: Config = {
   organizationName: GH_ORG,
   projectName: GH_REPO,
 
+  // Exposed to React components (e.g. homepage CTA) via `useDocusaurusContext`
+  // so org/repo changes stay in one place.
+  customFields: {
+    ghUrl: GH_URL,
+  },
+
   onBrokenLinks: 'throw',
   markdown: {
     hooks: {
@@ -68,11 +74,9 @@ const config: Config = {
       },
     ],
     navbar: {
-      title: 'db-mcp-gateway',
-      logo: {
-        alt: 'db-mcp-gateway shield logo',
-        src: 'img/logo.svg',
-      },
+      // Literal 🛡️ emoji as logo (per brand). Docusaurus lets us drop the
+      // <img> and put the emoji straight in the title.
+      title: '🛡️ db-mcp-gateway',
       items: [
         {
           type: 'docSidebar',
