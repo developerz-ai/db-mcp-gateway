@@ -8,8 +8,10 @@ import HomepageFeatures from '@site/src/components/HomepageFeatures';
 import styles from './index.module.css';
 
 // Landing shape mirrors react-redux.js.org: centered hero + three feature
-// cards. Everything else lives in the docs. The hero uses Docusaurus's stock
-// `.hero` / `.hero__title` classes so light/dark surfaces come free from Infima.
+// cards, nothing else. Everything else lives in the docs — the sidebar and
+// the "Get Started" CTA drive discovery. The hero uses Docusaurus's stock
+// `.hero` / `.hero__title` classes so light/dark surfaces come free from
+// Infima (no extra CSS needed for theme switching).
 
 function HomepageHeader(): ReactNode {
   return (
