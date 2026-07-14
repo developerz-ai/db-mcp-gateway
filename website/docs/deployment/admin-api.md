@@ -54,7 +54,7 @@ Audit shape (one row per write):
 | `before` | Pre-write snapshot JSON. `NULL` on `create`. |
 | `after` | Post-write snapshot JSON. `NULL` on `delete`. |
 | `request_id` | Threaded from the HTTP request for join-back to operator dashboards |
-| `ts` | Server-side, monotonic |
+| `ts` | Server-side, assigned at write time (not monotonic — ordering uses `(ts, id)` as the tie-breaker). |
 
 Query examples (run as the state DB superuser):
 
@@ -64,13 +64,13 @@ SELECT ts, action, target_type, target_id
   FROM permissions_audit
  WHERE actor_email = 'alice@example.com'
    AND ts > now() - interval '1 hour'
- ORDER BY ts;
+ ORDER BY ts, id;
 
 -- "Who last edited this grant?"
 SELECT ts, actor_email, action, before, after
   FROM permissions_audit
  WHERE target_type = 'grant' AND target_id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
- ORDER BY ts DESC LIMIT 5;
+ ORDER BY ts DESC, id DESC LIMIT 5;
 ```
 
 ## Endpoints
@@ -230,7 +230,7 @@ The spec calls out these as the queries operators want to run; both work today:
 -- "Show me the timeline of all permission changes"
 SELECT ts, actor_email, action, target_type, target_id
   FROM permissions_audit
- ORDER BY ts DESC LIMIT 100;
+ ORDER BY ts DESC, id DESC LIMIT 100;
 
 -- "What permissions does this user have right now?"
 SELECT g.action,

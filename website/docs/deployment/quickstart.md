@@ -152,7 +152,7 @@ Most restrictive value wins when multiple grants match. See [../initial-idea/06-
 
 | You need | Why |
 |---|---|
-| Docker + docker-compose (or k8s + Helm) | Run the gateway image |
+| Docker + docker-compose (or k8s manifests) | Run the gateway image. A Helm chart is on the roadmap — until then, hand-roll the manifests (see below). |
 | One Postgres instance for *gateway state* (sessions + audit) | Keep gateway state separate from your prod DBs |
 | Network reachability gateway → each target DB | Self-evident |
 | An OIDC IdP (Okta, Google Workspace, Authentik, Keycloak, Entra) | Identity |
@@ -217,7 +217,7 @@ Note the `client_id` and `client_secret`.
 
 ## 3. Configure the gateway
 
-Drop `config.yml` somewhere — full target shape below. **Heads-up:** the running binary reads only `servers:` and `permissions:` from this file; the `gateway:` / `auth:` / `logging:` blocks shown here are the planned shape but are accepted-but-ignored today and come from environment variables (see the env table above). Unknown keys *inside* `servers`/`databases`/`permissions`/`grants`/`constraints` abort boot ([#16](https://github.com/developerz-ai/db-mcp-gateway/issues/16)). `databases[*].password` accepts `${ENV:NAME}`, `${FILE:/path}`, or a `vault:`/`aws-sm:`/`gcp-sm:` ref — all resolved at boot.
+Drop `config.yml` somewhere — full target shape below. **Heads-up:** the running binary reads only `servers:` and `permissions:` from this file; the `gateway:` / `auth:` / `logging:` blocks shown here are the planned shape but are accepted-but-ignored today and come from environment variables (see the env table above). Unknown keys *inside* `servers`/`databases`/`permissions`/`grants`/`constraints` abort boot ([#16](https://github.com/developerz-ai/db-mcp-gateway/issues/16)). `databases[*].password` accepts `${ENV:NAME}` and `${FILE:/path}` refs today — both resolved at boot. `vault:` / `aws-sm:` / `gcp-sm:` refs parse but are **recognised-and-rejected** at boot until the backends land (see the status table above); use env or file refs in the meantime.
 
 ```yaml
 gateway:

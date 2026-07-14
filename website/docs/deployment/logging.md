@@ -21,7 +21,7 @@ The dispatch-time log line (one per `tools/call`) adds:
 | `tool` | string | `run_query` / `explain` / `list_servers` / … |
 | `server` | string | `<server>` from the call args, empty for tools that aren't server-scoped |
 | `db` | string | `<database>` from the call args, empty for tools that aren't database-scoped |
-| `outcome` | string | `success` / `forbidden` / `timeout` / `syntax_error` / `unavailable` / `forbidden_sql` / `internal` |
+| `outcome` | string | `success` / `forbidden` / `forbidden_sql` / `timeout` / `syntax_error` / `unavailable` / `rate_limited` / `service_overloaded` / `internal` — canonical list per [spec 03 §Errors](../initial-idea/03-mcp-tools.md#errors) |
 | `duration_ms` | integer | Wall-clock the tool took; `0` for outcomes where the tool didn't start (e.g. forbidden before any work) |
 
 On audit-write failure the line additionally carries `audit_write_duration_ms` (integer) — wall-clock the failed audit insert took. `duration_ms` on that same line keeps the contract above (tool execution time), so `success` and `audit write failed` lines can be compared apples-to-apples.
