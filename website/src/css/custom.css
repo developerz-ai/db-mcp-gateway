@@ -1,12 +1,14 @@
 /*
- * Docusaurus Infima overrides for db-mcp-gateway.
+ * Bare-minimum Infima override — layout, colors, and spacing are Docusaurus
+ * classic defaults so the docs read like react-redux.js.org (or any other
+ * stock Docusaurus site). Only three things are overridden:
  *
- * Palette mirrors the shadcn/Vercel-inspired look of the landing page
- * (src/pages/index.tsx) so a reader clicking "Docs" doesn't experience a
- * visual break. Dark mode is the default (matches brand); light mode is
- * styled too so the theme toggle in the navbar works properly.
+ *   1. Primary brand color (emerald-500) for links, sidebar-active, buttons.
+ *   2. Font family (Inter + JetBrains Mono) so docs pages match the landing.
+ *   3. GitHub navbar icon (replaces the "GitHub" text label with the mark).
  *
- * One accent (emerald-500) is reserved for CTAs, links, and the brand shield.
+ * Everything else — hero, feature cards, dark-mode surfaces — inherits from
+ * Docusaurus's default theme.
  */
 
 :root {
@@ -22,103 +24,12 @@
     Helvetica, Arial, sans-serif;
   --ifm-font-family-monospace: 'JetBrains Mono', ui-monospace, SFMono-Regular,
     Menlo, Consolas, monospace;
-  --ifm-font-size-base: 15.5px;
-  --ifm-line-height-base: 1.65;
-  --ifm-heading-font-weight: 700;
-  --ifm-heading-line-height: 1.15;
-
-  --ifm-code-font-size: 90%;
-  --ifm-code-border-radius: 5px;
-  --ifm-code-padding-horizontal: 5px;
-  --ifm-code-padding-vertical: 1px;
-
-  --ifm-navbar-height: 60px;
-  --ifm-navbar-item-padding-horizontal: 14px;
 
   --docusaurus-highlighted-code-line-bg: rgba(16, 185, 129, 0.12);
 }
 
-/* ── Dark (default) — zinc-950 background, emerald accent ── */
 [data-theme='dark'] {
-  --ifm-background-color: #09090b;
-  --ifm-background-surface-color: #0d0d0f;
-  --ifm-color-content: #fafafa;
-  --ifm-color-content-secondary: #a1a1aa;
-  --ifm-color-emphasis-0: #09090b;
-  --ifm-color-emphasis-100: #18181b;
-  --ifm-color-emphasis-200: #27272a;
-  --ifm-color-emphasis-300: #3f3f46;
-  --ifm-color-emphasis-500: #71717a;
-  --ifm-color-emphasis-600: #a1a1aa;
-  --ifm-color-emphasis-700: #d4d4d8;
-  --ifm-color-emphasis-800: #e4e4e7;
-  --ifm-color-emphasis-900: #fafafa;
-  --ifm-color-emphasis-1000: #ffffff;
-
-  --ifm-navbar-background-color: rgba(9, 9, 11, 0.75);
-  --ifm-navbar-shadow: inset 0 -1px 0 rgba(255, 255, 255, 0.06);
-  --ifm-footer-background-color: #0a0a0c;
-  --ifm-footer-color: #a1a1aa;
-  --ifm-footer-link-color: #a1a1aa;
-  --ifm-footer-title-color: #fafafa;
-  --ifm-toc-border-color: rgba(255, 255, 255, 0.06);
-  --ifm-hr-border-color: rgba(255, 255, 255, 0.06);
-
-  --ifm-code-background: #18181b;
-  --ifm-pre-background: #0a0a0a;
-  --ifm-blockquote-color: #d4d4d8;
-  --ifm-blockquote-border-color: rgba(16, 185, 129, 0.6);
-  --ifm-table-stripe-background: rgba(255, 255, 255, 0.02);
-  --ifm-table-border-color: #27272a;
-
-  --ifm-menu-color: #a1a1aa;
-  --ifm-menu-color-background-active: transparent;
-  --ifm-menu-color-background-hover: rgba(255, 255, 255, 0.03);
-  --ifm-menu-color-active: #10b981;
-}
-
-/* ── Light — clean shadcn light: zinc-50 bg, emerald accent, zinc text ── */
-[data-theme='light'] {
-  --ifm-background-color: #ffffff;
-  --ifm-background-surface-color: #fafafa;
-  --ifm-color-content: #18181b;
-  --ifm-color-content-secondary: #52525b;
-
-  --ifm-navbar-background-color: rgba(255, 255, 255, 0.85);
-  --ifm-navbar-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.06);
-  --ifm-footer-background-color: #fafafa;
-  --ifm-footer-color: #52525b;
-  --ifm-footer-link-color: #52525b;
-  --ifm-footer-title-color: #18181b;
-  --ifm-toc-border-color: rgba(0, 0, 0, 0.06);
-  --ifm-hr-border-color: rgba(0, 0, 0, 0.06);
-
-  --ifm-code-background: #f4f4f5;
-  --ifm-pre-background: #fafafa;
-  --ifm-blockquote-color: #3f3f46;
-  --ifm-blockquote-border-color: rgba(16, 185, 129, 0.75);
-  --ifm-table-stripe-background: rgba(0, 0, 0, 0.015);
-  --ifm-table-border-color: #e4e4e7;
-
-  --ifm-menu-color: #52525b;
-  --ifm-menu-color-background-active: transparent;
-  --ifm-menu-color-background-hover: rgba(0, 0, 0, 0.03);
-  --ifm-menu-color-active: #10b981;
-}
-
-/* ── Navbar ── */
-.navbar {
-  -webkit-backdrop-filter: saturate(180%) blur(12px);
-  backdrop-filter: saturate(180%) blur(12px);
-  border-bottom: 1px solid var(--ifm-toc-border-color);
-}
-.navbar__title {
-  font-weight: 600;
-  letter-spacing: -0.01em;
-}
-.navbar__logo img {
-  width: 22px;
-  height: 22px;
+  --docusaurus-highlighted-code-line-bg: rgba(16, 185, 129, 0.2);
 }
 
 /* GitHub navbar icon — swaps text label for GitHub mark. */
@@ -138,104 +49,4 @@
 .header-github-link .navbar__label,
 .header-github-link span[class*='iconExternalLink'] {
   display: none;
-}
-
-/* ── Sidebar — tighter, shadcn-ish ── */
-.menu__link {
-  font-size: 14px;
-  font-weight: 500;
-  transition: color 0.15s;
-}
-.menu__link--active {
-  font-weight: 500;
-}
-.menu__list-item-collapsible--active {
-  background: transparent;
-}
-.menu__caret,
-.menu__link--sublist-caret::after {
-  opacity: 0.6;
-}
-
-/* ── Content typography ── */
-.markdown h1 {
-  font-size: 34px;
-  letter-spacing: -0.02em;
-}
-.markdown h2 {
-  font-size: 24px;
-  letter-spacing: -0.02em;
-  margin-top: 40px;
-}
-.markdown h3 {
-  font-size: 18px;
-  letter-spacing: -0.015em;
-  margin-top: 24px;
-}
-.markdown a {
-  color: var(--ifm-color-primary);
-}
-.markdown a:hover {
-  text-decoration: underline;
-  text-underline-offset: 2px;
-}
-
-/* ── Code — inline + fenced, matched to landing ── */
-.markdown code:not([class]) {
-  border: 1px solid var(--ifm-toc-border-color);
-  color: var(--ifm-color-content);
-}
-pre.prism-code,
-div[class*='codeBlock'] pre {
-  border: 1px solid var(--ifm-color-emphasis-200);
-  border-radius: 8px;
-  font-size: 13.5px;
-}
-
-/* ── Blockquote callouts ── */
-.markdown blockquote {
-  background: var(--ifm-color-emphasis-100);
-  border-left: 3px solid var(--ifm-blockquote-border-color);
-  border-radius: 6px;
-  color: var(--ifm-blockquote-color);
-  padding: 12px 16px;
-}
-
-/* ── Tables ── */
-.markdown table {
-  border: 1px solid var(--ifm-table-border-color);
-  border-radius: 8px;
-  overflow: hidden;
-  font-size: 14px;
-  display: table;
-  width: 100%;
-}
-.markdown table thead tr {
-  background: var(--ifm-color-emphasis-100);
-}
-.markdown table th {
-  color: var(--ifm-color-content-secondary);
-  font-weight: 500;
-  text-transform: uppercase;
-  font-size: 11px;
-  letter-spacing: 0.08em;
-}
-
-/* ── Pagination cards (prev / next) ── */
-.pagination-nav__link {
-  border-color: var(--ifm-color-emphasis-200);
-  border-radius: 8px;
-  transition:
-    border-color 0.15s,
-    background 0.15s;
-}
-.pagination-nav__link:hover {
-  border-color: var(--ifm-color-primary);
-  background: rgba(16, 185, 129, 0.05);
-}
-
-/* ── TOC (right column) ── */
-.table-of-contents__link--active,
-.table-of-contents__link:hover {
-  color: var(--ifm-color-primary);
 }
