@@ -9,6 +9,11 @@ use std::time::Duration;
 
 const DEFAULT_GROUPS_CLAIM: &str = "groups";
 const DEFAULT_SESSION_TTL_HOURS: u64 = 8;
+/// Default absolute refresh-chain lifetime, in days, when `REFRESH_TTL_DAYS` is
+/// unset. Conservative on purpose — see [`crate::transport::DEFAULT_REFRESH_TTL`]
+/// for the group-staleness rationale. Operators raise it (up to a 90-day "stay
+/// signed in" window) via `REFRESH_TTL_DAYS`.
+const DEFAULT_REFRESH_TTL_DAYS: u64 = 1;
 const DEFAULT_DEV_SIGNING_KEY: &str = "dev-only-session-signing-key-change-me";
 
 /// `Debug` is hand-rolled to redact `client_secret` and `session_signing_key`.
@@ -24,6 +29,10 @@ pub struct AuthConfig {
     pub audience: String,
     pub groups_claim: String,
     pub session_ttl: Duration,
+    /// Absolute lifetime of a refresh-token *chain* (see
+    /// [`crate::transport::DEFAULT_REFRESH_TTL`]). Rotation renews the opaque
+    /// value but never this deadline. Overridable via `REFRESH_TTL_DAYS`.
+    pub refresh_ttl: Duration,
     /// HMAC key for the gateway-issued session JWT. Distinct from IdP keys —
     /// we re-sign so we can revoke via the state DB denylist.
     pub session_signing_key: Vec<u8>,
@@ -41,6 +50,7 @@ impl std::fmt::Debug for AuthConfig {
             .field("audience", &self.audience)
             .field("groups_claim", &self.groups_claim)
             .field("session_ttl", &self.session_ttl)
+            .field("refresh_ttl", &self.refresh_ttl)
             .field("session_signing_key", &"<redacted>")
             .field("mock_mode", &self.mock_mode)
             .finish()
@@ -51,6 +61,11 @@ impl std::fmt::Debug for AuthConfig {
 pub enum AuthConfigError {
     #[error("invalid SESSION_TTL_HOURS `{value}`: {source}")]
     SessionTtl {
+        value: String,
+        source: std::num::ParseIntError,
+    },
+    #[error("invalid REFRESH_TTL_DAYS `{value}`: {source}")]
+    RefreshTtl {
         value: String,
         source: std::num::ParseIntError,
     },
@@ -74,6 +89,7 @@ impl Default for AuthConfig {
             audience: String::new(),
             groups_claim: DEFAULT_GROUPS_CLAIM.to_string(),
             session_ttl: Duration::from_secs(DEFAULT_SESSION_TTL_HOURS * 3600),
+            refresh_ttl: Duration::from_secs(DEFAULT_REFRESH_TTL_DAYS * 24 * 3600),
             session_signing_key: DEFAULT_DEV_SIGNING_KEY.as_bytes().to_vec(),
             mock_mode: false,
         }
@@ -112,6 +128,12 @@ impl AuthConfig {
                 .map_err(|source| AuthConfigError::SessionTtl { value, source })?;
             config.session_ttl = Duration::from_secs(hours * 3600);
         }
+        if let Ok(value) = std::env::var("REFRESH_TTL_DAYS") {
+            let days: u64 = value
+                .parse()
+                .map_err(|source| AuthConfigError::RefreshTtl { value, source })?;
+            config.refresh_ttl = Duration::from_secs(days * 24 * 3600);
+        }
         if let Ok(value) = std::env::var("SESSION_SIGNING_KEY") {
             config.session_signing_key = value.into_bytes();
         }
@@ -143,6 +165,7 @@ mod tests {
         let config = AuthConfig::default();
         assert_eq!(config.groups_claim, "groups");
         assert_eq!(config.session_ttl, Duration::from_secs(8 * 3600));
+        assert_eq!(config.refresh_ttl, Duration::from_secs(24 * 3600));
         assert!(!config.mock_mode);
     }
 

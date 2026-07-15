@@ -173,6 +173,8 @@ async fn run() -> anyhow::Result<()> {
         permissions_repo.clone(),
         std::time::Duration::from_secs(config.permissions_cache_ttl_seconds),
     );
+    // Captured before `auth_config` moves into the facade below.
+    let refresh_ttl = auth_config.refresh_ttl;
     let app_state = AppState {
         auth: Some(AuthFacade {
             config: Arc::new(auth_config),
@@ -180,7 +182,7 @@ async fn run() -> anyhow::Result<()> {
             oidc,
             flows: PendingFlows::default(),
             codes: AuthCodes::default(),
-            refresh: RefreshTokens::default(),
+            refresh: RefreshTokens::with_ttl(refresh_ttl),
         }),
         config: Arc::new(config_file),
         adapter_registry: AdapterRegistry::new(),

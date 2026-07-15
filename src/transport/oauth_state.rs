@@ -264,9 +264,10 @@ impl AuthCodes {
     }
 }
 
-/// Absolute lifetime of a refresh-token *chain*, measured from the first token's
-/// mint and **never extended by rotation**. Three constraints set it; the
-/// tightest wins:
+/// Default absolute lifetime of a refresh-token *chain* when the deployment sets
+/// no override (`REFRESH_TTL_DAYS` unset). Measured from the first token's mint
+/// and **never extended by rotation**. Three constraints set it; the tightest
+/// wins:
 ///
 /// 1. **Stale groups (O3b).** A refresh re-mints a session from the IdP identity
 ///    frozen at the *original* browser login ([`GrantIdentity`], groups
@@ -278,28 +279,41 @@ impl AuthCodes {
 /// 2. Bounds a leaked (and silently rotated) chain's usefulness.
 /// 3. Without any cap, a continuously rotated chain would live forever.
 ///
-/// One day: spans a working day of silent renewals, yet a revoked group reaches
-/// the gateway within an operational window. The fuller fix — re-validating the
-/// identity against the IdP on every refresh — needs an IdP refresh token
-/// (`offline_access`) the bridge doesn't currently hold, and is deferred; see
-/// `docs/initial-idea/04-auth-sso.md`.
-const REFRESH_TTL: Duration = Duration::from_secs(24 * 3600);
+/// One day is a conservative default: it spans a working day of silent renewals,
+/// yet a revoked group reaches the gateway within an operational window. An
+/// operator who wants longer-lived sessions (e.g. a 90-day "stay signed in"
+/// window) raises this via `REFRESH_TTL_DAYS` ([`AuthConfig::refresh_ttl`]),
+/// accepting the wider group-staleness window that implies. The fuller fix —
+/// re-validating the identity against the IdP on every refresh — needs an IdP
+/// refresh token (`offline_access`) the bridge doesn't currently hold, and is
+/// deferred; see `docs/initial-idea/04-auth-sso.md`.
+pub const DEFAULT_REFRESH_TTL: Duration = Duration::from_secs(24 * 3600);
 
-/// Whether a refresh chain born at `issued_at` has reached [`REFRESH_TTL`] as of
-/// `now`. A pure boundary so the absolute cap is unit-testable without sleeping
-/// a day or building a past `Instant` (`Instant - Duration` can underflow the
+/// Whether a refresh chain born at `issued_at` has reached its absolute `ttl` as
+/// of `now`. A pure boundary so the cap is unit-testable without sleeping a day
+/// or building a past `Instant` (`Instant - Duration` can underflow the
 /// monotonic clock on a freshly-booted process). `saturating_*` never panics.
-fn chain_expired(issued_at: Instant, now: Instant) -> bool {
-    now.saturating_duration_since(issued_at) >= REFRESH_TTL
+fn chain_expired(issued_at: Instant, now: Instant, ttl: Duration) -> bool {
+    now.saturating_duration_since(issued_at) >= ttl
 }
 
 /// Refresh-token store: hashed token → the verified identity it renews. Rotated
 /// on every redemption (the old token is removed, a new one issued), per OAuth
 /// 2.1 §4.3.1 for public clients. In-memory like the other flow state — see the
 /// deployment note on single-replica / sticky routing for the auth dance.
-#[derive(Clone, Default, Debug)]
+///
+/// `ttl` is the absolute chain lifetime (see [`DEFAULT_REFRESH_TTL`]); production
+/// threads the configured [`AuthConfig::refresh_ttl`] via [`RefreshTokens::with_ttl`].
+#[derive(Clone, Debug)]
 pub struct RefreshTokens {
     inner: Arc<Mutex<HashMap<[u8; 32], RefreshToken>>>,
+    ttl: Duration,
+}
+
+impl Default for RefreshTokens {
+    fn default() -> Self {
+        Self::with_ttl(DEFAULT_REFRESH_TTL)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +327,15 @@ pub struct RefreshToken {
 }
 
 impl RefreshTokens {
+    /// Construct with a caller-chosen absolute chain TTL. Production threads
+    /// [`AuthConfig::refresh_ttl`] here; `Default` uses [`DEFAULT_REFRESH_TTL`].
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            inner: Arc::default(),
+            ttl,
+        }
+    }
+
     /// Insert a token that starts a fresh chain (birth = now). Used when the
     /// token is minted off an authorization-code redemption, not a rotation.
     pub async fn insert(&self, token: &str, identity: GrantIdentity) -> Result<(), StoreError> {
@@ -360,7 +383,7 @@ impl RefreshTokens {
             // absolute TTL, reject it (treat as if it doesn't exist). The
             // background GC task will clean up the rest.
             let now = Instant::now();
-            if chain_expired(rt.issued_at, now) {
+            if chain_expired(rt.issued_at, now, self.ttl) {
                 return None;
             }
             Some(rt)
@@ -387,7 +410,7 @@ impl RefreshTokens {
     pub async fn gc_expired(&self) {
         let mut map = self.inner.lock().await;
         let now = Instant::now();
-        map.retain(|_, t| !chain_expired(t.issued_at, now));
+        map.retain(|_, t| !chain_expired(t.issued_at, now, self.ttl));
     }
 }
 
@@ -449,25 +472,28 @@ mod tests {
     }
 
     #[test]
-    fn refresh_chain_ttl_bounds_group_staleness_within_a_day() {
-        // O3b: the chain's `groups` are frozen at the original login, so
-        // REFRESH_TTL is the worst-case window a since-revoked group keeps
-        // minting sessions. Guard against a regression back to a multi-week cap.
-        assert!(REFRESH_TTL <= Duration::from_secs(24 * 3600));
+    fn default_refresh_chain_ttl_bounds_group_staleness_within_a_day() {
+        // O3b: the chain's `groups` are frozen at the original login, so the
+        // chain TTL is the worst-case window a since-revoked group keeps minting
+        // sessions. The *default* stays conservative — an operator opts into a
+        // longer window explicitly via `REFRESH_TTL_DAYS`; guard the default
+        // against an accidental regression to a multi-week cap.
+        assert!(DEFAULT_REFRESH_TTL <= Duration::from_secs(24 * 3600));
     }
 
     #[test]
     fn chain_is_dead_once_it_reaches_the_absolute_ttl() {
         // Offset off a single base instant so the future `now` never underflows
         // the monotonic clock on a young process.
+        let ttl = DEFAULT_REFRESH_TTL;
         let born = Instant::now();
-        assert!(!chain_expired(born, born), "a fresh chain is live");
+        assert!(!chain_expired(born, born, ttl), "a fresh chain is live");
         assert!(
-            !chain_expired(born, born + REFRESH_TTL - Duration::from_secs(1)),
+            !chain_expired(born, born + ttl - Duration::from_secs(1), ttl),
             "inside the window the chain still renews"
         );
         assert!(
-            chain_expired(born, born + REFRESH_TTL),
+            chain_expired(born, born + ttl, ttl),
             "at the cap the chain is dead — no more stale-group minting"
         );
     }
@@ -477,7 +503,7 @@ mod tests {
         let store = RefreshTokens::default();
         // Born a full TTL ago → already past the cap. checked_sub guards the
         // (theoretical) young-clock underflow; skip rather than panic if so.
-        let Some(stale_birth) = Instant::now().checked_sub(REFRESH_TTL) else {
+        let Some(stale_birth) = Instant::now().checked_sub(DEFAULT_REFRESH_TTL) else {
             return;
         };
         store
@@ -487,7 +513,28 @@ mod tests {
         // take() checks expiration and rejects expired tokens before returning.
         assert!(
             store.take("stale").await.is_none(),
-            "a chain at/over REFRESH_TTL must not renew"
+            "a chain at/over its TTL must not renew"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_ttl_extends_the_chain_window() {
+        // A chain older than the default but younger than a longer configured
+        // TTL (e.g. the 90-day "stay signed in" window) still renews.
+        let ttl = Duration::from_secs(90 * 24 * 3600);
+        let store = RefreshTokens::with_ttl(ttl);
+        let Some(birth) =
+            Instant::now().checked_sub(DEFAULT_REFRESH_TTL + Duration::from_secs(3600))
+        else {
+            return;
+        };
+        store
+            .insert_rotated("long-lived", identity(), birth)
+            .await
+            .unwrap();
+        assert!(
+            store.take("long-lived").await.is_some(),
+            "inside the configured TTL the chain still renews"
         );
     }
 
