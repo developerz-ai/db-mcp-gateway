@@ -8,8 +8,8 @@ import styles from './styles.module.css';
 // (MUST)" list so the landing and the internal contract stay in lockstep.
 //
 // Icons use emoji (not a custom icon-font or SVG bundle) so they render
-// consistently across OSes with zero extra asset weight. Same choice as the
-// 🛡️ navbar brand — one visual vocabulary across the landing surface.
+// consistently across OSes with zero extra asset weight, and match the 🛡️
+// navbar brand for one visual vocabulary across the landing surface.
 
 type FeatureItem = {
   icon: string;
