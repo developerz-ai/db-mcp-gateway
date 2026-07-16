@@ -35,12 +35,18 @@ CTA that jumps to `/docs/deployment/quickstart`. Shape lifted from
   → quickstart) and "View on GitHub" (secondary, → repo URL from
   `customFields.ghUrl`).
 - **Feature cards** (`website/src/components/HomepageFeatures/`): exactly
-  three, wording tracked one-for-one against CLAUDE.md's "Non-negotiables
-  (MUST)" list so the landing and the internal contract stay in lockstep
-  ("Credentials never leave the gateway", "Identity, end-to-end",
-  "Config-as-code"). Each card leads with an emoji icon (🔒 / 👤 / 📝)
-  wrapped in `aria-hidden="true"` — emoji over an icon-font/SVG bundle
-  keeps zero extra asset weight and renders consistently on every OS.
+  three, chosen as the reader-facing summary of CLAUDE.md's five
+  Non-negotiables (MUST) — "Credentials never leave the gateway"
+  (MUST #1), "Identity, end-to-end" (MUST #2), and "Config-as-code"
+  (MUST #5). The remaining two MUSTs — read-only-by-default with no
+  gateway-provisioned write grants (MUST #3), and synchronous audit
+  where a failed audit write fails the request (MUST #4) — are
+  operator-side invariants rather than landing-page pitches; they live
+  in `docs/deployment/quickstart` and the audit spec, and the landing
+  intentionally does not repeat them. Each card leads with an emoji
+  icon (🔒 / 👤 / 📝) wrapped in `aria-hidden="true"` — emoji over an
+  icon-font/SVG bundle keeps zero extra asset weight and renders
+  consistently on every OS.
 
 Adding a fourth card, a testimonials strip, or any block that isn't in
 this section requires a spec update in the same PR — landing shape is a
@@ -112,11 +118,25 @@ next build.
 
 ## Theme
 
-Docusaurus classic theme (stock Infima) with a single override: the
-Infima `--ifm-color-primary` variable is set to emerald-500 so buttons,
-links, and the sidebar accent pick up the brand color without touching
-any other surface. Typography is Inter (body) and JetBrains Mono (code),
-loaded via `@import` in `website/src/css/custom.css`. Both light and
-dark modes ship; dark is the default so the initial render matches the
-brand. Same visual model as `react-redux.js.org` — stock Docusaurus,
-one primary-color swap, nothing else custom.
+Docusaurus classic theme (stock Infima) with a small, enumerated set of
+overrides in `website/src/css/custom.css`:
+
+1. **Brand color scale** — `--ifm-color-primary` and its six
+   dark/light shades set to emerald-500 (`#10b981`), plus
+   `--docusaurus-highlighted-code-line-bg` tinted to match (light + dark
+   variants). Drives buttons, links, sidebar-active, and code-line
+   highlights without touching any other Infima surface.
+2. **Typography** — `--ifm-font-family-base` set to Inter (with a
+   system-font fallback stack) and `--ifm-font-family-monospace` set to
+   JetBrains Mono (with `ui-monospace` fallback). So docs pages match the
+   landing.
+3. **GitHub navbar icon** — `.header-github-link` replaces the "GitHub"
+   text label with the mark, via a `mask-image` data-URL SVG that
+   inherits `--ifm-navbar-link-color` so it themes cleanly in light and
+   dark modes.
+
+Everything else — hero surfaces, feature-card layout, dark-mode
+palette — inherits from Docusaurus's default theme. Both light and dark
+modes ship; dark is the default so the initial render matches the
+brand. Same visual model as `react-redux.js.org`: stock Docusaurus,
+brand-color swap, nothing invasive on top.
