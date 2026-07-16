@@ -23,6 +23,35 @@ The uploaded artifact is the whole `website/build/` directory produced by
 `docusaurus build`. Docusaurus emits landing and docs together; no separate
 merge step.
 
+## Landing shape
+
+The landing at `/` is intentionally minimal — hero + three feature cards,
+nothing else. Discovery is driven by the sidebar and the "Get Started"
+CTA that jumps to `/docs/deployment/quickstart`. Shape lifted from
+`react-redux.js.org`: single centered hero, three-column card row below.
+
+- **Hero** (`website/src/pages/index.tsx`): 🛡️ brand mark inline with the
+  product name, one-line subtitle, two CTAs — "Get Started" (primary,
+  → quickstart) and "View on GitHub" (secondary, → repo URL from
+  `customFields.ghUrl`).
+- **Feature cards** (`website/src/components/HomepageFeatures/`): exactly
+  three, chosen as the reader-facing summary of CLAUDE.md's five
+  Non-negotiables (MUST) — "Credentials never leave the gateway"
+  (MUST #1), "Identity, end-to-end" (MUST #2), and "Config-as-code"
+  (MUST #5). The remaining two MUSTs — read-only-by-default with no
+  gateway-provisioned write grants (MUST #3), and synchronous audit
+  where a failed audit write fails the request (MUST #4) — are
+  operator-side invariants rather than landing-page pitches; they live
+  in `docs/deployment/quickstart` and the audit spec, and the landing
+  intentionally does not repeat them. Each card leads with an emoji
+  icon (🔒 / 👤 / 📝) wrapped in `aria-hidden="true"` — emoji over an
+  icon-font/SVG bundle keeps zero extra asset weight and renders
+  consistently on every OS.
+
+Adding a fourth card, a testimonials strip, or any block that isn't in
+this section requires a spec update in the same PR — landing shape is a
+public surface and drifts silently otherwise.
+
 ## Source → output
 
 | Source | Output URL | Owner |
@@ -89,8 +118,25 @@ next build.
 
 ## Theme
 
-Palette + typography match the landing page (shadcn/Vercel-inspired zinc-950
-+ emerald-500 accent, Inter + JetBrains Mono). Overrides live in
-`website/src/css/custom.css` on top of Docusaurus's Infima framework.
-Both light and dark modes are styled; dark is the default so the initial
-render matches the brand.
+Docusaurus classic theme (stock Infima) with a small, enumerated set of
+overrides in `website/src/css/custom.css`:
+
+1. **Brand color scale** — `--ifm-color-primary` and its six
+   dark/light shades set to emerald-500 (`#10b981`), plus
+   `--docusaurus-highlighted-code-line-bg` tinted to match (light + dark
+   variants). Drives buttons, links, sidebar-active, and code-line
+   highlights without touching any other Infima surface.
+2. **Typography** — `--ifm-font-family-base` set to Inter (with a
+   system-font fallback stack) and `--ifm-font-family-monospace` set to
+   JetBrains Mono (with `ui-monospace` fallback). So docs pages match the
+   landing.
+3. **GitHub navbar icon** — `.header-github-link` replaces the "GitHub"
+   text label with the mark, via a `mask-image` data-URL SVG that
+   inherits `--ifm-navbar-link-color` so it themes cleanly in light and
+   dark modes.
+
+Everything else — hero surfaces, feature-card layout, dark-mode
+palette — inherits from Docusaurus's default theme. Both light and dark
+modes ship; dark is the default so the initial render matches the
+brand. Same visual model as `react-redux.js.org`: stock Docusaurus,
+brand-color swap, nothing invasive on top.

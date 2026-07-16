@@ -13,7 +13,7 @@ const GH_URL = `https://github.com/${GH_ORG}/${GH_REPO}`;
 const config: Config = {
   title: 'db-mcp-gateway',
   tagline:
-    'Give AI agents database access — without ever handing out a database URL.',
+    'Give AI agents database access without ever handing out a database URL.',
   favicon: 'img/favicon.svg',
 
   future: {
