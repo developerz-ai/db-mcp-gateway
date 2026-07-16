@@ -23,6 +23,29 @@ The uploaded artifact is the whole `website/build/` directory produced by
 `docusaurus build`. Docusaurus emits landing and docs together; no separate
 merge step.
 
+## Landing shape
+
+The landing at `/` is intentionally minimal — hero + three feature cards,
+nothing else. Discovery is driven by the sidebar and the "Get Started"
+CTA that jumps to `/docs/deployment/quickstart`. Shape lifted from
+`react-redux.js.org`: single centered hero, three-column card row below.
+
+- **Hero** (`website/src/pages/index.tsx`): 🛡️ brand mark inline with the
+  product name, one-line subtitle, two CTAs — "Get Started" (primary,
+  → quickstart) and "View on GitHub" (secondary, → repo URL from
+  `customFields.ghUrl`).
+- **Feature cards** (`website/src/components/HomepageFeatures/`): exactly
+  three, wording tracked one-for-one against CLAUDE.md's "Non-negotiables
+  (MUST)" list so the landing and the internal contract stay in lockstep
+  ("Credentials never leave the gateway", "Identity, end-to-end",
+  "Config-as-code"). Each card leads with an emoji icon (🔒 / 👤 / 📝)
+  wrapped in `aria-hidden="true"` — emoji over an icon-font/SVG bundle
+  keeps zero extra asset weight and renders consistently on every OS.
+
+Adding a fourth card, a testimonials strip, or any block that isn't in
+this section requires a spec update in the same PR — landing shape is a
+public surface and drifts silently otherwise.
+
 ## Source → output
 
 | Source | Output URL | Owner |
@@ -89,8 +112,11 @@ next build.
 
 ## Theme
 
-Palette + typography match the landing page (shadcn/Vercel-inspired zinc-950
-+ emerald-500 accent, Inter + JetBrains Mono). Overrides live in
-`website/src/css/custom.css` on top of Docusaurus's Infima framework.
-Both light and dark modes are styled; dark is the default so the initial
-render matches the brand.
+Docusaurus classic theme (stock Infima) with a single override: the
+Infima `--ifm-color-primary` variable is set to emerald-500 so buttons,
+links, and the sidebar accent pick up the brand color without touching
+any other surface. Typography is Inter (body) and JetBrains Mono (code),
+loaded via `@import` in `website/src/css/custom.css`. Both light and
+dark modes ship; dark is the default so the initial render matches the
+brand. Same visual model as `react-redux.js.org` — stock Docusaurus,
+one primary-color swap, nothing else custom.
