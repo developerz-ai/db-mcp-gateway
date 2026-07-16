@@ -7,9 +7,9 @@ import styles from './styles.module.css';
 // shape (three cards, one row). Wording tracks CLAUDE.md's "Non-negotiables
 // (MUST)" list so the landing and the internal contract stay in lockstep.
 //
-// Icons use emoji (not a custom icon-font or SVG bundle) so they render
-// consistently across OSes with zero extra asset weight, and match the 🛡️
-// navbar brand for one visual vocabulary across the landing surface.
+// Icons use emoji (not a custom icon-font or SVG bundle), so they render
+// on every OS with zero extra asset weight, and match the 🛡️ navbar
+// brand for one visual vocabulary across the landing surface.
 
 type FeatureItem = {
   icon: string;
