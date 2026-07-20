@@ -1,6 +1,7 @@
 import type {ReactNode} from 'react';
 import clsx from 'clsx';
 import Link from '@docusaurus/Link';
+import useBaseUrl from '@docusaurus/useBaseUrl';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
@@ -21,10 +22,14 @@ function HomepageHeader(): ReactNode {
   return (
     <header className={clsx('hero', styles.heroBanner)}>
       <div className="container">
+        <img
+          className={styles.heroLogo}
+          src={useBaseUrl('/img/logo.png')}
+          alt=""
+          aria-hidden="true"
+          width={160}
+        />
         <Heading as="h1" className="hero__title">
-          <span className={styles.brandMark} aria-hidden="true">
-            🛡️
-          </span>{' '}
           db-mcp-gateway
         </Heading>
         <p className="hero__subtitle">

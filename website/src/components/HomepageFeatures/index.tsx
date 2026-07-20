@@ -8,8 +8,8 @@ import styles from './styles.module.css';
 // (MUST)" list so the landing and the internal contract stay in lockstep.
 //
 // Icons use emoji (not a custom icon-font or SVG bundle), so they render
-// on every OS with zero extra asset weight, and match the 🛡️ navbar
-// brand for one visual vocabulary across the landing surface.
+// on every OS with zero extra asset weight, keeping the shield logo in the
+// navbar/hero as the only raster brand asset on the landing surface.
 
 type FeatureItem = {
   icon: string;

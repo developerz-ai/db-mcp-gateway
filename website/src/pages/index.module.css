@@ -11,9 +11,10 @@
   overflow: hidden;
 }
 
-.brandMark {
-  font-size: 0.9em;
-  margin-right: 0.15em;
+.heroLogo {
+  height: auto;
+  max-width: 160px;
+  margin-bottom: 1.25rem;
 }
 
 .buttons {

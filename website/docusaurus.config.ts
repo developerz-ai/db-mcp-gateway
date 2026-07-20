@@ -74,9 +74,11 @@ const config: Config = {
       },
     ],
     navbar: {
-      // Literal 🛡️ emoji as logo (per brand). Docusaurus lets us drop the
-      // <img> and put the emoji straight in the title.
-      title: '🛡️ db-mcp-gateway',
+      title: 'db-mcp-gateway',
+      logo: {
+        alt: 'db-mcp-gateway logo',
+        src: 'img/logo.png',
+      },
       items: [
         {
           type: 'docSidebar',

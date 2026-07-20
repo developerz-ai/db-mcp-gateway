@@ -1,4 +1,8 @@
-# db-mcp-gateway 🛡️
+<p align="center">
+  <img src="website/static/img/logo.png" alt="db-mcp-gateway" width="200">
+</p>
+
+<h1 align="center">db-mcp-gateway</h1>
 
 **Self-hosted MCP gateway for AI agents that need database access — without ever handing out a database URL.** 🔐
 
