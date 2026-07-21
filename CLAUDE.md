@@ -165,3 +165,7 @@ docker-compose.dev.yml
 - `docs/usage/` — developer-facing. Treat additions as public-API changes.
 - `docs/deployment/` — operator-facing.
 - Architecture decisions land in the spec, not in code comments.
+
+## Note
+
+Do not use git worktrees — work directly in this checkout. See `.claude/commands/feature.md` and `.claude/commands/planx.md`.
