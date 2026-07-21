@@ -224,7 +224,17 @@ pub async fn complete_bridge_login(
         .await
     {
         Ok(v) => v,
-        Err(_) => return redirect_with_error(&bridge, "access_denied"),
+        Err(err) => {
+            // Log the typed reason. `access_denied` is all the client may learn
+            // (it can't be told whether the IdP was slow, the nonce mismatched,
+            // or the email was unverified), which left this the one login
+            // failure with no server-side trace at all — an operator saw a user
+            // bounced with `access_denied` and had nothing to correlate. Every
+            // `AuthError` Display is secret-free by construction (see
+            // `auth::errors`), so the variant is safe to record.
+            tracing::warn!(reason = %err, "bridge login failed at the IdP exchange");
+            return redirect_with_error(&bridge, "access_denied");
+        }
     };
 
     // Don't mint a session yet — only stash the verified identity. The session

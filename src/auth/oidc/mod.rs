@@ -31,6 +31,21 @@ pub struct OidcClient {
     jwks: Arc<RwLock<Option<JwksCache>>>,
 }
 
+/// Cap on an IdP metadata round-trip (discovery, JWKS). These are small,
+/// cacheable GETs against static documents; if one is slow, something is wrong
+/// and failing fast is right.
+const DEFAULT_IDP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Cap on the authorization-code exchange specifically. Deliberately looser than
+/// [`DEFAULT_IDP_TIMEOUT`]: this POST makes the IdP mint tokens, which means
+/// touching its user store, and a busy IdP has been observed answering in
+/// 3–27 s. At 10 s the gateway aborted a call the IdP then completed
+/// successfully — the user got a bare `access_denied` at their loopback
+/// callback while the IdP logged a 200, and a retry seconds later worked. A
+/// browser login leg can afford to wait; a spurious sign-out failure can't.
+/// Still bounded, so a genuinely hung IdP can't pin the task open (T3).
+const TOKEN_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
 impl OidcClient {
     pub fn new(config: AuthConfig) -> Result<Self, AuthError> {
         // Token exchange must not follow redirects (SSRF guard). Fall back to
@@ -39,11 +54,12 @@ impl OidcClient {
         // the very SSRF surface this client is supposed to close.
         // Bound every IdP round-trip so a hung/slow IdP can't pin a request
         // task open indefinitely (T3). connect_timeout caps the TCP/TLS dial;
-        // timeout caps the whole request.
+        // timeout caps the whole request. The code exchange overrides the
+        // latter — see `TOKEN_EXCHANGE_TIMEOUT`.
         use std::time::Duration;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(10))
+            .timeout(DEFAULT_IDP_TIMEOUT)
             .connect_timeout(Duration::from_secs(5))
             .build()
             .map_err(|_| AuthError::HttpClient)?;
@@ -106,6 +122,7 @@ impl OidcClient {
                 ("client_secret", &self.config.client_secret),
                 ("code_verifier", code_verifier),
             ])
+            .timeout(TOKEN_EXCHANGE_TIMEOUT)
             .send()
             .await
             .map_err(|_| AuthError::CodeExchange)?;
