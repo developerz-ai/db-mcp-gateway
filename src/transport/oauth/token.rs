@@ -1,11 +1,9 @@
-use std::time::Instant;
-
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::header::{CACHE_CONTROL, PRAGMA};
 use axum::response::{IntoResponse, Response};
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -162,17 +160,14 @@ async fn token_refresh(auth: &AuthFacade, form: TokenForm) -> Response {
 async fn issue_token_response(
     auth: &AuthFacade,
     identity: GrantIdentity,
-    chain_issued_at: Option<Instant>,
+    chain_issued_at: Option<DateTime<Utc>>,
 ) -> Response {
     // Preserve the original `/authorize` login time so `admin.session_max_age_secs`
-    // counts from the first login, not from this rotation. The refresh-token chain
-    // already carries the birth `Instant`; convert it to wall-clock by subtracting
-    // the elapsed monotonic time from `Utc::now()`. `None` on fresh authorizations:
-    // stamp `issued_at` as now (handled inside `SessionStore::create`).
-    let original_issued_at = chain_issued_at.map(|birth| {
-        let elapsed = Instant::now().saturating_duration_since(birth);
-        Utc::now() - ChronoDuration::from_std(elapsed).unwrap_or_default()
-    });
+    // counts from the first login, not from this rotation. The chain birth is
+    // already wall-clock (it round-trips through the state DB), so it carries
+    // straight through. `None` on fresh authorizations: stamp `issued_at` as now
+    // (handled inside `SessionStore::create`).
+    let original_issued_at = chain_issued_at;
 
     let session = match auth
         .sessions

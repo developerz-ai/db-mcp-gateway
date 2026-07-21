@@ -1,18 +1,26 @@
-//! In-memory flow state for the auth round-trips fronted by `transport/`.
+//! Flow state for the auth round-trips fronted by `transport/`.
 //!
 //! Three TTL-bounded stores plus the context they carry: pending IdP logins
 //! ([`PendingFlows`]), one-time authorization codes ([`AuthCodes`]), and
-//! rotating refresh tokens ([`RefreshTokens`]). All are in-process — a restart
-//! drops them and an HA deployment must pin the OAuth dance to one replica or
-//! sticky-route it (see `docs/initial-idea/02-architecture.md#ha`). The
-//! Dynamic-Client-Registration store lives next door in
-//! [`super::client_registry`].
+//! rotating refresh tokens ([`RefreshTokens`]).
+//!
+//! The first two are in-process by design — both are seconds-to-minutes legs of
+//! a single browser round-trip, so a restart mid-login is a retry, not a
+//! sign-out. An HA deployment must still pin the OAuth dance to one replica or
+//! sticky-route it (see `docs/initial-idea/02-architecture.md#ha`).
+//!
+//! [`RefreshTokens`] is the exception: a chain is meant to outlive the process
+//! (that is the whole point of `REFRESH_TTL_DAYS`), so production persists it in
+//! the state DB. The Dynamic-Client-Registration store lives next door in
+//! [`super::client_registry`] and is persisted for the same reason.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sha2::{Digest, Sha256};
+use sqlx::PgPool;
 use tokio::sync::Mutex;
 
 /// Size cap on the pending flows map. A login produces one pending flow;
@@ -32,12 +40,16 @@ const REFRESH_TOKENS_MAX_SIZE: usize = 100_000;
 pub enum StoreError {
     /// The store has reached its size cap; new entries are rejected.
     StoreFull,
+    /// The backing store (state DB) is unreachable or rejected the write. Never
+    /// carries the underlying `sqlx::Error` — its `Display` can embed the DSN.
+    Backend,
 }
 
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StoreError::StoreFull => write!(f, "auth store full"),
+            StoreError::Backend => write!(f, "auth store unavailable"),
         }
     }
 }
@@ -290,24 +302,54 @@ impl AuthCodes {
 pub const DEFAULT_REFRESH_TTL: Duration = Duration::from_secs(24 * 3600);
 
 /// Whether a refresh chain born at `issued_at` has reached its absolute `ttl` as
-/// of `now`. A pure boundary so the cap is unit-testable without sleeping a day
-/// or building a past `Instant` (`Instant - Duration` can underflow the
-/// monotonic clock on a freshly-booted process). `saturating_*` never panics.
-fn chain_expired(issued_at: Instant, now: Instant, ttl: Duration) -> bool {
-    now.saturating_duration_since(issued_at) >= ttl
+/// of `now`. A pure boundary so the cap is unit-testable without sleeping a day.
+/// Wall-clock (not `Instant`) because the chain outlives the process: the birth
+/// time round-trips through `oauth_refresh_tokens.chain_issued_at`, and a
+/// monotonic clock means nothing across a restart.
+fn chain_expired(issued_at: DateTime<Utc>, now: DateTime<Utc>, ttl: Duration) -> bool {
+    let elapsed = now.signed_duration_since(issued_at);
+    elapsed >= ChronoDuration::from_std(ttl).unwrap_or(ChronoDuration::MAX)
 }
 
 /// Refresh-token store: hashed token → the verified identity it renews. Rotated
 /// on every redemption (the old token is removed, a new one issued), per OAuth
-/// 2.1 §4.3.1 for public clients. In-memory like the other flow state — see the
-/// deployment note on single-replica / sticky routing for the auth dance.
+/// 2.1 §4.3.1 for public clients.
+///
+/// Two backends behind one API, mirroring [`super::client_registry`]:
+/// - **DB** (`with_db`) — the production path. Chains live in the shared state
+///   DB (`oauth_refresh_tokens`, migration 0009). In memory, a redeploy dropped
+///   every chain and forced every signed-in agent through a full browser SSO
+///   login, which made `REFRESH_TTL_DAYS` a fiction — the real "stay signed in"
+///   ceiling was time-until-next-rollout, not the configured window.
+/// - **Memory** (`default`) — unit tests and the auth-less test bootstrap.
 ///
 /// `ttl` is the absolute chain lifetime (see [`DEFAULT_REFRESH_TTL`]); production
-/// threads the configured [`AuthConfig::refresh_ttl`] via [`RefreshTokens::with_ttl`].
-#[derive(Clone, Debug)]
+/// threads the configured [`AuthConfig::refresh_ttl`] via [`RefreshTokens::with_db`].
+#[derive(Clone)]
 pub struct RefreshTokens {
-    inner: Arc<Mutex<HashMap<[u8; 32], RefreshToken>>>,
+    backend: RefreshBackend,
     ttl: Duration,
+}
+
+#[derive(Clone)]
+enum RefreshBackend {
+    Db(PgPool),
+    Memory(Arc<Mutex<HashMap<[u8; 32], RefreshToken>>>),
+}
+
+impl std::fmt::Debug for RefreshTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hand-rolled: `PgPool`'s Debug can render the DSN (password). Never let
+        // it reach a log line — same guard as `ClientRegistry` / `SessionStore`.
+        let backend = match &self.backend {
+            RefreshBackend::Db(_) => "Db(<PgPool>)",
+            RefreshBackend::Memory(_) => "Memory",
+        };
+        f.debug_struct("RefreshTokens")
+            .field("backend", &backend)
+            .field("ttl", &self.ttl)
+            .finish()
+    }
 }
 
 impl Default for RefreshTokens {
@@ -321,25 +363,40 @@ pub struct RefreshToken {
     pub identity: GrantIdentity,
     /// When the rotation *chain* this token belongs to was first minted. Carried
     /// verbatim across rotations (see [`RefreshTokens::insert_rotated`]) so the
-    /// chain expires an absolute [`REFRESH_TTL`] after the first token — rotation
-    /// renews the opaque value but never the deadline.
-    pub issued_at: Instant,
+    /// chain expires an absolute TTL after the first token — rotation renews the
+    /// opaque value but never the deadline.
+    pub issued_at: DateTime<Utc>,
 }
 
 impl RefreshTokens {
-    /// Construct with a caller-chosen absolute chain TTL. Production threads
-    /// [`AuthConfig::refresh_ttl`] here; `Default` uses [`DEFAULT_REFRESH_TTL`].
-    pub fn with_ttl(ttl: Duration) -> Self {
+    /// Production store: chains persisted in the shared state DB, so a restart
+    /// or redeploy no longer signs every agent out (migration 0009 must have run
+    /// — `state::connect` does). `ttl` is [`AuthConfig::refresh_ttl`].
+    pub fn with_db(pool: PgPool, ttl: Duration) -> Self {
         Self {
-            inner: Arc::default(),
+            backend: RefreshBackend::Db(pool),
             ttl,
         }
+    }
+
+    /// In-memory store with a caller-chosen absolute chain TTL. Tests only —
+    /// production uses [`RefreshTokens::with_db`].
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            backend: RefreshBackend::Memory(Arc::default()),
+            ttl,
+        }
+    }
+
+    /// The absolute chain lifetime this store enforces.
+    pub const fn ttl(&self) -> Duration {
+        self.ttl
     }
 
     /// Insert a token that starts a fresh chain (birth = now). Used when the
     /// token is minted off an authorization-code redemption, not a rotation.
     pub async fn insert(&self, token: &str, identity: GrantIdentity) -> Result<(), StoreError> {
-        self.store(token, identity, Instant::now()).await
+        self.store(token, identity, Utc::now()).await
     }
 
     /// Insert a rotated token, carrying the chain's original `issued_at` forward
@@ -348,7 +405,7 @@ impl RefreshTokens {
         &self,
         token: &str,
         identity: GrantIdentity,
-        issued_at: Instant,
+        issued_at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
         self.store(token, identity, issued_at).await
     }
@@ -357,38 +414,66 @@ impl RefreshTokens {
         &self,
         token: &str,
         identity: GrantIdentity,
-        issued_at: Instant,
+        issued_at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        let mut map = self.inner.lock().await;
-        // Check size before inserting; reject if full.
-        if map.len() >= REFRESH_TOKENS_MAX_SIZE {
-            return Err(StoreError::StoreFull);
+        match &self.backend {
+            RefreshBackend::Db(pool) => {
+                Self::store_db(pool, hash_secret(token), &identity, issued_at, self.ttl)
+                    .await
+                    .map_err(|_| {
+                        // Deliberately no error source: a `sqlx::Error` can render
+                        // the DSN (password) in its `Display` (see `state::connect`).
+                        tracing::warn!("refresh token insert failed (state DB)");
+                        StoreError::Backend
+                    })
+            }
+            RefreshBackend::Memory(map) => {
+                let mut map = map.lock().await;
+                let key = hash_secret(token);
+                // Check size before inserting; reject if full. Replacing an
+                // existing key doesn't grow the map, so let it through at cap.
+                if map.len() >= REFRESH_TOKENS_MAX_SIZE && !map.contains_key(&key) {
+                    return Err(StoreError::StoreFull);
+                }
+                map.insert(
+                    key,
+                    RefreshToken {
+                        identity,
+                        issued_at,
+                    },
+                );
+                Ok(())
+            }
         }
-        map.insert(
-            hash_secret(token),
-            RefreshToken {
-                identity,
-                issued_at,
-            },
-        );
-        Ok(())
     }
 
     /// Remove and return a refresh token (rotation consumes it), if still live
     /// (i.e., not yet expired past the absolute chain TTL).
+    ///
+    /// A DB error yields `None` — fail closed: an unresolvable token is treated
+    /// as invalid rather than waved through.
     pub async fn take(&self, token: &str) -> Option<RefreshToken> {
-        let mut map = self.inner.lock().await;
-        if let Some(rt) = map.remove(&hash_secret(token)) {
-            // Check expiration before returning: if the chain has passed its
-            // absolute TTL, reject it (treat as if it doesn't exist). The
-            // background GC task will clean up the rest.
-            let now = Instant::now();
-            if chain_expired(rt.issued_at, now, self.ttl) {
-                return None;
+        match &self.backend {
+            RefreshBackend::Db(pool) => Self::take_db(pool, hash_secret(token))
+                .await
+                .unwrap_or_else(|_| {
+                    // No error source — see the DSN-leak note on `store`.
+                    tracing::warn!("refresh token lookup failed (state DB)");
+                    None
+                })
+                // The row's own `expires_at` already gates redemption, but
+                // re-check against the *current* configured TTL so lowering
+                // `REFRESH_TTL_DAYS` takes effect on chains minted under the
+                // old, longer window instead of honoring the stale deadline.
+                .filter(|rt| !chain_expired(rt.issued_at, Utc::now(), self.ttl)),
+            RefreshBackend::Memory(map) => {
+                let mut map = map.lock().await;
+                let rt = map.remove(&hash_secret(token))?;
+                // Check expiration before returning: if the chain has passed its
+                // absolute TTL, reject it (treat as if it doesn't exist). The
+                // background GC task will clean up the rest.
+                (!chain_expired(rt.issued_at, Utc::now(), self.ttl)).then_some(rt)
             }
-            Some(rt)
-        } else {
-            None
         }
     }
 
@@ -399,18 +484,131 @@ impl RefreshTokens {
     /// (each rotation mints a new session), so `sub` is the only handle spanning
     /// it — hence purge-by-identity rather than per-token. (O4)
     pub async fn purge_for_sub(&self, sub: &str) -> usize {
-        let mut map = self.inner.lock().await;
-        let before = map.len();
-        map.retain(|_, t| t.identity.sub != sub);
-        before - map.len()
+        match &self.backend {
+            RefreshBackend::Db(pool) => {
+                sqlx::query("DELETE FROM oauth_refresh_tokens WHERE user_sub = $1")
+                    .bind(sub)
+                    .execute(pool)
+                    .await
+                    .map(|r| r.rows_affected() as usize)
+                    .unwrap_or_else(|_| {
+                        // No error source — see the DSN-leak note on `store`.
+                        // Logout still revokes the session row; surface the
+                        // failed purge as 0 rather than a bogus count.
+                        tracing::warn!("refresh token purge failed (state DB)");
+                        0
+                    })
+            }
+            RefreshBackend::Memory(map) => {
+                let mut map = map.lock().await;
+                let before = map.len();
+                map.retain(|_, t| t.identity.sub != sub);
+                before - map.len()
+            }
+        }
     }
 
     /// Remove all expired refresh token chains. Called periodically by a
     /// background task.
     pub async fn gc_expired(&self) {
-        let mut map = self.inner.lock().await;
-        let now = Instant::now();
-        map.retain(|_, t| !chain_expired(t.issued_at, now, self.ttl));
+        match &self.backend {
+            RefreshBackend::Db(pool) => {
+                if sqlx::query("DELETE FROM oauth_refresh_tokens WHERE expires_at <= now()")
+                    .execute(pool)
+                    .await
+                    .is_err()
+                {
+                    // No error source — see the DSN-leak note on `store`.
+                    tracing::warn!("refresh token GC failed (state DB)");
+                }
+            }
+            RefreshBackend::Memory(map) => {
+                let mut map = map.lock().await;
+                let now = Utc::now();
+                map.retain(|_, t| !chain_expired(t.issued_at, now, self.ttl));
+            }
+        }
+    }
+
+    /// DB insert: enforce the cap against live rows (a rotation replaces its own
+    /// row, so it never grows the table and is let through at cap), then upsert.
+    /// The count/insert pair isn't atomic, but the cap is a resource ceiling, not
+    /// an invariant — a transient one-over is harmless.
+    async fn store_db(
+        pool: &PgPool,
+        token_hash: [u8; 32],
+        identity: &GrantIdentity,
+        issued_at: DateTime<Utc>,
+        ttl: Duration,
+    ) -> Result<(), sqlx::Error> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT exists(SELECT 1 FROM oauth_refresh_tokens WHERE token_hash = $1)",
+        )
+        .bind(token_hash.as_slice())
+        .fetch_one(pool)
+        .await?;
+        if !exists {
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM oauth_refresh_tokens")
+                .fetch_one(pool)
+                .await?;
+            if count >= REFRESH_TOKENS_MAX_SIZE as i64 {
+                return Err(sqlx::Error::Protocol("refresh token store full".into()));
+            }
+        }
+
+        let groups = serde_json::to_value(&identity.groups)
+            .unwrap_or_else(|_| serde_json::Value::Array(vec![]));
+        // `expires_at` materializes the absolute deadline so GC and the CHECK
+        // constraint are plain comparisons. Infallible for any sane TTL; clamp
+        // rather than panic (CLAUDE.md: no unwrap outside main/tests).
+        let expires_at =
+            issued_at + ChronoDuration::from_std(ttl).unwrap_or_else(|_| ChronoDuration::days(1));
+        sqlx::query(
+            "INSERT INTO oauth_refresh_tokens \
+               (token_hash, user_sub, email, groups, chain_issued_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (token_hash) DO UPDATE \
+               SET user_sub = EXCLUDED.user_sub, \
+                   email = EXCLUDED.email, \
+                   groups = EXCLUDED.groups, \
+                   chain_issued_at = EXCLUDED.chain_issued_at, \
+                   expires_at = EXCLUDED.expires_at",
+        )
+        .bind(token_hash.as_slice())
+        .bind(&identity.sub)
+        .bind(&identity.email)
+        .bind(&groups)
+        .bind(issued_at)
+        .bind(expires_at)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// DB redemption: delete-and-return in one statement so a concurrent replay
+    /// of the same token can only win once (rotation must be single-use). The
+    /// `expires_at` filter is part of the same statement, so a lapsed chain is
+    /// reported as absent (and left for `gc_expired` to reap).
+    async fn take_db(
+        pool: &PgPool,
+        token_hash: [u8; 32],
+    ) -> Result<Option<RefreshToken>, sqlx::Error> {
+        let row: Option<(String, String, serde_json::Value, DateTime<Utc>)> = sqlx::query_as(
+            "DELETE FROM oauth_refresh_tokens \
+             WHERE token_hash = $1 AND expires_at > now() \
+             RETURNING user_sub, email, groups, chain_issued_at",
+        )
+        .bind(token_hash.as_slice())
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.map(|(sub, email, groups, issued_at)| RefreshToken {
+            identity: GrantIdentity {
+                sub,
+                email,
+                groups: serde_json::from_value(groups).unwrap_or_default(),
+            },
+            issued_at,
+        }))
     }
 }
 
@@ -451,8 +649,8 @@ mod tests {
         let store = RefreshTokens::default();
 
         // A rotated token must store the *passed* chain birth verbatim, not
-        // `Instant::now()` — that's what keeps the absolute TTL from sliding.
-        let birth = Instant::now();
+        // `Utc::now()` — that's what keeps the absolute TTL from sliding.
+        let birth = Utc::now();
         store
             .insert_rotated("rotated", identity(), birth)
             .await
@@ -464,9 +662,9 @@ mod tests {
         );
 
         // A fresh insert, by contrast, stamps ~now.
-        let before = Instant::now();
+        let before = Utc::now();
         store.insert("fresh", identity()).await.unwrap();
-        let after = Instant::now();
+        let after = Utc::now();
         let fresh = store.take("fresh").await.expect("token is live");
         assert!(fresh.issued_at >= before && fresh.issued_at <= after);
     }
@@ -483,17 +681,16 @@ mod tests {
 
     #[test]
     fn chain_is_dead_once_it_reaches_the_absolute_ttl() {
-        // Offset off a single base instant so the future `now` never underflows
-        // the monotonic clock on a young process.
         let ttl = DEFAULT_REFRESH_TTL;
-        let born = Instant::now();
+        let span = ChronoDuration::from_std(ttl).unwrap();
+        let born = Utc::now();
         assert!(!chain_expired(born, born, ttl), "a fresh chain is live");
         assert!(
-            !chain_expired(born, born + ttl - Duration::from_secs(1), ttl),
+            !chain_expired(born, born + span - ChronoDuration::seconds(1), ttl),
             "inside the window the chain still renews"
         );
         assert!(
-            chain_expired(born, born + ttl, ttl),
+            chain_expired(born, born + span, ttl),
             "at the cap the chain is dead — no more stale-group minting"
         );
     }
@@ -501,11 +698,8 @@ mod tests {
     #[tokio::test]
     async fn expired_refresh_chain_is_gc_dropped_and_not_returned() {
         let store = RefreshTokens::default();
-        // Born a full TTL ago → already past the cap. checked_sub guards the
-        // (theoretical) young-clock underflow; skip rather than panic if so.
-        let Some(stale_birth) = Instant::now().checked_sub(DEFAULT_REFRESH_TTL) else {
-            return;
-        };
+        // Born a full TTL ago → already past the cap.
+        let stale_birth = Utc::now() - ChronoDuration::from_std(DEFAULT_REFRESH_TTL).unwrap();
         store
             .insert_rotated("stale", identity(), stale_birth)
             .await
@@ -523,11 +717,8 @@ mod tests {
         // TTL (e.g. the 90-day "stay signed in" window) still renews.
         let ttl = Duration::from_secs(90 * 24 * 3600);
         let store = RefreshTokens::with_ttl(ttl);
-        let Some(birth) =
-            Instant::now().checked_sub(DEFAULT_REFRESH_TTL + Duration::from_secs(3600))
-        else {
-            return;
-        };
+        let birth = Utc::now()
+            - ChronoDuration::from_std(DEFAULT_REFRESH_TTL + Duration::from_secs(3600)).unwrap();
         store
             .insert_rotated("long-lived", identity(), birth)
             .await

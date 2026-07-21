@@ -9,7 +9,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::{MockUser, spawn_mock_idp};
 use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
@@ -913,13 +913,7 @@ async fn refresh_chain_expires_past_absolute_ttl() {
     let (_access, refresh_token) = obtain_token_pair(&http, &gw).await;
 
     // The absolute chain TTL is 24 h; backdate by 25 h to land clearly past it.
-    // `checked_sub` guards against a young monotonic clock (process younger than
-    // 25 h); if that happens we skip rather than panic — the unit tests in
-    // `oauth_state` cover this boundary exhaustively.
-    let Some(stale_birth) = Instant::now().checked_sub(Duration::from_secs(25 * 3600)) else {
-        // Monotonic clock underflow — skip on very young processes.
-        return;
-    };
+    let stale_birth = chrono::Utc::now() - chrono::Duration::hours(25);
 
     // Overwrite the live entry with a stale `issued_at`. The raw token hashes
     // to the same map key, so this replaces the existing entry in place.

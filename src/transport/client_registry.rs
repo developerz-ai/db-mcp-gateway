@@ -23,13 +23,21 @@ use chrono::{Duration as ChronoDuration, Utc};
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 
-/// TTL for a Dynamic-Client-Registration entry. A client registers, then walks
-/// `/authorize` → `/token` right away and only re-authorizes on a full browser
-/// re-login (refresh covers the common renewal), so the entry need only outlive
-/// that. Persisted in the DB backend (survives restarts) and time-bounded in the
-/// memory backend; either way a lapsed entry is GC'd and a spec-compliant client
-/// re-registers on the next `invalid_client`.
-const CLIENT_TTL: Duration = Duration::from_secs(24 * 3600);
+/// TTL for a Dynamic-Client-Registration entry, refreshed on every successful
+/// `/authorize` lookup so an actively-used client never lapses.
+///
+/// Was 24 h, on the assumption that a client registers and immediately walks
+/// `/authorize` → `/token`. It does — but it then *caches* the `client_id`
+/// indefinitely and only re-authorizes days later, when the refresh chain runs
+/// out or the user signs out. By then the registration had been GC'd and the
+/// browser landed on a bare `invalid_client` JSON page: a dead end, because
+/// nothing in the OAuth redirect leg tells the client to re-register.
+///
+/// So the window has to cover the whole "stay signed in" horizon, not one
+/// login: 90 days, sliding. `/authorize` self-heals the residual case (see
+/// `oauth::authorize`), and the cap plus GC still bound an unauthenticated
+/// `/register` flood.
+const CLIENT_TTL: Duration = Duration::from_secs(90 * 24 * 3600);
 
 /// Hard cap on registered clients. `/register` is unauthenticated (open DCR per
 /// RFC 7591), so the store needs a ceiling or a flood could exhaust it. At the
@@ -135,12 +143,16 @@ impl ClientRegistry {
     }
 
     /// The registered redirect URIs for `client_id`, if the registration is
-    /// still live. `None` means "unknown client" — `/authorize` rejects it. A DB
-    /// error also yields `None` (fail closed: an unresolvable client is treated
-    /// as unknown rather than waved through).
+    /// still live. `None` means "unknown client". A DB error also yields `None`
+    /// (fail closed: an unresolvable client is treated as unknown rather than
+    /// waved through).
+    ///
+    /// A hit slides `expires_at` forward by a full [`CLIENT_TTL`], so a client
+    /// that keeps authorizing keeps its registration indefinitely and only an
+    /// abandoned one ages out.
     pub async fn redirect_uris(&self, client_id: &str) -> Option<Vec<String>> {
         match &self.backend {
-            Backend::Db(pool) => Self::lookup_db(pool, client_id).await.unwrap_or_else(|_| {
+            Backend::Db(pool) => Self::touch_db(pool, client_id).await.unwrap_or_else(|_| {
                 // No error source — see the DSN-leak note on `insert`.
                 tracing::warn!("client registration lookup failed (state DB)");
                 None
@@ -148,7 +160,9 @@ impl ClientRegistry {
             Backend::Memory(map) => {
                 let mut map = map.lock().await;
                 Self::gc_mem(&mut map);
-                map.get(client_id).map(|c| c.redirect_uris.clone())
+                let client = map.get_mut(client_id)?;
+                client.expires_at = Instant::now() + CLIENT_TTL;
+                Some(client.redirect_uris.clone())
             }
         }
     }
@@ -204,12 +218,18 @@ impl ClientRegistry {
     }
 
     /// DB lookup: the live registration's URIs, or `None` if absent/expired.
-    async fn lookup_db(pool: &PgPool, client_id: &str) -> Result<Option<Vec<String>>, sqlx::Error> {
+    /// Slides `expires_at` in the same statement, so the read and the renewal
+    /// can't disagree and no extra round-trip lands on the `/authorize` path.
+    async fn touch_db(pool: &PgPool, client_id: &str) -> Result<Option<Vec<String>>, sqlx::Error> {
+        // Infallible for the const TTL; clamp rather than panic (CLAUDE.md).
+        let ttl = ChronoDuration::from_std(CLIENT_TTL).unwrap_or_else(|_| ChronoDuration::days(90));
         let row: Option<serde_json::Value> = sqlx::query_scalar(
-            "SELECT redirect_uris FROM oauth_clients \
-             WHERE client_id = $1 AND expires_at > now()",
+            "UPDATE oauth_clients SET expires_at = $2 \
+             WHERE client_id = $1 AND expires_at > now() \
+             RETURNING redirect_uris",
         )
         .bind(client_id)
+        .bind(Utc::now() + ttl)
         .fetch_optional(pool)
         .await?;
         Ok(row.map(|v| serde_json::from_value(v).unwrap_or_default()))

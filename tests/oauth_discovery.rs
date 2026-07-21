@@ -183,12 +183,58 @@ async fn authorize_rejects_a_request_without_state() {
 }
 
 #[tokio::test]
-async fn authorize_rejects_an_unregistered_client() {
+async fn authorize_rejects_an_unregistered_client_asking_for_a_remote_redirect() {
     let base = spawn_gateway().await;
-    // Well-formed PKCE request, but the client_id was never registered.
+    // Well-formed PKCE request, but the client_id was never registered *and* the
+    // redirect points off-box. Adopting it would let a code be delivered to a
+    // host nobody vouched for — the exact hole the allowlist closes.
     let resp = client()
         .get(format!(
             "{base}/authorize?response_type=code&client_id=mcp-never-registered\
+             &redirect_uri=https://evil.example.com/cb\
+             &code_challenge=abc&code_challenge_method=S256"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_client");
+}
+
+#[tokio::test]
+async fn authorize_adopts_an_unregistered_client_on_a_loopback_redirect() {
+    let base = spawn_gateway().await;
+    // A client whose registration lapsed (or predates the persistent store)
+    // replays its cached client_id against a loopback callback. That code can
+    // only reach the user's own machine, so the request proceeds instead of
+    // dead-ending on `invalid_client` with nothing telling it to re-register.
+    // `state` is omitted, so the request stops at the *next* gate — proof the
+    // client/redirect gate let it through.
+    let resp = client()
+        .get(format!(
+            "{base}/authorize?response_type=code&client_id=mcp-never-registered\
+             &redirect_uri=http://127.0.0.1:9/cb\
+             &code_challenge=abc&code_challenge_method=S256"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_request");
+    assert_eq!(body["error_description"], "state is required");
+}
+
+#[tokio::test]
+async fn authorize_refuses_to_adopt_an_absurd_client_id() {
+    let base = spawn_gateway().await;
+    // `/authorize` is unauthenticated: adoption must not become a way to write
+    // arbitrary-length junk into the registry.
+    let huge = "x".repeat(200);
+    let resp = client()
+        .get(format!(
+            "{base}/authorize?response_type=code&client_id={huge}\
              &redirect_uri=http://127.0.0.1:9/cb\
              &code_challenge=abc&code_challenge_method=S256"
         ))

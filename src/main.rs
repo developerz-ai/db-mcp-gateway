@@ -182,7 +182,11 @@ async fn run() -> anyhow::Result<()> {
             oidc,
             flows: PendingFlows::default(),
             codes: AuthCodes::default(),
-            refresh: RefreshTokens::with_ttl(refresh_ttl),
+            // Persist refresh chains in the shared state DB: a chain is meant to
+            // outlive the process (that is what `REFRESH_TTL_DAYS` buys), and an
+            // in-memory store silently capped the real "stay signed in" window at
+            // time-until-next-rollout.
+            refresh: RefreshTokens::with_db(state_db.clone(), refresh_ttl),
         }),
         config: Arc::new(config_file),
         adapter_registry: AdapterRegistry::new(),

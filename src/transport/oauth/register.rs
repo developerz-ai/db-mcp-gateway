@@ -74,6 +74,14 @@ pub fn is_valid_redirect_uri(raw: &str) -> bool {
     }
 }
 
+/// Whether `raw` is an `http://` loopback redirect URI — i.e. one that can only
+/// deliver an authorization code to the user's *own* machine. `/authorize`
+/// leans on this to adopt an unknown `client_id` without weakening the redirect
+/// allowlist: there is no third party such a code could leak to.
+pub fn is_loopback_redirect_uri(raw: &str) -> bool {
+    Url::parse(raw).is_ok_and(|url| is_http_loopback(&url))
+}
+
 /// An `http://` URL whose host is a loopback address (`localhost`, `127.0.0.0/8`,
 /// or `::1`).
 fn is_http_loopback(url: &Url) -> bool {

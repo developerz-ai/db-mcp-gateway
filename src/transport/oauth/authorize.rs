@@ -8,7 +8,21 @@ use crate::auth::pkce;
 use super::super::app_state::AppState;
 use super::super::oauth_state::{GrantIdentity, OAuthBridge};
 use super::helpers::{build_redirect, oauth_error, random_token, redirect_with_error};
-use super::register::redirect_uri_matches;
+use super::register::{is_loopback_redirect_uri, redirect_uri_matches};
+
+/// Upper bound on a `client_id` the gateway will *adopt* at `/authorize` (as
+/// opposed to one it minted at `/register`). `/authorize` is unauthenticated, so
+/// without a bound an adversary could stuff arbitrary-length junk into the
+/// registry; the store's own cap bounds the row count, this bounds the row size.
+/// Comfortably above the 36-char ids `/register` mints.
+const MAX_ADOPTABLE_CLIENT_ID: usize = 128;
+
+/// Whether an unregistered `client_id` is shaped like a real one and therefore
+/// safe to record verbatim: bounded length, printable ASCII only (no control
+/// characters, no whitespace — nothing that would mangle a log line).
+fn is_adoptable_client_id(client_id: &str) -> bool {
+    client_id.len() <= MAX_ADOPTABLE_CLIENT_ID && client_id.chars().all(|c| c.is_ascii_graphic())
+}
 
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeParams {
@@ -48,22 +62,59 @@ pub async fn authorize(
             "client_id is required",
         );
     };
-    let Some(registered) = state.client_registry.redirect_uris(client_id).await else {
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_client",
-            "unknown client_id; register via /register first",
-        );
-    };
-    let Some(redirect_uri) = p
-        .redirect_uri
-        .filter(|u| registered.iter().any(|r| redirect_uri_matches(r, u)))
-    else {
+    let Some(requested_uri) = p.redirect_uri.filter(|u| !u.is_empty()) else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
-            "redirect_uri must exactly match a registered redirect URI",
+            "redirect_uri is required",
         );
+    };
+    let redirect_uri = match state.client_registry.redirect_uris(client_id).await {
+        Some(registered) => {
+            if !registered
+                .iter()
+                .any(|r| redirect_uri_matches(r, &requested_uri))
+            {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "redirect_uri must exactly match a registered redirect URI",
+                );
+            }
+            requested_uri
+        }
+        // Unknown client_id, loopback redirect: adopt the id rather than
+        // dead-end. A client caches its `client_id` and replays it for as long
+        // as it stays signed in; if the registration is gone (pre-0008 install,
+        // TTL lapsed, state DB restored from a backup) the browser lands on a
+        // bare `invalid_client` page with nothing telling it to re-register.
+        // Adopting is safe *only* for loopback: the code goes to the user's own
+        // machine, so there is no third party to leak it to (RFC 8252 §7.3).
+        // An https redirect stays a hard reject — that is the case where waving
+        // an unknown client through would let a code be sent to an attacker's
+        // host, which is exactly what the allowlist exists to prevent.
+        None if is_loopback_redirect_uri(&requested_uri) && is_adoptable_client_id(client_id) => {
+            if !state
+                .client_registry
+                .insert(client_id.to_string(), vec![requested_uri.clone()])
+                .await
+            {
+                return oauth_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "temporarily_unavailable",
+                    "client registration capacity reached; retry later",
+                );
+            }
+            tracing::info!("adopted an unregistered client_id for a loopback redirect");
+            requested_uri
+        }
+        None => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_client",
+                "unknown client_id; register via /register first",
+            );
+        }
     };
     // PKCE is mandatory (OAuth 2.1 §7.5.2). Only S256 — never plain.
     let Some(code_challenge) = p.code_challenge.filter(|c| !c.is_empty()) else {
