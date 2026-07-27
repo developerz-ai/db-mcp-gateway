@@ -139,6 +139,16 @@ jobs:
   # digest, then stitched into one manifest list by `merge`. Native arm64
   # replaces QEMU emulation, which tripled build time once the mysql/mongo deps
   # landed and blew the 30-min ceiling — no `main` image shipped for a week.
+  #
+  # DUAL-PUSH (#907): every per-arch image is also pushed to DOCR
+  # (registry.digitalocean.com/developerz-ai/db-mcp-gateway) using the org-level
+  # `DOCR_TOKEN` Actions secret (the same secret proven live on discord-server,
+  # mmarketing, venom-astrology). GHCR stays the public artifact; DOCR is the
+  # in-cluster source Image Updater tracks, so the per-arch images must live in
+  # DOCR too — a cross-registry manifest list (per-arch in GHCR, manifest in
+  # DOCR) would fail to pull on a reschedule. `merge` then creates the
+  # multi-arch manifest list under the same short-SHA + main tags in BOTH
+  # registries.
   build:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [fmt, clippy, test, audit]
@@ -170,6 +180,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: log in to docr
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: ${{ secrets.DOCR_TOKEN }}
+          password: ${{ secrets.DOCR_TOKEN }}
       - name: image labels
         id: meta
         uses: docker/metadata-action@v5
@@ -184,7 +200,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
           cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
-          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          outputs: |
+            type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+            type=image,name=registry.digitalocean.com/developerz-ai/db-mcp-gateway,push-by-digest=true,name-canonical=true,push=true
       - name: export digest
         run: |
           mkdir -p "${{ runner.temp }}/digests"
@@ -200,6 +218,9 @@ jobs:
 
   # Stitch the per-arch digests into one multi-arch manifest under the real
   # tags. Skipped automatically when `build` is skipped (PRs) or any arch fails.
+  # DUAL-PUSH: the same multi-arch manifest list is created in BOTH registries
+  # so the short-SHA + main tags are pullable from whichever Image Updater (or
+  # any external client) is configured to read.
   merge:
     needs: [build]
     runs-on: blacksmith-2vcpu-ubuntu-2404
@@ -221,7 +242,13 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: derive image metadata
+      - name: log in to docr
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: ${{ secrets.DOCR_TOKEN }}
+          password: ${{ secrets.DOCR_TOKEN }}
+      - name: derive ghcr image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -230,13 +257,29 @@ jobs:
           tags: |
             type=sha,prefix=,format=short
             type=raw,value=main
-      - name: create manifest list & push
+      - name: create ghcr manifest list & push
         working-directory: ${{ runner.temp }}/digests
         run: |
           # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag, one image ref per digest
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+      - name: derive docr image metadata
+        id: meta-docr
+        uses: docker/metadata-action@v5
+        with:
+          images: registry.digitalocean.com/developerz-ai/db-mcp-gateway
+          # mirror the GHCR tag set so the same :<sha> / :main refs work in DOCR
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=main
+      - name: create docr manifest list & push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag, one image ref per digest
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON_DOCR") \
+            $(printf 'registry.digitalocean.com/developerz-ai/db-mcp-gateway@sha256:%s ' *)
       - name: inspect
         run: |
           docker buildx imagetools inspect \
