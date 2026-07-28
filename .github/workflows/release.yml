@@ -162,10 +162,17 @@ jobs:
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
       - name: create docr manifest list & push
         working-directory: ${{ runner.temp }}/digests
+        env:
+          # docker/metadata-action@v5 auto-sets only `DOCKER_METADATA_OUTPUT_JSON`
+          # (shared name, no per-step suffix); with two metadata steps in the same
+          # job the second overwrites the first. Mirror the DOCR step's `json`
+          # output into a step-scoped env var so the jq below reads the right
+          # tag set (#907).
+          DOCR_METADATA_JSON: ${{ steps.meta-docr.outputs.json }}
         run: |
           # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag, one image ref per digest
           docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON_DOCR") \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCR_METADATA_JSON") \
             $(printf '${{ env.DOCR_REGISTRY }}/${{ env.DOCR_IMAGE_NAME }}@sha256:%s ' *)
       - name: inspect
         run: |
