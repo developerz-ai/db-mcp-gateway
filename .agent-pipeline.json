@@ -1,0 +1,45 @@
+{
+  "repo": "developerz-ai/db-mcp-gateway",
+  "ci": {
+    "requiredChecks": [
+      "clippy",
+      "audit",
+      "fmt",
+      "test"
+    ]
+  },
+  "merge": {
+    "reviewGate": "attested",
+    "crDisabledFallback": "self-attested",
+    "classificationParks": "autonomous",
+    "fallbackApprover": {
+      "appId": 4320965,
+      "installationId": 147124714,
+      "privateKeyEnv": "MERGE_ATTESTOR_PRIVATE_KEY",
+      "waitMs": 1200000
+    }
+  },
+  "labels": { "ready": "ready", "afk": "afk", "hitl": "hitl" },
+  "memory": { "teamHandoffDir": ".agent-setup/openclaw-profile/memory/handoff" },
+  "policy": { "module": "scripts/execute-prd/lib/policy-module.ts" },
+  "repoSync": {
+    "reportsDir": ".infra-sync/reports",
+    "ciProvider": "github-actions",
+    "manifestPaths": [
+      "stacks/**/application.yml",
+      "stacks/**/manifests/**",
+      "stacks/**/kustomization.yml",
+      "stacks/**/values.yaml"
+    ],
+    "importantPathsToFlag": [
+      "stacks/platform/**",
+      "stacks/stateful/**",
+      "stacks/sso/**"
+    ],
+    "priorityLabels": {
+      "P0": ["bug", "incident", "platform", "dr"],
+      "P1": ["secrets", "observability", "ready"],
+      "P2": ["improvement", "documentation", "area/docs"]
+    }
+  }
+}
