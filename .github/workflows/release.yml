@@ -17,22 +17,32 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   # DOCR mirror (#907) — the in-cluster source the ArgoCD Image Updater tracks.
-  # The same per-arch digests are pushed here, and `merge` builds a matching
-  # multi-arch manifest list under the semver + :latest tags. The org-level
-  # `DOCR_TOKEN` Actions secret authenticates both the per-arch push and the
-  # manifest create (DOC digital-ocean API token; same proven on discord-server,
-  # mmarketing, venom-astrology).
+  # Per-arch builds push the image to both registries under the per-arch tag
+  # `${PLATFORM_PAIR}-${version}` (e.g. `linux-amd64-1.4.5`,
+  # `linux-arm64-1.4.5`); the `merge` job reads those per-arch tag refs and
+  # imagetools-creates a single multi-arch manifest at the semver + `:latest`
+  # tag set, applied to BOTH registries. The `DOCR_TOKEN` Actions secret
+  # authenticates both per-arch push and the imagetools stitch.
   DOCR_REGISTRY: registry.digitalocean.com
   DOCR_IMAGE_NAME: developerz-ai/db-mcp-gateway
 
 jobs:
-  # Native per-arch build (amd64 + arm64), each pushed by digest, then merged
-  # into one manifest list under the semver + :latest tags. Native arm64 runners
-  # replace the single-runner QEMU build that timed out at 30 min (see ci.yml).
-  # Release compiles are CPU-bound: amd64 runs on an 8-vCPU runner; arm64 stays
-  # on 2-vCPU (no larger arm runner is provisioned for the org — bumping to an
-  # unavailable size would hang the release). gha layer cache (cache-from/to
-  # below) already memoises the dependency build across runs.
+  # Native per-arch build (amd64 + arm64), each pushed at the per-arch tag,
+  # then merged into one multi-arch manifest list under the semver + :latest
+  # tags. Native arm64 runners replace the single-runner QEMU build that timed
+  # out at 30 min (see ci.yml). Release compiles are CPU-bound: amd64 runs on
+  # an 8-vCPU runner; arm64 stays on 2-vCPU (no larger arm runner is
+  # provisioned for the org — bumping to an unavailable size would hang the
+  # release). gha layer cache (cache-from/to below) already memoises the
+  # dependency build across runs.
+  #
+  # Per-arch tag pattern is intentional. Prior revision used
+  # `push-by-digest=true,name-canonical=true,push=true`, which buildx reports
+  # as successful but the per-arch image never materializes at the digest ref
+  # in GHCR/DOCR (`MANIFEST_UNKNOWN` on a HEAD probe). `imagetools create`
+  # then fails on `not found`. The per-arch tag is a known-stable ref the
+  # imagetools stitch can fetch deterministically — it survives both
+  # registries' round-tripping semantics.
   build:
     runs-on: ${{ matrix.runner }}
     # arm64 is a 2-vCPU runner (no larger arm size provisioned). A release whose
@@ -56,6 +66,13 @@ jobs:
         run: |
           platform="${{ matrix.platform }}"
           echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+      - name: derive version
+        id: ver
+        # Tag is vX.Y.Z; the published image tags drop the leading v
+        # (docker/metadata-action semver pattern), so strip it for the body —
+        # otherwise the artifact refs would point at ...:vX.Y.Z, which doesn't
+        # match what the merger reads back.
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v5
         with:
           # Build context is `.`; keep the checkout token out of the build
@@ -79,7 +96,12 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-      - name: build & push by digest
+          # Per-arch tag (e.g. `linux-amd64-1.4.5`). One image ref per arch,
+          # no canonical digest, no semver+latest — those are owned by the
+          # `merge` job's imagetools step. This is what the merger reads in.
+          tags: |
+            type=raw,value=${{ env.PLATFORM_PAIR }}-${{ steps.ver.outputs.version }}
+      - name: build & push per-arch
         id: build
         uses: docker/build-push-action@v6
         with:
@@ -89,20 +111,8 @@ jobs:
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
           cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
           outputs: |
-            type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-            type=image,name=${{ env.DOCR_REGISTRY }}/${{ env.DOCR_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-      - name: export digest
-        run: |
-          mkdir -p "${{ runner.temp }}/digests"
-          digest="${{ steps.build.outputs.digest }}"
-          touch "${{ runner.temp }}/digests/${digest#sha256:}"
-      - name: upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-${{ env.PLATFORM_PAIR }}
-          path: ${{ runner.temp }}/digests/*
-          if-no-files-found: error
-          retention-days: 1
+            type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push=true
+            type=image,name=${{ env.DOCR_REGISTRY }}/${{ env.DOCR_IMAGE_NAME }},push=true
 
   merge:
     needs: [build]
@@ -112,12 +122,11 @@ jobs:
       contents: read
       packages: write
     steps:
-      - name: download digests
-        uses: actions/download-artifact@v4
-        with:
-          path: ${{ runner.temp }}/digests
-          pattern: digests-*
-          merge-multiple: true
+      - name: derive version
+        id: ver
+        # Mirror the build job's derive; keep both jobs reading the same
+        # semver (e.g. `1.4.5` not `v1.4.5`).
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - name: log in to ghcr
         uses: docker/login-action@v3
@@ -136,19 +145,19 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # v1.2.3 → tags: 1.2.3, 1.2, 1, latest
+          # v1.4.5 → tags: 1.4.5, 1.4, 1, latest
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
       - name: create ghcr manifest list & push
-        working-directory: ${{ runner.temp }}/digests
         run: |
-          # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag, one image ref per digest
+          # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:linux-amd64-${{ steps.ver.outputs.version }}" \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:linux-arm64-${{ steps.ver.outputs.version }}"
       - name: derive docr image metadata
         id: meta-docr
         uses: docker/metadata-action@v5
@@ -161,7 +170,6 @@ jobs:
             type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
       - name: create docr manifest list & push
-        working-directory: ${{ runner.temp }}/digests
         env:
           # docker/metadata-action@v5 auto-sets only `DOCKER_METADATA_OUTPUT_JSON`
           # (shared name, no per-step suffix); with two metadata steps in the same
@@ -170,10 +178,11 @@ jobs:
           # tag set (#907).
           DOCR_METADATA_JSON: ${{ steps.meta-docr.outputs.json }}
         run: |
-          # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag, one image ref per digest
+          # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCR_METADATA_JSON") \
-            $(printf '${{ env.DOCR_REGISTRY }}/${{ env.DOCR_IMAGE_NAME }}@sha256:%s ' *)
+            "${{ env.DOCR_REGISTRY }}/${{ env.DOCR_IMAGE_NAME }}:linux-amd64-${{ steps.ver.outputs.version }}" \
+            "${{ env.DOCR_REGISTRY }}/${{ env.DOCR_IMAGE_NAME }}:linux-arm64-${{ steps.ver.outputs.version }}"
       - name: inspect
         run: |
           docker buildx imagetools inspect \
