@@ -95,10 +95,15 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # Per-arch tag (e.g. `linux-amd64-1.4.5`). One image ref per arch,
-          # no canonical digest, no semver+latest — those are owned by the
-          # `merge` job's imagetools step. This is what the merger reads in.
+          images: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            ${{ env.DOCR_REGISTRY }}/${{ env.DOCR_IMAGE_NAME }}
+          # Per-arch tag (e.g. `linux-amd64-1.4.5`) — declared for BOTH registries
+          # so the build step can promote the labels into both `tags:` lists
+          # below and produce concrete, fetchable refs at each registry. The
+          # previous design only emitted per-arch labels under the GHCR image
+          # base, which left the buildx `outputs:` mode publish nothing tagged
+          # at all (TAG-set became empty after dropping the digest-mode flags).
           tags: |
             type=raw,value=${{ env.PLATFORM_PAIR }}-${{ steps.ver.outputs.version }}
       - name: build & push per-arch
@@ -110,9 +115,15 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
           cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
-          outputs: |
-            type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push=true
-            type=image,name=${{ env.DOCR_REGISTRY }}/${{ env.DOCR_IMAGE_NAME }},push=true
+          # Plain `tags:` + `push: true` (no `outputs:`) — buildx writes the
+          # manifest AT the explicit refs and applies them to BOTH registries
+          # via the comma-separated list. The previous `outputs: type=image,name=
+          # ... push=true` mode silently dropped metadata tags under the v6 action
+          # once name-canonical was removed, which is why per-arch refs landed as
+          # untagged manifests in the first attempt of the per-arch-tag design.
+          # `tags:` is the well-trodden, tested path.
+          tags: ${{ steps.meta.outputs.tags }}
+          push: true
 
   merge:
     needs: [build]
