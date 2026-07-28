@@ -16,6 +16,14 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # DOCR mirror (#907) — the in-cluster source the ArgoCD Image Updater tracks.
+  # The same per-arch digests are pushed here, and `merge` builds a matching
+  # multi-arch manifest list under the semver + :latest tags. The org-level
+  # `DOCR_TOKEN` Actions secret authenticates both the per-arch push and the
+  # manifest create (DOC digital-ocean API token; same proven on discord-server,
+  # mmarketing, venom-astrology).
+  DOCR_REGISTRY: registry.digitalocean.com
+  DOCR_IMAGE_NAME: developerz-ai/db-mcp-gateway
 
 jobs:
   # Native per-arch build (amd64 + arm64), each pushed by digest, then merged
@@ -60,6 +68,12 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: log in to docr
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCR_REGISTRY }}
+          username: ${{ secrets.DOCR_TOKEN }}
+          password: ${{ secrets.DOCR_TOKEN }}
       - name: image labels
         id: meta
         uses: docker/metadata-action@v5
@@ -74,7 +88,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
           cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          outputs: |
+            type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+            type=image,name=${{ env.DOCR_REGISTRY }}/${{ env.DOCR_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
       - name: export digest
         run: |
           mkdir -p "${{ runner.temp }}/digests"
@@ -109,7 +125,13 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: derive image metadata
+      - name: log in to docr
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCR_REGISTRY }}
+          username: ${{ secrets.DOCR_TOKEN }}
+          password: ${{ secrets.DOCR_TOKEN }}
+      - name: derive ghcr image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -120,13 +142,38 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
-      - name: create manifest list & push
+      - name: create ghcr manifest list & push
         working-directory: ${{ runner.temp }}/digests
         run: |
           # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag, one image ref per digest
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+      - name: derive docr image metadata
+        id: meta-docr
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCR_REGISTRY }}/${{ env.DOCR_IMAGE_NAME }}
+          # mirror the GHCR tag set so the same :<semver> / :latest refs work in DOCR
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+      - name: create docr manifest list & push
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          # docker/metadata-action@v5 auto-sets only `DOCKER_METADATA_OUTPUT_JSON`
+          # (shared name, no per-step suffix); with two metadata steps in the same
+          # job the second overwrites the first. Mirror the DOCR step's `json`
+          # output into a step-scoped env var so the jq below reads the right
+          # tag set (#907).
+          DOCR_METADATA_JSON: ${{ steps.meta-docr.outputs.json }}
+        run: |
+          # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag, one image ref per digest
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCR_METADATA_JSON") \
+            $(printf '${{ env.DOCR_REGISTRY }}/${{ env.DOCR_IMAGE_NAME }}@sha256:%s ' *)
       - name: inspect
         run: |
           docker buildx imagetools inspect \
@@ -149,10 +196,13 @@ jobs:
         with:
           generate_release_notes: true
           body: |
-            Container images for this release are published to GitHub Container Registry:
+            Container images for this release are dual-pushed (#907):
 
             ```
             ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.version }}
+            registry.digitalocean.com/developerz-ai/db-mcp-gateway:${{ steps.ver.outputs.version }}
             ```
 
-            See `docs/deployment/quickstart.md` for setup.
+            GHCR is the public artifact; DOCR is the in-cluster source the
+            ArgoCD Image Updater tracks. See `docs/deployment/quickstart.md`
+            for setup.
