@@ -46,6 +46,12 @@ jobs:
           shared-key: build
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # --all-targets enables cfg(test), which makes imports used only by
+      # #[cfg(any(test, debug_assertions))] helpers look live. The release
+      # configuration compiles those helpers out, so the same code emitted
+      # unused-import warnings that only ever surfaced in a `docker build`.
+      # Lint the shipping configuration too.
+      - run: cargo clippy --release --all-features -- -D warnings
 
   test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
