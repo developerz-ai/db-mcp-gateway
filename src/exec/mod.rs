@@ -8,7 +8,10 @@
 //!
 //! Security-required (see CLAUDE.md). The non-negotiables — no credentials
 //! in errors/logs, DB-side `statement_timeout` set per-tx — are documented
-//! and enforced on the per-adapter side; see [`pg`] for the Pg pattern.
+//! and enforced on the per-adapter side; see [`pg`] for the Pg pattern. The
+//! one piece that is *not* per-adapter is the timeout ceiling
+//! ([`DEFAULT_STATEMENT_TIMEOUT_MS`]): it's gateway policy, lives in
+//! [`adapter`], and every impl applies it identically.
 
 pub mod adapter;
 pub mod mongo;
@@ -22,7 +25,9 @@ use tokio::sync::RwLock;
 
 use crate::config::{Database, Server, ServerKind};
 
-pub use adapter::{AdapterKind, DbAdapter, ExecError, ExecQuery, ExecResult};
+pub use adapter::{
+    AdapterKind, DEFAULT_STATEMENT_TIMEOUT_MS, DbAdapter, ExecError, ExecQuery, ExecResult,
+};
 pub use mongo::MongoAdapter;
 pub use pg::PgAdapter;
 

@@ -9,6 +9,7 @@ use db_mcp_gateway::state::permissions::mysql::MysqlPermissionsRepo;
 use db_mcp_gateway::state::permissions::{DbType, GrantAction, GrantTarget, PermissionsRepo};
 use db_mcp_gateway::state::{self};
 use serde_json::json;
+use sqlx::MySqlPool;
 use uuid::Uuid;
 
 fn mysql_dsn() -> String {
@@ -17,11 +18,14 @@ fn mysql_dsn() -> String {
     })
 }
 
-async fn repo() -> MysqlPermissionsRepo {
-    let pool = state::connect_permissions_mysql(&mysql_dsn(), 5)
+async fn pool() -> MySqlPool {
+    state::connect_permissions_mysql(&mysql_dsn(), 5)
         .await
-        .expect("mysql permissions store up (run `bin/dev up`)");
-    MysqlPermissionsRepo::new(pool)
+        .expect("mysql permissions store up (run `bin/dev up`)")
+}
+
+async fn repo() -> MysqlPermissionsRepo {
+    MysqlPermissionsRepo::new(pool().await)
 }
 
 fn unique_sub(prefix: &str) -> String {
@@ -282,5 +286,128 @@ async fn list_grants_database_filter_excludes_wildcards_and_revoked() {
     assert!(
         after.is_empty(),
         "revoked grant must not appear in list_grants"
+    );
+}
+
+/// Parity with pg's `get_user_by_sub_skips_soft_deleted`. Soft delete must
+/// hide the row from both single-row lookup and the listing, and a second
+/// delete must be a no-op.
+#[tokio::test]
+async fn get_user_by_sub_skips_soft_deleted() {
+    let r = repo().await;
+    let sub = unique_sub("mysql-getsoft");
+    let user = r
+        .upsert_user(&sub, "x@example.com", &[])
+        .await
+        .expect("create");
+
+    assert!(
+        r.get_user_by_sub(&sub).await.expect("get").is_some(),
+        "live user should be found"
+    );
+    let before = r.list_users().await.expect("list before");
+    assert!(before.iter().any(|u| u.id == user.id));
+
+    assert!(
+        r.soft_delete_user(user.id).await.expect("delete"),
+        "delete should hit one row"
+    );
+    assert!(
+        r.get_user_by_sub(&sub).await.expect("get").is_none(),
+        "soft-deleted user must not surface"
+    );
+    let after = r.list_users().await.expect("list after");
+    assert!(!after.iter().any(|u| u.id == user.id));
+    assert!(
+        !r.soft_delete_user(user.id).await.expect("redelete"),
+        "second delete should affect 0 rows"
+    );
+}
+
+/// Parity with pg's `database_crud_and_list_filters_soft_deleted`. Also the
+/// query behind `permissions_databases_server_db_name_live_idx`: the loader
+/// reads the live-database listing on every permissions-cache miss.
+#[tokio::test]
+async fn database_crud_and_list_filters_soft_deleted() {
+    let r = repo().await;
+    let server = format!("mysql-dbcrud-{}", Uuid::new_v4().simple());
+
+    let pg_db = r
+        .create_database(&server, "app", DbType::Postgres)
+        .await
+        .expect("create pg");
+    let mysql_db = r
+        .create_database(&server, "warehouse", DbType::Mysql)
+        .await
+        .expect("create mysql");
+    assert_eq!(pg_db.db_type, DbType::Postgres);
+    assert_eq!(mysql_db.db_type, DbType::Mysql);
+
+    let listed = r.list_databases().await.expect("list");
+    assert!(listed.iter().any(|d| d.id == pg_db.id));
+    assert!(listed.iter().any(|d| d.id == mysql_db.id));
+
+    let renamed = r
+        .update_database(mysql_db.id, None, Some("warehouse-v2"), None)
+        .await
+        .expect("update")
+        .expect("row exists");
+    assert_eq!(renamed.db_name, "warehouse-v2");
+    assert_eq!(renamed.server, server, "unset PATCH fields stay put");
+    assert_eq!(renamed.db_type, DbType::Mysql);
+
+    assert!(r.soft_delete_database(pg_db.id).await.expect("del"));
+    let after = r.list_databases().await.expect("list2");
+    assert!(
+        !after.iter().any(|d| d.id == pg_db.id),
+        "soft-deleted db must drop from list"
+    );
+    assert!(
+        r.get_database(pg_db.id).await.expect("get").is_none(),
+        "soft-deleted db must not be fetchable"
+    );
+    assert!(
+        !r.soft_delete_database(pg_db.id).await.expect("redel"),
+        "second delete should affect 0 rows"
+    );
+}
+
+/// Parity with pg's `raw_insert_with_both_specific_and_wildcard_is_rejected_by_check`.
+/// Mysql 8 enforces CHECK constraints, so the XOR is a real safety net behind
+/// the typed `GrantTarget` — not just documentation — on this backend too.
+#[tokio::test]
+async fn raw_insert_with_both_specific_and_wildcard_is_rejected_by_check() {
+    let p = pool().await;
+    let r = MysqlPermissionsRepo::new(p.clone());
+    let sub = unique_sub("mysql-xorcheck");
+    let server = format!("mysql-xor-{}", Uuid::new_v4().simple());
+
+    let user = r
+        .upsert_user(&sub, "x@example.com", &[])
+        .await
+        .expect("user upsert");
+    let db = r
+        .create_database(&server, "app", DbType::Postgres)
+        .await
+        .expect("db create");
+
+    // Both `database_id` AND `db_name_wildcard = TRUE` → must violate
+    // permissions_grants_target_xor_wildcard_check.
+    let err = sqlx::query(
+        "INSERT INTO permissions_grants \
+         (id, user_id, server, database_id, db_name_wildcard, action, constraints_json) \
+         VALUES (?, ?, ?, ?, TRUE, 'query_read', '{}')",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(user.id.to_string())
+    .bind(&server)
+    .bind(db.id.to_string())
+    .execute(&p)
+    .await
+    .expect_err("CHECK must reject the contradictory row");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("permissions_grants_target_xor_wildcard_check"),
+        "expected XOR check violation, got: {msg}"
     );
 }
