@@ -696,7 +696,7 @@ checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
 name = "db-mcp-gateway"
-version = "1.4.1"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
