@@ -5,4 +5,15 @@ cd "$(dirname "$0")/.."
 
 bin/lint
 bin/test
+
+# CI has a fourth job. Without this, a cargo-audit failure was only discovered
+# after pushing. Skipped with a notice rather than failing when the tool is
+# absent, so bin/ci stays runnable on a fresh checkout.
+if command -v cargo-audit >/dev/null 2>&1; then
+  echo "→ cargo audit"
+  cargo audit
+else
+  echo "→ cargo audit — SKIPPED (install: cargo install cargo-audit)"
+fi
+
 echo "✓ CI checks passed"

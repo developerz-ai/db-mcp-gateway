@@ -1,12 +1,11 @@
 # syntax=docker/dockerfile:1.7
 
 # ---- build ----
-FROM rust:1.85-slim-bookworm AS builder
+# Matches rust-toolchain.toml exactly. When the two drift, the toolchain file
+# wins and rustup re-downloads inside the builder on every cache miss — bump
+# both together.
+FROM rust:1.96-slim-bookworm AS builder
 WORKDIR /src
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
 
 # Cache deps separately from source. Copy only manifests first.
 COPY Cargo.toml Cargo.lock* rust-toolchain.toml ./
@@ -16,7 +15,6 @@ RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
 
 COPY . .
 RUN cargo build --release --locked
-RUN strip target/release/db-mcp-gateway
 
 # ---- runtime ----
 FROM gcr.io/distroless/cc-debian12:nonroot

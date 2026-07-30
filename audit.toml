@@ -1,14 +1,27 @@
 # cargo-audit configuration.
 #
 # Ignored advisories must be justified here. Re-evaluate at every dependency bump.
+#
+# NOTE: cargo-audit reads `.cargo/audit.toml`, not this file. This copy is the
+# human-facing record and is kept in sync by hand; CI additionally passes
+# `--ignore RUSTSEC-2023-0071` on the command line, so editing this file alone
+# changes nothing about what CI enforces.
 
 [advisories]
 ignore = [
-    # rsa 0.9 Marvin Attack timing side-channel.
-    # Pulled in transitively by sqlx-mysql via sqlx's default feature set, even
-    # though we only enable the postgres backend (see Cargo.toml). The mysql
-    # backend code never executes at runtime, so the vulnerable rsa code is
-    # unreachable. Re-check when sqlx exposes per-backend feature gates or
-    # rsa releases a fix.
+    # rsa 0.9 Marvin Attack timing side-channel, reached through sqlx-mysql.
+    #
+    # This entry previously claimed "we only enable the postgres backend" and
+    # that the mysql code never executes. Both are false: Cargo.toml enables
+    # sqlx's `mysql` feature, MySQL is a supported `permissions_store.driver`,
+    # and CI runs the MySQL repo tests against a live server.
+    #
+    # `rsa` is reached only by the caching_sha2_password / sha256_password
+    # handshake, and only on a connection that is not already TLS-wrapped. A
+    # PERMISSIONS_DB_DSN with `ssl-mode=REQUIRED` avoids it; we do not yet force
+    # that, so it stays reachable under operator misconfiguration.
+    #
+    # No fixed upstream `rsa` release exists. Re-check when one ships, or when
+    # sqlx drops the dependency.
     "RUSTSEC-2023-0071",
 ]
