@@ -1,12 +1,8 @@
-{"type":"http","url":"https://glitchtip.infra.developerz.ai/mcp",
+{
   "mcpServers": {
-    "ui-debugger": {
-      "command": "npx",
-      "args": ["-y", "@developerz.ai/ui-debugger-mcp@latest"],
-      "env": {
-        "OPENAI_API_KEY": "${UI_DEBUGGER_API_KEY}",
-        "OPENAI_BASE_URL": "${UI_DEBUGGER_BASE_URL:-https://openrouter.ai/api/v1}"
-      }
+    "glitchtip": {
+      "type": "http",
+      "url": "https://glitchtip.infra.developerz.ai/mcp"
     }
   }
 }
