@@ -144,6 +144,13 @@ impl OidcClient {
         let key = self.decoding_key(&kid).await?;
 
         let mut validation = Validation::new(Algorithm::RS256);
+        // `set_issuer` / `set_audience` only constrain a claim that is *present*:
+        // in `jsonwebtoken` 9.3 an absent `iss`/`aud` falls through the match to
+        // `_ => {}`. `required_spec_claims` defaults to `{exp}` alone, and our
+        // claims deserialize into `serde_json::Value`, so nothing else forces
+        // them to exist — a token from the IdP's JWKS with no `aud` would verify.
+        // Demanding them here is OIDC Core 3.1.3.7 step 3.
+        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
         validation.set_issuer(&[&self.config.issuer]);
         validation.set_audience(&[&self.config.audience]);
         validation.validate_exp = true;

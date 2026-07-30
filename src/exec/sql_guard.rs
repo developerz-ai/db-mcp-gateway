@@ -17,14 +17,15 @@
 //!   filesystem/network functions.
 //!
 //! Anything not explicitly recognised — a write hidden in a CTE or subquery,
-//! `SELECT ... FOR UPDATE/SHARE`, `SELECT ... INTO`, `EXPLAIN ANALYZE` (which
-//! executes) — is rejected with a typed error. Conservative on purpose: better
+//! `SELECT ... FOR UPDATE/SHARE`, `SELECT ... INTO`, `EXPLAIN ANALYZE` in
+//! either spelling (`ANALYZE` keyword or `(ANALYZE)` option — both execute)
+//! — is rejected with a typed error. Conservative on purpose: better
 //! to reject a legitimate exotic statement than quietly send an unintended one.
 
 use sqlparser::ast::{
     Assignment, Delete, Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, Insert, OnConflictAction, OnInsert, Query, Select, SelectItem, SetExpr, Statement,
-    TableFactor, TableWithJoins,
+    GroupByExpr, Insert, JoinConstraint, JoinOperator, ObjectName, OnConflictAction, OnInsert,
+    Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, UtilityOption,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
@@ -130,10 +131,19 @@ fn check_statement(stmt: &Statement, access: Access) -> Result<(), GuardError> {
         Statement::Delete(delete) if access == Access::ReadWrite => check_delete(delete),
 
         Statement::Query(query) => check_query(query),
-        // EXPLAIN ANALYZE *executes* its target (so it would run a writable CTE),
-        // unlike plain EXPLAIN which only plans — reject it outright.
-        Statement::Explain { analyze: true, .. } => Err(GuardError::ExplainAnalyze),
-        Statement::Explain { statement, .. } => check_statement(statement, access),
+        // EXPLAIN ANALYZE *executes* its target (so it would run a writable CTE
+        // and blow past the row cap), unlike plain EXPLAIN which only plans.
+        Statement::Explain {
+            analyze,
+            options,
+            statement,
+            ..
+        } => {
+            if explain_analyzes(*analyze, options.as_deref()) {
+                return Err(GuardError::ExplainAnalyze);
+            }
+            check_statement(statement, access)
+        }
         Statement::ExplainTable { .. } => Ok(()), // `\d table` analog; read-only
         // Explicitly call out the families we reject so the error message is
         // useful — a single catch-all would say "Statement" for everything.
@@ -162,6 +172,24 @@ fn check_statement(stmt: &Statement, access: Access) -> Result<(), GuardError> {
     }
 }
 
+/// Whether an `EXPLAIN` carries `ANALYZE` — i.e. whether Postgres will actually
+/// *run* the statement instead of only planning it.
+///
+/// Postgres accepts the flag two ways and sqlparser models them differently:
+/// the bare keyword form (`EXPLAIN ANALYZE …`) sets `analyze`, while the
+/// parenthesised form (`EXPLAIN (ANALYZE, FORMAT JSON) …`) leaves `analyze`
+/// false and lands the flag in `options`. Both execute; both must be caught.
+///
+/// An explicit `(ANALYZE false)` is rejected too: the guard does not interpret
+/// option arguments, and there is no reason to write that form.
+fn explain_analyzes(analyze: bool, options: Option<&[UtilityOption]>) -> bool {
+    analyze
+        || options.is_some_and(|opts| {
+            opts.iter()
+                .any(|opt| opt.name.value.eq_ignore_ascii_case("analyze"))
+        })
+}
+
 fn check_query(query: &Query) -> Result<(), GuardError> {
     // SELECT ... FOR UPDATE / FOR SHARE acquires write locks even though it's
     // syntactically a SELECT. Read-only roles can't take those locks anyway,
@@ -176,6 +204,23 @@ fn check_query(query: &Query) -> Result<(), GuardError> {
         for cte in &with.cte_tables {
             check_query(&cte.query)?;
         }
+    }
+    // The query tail sits outside the SELECT body but is made of ordinary
+    // expression positions — `ORDER BY pg_read_file('/x')` or
+    // `LIMIT length(pg_read_file('/x'))` executes just like a projection would.
+    // (`FETCH` and ClickHouse's `LIMIT … BY` are not walked: the Postgres
+    // dialect parses `FETCH` quantities as literals and never produces
+    // `limit_by`, so neither can carry a call.)
+    if let Some(order_by) = &query.order_by {
+        for order in &order_by.exprs {
+            check_expr(&order.expr)?;
+        }
+    }
+    if let Some(limit) = &query.limit {
+        check_expr(limit)?;
+    }
+    if let Some(offset) = &query.offset {
+        check_expr(&offset.value)?;
     }
     check_set_expr(&query.body)
 }
@@ -340,6 +385,65 @@ fn check_table_with_joins(twj: &TableWithJoins) -> Result<(), GuardError> {
     check_table_factor(&twj.relation)?;
     for join in &twj.joins {
         check_table_factor(&join.relation)?;
+        check_join_operator(&join.join_operator)?;
+    }
+    Ok(())
+}
+
+/// A join's `ON <expr>` is a full expression position — `JOIN t2 ON
+/// pg_read_file('/x') IS NOT NULL` runs the function just like a `WHERE` would.
+/// `USING (cols)` and `NATURAL` carry only identifiers.
+fn check_join_operator(op: &JoinOperator) -> Result<(), GuardError> {
+    match op {
+        JoinOperator::Inner(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c)
+        | JoinOperator::LeftSemi(c)
+        | JoinOperator::RightSemi(c)
+        | JoinOperator::LeftAnti(c)
+        | JoinOperator::RightAnti(c) => check_join_constraint(c),
+        JoinOperator::AsOf {
+            match_condition,
+            constraint,
+        } => {
+            check_expr(match_condition)?;
+            check_join_constraint(constraint)
+        }
+        JoinOperator::CrossJoin | JoinOperator::CrossApply | JoinOperator::OuterApply => Ok(()),
+    }
+}
+
+fn check_join_constraint(constraint: &JoinConstraint) -> Result<(), GuardError> {
+    match constraint {
+        JoinConstraint::On(expr) => check_expr(expr),
+        JoinConstraint::Using(_) | JoinConstraint::Natural | JoinConstraint::None => Ok(()),
+    }
+}
+
+/// Reject a call by name. Matches on the last identifier component so that
+/// schema-qualified calls (`pg_catalog.pg_read_file(...)`) are caught too.
+fn check_denied_name(name: &ObjectName) -> Result<(), GuardError> {
+    let fn_name = name.0.last().map(|i| i.value.as_str()).unwrap_or("");
+    match DENIED_FUNCTIONS
+        .iter()
+        .find(|&&d| d.eq_ignore_ascii_case(fn_name))
+    {
+        Some(&denied) => Err(GuardError::DeniedFunction(denied)),
+        None => Ok(()),
+    }
+}
+
+/// Walk a positional/named argument list, e.g. so that
+/// `generate_series(1, pg_read_file('/x'))` is rejected on the inner call.
+fn check_function_arg_list(args: &[FunctionArg]) -> Result<(), GuardError> {
+    for arg in args {
+        let arg_expr = match arg {
+            FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => arg,
+        };
+        if let FunctionArgExpr::Expr(e) = arg_expr {
+            check_expr(e)?;
+        }
     }
     Ok(())
 }
@@ -349,32 +453,28 @@ fn check_table_factor(factor: &TableFactor) -> Result<(), GuardError> {
         // Plain table reference or table-valued function like `pg_ls_dir('/tmp')`.
         // The Postgres dialect parses `FROM func(args)` as `Table { args: Some(...) }`.
         TableFactor::Table { name, args, .. } => {
-            let fn_name = name.0.last().map(|i| i.value.as_str()).unwrap_or("");
-            if let Some(&denied) = DENIED_FUNCTIONS
-                .iter()
-                .find(|&&d| d.eq_ignore_ascii_case(fn_name))
-            {
-                return Err(GuardError::DeniedFunction(denied));
+            check_denied_name(name)?;
+            match args {
+                Some(tfa) => check_function_arg_list(&tfa.args),
+                None => Ok(()),
             }
-            // Walk any function arguments (e.g. `generate_series(1, pg_read_file('x'))`)
-            if let Some(tfa) = args {
-                for arg in &tfa.args {
-                    let arg_expr = match arg {
-                        FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => arg,
-                    };
-                    if let FunctionArgExpr::Expr(e) = arg_expr {
-                        check_expr(e)?;
-                    }
-                }
-            }
-            Ok(())
+        }
+        // `FROM LATERAL func(args)` parses into its own variant — same denylist
+        // bypass as the `Table` form if it isn't checked by name too.
+        TableFactor::Function { name, args, .. } => {
+            check_denied_name(name)?;
+            check_function_arg_list(args)
         }
         // `TABLE(<expr>)` syntax.
         TableFactor::TableFunction { expr, .. } => check_expr(expr),
         // Subquery in the FROM clause.
         TableFactor::Derived { subquery, .. } => check_query(subquery),
-        // All other variants (UNNEST, NestedJoin, Pivot, etc.) contain no
-        // directly callable functions that could be denied — fall through.
+        // Parenthesised join tree: `FROM (a JOIN b ON <expr>)`.
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => check_table_with_joins(table_with_joins),
+        // All other variants (UNNEST, Pivot, etc.) contain no directly
+        // callable functions that could be denied — fall through.
         _ => Ok(()),
     }
 }
@@ -384,15 +484,7 @@ fn check_table_factor(factor: &TableFactor) -> Result<(), GuardError> {
 fn check_expr(expr: &Expr) -> Result<(), GuardError> {
     match expr {
         Expr::Function(f) => {
-            // Match on the last identifier component so that schema-qualified
-            // calls (`pg_catalog.pg_read_file(...)`) are caught too.
-            let fn_name = f.name.0.last().map(|i| i.value.as_str()).unwrap_or("");
-            if let Some(&denied) = DENIED_FUNCTIONS
-                .iter()
-                .find(|&&d| d.eq_ignore_ascii_case(fn_name))
-            {
-                return Err(GuardError::DeniedFunction(denied));
-            }
+            check_denied_name(&f.name)?;
             check_function_args(&f.args)
         }
         Expr::BinaryOp { left, right, .. } => {
@@ -470,17 +562,7 @@ fn check_function_args(args: &FunctionArguments) -> Result<(), GuardError> {
         FunctionArguments::None => Ok(()),
         // Some dialects allow bare subquery as the sole argument.
         FunctionArguments::Subquery(q) => check_query(q),
-        FunctionArguments::List(list) => {
-            for arg in &list.args {
-                let arg_expr = match arg {
-                    FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => arg,
-                };
-                if let FunctionArgExpr::Expr(e) = arg_expr {
-                    check_expr(e)?;
-                }
-            }
-            Ok(())
-        }
+        FunctionArguments::List(list) => check_function_arg_list(&list.args),
     }
 }
 
@@ -544,6 +626,44 @@ mod tests {
             "EXPLAIN ANALYZE WITH x AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM x",
             GuardError::ExplainAnalyze,
         );
+    }
+
+    /// The parenthesised utility-option form is the *other* spelling of the same
+    /// flag, and it is the one the Postgres dialect parses into `options` with
+    /// `analyze: false` — so a keyword-only check lets it through and the DB
+    /// runs the query in full, row cap and all bypassed.
+    #[test]
+    fn explain_with_analyze_utility_option_rejected() {
+        rejected("EXPLAIN (ANALYZE) SELECT 1", GuardError::ExplainAnalyze);
+        rejected(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1",
+            GuardError::ExplainAnalyze,
+        );
+        rejected(
+            "EXPLAIN (VERBOSE, ANALYZE) SELECT * FROM users",
+            GuardError::ExplainAnalyze,
+        );
+        // Option names are identifiers — match them case-insensitively.
+        rejected("EXPLAIN (analyze) SELECT 1", GuardError::ExplainAnalyze);
+        rejected("EXPLAIN (AnAlYzE) SELECT 1", GuardError::ExplainAnalyze);
+        // Argument form: still executes when true, and we don't interpret args.
+        rejected(
+            "EXPLAIN (ANALYZE true) SELECT 1",
+            GuardError::ExplainAnalyze,
+        );
+        rejected(
+            "EXPLAIN (ANALYZE) WITH x AS (INSERT INTO t VALUES (1) RETURNING id) SELECT * FROM x",
+            GuardError::ExplainAnalyze,
+        );
+    }
+
+    #[test]
+    fn explain_without_analyze_still_allowed() {
+        // The fix must not turn every parenthesised EXPLAIN into a rejection.
+        ok("EXPLAIN SELECT 1");
+        ok("EXPLAIN (FORMAT JSON) SELECT 1");
+        ok("EXPLAIN (VERBOSE) SELECT 1");
+        ok("EXPLAIN (COSTS false, FORMAT TEXT) SELECT * FROM users");
     }
 
     #[test]
@@ -675,6 +795,8 @@ mod tests {
     #[test]
     fn pg_ls_dir_rejected() {
         rejected_denied("SELECT * FROM pg_ls_dir('/tmp')", "pg_ls_dir");
+        // `LATERAL` puts the same call in a different table-factor variant.
+        rejected_denied("SELECT * FROM t, LATERAL pg_ls_dir('/tmp')", "pg_ls_dir");
     }
 
     #[test]
@@ -735,6 +857,47 @@ mod tests {
     fn denied_function_in_having_rejected() {
         rejected_denied(
             "SELECT id FROM t GROUP BY id HAVING pg_read_file('/etc/passwd') IS NOT NULL",
+            "pg_read_file",
+        );
+    }
+
+    #[test]
+    fn denied_function_in_query_tail_rejected() {
+        // ORDER BY / LIMIT / OFFSET hang off `Query`, not off the SELECT body —
+        // they need their own walk or the denylist misses them.
+        rejected_denied(
+            "SELECT id FROM t ORDER BY pg_read_file('/etc/passwd')",
+            "pg_read_file",
+        );
+        rejected_denied(
+            "SELECT id FROM t LIMIT length(pg_read_file('/etc/passwd'))",
+            "pg_read_file",
+        );
+        rejected_denied(
+            "SELECT id FROM t OFFSET length(pg_read_file('/etc/passwd'))",
+            "pg_read_file",
+        );
+        // Same tail on an inner query, reached through the CTE walk.
+        rejected_denied(
+            "WITH x AS (SELECT id FROM t ORDER BY pg_read_file('/etc/passwd')) SELECT * FROM x",
+            "pg_read_file",
+        );
+    }
+
+    #[test]
+    fn denied_function_in_join_constraint_rejected() {
+        // A join's ON predicate is an expression position like any other.
+        rejected_denied(
+            "SELECT a.id FROM a JOIN b ON pg_read_file('/etc/passwd') IS NOT NULL",
+            "pg_read_file",
+        );
+        rejected_denied(
+            "SELECT a.id FROM a LEFT JOIN b ON a.id = length(pg_read_file('/etc/passwd'))",
+            "pg_read_file",
+        );
+        // Parenthesised join tree — a `NestedJoin` table factor.
+        rejected_denied(
+            "SELECT * FROM (a JOIN b ON pg_read_file('/etc/passwd') IS NOT NULL)",
             "pg_read_file",
         );
     }

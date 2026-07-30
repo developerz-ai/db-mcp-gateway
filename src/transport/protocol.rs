@@ -144,7 +144,8 @@ impl ToolsListResult {
                             "database": { "type": "string" },
                             "table":    { "type": "string" },
                             "schema":   { "type": "string" },
-                            "limit":    { "type": "integer", "minimum": 1 }
+                            "limit":    { "type": "integer", "minimum": 1 },
+                            "reason":   { "type": "string" }
                         },
                         "required": ["server", "database", "table"],
                         "additionalProperties": false
@@ -160,7 +161,8 @@ impl ToolsListResult {
                         "properties": {
                             "server":   { "type": "string" },
                             "database": { "type": "string" },
-                            "sql":      { "type": "string" }
+                            "sql":      { "type": "string" },
+                            "reason":   { "type": "string" }
                         },
                         "required": ["server", "database", "sql"],
                         "additionalProperties": false

@@ -43,8 +43,8 @@ servers:
 # Permissions tie (group from IdP) × (server × database) × (action) + optional constraints.
 #
 # Actions form a hierarchy:
-#   - schema_read: describe_schema, sample_table
-#   - query_read: everything in schema_read + run_query, explain
+#   - schema_read: describe_schema (metadata only)
+#   - query_read: everything in schema_read + run_query, explain, sample_table
 #   - query_write: everything in query_read + write capability (if target DB role grants it)
 #   - history_read: separate grant for get_query_history
 #

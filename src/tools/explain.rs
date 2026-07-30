@@ -40,6 +40,8 @@ pub struct Arguments {
     pub server: String,
     pub database: String,
     pub sql: String,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -80,7 +82,7 @@ pub async fn run(
         // Audit the *user's* SQL, not the EXPLAIN-wrapped one — operators
         // see what the agent asked for.
         sql: Some(&args.sql),
-        reason: None,
+        reason: args.reason.as_deref(),
         db_type: super::db_type_for_server(config, &args.server),
     };
     let db_grants = match load_or_empty(permissions_cache, identity).await {
@@ -120,6 +122,16 @@ async fn compute_outcome(
         Decision::Allow { constraints } => constraints,
         Decision::Deny => return forbidden(id),
     };
+
+    // Same guard as `run_query`: a grant demanding a reason applies to every
+    // way the caller reaches the target DB, plan-only included.
+    if constraints.require_reason && args.reason.as_deref().is_none_or(str::is_empty) {
+        return error_outcome(
+            id,
+            "reason_required",
+            "policy requires a `reason` for this server/database",
+        );
+    }
 
     if let Err(err) = sql_guard::is_read_only(&args.sql) {
         return error_outcome(
