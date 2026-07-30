@@ -137,8 +137,8 @@ jobs:
   # the quality jobs above so an unpublishable commit never ships an image.
   # Release tags (semver + :latest + GitHub release) live in release.yml.
   #
-  # Built on NATIVE per-arch runners in parallel (amd64 + arm64), each pushed by
-  # digest, then stitched into one manifest list by `merge`. Native arm64
+  # Built on NATIVE per-arch runners in parallel (amd64 + arm64), each pushed at
+  # a per-arch tag, then stitched into one manifest list by `merge`. Native arm64
   # replaces QEMU emulation, which tripled build time once the mysql/mongo deps
   # landed and blew the 30-min ceiling — no `main` image shipped for a week.
   #
@@ -151,6 +151,13 @@ jobs:
   # DOCR) would fail to pull on a reschedule. `merge` then creates the
   # multi-arch manifest list under the same short-SHA + main tags in BOTH
   # registries.
+  #
+  # Per-arch tag (`linux-amd64-<short-sha>`), not push-by-digest. buildx reports
+  # a digest-mode push as successful, but with two `type=image` outputs the
+  # per-arch manifest never materializes at that digest ref in GHCR, so `merge`
+  # died on `imagetools create ... not found`. A tag is a ref both
+  # registries round-trip deterministically — same fix release.yml already
+  # carries.
   build:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [fmt, clippy, test, audit]
@@ -172,6 +179,12 @@ jobs:
         run: |
           platform="${{ matrix.platform }}"
           echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+      - name: derive short sha
+        id: sha
+        # Same 7-char form docker/metadata-action's `type=sha,format=short`
+        # produces, so the per-arch tags below and the final manifest tag in
+        # `merge` are derived from one value.
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
@@ -192,8 +205,14 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
-      - name: build & push by digest
+          images: |
+            ghcr.io/${{ github.repository }}
+            registry.digitalocean.com/developerz-ai/db-mcp-gateway
+          # Per-arch tag declared for BOTH registries so one `tags:` list pushes
+          # a concrete, fetchable ref to each.
+          tags: |
+            type=raw,value=${{ env.PLATFORM_PAIR }}-${{ steps.sha.outputs.short }}
+      - name: build & push per-arch
         id: build
         uses: docker/build-push-action@v6
         with:
@@ -202,21 +221,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
           cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
-          outputs: |
-            type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
-            type=image,name=registry.digitalocean.com/developerz-ai/db-mcp-gateway,push-by-digest=true,name-canonical=true,push=true
-      - name: export digest
-        run: |
-          mkdir -p "${{ runner.temp }}/digests"
-          digest="${{ steps.build.outputs.digest }}"
-          touch "${{ runner.temp }}/digests/${digest#sha256:}"
-      - name: upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-${{ env.PLATFORM_PAIR }}
-          path: ${{ runner.temp }}/digests/*
-          if-no-files-found: error
-          retention-days: 1
+          tags: ${{ steps.meta.outputs.tags }}
+          push: true
 
   # Stitch the per-arch digests into one multi-arch manifest under the real
   # tags. Skipped automatically when `build` is skipped (PRs) or any arch fails.
@@ -231,12 +237,10 @@ jobs:
       contents: read
       packages: write
     steps:
-      - name: download digests
-        uses: actions/download-artifact@v4
-        with:
-          path: ${{ runner.temp }}/digests
-          pattern: digests-*
-          merge-multiple: true
+      - name: derive short sha
+        id: sha
+        # Mirror the build job's derive so both read the same per-arch tag.
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - name: log in to ghcr
         uses: docker/login-action@v3
@@ -260,12 +264,12 @@ jobs:
             type=sha,prefix=,format=short
             type=raw,value=main
       - name: create ghcr manifest list & push
-        working-directory: ${{ runner.temp }}/digests
         run: |
-          # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag, one image ref per digest
+          # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+            "ghcr.io/${{ github.repository }}:linux-amd64-${{ steps.sha.outputs.short }}" \
+            "ghcr.io/${{ github.repository }}:linux-arm64-${{ steps.sha.outputs.short }}"
       - name: derive docr image metadata
         id: meta-docr
         uses: docker/metadata-action@v5
@@ -276,7 +280,6 @@ jobs:
             type=sha,prefix=,format=short
             type=raw,value=main
       - name: create docr manifest list & push
-        working-directory: ${{ runner.temp }}/digests
         env:
           # docker/metadata-action@v5 auto-sets only `DOCKER_METADATA_OUTPUT_JSON`
           # (shared name, no per-step suffix); with two metadata steps in the same
@@ -285,10 +288,11 @@ jobs:
           # tag set (#907).
           DOCR_METADATA_JSON: ${{ steps.meta-docr.outputs.json }}
         run: |
-          # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag, one image ref per digest
+          # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCR_METADATA_JSON") \
-            $(printf 'registry.digitalocean.com/developerz-ai/db-mcp-gateway@sha256:%s ' *)
+            "registry.digitalocean.com/developerz-ai/db-mcp-gateway:linux-amd64-${{ steps.sha.outputs.short }}" \
+            "registry.digitalocean.com/developerz-ai/db-mcp-gateway:linux-arm64-${{ steps.sha.outputs.short }}"
       - name: inspect
         run: |
           docker buildx imagetools inspect \
