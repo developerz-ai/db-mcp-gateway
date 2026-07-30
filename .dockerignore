@@ -7,3 +7,13 @@ docs/
 .env.*
 *.md
 !README.md
+
+# The Docusaurus site is ~400 MB with node_modules and is never part of the
+# binary. Left in, it dominated the build context and made a docs-only push
+# invalidate the `COPY . .` layer, forcing a cold release rebuild.
+website/
+
+# Local tooling state — same reasoning: context weight and spurious cache busts.
+tmp/
+.codegraph/
+.claude-task-master/

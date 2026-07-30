@@ -1,4 +1,9 @@
 [toolchain]
-channel = "stable"
+# Exact version, not "stable". A floating channel meant a new stable release
+# could fail CI on an unrelated PR (new clippy lints under -D warnings) with no
+# way to reproduce yesterday's green, and it silently overrode the Docker
+# builder's pinned base image — rustup re-downloaded the toolchain on every
+# build. Bump deliberately. MSRV stays declared in Cargo.toml (rust-version).
+channel = "1.96.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

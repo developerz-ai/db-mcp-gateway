@@ -7,7 +7,13 @@ on:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # PRs: cancel superseded runs. Pushes to main: never — Argo Image Updater
+  # pins to the short SHA (see the `build` job), so cancelling the first of two
+  # closely-landed merges leaves that commit with no image at its tag.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,19 +31,25 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
-    timeout-minutes: 15
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # A Cargo.lock change misses the cache, and a cold build of this graph
+    # (aws-lc-rs, mongodb, sqlx ×2 backends, sentry, axum) on 2 vCPU runs well
+    # past 15 min. release.yml already went to 60 for the same reason.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
-    timeout-minutes: 15
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 40
     services:
       postgres:
         image: postgres:16
@@ -108,7 +120,11 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --all-targets
+        with:
+          shared-key: build
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # No separate `cargo build` step — `cargo test --all-targets` builds the
+      # same targets, so the extra invocation was a wasted fingerprint pass.
       - run: cargo test --all-targets
 
   audit:
@@ -119,7 +135,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       # Prebuilt cargo-audit binary instead of `cargo install` (source compile
       # every run). taiki-e/install-action pulls the release binary; the audit
       # invocation and audit.toml ignore semantics below are unchanged.
@@ -127,9 +142,11 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
-      # RUSTSEC-2023-0071 (rsa via sqlx-mysql) is unreachable: we only enable
-      # the postgres backend, sqlx-mysql is pulled in transitively but never
-      # executed. See audit.toml for the long-form justification.
+      # RUSTSEC-2023-0071 (rsa via sqlx-mysql). NOT unreachable — MySQL is a
+      # supported permissions_store driver and CI exercises it. Suppressed only
+      # because no fixed upstream `rsa` release exists; the reachable path is
+      # a non-TLS caching_sha2_password handshake. Full justification and the
+      # mitigation plan are in .cargo/audit.toml.
       - run: cargo audit --ignore RUSTSEC-2023-0071
 
   # Publish a multi-arch image on push to main, tagged with the short commit
@@ -171,9 +188,9 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: blacksmith-2vcpu-ubuntu-2404
+            runner: blacksmith-4vcpu-ubuntu-2404
           - platform: linux/arm64
-            runner: blacksmith-2vcpu-ubuntu-2404-arm
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
     steps:
       - name: prepare platform pair
         run: |
@@ -213,7 +230,6 @@ jobs:
           tags: |
             type=raw,value=${{ env.PLATFORM_PAIR }}-${{ steps.sha.outputs.short }}
       - name: build & push per-arch
-        id: build
         uses: docker/build-push-action@v6
         with:
           context: .

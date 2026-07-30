@@ -12,6 +12,14 @@ on:
       - "website/**"
       - "README.md"
       - ".github/workflows/pages.yml"
+  # Build-only on PRs. docusaurus.config.ts sets onBrokenLinks: 'throw', so
+  # without this a PR that breaks a link merges green and only fails here on
+  # main — leaving the published site stale with no signal on the PR.
+  pull_request:
+    paths:
+      - "website/**"
+      - "README.md"
+      - ".github/workflows/pages.yml"
   workflow_dispatch:
 
 # Least privilege; the deploy job needs pages + id-token to publish.
@@ -20,10 +28,37 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel a deploy mid-flight: actions/deploy-pages can leave the Pages
+  # deployment half-applied. Matches GitHub's own Pages template.
+  cancel-in-progress: false
 
 jobs:
+  # PR gate: typecheck + build, no deploy. Same steps as `deploy` up to the
+  # artifact upload.
+  build:
+    if: github.event_name == 'pull_request'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+
   deploy:
+    if: github.event_name != 'pull_request'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     # Job-level permissions replace workflow-level (they do not merge), so

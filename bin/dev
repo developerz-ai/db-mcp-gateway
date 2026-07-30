@@ -23,7 +23,9 @@ case "${1:-up}" in
   up)    "${COMPOSE[@]}" up -d ;;
   down)  "${COMPOSE[@]}" down ;;
   reset) "${COMPOSE[@]}" down -v ;;
-  logs)  shift; "${COMPOSE[@]}" logs -f "${@:-}" ;;
+  # "$@" not "${@:-}": with no service argument the latter expands to a single
+  # empty string, so bare `bin/dev logs` ran `logs -f ""` → "no such service".
+  logs)  shift; "${COMPOSE[@]}" logs -f "$@" ;;
   ps)    "${COMPOSE[@]}" ps ;;
   psql)
     target="${2:-state}"
