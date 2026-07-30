@@ -14,8 +14,13 @@
 //! writer's contract still says "no secrets in JSON," so a future schema
 //! change has a clear bar.
 
+// Only `latest_for_target` below needs these, and it is cfg'd out of release
+// builds — so the imports must carry the same cfg or a release build warns.
+#[cfg(any(test, debug_assertions))]
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
+// Same story: both are reached only from the cfg'd read helper.
+#[cfg(any(test, debug_assertions))]
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 

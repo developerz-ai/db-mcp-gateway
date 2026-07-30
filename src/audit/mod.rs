@@ -11,6 +11,9 @@
 pub mod permissions;
 pub mod pruner;
 
+// Only `latest_for_user_tool` below needs these, and it is cfg'd out of release
+// builds — so the imports must carry the same cfg or a release build warns.
+#[cfg(any(test, debug_assertions))]
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;

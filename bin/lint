@@ -8,3 +8,10 @@ cargo fmt --all -- --check
 
 echo "→ cargo clippy"
 cargo clippy --all-targets --all-features -- -D warnings
+
+# --all-targets enables cfg(test); the release build does not. Imports used
+# only by #[cfg(any(test, debug_assertions))] helpers pass the check above and
+# still warn in the shipping build, which is how four unused imports reached
+# main invisibly. Lint what actually ships.
+echo "→ cargo clippy (release cfg)"
+cargo clippy --release --all-features -- -D warnings
