@@ -275,8 +275,15 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
-          # bare short SHA (e.g. a1b2c3d) + moving `main` tag
+          # Three tags per commit:
+          #   sha-a1b2c3d — what ArgoCD Image Updater tracks. Its allow-tags is
+          #     `regexp:^sha-[0-9a-f]{7}$`, so the `sha-` prefix is load-bearing:
+          #     without it the updater matches nothing and the cluster silently
+          #     never rolls forward.
+          #   a1b2c3d — bare form, kept for anything already pinning it.
+          #   main — moving convenience tag.
           tags: |
+            type=sha,format=short
             type=sha,prefix=,format=short
             type=raw,value=main
       - name: create ghcr manifest list & push
@@ -291,8 +298,10 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: registry.digitalocean.com/developerz-ai/db-mcp-gateway
-          # mirror the GHCR tag set so the same :<sha> / :main refs work in DOCR
+          # Mirror the GHCR tag set exactly. DOCR is the registry Image Updater
+          # actually reads, so `sha-<7>` must exist here above all.
           tags: |
+            type=sha,format=short
             type=sha,prefix=,format=short
             type=raw,value=main
       - name: create docr manifest list & push
