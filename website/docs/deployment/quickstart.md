@@ -99,7 +99,7 @@ The env→YAML unification is still pending, so these come from the environment,
 | `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | — | Gateway's OIDC client credentials |
 | `OIDC_REDIRECT_URL` | `http://localhost:8443/auth/callback` | Must match the IdP app's redirect URI |
 | `OIDC_GROUPS_CLAIM` | `groups` | ID-token claim carrying group membership |
-| `SESSION_SIGNING_KEY` | dev-only default | HMAC key for gateway-issued session JWTs — **set this in any real deploy** |
+| `SESSION_SIGNING_KEY` | dev-only default | HMAC key for gateway-issued session JWTs — **set this in any real deploy**. Minimum 32 bytes; empty or shorter values are refused at boot |
 | `TLS_CERT_PATH` | — | PEM-encoded leaf cert (+ intermediates). Required unless `TLS_DISABLED=true` |
 | `TLS_KEY_PATH` | — | PEM-encoded private key. Required unless `TLS_DISABLED=true` |
 | `TLS_DISABLED` | `false` | Dev-only escape. `true` serves plain HTTP and emits a `WARN` log on startup |

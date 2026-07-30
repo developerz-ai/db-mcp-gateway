@@ -21,8 +21,8 @@ A request is allowed iff *some* grant matches. Denies are not explicit — absen
 
 | Action | What it unlocks |
 |---|---|
-| `schema_read` | `list_databases`, `describe_schema`, `sample_table` (size-capped) |
-| `query_read` | `run_query` with read-only enforcement, `explain`, `get_query_history` |
+| `schema_read` | `list_databases`, `describe_schema` |
+| `query_read` | `run_query` with read-only enforcement, `explain`, `sample_table` (size-capped), `get_query_history` |
 | `query_write` | `run_query` with write grants (requires the DB role to also have write privileges) |
 | `history_read` | Read your *own* query history. Other users' history is never readable here — admin-only via state DB |
 

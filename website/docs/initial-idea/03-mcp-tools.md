@@ -26,7 +26,9 @@ Args: `server`, `database`, optional `schema`, optional `table`. Returns tables/
 
 ### `sample_table`
 
-Args: `server`, `database`, `table`, optional `limit` (default 10, capped). Returns a small sample. Useful for "what does this data look like" without writing SQL.
+Args: `server`, `database`, `table`, optional `schema`, optional `limit` (default 10, capped), optional `reason`. Returns a small sample. Useful for "what does this data look like" without writing SQL.
+
+**Requires `query_read`, not `schema_read`.** This tool returns row data, so it is authorized exactly like `run_query` and honours the same `require_reason` constraint. A `schema_read` grant covers metadata only (`describe_schema`, `list_databases`).
 
 ### `run_query`
 
@@ -40,7 +42,7 @@ Args: `server`, `database`, `sql`, optional `limit`, optional `reason`. Executes
 
 ### `explain`
 
-Args: `server`, `database`, `sql`. Returns `EXPLAIN` (or vendor equivalent) without executing. Lets the agent estimate cost before running expensive queries.
+Args: `server`, `database`, `sql`, optional `reason`. Returns `EXPLAIN` (or vendor equivalent) without executing. Lets the agent estimate cost before running expensive queries. Honours the same `require_reason` constraint as `run_query`.
 
 **`EXPLAIN ANALYZE` is rejected** — same reason as in `run_query`. Use plain `EXPLAIN` instead.
 
