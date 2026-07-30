@@ -1,4 +1,4 @@
-//! MongoDB target adapter — scaffold + read-only enforcement (#57).
+//! MongoDB target adapter — read-only enforcement + command execution.
 //!
 //! Wire-shape: [`MongoAdapter`] implements [`super::DbAdapter`] and is
 //! dispatched to by [`super::AdapterRegistry`] when `server.kind` is
@@ -6,10 +6,10 @@
 //! type — they only see `Arc<dyn DbAdapter>` from the registry, identical
 //! to the pg path.
 //!
-//! This issue ships *no execution*. The trait's `execute` runs the
-//! [`rejector`] first; if the command passes, it returns
-//! [`super::ExecError::NotImplemented`] — the typed "scaffold gap" marker.
-//! #58 replaces that branch with the real mongo client call.
+//! `execute` runs the [`rejector`] first; only an accepted read command
+//! reaches the driver, and it reaches it under the gateway's always-present
+//! time budget ([`super::adapter::effective_timeout_ms`]) — see
+//! [`MongoAdapter::execute`] for the timeout / cancellation contract.
 //!
 //! Security-required (CLAUDE.md). The connection password is *never*
 //! embedded in `Display` for any error or in any tracing field, identical
@@ -20,7 +20,7 @@
 
 pub mod rejector;
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -33,7 +33,10 @@ use serde_json::Value;
 
 use crate::config::{Database, Server, Tls};
 
-use super::adapter::{AdapterKind, DbAdapter, ExecError, ExecQuery, ExecResult};
+use super::adapter::{
+    AdapterKind, DbAdapter, ExecError, ExecQuery, ExecResult, TOKIO_TIMEOUT_SLACK_MS,
+    effective_timeout_ms,
+};
 use super::pg::resolve_password;
 
 /// Per-`(server, database)` mongo adapter. Wraps a `mongodb::Client`; one
@@ -123,27 +126,81 @@ impl DbAdapter for MongoAdapter {
     }
 
     /// Read-only enforcement first; on accept, dispatch the parsed BSON
-    /// command to the mongo driver. Cancellation is the future-drop chain:
-    /// dropping this future drops the cursor → mongo kills the operation
-    /// server-side (spec 12 §239 / CLAUDE.md *§Cancellation safety*).
+    /// command to the mongo driver under the gateway's time budget.
     ///
     /// A rejected command maps to [`ExecError::Forbidden`] (→ tool code
     /// `forbidden_sql`), matching the pg path's `sql_guard::is_read_only`
     /// posture. Per spec 03, this is a policy denial, not a syntax error.
+    ///
+    /// **Timeout** — identical semantics to `PgAdapter::execute`. The budget
+    /// is [`effective_timeout_ms`]: always present, and clamped so a grant
+    /// can only tighten it. It is applied twice, because neither half is
+    /// sufficient alone:
+    ///
+    /// - `maxTimeMS` on the command, so mongo kills the operation
+    ///   server-side and we get the precise `MaxTimeMSExpired` (code 50) →
+    ///   [`ExecError::Timeout`] mapping.
+    /// - A `tokio::time::timeout` around the whole dispatch *including the
+    ///   cursor drain*, because `maxTimeMS` does not reliably reach the
+    ///   `getMore` round-trips that drain the rest of the cursor (mongo
+    ///   carries an aggregation cursor's deadline into `getMore`; a `find`
+    ///   cursor's is not covered), so a large result set would otherwise
+    ///   blow straight through the budget.
+    ///
+    /// **Cancellation** — there is NO server-side kill here, and that is a
+    /// known gap against the pg path's `pg_cancel_backend` drop guard.
+    /// Dropping this future drops the driver's operation future (freeing the
+    /// client-side connection) and schedules `killCursors` for any open
+    /// cursor id, but `killCursors` does not abort an operation that is
+    /// already executing, and the `count` / `distinct` arms never open a
+    /// cursor at all. So after an agent disconnects, mongo keeps working on
+    /// the operation until it finishes or `maxTimeMS` expires — bounded, but
+    /// not cancelled. A genuine equivalent needs the operation's `opid` from
+    /// `$currentOp` plus `killOp`, which the driver does not surface.
+    /// (The `outcome: cancelled` audit row is unaffected: it is written by
+    /// the backend-agnostic drop guard in `tools::audit_dispatch`.)
     async fn execute(&self, query: ExecQuery<'_>) -> Result<ExecResult, ExecError> {
         rejector::validate_command(query.sql)
             .map_err(|err| ExecError::Forbidden(err.to_string()))?;
 
+        let effective_ms = effective_timeout_ms(query.statement_timeout_ms);
+        let budget = Duration::from_millis(u64::from(effective_ms) + TOKIO_TIMEOUT_SLACK_MS);
+        match tokio::time::timeout(budget, self.dispatch(&query, effective_ms)).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(ExecError::Timeout),
+        }
+    }
+
+    /// Cheap liveness probe — ping the admin database. Same role as pg's
+    /// `SELECT 1`: confirms the client can hand out a working connection
+    /// and the server is responding. Costs one round-trip.
+    async fn health(&self) -> Result<(), ExecError> {
+        use mongodb::bson::doc;
+        self.client
+            .database("admin")
+            .run_command(doc! { "ping": 1 })
+            .await
+            .map(|_| ())
+            .map_err(|_| ExecError::Unavailable)
+    }
+}
+
+impl MongoAdapter {
+    /// Parse, stamp the DB-side budget, and run one already-accepted command.
+    /// Split out of [`DbAdapter::execute`] so the `tokio::time::timeout`
+    /// there covers the cursor drain as well as the initial dispatch.
+    async fn dispatch(
+        &self,
+        query: &ExecQuery<'_>,
+        effective_ms: u32,
+    ) -> Result<ExecResult, ExecError> {
         let mut cmd: Document = serde_json::from_str(query.sql).map_err(|_| ExecError::Sql)?;
         let command_name = first_command_name(&cmd).ok_or(ExecError::Sql)?;
 
-        // Inject `maxTimeMS` at the command layer so mongo enforces the
-        // timeout server-side. Belt-and-suspenders: dropping the future
-        // also cancels via the cursor-drop chain, but a slow mongo that
-        // ignores our `maxTimeMS` still can't pin a connection forever.
-        if let Some(ms) = query.statement_timeout_ms {
-            cmd.insert("maxTimeMS", i64::from(ms));
-        }
+        // Unconditional: `insert` overwrites, so a caller-supplied
+        // `maxTimeMS` in the raw command can only ever be replaced by the
+        // gateway's clamped value — it can't be used to buy more budget.
+        cmd.insert("maxTimeMS", i64::from(effective_ms));
 
         let started = Instant::now();
         let db = self.client.database(&self.database_name);
@@ -225,19 +282,6 @@ impl DbAdapter for MongoAdapter {
                 "command `{other}` is rejector-allowed but not dispatch-wired"
             ))),
         }
-    }
-
-    /// Cheap liveness probe — ping the admin database. Same role as pg's
-    /// `SELECT 1`: confirms the client can hand out a working connection
-    /// and the server is responding. Costs one round-trip.
-    async fn health(&self) -> Result<(), ExecError> {
-        use mongodb::bson::doc;
-        self.client
-            .database("admin")
-            .run_command(doc! { "ping": 1 })
-            .await
-            .map(|_| ())
-            .map_err(|_| ExecError::Unavailable)
     }
 }
 

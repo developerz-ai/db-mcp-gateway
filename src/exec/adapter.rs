@@ -1,8 +1,15 @@
-//! `DbAdapter` trait — the contract every storage backend implements.
+//! `DbAdapter` trait — the contract every storage backend implements, plus
+//! the timeout policy every impl must apply.
 //!
-//! Only [`super::pg::PgAdapter`] implements this today. Mongo (#57) and
-//! mysql (#59) slot in here without touching the tools layer: every per-DB
-//! tool drives the registry and the registry returns the right adapter.
+//! [`super::pg::PgAdapter`] and [`super::mongo::MongoAdapter`] implement this
+//! today; mysql (#59) slots in here without touching the tools layer: every
+//! per-DB tool drives the registry and the registry returns the right
+//! adapter.
+//!
+//! [`effective_timeout_ms`] lives here rather than in one impl because the
+//! ceiling is a *gateway* policy, not a backend detail — an adapter that
+//! computed its own would let a grant loosen past the ceiling and invert
+//! most-restrictive-wins.
 //!
 //! Security note: `ExecError`'s `Display` never carries connection strings,
 //! hostnames, passwords, or SQLSTATE codes. The pg-side mapping is in
@@ -13,6 +20,34 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::ServerKind;
+
+/// Gateway-wide ceiling on a single query's wall-clock budget. When a grant
+/// declines to set `statement_timeout_ms` (spec-06 "no constraint from this
+/// side"), a query would otherwise run unbounded and pin a driver connection
+/// indefinitely — a handful of those starve every other user of this
+/// `(server, database)`. So the gateway always imposes this floor. A grant
+/// may only *tighten* it (most-restrictive-wins): it can never raise the
+/// budget above this ceiling. 30s is generous for an interactive read yet
+/// short enough that a runaway query frees its connection promptly.
+///
+/// Every adapter applies this — the policy is the gateway's, not the
+/// backend's, so it lives next to the trait rather than in one impl.
+pub const DEFAULT_STATEMENT_TIMEOUT_MS: u32 = 30_000;
+
+/// Extra slack on top of the DB-side timeout so the Tokio guard doesn't
+/// preempt before the backend has a chance to surface its own cancel (which
+/// carries the precise, typed error).
+pub(super) const TOKIO_TIMEOUT_SLACK_MS: u64 = 500;
+
+/// Effective per-query timeout in milliseconds. The grant value wins when
+/// present (it may be more restrictive) but is clamped to the gateway
+/// ceiling so it can only tighten, never loosen:
+/// `effective = min(grant.unwrap_or(CEILING), CEILING)`.
+pub(super) fn effective_timeout_ms(grant: Option<u32>) -> u32 {
+    grant
+        .unwrap_or(DEFAULT_STATEMENT_TIMEOUT_MS)
+        .min(DEFAULT_STATEMENT_TIMEOUT_MS)
+}
 
 /// Backend identifier — used for metrics tagging and per-adapter dispatch.
 /// More variants land as `PgAdapter`'s siblings arrive.
@@ -111,9 +146,12 @@ pub enum ExecError {
 ///
 /// 1. Never let credentials leak into `ExecError::Display`, tracing fields,
 ///    or panic payloads (CLAUDE.md non-negotiable #1).
-/// 2. Honor `statement_timeout_ms` *at the DB* if the backend supports it,
-///    so a single misuse can't outlive its tx. Future-drop is the secondary
-///    cancellation chain — see `PgAdapter::execute` for the pg pattern.
+/// 2. Bound EVERY call by [`effective_timeout_ms`] — never by the raw
+///    `statement_timeout_ms`, which is `None` when the grant declines to cap
+///    and may exceed the ceiling when it asks for more. Push it to the DB if
+///    the backend supports it (`SET LOCAL statement_timeout` / `maxTimeMS`)
+///    *and* wrap the whole call in a `tokio::time::timeout`, so a backend
+///    that ignores the DB-side cap still can't pin a connection.
 /// 3. Surface row truncation via `ExecResult.truncated` instead of returning
 ///    more than `row_limit` rows.
 #[async_trait]
@@ -130,4 +168,21 @@ pub trait DbAdapter: Send + Sync + std::fmt::Debug {
     /// `/readyz` to confirm the adapter's pool can still acquire a connection
     /// without consulting the underlying DB's query planner.
     async fn health(&self) -> Result<(), ExecError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_timeout_clamps_and_defaults() {
+        // No grant constraint → gateway ceiling, never unbounded.
+        assert_eq!(effective_timeout_ms(None), DEFAULT_STATEMENT_TIMEOUT_MS);
+        assert_eq!(effective_timeout_ms(None), 30_000);
+        // A tighter grant wins (most-restrictive-wins).
+        assert_eq!(effective_timeout_ms(Some(5_000)), 5_000);
+        // A looser grant is clamped down to the ceiling — it can only tighten.
+        assert_eq!(effective_timeout_ms(Some(60_000)), 30_000);
+        assert_eq!(effective_timeout_ms(Some(3_600_000)), 30_000);
+    }
 }
