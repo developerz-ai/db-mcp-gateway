@@ -458,6 +458,31 @@ async fn wildcard_sentinel_db_name_is_rejected() {
         "rejected wildcard-db_name POST must not persist a row"
     );
 
+    // ...and no audit row either. The rejection has to happen before the
+    // audited transaction opens, otherwise the spec claim in
+    // `12-dynamic-permissions.md` ("leaves the store and `permissions_audit`
+    // unchanged") is a lie. Scope to the exact `(server, db_name)` pair the
+    // caller sent — no legitimate audit row can carry `db_name = "*"` once
+    // this validation is in place, but the tighter filter keeps the assertion
+    // meaningful even if a future test regresses the invariant.
+    let audit_rows: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM permissions_audit \
+         WHERE target_type = 'database' \
+           AND after->>'server' = $1 \
+           AND after->>'db_name' = $2",
+    )
+    .bind("prod")
+    .bind("*")
+    .fetch_one(&h.pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert_eq!(
+        audit_rows, 0,
+        "rejected wildcard-db_name POST must not write an audit row"
+    );
+
     h.cleanup().await;
 }
 
@@ -506,6 +531,28 @@ async fn wildcard_sentinel_server_is_rejected() {
     assert!(
         !exists,
         "rejected wildcard-server POST must not persist a row"
+    );
+
+    // ...and no audit row for the rejected server-wildcard either — the doc
+    // in `12-dynamic-permissions.md` promises the audit table stays clean on
+    // rejection. Scope to the exact `(server, db_name)` pair; `db_name` is a
+    // per-test UUID so this can never collide with a sibling test.
+    let audit_rows: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM permissions_audit \
+         WHERE target_type = 'database' \
+           AND after->>'server' = $1 \
+           AND after->>'db_name' = $2",
+    )
+    .bind("*")
+    .bind(&db_name)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert_eq!(
+        audit_rows, 0,
+        "rejected wildcard-server POST must not write an audit row"
     );
 
     h.cleanup().await;
