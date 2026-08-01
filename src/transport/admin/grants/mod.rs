@@ -126,7 +126,7 @@ pub async fn create(
         .await
         .map_err(|err| internal("commit tx", err, &actor.request_id))?;
 
-    invalidate_cache(&state.cache, user_sub.as_deref()).await;
+    PermissionsCache::spawn_invalidate(&state.cache, user_sub.as_deref());
 
     Ok((StatusCode::CREATED, Json(GrantResponse::from(grant))))
 }
@@ -225,7 +225,7 @@ pub async fn patch(
         .await
         .map_err(|err| internal("commit tx", err, &actor.request_id))?;
 
-    invalidate_cache(&state.cache, user_sub.as_deref()).await;
+    PermissionsCache::spawn_invalidate(&state.cache, user_sub.as_deref());
 
     Ok(Json(GrantResponse::from(after)))
 }
@@ -281,18 +281,7 @@ pub async fn delete(
         .await
         .map_err(|err| internal("commit tx", err, &actor.request_id))?;
 
-    invalidate_cache(&state.cache, user_sub.as_deref()).await;
+    PermissionsCache::spawn_invalidate(&state.cache, user_sub.as_deref());
 
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// Fire-and-forget cache invalidation. Runs AFTER the tx commits so a
-/// concurrent reader that re-warms during the gap sees the post-commit
-/// state. A pre-commit invalidation would let the reader re-warm with the
-/// stale grant, which is worse. The TTL (default 60s) is the safety net if
-/// `cache` is `None` or the user_sub lookup returned `None`.
-async fn invalidate_cache(cache: &Option<PermissionsCache>, user_sub: Option<&str>) {
-    if let (Some(cache), Some(sub)) = (cache.as_ref(), user_sub) {
-        cache.invalidate(sub).await;
-    }
 }

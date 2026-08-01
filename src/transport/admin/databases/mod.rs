@@ -43,6 +43,7 @@ use uuid::Uuid;
 use crate::audit::permissions::{
     self, PermissionsAuditAction, PermissionsAuditRow, PermissionsAuditTargetType,
 };
+use crate::authz::PermissionsCache;
 use crate::state::permissions::{PermissionsDatabase, PermissionsRepo};
 
 use super::error::AdminError;
@@ -53,11 +54,19 @@ pub use dto::{CreateDatabaseRequest, DatabaseResponse, UpdateDatabaseRequest};
 use sql::{tx_create_database, tx_get_database_by_id, tx_soft_delete_database, tx_update_database};
 use validation::{internal, invalid_body, invalid_id, parse_db_type, trimmed_non_empty};
 
-/// Shared state cloned into every databases-route handler.
+/// Shared state cloned into every databases-route handler. The `cache` field
+/// is `Option<PermissionsCache>` for parity with [`super::users::UsersState`]
+/// and [`super::grants::GrantsState`] — YAML-only installs run without a
+/// resolver cache and invalidation is then a no-op. A database mutation can
+/// change the meaning of every user's grants (a rename shifts what a
+/// `(server, db_name)` grant resolves to; a soft-delete drops the target
+/// entirely), so per-user invalidation is not enough — every mutation here
+/// clears the whole cache.
 #[derive(Clone)]
 pub struct DatabasesState {
     pub repo: Arc<dyn PermissionsRepo>,
     pub state_db: PgPool,
+    pub cache: Option<PermissionsCache>,
 }
 
 impl std::fmt::Debug for DatabasesState {
@@ -65,6 +74,7 @@ impl std::fmt::Debug for DatabasesState {
         f.debug_struct("DatabasesState")
             .field("repo", &"<Arc<dyn PermissionsRepo>>")
             .field("state_db", &"<PgPool>")
+            .field("cache", &self.cache.as_ref().map(|_| "<PermissionsCache>"))
             .finish()
     }
 }
@@ -111,6 +121,12 @@ pub async fn create(
     tx.commit()
         .await
         .map_err(|err| internal("commit tx", err, &actor.request_id))?;
+
+    // A new `permissions_databases` row expands what every user's wildcard
+    // grant (`database: "*"`) resolves to at request time, so per-user
+    // invalidation isn't enough — flush the whole cache. Runs after commit so
+    // a rolled-back insert never bumps the resolver revision.
+    PermissionsCache::spawn_invalidate_all(&state.cache);
 
     Ok((StatusCode::CREATED, Json(DatabaseResponse::from(database))))
 }
@@ -212,6 +228,8 @@ pub async fn patch(
         .await
         .map_err(|err| internal("commit tx", err, &actor.request_id))?;
 
+    PermissionsCache::spawn_invalidate_all(&state.cache);
+
     Ok(Json(DatabaseResponse::from(after)))
 }
 
@@ -261,6 +279,9 @@ pub async fn delete(
     tx.commit()
         .await
         .map_err(|err| internal("commit tx", err, &actor.request_id))?;
+
+    PermissionsCache::spawn_invalidate_all(&state.cache);
+
     Ok(StatusCode::NO_CONTENT)
 }
 

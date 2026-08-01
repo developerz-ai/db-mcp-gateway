@@ -731,12 +731,23 @@ async fn live_grant_change_invalidates_cache_for_user() {
     h.track_grant(grant_id);
 
     // Read through the cache again — must see the new grant. The
-    // invalidation fired post-commit, so this read goes to the DB.
-    let after = h
-        .cache
-        .get_for(&identity)
-        .await
-        .expect("cache load post-invalidate");
+    // invalidation fires post-commit on a `tokio::spawn`ed task (so a
+    // client disconnect can't strand the write-lock cleanup), so poll
+    // briefly for the entry drop rather than assuming a single read wins
+    // the race with the invalidator.
+    let mut attempts = 0;
+    let after = loop {
+        let grants = h
+            .cache
+            .get_for(&identity)
+            .await
+            .expect("cache load post-invalidate");
+        if grants.len() == 1 || attempts >= 40 {
+            break grants;
+        }
+        attempts += 1;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
     assert_eq!(
         after.len(),
         1,
