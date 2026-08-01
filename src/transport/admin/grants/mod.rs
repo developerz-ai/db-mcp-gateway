@@ -126,7 +126,7 @@ pub async fn create(
         .await
         .map_err(|err| internal("commit tx", err, &actor.request_id))?;
 
-    invalidate_cache(&state.cache, user_sub.as_deref()).await;
+    invalidate_cache(&state.cache, user_sub.as_deref());
 
     Ok((StatusCode::CREATED, Json(GrantResponse::from(grant))))
 }
@@ -225,7 +225,7 @@ pub async fn patch(
         .await
         .map_err(|err| internal("commit tx", err, &actor.request_id))?;
 
-    invalidate_cache(&state.cache, user_sub.as_deref()).await;
+    invalidate_cache(&state.cache, user_sub.as_deref());
 
     Ok(Json(GrantResponse::from(after)))
 }
@@ -281,7 +281,7 @@ pub async fn delete(
         .await
         .map_err(|err| internal("commit tx", err, &actor.request_id))?;
 
-    invalidate_cache(&state.cache, user_sub.as_deref()).await;
+    invalidate_cache(&state.cache, user_sub.as_deref());
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -291,8 +291,18 @@ pub async fn delete(
 /// state. A pre-commit invalidation would let the reader re-warm with the
 /// stale grant, which is worse. The TTL (default 60s) is the safety net if
 /// `cache` is `None` or the user_sub lookup returned `None`.
-async fn invalidate_cache(cache: &Option<PermissionsCache>, user_sub: Option<&str>) {
+///
+/// Detached via `tokio::spawn` so a client disconnect between the revision
+/// bump and the entry removal cannot leave the stale entry live until TTL:
+/// [`PermissionsCache::invalidate`] takes a write lock, and awaiting it on
+/// the request task means cancellation drops the future mid-invalidate.
+/// The spawned task owns its inputs and runs to completion regardless.
+fn invalidate_cache(cache: &Option<PermissionsCache>, user_sub: Option<&str>) {
     if let (Some(cache), Some(sub)) = (cache.as_ref(), user_sub) {
-        cache.invalidate(sub).await;
+        let cache = cache.clone();
+        let sub = sub.to_string();
+        tokio::spawn(async move {
+            cache.invalidate(&sub).await;
+        });
     }
 }

@@ -193,7 +193,9 @@ pub async fn patch(
 
     // A group change flips constraint-merge results; invalidate even on
     // email-only patches so the cache never lags a mutation admins observe.
-    invalidate_cache(&state.cache, Some(&after.user_sub)).await;
+    // Fire-and-forget (see `invalidate_cache`) — the write-lock cleanup
+    // must not be tied to the request future's lifetime.
+    invalidate_cache(&state.cache, Some(&after.user_sub));
 
     Ok(Json(UserResponse::from(after)))
 }
@@ -254,8 +256,9 @@ pub async fn delete(
 
     // A soft-deleted user must not keep landing authz decisions from cache
     // until the TTL expires — drop the entry so the next request reloads
-    // (and now sees no active row, i.e. no grants).
-    invalidate_cache(&state.cache, Some(&before.user_sub)).await;
+    // (and now sees no active row, i.e. no grants). Fire-and-forget so a
+    // client disconnect can't strand the entry (see `invalidate_cache`).
+    invalidate_cache(&state.cache, Some(&before.user_sub));
 
     Ok(StatusCode::NO_CONTENT)
 }

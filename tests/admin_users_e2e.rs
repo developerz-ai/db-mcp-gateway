@@ -23,11 +23,14 @@ use axum::Router;
 use axum::extract::Request;
 use axum::middleware as axum_mw;
 use axum::middleware::Next;
-use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore, jwt};
+use db_mcp_gateway::auth::{AuthConfig, Identity, OidcClient, SessionId, SessionStore, jwt};
+use db_mcp_gateway::authz::PermissionsCache;
 use db_mcp_gateway::config::{AdminBlock, Config, ConfigFile};
 use db_mcp_gateway::exec::AdapterRegistry;
 use db_mcp_gateway::state;
-use db_mcp_gateway::state::permissions::{PermissionsRepo, pg::PgPermissionsRepo};
+use db_mcp_gateway::state::permissions::{
+    DbType, GrantAction, GrantTarget, PermissionsRepo, pg::PgPermissionsRepo,
+};
 use db_mcp_gateway::transport::admin;
 use db_mcp_gateway::transport::admin::middleware::AdminActor;
 use db_mcp_gateway::transport::admin::users::UsersState;
@@ -929,4 +932,362 @@ async fn admin_disabled_returns_404_on_admin_routes() {
         .bind(&admin_sub)
         .execute(&pool)
         .await;
+}
+
+/// Boot the gateway with the resolver cache wired up, so admin mutations
+/// can be observed to invalidate cached authz decisions. Mirrors
+/// [`spawn_gateway`] otherwise; kept separate so the cache-free tests above
+/// keep exercising the YAML-only install shape.
+async fn spawn_gateway_with_cache() -> (Harness, PermissionsCache, AuthConfig, SessionStore) {
+    let pool = pool().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    let auth_config = AuthConfig {
+        issuer: "http://idp.invalid".to_string(),
+        client_id: "test".to_string(),
+        client_secret: "test".to_string(),
+        audience: "test".to_string(),
+        redirect_url: format!("{base_url}/auth/callback"),
+        ..AuthConfig::default()
+    };
+    let sessions = SessionStore::new(pool.clone());
+    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient builds");
+
+    let mut config_file = ConfigFile::from_yaml_str("servers: []\npermissions: []\n").unwrap();
+    config_file.admin = Some(AdminBlock {
+        enabled: true,
+        group: ADMIN_GROUP.to_string(),
+        session_max_age_secs: None,
+    });
+
+    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
+    // 60s TTL keeps the "before" cache entry fresh for the whole test — we
+    // rely on the invalidation, not TTL expiry, to prove the drop.
+    let cache = PermissionsCache::new(repo.clone(), Duration::from_secs(60));
+
+    let config = Config {
+        bind: addr,
+        ..Config::default()
+    };
+    let app = transport::router(
+        &config,
+        AppState {
+            auth: Some(AuthFacade {
+                config: Arc::new(auth_config.clone()),
+                sessions: sessions.clone(),
+                oidc,
+                flows: PendingFlows::default(),
+                codes: db_mcp_gateway::transport::AuthCodes::default(),
+                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
+            }),
+            config: Arc::new(config_file),
+            adapter_registry: AdapterRegistry::new(),
+            state_db: Some(pool.clone()),
+            shutdown: Default::default(),
+            metrics: None,
+            permissions_cache: Some(cache.clone()),
+            permissions_repo: Some(repo),
+            mcp_path: std::sync::Arc::from("/mcp"),
+            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
+        },
+    )
+    .expect("router builds");
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+
+    (
+        Harness {
+            base_url,
+            pool,
+            cleanup_subs: Vec::new(),
+        },
+        cache,
+        auth_config,
+        sessions,
+    )
+}
+
+/// Poll `cache.get_for` until the grant count reaches `want` or we exhaust
+/// the retry budget. Invalidation runs on a `tokio::spawn`ed task (so a
+/// client disconnect can't strand the write-lock cleanup), so the read
+/// after the admin call races the invalidator — this helper waits it out.
+async fn poll_cache_len(
+    cache: &PermissionsCache,
+    identity: &Identity,
+    want: usize,
+) -> Arc<Vec<db_mcp_gateway::config::Grant>> {
+    let mut attempts = 0;
+    loop {
+        let grants = cache.get_for(identity).await.expect("cache load");
+        if grants.len() == want || attempts >= 40 {
+            return grants;
+        }
+        attempts += 1;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn latest_audit_action(pool: &PgPool, target_id: Uuid) -> Option<String> {
+    latest_audit_for_target(pool, target_id)
+        .await
+        .map(|(action, _, _, _, _)| action)
+}
+
+/// **Cache invalidation on PATCH.** A cached authz decision for a user
+/// must NOT survive a PATCH on that user's row. Group changes flip
+/// constraint-merge results, and even email-only patches invalidate
+/// because we never want the cache to lag a mutation admins observe.
+///
+/// Setup: seed a user via admin, warm the cache (0 grants), add a grant
+/// out-of-band via the repo (bypasses the admin-endpoint invalidation),
+/// then PATCH the user. If the PATCH fires the invalidation, the next
+/// `get_for` reloads from the DB and sees the out-of-band grant.
+#[tokio::test]
+async fn patch_invalidates_cached_authz_for_user() {
+    let (mut h, cache, auth_cfg, sessions) = spawn_gateway_with_cache().await;
+    let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    let target_sub = format!("target-e2e-cache-{}", Uuid::new_v4().simple());
+    h.track(target_sub.clone());
+
+    let jwt = mint_session(
+        &sessions,
+        &auth_cfg.session_signing_key,
+        &admin_sub,
+        "admin@example.com",
+        &[ADMIN_GROUP.to_string()],
+    )
+    .await;
+
+    // Seed target user via admin API so cache invalidation on the create
+    // path is exercised alongside the eventual PATCH.
+    let create: Value = client()
+        .post(format!("{}/admin/v1/users", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&json!({
+            "user_sub": target_sub,
+            "user_email": "cache@example.com",
+            "groups": ["engineers"],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let target_id: Uuid = create["id"].as_str().unwrap().parse().unwrap();
+
+    let identity = Identity {
+        session_id: SessionId::new(),
+        user_sub: target_sub.clone(),
+        user_email: "cache@example.com".to_string(),
+        groups: vec!["engineers".to_string()],
+        issued_at: chrono::Utc::now(),
+    };
+
+    // Warm the cache with the pre-patch state: no grants.
+    let initial = cache.get_for(&identity).await.expect("cache warm");
+    assert!(initial.is_empty(), "target user starts with no grants");
+
+    // Add a database + grant directly via the repo. This intentionally
+    // bypasses the admin endpoint's cache invalidation so we can prove
+    // the PATCH below is what drops the stale entry.
+    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(h.pool.clone()));
+    let db_row = repo
+        .create_database(
+            "prod",
+            &format!("cache-app-{}", Uuid::new_v4().simple()),
+            DbType::Postgres,
+        )
+        .await
+        .expect("seed database");
+    let db_id = db_row.id;
+    let grant = repo
+        .create_grant(
+            target_id,
+            GrantTarget::Specific { database_id: db_id },
+            GrantAction::QueryRead,
+            json!({ "row_limit": 100 }),
+        )
+        .await
+        .expect("seed grant");
+
+    // Cache still returns 0 — TTL is 60s and no invalidation has fired.
+    let stale = cache.get_for(&identity).await.expect("cache still stale");
+    assert!(
+        stale.is_empty(),
+        "cache must return the pre-warmed empty set until an invalidation fires"
+    );
+
+    // PATCH the user — this is the invalidation trigger under test.
+    let resp = client()
+        .patch(format!("{}/admin/v1/users/{}", h.base_url, target_id))
+        .bearer_auth(&jwt)
+        .json(&json!({ "user_email": "cache2@example.com" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Post-PATCH: the fire-and-forget invalidation lands, the next
+    // `get_for` reloads from the DB, and the out-of-band grant appears.
+    let after = poll_cache_len(&cache, &identity, 1).await;
+    assert_eq!(
+        after.len(),
+        1,
+        "PATCH must invalidate the cache entry; got {after:?}"
+    );
+
+    // Mutation audit row landed (belt-and-suspenders — CLAUDE.md #4).
+    assert_eq!(
+        latest_audit_action(&h.pool, target_id).await.as_deref(),
+        Some("update"),
+        "PATCH must write an update audit row"
+    );
+
+    // Cleanup: revoke the grant + drop the database we seeded directly.
+    let _ = sqlx::query("DELETE FROM permissions_audit WHERE target_id = $1")
+        .bind(grant.id)
+        .execute(&h.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM permissions_grants WHERE id = $1")
+        .bind(grant.id)
+        .execute(&h.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM permissions_audit WHERE target_id = $1")
+        .bind(db_id)
+        .execute(&h.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM permissions_databases WHERE id = $1")
+        .bind(db_id)
+        .execute(&h.pool)
+        .await;
+    h.cleanup().await;
+}
+
+/// **Cache invalidation on DELETE.** A soft-deleted user's cached grants
+/// must not keep landing authz decisions until the TTL expires. Seed a
+/// user + grant, warm the cache (sees the grant), DELETE the user, then
+/// prove the cache reflects the deletion (loader returns empty for the
+/// missing user).
+#[tokio::test]
+async fn delete_invalidates_cached_authz_for_user() {
+    let (mut h, cache, auth_cfg, sessions) = spawn_gateway_with_cache().await;
+    let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    let target_sub = format!("target-e2e-cache-del-{}", Uuid::new_v4().simple());
+    h.track(target_sub.clone());
+
+    let jwt = mint_session(
+        &sessions,
+        &auth_cfg.session_signing_key,
+        &admin_sub,
+        "admin@example.com",
+        &[ADMIN_GROUP.to_string()],
+    )
+    .await;
+
+    // Seed target user + a real grant so the "before" cache state is
+    // non-empty — that way the assertion after DELETE proves the entry
+    // was dropped, not just that a fresh load happened to return empty.
+    let create: Value = client()
+        .post(format!("{}/admin/v1/users", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&json!({
+            "user_sub": target_sub,
+            "user_email": "doomed@example.com",
+            "groups": ["engineers"],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let target_id: Uuid = create["id"].as_str().unwrap().parse().unwrap();
+
+    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(h.pool.clone()));
+    let db_row = repo
+        .create_database(
+            "prod",
+            &format!("del-cache-app-{}", Uuid::new_v4().simple()),
+            DbType::Postgres,
+        )
+        .await
+        .expect("seed database");
+    let db_id = db_row.id;
+    let grant = repo
+        .create_grant(
+            target_id,
+            GrantTarget::Specific { database_id: db_id },
+            GrantAction::QueryRead,
+            json!({ "row_limit": 100 }),
+        )
+        .await
+        .expect("seed grant");
+
+    let identity = Identity {
+        session_id: SessionId::new(),
+        user_sub: target_sub.clone(),
+        user_email: "doomed@example.com".to_string(),
+        groups: vec!["engineers".to_string()],
+        issued_at: chrono::Utc::now(),
+    };
+
+    // Warm cache — we should see the seeded grant.
+    let initial = cache.get_for(&identity).await.expect("cache warm");
+    assert_eq!(initial.len(), 1, "pre-delete cache carries the grant");
+
+    // DELETE the user.
+    let resp = client()
+        .delete(format!("{}/admin/v1/users/{}", h.base_url, target_id))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Post-DELETE: the fire-and-forget invalidation lands, the next
+    // `get_for` reloads, and the loader returns empty because the user
+    // row is now soft-deleted (get_user_by_sub returns None).
+    let after = poll_cache_len(&cache, &identity, 0).await;
+    assert!(
+        after.is_empty(),
+        "DELETE must invalidate the cache entry; got {after:?}"
+    );
+
+    // Mutation audit row landed.
+    assert_eq!(
+        latest_audit_action(&h.pool, target_id).await.as_deref(),
+        Some("delete"),
+        "DELETE must write a delete audit row"
+    );
+
+    // Cleanup the seeded grant + database.
+    let _ = sqlx::query("DELETE FROM permissions_audit WHERE target_id = $1")
+        .bind(grant.id)
+        .execute(&h.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM permissions_grants WHERE id = $1")
+        .bind(grant.id)
+        .execute(&h.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM permissions_audit WHERE target_id = $1")
+        .bind(db_id)
+        .execute(&h.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM permissions_databases WHERE id = $1")
+        .bind(db_id)
+        .execute(&h.pool)
+        .await;
+    h.cleanup().await;
 }
