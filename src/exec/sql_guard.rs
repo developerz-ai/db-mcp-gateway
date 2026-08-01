@@ -436,6 +436,29 @@ mod tests {
         ok("EXPLAIN (COSTS false, FORMAT TEXT) SELECT * FROM users");
     }
 
+    /// Nested `EXPLAIN` never reaches the guard's shape check: the Postgres
+    /// dialect rejects it at parse time with `"Explain must be root of the
+    /// plan"`, matching Postgres itself. The unwrap `while` loop in
+    /// [`check_sql`] therefore only ever iterates once today — it stays a
+    /// loop (rather than an `if let`) as defense-in-depth for any future
+    /// dialect that admits nested `EXPLAIN`, so ANALYZE at any wrapper depth
+    /// would still be caught before the DB is touched.
+    #[test]
+    fn nested_explain_rejected_at_parse_time() {
+        assert!(matches!(
+            is_read_only("EXPLAIN EXPLAIN ANALYZE SELECT 1"),
+            Err(GuardError::Parse)
+        ));
+        assert!(matches!(
+            is_read_only("EXPLAIN EXPLAIN (ANALYZE) SELECT 1"),
+            Err(GuardError::Parse)
+        ));
+        assert!(matches!(
+            is_read_only("EXPLAIN EXPLAIN DELETE FROM users"),
+            Err(GuardError::Parse)
+        ));
+    }
+
     #[test]
     fn writable_cte_rejected() {
         rejected(
@@ -839,6 +862,25 @@ mod tests {
         ok_write("SELECT id, email FROM users WHERE id = 1");
         ok_write("WITH x AS (SELECT 1) SELECT * FROM x");
         ok_write("EXPLAIN SELECT 1");
+    }
+
+    /// `EXPLAIN` without `ANALYZE` does not execute; once the wrapper is
+    /// peeled, the shape check sees a write statement and the ReadWrite grant
+    /// covers it. ANALYZE still executes and stays rejected — the write grant
+    /// must not become a way to bypass the row cap.
+    #[test]
+    fn write_mode_allows_explain_of_a_write() {
+        ok_write("EXPLAIN INSERT INTO t VALUES (1)");
+        ok_write("EXPLAIN (FORMAT JSON) UPDATE users SET x = 1");
+        ok_write("EXPLAIN DELETE FROM users WHERE id = 1");
+        rejected_write(
+            "EXPLAIN ANALYZE INSERT INTO t VALUES (1)",
+            GuardError::ExplainAnalyze,
+        );
+        rejected_write(
+            "EXPLAIN (ANALYZE) DELETE FROM users",
+            GuardError::ExplainAnalyze,
+        );
     }
 
     #[test]
