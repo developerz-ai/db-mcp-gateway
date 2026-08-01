@@ -31,13 +31,29 @@ use super::adapter::{
     effective_timeout_ms,
 };
 
-const DEFAULT_POOL_MAX_CONNECTIONS: u32 = 5;
+/// Public so integration tests (e.g. `cancellation_real_db`) can size the
+/// saturation workload to match the pool exactly rather than duplicating the
+/// literal — a stale copy would silently stop exercising full saturation if
+/// this constant changed.
+pub const DEFAULT_POOL_MAX_CONNECTIONS: u32 = 5;
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Dedicated pool for `pg_cancel_backend(pid)` writes. Must stay separate
+/// from the main pool — if `CancelOnDrop::drop` fired through the main
+/// pool, its `execute` would queue on `acquire()` behind the very
+/// connections the cancels are trying to free (five hung queries + five
+/// drops with `max_connections = 5` deadlocks every cancel until
+/// `statement_timeout` expires). Sized to 2 so a burst of concurrent
+/// disconnects gets two round-trips in parallel; cancels are single-round
+/// and cheap, no need for more.
+const CANCEL_POOL_MAX_CONNECTIONS: u32 = 2;
 
 /// Per-`(server, database)` Postgres adapter. Wraps a `PgPool`; one instance
 /// per logical DB so a slow query on DB A can never block DB B.
 pub struct PgAdapter {
     pool: PgPool,
+    /// Dedicated pool for `pg_cancel_backend(pid)`. Never shares connections
+    /// with `pool` — see [`CANCEL_POOL_MAX_CONNECTIONS`] for the reason.
+    cancel_pool: PgPool,
     /// Composite label for metrics tagging — bounded cardinality, supplied
     /// from YAML config rather than user input.
     db_label: String,
@@ -60,8 +76,16 @@ impl PgAdapter {
     pub async fn open(server: &Server, database: &Database) -> Result<Self, ExecError> {
         let password = resolve_password(&database.password)?;
         let opts = build_connect_options(server, database, &password);
+        // Same DSN for both pools — the cancel pool is a Postgres client like
+        // any other, it just never runs anything but `pg_cancel_backend(...)`.
         let pool = PgPoolOptions::new()
             .max_connections(DEFAULT_POOL_MAX_CONNECTIONS)
+            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+            .connect_with(opts.clone())
+            .await
+            .map_err(|_| ExecError::Connection)?;
+        let cancel_pool = PgPoolOptions::new()
+            .max_connections(CANCEL_POOL_MAX_CONNECTIONS)
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
             .connect_with(opts)
             .await
@@ -71,10 +95,19 @@ impl PgAdapter {
         // Single label `db = "<server>/<database>"` — bounded cardinality.
         // Live connection count would need a polling task; reporting the
         // configured max is the cheap first signal for "pool exists for this
-        // db".
-        gauge!("pool_size", "db" => db_label.clone()).set(DEFAULT_POOL_MAX_CONNECTIONS as f64);
+        // db". A separate `pool_kind` label distinguishes the query pool from
+        // the cancel pool so operator dashboards see both without stat name
+        // proliferation.
+        gauge!("pool_size", "db" => db_label.clone(), "pool_kind" => "query")
+            .set(DEFAULT_POOL_MAX_CONNECTIONS as f64);
+        gauge!("pool_size", "db" => db_label.clone(), "pool_kind" => "cancel")
+            .set(CANCEL_POOL_MAX_CONNECTIONS as f64);
 
-        Ok(Self { pool, db_label })
+        Ok(Self {
+            pool,
+            cancel_pool,
+            db_label,
+        })
     }
 }
 
@@ -94,7 +127,12 @@ impl DbAdapter for PgAdapter {
         // Belt-and-suspenders: a Tokio-side deadline so even a misapplied
         // SET LOCAL (or a DB that ignores it) still bounds the call.
         let budget = Duration::from_millis(u64::from(effective_ms) + TOKIO_TIMEOUT_SLACK_MS);
-        match tokio::time::timeout(budget, run_query_inner(&self.pool, &query)).await {
+        match tokio::time::timeout(
+            budget,
+            run_query_inner(&self.pool, &self.cancel_pool, &query),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_elapsed) => Err(ExecError::Timeout),
         }
@@ -182,14 +220,17 @@ pub(super) fn resolve_password(password: &Password) -> Result<SecretString, Exec
 /// backend — it only closes the client socket. The backend keeps executing
 /// until it finishes or hits `statement_timeout`, pinning a pool connection
 /// for up to the full timeout after the client is gone. So we capture the
-/// backend PID up front and, on drop, cancel it over a *separate* pooled
-/// connection (the original is mid-query and can't issue the cancel).
+/// backend PID up front and, on drop, cancel it over the **cancel pool** —
+/// a pool that is deliberately separate from the query pool. Using the
+/// query pool would have `execute` queue on `acquire()` behind the very
+/// connections the cancels are trying to free (see
+/// [`CANCEL_POOL_MAX_CONNECTIONS`]).
 ///
 /// Disarmed on the normal path once the query has run to completion, so a
 /// cleanly-returned connection is never targeted — otherwise a late cancel
 /// could hit an unrelated query that reused the same backend PID.
 struct CancelOnDrop {
-    /// `Some` while armed: a pool handle (to open the cancel connection) and
+    /// `Some` while armed: the cancel pool (never the main query pool) and
     /// the backend PID to cancel.
     armed: Option<(PgPool, i32)>,
 }
@@ -222,19 +263,26 @@ impl Drop for CancelOnDrop {
     }
 }
 
-async fn run_query_inner(pool: &PgPool, query: &ExecQuery<'_>) -> Result<ExecResult, ExecError> {
+async fn run_query_inner(
+    pool: &PgPool,
+    cancel_pool: &PgPool,
+    query: &ExecQuery<'_>,
+) -> Result<ExecResult, ExecError> {
     let started = Instant::now();
     let mut tx = pool.begin().await.map_err(|_| ExecError::Unavailable)?;
 
     // Capture this connection's backend PID so a drop (agent disconnect) can
     // cancel the exact backend running our query — dropping `tx` alone won't
-    // stop it. Armed now and disarmed only after a clean commit below.
+    // stop it. Armed now and disarmed only after a clean commit below. The
+    // guard holds the *cancel* pool so `pg_cancel_backend` can always
+    // acquire, even when every connection in the query pool is pinned by
+    // stuck backends.
     let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *tx)
         .await
         .map_err(classify)?;
     let mut cancel = CancelOnDrop {
-        armed: Some((pool.clone(), pid)),
+        armed: Some((cancel_pool.clone(), pid)),
     };
 
     // Run the statement under the guard. By the time this block resolves — Ok

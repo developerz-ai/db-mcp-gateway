@@ -35,7 +35,7 @@ use std::time::Duration;
 use db_mcp_gateway::audit;
 use db_mcp_gateway::auth::{Identity, SessionId};
 use db_mcp_gateway::config::{Database, Password, Server, ServerKind, Tls};
-use db_mcp_gateway::exec::{DbAdapter, ExecQuery, PgAdapter};
+use db_mcp_gateway::exec::{DEFAULT_POOL_MAX_CONNECTIONS, DbAdapter, ExecQuery, PgAdapter};
 use db_mcp_gateway::state;
 use db_mcp_gateway::tools::audit_dispatch::{AuditHeader, Outcome, RequestContext, audit_dispatch};
 use db_mcp_gateway::transport::jsonrpc::Response;
@@ -326,4 +326,113 @@ async fn cancelled_dispatch_cancels_pg_backend_and_writes_audit_row() {
         .execute(&state_pool)
         .await
         .expect("cleanup");
+}
+
+/// Regression for the "cancel through the pool the stuck queries are pinning"
+/// bug (#136). With the fix, `CancelOnDrop` fires on a dedicated cancel pool,
+/// so a fully-pinned query pool does NOT block the cancels. This test spawns
+/// enough hung queries to saturate the query pool, aborts them all at once,
+/// and asserts every backend transitions out of `active` well before
+/// `statement_timeout` could plausibly end them.
+///
+/// Under the pre-fix code, all N cancel spawns would `pool.acquire()` on the
+/// query pool — the exact pool whose N slots are held by the N stuck
+/// backends the cancels are trying to free. Each `acquire()` would wait for
+/// a slot that only opens when its own target's `statement_timeout` fires.
+///
+/// Uses `pg_sleep(33)` — distinct from 31/32 above — to avoid cross-test
+/// pg_stat_activity contamination when the file's tests run in parallel.
+#[tokio::test]
+async fn concurrent_aborts_do_not_queue_on_query_pool() {
+    let monitor = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&target_db_url())
+        .await
+        .expect("monitor connection to target DB (run `bin/dev up`)");
+
+    let adapter = Arc::new(
+        PgAdapter::open(&test_server(), &test_database())
+            .await
+            .expect("PgAdapter open"),
+    );
+
+    // Saturate the query pool so every slot is held by a pg_sleep. If cancels
+    // queued on this pool (the bug), none would run until statement_timeout
+    // expired. Tied to `DEFAULT_POOL_MAX_CONNECTIONS` so resizing the pool
+    // can't silently leave this test under-saturated.
+    const HUNG_QUERIES: usize = DEFAULT_POOL_MAX_CONNECTIONS as usize;
+    let mut tasks = Vec::with_capacity(HUNG_QUERIES);
+    for _ in 0..HUNG_QUERIES {
+        let adapter_task = adapter.clone();
+        tasks.push(tokio::spawn(async move {
+            adapter_task
+                .execute(ExecQuery {
+                    sql: "SELECT pg_sleep(33)",
+                    binds: &[],
+                    statement_timeout_ms: Some(30_000),
+                    row_limit: 1,
+                })
+                .await
+        }));
+    }
+
+    // Wait until all N backends are visible as `active` — the test premise
+    // is that the pool is FULLY pinned before we drop.
+    let mut pids: Vec<i32> = Vec::new();
+    for _ in 0..40 {
+        pids = sqlx::query_scalar(
+            "SELECT pid FROM pg_stat_activity \
+             WHERE query = 'SELECT pg_sleep(33)' \
+             AND state = 'active' \
+             AND pid != pg_backend_pid()",
+        )
+        .fetch_all(&monitor)
+        .await
+        .expect("pg_stat_activity lookup");
+        if pids.len() >= HUNG_QUERIES {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        pids.len(),
+        HUNG_QUERIES,
+        "expected {HUNG_QUERIES} pg_sleep(33) backends visible, saw {}: \
+         did the query pool saturate? (run `bin/dev up`)",
+        pids.len(),
+    );
+
+    // Abort every task simultaneously. Under the fix, each `CancelOnDrop` spawns
+    // a cancel on the *cancel* pool; under the bug, each would queue on the
+    // saturated query pool.
+    for t in &tasks {
+        t.abort();
+    }
+
+    // With the fix, cancels run within a couple of tokio ticks. 1500ms is
+    // generous for five parallel cancels over a size-2 cancel pool (two
+    // concurrent + serialised remainder — still well below statement_timeout).
+    // Under the bug, this budget expires long before any cancel lands and
+    // every pid is still `active`.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let still_active: Vec<i32> = sqlx::query_scalar(
+        "SELECT pid FROM pg_stat_activity \
+         WHERE pid = ANY($1) AND state = 'active'",
+    )
+    .bind(&pids)
+    .fetch_all(&monitor)
+    .await
+    .expect("pg_stat_activity follow-up");
+
+    assert!(
+        still_active.is_empty(),
+        "{}/{} backends still active {}ms after abort — cancels are queueing \
+         on the query pool (bug), or the cancel pool is undersized. \
+         active pids: {:?}",
+        still_active.len(),
+        HUNG_QUERIES,
+        1500,
+        still_active,
+    );
 }
