@@ -172,12 +172,21 @@ The grants handlers validate at the API layer **before** the DB CHECKs would cat
 
 The resolver caches `(user, server, db) → grants` per session. Admin API writes publish a tiny invalidation event over an in-process channel; the next tool call recomputes. No restart needed. Cache TTL is also short (default 60s) so a missed invalidation self-heals.
 
-Implementation notes the handler honors:
+Every admin surface that can change a grant's meaning invalidates on a successful commit — not just `/admin/v1/grants`:
+
+| Surface | Scope | Why |
+|---|---|---|
+| `/admin/v1/grants` (POST/PATCH/DELETE) | Per-user (`PermissionsCache::spawn_invalidate`) | A grant only ever affects the one user it targets. |
+| `/admin/v1/users` (PATCH/DELETE) | Per-user, keyed on the mutated row's `user_sub` | A group change flips constraint-merge results; a soft-delete must stop landing decisions for the deleted principal immediately, not after TTL. `create` skips invalidation — a fresh row has no existing cache entry. |
+| `/admin/v1/databases` (POST/PATCH/DELETE) | Full flush (`PermissionsCache::spawn_invalidate_all`) | A `permissions_databases` row change can shift what a `(server, db_name)` wildcard grant resolves to for *any* user — narrower per-user invalidation is not sufficient. |
+
+Implementation notes every handler honors:
 
 | Rule | Behavior |
 |---|---|
 | Post-commit, fire-and-forget | Hook fires **after** the data + audit tx commits. Pre-commit lets a concurrent reader re-warm with the still-stale grant; post-commit guarantees the next re-warm sees the new state. |
-| `user_sub`-keyed | Cache key is the SSO subject; grants reference users by row id. Handler resolves `user_sub` through the same tx (lookup sees the same DB state the audit row records), then passes it to `PermissionsCache::invalidate`. |
+| Detached from the request | `spawn_invalidate` / `spawn_invalidate_all` run the invalidation on a `tokio::spawn`ed task, not awaited inline on the request future. A client disconnect between the tx commit and the invalidate call must not leave a stale entry live until TTL — the detached task owns its inputs and runs to completion regardless of what happens to the request. |
+| `user_sub`-keyed (user/grant paths) | Cache key is the SSO subject; grants reference users by row id. Handler resolves `user_sub` through the same tx (lookup sees the same DB state the audit row records) before spawning the invalidation. |
 | YAML-only installs | No state DB → resolver cache absent → invalidation is a no-op. TTL is the safety net. |
 
 ## Wildcard grants
