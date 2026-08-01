@@ -114,9 +114,16 @@ pub async fn dispatch_call(
     // Field names are the log contract documented in
     // docs/deployment/logging.md (issue #14): `user_sub`, `db` — Alloy/Loki
     // parsers key off these directly. Renaming silently breaks consumers.
+    //
+    // `request_id` is `request_ctx.request_id` (gateway-minted), NOT the
+    // client's JSON-RPC `id` — that value is caller-controlled (arbitrary
+    // JSON, unbounded length, no uniqueness guarantee) and is only ever
+    // echoed back in the response envelope. Using the gateway UUID here
+    // keeps this span's `request_id` and the eventual `audit_calls.request_id`
+    // the same value, so a log line and its audit row always correlate.
     let span = info_span!(
         "tool_dispatch",
-        request_id = %id,
+        request_id = %request_ctx.request_id,
         user_sub = %identity.user_sub,
         tool = %call.name,
         server = span_server,

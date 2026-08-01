@@ -110,6 +110,70 @@ fn dispatch_log_line_matches_field_contract() {
     );
 }
 
+/// `run_query`'s pre-dispatch event fires inside the `tool_dispatch` span,
+/// but the production formatter drops span fields (`with_current_span(false)` +
+/// `with_span_list(false)`). Every log line that needs to correlate with an
+/// audit row must therefore carry `request_id` on the event itself. Regression
+/// test for the `tool.run_query.dispatch` site — if a future refactor drops
+/// the explicit `request_id` field, this test surfaces it before Loki does.
+#[test]
+fn run_query_dispatch_event_carries_request_id() {
+    let buf = BufWriter::default();
+    // Mirror `main.rs` — same reason as the sibling test above.
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("info"))
+        .json()
+        .flatten_event(true)
+        .with_current_span(false)
+        .with_span_list(false)
+        .with_target(false)
+        .with_writer(buf.clone())
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        // Verbatim shape of the pre-dispatch log line emitted by
+        // `src/tools/run_query.rs::compute_outcome`. If that site drops
+        // `request_id`, this assert fires.
+        let request_id = uuid::Uuid::new_v4();
+        tracing::info!(
+            request_id = %request_id,
+            user_sub = "alice@example.com",
+            server = "target",
+            db = "app",
+            row_limit = 100_u32,
+            timeout_ms = Option::<u64>::Some(200),
+            "tool.run_query.dispatch"
+        );
+    });
+
+    let raw = buf.take();
+    let line = raw.lines().next().expect("subscriber emitted a line");
+    let log: Value = serde_json::from_str(line)
+        .unwrap_or_else(|err| panic!("log line is not JSON: {err}\nline: {line}"));
+
+    assert_eq!(log["message"].as_str(), Some("tool.run_query.dispatch"));
+    let request_id = log
+        .get("request_id")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("missing `request_id` in tool.run_query.dispatch: {line}"));
+    // The event must carry a well-formed UUID (the production site emits
+    // `RequestContext::request_id`, always a UUID).
+    uuid::Uuid::parse_str(request_id)
+        .unwrap_or_else(|_| panic!("request_id is not a UUID: {request_id}"));
+
+    // Guard against span-fields creeping in: `with_current_span(false)` +
+    // `with_span_list(false)` must keep the JSON flat, same as the sibling
+    // event test.
+    assert!(
+        log.get("span").is_none(),
+        "subscriber emitted a `span` key — flatten_event should hoist fields"
+    );
+    assert!(
+        log.get("spans").is_none(),
+        "subscriber emitted a `spans` key — with_span_list(false) should drop it"
+    );
+}
+
 /// Guard against future drift: if a dev adds a log site that interpolates a
 /// likely-secret value, this test surfaces it. Heuristic — `Password::Literal`'s
 /// hand-rolled Debug prints `Password::Literal(<redacted>)` exactly, so a

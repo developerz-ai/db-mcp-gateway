@@ -93,7 +93,15 @@ pub async fn run(
             return audit_dispatch(id, identity, state_db, request_ctx, header, work).await;
         }
     };
-    let work = compute_outcome(id.clone(), identity, config, registry, &db_grants, &args);
+    let work = compute_outcome(
+        id.clone(),
+        identity,
+        config,
+        registry,
+        &db_grants,
+        request_ctx,
+        &args,
+    );
     audit_dispatch(id, identity, state_db, request_ctx, header, work).await
 }
 
@@ -103,6 +111,7 @@ async fn compute_outcome(
     config: &ConfigFile,
     registry: &AdapterRegistry,
     db_grants: &[Grant],
+    request_ctx: &RequestContext,
     args: &Arguments,
 ) -> Outcome {
     let Some((server, database)) = find_server_db(config, &args.server, &args.database) else {
@@ -179,8 +188,14 @@ async fn compute_outcome(
     let row_limit = effective_row_limit(args.limit, constraints.row_limit);
     let timeout_ms = constraints.statement_timeout_ms;
 
+    // Emit `request_id` explicitly. The production formatter (main.rs) sets
+    // `with_current_span(false)` + `with_span_list(false)`, so span fields
+    // from the enclosing `tool_dispatch` span never render — every event
+    // that needs to correlate with a Loki log line or audit row has to
+    // carry `request_id` on itself. The chokepoint's "tool dispatched"
+    // line does; so must this one.
     tracing::info!(
-        request_id = %id,
+        request_id = %request_ctx.request_id,
         user_sub = %identity.user_sub,
         server = %server.name,
         db = %database.name,

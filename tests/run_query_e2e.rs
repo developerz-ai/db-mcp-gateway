@@ -685,6 +685,84 @@ async fn run_query_cache_backed_db_grant() {
         .expect("cleanup user");
 }
 
+/// HTTP-boundary regression for #136: a hostile client-controlled JSON-RPC id
+/// (embedded quotes, arbitrary shape) must round-trip verbatim in the response
+/// envelope, but MUST NOT reach `audit_calls.request_id` — the audit row's
+/// `request_id` is a gateway-minted UUID unrelated to whatever the client sent.
+///
+/// The unit-level check in `tests/audit_dispatch_cancellation_real_db.rs`
+/// exercises `audit_dispatch` directly; this test drives the whole transport
+/// stack (`/mcp` POST → transport → `dispatch_call` → `run_query` →
+/// `audit_dispatch` → audit row) to pin the contract end-to-end.
+#[tokio::test]
+async fn run_query_preserves_client_id_but_audit_row_carries_gateway_uuid() {
+    let booted = boot_gateway().await;
+    let (url, bearer, pool, sub) = (
+        booted.url.as_str(),
+        booted.bearer.as_str(),
+        &booted.state_db,
+        booted.user_sub.as_str(),
+    );
+
+    // Deliberately hostile client id: a string with embedded quotes — exactly
+    // the shape that used to leak into `audit_calls.request_id` via
+    // `id.to_string()` before #136.
+    let hostile_client_id = r#"weird"client"id"#;
+    let resp: Value = client()
+        .post(format!("{url}/mcp"))
+        .bearer_auth(bearer)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": hostile_client_id,
+            "method": "tools/call",
+            "params": {
+                "name": "run_query",
+                "arguments": {
+                    "server": "target",
+                    "database": "app",
+                    "sql": "SELECT 1::int8 AS n",
+                },
+            },
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // JSON-RPC envelope must echo the caller's id verbatim — response
+    // correlation is the client's job, and we never touch their id.
+    assert_eq!(
+        resp["id"], hostile_client_id,
+        "response envelope did not echo client id: {resp}"
+    );
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+
+    // Audit row's `request_id` must be a gateway-minted UUID, NOT derived
+    // from the hostile client id.
+    let row = db_mcp_gateway::audit::latest_for_user_tool(pool, sub, "run_query")
+        .await
+        .expect("audit lookup query runs")
+        .expect("audit row exists for the request");
+    assert_eq!(row.outcome, "success");
+    uuid::Uuid::parse_str(&row.request_id).unwrap_or_else(|_| {
+        panic!(
+            "audit request_id must be a well-formed UUID, got {:?}",
+            row.request_id
+        )
+    });
+    assert!(
+        !row.request_id.contains('"'),
+        "audit request_id must never carry the client id's quoting, got {:?}",
+        row.request_id
+    );
+    assert_ne!(
+        row.request_id, hostile_client_id,
+        "audit request_id must not be derived from the client's JSON-RPC id"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Concurrency cap tests — 429 (per-identity) and 503 (global)
 //

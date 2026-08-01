@@ -2,6 +2,8 @@
 
 use std::net::{IpAddr, SocketAddr};
 
+use uuid::Uuid;
+
 use crate::transport::jsonrpc::Response;
 
 /// Result of a tool's compute step. Carries the response to send back AND
@@ -49,15 +51,30 @@ pub struct AuditHeader<'a> {
 pub struct RequestContext {
     pub ip: Option<IpAddr>,
     pub agent_client: Option<String>,
+    /// Gateway-minted correlation id for this dispatch — NOT the client's
+    /// JSON-RPC `id`. That value is caller-controlled (arbitrary JSON: a
+    /// number, a string with embedded quotes, unbounded length, or the same
+    /// value reused across every call a buggy/malicious client makes) and is
+    /// only ever echoed back in the JSON-RPC response envelope, never
+    /// persisted. `request_id` is what both the `tool_dispatch` tracing span
+    /// and `audit_calls.request_id` use, so a log line and its audit row
+    /// always correlate through one canonical, well-formed value. Defaults
+    /// to the nil UUID via `#[derive(Default)]` — fine for tests that don't
+    /// care about it; every production request goes through
+    /// [`Self::from_request`], which always mints a fresh one.
+    pub request_id: Uuid,
 }
 
 impl RequestContext {
     /// Build from an axum `ConnectInfo<SocketAddr>` + an optional User-Agent
-    /// header. Both are best-effort; missing values just stay `None`.
+    /// header. Both are best-effort; missing values just stay `None`. Mints
+    /// a fresh `request_id` — see the field doc for why this, not the
+    /// client's JSON-RPC id, is the correlation value.
     pub fn from_request(addr: Option<SocketAddr>, user_agent: Option<&str>) -> Self {
         Self {
             ip: addr.map(|a| a.ip()),
             agent_client: user_agent.map(str::to_string),
+            request_id: Uuid::new_v4(),
         }
     }
 }
