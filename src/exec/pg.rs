@@ -324,10 +324,40 @@ async fn run_query_inner(
                 }
                 rows.push(decode_row(&row));
             }
-            // Stream is dropped here so the borrow on `tx` ends and we can commit.
+            // Stream is dropped here so the borrow on `tx` ends.
         }
 
-        tx.commit().await.map_err(classify)?;
+        if truncated {
+            // sqlx always issues the portal `Execute` with `limit: 0` (no
+            // server-side row cap — see sqlx's own comment on that call site
+            // about parallel-worker pessimization from a nonzero limit), so
+            // breaking out of the loop above does NOT stop Postgres from
+            // generating and queueing the rest of the result set. The
+            // connection cannot accept a new command — `COMMIT` included —
+            // until that queued traffic is fully read: `wait_until_ready`
+            // drains it silently on the very next `.await` on this
+            // connection. That defeats the row cap on exactly the queries
+            // where it matters: a query big enough to need truncating is a
+            // query where draining "the rest" is the expensive part.
+            //
+            // Cancel the backend instead — the same mechanism `CancelOnDrop`
+            // uses for a client disconnect, just invoked inline. Postgres
+            // checks for a pending cancel between row-generation steps, so
+            // the backend aborts server-side in short order rather than
+            // continuing to produce rows nobody asked for.
+            let _ = sqlx::query("SELECT pg_cancel_backend($1)")
+                .bind(pid)
+                .execute(cancel_pool)
+                .await;
+            // The backend is now in an aborted-transaction state — only
+            // ROLLBACK is valid on it, and this is a read-only query with
+            // nothing to lose by discarding the transaction. Errors here are
+            // expected and ignored: the truncated rows already collected are
+            // the result regardless of how the rollback itself resolves.
+            let _ = tx.rollback().await;
+        } else {
+            tx.commit().await.map_err(classify)?;
+        }
 
         Ok(ExecResult {
             columns,

@@ -93,6 +93,45 @@ async fn row_limit_truncates_and_flags() {
     assert!(result.truncated, "expected truncated=true beyond row_limit");
 }
 
+/// Regression for the #136 audit finding "row cap doesn't bound work":
+/// sqlx always issues the portal `Execute` with `limit: 0` (no server-side
+/// row cap), so breaking the Rust-side read loop early does NOT stop
+/// Postgres from generating and queueing the rest of the result. Without an
+/// active cancel on truncation, the next `.await` on that connection
+/// (`COMMIT`) silently drains every remaining row before it can proceed —
+/// on exactly the query shape a row cap exists to protect against.
+///
+/// `pg_sleep(0.01)` per row makes the *drain* cost measurable: 300 rows at
+/// 10ms each is 3s if fully drained, but `row_limit: 5` should only ever
+/// pay for the first handful of rows plus cancel latency. Bounded well
+/// under the full-drain time proves the cap actually bounds server-side
+/// work, not just the client-visible row count.
+#[tokio::test]
+async fn truncated_query_cancels_instead_of_draining_the_rest() {
+    let a = adapter().await;
+    let started = Instant::now();
+    let result = a
+        .execute(query(
+            "SELECT generate_series(1, 100000000)::int8 AS n",
+            Some(30_000),
+            5,
+        ))
+        .await
+        .expect("truncated query still succeeds, not times out");
+    let elapsed = started.elapsed();
+
+    assert_eq!(result.rows.len(), 5);
+    assert!(result.truncated);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "truncated query took {elapsed:?} — a 100M-row `generate_series` \
+         streams cheaply-produced rows continuously, so postgres queues far \
+         more than the row cap wants; if the connection has to drain that \
+         instead of cancelling the backend, this takes several seconds. \
+         Row cap did not bound server-side work (cancel-on-truncate regression)"
+    );
+}
+
 /// The headline #4 acceptance: a query exceeding `statement_timeout_ms` is
 /// killed at the DB and surfaces as the typed `ExecError::Timeout` — not a
 /// raw sqlx error and never the underlying SQLSTATE string.
