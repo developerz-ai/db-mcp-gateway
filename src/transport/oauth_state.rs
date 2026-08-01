@@ -144,7 +144,20 @@ impl PendingFlows {
         bridge: Option<OAuthBridge>,
     ) -> Result<(), StoreError> {
         let mut map = self.inner.lock().await;
-        // Check size before inserting; reject if full.
+        // Reclaim expired flows before rejecting at cap. The periodic sweep
+        // (`spawn_oauth_state_gc`, every 30s) only reaps entries that have
+        // crossed `FLOW_TTL` (15 min) — it does nothing against a sustained
+        // `/authorize` flood that keeps the map packed with *fresh* junk
+        // faster than entries naturally expire. This is unauthenticated
+        // (pre-login) traffic, so map.len() at cap is not evidence the
+        // gateway is actually busy — it may just mean the sweep hasn't run
+        // since the last burst. Trying a GC right here costs one map scan
+        // only on the (rare) at-cap path, and immediately frees room for
+        // real logins sitting behind a burst that's already aged out.
+        if map.len() >= PENDING_FLOWS_MAX_SIZE {
+            let now = Instant::now();
+            map.retain(|_, flow| flow.expires_at > now);
+        }
         if map.len() >= PENDING_FLOWS_MAX_SIZE {
             return Err(StoreError::StoreFull);
         }
@@ -183,6 +196,25 @@ impl PendingFlows {
         let mut map = self.inner.lock().await;
         let now = Instant::now();
         map.retain(|_, flow| flow.expires_at > now);
+    }
+}
+
+#[cfg(test)]
+impl PendingFlows {
+    /// Test-only: insert a flow with an explicit expiry, bypassing the real
+    /// `FLOW_TTL` (15 min) so tests can manufacture already-expired entries
+    /// without sleeping for one.
+    async fn insert_with_expiry(&self, state: String, expires_at: Instant) {
+        let mut map = self.inner.lock().await;
+        map.insert(
+            state,
+            PendingFlow {
+                nonce: "nonce".into(),
+                idp_verifier: "verifier".into(),
+                bridge: None,
+                expires_at,
+            },
+        );
     }
 }
 
@@ -233,7 +265,15 @@ impl AuthCodes {
         client_id: String,
     ) -> Result<(), StoreError> {
         let mut map = self.inner.lock().await;
-        // Check size before inserting; reject if full.
+        // Same opportunistic-GC-before-reject as `PendingFlows::insert_flow`
+        // — reclaim already-expired codes before giving up, so a burst that
+        // filled the map with codes that have since redeemed-or-expired
+        // doesn't wedge new logins for the rest of the periodic sweep
+        // interval.
+        if map.len() >= AUTH_CODES_MAX_SIZE {
+            let now = Instant::now();
+            map.retain(|_, ac| ac.expires_at > now);
+        }
         if map.len() >= AUTH_CODES_MAX_SIZE {
             return Err(StoreError::StoreFull);
         }
@@ -273,6 +313,30 @@ impl AuthCodes {
         let mut map = self.inner.lock().await;
         let now = Instant::now();
         map.retain(|_, code| code.expires_at > now);
+    }
+}
+
+#[cfg(test)]
+impl AuthCodes {
+    /// Test-only: insert a code with an explicit expiry, bypassing the real
+    /// `CODE_TTL` (60s) so tests can manufacture already-expired entries
+    /// without sleeping for one.
+    async fn insert_with_expiry(&self, code: &str, expires_at: Instant) {
+        let mut map = self.inner.lock().await;
+        map.insert(
+            hash_secret(code),
+            AuthCode {
+                identity: GrantIdentity {
+                    sub: "test".into(),
+                    email: "test@example.com".into(),
+                    groups: vec![],
+                },
+                code_challenge: "challenge".into(),
+                redirect_uri: "https://app/cb".into(),
+                client_id: "client".into(),
+                expires_at,
+            },
+        );
     }
 }
 
@@ -870,6 +934,54 @@ mod tests {
         assert_eq!(result, Err(StoreError::StoreFull));
     }
 
+    /// Regression for the #136 audit finding "/authorize flood wedges all
+    /// logins ... cap hit without GC'ing expired flows first". Filling the
+    /// map with entries that have ALREADY expired (simulating a burst that
+    /// aged out before the periodic 30s sweep ran) must not permanently
+    /// block a real login — `insert_flow`'s opportunistic GC-on-full must
+    /// reclaim the room inline, without waiting for `gc_expired` to be
+    /// called externally.
+    #[tokio::test]
+    async fn pending_flows_opportunistic_gc_reclaims_room_at_cap() {
+        let store = PendingFlows::default();
+        let already_expired = Instant::now() - Duration::from_secs(1);
+        for i in 0..PENDING_FLOWS_MAX_SIZE {
+            store
+                .insert_with_expiry(format!("expired-{i}"), already_expired)
+                .await;
+        }
+
+        let result = store
+            .insert("real-login".into(), "nonce".into(), "verifier".into())
+            .await;
+        assert!(
+            result.is_ok(),
+            "opportunistic GC must free room for a legitimate login at cap"
+        );
+        assert!(store.take("real-login").await.is_some());
+    }
+
+    /// A map genuinely full of LIVE (non-expired) flows must still reject —
+    /// the opportunistic GC only reclaims what's actually stale; it must not
+    /// evict live entries just to make room.
+    #[tokio::test]
+    async fn pending_flows_opportunistic_gc_does_not_evict_live_entries() {
+        let store = PendingFlows::default();
+        for i in 0..PENDING_FLOWS_MAX_SIZE {
+            store
+                .insert(format!("live-{i}"), "nonce".into(), "verifier".into())
+                .await
+                .unwrap();
+        }
+
+        let result = store
+            .insert("overflow".into(), "nonce".into(), "verifier".into())
+            .await;
+        assert_eq!(result, Err(StoreError::StoreFull));
+        // All the original live flows must still be there.
+        assert!(store.take("live-0").await.is_some());
+    }
+
     #[tokio::test]
     async fn auth_codes_rejects_when_full() {
         let store = AuthCodes::default();
@@ -899,6 +1011,33 @@ mod tests {
             )
             .await;
         assert_eq!(result, Err(StoreError::StoreFull));
+    }
+
+    /// Same opportunistic-GC regression as `PendingFlows`, for `AuthCodes`.
+    #[tokio::test]
+    async fn auth_codes_opportunistic_gc_reclaims_room_at_cap() {
+        let store = AuthCodes::default();
+        let already_expired = Instant::now() - Duration::from_secs(1);
+        for i in 0..AUTH_CODES_MAX_SIZE {
+            store
+                .insert_with_expiry(&format!("expired-{i}"), already_expired)
+                .await;
+        }
+
+        let result = store
+            .insert(
+                "real-code",
+                identity(),
+                "challenge".into(),
+                "uri".into(),
+                "client".into(),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "opportunistic GC must free room for a real code at cap"
+        );
+        assert!(store.take("real-code").await.is_some());
     }
 
     #[tokio::test]

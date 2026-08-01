@@ -67,7 +67,10 @@ pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError
     let gated = Router::new()
         .route(&path, post(post_handler))
         .route("/auth/logout", post(auth_routes::logout))
-        .route_layer(middleware::from_fn_with_state(limiter, limit::enforce))
+        .route_layer(middleware::from_fn_with_state(
+            limiter.clone(),
+            limit::enforce,
+        ))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware::bearer_auth,
@@ -78,13 +81,12 @@ pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError
     // `mcp_path`-suffixed well-known (e.g. `/.well-known/oauth-protected-resource/mcp`).
     let prm_suffixed = format!("/.well-known/oauth-protected-resource{path}");
 
-    let open = Router::new()
+    // Genuinely open: k8s probes + Prometheus scraper (unauthenticated by
+    // design — no bearer to check) and OAuth/OIDC discovery metadata (public
+    // by spec, read-only, cheap to serve). Deliberately NOT concurrency-limited
+    // — probes are trusted infra traffic and discovery documents are static.
+    let probes_and_metadata = Router::new()
         .route(&path, get(sse::handler))
-        .route("/auth/login", post(auth_routes::login))
-        .route("/auth/callback", get(auth_routes::callback))
-        // MCP OAuth bridge (RFC 9728 / 8414 / 7591 + PKCE). These let
-        // spec-compliant clients (Claude Code, …) discover + complete OAuth
-        // with no manual credential wiring. See `transport::oauth`.
         .route(
             "/.well-known/oauth-protected-resource",
             get(oauth::protected_resource_metadata),
@@ -99,20 +101,39 @@ pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError
             "/.well-known/openid-configuration",
             get(oauth::authorization_server_metadata),
         )
+        .route("/healthz", get(probes::healthz))
+        .route("/readyz", get(probes::readyz))
+        .route("/metrics", get(probes::metrics));
+
+    // Open (no bearer — that's the point, these run BEFORE a session exists)
+    // but still concurrency-limited: each of these writes into an in-memory,
+    // size-capped store (`PendingFlows`, `AuthCodes`) or does IdP/DB work, so
+    // an unauthenticated flood must be bounded the same way authenticated
+    // traffic is (#136 audit: "/authorize flood wedges all logins" — this
+    // router previously skipped `limit::enforce` entirely). Global cap only
+    // in practice: `limit::enforce` degrades to global-only when no
+    // `Identity` extension is present, which is always true here.
+    let oauth_flow = Router::new()
+        .route("/auth/login", post(auth_routes::login))
+        .route("/auth/callback", get(auth_routes::callback))
+        // MCP OAuth bridge (RFC 9728 / 8414 / 7591 + PKCE). These let
+        // spec-compliant clients (Claude Code, …) discover + complete OAuth
+        // with no manual credential wiring. See `transport::oauth`.
         .route("/authorize", get(oauth::authorize))
         .route("/token", post(oauth::token))
         // RFC 7009 token revocation. Unauthenticated like /token — the presented
         // token is itself the credential; you can only revoke one you hold.
         .route("/revoke", post(oauth::revoke))
         .route("/register", post(oauth::register))
-        // Ops endpoints: k8s probes + Prometheus scraper. Unauthenticated by
-        // design — probes don't carry a bearer, and exposed bodies are
-        // generic strings + Prometheus exposition only (no DB internals).
-        .route("/healthz", get(probes::healthz))
-        .route("/readyz", get(probes::readyz))
-        .route("/metrics", get(probes::metrics));
+        .route_layer(middleware::from_fn_with_state(
+            limiter.clone(),
+            limit::enforce,
+        ));
 
-    let mut router = open.merge(gated).with_state(state.clone());
+    let mut router = probes_and_metadata
+        .merge(oauth_flow)
+        .merge(gated)
+        .with_state(state.clone());
 
     // Spec 12: when `admin.enabled` is false (or absent), the entire `/admin/*`
     // surface stays unmounted — a request to it returns axum's default 404.

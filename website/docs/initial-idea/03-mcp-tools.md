@@ -81,6 +81,8 @@ Two independent concurrency caps protect the query path:
 
 Both caps are checked on the bearer-gated router *after* authentication. A per-identity permit is held for the full lifetime of the request. The global cap is checked first to keep the per-identity map lookup cheap on a saturated gateway.
 
+The **global** cap also fronts the unauthenticated OAuth flow routes — `POST /auth/login`, `GET /auth/callback`, `GET /authorize`, `POST /token`, `POST /revoke`, `POST /register` — because each writes into a size-capped in-memory store (`PendingFlows`, `AuthCodes`) or drives IdP/DB work, so an unauthenticated flood must be bounded the same way authenticated traffic is. When the cap is exhausted these routes return `503` `service_overloaded` with `Retry-After: 1`, identical to the bearer-gated path. The per-identity cap does not apply here (no `Identity` extension exists pre-session). The configured MCP SSE endpoint (`GET` on `mcp_path`), discovery metadata, `/healthz`, `/readyz`, and `/metrics` are deliberately *not* gated — probes are trusted infra traffic and discovery documents are static.
+
 The 30 s statement-timeout ceiling (see `run_query` above) is the complementary per-query bound: it limits how long one request can hold its permits.
 
 ## What we don't expose
