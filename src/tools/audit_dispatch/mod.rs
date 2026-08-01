@@ -72,6 +72,34 @@ impl CancelledAuditGuard {
         self.row = None;
         self.state_db = None;
     }
+
+    /// Record the tool's actual outcome on the pre-built row. Called after
+    /// `work.await` completes so the guard's fallback write — fired if the
+    /// dispatch future is dropped or the primary `audit::log` fails — carries
+    /// the real outcome rather than the placeholder `"cancelled"` that
+    /// `finalize_dropped_row` falls back to when the outcome was never set.
+    fn record_outcome(&mut self, outcome: &Outcome) {
+        if let Some(row) = self.row.as_mut() {
+            row.outcome = outcome.code.to_string();
+            row.elapsed_ms = outcome.elapsed_ms;
+            row.row_count = outcome.row_count;
+            row.truncated = outcome.truncated;
+            row.error_message = outcome.error_message.clone();
+        }
+    }
+}
+
+/// If the tool never got to set an outcome, the drop is firing mid-work —
+/// the true outcome is unknown, so tag it `"cancelled"` and stamp the
+/// error_message so operators can distinguish it from a forbidden row at a
+/// glance. If the outcome IS set, the drop is firing AFTER work completed
+/// (the primary `audit::log` failed, timed out, or the future was dropped
+/// mid-audit) and the real outcome must be preserved for the retry.
+fn finalize_dropped_row(row: &mut AuditRow) {
+    if row.outcome.is_empty() {
+        row.outcome = "cancelled".to_string();
+        row.error_message = Some("client disconnected before completion".to_string());
+    }
 }
 
 impl Drop for CancelledAuditGuard {
@@ -82,23 +110,23 @@ impl Drop for CancelledAuditGuard {
         let Some(pool) = self.state_db.take() else {
             return;
         };
-        row.outcome = "cancelled".to_string();
-        // Distinct error_message so operators can tell a cancelled row
-        // from a forbidden one when scanning the table at speed.
-        row.error_message = Some("client disconnected before completion".to_string());
+        finalize_dropped_row(&mut row);
+        let outcome_tag = row.outcome.clone();
         counter!(
             METRIC_TOOL_CALLS,
             "tool" => self.tool,
-            "outcome" => "cancelled",
+            "outcome" => outcome_tag,
         )
         .increment(1);
         // Detached spawn. We can't await it; if it fails, there's no
-        // surface to report the failure to — the agent already disconnected.
+        // surface to report the failure to — the agent already disconnected
+        // (or the primary write already returned an error the caller saw).
         // Operator sees the failure in tracing via audit::log's internal
-        // error path.
+        // error path. `audit::log` has its own timeout so a wedged state DB
+        // does not stall the detached task forever.
         tokio::spawn(async move {
             if let Err(err) = audit::log(&pool, &row).await {
-                tracing::error!(%err, "cancelled audit row write failed");
+                tracing::error!(%err, "fallback audit row write failed");
             }
         });
     }
@@ -151,7 +179,7 @@ where
     //
     // The guard carries a pre-built row so the spawned task doesn't need
     // to re-thread identity / context across the spawn boundary.
-    let cancel_guard = CancelledAuditGuard {
+    let mut cancel_guard = CancelledAuditGuard {
         row: Some(AuditRow {
             request_id: id.to_string(),
             user_sub: identity.user_sub.clone(),
@@ -175,8 +203,14 @@ where
         tool: header.tool,
     };
     let outcome = work.await;
-    // Work completed normally — release the guard so its Drop is a no-op.
-    cancel_guard.disarm();
+    // Work completed — mirror the outcome onto the guard's row so that if
+    // the future is dropped during the audit write below (or the write
+    // itself fails), the guard's detached fallback carries the actual
+    // outcome rather than the placeholder `"cancelled"`. Guard stays armed
+    // until the primary write succeeds — closing the window between "tool
+    // ran" and "row landed" that used to let a wedged state DB + client
+    // disconnect leave the tool call with zero audit rows.
+    cancel_guard.record_outcome(&outcome);
 
     counter!(
         METRIC_TOOL_CALLS,
@@ -235,6 +269,12 @@ where
         // the tool itself took. The audit-insert latency is a separate field
         // (`audit_write_duration_ms`) so consumers comparing dispatch lines
         // across success/failure don't see two different semantics.
+        //
+        // NOTE: guard stays armed on this path. Its detached Drop attempt is
+        // defense-in-depth against a transient state DB blip and carries the
+        // real outcome (see `record_outcome` above). We already told the
+        // caller the request failed, so the retry's success or failure is
+        // operator-visible via tracing only.
         tracing::error!(
             %err,
             request_id = %id,
@@ -252,5 +292,134 @@ where
         );
     }
 
+    // Primary audit landed. Release the guard so its Drop is a no-op.
+    cancel_guard.disarm();
     outcome.response
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure-logic tests for the two helpers that decide what a cancellation
+    //! or post-work drop actually writes. Full state-DB failure integration
+    //! coverage lives in `tests/audit_dispatch_cancellation_real_db.rs`.
+
+    use super::*;
+    use crate::transport::jsonrpc::Response;
+    use serde_json::json;
+
+    fn empty_row() -> AuditRow {
+        AuditRow {
+            request_id: "req-1".into(),
+            user_sub: "user-1".into(),
+            user_email: "u@example.com".into(),
+            groups: vec!["g".into()],
+            tool: "run_query".into(),
+            server: Some("srv".into()),
+            database: Some("db".into()),
+            sql: Some("SELECT 1".into()),
+            reason: None,
+            outcome: String::new(),
+            elapsed_ms: None,
+            row_count: None,
+            truncated: None,
+            error_message: None,
+            agent_client: None,
+            ip: None,
+            db_type: Some("postgres".into()),
+        }
+    }
+
+    fn outcome_success() -> Outcome {
+        Outcome {
+            response: Response::result(json!(1), &json!({"ok": true})),
+            code: "success",
+            elapsed_ms: Some(42),
+            row_count: Some(3),
+            truncated: Some(false),
+            error_message: None,
+        }
+    }
+
+    /// A drop with no outcome recorded — mid-work disconnect. The row must
+    /// be tagged `"cancelled"` and get the distinguishing error_message so
+    /// operators can tell it apart from `"forbidden"` at a glance.
+    #[test]
+    fn finalize_dropped_row_stamps_cancelled_when_outcome_empty() {
+        let mut row = empty_row();
+        finalize_dropped_row(&mut row);
+        assert_eq!(row.outcome, "cancelled");
+        assert_eq!(
+            row.error_message.as_deref(),
+            Some("client disconnected before completion")
+        );
+    }
+
+    /// A drop AFTER `record_outcome` was called — the tool completed, then
+    /// the primary `audit::log` failed / was cancelled. The retry must carry
+    /// the real outcome, not overwrite it with `"cancelled"`.
+    #[test]
+    fn finalize_dropped_row_preserves_recorded_outcome() {
+        let mut row = empty_row();
+        row.outcome = "success".into();
+        row.elapsed_ms = Some(42);
+        row.error_message = None;
+        finalize_dropped_row(&mut row);
+        assert_eq!(row.outcome, "success");
+        assert_eq!(row.elapsed_ms, Some(42));
+        assert_eq!(row.error_message, None);
+    }
+
+    /// A recorded error outcome is preserved too — a failed query whose
+    /// audit write then fails should still record the failure, not
+    /// `"cancelled"`.
+    #[test]
+    fn finalize_dropped_row_preserves_error_outcome() {
+        let mut row = empty_row();
+        row.outcome = "forbidden_sql".into();
+        row.error_message = Some("statement type `INSERT` is not allowed".into());
+        finalize_dropped_row(&mut row);
+        assert_eq!(row.outcome, "forbidden_sql");
+        assert_eq!(
+            row.error_message.as_deref(),
+            Some("statement type `INSERT` is not allowed")
+        );
+    }
+
+    /// Builds a guard with an empty-outcome row, calls `record_outcome`,
+    /// and asserts every audit-relevant field on the guard's row mirrors
+    /// the outcome. This is the property the reorder relies on: if the
+    /// future is dropped after `record_outcome` but before `disarm`, the
+    /// fallback write must carry these values.
+    #[test]
+    fn record_outcome_mirrors_all_audit_fields_onto_guard_row() {
+        let mut guard = CancelledAuditGuard {
+            row: Some(empty_row()),
+            state_db: None, // no pool needed for this pure test
+            tool: "run_query",
+        };
+        let out = outcome_success();
+        guard.record_outcome(&out);
+        let row = guard.row.as_ref().expect("row still armed");
+        assert_eq!(row.outcome, "success");
+        assert_eq!(row.elapsed_ms, Some(42));
+        assert_eq!(row.row_count, Some(3));
+        assert_eq!(row.truncated, Some(false));
+        assert_eq!(row.error_message, None);
+        // Neutralise the guard's Drop for the test — no state_db was set, so
+        // Drop's `let Some(pool) = ...` short-circuits and nothing spawns.
+    }
+
+    /// `record_outcome` on a disarmed guard is a no-op (defensive: the
+    /// dispatch function only calls it while armed, but the guard's own
+    /// contract should not panic if the invariant is ever relaxed).
+    #[test]
+    fn record_outcome_on_disarmed_guard_is_noop() {
+        let mut guard = CancelledAuditGuard {
+            row: None,
+            state_db: None,
+            tool: "run_query",
+        };
+        guard.record_outcome(&outcome_success());
+        assert!(guard.row.is_none());
+    }
 }

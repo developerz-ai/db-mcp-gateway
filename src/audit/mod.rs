@@ -16,7 +16,18 @@ pub mod pruner;
 #[cfg(any(test, debug_assertions))]
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use std::time::Duration;
 use uuid::Uuid;
+
+/// Hard ceiling on a single audit write. A wedged state DB must surface as a
+/// typed error so the caller can fail the request — non-negotiable #4 rules
+/// out an audit that hangs forever on a stuck backend. 15s is a comfortable
+/// upper bound for a single-row insert; healthy writes land in single-digit
+/// milliseconds. Not configurable on purpose: an operator who tunes this
+/// down to 100ms would trade non-negotiable-#4 compliance for latency, and
+/// tuning it up past this ceiling gives a truly wedged DB a longer window
+/// to stall every in-flight request.
+pub const AUDIT_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One row in `audit_calls`. Fields mirror spec 07 §Fields. Most fields are
 /// `Option` because not every tool / outcome populates them (e.g.
@@ -67,11 +78,22 @@ pub struct AuditRow {
 pub enum AuditError {
     #[error("audit write failed")]
     Write(#[source] sqlx::Error),
+    #[error("audit write timed out after {0:?}")]
+    Timeout(Duration),
 }
 
 /// Persist one audit row. Synchronous on the request path: callers MUST
 /// propagate this error to the agent so an unaudited call never succeeds.
+/// The write is wrapped in an [`AUDIT_WRITE_TIMEOUT`] deadline so a wedged
+/// state DB fails the request instead of hanging the tool response.
 pub async fn log(pool: &PgPool, row: &AuditRow) -> Result<(), AuditError> {
+    match tokio::time::timeout(AUDIT_WRITE_TIMEOUT, insert_row(pool, row)).await {
+        Ok(res) => res,
+        Err(_) => Err(AuditError::Timeout(AUDIT_WRITE_TIMEOUT)),
+    }
+}
+
+async fn insert_row(pool: &PgPool, row: &AuditRow) -> Result<(), AuditError> {
     let groups_json = serde_json::to_value(&row.groups).unwrap_or(serde_json::Value::Array(vec![]));
     sqlx::query(
         "INSERT INTO audit_calls \
