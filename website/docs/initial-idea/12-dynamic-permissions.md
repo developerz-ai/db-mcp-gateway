@@ -201,6 +201,23 @@ Implementation notes every handler honors:
 
 Tested with proptest in #55. The property: for any pair of `(wildcard_grant, specific_grant)` on overlapping databases, the merged result is never more permissive than the specific grant alone.
 
+### Reserved `"*"` sentinel on `/admin/v1/databases`
+
+`"*"` is *only* meaningful as the wildcard marker on grants (`grant.server == "*"` / `grant.database == "*"`, expressed on the API as `db_name_wildcard: true` + `database_id: null`). A `permissions_databases` row whose `server` or `db_name` is literally `"*"` would let every `Specific`-target grant pointing at it silently behave as a wildcard — an authz escalation an admin registering a database `"*"` would not expect or intend.
+
+To keep the sentinel from ever reaching the store, `POST` and `PATCH` on `/admin/v1/databases` reject any request where the trimmed `server` or `db_name` equals `"*"`:
+
+| Body field | Value (after `trim()`) | Response |
+|---|---|---|
+| `server` | `"*"` | `400 invalid_request`, message names the field and points at the wildcard-grant alternative |
+| `db_name` | `"*"` | Same |
+| Either | whitespace-only | `400 invalid_request`, `<field> must be non-empty` |
+| Either | any other string containing `*` (e.g. `prod-*-shard`) | Accepted — only the bare sentinel is magic to the evaluator |
+
+The rejection runs before any INSERT/UPDATE against `permissions_databases`, so a rejected request leaves the store and `permissions_audit` unchanged (verified end-to-end in `tests/admin_databases_e2e.rs`).
+
+The supported way to grant access to every database on a server is `db_name_wildcard: true` + `database_id: null` on `POST /admin/v1/grants` (see [Request shapes](#request-shapes) above), *not* a `permissions_databases` row literally named `"*"`.
+
 ## `DbAdapter` trait
 
 Polymorphic query execution. CLAUDE.md convention: trait when the second impl arrives. Mongo is that second impl, so it lands now.

@@ -439,6 +439,25 @@ async fn wildcard_sentinel_db_name_is_rejected() {
         "error message must name the field; got {err}"
     );
 
+    // No row for the rejected create — validation must run before any INSERT
+    // into `permissions_databases` (defense in depth: even if evaluation later
+    // treats a `"*"` row as a wildcard, none should ever be persisted).
+    let exists: bool = sqlx::query(
+        "SELECT EXISTS (SELECT 1 FROM permissions_databases \
+         WHERE server = $1 AND db_name = $2)",
+    )
+    .bind("prod")
+    .bind("*")
+    .fetch_one(&h.pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert!(
+        !exists,
+        "rejected wildcard-db_name POST must not persist a row"
+    );
+
     h.cleanup().await;
 }
 
@@ -450,12 +469,13 @@ async fn wildcard_sentinel_server_is_rejected() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
 
+    let db_name = format!("app-{}", Uuid::new_v4().simple());
     let resp = client()
         .post(format!("{}/admin/v1/databases", h.base_url))
         .bearer_auth(&jwt)
         .json(&json!({
             "server": "*",
-            "db_name": format!("app-{}", Uuid::new_v4().simple()),
+            "db_name": db_name,
             "db_type": "postgres",
         }))
         .send()
@@ -465,11 +485,27 @@ async fn wildcard_sentinel_server_is_rejected() {
     let err: Value = resp.json().await.unwrap();
     assert_eq!(err["error"]["code"], "invalid_request");
     assert!(
-        err["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("server"),
+        err["error"]["message"].as_str().unwrap().contains("server"),
         "error message must name the field; got {err}"
+    );
+
+    // No row for the rejected create — same defense-in-depth check as the
+    // db_name sibling: query the state DB for the intended `(server, db_name)`
+    // pair and assert nothing landed.
+    let exists: bool = sqlx::query(
+        "SELECT EXISTS (SELECT 1 FROM permissions_databases \
+         WHERE server = $1 AND db_name = $2)",
+    )
+    .bind("*")
+    .bind(&db_name)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert!(
+        !exists,
+        "rejected wildcard-server POST must not persist a row"
     );
 
     h.cleanup().await;
