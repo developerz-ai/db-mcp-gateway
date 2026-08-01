@@ -404,6 +404,200 @@ async fn unknown_db_type_is_rejected() {
     h.cleanup().await;
 }
 
+/// Regression for the #136 audit finding "permissions_databases rows named
+/// `*` become wildcard grants; nothing rejects the sentinel". `"*"` is the
+/// magic string the authz evaluator treats as a wildcard match
+/// (`grant.server == "*"` / `grant.database == "*"`) — a database row
+/// literally named `"*"` would make every `Specific`-target grant pointing
+/// at it silently behave as a wildcard, an authz escalation an admin
+/// creating a database named `"*"` would not expect. Both `server` and
+/// `db_name` must be rejected at create; no row, no audit row either way.
+#[tokio::test]
+async fn wildcard_sentinel_db_name_is_rejected() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
+
+    let resp = client()
+        .post(format!("{}/admin/v1/databases", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&json!({
+            "server": "prod",
+            "db_name": "*",
+            "db_type": "postgres",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err: Value = resp.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "invalid_request");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("db_name"),
+        "error message must name the field; got {err}"
+    );
+
+    // No row for the rejected create — validation must run before any INSERT
+    // into `permissions_databases` (defense in depth: even if evaluation later
+    // treats a `"*"` row as a wildcard, none should ever be persisted).
+    let exists: bool = sqlx::query(
+        "SELECT EXISTS (SELECT 1 FROM permissions_databases \
+         WHERE server = $1 AND db_name = $2)",
+    )
+    .bind("prod")
+    .bind("*")
+    .fetch_one(&h.pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert!(
+        !exists,
+        "rejected wildcard-db_name POST must not persist a row"
+    );
+
+    // ...and no audit row either. The rejection has to happen before the
+    // audited transaction opens, otherwise the spec claim in
+    // `12-dynamic-permissions.md` ("leaves the store and `permissions_audit`
+    // unchanged") is a lie. Scope to the exact `(server, db_name)` pair the
+    // caller sent — no legitimate audit row can carry `db_name = "*"` once
+    // this validation is in place, but the tighter filter keeps the assertion
+    // meaningful even if a future test regresses the invariant.
+    let audit_rows: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM permissions_audit \
+         WHERE target_type = 'database' \
+           AND after->>'server' = $1 \
+           AND after->>'db_name' = $2",
+    )
+    .bind("prod")
+    .bind("*")
+    .fetch_one(&h.pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert_eq!(
+        audit_rows, 0,
+        "rejected wildcard-db_name POST must not write an audit row"
+    );
+
+    h.cleanup().await;
+}
+
+/// Same sentinel check on `server` — `grant.server == "*"` is an even wider
+/// escalation than `db_name`, matching every server on the gateway rather
+/// than every database on one server.
+#[tokio::test]
+async fn wildcard_sentinel_server_is_rejected() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
+
+    let db_name = format!("app-{}", Uuid::new_v4().simple());
+    let resp = client()
+        .post(format!("{}/admin/v1/databases", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&json!({
+            "server": "*",
+            "db_name": db_name,
+            "db_type": "postgres",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err: Value = resp.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "invalid_request");
+    assert!(
+        err["error"]["message"].as_str().unwrap().contains("server"),
+        "error message must name the field; got {err}"
+    );
+
+    // No row for the rejected create — same defense-in-depth check as the
+    // db_name sibling: query the state DB for the intended `(server, db_name)`
+    // pair and assert nothing landed.
+    let exists: bool = sqlx::query(
+        "SELECT EXISTS (SELECT 1 FROM permissions_databases \
+         WHERE server = $1 AND db_name = $2)",
+    )
+    .bind("*")
+    .bind(&db_name)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert!(
+        !exists,
+        "rejected wildcard-server POST must not persist a row"
+    );
+
+    // ...and no audit row for the rejected server-wildcard either — the doc
+    // in `12-dynamic-permissions.md` promises the audit table stays clean on
+    // rejection. Scope to the exact `(server, db_name)` pair; `db_name` is a
+    // per-test UUID so this can never collide with a sibling test.
+    let audit_rows: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM permissions_audit \
+         WHERE target_type = 'database' \
+           AND after->>'server' = $1 \
+           AND after->>'db_name' = $2",
+    )
+    .bind("*")
+    .bind(&db_name)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert_eq!(
+        audit_rows, 0,
+        "rejected wildcard-server POST must not write an audit row"
+    );
+
+    h.cleanup().await;
+}
+
+/// The sentinel check must also apply to PATCH — renaming an existing
+/// database to `"*"` is the same escalation as creating one with that name.
+#[tokio::test]
+async fn patch_to_wildcard_sentinel_db_name_is_rejected() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
+
+    let create: Value = client()
+        .post(format!("{}/admin/v1/databases", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&json!({
+            "server": "prod",
+            "db_name": format!("app-{}", Uuid::new_v4().simple()),
+            "db_type": "postgres",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id: Uuid = create["id"].as_str().unwrap().parse().unwrap();
+    h.track_db(id);
+
+    let resp = client()
+        .patch(format!("{}/admin/v1/databases/{}", h.base_url, id))
+        .bearer_auth(&jwt)
+        .json(&json!({ "db_name": "*" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err: Value = resp.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "invalid_request");
+
+    h.cleanup().await;
+}
+
 #[tokio::test]
 async fn patch_updates_and_audits_before_and_after() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
