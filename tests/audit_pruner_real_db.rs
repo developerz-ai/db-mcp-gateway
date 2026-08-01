@@ -23,6 +23,7 @@ async fn pool() -> sqlx::PgPool {
 
 fn audit_row(user_sub: &str, request_id: &str) -> AuditRow {
     AuditRow {
+        id: Uuid::new_v4(),
         request_id: request_id.to_string(),
         user_sub: user_sub.to_string(),
         user_email: "pruner-test@example.com".to_string(),

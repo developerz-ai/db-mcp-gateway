@@ -16,7 +16,18 @@ pub mod pruner;
 #[cfg(any(test, debug_assertions))]
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use std::time::Duration;
 use uuid::Uuid;
+
+/// Hard ceiling on a single audit write. A wedged state DB must surface as a
+/// typed error so the caller can fail the request — non-negotiable #4 rules
+/// out an audit that hangs forever on a stuck backend. 15s is a comfortable
+/// upper bound for a single-row insert; healthy writes land in single-digit
+/// milliseconds. Not configurable on purpose: an operator who tunes this
+/// down to 100ms would trade non-negotiable-#4 compliance for latency, and
+/// tuning it up past this ceiling gives a truly wedged DB a longer window
+/// to stall every in-flight request.
+pub const AUDIT_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One row in `audit_calls`. Fields mirror spec 07 §Fields. Most fields are
 /// `Option` because not every tool / outcome populates them (e.g.
@@ -24,6 +35,13 @@ use uuid::Uuid;
 /// `error_message`).
 #[derive(Debug, Clone)]
 pub struct AuditRow {
+    /// Row primary key. Callers on the request path (see
+    /// `tools::audit_dispatch`) generate this once per dispatch and share
+    /// it between the primary write and the drop-guard fallback so the two
+    /// writes are idempotent under `ON CONFLICT (id) DO NOTHING` — a
+    /// timed-out primary that ends up committing anyway will not produce a
+    /// duplicate row when the fallback re-inserts.
+    pub id: Uuid,
     pub request_id: String,
     pub user_sub: String,
     pub user_email: String,
@@ -67,20 +85,38 @@ pub struct AuditRow {
 pub enum AuditError {
     #[error("audit write failed")]
     Write(#[source] sqlx::Error),
+    #[error("audit write timed out after {0:?}")]
+    Timeout(Duration),
 }
 
 /// Persist one audit row. Synchronous on the request path: callers MUST
 /// propagate this error to the agent so an unaudited call never succeeds.
+/// The write is wrapped in an [`AUDIT_WRITE_TIMEOUT`] deadline so a wedged
+/// state DB fails the request instead of hanging the tool response.
 pub async fn log(pool: &PgPool, row: &AuditRow) -> Result<(), AuditError> {
+    match tokio::time::timeout(AUDIT_WRITE_TIMEOUT, insert_row(pool, row)).await {
+        Ok(res) => res,
+        Err(_) => Err(AuditError::Timeout(AUDIT_WRITE_TIMEOUT)),
+    }
+}
+
+async fn insert_row(pool: &PgPool, row: &AuditRow) -> Result<(), AuditError> {
     let groups_json = serde_json::to_value(&row.groups).unwrap_or(serde_json::Value::Array(vec![]));
+    // `ON CONFLICT (id) DO NOTHING` makes the write idempotent when the
+    // request-path guard fires a fallback insert after a timed-out primary
+    // write: even in the (theoretically possible) SQLx-cancellation race
+    // where the primary INSERT still commits, the fallback with the same
+    // `id` becomes a no-op instead of a duplicate row. Append-only
+    // semantics are preserved — we never UPDATE, only skip inserting.
     sqlx::query(
         "INSERT INTO audit_calls \
          (id, request_id, user_sub, user_email, groups, tool, server_name, database_name, \
           sql, reason, outcome, elapsed_ms, row_count, truncated, error_message, \
           agent_client, ip, db_type) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+         ON CONFLICT (id) DO NOTHING",
     )
-    .bind(Uuid::new_v4())
+    .bind(row.id)
     .bind(&row.request_id)
     .bind(&row.user_sub)
     .bind(&row.user_email)
@@ -114,7 +150,7 @@ pub async fn latest_for_user_tool(
 ) -> Result<Option<AuditRow>, AuditError> {
     use sqlx::Row;
     let row = sqlx::query(
-        "SELECT request_id, user_sub, user_email, groups, tool, server_name, database_name, \
+        "SELECT id, request_id, user_sub, user_email, groups, tool, server_name, database_name, \
                 sql, reason, outcome, elapsed_ms, row_count, truncated, error_message, \
                 agent_client, ip, db_type, occurred_at \
          FROM audit_calls WHERE user_sub = $1 AND tool = $2 \
@@ -134,6 +170,7 @@ pub async fn latest_for_user_tool(
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
         AuditRow {
+            id: r.get("id"),
             request_id: r.get("request_id"),
             user_sub: r.get("user_sub"),
             user_email: r.get("user_email"),

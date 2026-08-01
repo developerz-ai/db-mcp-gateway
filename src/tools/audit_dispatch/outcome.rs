@@ -12,9 +12,11 @@ use super::Outcome;
 /// is duplicated inside the JSON body so agents that only read the tool
 /// payload still get it.
 ///
-/// Private to this module: takes an arbitrary `message`, so external callers
-/// build errors through `error_outcome` / `outcome_from_exec_error` instead.
-fn tool_error(id: Value, code: &'static str, message: &str) -> Response {
+/// Exposed to `super` (`audit_dispatch::mod`) so audit-write failures can
+/// surface the spec-03 code (`"timeout"` / `"internal"`) instead of a bare
+/// JSON-RPC internal error. External tool callers keep using
+/// `error_outcome` / `outcome_from_exec_error`.
+pub(super) fn tool_error(id: Value, code: &'static str, message: &str) -> Response {
     let body = serde_json::json!({
         "request_id": id.clone(),
         "code": code,
