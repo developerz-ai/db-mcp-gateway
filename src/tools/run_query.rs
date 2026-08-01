@@ -250,12 +250,17 @@ fn find_server_db<'a>(
     Some((server, database))
 }
 
+/// `effective = min(caller.unwrap_or(DEFAULT_ROW_LIMIT), grant.unwrap_or(CEILING), CEILING)`.
+/// The grant is clamped to [`super::GATEWAY_ROW_LIMIT_CEILING`] first so a
+/// grant that declines to set `row_limit` (or one that names a value above
+/// the ceiling) still bounds the caller's request — an absent grant used to
+/// mean "whatever the caller asks for," including a hostile `limit` near
+/// `u32::MAX`.
 fn effective_row_limit(caller: Option<u32>, grant: Option<u32>) -> u32 {
-    let caller = caller.unwrap_or(DEFAULT_ROW_LIMIT);
-    match grant {
-        Some(grant_cap) => caller.min(grant_cap),
-        None => caller,
-    }
+    let grant_capped = grant
+        .unwrap_or(super::GATEWAY_ROW_LIMIT_CEILING)
+        .min(super::GATEWAY_ROW_LIMIT_CEILING);
+    caller.unwrap_or(DEFAULT_ROW_LIMIT).min(grant_capped)
 }
 
 #[cfg(test)]
@@ -269,5 +274,40 @@ mod tests {
         assert_eq!(effective_row_limit(Some(50), None), 50);
         assert_eq!(effective_row_limit(None, Some(20)), 20);
         assert_eq!(effective_row_limit(None, None), DEFAULT_ROW_LIMIT);
+    }
+
+    /// Regression for the #136 audit finding "caller `limit` unbounded when
+    /// the grant sets no `row_limit`": an absent grant must still clamp to
+    /// the gateway ceiling, not pass the caller's raw (potentially
+    /// near-`u32::MAX`) request straight through.
+    #[test]
+    fn effective_row_limit_clamps_to_gateway_ceiling_when_grant_is_silent() {
+        assert_eq!(
+            effective_row_limit(Some(u32::MAX), None),
+            super::super::GATEWAY_ROW_LIMIT_CEILING
+        );
+        assert_eq!(
+            effective_row_limit(Some(4_000_000_000), None),
+            super::super::GATEWAY_ROW_LIMIT_CEILING
+        );
+    }
+
+    /// A grant naming a `row_limit` above the ceiling must still be clamped
+    /// down — a grant can only tighten the ceiling, never loosen past it
+    /// (same most-restrictive-wins posture as `effective_timeout_ms`).
+    #[test]
+    fn effective_row_limit_clamps_grant_above_ceiling() {
+        assert_eq!(
+            effective_row_limit(Some(u32::MAX), Some(u32::MAX)),
+            super::super::GATEWAY_ROW_LIMIT_CEILING
+        );
+    }
+
+    /// A tight grant still wins even against a hostile caller request — the
+    /// pre-existing most-restrictive-wins behavior must survive the ceiling
+    /// clamp being added ahead of it.
+    #[test]
+    fn effective_row_limit_grant_still_wins_under_hostile_caller_request() {
+        assert_eq!(effective_row_limit(Some(u32::MAX), Some(7)), 7);
     }
 }
