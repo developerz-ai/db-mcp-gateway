@@ -148,19 +148,26 @@ impl DbAdapter for MongoAdapter {
     ///   cursor's is not covered), so a large result set would otherwise
     ///   blow straight through the budget.
     ///
-    /// **Cancellation** — best-effort server-side kill via `cancel::KillOpOnDrop`
-    /// (#141), the mongo analogue of the pg path's `pg_cancel_backend` drop
-    /// guard. Every command is stamped with a unique `comment` marker before
-    /// dispatch; if the future is dropped mid-operation (agent disconnect),
-    /// the guard's `Drop` spawns a detached `currentOp` lookup by that
-    /// marker followed by `killOp` on the matching `opid`. Two things keep
-    /// this short of a guarantee (see `cancel` module docs for the full
-    /// rationale): `killOp` requires a cluster-admin privilege the
-    /// least-privilege mongo role doesn't have by default, and the
-    /// `currentOp` lookup can race a very short-lived operation's own
-    /// registration. Either way `maxTimeMS` remains the hard backstop.
-    /// (The `outcome: cancelled` audit row is unaffected: it is written by
-    /// the backend-agnostic drop guard in `tools::audit_dispatch`.)
+    /// **Cancellation** — best-effort server-side kill of the *initial*
+    /// command phase via `cancel::KillOpOnDrop` (#141), the mongo analogue
+    /// of the pg path's `pg_cancel_backend` drop guard. Every command is
+    /// stamped with a unique `comment` marker before dispatch; if the
+    /// future is dropped mid-operation (agent disconnect), the guard's
+    /// `Drop` spawns a detached `currentOp` lookup by that marker followed
+    /// by `killOp` on every matching `opid` (a `mongos` fan-out surfaces
+    /// one entry per shard). A disconnect during the *cursor drain* is
+    /// covered by the driver's own `killCursors` on `Cursor::drop`, not by
+    /// this guard — the marker rides on the initial `find` / `aggregate`
+    /// but each `getMore` round-trip is a fresh operation with no marker
+    /// to find. Three things keep even the initial-phase kill short of a
+    /// guarantee (see `cancel` module docs for the full rationale):
+    /// `killOp` and `currentOp` (with `$ownOps: false`) both require
+    /// cluster-admin privileges the least-privilege mongo role doesn't
+    /// have by default, the `currentOp` lookup can race a very short-lived
+    /// operation's own registration, and only the initial command is
+    /// targeted. Either way `maxTimeMS` remains the hard backstop. (The
+    /// `outcome: cancelled` audit row is unaffected: it is written by the
+    /// backend-agnostic drop guard in `tools::audit_dispatch`.)
     async fn execute(&self, query: ExecQuery<'_>) -> Result<ExecResult, ExecError> {
         rejector::validate_command(query.sql)
             .map_err(|err| ExecError::Forbidden(err.to_string()))?;

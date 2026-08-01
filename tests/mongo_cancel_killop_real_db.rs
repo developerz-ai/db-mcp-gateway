@@ -12,6 +12,13 @@
 //! (agent disconnect) causes `cancel::KillOpOnDrop` to fire `currentOp` +
 //! `killOp`, and the operation actually stops running server-side — not just
 //! "the client gave up on it".
+//!
+//! Audit assertion intentionally skipped in both tests: they exercise the
+//! exec layer (`MongoAdapter::execute`) in isolation. The `outcome: cancelled`
+//! audit row is written by the backend-agnostic drop guard in
+//! `tools::audit_dispatch`, which this file never enters. Audit coverage for
+//! cancellation lives in the tool-dispatch integration tests
+//! (see `tests/cancellation_real_db.rs`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -86,9 +93,8 @@ fn unique_collection() -> String {
 
 /// Bulk-insert `count` trivial documents, chunked under the 100k/16MB
 /// per-command cap.
-async fn seed(collection: &str, count: usize) {
+async fn seed(client: &Client, collection: &str, count: usize) {
     const CHUNK: usize = 20_000;
-    let client = side_client();
     for start in (1..=count).step_by(CHUNK) {
         let end = (start + CHUNK - 1).min(count);
         let docs: Vec<Document> = (start..=end).map(|i| doc! { "i": i as i64 }).collect();
@@ -100,8 +106,8 @@ async fn seed(collection: &str, count: usize) {
     }
 }
 
-async fn drop_collection(collection: &str) {
-    let _ = side_client()
+async fn drop_collection(client: &Client, collection: &str) {
+    let _ = client
         .database(TARGET_DB)
         .run_command(doc! { "drop": collection })
         .await;
@@ -113,9 +119,15 @@ async fn drop_collection(collection: &str) {
 /// internal `comment` marker — the test has no way to know that marker
 /// ahead of time, and `ns` is a clean, collision-free proxy since each test
 /// run uses a fresh UUID'd collection name.
-async fn op_running_against(collection: &str) -> bool {
+///
+/// Takes a borrowed `&Client` so the caller can reuse one connection pool
+/// across the whole test — `poll_until` calls this every 50 ms, and
+/// constructing a fresh `Client` per iteration would open (and never close)
+/// dozens of pools per run, exhausting a constrained CI mongo container's
+/// connection limit.
+async fn op_running_against(client: &Client, collection: &str) -> bool {
     let ns = format!("{TARGET_DB}.{collection}");
-    let admin = side_client().database("admin");
+    let admin = client.database("admin");
     let response = admin
         .run_command(doc! {
             "currentOp": 1,
@@ -131,11 +143,12 @@ async fn op_running_against(collection: &str) -> bool {
 }
 
 /// Poll `op_running_against` until it returns `want` or the deadline passes.
-/// Returns the last observed value.
-async fn poll_until(collection: &str, want: bool, deadline: Duration) -> bool {
+/// Returns the last observed value. Reuses the caller's `Client` — see
+/// `op_running_against` for why.
+async fn poll_until(client: &Client, collection: &str, want: bool, deadline: Duration) -> bool {
     let start = std::time::Instant::now();
     loop {
-        let seen = op_running_against(collection).await;
+        let seen = op_running_against(client, collection).await;
         if seen == want || start.elapsed() >= deadline {
             return seen;
         }
@@ -153,11 +166,12 @@ async fn poll_until(collection: &str, want: bool, deadline: Duration) -> bool {
 /// cancel guard's `killOp` can.
 #[tokio::test]
 async fn dropped_execute_future_kills_the_mongo_op() {
+    let monitor = side_client();
     let coll = unique_collection();
     // Enough documents that an unindexed sort takes a comfortable few
     // hundred ms to a couple of seconds — long enough to observe in
     // currentOp before the test aborts, short enough not to make CI slow.
-    seed(&coll, 200_000).await;
+    seed(&monitor, &coll, 200_000).await;
 
     let adapter = Arc::new(adapter().await);
     let sql =
@@ -178,26 +192,31 @@ async fn dropped_execute_future_kills_the_mongo_op() {
 
     // Wait until the aggregation is actually visible as running server-side
     // before we abort — otherwise the abort could race the op even starting.
-    let started = poll_until(&coll, true, Duration::from_secs(5)).await;
-    assert!(
-        started,
-        "aggregate against {coll} never appeared in currentOp — \
-         is target-mongo up? (run `bin/dev up`) or did 200k docs sort too fast?"
-    );
+    let started = poll_until(&monitor, &coll, true, Duration::from_secs(5)).await;
 
     // Drop the future — same mechanism as an agent disconnecting mid-query.
     // `MongoAdapter::execute`'s `tokio::time::timeout` wraps `dispatch`,
-    // which owns `kill_guard`; aborting the task drops both.
+    // which owns `kill_guard`; aborting the task drops both. Safe to run
+    // even if `started == false` — abort of a task that never reached the
+    // DB is a no-op.
     task.abort();
 
     // Poll for the op to disappear from currentOp. `killOp` is two
     // round-trips (currentOp lookup + killOp itself) on a detached spawn,
     // so give it more headroom than the pg cancellation test's single
     // `pg_cancel_backend` call.
-    let still_running = poll_until(&coll, false, Duration::from_secs(5)).await;
+    let still_running = poll_until(&monitor, &coll, false, Duration::from_secs(5)).await;
 
-    drop_collection(&coll).await;
+    // Drop the 200k-doc collection BEFORE asserting: an early panic here
+    // would otherwise leave it behind on the shared dev mongo, and reruns
+    // would accumulate.
+    drop_collection(&monitor, &coll).await;
 
+    assert!(
+        started,
+        "aggregate against {coll} never appeared in currentOp — \
+         is target-mongo up? (run `bin/dev up`) or did 200k docs sort too fast?"
+    );
     assert!(
         !still_running,
         "aggregate against {coll} still running in currentOp after abort — \
@@ -214,8 +233,9 @@ async fn dropped_execute_future_kills_the_mongo_op() {
 /// kill — this just confirms disarm doesn't false-trigger on the DB side).
 #[tokio::test]
 async fn completed_command_leaves_nothing_in_current_op() {
+    let monitor = side_client();
     let coll = unique_collection();
-    seed(&coll, 10).await;
+    seed(&monitor, &coll, 10).await;
 
     let adapter = adapter().await;
     let sql = format!(r#"{{"find":"{coll}","filter":{{}}}}"#);
@@ -228,15 +248,15 @@ async fn completed_command_leaves_nothing_in_current_op() {
             row_limit: 10,
         })
         .await;
-    assert!(result.is_ok(), "expected the find to succeed: {result:?}");
 
     // No polling needed — the command already completed synchronously by
     // the time `execute` returned, so any in-progress state is stale noise,
     // not a race. A single check confirms nothing lingers.
-    assert!(
-        !op_running_against(&coll).await,
-        "a completed command left an entry in currentOp"
-    );
+    let lingering = op_running_against(&monitor, &coll).await;
 
-    drop_collection(&coll).await;
+    // Cleanup first, then assert — same rationale as the sister test.
+    drop_collection(&monitor, &coll).await;
+
+    assert!(result.is_ok(), "expected the find to succeed: {result:?}");
+    assert!(!lingering, "a completed command left an entry in currentOp");
 }

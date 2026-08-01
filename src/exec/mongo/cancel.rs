@@ -9,12 +9,14 @@
 //!   `currentOp` entry back to *this* request) requires MongoDB **4.4+**.
 //!   The gateway's minimum supported Mongo version is 4.4 — see
 //!   `config-reference.md` §Mongo.
-//! - `killOp` is a cluster-admin action (`killop` on `cluster` resource, or
-//!   the built-in `clusterManager` role) — NOT part of a least-privilege
-//!   read-only role. Operators who want mongo cancellation must grant it
-//!   explicitly on the gateway's mongo role; deployment docs call this out.
-//!   Without it, `killOp` fails, the guard logs a warning, and `maxTimeMS`
-//!   remains the only bound — identical to pre-#141 behavior.
+//! - Cancellation needs TWO cluster-admin actions, neither of which belongs
+//!   to a least-privilege read-only role: `inprog` (for the `currentOp`
+//!   lookup, which uses `$ownOps: false`) and `killop`. The built-in
+//!   `clusterManager` role covers both. Operators who want mongo
+//!   cancellation must grant them explicitly on the gateway's mongo role;
+//!   deployment docs call this out. Without them, the lookup or `killOp`
+//!   fails, the guard logs a warning, and `maxTimeMS` remains the only
+//!   bound — identical to pre-#141 behavior.
 //! - The lookup is inherently best-effort: `currentOp` is polled once, after
 //!   the drop fires, and races the operation's own registration. A very
 //!   short-lived operation may already be gone by the time we look. This is
@@ -24,6 +26,7 @@
 
 use mongodb::Client;
 use mongodb::bson::{Bson, Document, doc};
+use tracing::Instrument;
 use uuid::Uuid;
 
 /// Stamp a unique `comment` on `cmd` and return the marker. Unconditional
@@ -48,6 +51,19 @@ pub struct KillOpOnDrop {
     armed: Option<(Client, String)>,
 }
 
+impl std::fmt::Debug for KillOpOnDrop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never derive: `mongodb::Client`'s own `Debug` renders the parsed
+        // `ClientOptions` including credentials, and the marker is a
+        // request-scoped token used to authenticate a `killOp` against this
+        // exact operation. Structural info only — same posture as
+        // `MongoAdapter::Debug`.
+        f.debug_struct("KillOpOnDrop")
+            .field("armed", &self.armed.is_some())
+            .finish()
+    }
+}
+
 impl KillOpOnDrop {
     pub fn armed(client: Client, marker: String) -> Self {
         Self {
@@ -65,31 +81,78 @@ impl Drop for KillOpOnDrop {
         let Some((client, marker)) = self.armed.take() else {
             return;
         };
+        // `Drop` can run outside a runtime context (runtime teardown, or a
+        // test dropping the future after the runtime ends). `tokio::spawn`
+        // panics there, and CLAUDE.md forbids panics on the hot path; a
+        // panic during unwind is also an abort. Best-effort means "skip",
+        // not "abort".
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!("no tokio runtime at drop; skipping mongo killOp");
+            return;
+        };
+        // Inherit the dispatch span so `request_id`, `user`, `server`, and
+        // `database` reach the warn lines below — the detached task starts
+        // with no parent otherwise, and an operator seeing "killOp failed"
+        // could not map it back to a request.
+        let span = tracing::Span::current();
         // Detached: the parent future is being dropped, so we can't await
         // inline. Runs on a fresh task independent of the dropped future.
-        tokio::spawn(async move {
-            let admin = client.database("admin");
-            let Some(opid) = find_opid_by_marker(&admin, &marker).await else {
-                return;
-            };
-            if let Err(err) = admin.run_command(doc! { "killOp": 1, "op": opid }).await {
-                // `killOp` commonly fails with "unauthorized" when the role
-                // lacks the privilege documented in the module docs — that
-                // is an expected, not exceptional, outcome for operators who
-                // haven't opted in. Warn, don't error: `maxTimeMS` is still
-                // the backstop.
-                tracing::warn!(%err, "killOp failed during mongo cancel (missing privilege, or op already finished)");
+        handle.spawn(
+            async move {
+                let admin = client.database("admin");
+                let opids = find_opids_by_marker(&admin, &marker).await;
+                for opid in opids {
+                    if let Err(err) = admin.run_command(doc! { "killOp": 1, "op": opid }).await {
+                        // `killOp` commonly fails with "unauthorized" when
+                        // the role lacks the privilege documented in the
+                        // module docs — that is an expected, not
+                        // exceptional, outcome for operators who haven't
+                        // opted in. Warn, don't error: `maxTimeMS` is still
+                        // the backstop. Log only the driver's error
+                        // category — never `%err`, whose `Display` can
+                        // surface `Authentication` / `ServerSelection`
+                        // messages carrying credentials or hostnames
+                        // (CLAUDE.md `src/exec/**` redaction rule).
+                        tracing::warn!(
+                            error_kind = classify_mongo_error(&err),
+                            "killOp failed during mongo cancel (missing privilege, or op already finished)"
+                        );
+                    }
+                }
             }
-        });
+            .instrument(span),
+        );
     }
 }
 
-/// Look up the `opid` of the in-progress operation carrying `marker` as its
-/// `command.comment`. Returns `None` on any lookup failure or if nothing
-/// matched — both are expected outcomes (see module docs), not exceptions to
-/// propagate.
-async fn find_opid_by_marker(admin: &mongodb::Database, marker: &str) -> Option<Bson> {
-    let response = admin
+/// Category label for a `mongodb::Error` — safe to log. The driver's
+/// `Display` and `Debug` can surface authentication messages, server-selection
+/// details, and other operator-sensitive context; only the `ErrorKind`
+/// variant name goes to `tracing`. `ErrorKind` is `#[non_exhaustive]`, so the
+/// catch-all is required.
+fn classify_mongo_error(err: &mongodb::error::Error) -> &'static str {
+    use mongodb::error::ErrorKind;
+    match err.kind.as_ref() {
+        ErrorKind::Authentication { .. } => "authentication",
+        ErrorKind::Command(_) => "command",
+        ErrorKind::Io(_) => "io",
+        ErrorKind::ConnectionPoolCleared { .. } => "pool_cleared",
+        ErrorKind::DnsResolve { .. } => "dns_resolve",
+        ErrorKind::ServerSelection { .. } => "server_selection",
+        _ => "other",
+    }
+}
+
+/// Look up every `opid` of an in-progress operation carrying `marker` as its
+/// `command.comment`. Returns an empty vec on any lookup failure or if
+/// nothing matched — both are expected outcomes (see module docs), not
+/// exceptions to propagate.
+///
+/// Iterates every `inprog` entry rather than picking the first: a `mongos`
+/// fan-out surfaces one entry per shard for the same request, and each
+/// entry carries its own shard-local `opid` that must be killed individually.
+async fn find_opids_by_marker(admin: &mongodb::Database, marker: &str) -> Vec<Bson> {
+    let Ok(response) = admin
         .run_command(doc! {
             "currentOp": 1,
             "$ownOps": false,
@@ -97,15 +160,26 @@ async fn find_opid_by_marker(admin: &mongodb::Database, marker: &str) -> Option<
         })
         .await
         .inspect_err(|err| {
-            tracing::warn!(%err, "currentOp lookup failed during mongo cancel");
+            tracing::warn!(
+                error_kind = classify_mongo_error(err),
+                "currentOp lookup failed during mongo cancel"
+            );
         })
-        .ok()?;
-    let inprog = response.get_array("inprog").ok()?;
-    let entry = inprog.first()?;
-    let Bson::Document(entry_doc) = entry else {
-        return None;
+    else {
+        return Vec::new();
     };
-    entry_doc.get("opid").cloned()
+    let Ok(inprog) = response.get_array("inprog") else {
+        return Vec::new();
+    };
+    inprog
+        .iter()
+        .filter_map(|entry| {
+            let Bson::Document(doc) = entry else {
+                return None;
+            };
+            doc.get("opid").cloned()
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -157,5 +231,27 @@ mod tests {
         assert!(guard.armed.is_none());
         // Drop now runs with `armed == None` — `Drop::drop`'s `let Some(...)
         // = ... else { return }` returns immediately, no spawn.
+    }
+
+    /// `Debug` must never leak the mongo client (credentials in
+    /// `ClientOptions`) or the request-scoped marker. Mirrors
+    /// `MongoAdapter::debug_does_not_leak_credentials`.
+    #[tokio::test]
+    async fn debug_does_not_leak_client_or_marker() {
+        use mongodb::options::{ClientOptions, ServerAddress};
+
+        let options = ClientOptions::builder()
+            .hosts(vec![ServerAddress::Tcp {
+                host: "leak-host".to_string(),
+                port: Some(27017),
+            }])
+            .build();
+        let client = Client::with_options(options).expect("client constructs");
+        let marker = "leak-marker-should-not-appear";
+        let guard = KillOpOnDrop::armed(client, marker.to_string());
+        let rendered = format!("{guard:?}");
+        assert!(rendered.contains("armed"));
+        assert!(!rendered.contains(marker), "leaked marker: {rendered}");
+        assert!(!rendered.contains("leak-host"), "leaked host: {rendered}");
     }
 }
