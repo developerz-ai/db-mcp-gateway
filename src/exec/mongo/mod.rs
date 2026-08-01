@@ -18,6 +18,7 @@
 //! (not concatenated into a URI), so no encoding bug can turn a
 //! `:`-bearing password into URI structure. See [`MongoAdapter::open`].
 
+mod cancel;
 pub mod rejector;
 
 use std::time::{Duration, Instant};
@@ -147,18 +148,26 @@ impl DbAdapter for MongoAdapter {
     ///   cursor's is not covered), so a large result set would otherwise
     ///   blow straight through the budget.
     ///
-    /// **Cancellation** — there is NO server-side kill here, and that is a
-    /// known gap against the pg path's `pg_cancel_backend` drop guard.
-    /// Dropping this future drops the driver's operation future (freeing the
-    /// client-side connection) and schedules `killCursors` for any open
-    /// cursor id, but `killCursors` does not abort an operation that is
-    /// already executing, and the `count` / `distinct` arms never open a
-    /// cursor at all. So after an agent disconnects, mongo keeps working on
-    /// the operation until it finishes or `maxTimeMS` expires — bounded, but
-    /// not cancelled. A genuine equivalent needs the operation's `opid` from
-    /// `$currentOp` plus `killOp`, which the driver does not surface.
-    /// (The `outcome: cancelled` audit row is unaffected: it is written by
-    /// the backend-agnostic drop guard in `tools::audit_dispatch`.)
+    /// **Cancellation** — best-effort server-side kill of the *initial*
+    /// command phase via `cancel::KillOpOnDrop` (#141), the mongo analogue
+    /// of the pg path's `pg_cancel_backend` drop guard. Every command is
+    /// stamped with a unique `comment` marker before dispatch; if the
+    /// future is dropped mid-operation (agent disconnect), the guard's
+    /// `Drop` spawns a detached `currentOp` lookup by that marker followed
+    /// by `killOp` on every matching `opid` (a `mongos` fan-out surfaces
+    /// one entry per shard). A disconnect during the *cursor drain* is
+    /// covered by the driver's own `killCursors` on `Cursor::drop`, not by
+    /// this guard — the marker rides on the initial `find` / `aggregate`
+    /// but each `getMore` round-trip is a fresh operation with no marker
+    /// to find. Three things keep even the initial-phase kill short of a
+    /// guarantee (see `cancel` module docs for the full rationale):
+    /// `killOp` and `currentOp` (with `$ownOps: false`) both require
+    /// cluster-admin privileges the least-privilege mongo role doesn't
+    /// have by default, the `currentOp` lookup can race a very short-lived
+    /// operation's own registration, and only the initial command is
+    /// targeted. Either way `maxTimeMS` remains the hard backstop. (The
+    /// `outcome: cancelled` audit row is unaffected: it is written by the
+    /// backend-agnostic drop guard in `tools::audit_dispatch`.)
     async fn execute(&self, query: ExecQuery<'_>) -> Result<ExecResult, ExecError> {
         rejector::validate_command(query.sql)
             .map_err(|err| ExecError::Forbidden(err.to_string()))?;
@@ -201,87 +210,107 @@ impl MongoAdapter {
         // `maxTimeMS` in the raw command can only ever be replaced by the
         // gateway's clamped value — it can't be used to buy more budget.
         cmd.insert("maxTimeMS", i64::from(effective_ms));
+        // Marker for the cancel guard's `currentOp` lookup — see
+        // `cancel::stamp_marker` and this method's own doc comment above.
+        let marker = cancel::stamp_marker(&mut cmd);
+        let mut kill_guard = cancel::KillOpOnDrop::armed(self.client.clone(), marker);
 
         let started = Instant::now();
         let db = self.client.database(&self.database_name);
 
-        match command_name.as_str() {
-            // Cursor-returning commands. `run_cursor_command` handles the
-            // initial response *and* follow-up `getMore` calls so we can
-            // drain past the first batch when the user asks for more rows.
-            "find" | "aggregate" => {
-                let mut cursor = db.run_cursor_command(cmd).await.map_err(classify)?;
-                let limit = query.row_limit as usize;
-                let mut rows: Vec<Vec<Value>> = Vec::new();
-                let mut truncated = false;
-                while let Some(doc_result) = cursor.next().await {
-                    if rows.len() >= limit {
-                        truncated = true;
-                        break;
+        // Wrapped in a block so `?` inside each arm exits the block (captured
+        // into `result`) rather than this function — an early function return
+        // would skip `kill_guard.disarm()` below. Harmless either way (the
+        // guard is best-effort: a currentOp lookup against an already-errored
+        // operation just finds nothing), but disarming on every normal
+        // completion — success or typed error — is the correct target, same
+        // posture as `pg::run_query_inner`'s `CancelOnDrop`.
+        let result: Result<ExecResult, ExecError> = async {
+            match command_name.as_str() {
+                // Cursor-returning commands. `run_cursor_command` handles the
+                // initial response *and* follow-up `getMore` calls so we can
+                // drain past the first batch when the user asks for more rows.
+                "find" | "aggregate" => {
+                    let mut cursor = db.run_cursor_command(cmd).await.map_err(classify)?;
+                    let limit = query.row_limit as usize;
+                    let mut rows: Vec<Vec<Value>> = Vec::new();
+                    let mut truncated = false;
+                    while let Some(doc_result) = cursor.next().await {
+                        if rows.len() >= limit {
+                            truncated = true;
+                            break;
+                        }
+                        let doc = doc_result.map_err(classify)?;
+                        rows.push(vec![doc_to_json(doc)]);
                     }
-                    let doc = doc_result.map_err(classify)?;
-                    rows.push(vec![doc_to_json(doc)]);
+                    Ok(ExecResult {
+                        columns: vec!["document".to_string()],
+                        rows,
+                        truncated,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    })
                 }
-                Ok(ExecResult {
-                    columns: vec!["document".to_string()],
-                    rows,
-                    truncated,
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                })
-            }
-            // Scalar commands. The response shape carries the answer in
-            // a single field that's documented per command name.
-            "count" => {
-                let response = db.run_command(cmd).await.map_err(classify)?;
-                let n = response
-                    .get_i64("n")
-                    .or_else(|_| response.get_i32("n").map(i64::from));
-                // `row_limit == 0` is a valid grant constraint (authz
-                // proptests generate it) and the exec invariant is
-                // "never emit more rows than configured" — the cursor
-                // arms above honor it implicitly via `rows.len() >= limit`
-                // / `.take(limit)`; the scalar arm has to do it explicitly
-                // because its result shape is fixed at one row.
-                let (rows, truncated) = if query.row_limit == 0 {
-                    (Vec::new(), true)
-                } else {
-                    let value = match n {
-                        Ok(v) => Value::from(v),
-                        Err(_) => Value::Null,
+                // Scalar commands. The response shape carries the answer in
+                // a single field that's documented per command name.
+                "count" => {
+                    let response = db.run_command(cmd).await.map_err(classify)?;
+                    let n = response
+                        .get_i64("n")
+                        .or_else(|_| response.get_i32("n").map(i64::from));
+                    // `row_limit == 0` is a valid grant constraint (authz
+                    // proptests generate it) and the exec invariant is
+                    // "never emit more rows than configured" — the cursor
+                    // arms above honor it implicitly via `rows.len() >= limit`
+                    // / `.take(limit)`; the scalar arm has to do it explicitly
+                    // because its result shape is fixed at one row.
+                    let (rows, truncated) = if query.row_limit == 0 {
+                        (Vec::new(), true)
+                    } else {
+                        let value = match n {
+                            Ok(v) => Value::from(v),
+                            Err(_) => Value::Null,
+                        };
+                        (vec![vec![value]], false)
                     };
-                    (vec![vec![value]], false)
-                };
-                Ok(ExecResult {
-                    columns: vec!["count".to_string()],
-                    rows,
-                    truncated,
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                })
+                    Ok(ExecResult {
+                        columns: vec!["count".to_string()],
+                        rows,
+                        truncated,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    })
+                }
+                "distinct" => {
+                    let response = db.run_command(cmd).await.map_err(classify)?;
+                    let values: Vec<Bson> =
+                        response.get_array("values").cloned().unwrap_or_default();
+                    let limit = query.row_limit as usize;
+                    let truncated = values.len() > limit;
+                    let rows: Vec<Vec<Value>> = values
+                        .into_iter()
+                        .take(limit)
+                        .map(|b| vec![bson_to_json(b)])
+                        .collect();
+                    Ok(ExecResult {
+                        columns: vec!["value".to_string()],
+                        rows,
+                        truncated,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    })
+                }
+                // Rejector already filters to find/aggregate/count/distinct.
+                // This arm exists for type-system completeness — if the
+                // rejector's allow-list and dispatch table drift, fail loudly.
+                other => Err(ExecError::Forbidden(format!(
+                    "command `{other}` is rejector-allowed but not dispatch-wired"
+                ))),
             }
-            "distinct" => {
-                let response = db.run_command(cmd).await.map_err(classify)?;
-                let values: Vec<Bson> = response.get_array("values").cloned().unwrap_or_default();
-                let limit = query.row_limit as usize;
-                let truncated = values.len() > limit;
-                let rows: Vec<Vec<Value>> = values
-                    .into_iter()
-                    .take(limit)
-                    .map(|b| vec![bson_to_json(b)])
-                    .collect();
-                Ok(ExecResult {
-                    columns: vec!["value".to_string()],
-                    rows,
-                    truncated,
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                })
-            }
-            // Rejector already filters to find/aggregate/count/distinct.
-            // This arm exists for type-system completeness — if the
-            // rejector's allow-list and dispatch table drift, fail loudly.
-            other => Err(ExecError::Forbidden(format!(
-                "command `{other}` is rejector-allowed but not dispatch-wired"
-            ))),
         }
+        .await;
+        // Command finished (success or typed error) — no orphaned operation
+        // to kill. Guard stays armed ONLY if this future is dropped while
+        // awaiting above (agent disconnect / outer `tokio::time::timeout`).
+        kill_guard.disarm();
+        result
     }
 }
 
