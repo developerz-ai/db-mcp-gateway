@@ -31,7 +31,11 @@ use super::adapter::{
     effective_timeout_ms,
 };
 
-const DEFAULT_POOL_MAX_CONNECTIONS: u32 = 5;
+/// Public so integration tests (e.g. `cancellation_real_db`) can size the
+/// saturation workload to match the pool exactly rather than duplicating the
+/// literal — a stale copy would silently stop exercising full saturation if
+/// this constant changed.
+pub const DEFAULT_POOL_MAX_CONNECTIONS: u32 = 5;
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Dedicated pool for `pg_cancel_backend(pid)` writes. Must stay separate
 /// from the main pool — if `CancelOnDrop::drop` fired through the main

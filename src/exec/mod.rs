@@ -29,7 +29,7 @@ pub use adapter::{
     AdapterKind, DEFAULT_STATEMENT_TIMEOUT_MS, DbAdapter, ExecError, ExecQuery, ExecResult,
 };
 pub use mongo::MongoAdapter;
-pub use pg::PgAdapter;
+pub use pg::{DEFAULT_POOL_MAX_CONNECTIONS, PgAdapter};
 
 /// Composite key for the registry: `(server.name, database.name)`.
 type AdapterKey = (String, String);

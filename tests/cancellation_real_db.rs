@@ -35,7 +35,7 @@ use std::time::Duration;
 use db_mcp_gateway::audit;
 use db_mcp_gateway::auth::{Identity, SessionId};
 use db_mcp_gateway::config::{Database, Password, Server, ServerKind, Tls};
-use db_mcp_gateway::exec::{DbAdapter, ExecQuery, PgAdapter};
+use db_mcp_gateway::exec::{DEFAULT_POOL_MAX_CONNECTIONS, DbAdapter, ExecQuery, PgAdapter};
 use db_mcp_gateway::state;
 use db_mcp_gateway::tools::audit_dispatch::{AuditHeader, Outcome, RequestContext, audit_dispatch};
 use db_mcp_gateway::transport::jsonrpc::Response;
@@ -356,10 +356,11 @@ async fn concurrent_aborts_do_not_queue_on_query_pool() {
             .expect("PgAdapter open"),
     );
 
-    // Match `DEFAULT_POOL_MAX_CONNECTIONS` — saturate the query pool so every
-    // slot is held by a pg_sleep. If cancels queued on this pool (the bug),
-    // none would run until statement_timeout expired.
-    const HUNG_QUERIES: usize = 5;
+    // Saturate the query pool so every slot is held by a pg_sleep. If cancels
+    // queued on this pool (the bug), none would run until statement_timeout
+    // expired. Tied to `DEFAULT_POOL_MAX_CONNECTIONS` so resizing the pool
+    // can't silently leave this test under-saturated.
+    const HUNG_QUERIES: usize = DEFAULT_POOL_MAX_CONNECTIONS as usize;
     let mut tasks = Vec::with_capacity(HUNG_QUERIES);
     for _ in 0..HUNG_QUERIES {
         let adapter_task = adapter.clone();
