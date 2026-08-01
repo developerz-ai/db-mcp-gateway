@@ -245,7 +245,7 @@ Read-only enforcement is the interesting part. Mongo doesn't have a single "READ
 
 The connection still uses a least-privilege mongo role (read-only on the target DB) — defense in depth, same posture as the pg `ro_*` roles.
 
-Timeouts via `maxTimeMS`. Row caps via cursor batch limit + total-rows enforcement at the adapter. Cancellation: dropping the cursor kills the operation server-side.
+Timeouts via `maxTimeMS`. Row caps via cursor batch limit + total-rows enforcement at the adapter. Cancellation: `killOp` on client disconnect, best-effort and requires an opt-in privilege — see [config-reference.md §Mongo](../deployment/config-reference.md#mongo) for the full contract (`statement_timeout_ms` is the guaranteed bound either way, same as pg's belt-and-suspenders `tokio::time::timeout`).
 
 Audit row shape matches pg's: same envelope (`request_id`, `user`, `server`, `database`, `outcome`, `duration_ms`), payload carries `db_kind: "mongo"` and the BSON command with sensitive values redacted by the same rules as SQL parameter redaction in [07-logging-retention](07-logging-retention.md).
 

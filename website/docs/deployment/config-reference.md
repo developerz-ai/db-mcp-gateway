@@ -61,6 +61,25 @@ Boot-time validation (issue #16):
 > enforced yet — they're commented out in `config/example.yaml` so the parser
 > doesn't reject them. Will land when the relevant features ship.
 
+### Mongo
+
+- **Minimum server version: 4.4.** The gateway stamps a `comment` field on
+  every command so a disconnected agent's operation can be found in
+  `currentOp` and cancelled — `comment` on an arbitrary command requires
+  MongoDB 4.4+. Older servers are unsupported; there is no compatibility
+  fallback.
+- **Cancellation is best-effort, and off by default.** `killOp` is a
+  cluster-admin action, not part of a least-privilege read-only role. If the
+  gateway's mongo `role` lacks it, a disconnected agent's operation keeps
+  running until it finishes or hits `statement_timeout_ms` — bounded, same
+  as before this was added, just not actively killed. To opt in, grant the
+  role the built-in `clusterManager` role (or the narrower `inprog` +
+  `killop` privileges on the `cluster` resource) in addition to its
+  read-only grant on the target database. Even with the privilege, the
+  cancel is a best-effort lookup-then-kill (see the `cancel` module docs in
+  `src/exec/mongo/cancel.rs`) — `statement_timeout_ms` remains the
+  guaranteed bound either way.
+
 ## Permission
 
 `#[serde(deny_unknown_fields)]`.
