@@ -345,16 +345,34 @@ async fn run_query_inner(
             // checks for a pending cancel between row-generation steps, so
             // the backend aborts server-side in short order rather than
             // continuing to produce rows nobody asked for.
-            let _ = sqlx::query("SELECT pg_cancel_backend($1)")
+            //
+            // Cleanup outcome is deliberately NOT propagated to the caller:
+            // the truncated rows already collected are the result, and a
+            // valid truncated read must not be turned into a client-visible
+            // failure by cleanup noise. `pg_cancel_backend` returning `false`
+            // just means the backend is already gone (per Postgres docs) —
+            // equivalent to success for our purposes. Either cancel or
+            // rollback failing is logged at `warn` so operators still see it
+            // (the DB contract is documented in `docs/initial-idea/05-credentials.md`).
+            if sqlx::query("SELECT pg_cancel_backend($1)")
                 .bind(pid)
                 .execute(cancel_pool)
-                .await;
+                .await
+                .is_err()
+            {
+                // Same log shape as `CancelOnDrop::drop` — pid is enough for
+                // the operator to find the backend; sqlx error text is not
+                // included because its Display can quote the DSN on some
+                // variants (Configuration), and the request path never
+                // leaks credentials.
+                tracing::warn!(pid, "pg_cancel_backend on truncation failed");
+            }
             // The backend is now in an aborted-transaction state — only
             // ROLLBACK is valid on it, and this is a read-only query with
-            // nothing to lose by discarding the transaction. Errors here are
-            // expected and ignored: the truncated rows already collected are
-            // the result regardless of how the rollback itself resolves.
-            let _ = tx.rollback().await;
+            // nothing to lose by discarding the transaction.
+            if tx.rollback().await.is_err() {
+                tracing::warn!(pid, "rollback after truncation failed");
+            }
         } else {
             tx.commit().await.map_err(classify)?;
         }

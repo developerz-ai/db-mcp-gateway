@@ -28,10 +28,23 @@ Every database gets its **own** Postgres role. Not one role per server. Not one 
 | Privilege | `SELECT` on intended schemas; nothing else by default |
 | `statement_timeout` | Set on the role (`ALTER ROLE … SET statement_timeout`) — defense in depth on top of the gateway's own timeout |
 | `idle_in_transaction_session_timeout` | Short — read-only debugging doesn't need long transactions |
-| Row cap | Enforced gateway-side via `LIMIT` rewriting *and* by streaming the cursor and disconnecting at N |
+| Row cap | Enforced gateway-side by streaming the cursor, breaking at N, and cancelling the backend so it stops generating rows nobody asked for (see below) |
 | Naming | `mcp_gateway_<env>_<db>_ro` — boring, traceable in DB-side logs |
 
 The repo will ship example SQL for provisioning these roles (see [09-deployment](09-deployment.md)).
+
+### Row cap: cancel on truncate
+
+`row_limit` must bound **server-side** work, not just the client-visible row count. sqlx always issues the extended-protocol portal `Execute` with `limit: 0` (no server-side row cap — deliberate, to avoid parallel-worker pessimization), so breaking the Rust-side read loop at N does NOT stop Postgres from generating and queueing the rest of the result. The pooled connection cannot accept the next command (`COMMIT` included) until that queued traffic is fully read — `wait_until_ready` drains it silently on the next `.await`. That defeats the row cap on exactly the queries where it matters.
+
+Contract:
+
+- On truncation, the exec layer fires `pg_cancel_backend(pid)` through the dedicated **cancel pool** — same mechanism used for a client disconnect, invoked inline. The backend then aborts server-side rather than continuing to produce rows nobody asked for.
+- The now-aborted transaction only accepts `ROLLBACK`, so the exec layer follows the cancel with `tx.rollback()` instead of `tx.commit()`.
+- **Cleanup failures do not fail the request.** The truncated rows already collected are the result. `pg_cancel_backend` returning `false` means the backend is already gone (equivalent to success); either that or a `rollback` error is logged at `warn` level for observability, never surfaced to the client — a valid truncated read must not be turned into a failure by cleanup noise.
+- The non-truncated path is unchanged: plain `tx.commit()`, errors propagated as `ExecError::Sql` / `Unavailable`.
+
+Cancellation safety (CLAUDE.md §Cancellation safety) still holds: if the request future is dropped mid-query (agent disconnect / outer `tokio::time::timeout`), the `CancelOnDrop` guard fires `pg_cancel_backend` from a detached task. Disarming happens only after the inline cleanup returns, so a hang during rollback still hands the cancel off to the guard on outer-timeout kick-in.
 
 ## Why not IAM auth alone?
 

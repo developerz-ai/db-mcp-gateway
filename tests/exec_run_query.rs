@@ -101,11 +101,13 @@ async fn row_limit_truncates_and_flags() {
 /// (`COMMIT`) silently drains every remaining row before it can proceed —
 /// on exactly the query shape a row cap exists to protect against.
 ///
-/// `pg_sleep(0.01)` per row makes the *drain* cost measurable: 300 rows at
-/// 10ms each is 3s if fully drained, but `row_limit: 5` should only ever
-/// pay for the first handful of rows plus cancel latency. Bounded well
-/// under the full-drain time proves the cap actually bounds server-side
-/// work, not just the client-visible row count.
+/// `generate_series(1, 100_000_000)` is the amplifier: rows are produced
+/// cheaply and continuously, so Postgres queues far more than the 5-row
+/// cap wants long before we can break out of the loop. Under the pre-fix
+/// always-commit path this test measured ~29s (full drain) against
+/// ~565ms with cancel-on-truncate. Bounding this at 2s proves the cap
+/// actually bounds server-side work, not just the client-visible row
+/// count — a full drain cannot possibly finish that fast.
 #[tokio::test]
 async fn truncated_query_cancels_instead_of_draining_the_rest() {
     let a = adapter().await;
