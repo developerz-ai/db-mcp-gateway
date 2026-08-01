@@ -484,6 +484,15 @@ async fn authorize_route_is_concurrency_limited() {
         reqwest::StatusCode::SERVICE_UNAVAILABLE,
         "expected 503 with a zero-permit global cap — /authorize is not routed through limit::enforce"
     );
+    // Overload contract: `Retry-After: 1` alongside 503 (03-mcp-tools spec).
+    // Missing the header lets clients retry immediately and re-flood the cap.
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("1"),
+        "503 service_overloaded must set Retry-After: 1"
+    );
     let body: Value = resp.json().await.expect("503 body is JSON");
     assert_eq!(body["error"]["code"], "service_overloaded");
 }
