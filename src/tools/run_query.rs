@@ -179,8 +179,12 @@ async fn compute_outcome(
     let row_limit = effective_row_limit(args.limit, constraints.row_limit);
     let timeout_ms = constraints.statement_timeout_ms;
 
+    // No explicit `request_id` field here — this event fires inside the
+    // `tool_dispatch` span entered by `dispatch_call`, which already carries
+    // it (span context propagates to child events for any consumer that
+    // renders span fields, e.g. Loki via Alloy). Not threading `request_ctx`
+    // into `compute_outcome` just to duplicate a field the span already has.
     tracing::info!(
-        request_id = %id,
         user_sub = %identity.user_sub,
         server = %server.name,
         db = %database.name,

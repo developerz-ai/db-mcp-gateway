@@ -166,7 +166,7 @@ where
         // we refuse before running the tool. `duration_ms = 0` because no
         // tool work happened.
         tracing::info!(
-            request_id = %id,
+            request_id = %request_ctx.request_id,
             user_sub = %identity.user_sub,
             tool = %header.tool,
             server = header.server.unwrap_or(""),
@@ -202,7 +202,7 @@ where
     let mut cancel_guard = CancelledAuditGuard {
         row: Some(AuditRow {
             id: audit_id,
-            request_id: id.to_string(),
+            request_id: request_ctx.request_id.to_string(),
             user_sub: identity.user_sub.clone(),
             user_email: identity.user_email.clone(),
             groups: identity.groups.clone(),
@@ -249,7 +249,7 @@ where
     // per-tool code. `server` + `db` together fully scope the call per spec
     // 03; emitting only `db` makes correlation ambiguous across servers.
     tracing::info!(
-        request_id = %id,
+        request_id = %request_ctx.request_id,
         user_sub = %identity.user_sub,
         tool = %header.tool,
         server = header.server.unwrap_or(""),
@@ -261,7 +261,7 @@ where
 
     let row = AuditRow {
         id: audit_id,
-        request_id: id.to_string(),
+        request_id: request_ctx.request_id.to_string(),
         user_sub: identity.user_sub.clone(),
         user_email: identity.user_email.clone(),
         groups: identity.groups.clone(),
@@ -299,7 +299,7 @@ where
         // operator-visible via tracing only.
         tracing::error!(
             %err,
-            request_id = %id,
+            request_id = %request_ctx.request_id,
             user_sub = %identity.user_sub,
             tool = %header.tool,
             server = header.server.unwrap_or(""),

@@ -170,3 +170,81 @@ async fn completed_dispatch_does_not_leave_cancelled_row() {
         .await
         .unwrap();
 }
+
+/// Regression for the #136 audit finding "audit request_id is the raw
+/// client-controlled JSON-RPC id": `audit_calls.request_id` must be a
+/// gateway-minted UUID, not derived from the caller's `id` — which is
+/// arbitrary JSON (a string with embedded quotes here, exercising the
+/// exact shape that used to leak `"` characters straight into the column
+/// via `id.to_string()`).
+#[tokio::test]
+async fn audit_row_request_id_is_gateway_uuid_not_client_id() {
+    use db_mcp_gateway::tools::audit_dispatch::Outcome;
+    use db_mcp_gateway::transport::jsonrpc::Response;
+
+    let p = pool().await;
+    let user = format!("cancel-test-{}", Uuid::new_v4().simple());
+    // Deliberately hostile client id: embedded quotes, the exact shape that
+    // used to end up verbatim (with escaping) in `audit_calls.request_id`
+    // under `id.to_string()`.
+    let id = Value::from(r#"weird"client"id"#);
+    // `from_request` mints a real UUID, same as the production transport
+    // layer — `default()` (nil UUID) is used elsewhere in this file where
+    // the value doesn't matter; here it's the whole point.
+    let ctx = RequestContext::from_request(None, None);
+    let expected_request_id = ctx.request_id.to_string();
+
+    let identity = identity(&user);
+    let header = AuditHeader {
+        tool: "run_query",
+        server: Some("prod"),
+        database: Some("app"),
+        sql: Some("SELECT 1"),
+        reason: None,
+        db_type: Some("postgres"),
+    };
+    let id_for_outcome = id.clone();
+    let work = async move {
+        Outcome {
+            response: Response::result(id_for_outcome, &serde_json::json!({"ok":true})),
+            code: "success",
+            elapsed_ms: Some(1),
+            row_count: Some(1),
+            truncated: Some(false),
+            error_message: None,
+        }
+    };
+    let _ = audit_dispatch(id.clone(), &identity, Some(&p), &ctx, header, work).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let row = audit::latest_for_user_tool(&p, &user, "run_query")
+        .await
+        .expect("audit query runs")
+        .expect("audit row was written");
+
+    assert_eq!(
+        row.request_id, expected_request_id,
+        "audit row must carry the gateway-minted request_id from RequestContext"
+    );
+    assert!(
+        Uuid::parse_str(&row.request_id).is_ok(),
+        "request_id must be a well-formed UUID, got {:?}",
+        row.request_id
+    );
+    assert!(
+        !row.request_id.contains('"'),
+        "request_id must never carry the raw client id's quoting, got {:?}",
+        row.request_id
+    );
+    assert_ne!(
+        row.request_id,
+        id.to_string(),
+        "request_id must NOT be derived from the client's JSON-RPC id"
+    );
+
+    sqlx::query("DELETE FROM audit_calls WHERE user_sub = $1")
+        .bind(&user)
+        .execute(&p)
+        .await
+        .unwrap();
+}
