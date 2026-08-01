@@ -20,6 +20,7 @@ pub mod sample_table;
 use serde::Deserialize;
 use serde_json::Value;
 use sqlx::PgPool;
+use tracing::Instrument;
 use tracing::info_span;
 
 use crate::auth::Identity;
@@ -144,90 +145,101 @@ pub async fn dispatch_call(
         server = span_server,
         db = span_database,
     );
-    let _enter = span.enter();
 
-    match call.name.as_str() {
-        LIST_SERVERS => {
-            list_servers::run(
+    // `.instrument(span)`, not `span.enter()` held across the `.await`s
+    // below. A sync `Entered` guard doesn't track task suspension on a
+    // multi-threaded runtime: while this future is parked at an `.await`,
+    // the executor can poll a DIFFERENT task on the same OS thread, and
+    // that task's log events would be misattributed into this span until
+    // this future resumes and the guard finally drops. `Instrument`
+    // properly enters/exits the span around each individual poll, so
+    // interleaved tasks never see it as "current."
+    async move {
+        match call.name.as_str() {
+            LIST_SERVERS => {
+                list_servers::run(
+                    id,
+                    identity,
+                    config,
+                    permissions_cache,
+                    state_db,
+                    request_ctx,
+                    call.arguments,
+                )
+                .await
+            }
+            LIST_DATABASES => {
+                list_databases::run(
+                    id,
+                    identity,
+                    config,
+                    permissions_cache,
+                    state_db,
+                    request_ctx,
+                    call.arguments,
+                )
+                .await
+            }
+            DESCRIBE_SCHEMA => {
+                describe_schema::run(
+                    id,
+                    identity,
+                    config,
+                    registry,
+                    permissions_cache,
+                    state_db,
+                    request_ctx,
+                    call.arguments,
+                )
+                .await
+            }
+            SAMPLE_TABLE => {
+                sample_table::run(
+                    id,
+                    identity,
+                    config,
+                    registry,
+                    permissions_cache,
+                    state_db,
+                    request_ctx,
+                    call.arguments,
+                )
+                .await
+            }
+            EXPLAIN => {
+                explain::run(
+                    id,
+                    identity,
+                    config,
+                    registry,
+                    permissions_cache,
+                    state_db,
+                    request_ctx,
+                    call.arguments,
+                )
+                .await
+            }
+            RUN_QUERY => {
+                run_query::run(
+                    id,
+                    identity,
+                    config,
+                    registry,
+                    permissions_cache,
+                    state_db,
+                    request_ctx,
+                    call.arguments,
+                )
+                .await
+            }
+            other => Response::error(
                 id,
-                identity,
-                config,
-                permissions_cache,
-                state_db,
-                request_ctx,
-                call.arguments,
-            )
-            .await
+                ErrorObject::invalid_params(format!("unknown tool: {other}")),
+            ),
         }
-        LIST_DATABASES => {
-            list_databases::run(
-                id,
-                identity,
-                config,
-                permissions_cache,
-                state_db,
-                request_ctx,
-                call.arguments,
-            )
-            .await
-        }
-        DESCRIBE_SCHEMA => {
-            describe_schema::run(
-                id,
-                identity,
-                config,
-                registry,
-                permissions_cache,
-                state_db,
-                request_ctx,
-                call.arguments,
-            )
-            .await
-        }
-        SAMPLE_TABLE => {
-            sample_table::run(
-                id,
-                identity,
-                config,
-                registry,
-                permissions_cache,
-                state_db,
-                request_ctx,
-                call.arguments,
-            )
-            .await
-        }
-        EXPLAIN => {
-            explain::run(
-                id,
-                identity,
-                config,
-                registry,
-                permissions_cache,
-                state_db,
-                request_ctx,
-                call.arguments,
-            )
-            .await
-        }
-        RUN_QUERY => {
-            run_query::run(
-                id,
-                identity,
-                config,
-                registry,
-                permissions_cache,
-                state_db,
-                request_ctx,
-                call.arguments,
-            )
-            .await
-        }
-        other => Response::error(
-            id,
-            ErrorObject::invalid_params(format!("unknown tool: {other}")),
-        ),
     }
+    .instrument(span)
+    .await
 }
 
 /// Pull `server`/`database` out of `tools/call` arguments for the dispatch
