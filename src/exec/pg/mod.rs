@@ -13,23 +13,42 @@
 //!    the gateway allows) is resolved by
 //!    [`super::adapter::effective_timeout_ms`], so no query can pin a pool
 //!    connection indefinitely and no grant can loosen past the ceiling.
+//!
+//! Split by responsibility: `cancel` owns the drop-guard cancellation,
+//! `truncate` owns the row-cap cleanup, `decode` owns row → JSON and
+//! `sqlx::Error` → `ExecError`, `config` owns password resolution and
+//! `PgConnectOptions` construction. This file keeps only the adapter shape
+//! and `run_query_inner` orchestration.
+
+mod cancel;
+mod config;
+mod decode;
+mod truncate;
 
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use metrics::gauge;
-use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow, PgSslMode};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::{Column, Executor, PgPool, Row};
 
-use crate::config::{Database, Password, Server, Tls};
+use crate::config::{Database, Server};
 
 use super::adapter::{
     AdapterKind, DbAdapter, ExecError, ExecQuery, ExecResult, TOKIO_TIMEOUT_SLACK_MS,
     effective_timeout_ms,
 };
+
+use cancel::CancelOnDrop;
+use config::build_connect_options;
+use decode::{classify, decode_row};
+use truncate::cancel_and_rollback;
+
+// Re-exported so `super::pg::resolve_password` keeps working for sibling
+// adapters (mongo::MongoAdapter::open) without exposing the config submodule.
+pub(crate) use config::resolve_password;
 
 /// Public so integration tests (e.g. `cancellation_real_db`) can size the
 /// saturation workload to match the pool exactly rather than duplicating the
@@ -45,7 +64,7 @@ const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 /// `statement_timeout` expires). Sized to 2 so a burst of concurrent
 /// disconnects gets two round-trips in parallel; cancels are single-round
 /// and cheap, no need for more.
-const CANCEL_POOL_MAX_CONNECTIONS: u32 = 2;
+pub(super) const CANCEL_POOL_MAX_CONNECTIONS: u32 = 2;
 
 /// Per-`(server, database)` Postgres adapter. Wraps a `PgPool`; one instance
 /// per logical DB so a slow query on DB A can never block DB B.
@@ -150,119 +169,6 @@ impl DbAdapter for PgAdapter {
     }
 }
 
-fn build_connect_options(
-    server: &Server,
-    database: &Database,
-    password: &SecretString,
-) -> PgConnectOptions {
-    PgConnectOptions::new()
-        .host(&server.host)
-        .port(server.port)
-        .username(&database.role)
-        // The sqlx boundary: the plaintext `&str` exists only for this builder
-        // call, then lives inside `PgConnectOptions` (fed to the pool, dropped).
-        .password(password.expose_secret())
-        .database(&database.name)
-        .ssl_mode(match server.tls {
-            Tls::Required => PgSslMode::Require,
-            Tls::Insecure => PgSslMode::Disable,
-        })
-}
-
-/// Adapt `Password::resolve` into `ExecError`. The boot-time walk in
-/// `ConfigFile::resolve_secrets` already failed fast on every unresolvable
-/// ref — but pools are opened lazily, so a `${FILE:…}` mount that disappears
-/// after boot (rotation gone wrong) still needs a structured error here.
-///
-/// Visible to sibling adapters (`mongo::MongoAdapter::open`) — the
-/// resolution rules are identical regardless of backend, and the
-/// `ExecError` mapping is the same in every call site.
-pub(super) fn resolve_password(password: &Password) -> Result<SecretString, ExecError> {
-    use crate::config::SecretError;
-    password.resolve().map_err(|err| match err {
-        SecretError::EnvNotSet(name) | SecretError::EnvNotUtf8(name) => {
-            ExecError::PasswordUnresolved {
-                kind: "env",
-                reference: name,
-            }
-        }
-        SecretError::FileUnreadable { path, .. } | SecretError::FileEmpty(path) => {
-            ExecError::PasswordUnresolved {
-                kind: "file",
-                reference: path.display().to_string(),
-            }
-        }
-        // Keep the stable `(kind, reference)` tool-facing shape: `kind` is the
-        // category, the scheme goes into `reference`. Emitting `kind: "vault"`
-        // would force tool callers to match on every supported backend name.
-        SecretError::BackendNotImplemented(scheme) => ExecError::PasswordUnresolved {
-            kind: "backend",
-            reference: scheme,
-        },
-        // Malformed refs are caught at YAML parse time, never reach here —
-        // but stay structured rather than panic if invariants drift. No
-        // payload is available (and intentionally so: the raw token could
-        // be a typo'd plaintext password — see `SecretError::Malformed`).
-        SecretError::Malformed => ExecError::PasswordUnresolved {
-            kind: "malformed",
-            reference: String::new(),
-        },
-    })
-}
-
-/// Fires `pg_cancel_backend(pid)` from a detached task if dropped while
-/// armed — the server-side half of cancellation safety (CLAUDE.md
-/// *§Cancellation safety*).
-///
-/// Why this is necessary: when the agent disconnects, axum drops the handler
-/// future and with it this query future, mid-`.await`. Dropping a sqlx
-/// `Transaction` does NOT stop the query already running on the Postgres
-/// backend — it only closes the client socket. The backend keeps executing
-/// until it finishes or hits `statement_timeout`, pinning a pool connection
-/// for up to the full timeout after the client is gone. So we capture the
-/// backend PID up front and, on drop, cancel it over the **cancel pool** —
-/// a pool that is deliberately separate from the query pool. Using the
-/// query pool would have `execute` queue on `acquire()` behind the very
-/// connections the cancels are trying to free (see
-/// [`CANCEL_POOL_MAX_CONNECTIONS`]).
-///
-/// Disarmed on the normal path once the query has run to completion, so a
-/// cleanly-returned connection is never targeted — otherwise a late cancel
-/// could hit an unrelated query that reused the same backend PID.
-struct CancelOnDrop {
-    /// `Some` while armed: the cancel pool (never the main query pool) and
-    /// the backend PID to cancel.
-    armed: Option<(PgPool, i32)>,
-}
-
-impl CancelOnDrop {
-    fn disarm(&mut self) {
-        self.armed = None;
-    }
-}
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        let Some((pool, pid)) = self.armed.take() else {
-            return;
-        };
-        // Detached: the parent future is being dropped, so we can't await the
-        // cancel inline. The spawn outlives this Drop and runs on a fresh
-        // connection. No error Display in the log — this is the request path,
-        // and `pid` alone tells the operator which backend failed to cancel.
-        tokio::spawn(async move {
-            if sqlx::query("SELECT pg_cancel_backend($1)")
-                .bind(pid)
-                .execute(&pool)
-                .await
-                .is_err()
-            {
-                tracing::warn!(pid, "pg_cancel_backend on drop failed");
-            }
-        });
-    }
-}
-
 async fn run_query_inner(
     pool: &PgPool,
     cancel_pool: &PgPool,
@@ -281,9 +187,7 @@ async fn run_query_inner(
         .fetch_one(&mut *tx)
         .await
         .map_err(classify)?;
-    let mut cancel = CancelOnDrop {
-        armed: Some((cancel_pool.clone(), pid)),
-    };
+    let mut cancel = CancelOnDrop::armed(cancel_pool.clone(), pid);
 
     // Run the statement under the guard. By the time this block resolves — Ok
     // OR Err — the backend has stopped executing our query, so we disarm
@@ -324,10 +228,19 @@ async fn run_query_inner(
                 }
                 rows.push(decode_row(&row));
             }
-            // Stream is dropped here so the borrow on `tx` ends and we can commit.
+            // Stream is dropped here so the borrow on `tx` ends.
         }
 
-        tx.commit().await.map_err(classify)?;
+        if truncated {
+            // Truncation cleanup: cancel the backend so it stops generating
+            // rows nobody asked for, then rollback the (now-aborted) tx.
+            // Cleanup failures are logged at `warn` but do NOT fail the
+            // request — see [`truncate::cancel_and_rollback`] and
+            // `docs/initial-idea/05-credentials.md` for the contract.
+            cancel_and_rollback(tx, cancel_pool, pid).await;
+        } else {
+            tx.commit().await.map_err(classify)?;
+        }
 
         Ok(ExecResult {
             columns,
@@ -342,105 +255,9 @@ async fn run_query_inner(
     result
 }
 
-fn classify(err: sqlx::Error) -> ExecError {
-    // Postgres `statement_timeout` raises SQLSTATE `57014` (`query_canceled`).
-    if let sqlx::Error::Database(db) = &err
-        && let Some(code) = db.code()
-        && code == "57014"
-    {
-        return ExecError::Timeout;
-    }
-    if matches!(err, sqlx::Error::PoolTimedOut | sqlx::Error::Io(_)) {
-        return ExecError::Unavailable;
-    }
-    ExecError::Sql
-}
-
-fn decode_row(row: &PgRow) -> Vec<Value> {
-    (0..row.columns().len())
-        .map(|i| decode_value(row, i))
-        .collect()
-}
-
-/// Best-effort value decode for the common Postgres types. Real schema-aware
-/// type handling (timestamps, arrays) arrives with the tools that need them
-/// — for now anything we can't recognise serialises as `null`.
-fn decode_value(row: &PgRow, idx: usize) -> Value {
-    // JSON / JSONB first — these come back as opaque types that don't
-    // decode as String. Without this, an `EXPLAIN (FORMAT JSON)` plan or
-    // any `jsonb` column would surface to clients as `null`.
-    if let Ok(json) = row.try_get::<sqlx::types::Json<Value>, _>(idx) {
-        return json.0;
-    }
-    // NULL has no concrete type to probe against; let it fall through to the
-    // Option-of-string check which is the most permissive null detection.
-    if let Ok(None) = row.try_get::<Option<String>, _>(idx) {
-        return Value::Null;
-    }
-    if let Ok(v) = row.try_get::<i64, _>(idx) {
-        return Value::from(v);
-    }
-    if let Ok(v) = row.try_get::<i32, _>(idx) {
-        return Value::from(v);
-    }
-    if let Ok(v) = row.try_get::<f64, _>(idx) {
-        return Value::from(v);
-    }
-    if let Ok(v) = row.try_get::<bool, _>(idx) {
-        return Value::from(v);
-    }
-    if let Ok(v) = row.try_get::<String, _>(idx) {
-        return Value::from(v);
-    }
-    Value::Null
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resolve_password_handles_each_form() {
-        assert_eq!(
-            resolve_password(&Password::Literal("hunter2".into()))
-                .unwrap()
-                .expose_secret(),
-            "hunter2"
-        );
-
-        let env_name = "DB_MCP_EXEC_TEST_PW";
-        // SAFETY: test sets and clears a unique env var; nothing else reads it.
-        unsafe {
-            std::env::set_var(env_name, "from-env");
-        }
-        assert_eq!(
-            resolve_password(&Password::EnvVar(env_name.into()))
-                .unwrap()
-                .expose_secret(),
-            "from-env"
-        );
-        unsafe {
-            std::env::remove_var(env_name);
-        }
-        assert!(matches!(
-            resolve_password(&Password::EnvVar(env_name.into())),
-            Err(ExecError::PasswordUnresolved { kind: "env", .. })
-        ));
-
-        // `kind: "backend"` keeps the tool-facing shape stable across
-        // backends; the scheme rides along in `reference` so operators can
-        // still tell vault from aws-sm in logs.
-        match resolve_password(&Password::SecretBackend {
-            scheme: "vault".into(),
-            reference: "secret/path".into(),
-        }) {
-            Err(ExecError::PasswordUnresolved { kind, reference }) => {
-                assert_eq!(kind, "backend");
-                assert_eq!(reference, "vault");
-            }
-            other => panic!("expected PasswordUnresolved {{ kind: backend, .. }}, got {other:?}"),
-        }
-    }
 
     #[test]
     fn exec_error_display_carries_no_secrets() {

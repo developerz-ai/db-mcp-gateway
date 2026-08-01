@@ -78,6 +78,32 @@ async fn quick_query_succeeds_with_columns_and_rows() {
     assert!(!result.truncated);
 }
 
+/// sqlx 0.8 rejects width-mismatched decodes at the OID layer: a
+/// `SMALLINT` (`INT2`) won't come out through the `i32` probe, nor `REAL`
+/// (`FLOAT4`) through `f64`. Without dedicated `i16`/`f32` branches the
+/// fallback silently returns `Value::Null` — a data-integrity bug on
+/// perfectly ordinary column types. This pins each numeric width to its
+/// probe so a future refactor can't drop one and re-open the hole.
+#[tokio::test]
+async fn decodes_every_numeric_width_not_just_i64_and_f64() {
+    let a = adapter().await;
+    let result = a
+        .execute(query(
+            "SELECT 7::int2 AS s, 42::int4 AS i, 99::int8 AS b, \
+             1.5::float4 AS r, 2.5::float8 AS d",
+            None,
+            10,
+        ))
+        .await
+        .expect("mixed-width numeric SELECT runs");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], serde_json::Value::from(7i16));
+    assert_eq!(result.rows[0][1], serde_json::Value::from(42i32));
+    assert_eq!(result.rows[0][2], serde_json::Value::from(99i64));
+    assert_eq!(result.rows[0][3], serde_json::Value::from(1.5f32));
+    assert_eq!(result.rows[0][4], serde_json::Value::from(2.5f64));
+}
+
 #[tokio::test]
 async fn row_limit_truncates_and_flags() {
     let a = adapter().await;
@@ -91,6 +117,47 @@ async fn row_limit_truncates_and_flags() {
         .expect("series query runs");
     assert_eq!(result.rows.len(), 10);
     assert!(result.truncated, "expected truncated=true beyond row_limit");
+}
+
+/// Regression for the #136 audit finding "row cap doesn't bound work":
+/// sqlx always issues the portal `Execute` with `limit: 0` (no server-side
+/// row cap), so breaking the Rust-side read loop early does NOT stop
+/// Postgres from generating and queueing the rest of the result. Without an
+/// active cancel on truncation, the next `.await` on that connection
+/// (`COMMIT`) silently drains every remaining row before it can proceed —
+/// on exactly the query shape a row cap exists to protect against.
+///
+/// `generate_series(1, 100_000_000)` is the amplifier: rows are produced
+/// cheaply and continuously, so Postgres queues far more than the 5-row
+/// cap wants long before we can break out of the loop. Under the pre-fix
+/// always-commit path this test measured ~29s (full drain) against
+/// ~565ms with cancel-on-truncate. Bounding this at 2s proves the cap
+/// actually bounds server-side work, not just the client-visible row
+/// count — a full drain cannot possibly finish that fast.
+#[tokio::test]
+async fn truncated_query_cancels_instead_of_draining_the_rest() {
+    let a = adapter().await;
+    let started = Instant::now();
+    let result = a
+        .execute(query(
+            "SELECT generate_series(1, 100000000)::int8 AS n",
+            Some(30_000),
+            5,
+        ))
+        .await
+        .expect("truncated query still succeeds, not times out");
+    let elapsed = started.elapsed();
+
+    assert_eq!(result.rows.len(), 5);
+    assert!(result.truncated);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "truncated query took {elapsed:?} — a 100M-row `generate_series` \
+         streams cheaply-produced rows continuously, so postgres queues far \
+         more than the row cap wants; if the connection has to drain that \
+         instead of cancelling the backend, this takes several seconds. \
+         Row cap did not bound server-side work (cancel-on-truncate regression)"
+    );
 }
 
 /// The headline #4 acceptance: a query exceeding `statement_timeout_ms` is
