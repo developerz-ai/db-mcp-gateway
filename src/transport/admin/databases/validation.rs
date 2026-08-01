@@ -15,6 +15,17 @@ pub(super) fn invalid_id(request_id: &str) -> AdminError {
     AdminError::invalid("invalid database id").with_request_id(request_id)
 }
 
+/// Validates `server` and `db_name` on create/patch. Beyond non-empty, the
+/// bare string `"*"` is rejected: it's the magic wildcard marker the authz
+/// evaluator checks for (`grant.server == "*"` / `grant.database == "*"` —
+/// see `authz::mod::can_see_server` / `matches`). A `permissions_databases`
+/// row literally named `"*"` would make every `Specific`-target grant
+/// pointing at it silently match every database on the server (or, for
+/// `server == "*"`, every server on the gateway) — an authz escalation an
+/// admin naming a database `"*"` would not expect or intend. The supported
+/// way to grant a wildcard is `GrantTarget::Wildcard` via
+/// `db_name_wildcard: true` + `database_id: null` on `/admin/v1/grants`,
+/// never a literal `db_name`.
 pub(super) fn trimmed_non_empty(
     value: &str,
     field: &str,
@@ -22,10 +33,18 @@ pub(super) fn trimmed_non_empty(
 ) -> Result<String, AdminError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        Err(AdminError::invalid(format!("{field} must be non-empty")).with_request_id(request_id))
-    } else {
-        Ok(trimmed.to_string())
+        return Err(
+            AdminError::invalid(format!("{field} must be non-empty")).with_request_id(request_id)
+        );
     }
+    if trimmed == "*" {
+        return Err(AdminError::invalid(format!(
+            "{field} cannot be the literal `*` — that string is reserved for wildcard grants \
+             (see db_name_wildcard on /admin/v1/grants)"
+        ))
+        .with_request_id(request_id));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Reject anything outside the `permissions_databases.db_type` CHECK (currently
@@ -58,4 +77,54 @@ pub(super) fn internal<E>(stage: &'static str, _err: E, request_id: &str) -> Adm
         "admin databases endpoint failed"
     );
     AdminError::internal().with_request_id(request_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trimmed_non_empty_accepts_and_trims_ordinary_names() {
+        assert_eq!(
+            trimmed_non_empty("  prod  ", "server", "req-1").unwrap(),
+            "prod"
+        );
+    }
+
+    #[test]
+    fn trimmed_non_empty_rejects_empty_and_whitespace_only() {
+        assert!(trimmed_non_empty("", "db_name", "req-1").is_err());
+        assert!(trimmed_non_empty("   ", "db_name", "req-1").is_err());
+    }
+
+    /// Regression for the #136 audit finding "permissions_databases rows
+    /// named `*` become wildcard grants; nothing rejects the sentinel" — a
+    /// `server`/`db_name` of exactly `"*"` must be rejected at the admin
+    /// API edge, before it ever reaches `permissions_databases` and gets
+    /// picked up as a false wildcard by the authz evaluator.
+    #[test]
+    fn trimmed_non_empty_rejects_bare_wildcard_sentinel() {
+        let err = trimmed_non_empty("*", "db_name", "req-1").unwrap_err();
+        assert!(format!("{err:?}").contains("reserved for wildcard grants"));
+        let err = trimmed_non_empty("*", "server", "req-1").unwrap_err();
+        assert!(format!("{err:?}").contains("reserved for wildcard grants"));
+    }
+
+    /// Whitespace padding around the sentinel must not slip past the check —
+    /// the comparison runs on the already-trimmed value.
+    #[test]
+    fn trimmed_non_empty_rejects_wildcard_sentinel_with_padding() {
+        assert!(trimmed_non_empty("  *  ", "db_name", "req-1").is_err());
+    }
+
+    /// A name that merely *contains* `*` (not equal to it) is a legitimate
+    /// database name and must NOT be rejected — only the bare sentinel is
+    /// magic to the evaluator.
+    #[test]
+    fn trimmed_non_empty_allows_names_containing_but_not_equal_to_asterisk() {
+        assert_eq!(
+            trimmed_non_empty("prod-*-shard", "db_name", "req-1").unwrap(),
+            "prod-*-shard"
+        );
+    }
 }

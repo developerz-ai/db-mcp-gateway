@@ -404,6 +404,117 @@ async fn unknown_db_type_is_rejected() {
     h.cleanup().await;
 }
 
+/// Regression for the #136 audit finding "permissions_databases rows named
+/// `*` become wildcard grants; nothing rejects the sentinel". `"*"` is the
+/// magic string the authz evaluator treats as a wildcard match
+/// (`grant.server == "*"` / `grant.database == "*"`) — a database row
+/// literally named `"*"` would make every `Specific`-target grant pointing
+/// at it silently behave as a wildcard, an authz escalation an admin
+/// creating a database named `"*"` would not expect. Both `server` and
+/// `db_name` must be rejected at create; no row, no audit row either way.
+#[tokio::test]
+async fn wildcard_sentinel_db_name_is_rejected() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
+
+    let resp = client()
+        .post(format!("{}/admin/v1/databases", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&json!({
+            "server": "prod",
+            "db_name": "*",
+            "db_type": "postgres",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err: Value = resp.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "invalid_request");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("db_name"),
+        "error message must name the field; got {err}"
+    );
+
+    h.cleanup().await;
+}
+
+/// Same sentinel check on `server` — `grant.server == "*"` is an even wider
+/// escalation than `db_name`, matching every server on the gateway rather
+/// than every database on one server.
+#[tokio::test]
+async fn wildcard_sentinel_server_is_rejected() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
+
+    let resp = client()
+        .post(format!("{}/admin/v1/databases", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&json!({
+            "server": "*",
+            "db_name": format!("app-{}", Uuid::new_v4().simple()),
+            "db_type": "postgres",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err: Value = resp.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "invalid_request");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("server"),
+        "error message must name the field; got {err}"
+    );
+
+    h.cleanup().await;
+}
+
+/// The sentinel check must also apply to PATCH — renaming an existing
+/// database to `"*"` is the same escalation as creating one with that name.
+#[tokio::test]
+async fn patch_to_wildcard_sentinel_db_name_is_rejected() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
+
+    let create: Value = client()
+        .post(format!("{}/admin/v1/databases", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&json!({
+            "server": "prod",
+            "db_name": format!("app-{}", Uuid::new_v4().simple()),
+            "db_type": "postgres",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id: Uuid = create["id"].as_str().unwrap().parse().unwrap();
+    h.track_db(id);
+
+    let resp = client()
+        .patch(format!("{}/admin/v1/databases/{}", h.base_url, id))
+        .bearer_auth(&jwt)
+        .json(&json!({ "db_name": "*" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err: Value = resp.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "invalid_request");
+
+    h.cleanup().await;
+}
+
 #[tokio::test]
 async fn patch_updates_and_audits_before_and_after() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
