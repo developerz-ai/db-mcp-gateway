@@ -117,7 +117,13 @@ impl Harness {
     }
 }
 
-async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
+/// Single gateway builder shared by both entry points. `cache = Some(_)` wires
+/// the resolver cache into `AppState`; `None` mirrors a YAML-only install and
+/// keeps the cache-free tests honest. Kept private so every AppState field
+/// addition lands in exactly one place.
+async fn spawn_gateway_inner(
+    cache: Option<PermissionsCache>,
+) -> (Harness, AuthConfig, SessionStore) {
     let pool = pool().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -164,7 +170,7 @@ async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
             state_db: Some(pool.clone()),
             shutdown: Default::default(),
             metrics: None,
-            permissions_cache: None,
+            permissions_cache: cache,
             permissions_repo: Some(repo),
             mcp_path: std::sync::Arc::from("/mcp"),
             client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
@@ -188,6 +194,10 @@ async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
         auth_config,
         sessions,
     )
+}
+
+async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
+    spawn_gateway_inner(None).await
 }
 
 fn client() -> reqwest::Client {
@@ -935,83 +945,16 @@ async fn admin_disabled_returns_404_on_admin_routes() {
 }
 
 /// Boot the gateway with the resolver cache wired up, so admin mutations
-/// can be observed to invalidate cached authz decisions. Mirrors
-/// [`spawn_gateway`] otherwise; kept separate so the cache-free tests above
-/// keep exercising the YAML-only install shape.
+/// can be observed to invalidate cached authz decisions. Thin wrapper over
+/// [`spawn_gateway_inner`] — the only real difference from [`spawn_gateway`]
+/// is the wired-in cache.
 async fn spawn_gateway_with_cache() -> (Harness, PermissionsCache, AuthConfig, SessionStore) {
-    let pool = pool().await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let base_url = format!("http://{addr}");
-
-    let auth_config = AuthConfig {
-        issuer: "http://idp.invalid".to_string(),
-        client_id: "test".to_string(),
-        client_secret: "test".to_string(),
-        audience: "test".to_string(),
-        redirect_url: format!("{base_url}/auth/callback"),
-        ..AuthConfig::default()
-    };
-    let sessions = SessionStore::new(pool.clone());
-    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient builds");
-
-    let mut config_file = ConfigFile::from_yaml_str("servers: []\npermissions: []\n").unwrap();
-    config_file.admin = Some(AdminBlock {
-        enabled: true,
-        group: ADMIN_GROUP.to_string(),
-        session_max_age_secs: None,
-    });
-
-    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
+    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool().await));
     // 60s TTL keeps the "before" cache entry fresh for the whole test — we
     // rely on the invalidation, not TTL expiry, to prove the drop.
-    let cache = PermissionsCache::new(repo.clone(), Duration::from_secs(60));
-
-    let config = Config {
-        bind: addr,
-        ..Config::default()
-    };
-    let app = transport::router(
-        &config,
-        AppState {
-            auth: Some(AuthFacade {
-                config: Arc::new(auth_config.clone()),
-                sessions: sessions.clone(),
-                oidc,
-                flows: PendingFlows::default(),
-                codes: db_mcp_gateway::transport::AuthCodes::default(),
-                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
-            }),
-            config: Arc::new(config_file),
-            adapter_registry: AdapterRegistry::new(),
-            state_db: Some(pool.clone()),
-            shutdown: Default::default(),
-            metrics: None,
-            permissions_cache: Some(cache.clone()),
-            permissions_repo: Some(repo),
-            mcp_path: std::sync::Arc::from("/mcp"),
-            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
-        },
-    )
-    .expect("router builds");
-    tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await;
-    });
-
-    (
-        Harness {
-            base_url,
-            pool,
-            cleanup_subs: Vec::new(),
-        },
-        cache,
-        auth_config,
-        sessions,
-    )
+    let cache = PermissionsCache::new(repo, Duration::from_secs(60));
+    let (h, cfg, sessions) = spawn_gateway_inner(Some(cache.clone())).await;
+    (h, cache, cfg, sessions)
 }
 
 /// Poll `cache.get_for` until the grant count reaches `want` or we exhaust
@@ -1281,6 +1224,213 @@ async fn delete_invalidates_cached_authz_for_user() {
         .bind(grant.id)
         .execute(&h.pool)
         .await;
+    let _ = sqlx::query("DELETE FROM permissions_audit WHERE target_id = $1")
+        .bind(db_id)
+        .execute(&h.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM permissions_databases WHERE id = $1")
+        .bind(db_id)
+        .execute(&h.pool)
+        .await;
+    h.cleanup().await;
+}
+
+/// **Database mutations full-flush every user.** A PATCH or DELETE on
+/// `/admin/v1/databases/:id` fires `PermissionsCache::invalidate_all` —
+/// per-user invalidation isn't enough because a database row change (rename,
+/// soft-delete) can reach any user whose grants reference it. This test
+/// warms cached authz for two distinct identities, mutates the database
+/// through both PATCH and DELETE, and proves both users' entries reload.
+#[tokio::test]
+async fn database_mutations_flush_all_cached_authz_for_all_users() {
+    let (mut h, cache, auth_cfg, sessions) = spawn_gateway_with_cache().await;
+    let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    let user_a_sub = format!("target-e2e-db-a-{}", Uuid::new_v4().simple());
+    let user_b_sub = format!("target-e2e-db-b-{}", Uuid::new_v4().simple());
+    h.track(user_a_sub.clone());
+    h.track(user_b_sub.clone());
+
+    let jwt = mint_session(
+        &sessions,
+        &auth_cfg.session_signing_key,
+        &admin_sub,
+        "admin@example.com",
+        &[ADMIN_GROUP.to_string()],
+    )
+    .await;
+
+    // Seed two distinct users via the admin API.
+    let user_a: Value = client()
+        .post(format!("{}/admin/v1/users", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&json!({
+            "user_sub": user_a_sub,
+            "user_email": "a@example.com",
+            "groups": ["engineers"],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let user_a_id: Uuid = user_a["id"].as_str().unwrap().parse().unwrap();
+
+    let user_b: Value = client()
+        .post(format!("{}/admin/v1/users", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&json!({
+            "user_sub": user_b_sub,
+            "user_email": "b@example.com",
+            "groups": ["engineers"],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let user_b_id: Uuid = user_b["id"].as_str().unwrap().parse().unwrap();
+
+    // Seed the database via the admin API so PATCH/DELETE below hit the
+    // real handler (and the real flush path).
+    let db: Value = client()
+        .post(format!("{}/admin/v1/databases", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&json!({
+            "server": "prod",
+            "db_name": format!("flush-app-{}", Uuid::new_v4().simple()),
+            "db_type": "postgres",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let db_id: Uuid = db["id"].as_str().unwrap().parse().unwrap();
+
+    let identity_a = Identity {
+        session_id: SessionId::new(),
+        user_sub: user_a_sub.clone(),
+        user_email: "a@example.com".to_string(),
+        groups: vec!["engineers".to_string()],
+        issued_at: chrono::Utc::now(),
+    };
+    let identity_b = Identity {
+        session_id: SessionId::new(),
+        user_sub: user_b_sub.clone(),
+        user_email: "b@example.com".to_string(),
+        groups: vec!["engineers".to_string()],
+        issued_at: chrono::Utc::now(),
+    };
+
+    // Warm both users' cache entries with the pre-mutation state (0 grants).
+    assert!(cache.get_for(&identity_a).await.unwrap().is_empty());
+    assert!(cache.get_for(&identity_b).await.unwrap().is_empty());
+
+    // Add a grant per user directly via the repo — bypasses admin API
+    // invalidation so the DB-endpoint flush is what drops the stale entries.
+    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(h.pool.clone()));
+    let grant_a = repo
+        .create_grant(
+            user_a_id,
+            GrantTarget::Specific { database_id: db_id },
+            GrantAction::QueryRead,
+            json!({ "row_limit": 100 }),
+        )
+        .await
+        .expect("seed grant a");
+    let grant_b = repo
+        .create_grant(
+            user_b_id,
+            GrantTarget::Specific { database_id: db_id },
+            GrantAction::QueryRead,
+            json!({ "row_limit": 100 }),
+        )
+        .await
+        .expect("seed grant b");
+
+    // Both users' caches still stale: TTL is 60s and no invalidation fired.
+    assert!(cache.get_for(&identity_a).await.unwrap().is_empty());
+    assert!(cache.get_for(&identity_b).await.unwrap().is_empty());
+
+    // PATCH the database — `invalidate_all` should fire.
+    let resp = client()
+        .patch(format!("{}/admin/v1/databases/{}", h.base_url, db_id))
+        .bearer_auth(&jwt)
+        .json(&json!({ "db_name": format!("flush-renamed-{}", Uuid::new_v4().simple()) }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Post-PATCH: both users' entries drop, reload, and now see their grant.
+    let a_after_patch = poll_cache_len(&cache, &identity_a, 1).await;
+    assert_eq!(
+        a_after_patch.len(),
+        1,
+        "database PATCH must reach user A: {a_after_patch:?}"
+    );
+    let b_after_patch = poll_cache_len(&cache, &identity_b, 1).await;
+    assert_eq!(
+        b_after_patch.len(),
+        1,
+        "database PATCH must reach user B: {b_after_patch:?}"
+    );
+
+    // Update audit row landed for the database (CLAUDE.md #4).
+    assert_eq!(
+        latest_audit_action(&h.pool, db_id).await.as_deref(),
+        Some("update"),
+        "PATCH must write an update audit row"
+    );
+
+    // DELETE the database — full flush again. The loader drops grants
+    // pointing at soft-deleted db rows, so both users should reload to 0.
+    let resp = client()
+        .delete(format!("{}/admin/v1/databases/{}", h.base_url, db_id))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let a_after_delete = poll_cache_len(&cache, &identity_a, 0).await;
+    assert!(
+        a_after_delete.is_empty(),
+        "database DELETE must reach user A: {a_after_delete:?}"
+    );
+    let b_after_delete = poll_cache_len(&cache, &identity_b, 0).await;
+    assert!(
+        b_after_delete.is_empty(),
+        "database DELETE must reach user B: {b_after_delete:?}"
+    );
+
+    // Delete audit row landed for the database.
+    assert_eq!(
+        latest_audit_action(&h.pool, db_id).await.as_deref(),
+        Some("delete"),
+        "DELETE must write a delete audit row"
+    );
+
+    // Cleanup the seeded grants + database + their audit rows.
+    for gid in [grant_a.id, grant_b.id] {
+        let _ = sqlx::query("DELETE FROM permissions_audit WHERE target_id = $1")
+            .bind(gid)
+            .execute(&h.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM permissions_grants WHERE id = $1")
+            .bind(gid)
+            .execute(&h.pool)
+            .await;
+    }
     let _ = sqlx::query("DELETE FROM permissions_audit WHERE target_id = $1")
         .bind(db_id)
         .execute(&h.pool)

@@ -46,26 +46,6 @@ impl std::fmt::Debug for UsersState {
     }
 }
 
-/// Fire-and-forget cache invalidation for a single user. Runs AFTER the tx
-/// commits so a rolled-back write never bumps the resolver revision. Cheap
-/// no-op when the cache is disabled (YAML-only installs) or the caller
-/// didn't have a `user_sub` to key on.
-///
-/// Detached via `tokio::spawn` so a client disconnect between the revision
-/// bump and the entry removal cannot leave the stale entry live until TTL:
-/// [`PermissionsCache::invalidate`] takes a write lock, and awaiting it on
-/// the request task means cancellation drops the future mid-invalidate.
-/// The spawned task owns its inputs and runs to completion regardless.
-pub(super) fn invalidate_cache(cache: &Option<PermissionsCache>, user_sub: Option<&str>) {
-    if let (Some(cache), Some(sub)) = (cache.as_ref(), user_sub) {
-        let cache = cache.clone();
-        let sub = sub.to_string();
-        tokio::spawn(async move {
-            cache.invalidate(&sub).await;
-        });
-    }
-}
-
 /// Public response shape. Carries no credentials — `permissions_users` rows
 /// never hold any — but kept as a dedicated DTO so adding fields to the
 /// storage struct doesn't accidentally widen the admin surface.

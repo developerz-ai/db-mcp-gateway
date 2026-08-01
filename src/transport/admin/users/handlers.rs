@@ -10,13 +10,14 @@ use uuid::Uuid;
 use crate::audit::permissions::{
     self, PermissionsAuditAction, PermissionsAuditRow, PermissionsAuditTargetType,
 };
+use crate::authz::PermissionsCache;
 
 use super::super::error::AdminError;
 use super::super::middleware::{AdminActor, tx_upsert_actor};
 use super::tx::{
     tx_get_user_by_id, tx_get_user_by_sub, tx_soft_delete_user, tx_update_user, tx_upsert_user,
 };
-use super::{CreateUserRequest, UpdateUserRequest, UserResponse, UsersState, invalidate_cache};
+use super::{CreateUserRequest, UpdateUserRequest, UserResponse, UsersState};
 use super::{internal, invalid_body, invalid_id, trimmed_non_empty, user_payload, validate_groups};
 
 pub async fn create(
@@ -193,9 +194,9 @@ pub async fn patch(
 
     // A group change flips constraint-merge results; invalidate even on
     // email-only patches so the cache never lags a mutation admins observe.
-    // Fire-and-forget (see `invalidate_cache`) — the write-lock cleanup
-    // must not be tied to the request future's lifetime.
-    invalidate_cache(&state.cache, Some(&after.user_sub));
+    // Fire-and-forget (see [`PermissionsCache::spawn_invalidate`]) — the
+    // write-lock cleanup must not be tied to the request future's lifetime.
+    PermissionsCache::spawn_invalidate(&state.cache, Some(&after.user_sub));
 
     Ok(Json(UserResponse::from(after)))
 }
@@ -257,8 +258,9 @@ pub async fn delete(
     // A soft-deleted user must not keep landing authz decisions from cache
     // until the TTL expires — drop the entry so the next request reloads
     // (and now sees no active row, i.e. no grants). Fire-and-forget so a
-    // client disconnect can't strand the entry (see `invalidate_cache`).
-    invalidate_cache(&state.cache, Some(&before.user_sub));
+    // client disconnect can't strand the entry (see
+    // [`PermissionsCache::spawn_invalidate`]).
+    PermissionsCache::spawn_invalidate(&state.cache, Some(&before.user_sub));
 
     Ok(StatusCode::NO_CONTENT)
 }

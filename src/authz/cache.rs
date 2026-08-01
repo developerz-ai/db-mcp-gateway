@@ -125,6 +125,43 @@ impl PermissionsCache {
         let mut map = self.inner.write().await;
         map.clear();
     }
+
+    /// Fire-and-forget per-user invalidation. Runs AFTER the caller's tx has
+    /// committed so a rolled-back write never bumps the resolver revision.
+    /// Cheap no-op when the cache is disabled (YAML-only installs) or the
+    /// caller didn't have a `user_sub` to key on.
+    ///
+    /// Detached via `tokio::spawn` so a client disconnect between the
+    /// revision bump and the entry removal cannot leave the stale entry live
+    /// until TTL: [`PermissionsCache::invalidate`] takes a write lock, and
+    /// awaiting it on the request task means cancellation drops the future
+    /// mid-invalidate. The spawned task owns its inputs and runs to
+    /// completion regardless.
+    ///
+    /// Single canonical detach point for every admin write path (users,
+    /// grants) so the detach contract lives next to the lock it protects.
+    pub fn spawn_invalidate(cache: &Option<Self>, user_sub: Option<&str>) {
+        if let (Some(cache), Some(sub)) = (cache.as_ref(), user_sub) {
+            let cache = cache.clone();
+            let sub = sub.to_string();
+            tokio::spawn(async move {
+                cache.invalidate(&sub).await;
+            });
+        }
+    }
+
+    /// Fire-and-forget full flush. Same detach contract as
+    /// [`Self::spawn_invalidate`], but calls [`Self::invalidate_all`] because
+    /// the mutation (a `permissions_databases` row change) can affect any
+    /// user's grant set — narrower per-user invalidation isn't enough.
+    pub fn spawn_invalidate_all(cache: &Option<Self>) {
+        if let Some(cache) = cache.as_ref() {
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                cache.invalidate_all().await;
+            });
+        }
+    }
 }
 
 /// Helper for the tool layer: load this identity's DB grants if the cache is

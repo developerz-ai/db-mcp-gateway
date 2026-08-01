@@ -79,25 +79,6 @@ impl std::fmt::Debug for DatabasesState {
     }
 }
 
-/// Fire-and-forget full cache flush. Runs AFTER the tx commits so a
-/// rolled-back write doesn't bump the resolver revision. Cheap no-op when
-/// the cache is disabled. Full flush — not per-user — because a database
-/// row change can affect any user's grant set (see [`DatabasesState`]).
-///
-/// Detached via `tokio::spawn` so a client disconnect between the revision
-/// bump and the map clear cannot leave stale entries live until TTL:
-/// [`PermissionsCache::invalidate_all`] takes a write lock, and awaiting
-/// it on the request task means cancellation drops the future mid-flush.
-/// The spawned task owns its cache clone and runs to completion.
-fn invalidate_all_cache(cache: &Option<PermissionsCache>) {
-    if let Some(cache) = cache.as_ref() {
-        let cache = cache.clone();
-        tokio::spawn(async move {
-            cache.invalidate_all().await;
-        });
-    }
-}
-
 pub async fn create(
     State(state): State<DatabasesState>,
     Extension(actor): Extension<AdminActor>,
@@ -241,7 +222,7 @@ pub async fn patch(
         .await
         .map_err(|err| internal("commit tx", err, &actor.request_id))?;
 
-    invalidate_all_cache(&state.cache);
+    PermissionsCache::spawn_invalidate_all(&state.cache);
 
     Ok(Json(DatabaseResponse::from(after)))
 }
@@ -293,7 +274,7 @@ pub async fn delete(
         .await
         .map_err(|err| internal("commit tx", err, &actor.request_id))?;
 
-    invalidate_all_cache(&state.cache);
+    PermissionsCache::spawn_invalidate_all(&state.cache);
 
     Ok(StatusCode::NO_CONTENT)
 }
