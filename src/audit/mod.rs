@@ -35,6 +35,13 @@ pub const AUDIT_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 /// `error_message`).
 #[derive(Debug, Clone)]
 pub struct AuditRow {
+    /// Row primary key. Callers on the request path (see
+    /// `tools::audit_dispatch`) generate this once per dispatch and share
+    /// it between the primary write and the drop-guard fallback so the two
+    /// writes are idempotent under `ON CONFLICT (id) DO NOTHING` — a
+    /// timed-out primary that ends up committing anyway will not produce a
+    /// duplicate row when the fallback re-inserts.
+    pub id: Uuid,
     pub request_id: String,
     pub user_sub: String,
     pub user_email: String,
@@ -95,14 +102,21 @@ pub async fn log(pool: &PgPool, row: &AuditRow) -> Result<(), AuditError> {
 
 async fn insert_row(pool: &PgPool, row: &AuditRow) -> Result<(), AuditError> {
     let groups_json = serde_json::to_value(&row.groups).unwrap_or(serde_json::Value::Array(vec![]));
+    // `ON CONFLICT (id) DO NOTHING` makes the write idempotent when the
+    // request-path guard fires a fallback insert after a timed-out primary
+    // write: even in the (theoretically possible) SQLx-cancellation race
+    // where the primary INSERT still commits, the fallback with the same
+    // `id` becomes a no-op instead of a duplicate row. Append-only
+    // semantics are preserved — we never UPDATE, only skip inserting.
     sqlx::query(
         "INSERT INTO audit_calls \
          (id, request_id, user_sub, user_email, groups, tool, server_name, database_name, \
           sql, reason, outcome, elapsed_ms, row_count, truncated, error_message, \
           agent_client, ip, db_type) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+         ON CONFLICT (id) DO NOTHING",
     )
-    .bind(Uuid::new_v4())
+    .bind(row.id)
     .bind(&row.request_id)
     .bind(&row.user_sub)
     .bind(&row.user_email)
@@ -136,7 +150,7 @@ pub async fn latest_for_user_tool(
 ) -> Result<Option<AuditRow>, AuditError> {
     use sqlx::Row;
     let row = sqlx::query(
-        "SELECT request_id, user_sub, user_email, groups, tool, server_name, database_name, \
+        "SELECT id, request_id, user_sub, user_email, groups, tool, server_name, database_name, \
                 sql, reason, outcome, elapsed_ms, row_count, truncated, error_message, \
                 agent_client, ip, db_type, occurred_at \
          FROM audit_calls WHERE user_sub = $1 AND tool = $2 \
@@ -156,6 +170,7 @@ pub async fn latest_for_user_tool(
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
         AuditRow {
+            id: r.get("id"),
             request_id: r.get("request_id"),
             user_sub: r.get("user_sub"),
             user_email: r.get("user_email"),

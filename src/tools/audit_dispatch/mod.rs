@@ -15,6 +15,7 @@ pub use outcome::{ToolErrorMessages, outcome_from_exec_error, success_outcome, t
 // their per-tool wording; callers outside `src/tools/` must go through the
 // sanitized `outcome_from_exec_error` boundary instead.
 pub(in crate::tools) use outcome::error_outcome;
+use outcome::tool_error;
 pub use types::{AuditHeader, Outcome, RequestContext};
 
 use std::future::Future;
@@ -23,8 +24,9 @@ use std::time::Instant;
 use metrics::{counter, histogram};
 use serde_json::Value;
 use sqlx::PgPool;
+use uuid::Uuid;
 
-use crate::audit::{self, AuditRow};
+use crate::audit::{self, AuditError, AuditRow};
 use crate::auth::Identity;
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
@@ -110,20 +112,30 @@ impl Drop for CancelledAuditGuard {
         let Some(pool) = self.state_db.take() else {
             return;
         };
+        // If the outcome was already recorded, `audit_dispatch` already
+        // emitted the primary METRIC_TOOL_CALLS increment at line ~215.
+        // Emitting it again here would double-count every audit-failure
+        // path. Only count in Drop for the mid-work cancellation branch
+        // where `finalize_dropped_row` promotes the empty outcome to
+        // `"cancelled"` and no primary increment ever ran.
+        let outcome_was_recorded = !row.outcome.is_empty();
         finalize_dropped_row(&mut row);
-        let outcome_tag = row.outcome.clone();
-        counter!(
-            METRIC_TOOL_CALLS,
-            "tool" => self.tool,
-            "outcome" => outcome_tag,
-        )
-        .increment(1);
+        if !outcome_was_recorded {
+            counter!(
+                METRIC_TOOL_CALLS,
+                "tool" => self.tool,
+                "outcome" => row.outcome.clone(),
+            )
+            .increment(1);
+        }
         // Detached spawn. We can't await it; if it fails, there's no
         // surface to report the failure to — the agent already disconnected
         // (or the primary write already returned an error the caller saw).
         // Operator sees the failure in tracing via audit::log's internal
         // error path. `audit::log` has its own timeout so a wedged state DB
-        // does not stall the detached task forever.
+        // does not stall the detached task forever. The row shares `id`
+        // with any prior primary write, so `ON CONFLICT (id) DO NOTHING`
+        // in `insert_row` makes this second attempt idempotent.
         tokio::spawn(async move {
             if let Err(err) = audit::log(&pool, &row).await {
                 tracing::error!(%err, "fallback audit row write failed");
@@ -172,6 +184,14 @@ where
         );
     };
 
+    // One audit-row primary key per dispatch, shared between the guard's
+    // fallback row and the primary write below. Combined with
+    // `ON CONFLICT (id) DO NOTHING` in `audit::insert_row`, this makes the
+    // primary + fallback pair idempotent — a timed-out primary that ends
+    // up committing anyway cannot produce a duplicate row when the guard's
+    // detached spawn retries.
+    let audit_id = Uuid::new_v4();
+
     // Arm the cancellation guard BEFORE awaiting the work. If `work.await`
     // is dropped (agent disconnect), the guard's `Drop` impl fires and
     // spawns a detached `outcome = "cancelled"` audit write. CLAUDE.md
@@ -181,6 +201,7 @@ where
     // to re-thread identity / context across the spawn boundary.
     let mut cancel_guard = CancelledAuditGuard {
         row: Some(AuditRow {
+            id: audit_id,
             request_id: id.to_string(),
             user_sub: identity.user_sub.clone(),
             user_email: identity.user_email.clone(),
@@ -239,6 +260,7 @@ where
     );
 
     let row = AuditRow {
+        id: audit_id,
         request_id: id.to_string(),
         user_sub: identity.user_sub.clone(),
         user_email: identity.user_email.clone(),
@@ -286,10 +308,21 @@ where
             audit_write_duration_ms = audit_started.elapsed().as_millis() as u64,
             "audit write failed; aborting tool response"
         );
-        return Response::error(
-            id,
-            ErrorObject::internal("audit write failed; request rejected"),
-        );
+        // Route through the tool_error shape (spec 03 §Errors) so the client
+        // gets a stable per-code payload. `AuditError::Timeout` surfaces as
+        // `"timeout"` — the same code the tool layer uses for a wedged
+        // target-DB — and `AuditError::Write` maps to `"internal"`. Both
+        // messages are sanitized: the underlying `sqlx::Error` is only in
+        // the tracing event above so a wrapped connection string cannot
+        // leak into a client response.
+        return match err {
+            AuditError::Timeout(_) => {
+                tool_error(id, "timeout", "audit write timed out; request rejected")
+            }
+            AuditError::Write(_) => {
+                tool_error(id, "internal", "audit write failed; request rejected")
+            }
+        };
     }
 
     // Primary audit landed. Release the guard so its Drop is a no-op.
@@ -309,6 +342,7 @@ mod tests {
 
     fn empty_row() -> AuditRow {
         AuditRow {
+            id: Uuid::new_v4(),
             request_id: "req-1".into(),
             user_sub: "user-1".into(),
             user_email: "u@example.com".into(),
