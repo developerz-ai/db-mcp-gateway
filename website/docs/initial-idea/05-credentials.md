@@ -41,7 +41,7 @@ Contract:
 
 - On truncation, the exec layer fires `pg_cancel_backend(pid)` through the dedicated **cancel pool** — same mechanism used for a client disconnect, invoked inline. The backend then aborts server-side rather than continuing to produce rows nobody asked for.
 - The now-aborted transaction only accepts `ROLLBACK`, so the exec layer follows the cancel with `tx.rollback()` instead of `tx.commit()`.
-- **Cleanup failures do not fail the request.** The truncated rows already collected are the result. `pg_cancel_backend` returning `false` means the backend is already gone (equivalent to success); either that or a `rollback` error is logged at `warn` level for observability, never surfaced to the client — a valid truncated read must not be turned into a failure by cleanup noise.
+- **Cleanup failures do not fail the request.** The truncated rows already collected are the result. `pg_cancel_backend` returning `false` means the backend is already gone (equivalent to success) and is not logged. Cancellation execution errors and `rollback` errors are logged at `warn` level for observability, never surfaced to the client — a valid truncated read must not be turned into a failure by cleanup noise.
 - The non-truncated path is unchanged: plain `tx.commit()`, errors propagated as `ExecError::Sql` / `Unavailable`.
 
 Cancellation safety (CLAUDE.md §Cancellation safety) still holds: if the request future is dropped mid-query (agent disconnect / outer `tokio::time::timeout`), the `CancelOnDrop` guard fires `pg_cancel_backend` from a detached task. Disarming happens only after the inline cleanup returns, so a hang during rollback still hands the cancel off to the guard on outer-timeout kick-in.
