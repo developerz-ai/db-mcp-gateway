@@ -14,7 +14,7 @@ const config: Config = {
   title: 'db-mcp-gateway',
   tagline:
     'Give AI agents database access without ever handing out a database URL.',
-  favicon: 'img/favicon.svg',
+  favicon: 'img/favicon.png',
 
   future: {
     v4: true,
