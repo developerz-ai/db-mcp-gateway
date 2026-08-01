@@ -19,7 +19,8 @@
 //!   the drop fires, and races the operation's own registration. A very
 //!   short-lived operation may already be gone by the time we look. This is
 //!   an accepted trade-off (YAGNI: don't build a polling loop for a gap this
-//!   narrow) — `maxTimeMS` remains the hard backstop either way.
+//!   narrow) — `maxTimeMS` remains the hard backstop either way, exactly as
+//!   it did before this module existed.
 
 use mongodb::Client;
 use mongodb::bson::{Bson, Document, doc};
