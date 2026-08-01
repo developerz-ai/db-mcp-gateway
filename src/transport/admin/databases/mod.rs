@@ -122,6 +122,12 @@ pub async fn create(
         .await
         .map_err(|err| internal("commit tx", err, &actor.request_id))?;
 
+    // A new `permissions_databases` row expands what every user's wildcard
+    // grant (`database: "*"`) resolves to at request time, so per-user
+    // invalidation isn't enough — flush the whole cache. Runs after commit so
+    // a rolled-back insert never bumps the resolver revision.
+    PermissionsCache::spawn_invalidate_all(&state.cache);
+
     Ok((StatusCode::CREATED, Json(DatabaseResponse::from(database))))
 }
 

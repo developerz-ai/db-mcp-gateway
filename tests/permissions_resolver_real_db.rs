@@ -359,3 +359,180 @@ async fn cache_hits_avoid_db_round_trip_and_invalidate_busts_it() {
 
     cleanup(&p, &sub, &server).await.expect("cleanup succeeds");
 }
+
+/// Wait for a detached `tokio::spawn` invalidation task to observably run.
+/// The spawned task takes a write lock; a `JoinHandle` isn't exposed, so we
+/// poll instead. Bounded — a stuck task fails the test loudly.
+async fn await_condition<F, Fut>(mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if check().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("invalidation task did not run within timeout");
+}
+
+#[tokio::test]
+async fn spawn_invalidate_drops_the_targeted_users_entry() {
+    let p = pool().await;
+    let sub = fresh("spawn-inv");
+    let server = fresh("spawn-inv-server");
+    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(p.clone()));
+
+    let user = repo.upsert_user(&sub, "u@example.com", &[]).await.unwrap();
+    let db = repo
+        .create_database(&server, "app", DbType::Postgres)
+        .await
+        .unwrap();
+    repo.create_grant(
+        user.id,
+        GrantTarget::Specific { database_id: db.id },
+        GrantAction::QueryRead,
+        serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+
+    let cache = PermissionsCache::new(repo.clone(), Duration::from_secs(60));
+    let id = identity_for(&sub, &[]);
+
+    let first = cache.get_for(&id).await.expect("first load");
+    assert_eq!(first.len(), 1, "sanity: single grant loads");
+
+    // Add a second grant behind the cache's back.
+    let db2 = repo
+        .create_database(&server, "warehouse", DbType::Postgres)
+        .await
+        .unwrap();
+    repo.create_grant(
+        user.id,
+        GrantTarget::Specific {
+            database_id: db2.id,
+        },
+        GrantAction::QueryRead,
+        serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+
+    // Fire-and-forget via the canonical detach helper.
+    let opt = Some(cache.clone());
+    PermissionsCache::spawn_invalidate(&opt, Some(&sub));
+
+    // After the spawned task lands, the next load must see both grants.
+    await_condition(|| async {
+        cache
+            .get_for(&id)
+            .await
+            .map(|g| g.len() == 2)
+            .unwrap_or(false)
+    })
+    .await;
+
+    cleanup(&p, &sub, &server).await.expect("cleanup succeeds");
+}
+
+#[tokio::test]
+async fn spawn_invalidate_is_a_noop_when_cache_is_none() {
+    // YAML-only installs pass `None`; calling the helper must not panic and
+    // must not spawn a task that would try to lock a missing cache.
+    PermissionsCache::spawn_invalidate(&None, Some("any-sub"));
+    // Also tolerate a missing user_sub even when the cache is wired.
+    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool().await));
+    let cache = Some(PermissionsCache::new(repo, Duration::from_secs(60)));
+    PermissionsCache::spawn_invalidate(&cache, None);
+    // If we got here without panicking or hanging, the no-op contract holds.
+}
+
+#[tokio::test]
+async fn spawn_invalidate_all_flushes_every_users_entry() {
+    let p = pool().await;
+    let sub_a = fresh("spawn-all-a");
+    let sub_b = fresh("spawn-all-b");
+    let server = fresh("spawn-all-server");
+    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(p.clone()));
+
+    let user_a = repo
+        .upsert_user(&sub_a, "a@example.com", &[])
+        .await
+        .unwrap();
+    let user_b = repo
+        .upsert_user(&sub_b, "b@example.com", &[])
+        .await
+        .unwrap();
+    let db = repo
+        .create_database(&server, "app", DbType::Postgres)
+        .await
+        .unwrap();
+    for uid in [user_a.id, user_b.id] {
+        repo.create_grant(
+            uid,
+            GrantTarget::Specific { database_id: db.id },
+            GrantAction::QueryRead,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    }
+
+    let cache = PermissionsCache::new(repo.clone(), Duration::from_secs(60));
+    let id_a = identity_for(&sub_a, &[]);
+    let id_b = identity_for(&sub_b, &[]);
+
+    // Populate both entries.
+    let a_first = cache.get_for(&id_a).await.expect("a first");
+    let b_first = cache.get_for(&id_b).await.expect("b first");
+    assert_eq!(a_first.len(), 1);
+    assert_eq!(b_first.len(), 1);
+
+    // Add a second grant for user A only, then spawn a full flush. Both
+    // entries must reload — flush isn't selective.
+    let db2 = repo
+        .create_database(&server, "warehouse", DbType::Postgres)
+        .await
+        .unwrap();
+    repo.create_grant(
+        user_a.id,
+        GrantTarget::Specific {
+            database_id: db2.id,
+        },
+        GrantAction::QueryRead,
+        serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+
+    let opt = Some(cache.clone());
+    PermissionsCache::spawn_invalidate_all(&opt);
+
+    await_condition(|| async {
+        cache
+            .get_for(&id_a)
+            .await
+            .map(|g| g.len() == 2)
+            .unwrap_or(false)
+    })
+    .await;
+    // User B's entry was flushed too; a reload returns a fresh Arc even
+    // though the underlying grant set is unchanged.
+    let b_second = cache.get_for(&id_b).await.expect("b second");
+    assert!(
+        !Arc::ptr_eq(&b_first, &b_second),
+        "full flush must drop unaffected users' entries too"
+    );
+
+    cleanup(&p, &sub_a, &server).await.expect("cleanup a");
+    cleanup(&p, &sub_b, &server).await.expect("cleanup b");
+}
+
+#[tokio::test]
+async fn spawn_invalidate_all_is_a_noop_when_cache_is_none() {
+    PermissionsCache::spawn_invalidate_all(&None);
+    // No panic, no hang — contract holds.
+}
