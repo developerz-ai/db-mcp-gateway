@@ -279,7 +279,17 @@ async fn mcp_oauth_bridge_full_flow() {
 
 /// Spawn a gateway with no auth and no state DB — sufficient to exercise
 /// `/register` and the `/authorize` parameter-validation rejection paths.
+/// Production-sized concurrency caps.
 async fn spawn_authless_gateway() -> (String, reqwest::Client) {
+    spawn_authless_gateway_with_caps(Config::default().max_concurrent_requests).await
+}
+
+/// Same as [`spawn_authless_gateway`], but with `max_concurrent_requests`
+/// overridden — lets a test drive the global concurrency cap into
+/// contention without needing hundreds of simultaneous connections.
+async fn spawn_authless_gateway_with_caps(
+    max_concurrent_requests: usize,
+) -> (String, reqwest::Client) {
     use db_mcp_gateway::config::ConfigFile;
     use db_mcp_gateway::exec::AdapterRegistry;
     use db_mcp_gateway::transport::ClientRegistry;
@@ -292,6 +302,7 @@ async fn spawn_authless_gateway() -> (String, reqwest::Client) {
     let gateway_url = format!("http://{addr}");
     let config = Config {
         bind: addr,
+        max_concurrent_requests,
         ..Config::default()
     };
     let state = AppState {
@@ -441,6 +452,40 @@ async fn attacker_redirect_uri_rejected() {
         "invalid_request",
         "external https URI not in allowlist must be rejected"
     );
+}
+
+/// Regression for the #136 audit finding "/authorize flood wedges all
+/// logins ... the open routes skip the concurrency limiter". `/authorize`
+/// must be bounded by the same global `ConcurrencyLimiter` gated traffic
+/// goes through — pre-fix, this router mounted it in the `open` group,
+/// which never got `limit::enforce` layered on at all, so no volume of
+/// concurrent `/authorize` traffic could ever be shed.
+///
+/// `max_concurrent_requests: 0` gives the global semaphore zero permits, so
+/// `try_acquire_owned()` fails unconditionally — deterministic, no timing
+/// race needed (an earlier version of this test tried firing a burst of
+/// concurrent requests against a cap of 1 and asserting at least one 503;
+/// that was flaky because `/authorize`'s fast-reject validation path
+/// completes faster than genuine request overlap can be engineered from a
+/// test client). A single request must come back 503 if and only if
+/// `/authorize` is actually routed through `limit::enforce`.
+#[tokio::test]
+async fn authorize_route_is_concurrency_limited() {
+    let (gw, http) = spawn_authless_gateway_with_caps(0).await;
+
+    let resp = http
+        .get(format!("{gw}/authorize"))
+        .send()
+        .await
+        .expect("request sent");
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "expected 503 with a zero-permit global cap — /authorize is not routed through limit::enforce"
+    );
+    let body: Value = resp.json().await.expect("503 body is JSON");
+    assert_eq!(body["error"]["code"], "service_overloaded");
 }
 
 /// `/authorize` without a `state` parameter (absent or empty) must return
