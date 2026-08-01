@@ -46,13 +46,22 @@ fn decode_value(row: &PgRow, idx: usize) -> Value {
     if let Ok(None) = row.try_get::<Option<String>, _>(idx) {
         return Value::Null;
     }
+    // sqlx 0.8 enforces strict type compatibility per column OID: an `INT2`
+    // value won't decode as `i32`, nor `REAL` as `f64`. Each width needs its
+    // own probe, or non-null smallints/reals silently surface as `null`.
     if let Ok(v) = row.try_get::<i64, _>(idx) {
         return Value::from(v);
     }
     if let Ok(v) = row.try_get::<i32, _>(idx) {
         return Value::from(v);
     }
+    if let Ok(v) = row.try_get::<i16, _>(idx) {
+        return Value::from(v);
+    }
     if let Ok(v) = row.try_get::<f64, _>(idx) {
+        return Value::from(v);
+    }
+    if let Ok(v) = row.try_get::<f32, _>(idx) {
         return Value::from(v);
     }
     if let Ok(v) = row.try_get::<bool, _>(idx) {

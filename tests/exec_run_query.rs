@@ -78,6 +78,32 @@ async fn quick_query_succeeds_with_columns_and_rows() {
     assert!(!result.truncated);
 }
 
+/// sqlx 0.8 rejects width-mismatched decodes at the OID layer: a
+/// `SMALLINT` (`INT2`) won't come out through the `i32` probe, nor `REAL`
+/// (`FLOAT4`) through `f64`. Without dedicated `i16`/`f32` branches the
+/// fallback silently returns `Value::Null` — a data-integrity bug on
+/// perfectly ordinary column types. This pins each numeric width to its
+/// probe so a future refactor can't drop one and re-open the hole.
+#[tokio::test]
+async fn decodes_every_numeric_width_not_just_i64_and_f64() {
+    let a = adapter().await;
+    let result = a
+        .execute(query(
+            "SELECT 7::int2 AS s, 42::int4 AS i, 99::int8 AS b, \
+             1.5::float4 AS r, 2.5::float8 AS d",
+            None,
+            10,
+        ))
+        .await
+        .expect("mixed-width numeric SELECT runs");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], serde_json::Value::from(7i16));
+    assert_eq!(result.rows[0][1], serde_json::Value::from(42i32));
+    assert_eq!(result.rows[0][2], serde_json::Value::from(99i64));
+    assert_eq!(result.rows[0][3], serde_json::Value::from(1.5f32));
+    assert_eq!(result.rows[0][4], serde_json::Value::from(2.5f64));
+}
+
 #[tokio::test]
 async fn row_limit_truncates_and_flags() {
     let a = adapter().await;
