@@ -308,4 +308,17 @@ mod tests {
     fn effective_row_limit_grant_still_wins_under_hostile_caller_request() {
         assert_eq!(effective_row_limit(Some(u32::MAX), Some(4)), 4);
     }
+
+    /// A grant naming a `row_limit` above the ceiling must still be clamped
+    /// down — the ceiling is gateway-wide, so drift between `sample_table`'s
+    /// and `run_query`'s independent copies of `effective_row_limit` cannot
+    /// let a hostile grant + caller pair bypass it. Mirrors the identical
+    /// regression in `run_query`.
+    #[test]
+    fn effective_row_limit_clamps_grant_above_ceiling() {
+        assert_eq!(
+            effective_row_limit(Some(u32::MAX), Some(u32::MAX)),
+            super::super::GATEWAY_ROW_LIMIT_CEILING
+        );
+    }
 }

@@ -7,7 +7,7 @@ The set of tools the gateway exposes to agents. This is the agent-facing contrac
 1. **Read-only by default.** A write-capable tool exists only if [06-permissions](06-permissions.md) explicitly enables it for the calling identity.
 2. **Every tool accepts `server` + `database`** (except `list_servers` / `list_databases`). The pair fully scopes the call.
 3. **`reason` is optional in the protocol but may be required by policy.** If policy requires it and it's absent, the gateway returns a structured error telling the agent to ask the user for one.
-4. **Results are size-capped.** All result-returning tools take a `limit` parameter; the gateway clamps it to a per-database max.
+4. **Results are size-capped.** All result-returning tools take a `limit` parameter. Most-restrictive-wins: the effective row limit is `min(caller.limit, grant.row_limit, gateway-ceiling)`. The **gateway-wide ceiling is 100,000 rows** and applies regardless of what the caller asks for or whether the grant sets `row_limit` — an absent or oversized grant still clamps to the ceiling, never "unbounded". A grant may only tighten below the ceiling; it may not loosen past it. When neither the caller nor the grant names a limit, `run_query` defaults to **1,000 rows** and `sample_table` defaults to **10 rows**.
 5. **No tool exposes credentials, connection strings, or hostnames.** Servers and databases are referenced by their config-defined logical name.
 
 ## Tools
