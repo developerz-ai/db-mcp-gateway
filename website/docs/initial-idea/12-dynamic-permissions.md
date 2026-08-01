@@ -170,7 +170,7 @@ The grants handlers validate at the API layer **before** the DB CHECKs would cat
 
 ### Cache invalidation
 
-The resolver caches `(user, server, db) → grants` per session. Admin API writes publish a tiny invalidation event over an in-process channel; the next tool call recomputes. No restart needed. Cache TTL is also short (default 60s) so a missed invalidation self-heals.
+The resolver caches `(user, server, db) → grants` per session. Admin API writes call `PermissionsCache::spawn_invalidate` (per-user) or `PermissionsCache::spawn_invalidate_all` (full flush) after the data + audit tx commits. Both launch a detached `tokio::spawn`ed task that runs the invalidation off the request future, so a client disconnect between commit and invalidate can't leave a stale entry live until TTL. The next tool call recomputes. No restart needed. Cache TTL is also short (default 60s) so a missed invalidation self-heals.
 
 Every admin surface that can change a grant's meaning invalidates on a successful commit — not just `/admin/v1/grants`:
 
