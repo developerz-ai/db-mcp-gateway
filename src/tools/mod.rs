@@ -54,6 +54,21 @@ pub(crate) fn db_type_for_server(config: &ConfigFile, server_name: &str) -> Opti
         .map(|s| db_type_label(s.kind))
 }
 
+/// Gateway-wide ceiling on rows returned in a single response, regardless of
+/// what the caller's `limit` argument requests or whether the grant sets its
+/// own `row_limit` constraint. Spec 03 §4 "Results are size-capped ... the
+/// gateway clamps it to a per-database max" — a grant that declines to set
+/// `row_limit` must still mean *a* max, not unbounded. Mirrors
+/// `exec::adapter::effective_timeout_ms`'s ceiling pattern: a grant may only
+/// tighten this, never loosen past it, and an absent grant still gets
+/// clamped here rather than passing the caller's raw request straight
+/// through to the DB. 100k rows is generous for any interactive read (spec
+/// 03's tools are not a bulk-export path) while bounding the in-memory
+/// `Vec<Vec<Value>>` and JSON response size a single request can force the
+/// gateway to build, even after the #136 row-cap-cancel fix stops the *DB
+/// connection* from being pinned by an oversized ask.
+pub(crate) const GATEWAY_ROW_LIMIT_CEILING: u32 = 100_000;
+
 pub use audit_dispatch::RequestContext;
 
 // Re-export canonical names so dispatch and the advertised capability can

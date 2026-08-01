@@ -236,12 +236,14 @@ fn find_server_db<'a>(
     Some((server, database))
 }
 
+/// `effective = min(caller.unwrap_or(DEFAULT_SAMPLE_LIMIT), grant.unwrap_or(CEILING), CEILING)`.
+/// See `run_query::effective_row_limit` for the full rationale — same
+/// gateway-wide ceiling, same "absent grant is not unbounded" fix.
 fn effective_row_limit(caller: Option<u32>, grant: Option<u32>) -> u32 {
-    let caller = caller.unwrap_or(DEFAULT_SAMPLE_LIMIT);
-    match grant {
-        Some(grant_cap) => caller.min(grant_cap),
-        None => caller,
-    }
+    let grant_capped = grant
+        .unwrap_or(super::GATEWAY_ROW_LIMIT_CEILING)
+        .min(super::GATEWAY_ROW_LIMIT_CEILING);
+    caller.unwrap_or(DEFAULT_SAMPLE_LIMIT).min(grant_capped)
 }
 
 #[cfg(test)]
@@ -289,5 +291,34 @@ mod tests {
         assert_eq!(effective_row_limit(Some(50), None), 50);
         assert_eq!(effective_row_limit(None, Some(3)), 3);
         assert_eq!(effective_row_limit(None, None), DEFAULT_SAMPLE_LIMIT);
+    }
+
+    /// Regression for the #136 audit finding "caller `limit` unbounded when
+    /// the grant sets no `row_limit`" — see `run_query`'s identical test for
+    /// the full rationale.
+    #[test]
+    fn effective_row_limit_clamps_to_gateway_ceiling_when_grant_is_silent() {
+        assert_eq!(
+            effective_row_limit(Some(u32::MAX), None),
+            super::super::GATEWAY_ROW_LIMIT_CEILING
+        );
+    }
+
+    #[test]
+    fn effective_row_limit_grant_still_wins_under_hostile_caller_request() {
+        assert_eq!(effective_row_limit(Some(u32::MAX), Some(4)), 4);
+    }
+
+    /// A grant naming a `row_limit` above the ceiling must still be clamped
+    /// down — the ceiling is gateway-wide, so drift between `sample_table`'s
+    /// and `run_query`'s independent copies of `effective_row_limit` cannot
+    /// let a hostile grant + caller pair bypass it. Mirrors the identical
+    /// regression in `run_query`.
+    #[test]
+    fn effective_row_limit_clamps_grant_above_ceiling() {
+        assert_eq!(
+            effective_row_limit(Some(u32::MAX), Some(u32::MAX)),
+            super::super::GATEWAY_ROW_LIMIT_CEILING
+        );
     }
 }
