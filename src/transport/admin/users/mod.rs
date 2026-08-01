@@ -17,15 +17,23 @@ use serde_json::{Value as JsonValue, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::authz::PermissionsCache;
 use crate::state::permissions::{PermissionsRepo, PermissionsUser};
 
 use super::error::AdminError;
 
-/// Shared state cloned into every users-route handler.
+/// Shared state cloned into every users-route handler. The `cache` field is
+/// `Option<PermissionsCache>` because YAML-only installs (no state DB pool)
+/// run without a resolver cache — invalidation is then a no-op. Mirrors the
+/// wiring in [`super::grants::GrantsState`] so a user mutation (patch/delete)
+/// drops the cached grant set that referenced them; without it, a revoked or
+/// re-grouped user keeps getting the old authz decision for up to the cache
+/// TTL.
 #[derive(Clone)]
 pub struct UsersState {
     pub repo: Arc<dyn PermissionsRepo>,
     pub state_db: PgPool,
+    pub cache: Option<PermissionsCache>,
 }
 
 impl std::fmt::Debug for UsersState {
@@ -33,7 +41,18 @@ impl std::fmt::Debug for UsersState {
         f.debug_struct("UsersState")
             .field("repo", &"<Arc<dyn PermissionsRepo>>")
             .field("state_db", &"<PgPool>")
+            .field("cache", &self.cache.as_ref().map(|_| "<PermissionsCache>"))
             .finish()
+    }
+}
+
+/// Fire-and-forget cache invalidation for a single user. Runs AFTER the tx
+/// commits so a rolled-back write never bumps the resolver revision. Cheap
+/// no-op when the cache is disabled (YAML-only installs) or the caller
+/// didn't have a `user_sub` to key on.
+pub(super) async fn invalidate_cache(cache: &Option<PermissionsCache>, user_sub: Option<&str>) {
+    if let (Some(cache), Some(sub)) = (cache.as_ref(), user_sub) {
+        cache.invalidate(sub).await;
     }
 }
 

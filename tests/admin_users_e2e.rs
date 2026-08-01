@@ -670,6 +670,7 @@ async fn audit_write_failure_rolls_back_user_write() {
     let users_state = UsersState {
         repo: repo.clone(),
         state_db: pool.clone(),
+        cache: None,
     };
     // The handler calls tx_upsert_actor inside the transaction, so the actor
     // row is not pre-seeded here. The empty request_id trips the CHECK on

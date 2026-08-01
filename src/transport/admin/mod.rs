@@ -74,6 +74,7 @@ pub fn router(
         .with_state(UsersState {
             repo: repo.clone(),
             state_db: state_db.clone(),
+            cache: cache.clone(),
         });
     let databases_routes = Router::new()
         .route(
@@ -89,6 +90,7 @@ pub fn router(
         .with_state(DatabasesState {
             repo: repo.clone(),
             state_db: state_db.clone(),
+            cache: cache.clone(),
         });
     let grants_routes = Router::new()
         .route("/admin/v1/grants", post(grants::create).get(grants::list))

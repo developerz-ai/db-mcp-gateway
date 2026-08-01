@@ -16,7 +16,7 @@ use super::super::middleware::{AdminActor, tx_upsert_actor};
 use super::tx::{
     tx_get_user_by_id, tx_get_user_by_sub, tx_soft_delete_user, tx_update_user, tx_upsert_user,
 };
-use super::{CreateUserRequest, UpdateUserRequest, UserResponse, UsersState};
+use super::{CreateUserRequest, UpdateUserRequest, UserResponse, UsersState, invalidate_cache};
 use super::{internal, invalid_body, invalid_id, trimmed_non_empty, user_payload, validate_groups};
 
 pub async fn create(
@@ -191,6 +191,10 @@ pub async fn patch(
         .await
         .map_err(|err| internal("commit tx", err, &actor.request_id))?;
 
+    // A group change flips constraint-merge results; invalidate even on
+    // email-only patches so the cache never lags a mutation admins observe.
+    invalidate_cache(&state.cache, Some(&after.user_sub)).await;
+
     Ok(Json(UserResponse::from(after)))
 }
 
@@ -247,5 +251,11 @@ pub async fn delete(
     tx.commit()
         .await
         .map_err(|err| internal("commit tx", err, &actor.request_id))?;
+
+    // A soft-deleted user must not keep landing authz decisions from cache
+    // until the TTL expires — drop the entry so the next request reloads
+    // (and now sees no active row, i.e. no grants).
+    invalidate_cache(&state.cache, Some(&before.user_sub)).await;
+
     Ok(StatusCode::NO_CONTENT)
 }
