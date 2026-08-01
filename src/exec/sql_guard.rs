@@ -21,14 +21,28 @@
 //! either spelling (`ANALYZE` keyword or `(ANALYZE)` option — both execute)
 //! — is rejected with a typed error. Conservative on purpose: better
 //! to reject a legitimate exotic statement than quietly send an unintended one.
+//!
+//! ## Substructure walk
+//!
+//! Beyond the top-level statement-shape check, denied-function lookups and
+//! nested-write / lock / `SELECT INTO` detection go through sqlparser's
+//! [`Visitor`] trait (the `visitor` feature). The `Visit` derive on every
+//! AST node walks every child node automatically, so a callback registered on
+//! `Expr` fires for expressions in every position sqlparser knows about
+//! (`EXISTS`, `ANY`/`ALL`, tuples, arrays, `FILTER`, window frames, `QUALIFY`,
+//! `UNNEST`, `GROUPING SETS`/`ROLLUP`/`CUBE`, `IS DISTINCT FROM`, `substring`
+//! / `trim` / `overlay` / …, and any node a future sqlparser bump adds). The
+//! previous hand-rolled recursion missed each of those positions until they
+//! were manually enumerated — that's the class of gap this file exists to
+//! close, and the reason the walk is now visitor-driven, not hand-recursion.
 
 use sqlparser::ast::{
-    Assignment, Delete, Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, Insert, JoinConstraint, JoinOperator, ObjectName, OnConflictAction, OnInsert,
-    Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, UtilityOption,
+    Expr, ObjectName, OnInsert, Query, SetExpr, Statement, TableFactor, UtilityOption, Visit,
+    Visitor,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
+use std::ops::ControlFlow;
 
 /// How much a query is allowed to do, decided upstream by the caller's grant
 /// (`query_read` → [`Access::ReadOnly`]; `query_write` → [`Access::ReadWrite`]).
@@ -106,47 +120,53 @@ pub fn check_sql(sql: &str, access: Access) -> Result<(), GuardError> {
         n => return Err(GuardError::MultiStatement(n)),
     }
 
-    check_statement(&statements[0], access)
+    // Unwrap `EXPLAIN` wrappers so shape and visitor operate on the actual
+    // target statement. ANALYZE — in either spelling — executes the wrapped
+    // statement, so it fails fast here before any further inspection.
+    let mut stmt: &Statement = &statements[0];
+    while let Statement::Explain {
+        analyze,
+        options,
+        statement,
+        ..
+    } = stmt
+    {
+        if explain_analyzes(*analyze, options.as_deref()) {
+            return Err(GuardError::ExplainAnalyze);
+        }
+        stmt = statement;
+    }
+
+    check_statement_shape(stmt, access)?;
+
+    match stmt.visit(&mut GuardVisitor::new()) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(e) => Err(e),
+    }
 }
 
-fn check_statement(stmt: &Statement, access: Access) -> Result<(), GuardError> {
-    // Data writes ride the same denied-function / no-schema-mod rails as reads;
-    // they are only *reachable* under `Access::ReadWrite`. Guarded arms come
-    // first so read mode falls through to the explicit `NotAllowed` rejections.
+/// Whether `stmt` is a statement type the guard admits at all under `access`.
+/// The substructure — nested writes, locking clauses, `SELECT INTO`, denied
+/// functions — is enforced by [`GuardVisitor`] afterwards. Explains have been
+/// unwrapped by [`check_sql`].
+fn check_statement_shape(stmt: &Statement, access: Access) -> Result<(), GuardError> {
     match stmt {
-        Statement::Insert(insert) if access == Access::ReadWrite => check_insert(insert),
-        Statement::Update {
-            table,
-            assignments,
-            from,
-            selection,
-            returning,
-        } if access == Access::ReadWrite => check_update(
-            table,
-            assignments,
-            from.as_ref(),
-            selection.as_ref(),
-            returning.as_deref(),
-        ),
-        Statement::Delete(delete) if access == Access::ReadWrite => check_delete(delete),
-
-        Statement::Query(query) => check_query(query),
-        // EXPLAIN ANALYZE *executes* its target (so it would run a writable CTE
-        // and blow past the row cap), unlike plain EXPLAIN which only plans.
-        Statement::Explain {
-            analyze,
-            options,
-            statement,
-            ..
-        } => {
-            if explain_analyzes(*analyze, options.as_deref()) {
-                return Err(GuardError::ExplainAnalyze);
-            }
-            check_statement(statement, access)
+        // Data writes are admitted under ReadWrite; the visitor still walks
+        // their read positions for denied functions and writable-CTE hazards.
+        // The ON clause is checked here so an unrecognised `OnInsert` variant
+        // (added in a future sqlparser bump) is denied by default rather than
+        // waved through with its inner fields un-inspected.
+        Statement::Insert(insert) if access == Access::ReadWrite => {
+            check_on_insert(insert.on.as_ref())
         }
-        Statement::ExplainTable { .. } => Ok(()), // `\d table` analog; read-only
-        // Explicitly call out the families we reject so the error message is
-        // useful — a single catch-all would say "Statement" for everything.
+        Statement::Update { .. } if access == Access::ReadWrite => Ok(()),
+        Statement::Delete(_) if access == Access::ReadWrite => Ok(()),
+
+        Statement::Query(_) => Ok(()),
+        Statement::ExplainTable { .. } => Ok(()), // `\d table` analog; read-only.
+
+        // Explicit rejections so the error message names the family, rather
+        // than the generic "unsupported" that the catch-all below emits.
         Statement::Insert { .. } => Err(GuardError::NotAllowed("INSERT")),
         Statement::Update { .. } => Err(GuardError::NotAllowed("UPDATE")),
         Statement::Delete { .. } => Err(GuardError::NotAllowed("DELETE")),
@@ -172,6 +192,18 @@ fn check_statement(stmt: &Statement, access: Access) -> Result<(), GuardError> {
     }
 }
 
+/// Deny-by-default match on the ON clause of an `INSERT` — the two shapes the
+/// guard understands are walked normally by the visitor; anything else (an
+/// `OnInsert` variant added in a future sqlparser bump) is rejected so its
+/// inner fields cannot slip past unexamined.
+fn check_on_insert(on: Option<&OnInsert>) -> Result<(), GuardError> {
+    match on {
+        None => Ok(()),
+        Some(OnInsert::DuplicateKeyUpdate(_) | OnInsert::OnConflict(_)) => Ok(()),
+        _ => Err(GuardError::NotAllowed("unsupported ON clause")),
+    }
+}
+
 /// Whether an `EXPLAIN` carries `ANALYZE` — i.e. whether Postgres will actually
 /// *run* the statement instead of only planning it.
 ///
@@ -190,239 +222,109 @@ fn explain_analyzes(analyze: bool, options: Option<&[UtilityOption]>) -> bool {
         })
 }
 
-fn check_query(query: &Query) -> Result<(), GuardError> {
-    // SELECT ... FOR UPDATE / FOR SHARE acquires write locks even though it's
-    // syntactically a SELECT. Read-only roles can't take those locks anyway,
-    // so the query would fail at the DB — but the rejection should happen
-    // here with a clean error, not as a cryptic "permission denied" from PG.
-    if !query.locks.is_empty() {
-        return Err(GuardError::Locking);
-    }
-    // A data-modifying CTE (`WITH x AS (INSERT ... RETURNING ...)`) hides the
-    // write behind a SELECT body — walk each CTE's inner query too.
-    if let Some(with) = &query.with {
-        for cte in &with.cte_tables {
-            check_query(&cte.query)?;
-        }
-    }
-    // The query tail sits outside the SELECT body but is made of ordinary
-    // expression positions — `ORDER BY pg_read_file('/x')` or
-    // `LIMIT length(pg_read_file('/x'))` executes just like a projection would.
-    // (`FETCH` and ClickHouse's `LIMIT … BY` are not walked: the Postgres
-    // dialect parses `FETCH` quantities as literals and never produces
-    // `limit_by`, so neither can carry a call.)
-    if let Some(order_by) = &query.order_by {
-        for order in &order_by.exprs {
-            check_expr(&order.expr)?;
-        }
-    }
-    if let Some(limit) = &query.limit {
-        check_expr(limit)?;
-    }
-    if let Some(offset) = &query.offset {
-        check_expr(&offset.value)?;
-    }
-    check_set_expr(&query.body)
+/// Substructure guard, run once the top-level [`check_statement_shape`] has
+/// admitted the statement. Enforces four things via sqlparser's `Visit`
+/// derive, which walks every child node automatically:
+///
+/// 1. Denied-function calls (`Expr::Function`, and `TableFactor::{Table,
+///    Function}` when a set-returning denied function is used as a table
+///    source).
+/// 2. `SELECT ... FOR UPDATE / FOR SHARE` — [`GuardError::Locking`].
+/// 3. `SELECT ... INTO new_table` — [`GuardError::SelectInto`].
+/// 4. Nested `Statement` — sqlparser encodes a writable CTE as a Query whose
+///    body is `SetExpr::Insert(Statement)`, so any `pre_visit_statement`
+///    firing *after* the top level is a write hiding in a read path.
+///
+/// Because every expression, query, and table-factor position is walked by
+/// the derive, this needs no per-variant enumeration and cannot silently miss
+/// a node type a future sqlparser bump adds.
+struct GuardVisitor {
+    top_seen: bool,
 }
 
-fn check_set_expr(body: &SetExpr) -> Result<(), GuardError> {
+impl GuardVisitor {
+    fn new() -> Self {
+        Self { top_seen: false }
+    }
+}
+
+impl Visitor for GuardVisitor {
+    type Break = GuardError;
+
+    fn pre_visit_statement(&mut self, stmt: &Statement) -> ControlFlow<GuardError> {
+        if !self.top_seen {
+            self.top_seen = true;
+            return ControlFlow::Continue(());
+        }
+        let kind = match stmt {
+            Statement::Insert(_) => "INSERT",
+            Statement::Update { .. } => "UPDATE",
+            Statement::Delete(_) => "DELETE",
+            // Any other nested statement type (implausible in a real query,
+            // but syntactically expressible) is deny-by-default rather than
+            // leave the caller wondering which read position it slipped past.
+            _ => return ControlFlow::Break(GuardError::NotAllowed("nested statement")),
+        };
+        ControlFlow::Break(GuardError::WriteInReadPath(kind))
+    }
+
+    fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<GuardError> {
+        // Read-only roles cannot take these locks anyway, so Postgres would
+        // return a cryptic "permission denied" — reject with a typed error
+        // here instead.
+        if !q.locks.is_empty() {
+            return ControlFlow::Break(GuardError::Locking);
+        }
+        // `SELECT ... INTO` lives on `Select.into`; the visitor has no
+        // callback for `Select` or `SetExpr`, so inspect this Query's body
+        // directly. Nested Queries are covered by their own pre_visit_query.
+        if body_has_select_into(q.body.as_ref()) {
+            return ControlFlow::Break(GuardError::SelectInto);
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<GuardError> {
+        if let Expr::Function(f) = expr {
+            if let Err(err) = check_denied_name(&f.name) {
+                return ControlFlow::Break(err);
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<GuardError> {
+        // `FROM pg_ls_dir(...)` and `FROM LATERAL pg_ls_dir(...)` place the
+        // denied name on a TableFactor, not an Expr::Function — check both
+        // shapes here so it is caught symmetrically with the expression pass.
+        let name = match tf {
+            TableFactor::Table { name, .. } | TableFactor::Function { name, .. } => name,
+            _ => return ControlFlow::Continue(()),
+        };
+        if let Err(err) = check_denied_name(name) {
+            return ControlFlow::Break(err);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Whether a query body directly contains a `SELECT ... INTO`. Recurses only
+/// through `SetOperation` branches (each is a `SetExpr`, not a `Query`, so
+/// the visitor's `pre_visit_query` does not fire on them). Nested
+/// `SetExpr::Query` is walked by the outer visitor instead.
+fn body_has_select_into(body: &SetExpr) -> bool {
     match body {
-        // `SELECT ... INTO new_table` materializes a table — DDL, not a read.
-        SetExpr::Select(select) if select.into.is_some() => Err(GuardError::SelectInto),
-        SetExpr::Select(select) => check_select(select),
-        // Walk `VALUES (…)` rows so a denied function can't hide in a literal
-        // list — reachable from `INSERT … VALUES` and bare `VALUES` bodies.
-        SetExpr::Values(values) => {
-            for row in &values.rows {
-                for expr in row {
-                    check_expr(expr)?;
-                }
-            }
-            Ok(())
-        }
-        SetExpr::Table(_) => Ok(()),
-        SetExpr::Query(inner) => check_query(inner),
+        SetExpr::Select(s) => s.into.is_some(),
         SetExpr::SetOperation { left, right, .. } => {
-            check_set_expr(left)?;
-            check_set_expr(right)
+            body_has_select_into(left) || body_has_select_into(right)
         }
-        SetExpr::Insert(_) => Err(GuardError::WriteInReadPath("INSERT")),
-        SetExpr::Update(_) => Err(GuardError::WriteInReadPath("UPDATE")),
+        _ => false,
     }
 }
 
-/// Walk the expressions inside a SELECT node to catch denied function calls
-/// in the projection, FROM, WHERE, HAVING, and GROUP BY clauses.
-fn check_select(select: &Select) -> Result<(), GuardError> {
-    check_select_items(&select.projection)?;
-    // FROM clause — catches set-returning functions like `pg_ls_dir('/tmp')`
-    // used directly as a table source.
-    for twj in &select.from {
-        check_table_with_joins(twj)?;
-    }
-    if let Some(where_expr) = &select.selection {
-        check_expr(where_expr)?;
-    }
-    if let GroupByExpr::Expressions(exprs, _) = &select.group_by {
-        for expr in exprs {
-            check_expr(expr)?;
-        }
-    }
-    if let Some(having) = &select.having {
-        check_expr(having)?;
-    }
-    Ok(())
-}
-
-/// Walk a projection / `RETURNING` list for denied function calls. Wildcards
-/// carry no callable expressions.
-fn check_select_items(items: &[SelectItem]) -> Result<(), GuardError> {
-    for item in items {
-        match item {
-            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                check_expr(e)?;
-            }
-            SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(..) => {}
-        }
-    }
-    Ok(())
-}
-
-/// Walk `SET col = <expr>` assignments (UPDATE, `ON CONFLICT DO UPDATE`,
-/// `ON DUPLICATE KEY UPDATE`) for denied functions in the assigned values.
-fn check_assignments(assignments: &[Assignment]) -> Result<(), GuardError> {
-    for a in assignments {
-        check_expr(&a.value)?;
-    }
-    Ok(())
-}
-
-/// `INSERT` under `Access::ReadWrite`. The write itself is permitted; every
-/// read position it carries is still guarded — the source query/`VALUES` must
-/// be read-only (no data-modifying CTE) and denied-function-free, and the
-/// `RETURNING` / `ON CONFLICT` clauses are walked too.
-fn check_insert(insert: &Insert) -> Result<(), GuardError> {
-    if let Some(source) = &insert.source {
-        check_query(source)?;
-    }
-    if let Some(returning) = &insert.returning {
-        check_select_items(returning)?;
-    }
-    if let Some(on) = &insert.on {
-        match on {
-            OnInsert::DuplicateKeyUpdate(assignments) => check_assignments(assignments)?,
-            OnInsert::OnConflict(on_conflict) => match &on_conflict.action {
-                OnConflictAction::DoNothing => {}
-                OnConflictAction::DoUpdate(do_update) => {
-                    check_assignments(&do_update.assignments)?;
-                    if let Some(selection) = &do_update.selection {
-                        check_expr(selection)?;
-                    }
-                }
-            },
-            // `OnInsert` is #[non_exhaustive]; an unrecognised ON clause can't
-            // be walked for denied functions, so reject rather than pass it on.
-            _ => return Err(GuardError::NotAllowed("unsupported ON clause")),
-        }
-    }
-    Ok(())
-}
-
-/// `UPDATE` under `Access::ReadWrite`. Assigned values, the optional `FROM`
-/// read source, the `WHERE` predicate, and `RETURNING` are all walked; the
-/// target table is a plain name that carries nothing callable.
-fn check_update(
-    table: &TableWithJoins,
-    assignments: &[Assignment],
-    from: Option<&TableWithJoins>,
-    selection: Option<&Expr>,
-    returning: Option<&[SelectItem]>,
-) -> Result<(), GuardError> {
-    check_table_with_joins(table)?;
-    check_assignments(assignments)?;
-    if let Some(from) = from {
-        check_table_with_joins(from)?;
-    }
-    if let Some(selection) = selection {
-        check_expr(selection)?;
-    }
-    if let Some(returning) = returning {
-        check_select_items(returning)?;
-    }
-    Ok(())
-}
-
-/// `DELETE` under `Access::ReadWrite`. Target/`USING` tables, the `WHERE`
-/// predicate, `RETURNING`, and the MySQL `ORDER BY` / `LIMIT` tail are walked.
-fn check_delete(delete: &Delete) -> Result<(), GuardError> {
-    let tables = match &delete.from {
-        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
-    };
-    for twj in tables {
-        check_table_with_joins(twj)?;
-    }
-    if let Some(using) = &delete.using {
-        for twj in using {
-            check_table_with_joins(twj)?;
-        }
-    }
-    if let Some(selection) = &delete.selection {
-        check_expr(selection)?;
-    }
-    if let Some(returning) = &delete.returning {
-        check_select_items(returning)?;
-    }
-    for order in &delete.order_by {
-        check_expr(&order.expr)?;
-    }
-    if let Some(limit) = &delete.limit {
-        check_expr(limit)?;
-    }
-    Ok(())
-}
-
-fn check_table_with_joins(twj: &TableWithJoins) -> Result<(), GuardError> {
-    check_table_factor(&twj.relation)?;
-    for join in &twj.joins {
-        check_table_factor(&join.relation)?;
-        check_join_operator(&join.join_operator)?;
-    }
-    Ok(())
-}
-
-/// A join's `ON <expr>` is a full expression position — `JOIN t2 ON
-/// pg_read_file('/x') IS NOT NULL` runs the function just like a `WHERE` would.
-/// `USING (cols)` and `NATURAL` carry only identifiers.
-fn check_join_operator(op: &JoinOperator) -> Result<(), GuardError> {
-    match op {
-        JoinOperator::Inner(c)
-        | JoinOperator::LeftOuter(c)
-        | JoinOperator::RightOuter(c)
-        | JoinOperator::FullOuter(c)
-        | JoinOperator::LeftSemi(c)
-        | JoinOperator::RightSemi(c)
-        | JoinOperator::LeftAnti(c)
-        | JoinOperator::RightAnti(c) => check_join_constraint(c),
-        JoinOperator::AsOf {
-            match_condition,
-            constraint,
-        } => {
-            check_expr(match_condition)?;
-            check_join_constraint(constraint)
-        }
-        JoinOperator::CrossJoin | JoinOperator::CrossApply | JoinOperator::OuterApply => Ok(()),
-    }
-}
-
-fn check_join_constraint(constraint: &JoinConstraint) -> Result<(), GuardError> {
-    match constraint {
-        JoinConstraint::On(expr) => check_expr(expr),
-        JoinConstraint::Using(_) | JoinConstraint::Natural | JoinConstraint::None => Ok(()),
-    }
-}
-
-/// Reject a call by name. Matches on the last identifier component so that
-/// schema-qualified calls (`pg_catalog.pg_read_file(...)`) are caught too.
+/// Match a callable's name against the denylist. Matches on the last identifier
+/// component so schema-qualified calls (`pg_catalog.pg_read_file(...)`) are
+/// caught too. Case-insensitive to match SQL identifier semantics.
 fn check_denied_name(name: &ObjectName) -> Result<(), GuardError> {
     let fn_name = name.0.last().map(|i| i.value.as_str()).unwrap_or("");
     match DENIED_FUNCTIONS
@@ -431,138 +333,6 @@ fn check_denied_name(name: &ObjectName) -> Result<(), GuardError> {
     {
         Some(&denied) => Err(GuardError::DeniedFunction(denied)),
         None => Ok(()),
-    }
-}
-
-/// Walk a positional/named argument list, e.g. so that
-/// `generate_series(1, pg_read_file('/x'))` is rejected on the inner call.
-fn check_function_arg_list(args: &[FunctionArg]) -> Result<(), GuardError> {
-    for arg in args {
-        let arg_expr = match arg {
-            FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => arg,
-        };
-        if let FunctionArgExpr::Expr(e) = arg_expr {
-            check_expr(e)?;
-        }
-    }
-    Ok(())
-}
-
-fn check_table_factor(factor: &TableFactor) -> Result<(), GuardError> {
-    match factor {
-        // Plain table reference or table-valued function like `pg_ls_dir('/tmp')`.
-        // The Postgres dialect parses `FROM func(args)` as `Table { args: Some(...) }`.
-        TableFactor::Table { name, args, .. } => {
-            check_denied_name(name)?;
-            match args {
-                Some(tfa) => check_function_arg_list(&tfa.args),
-                None => Ok(()),
-            }
-        }
-        // `FROM LATERAL func(args)` parses into its own variant — same denylist
-        // bypass as the `Table` form if it isn't checked by name too.
-        TableFactor::Function { name, args, .. } => {
-            check_denied_name(name)?;
-            check_function_arg_list(args)
-        }
-        // `TABLE(<expr>)` syntax.
-        TableFactor::TableFunction { expr, .. } => check_expr(expr),
-        // Subquery in the FROM clause.
-        TableFactor::Derived { subquery, .. } => check_query(subquery),
-        // Parenthesised join tree: `FROM (a JOIN b ON <expr>)`.
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => check_table_with_joins(table_with_joins),
-        // All other variants (UNNEST, Pivot, etc.) contain no directly
-        // callable functions that could be denied — fall through.
-        _ => Ok(()),
-    }
-}
-
-/// Recursively walk an expression node, rejecting any call to a denied
-/// function and recursing into subqueries so that nested attacks are caught.
-fn check_expr(expr: &Expr) -> Result<(), GuardError> {
-    match expr {
-        Expr::Function(f) => {
-            check_denied_name(&f.name)?;
-            check_function_args(&f.args)
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            check_expr(left)?;
-            check_expr(right)
-        }
-        Expr::UnaryOp { expr, .. } => check_expr(expr),
-        Expr::Nested(e) => check_expr(e),
-        // CAST / TRY_CAST / etc.
-        Expr::Cast { expr, .. } => check_expr(expr),
-        // IS NULL / IS NOT NULL / IS TRUE / …
-        Expr::IsNull(e)
-        | Expr::IsNotNull(e)
-        | Expr::IsTrue(e)
-        | Expr::IsNotTrue(e)
-        | Expr::IsFalse(e)
-        | Expr::IsNotFalse(e)
-        | Expr::IsUnknown(e)
-        | Expr::IsNotUnknown(e) => check_expr(e),
-        Expr::InList { expr, list, .. } => {
-            check_expr(expr)?;
-            for e in list {
-                check_expr(e)?;
-            }
-            Ok(())
-        }
-        Expr::InSubquery { expr, subquery, .. } => {
-            check_expr(expr)?;
-            check_query(subquery)
-        }
-        Expr::Subquery(q) => check_query(q),
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            check_expr(expr)?;
-            check_expr(low)?;
-            check_expr(high)
-        }
-        // LIKE / ILIKE / SIMILAR TO — walk both operands.
-        Expr::Like { expr, pattern, .. }
-        | Expr::ILike { expr, pattern, .. }
-        | Expr::SimilarTo { expr, pattern, .. } => {
-            check_expr(expr)?;
-            check_expr(pattern)
-        }
-        Expr::Case {
-            operand,
-            conditions,
-            results,
-            else_result,
-        } => {
-            if let Some(o) = operand {
-                check_expr(o)?;
-            }
-            for c in conditions {
-                check_expr(c)?;
-            }
-            for r in results {
-                check_expr(r)?;
-            }
-            if let Some(e) = else_result {
-                check_expr(e)?;
-            }
-            Ok(())
-        }
-        // Leaf nodes: identifiers, literals, typed strings, wildcards, etc.
-        _ => Ok(()),
-    }
-}
-
-/// Walk the argument list of a function call so that denied functions passed
-/// as arguments to wrapper functions are also rejected.
-fn check_function_args(args: &FunctionArguments) -> Result<(), GuardError> {
-    match args {
-        FunctionArguments::None => Ok(()),
-        // Some dialects allow bare subquery as the sole argument.
-        FunctionArguments::Subquery(q) => check_query(q),
-        FunctionArguments::List(list) => check_function_arg_list(&list.args),
     }
 }
 
@@ -864,7 +634,7 @@ mod tests {
     #[test]
     fn denied_function_in_query_tail_rejected() {
         // ORDER BY / LIMIT / OFFSET hang off `Query`, not off the SELECT body —
-        // they need their own walk or the denylist misses them.
+        // the Visit derive reaches them via the same walk as the projection.
         rejected_denied(
             "SELECT id FROM t ORDER BY pg_read_file('/etc/passwd')",
             "pg_read_file",
@@ -910,6 +680,113 @@ mod tests {
         ok("SELECT sum(amount) FROM orders GROUP BY user_id");
         ok("SELECT lower(email) FROM users");
         ok("SELECT coalesce(name, 'unknown') FROM t");
+    }
+
+    // --- Escape-position regressions (issue #138) ---
+    //
+    // Each of these was empirically shown to reach the target DB with the old
+    // hand-rolled `check_expr` — its `_ => Ok(())` fallthrough silently allowed
+    // every `Expr` variant the author hadn't listed. The visitor-based walk
+    // covers them without enumeration; these tests pin that guarantee.
+
+    #[test]
+    fn denied_in_exists_subquery_rejected() {
+        rejected_denied(
+            "SELECT 1 WHERE EXISTS (SELECT pg_read_file('/etc/passwd'))",
+            "pg_read_file",
+        );
+    }
+
+    #[test]
+    fn denied_in_any_all_subquery_rejected() {
+        rejected_denied(
+            "SELECT a FROM t WHERE a = ANY(SELECT pg_read_file('/etc/passwd'))",
+            "pg_read_file",
+        );
+        rejected_denied(
+            "SELECT a FROM t WHERE a = ALL(SELECT pg_read_file('/etc/passwd'))",
+            "pg_read_file",
+        );
+    }
+
+    #[test]
+    fn denied_in_tuple_rejected() {
+        rejected_denied("SELECT (pg_read_file('/etc/passwd'), 1)", "pg_read_file");
+    }
+
+    #[test]
+    fn denied_in_array_literal_rejected() {
+        rejected_denied("SELECT ARRAY[pg_read_file('/etc/passwd')]", "pg_read_file");
+    }
+
+    #[test]
+    fn denied_in_filter_clause_rejected() {
+        rejected_denied(
+            "SELECT count(*) FILTER (WHERE pg_read_file('/etc/passwd') IS NOT NULL) FROM t",
+            "pg_read_file",
+        );
+    }
+
+    #[test]
+    fn denied_in_window_frame_rejected() {
+        rejected_denied(
+            "SELECT sum(a) OVER (ORDER BY pg_read_file('/etc/passwd')) FROM t",
+            "pg_read_file",
+        );
+    }
+
+    #[test]
+    fn denied_in_distinct_on_rejected() {
+        rejected_denied(
+            "SELECT DISTINCT ON (pg_read_file('/etc/passwd')) a FROM t",
+            "pg_read_file",
+        );
+    }
+
+    #[test]
+    fn denied_in_unnest_rejected() {
+        rejected_denied(
+            "SELECT * FROM UNNEST(ARRAY[pg_read_file('/etc/passwd')])",
+            "pg_read_file",
+        );
+    }
+
+    #[test]
+    fn denied_in_is_distinct_from_rejected() {
+        rejected_denied(
+            "SELECT a FROM t WHERE a IS DISTINCT FROM pg_read_file('/etc/passwd')",
+            "pg_read_file",
+        );
+        rejected_denied(
+            "SELECT a FROM t WHERE a IS NOT DISTINCT FROM pg_read_file('/etc/passwd')",
+            "pg_read_file",
+        );
+    }
+
+    #[test]
+    fn denied_in_substring_rejected() {
+        // `substring(<expr> FROM ... FOR ...)` is `Expr::Substring`, not a
+        // `Function` call — and the old walker fell through it.
+        rejected_denied(
+            "SELECT substring(pg_read_file('/etc/passwd') FROM 1 FOR 2)",
+            "pg_read_file",
+        );
+    }
+
+    #[test]
+    fn denied_in_grouping_sets_rejected() {
+        rejected_denied(
+            "SELECT a FROM t GROUP BY GROUPING SETS ((pg_read_file('/etc/passwd')))",
+            "pg_read_file",
+        );
+        rejected_denied(
+            "SELECT a FROM t GROUP BY ROLLUP (pg_read_file('/etc/passwd'))",
+            "pg_read_file",
+        );
+        rejected_denied(
+            "SELECT a FROM t GROUP BY CUBE (pg_read_file('/etc/passwd'))",
+            "pg_read_file",
+        );
     }
 
     // --- Write mode (Access::ReadWrite) -------------------------------------
