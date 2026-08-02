@@ -35,36 +35,41 @@ fn unique_sub(prefix: &str) -> String {
 /// Hard-delete a seeded user plus every grant that touches them. Same rationale
 /// as `cleanup_user` in the pg suite: the shared dev DB otherwise accumulates
 /// rows across reruns, and the partial-uniqueness emulation lets soft-deleted
-/// rows linger and inflate the table.
+/// rows linger and inflate the table. `.expect(...)` so a cleanup failure fails
+/// the test loudly instead of silently leaking rows — pg does the same.
 async fn cleanup_user(pool: &MySqlPool, user_sub: &str) {
-    let _ = sqlx::query(
+    sqlx::query(
         "DELETE FROM permissions_grants \
          WHERE user_id IN (SELECT id FROM permissions_users WHERE user_sub = ?)",
     )
     .bind(user_sub)
     .execute(pool)
-    .await;
-    let _ = sqlx::query("DELETE FROM permissions_users WHERE user_sub = ?")
+    .await
+    .expect("cleanup grants");
+    sqlx::query("DELETE FROM permissions_users WHERE user_sub = ?")
         .bind(user_sub)
         .execute(pool)
-        .await;
+        .await
+        .expect("cleanup users");
 }
 
 /// Companion for `cleanup_user` — deletes everything a test seeded on a
 /// per-test-unique `server` name (grants first for the FK, then the databases
-/// themselves).
+/// themselves). `.expect(...)` for the same fail-loud reason as `cleanup_user`.
 async fn cleanup_server(pool: &MySqlPool, server: &str) {
-    let _ = sqlx::query(
+    sqlx::query(
         "DELETE FROM permissions_grants \
          WHERE database_id IN (SELECT id FROM permissions_databases WHERE server = ?)",
     )
     .bind(server)
     .execute(pool)
-    .await;
-    let _ = sqlx::query("DELETE FROM permissions_databases WHERE server = ?")
+    .await
+    .expect("cleanup grants for server");
+    sqlx::query("DELETE FROM permissions_databases WHERE server = ?")
         .bind(server)
         .execute(pool)
-        .await;
+        .await
+        .expect("cleanup databases");
 }
 
 /// Upsert + get-by-sub round-trip. Same contract as pg: the row exists
@@ -515,9 +520,17 @@ async fn mysql_paging_covers_every_row_without_duplicates() {
     }
 }
 
-/// Parity with pg pagination coverage for `list_databases`: an oversized limit
-/// clamps to `MAX_LIMIT`, a narrow limit bounds the returned rows, and a
-/// matched offset shifts the window against the same wide-page baseline.
+/// Parity with pg pagination coverage for `list_databases`: `limit` bounds the
+/// row count, `offset` shifts the window by exactly that many rows.
+///
+/// Anchors on our seeded block instead of `baseline[0..N]`. `list_databases`
+/// orders by `(server, db_name)`, so a concurrent test inserting a database
+/// with a lexicographically-earlier `server` shifts absolute positions
+/// mid-test. The seeded block itself is contiguous (same `server` + monotone
+/// `db_name`) and only we can touch it, so `offset = block_start + k` is a
+/// stable reference point once we've located `block_start`. We retry the
+/// windowed reads a few times to survive a concurrent insert landing between
+/// the `wide` snapshot and the offset read.
 #[tokio::test]
 async fn mysql_list_databases_honours_limit_and_offset() {
     let p = pool().await;
@@ -525,49 +538,74 @@ async fn mysql_list_databases_honours_limit_and_offset() {
     // Same server label for all three so a single `cleanup_server` sweeps them
     // (and any grant that happens to reference them).
     let server = format!("mysql-dbpage-{}", Uuid::new_v4().simple());
+    let mut seeded_ids = Vec::with_capacity(3);
     for i in 0..3 {
-        r.create_database(&server, &format!("db-{i}"), DbType::Postgres)
+        let db = r
+            .create_database(&server, &format!("db-{i}"), DbType::Postgres)
             .await
             .expect("seed db");
+        seeded_ids.push(db.id);
     }
 
-    let wide = Page::new(Some(Page::MAX_LIMIT), None);
-    let baseline = r.list_databases(wide).await.expect("baseline");
-    let seeded_positions: Vec<usize> = baseline
-        .iter()
-        .enumerate()
-        .filter(|(_, d)| d.server == server)
-        .map(|(i, _)| i)
-        .collect();
-    assert_eq!(seeded_positions.len(), 3, "three seeded dbs must appear");
-
-    let first_two = r
+    // limit alone: any page with `limit=2` must return at most two rows,
+    // independent of surrounding DB state.
+    let narrow = r
         .list_databases(Page::new(Some(2), None))
         .await
         .expect("limited");
-    assert_eq!(first_two.len(), 2, "limit must bound the row count");
+    assert!(
+        narrow.len() <= 2,
+        "limit must bound the row count, got {}",
+        narrow.len()
+    );
     assert_eq!(
-        first_two.iter().map(|d| d.id).collect::<Vec<_>>(),
-        baseline.iter().take(2).map(|d| d.id).collect::<Vec<_>>(),
-        "first page must be the head of the full ordering"
+        narrow.len(),
+        2,
+        "the DB has ≥3 rows we seeded; expect a full page"
     );
 
-    let shifted = r
-        .list_databases(Page::new(Some(2), Some(1)))
-        .await
-        .expect("offset");
-    assert_eq!(
-        shifted.iter().map(|d| d.id).collect::<Vec<_>>(),
-        baseline
-            .iter()
-            .skip(1)
-            .take(2)
-            .map(|d| d.id)
-            .collect::<Vec<_>>(),
-        "offset must shift the window by exactly that many rows"
-    );
+    // offset: locate our block, then verify `offset = block_start + 1` skips
+    // the first seeded row and returns the next two. Retry across concurrent
+    // churn since the block's absolute position is not stable.
+    let mut verified = false;
+    let mut last_shifted: Vec<Uuid> = Vec::new();
+    let mut last_expected: Vec<Uuid> = vec![seeded_ids[1], seeded_ids[2]];
+    for _ in 0..5 {
+        let wide = r
+            .list_databases(Page::new(Some(Page::MAX_LIMIT), None))
+            .await
+            .expect("wide");
+        let Some(block_start) = wide.iter().position(|d| d.server == server) else {
+            continue;
+        };
+        let block_start = block_start as u32;
+        // Confirm the block is still where we think it is before checking the
+        // shifted window — a shift between these two reads would surface as an
+        // anchor mismatch, and we simply retry.
+        let anchor = r
+            .list_databases(Page::new(Some(3), Some(block_start)))
+            .await
+            .expect("anchor");
+        if anchor.iter().map(|d| d.id).collect::<Vec<_>>() != seeded_ids {
+            continue;
+        }
+        let shifted = r
+            .list_databases(Page::new(Some(2), Some(block_start + 1)))
+            .await
+            .expect("offset");
+        last_shifted = shifted.iter().map(|d| d.id).collect();
+        last_expected = vec![seeded_ids[1], seeded_ids[2]];
+        if last_shifted == last_expected {
+            verified = true;
+            break;
+        }
+    }
 
     cleanup_server(&p, &server).await;
+    assert!(
+        verified,
+        "offset must shift the window by exactly that many rows (last shifted {last_shifted:?}, expected {last_expected:?})",
+    );
 }
 
 /// Parity with pg pagination coverage for `list_grants`. Seeds three grants
