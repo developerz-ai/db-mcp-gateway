@@ -296,3 +296,140 @@ async fn dropped_query_future_cancels_backend() {
         "backend not cancelled within 5s — drop did not fire pg_cancel_backend"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Decode fidelity (#136)
+//
+// `Value::Null` in a result row must mean SQL NULL and nothing else. These
+// types used to fall through every probe and arrive at the caller as `null`,
+// indistinguishable from a real NULL — a silently wrong answer for an agent
+// acting on the data.
+// ---------------------------------------------------------------------------
+
+/// The types the audit called out — plus the date/time family — must come back
+/// as their actual values, not `null`.
+#[tokio::test]
+async fn previously_nulled_types_decode_to_real_values() {
+    let adapter = adapter().await;
+    let result = adapter
+        .execute(query(
+            "SELECT '11111111-2222-3333-4444-555555555555'::uuid    AS u,
+                    '2026-08-02T10:30:00Z'::timestamptz              AS tstz,
+                    '2026-08-02 10:30:00'::timestamp                 AS ts,
+                    '2026-08-02'::date                               AS d,
+                    '10:30:00'::time                                 AS t,
+                    '1234.5600'::numeric                             AS n,
+                    '\\x0011ff'::bytea                               AS b",
+            None,
+            10,
+        ))
+        .await
+        .expect("query runs");
+
+    let row = &result.rows[0];
+    let col = |name: &str| {
+        let idx = result
+            .columns
+            .iter()
+            .position(|c| c == name)
+            .expect("column present");
+        row[idx].clone()
+    };
+
+    for name in ["u", "tstz", "ts", "d", "t", "n", "b"] {
+        assert!(
+            !col(name).is_null(),
+            "column `{name}` decoded to null — that is the #136 bug"
+        );
+    }
+    assert_eq!(col("u"), "11111111-2222-3333-4444-555555555555");
+    assert_eq!(col("ts"), "2026-08-02 10:30:00");
+    assert_eq!(col("d"), "2026-08-02");
+    assert_eq!(col("t"), "10:30:00");
+    assert_eq!(col("b"), "\\x0011ff");
+    // `numeric` keeps its trailing zeros: it is a decimal, not a float.
+    assert_eq!(col("n"), "1234.5600");
+    // RFC 3339, normalised to UTC.
+    let tstz = col("tstz");
+    let tstz = tstz.as_str().expect("timestamptz renders as a string");
+    assert!(
+        tstz.starts_with("2026-08-02T10:30:00"),
+        "unexpected timestamptz rendering: {tstz}"
+    );
+}
+
+/// `numeric` must survive as an exact decimal string. Rendering it as `f64`
+/// would trade a visibly wrong answer for an invisible one on money columns:
+/// this value needs 29 significant digits and `f64` carries ~15.
+#[tokio::test]
+async fn numeric_keeps_precision_a_float_would_lose() {
+    let adapter = adapter().await;
+    let exact = "12345678901234567890.123456789";
+    let result = adapter
+        .execute(query(&format!("SELECT '{exact}'::numeric AS n"), None, 10))
+        .await
+        .expect("query runs");
+
+    let got = result.rows[0][0]
+        .as_str()
+        .expect("numeric renders as string");
+    // Postgres ships numerics as base-10000 digit groups, so the decoded scale
+    // rounds up to a multiple of 4 and can carry extra trailing zeros. Those
+    // are cosmetic — every significant digit must survive verbatim.
+    assert_eq!(got.trim_end_matches('0'), exact, "got {got}");
+    assert_ne!(
+        got,
+        (exact.parse::<f64>().expect("parses")).to_string(),
+        "numeric must not be routed through f64"
+    );
+}
+
+/// SQL NULL still decodes to `null` — including for non-text types, where the
+/// old `Option<String>` probe could not even reach the NULL check.
+#[tokio::test]
+async fn sql_null_decodes_to_null_for_every_type() {
+    let adapter = adapter().await;
+    let result = adapter
+        .execute(query(
+            "SELECT NULL::timestamptz, NULL::uuid, NULL::numeric, NULL::text, NULL::int4[]",
+            None,
+            10,
+        ))
+        .await
+        .expect("query runs");
+    for (idx, value) in result.rows[0].iter().enumerate() {
+        assert!(
+            value.is_null(),
+            "column {idx} should be SQL NULL, got {value}"
+        );
+    }
+}
+
+/// A type the gateway can't render must be marked as such, never passed off as
+/// NULL. The marker names the type so the caller knows to cast it.
+#[tokio::test]
+async fn unrenderable_type_is_marked_not_nulled() {
+    let adapter = adapter().await;
+    let result = adapter
+        .execute(query("SELECT ARRAY[1,2,3] AS arr", None, 10))
+        .await
+        .expect("query runs");
+
+    let value = &result.rows[0][0];
+    assert!(
+        !value.is_null(),
+        "an unrenderable value must not masquerade as SQL NULL"
+    );
+    let named = value
+        .get("unsupported_type")
+        .and_then(|v| v.as_str())
+        .expect("marker carries the postgres type name");
+    assert!(!named.is_empty(), "type name should not be blank");
+
+    // And the caller's documented workaround actually works.
+    let cast = adapter
+        .execute(query("SELECT ARRAY[1,2,3]::text AS arr", None, 10))
+        .await
+        .expect("query runs");
+    assert_eq!(cast.rows[0][0], "{1,2,3}");
+}
