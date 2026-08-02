@@ -218,7 +218,7 @@ async fn post_handler(
     let request = match serde_json::from_str::<jsonrpc::Request>(&body) {
         Ok(request) if request.jsonrpc == jsonrpc::JSONRPC_VERSION => request,
         Ok(request) => {
-            let id = request.id.unwrap_or(Value::Null);
+            let id = request.id.response_id();
             return Json(jsonrpc::Response::error(
                 id,
                 jsonrpc::ErrorObject::invalid_request(),
@@ -251,14 +251,29 @@ async fn post_handler(
         // executing anyway just means running a real query nobody can see
         // the result of (#136 audit: was silently executed and audited under
         // a synthetic "null" id). Decline before touching config/registry/DB.
-        if request.id.is_none() {
+        if request.id.is_notification() {
             tracing::warn!(
                 %user_sub,
                 "tools/call sent as a notification (no id); declining without executing"
             );
             return StatusCode::ACCEPTED.into_response();
         }
-        let id = request.id.clone().unwrap_or(Value::Null);
+        // MCP requires a non-null id on requests. An explicit `"id": null` is
+        // neither a valid request nor a notification, so we surface it as
+        // invalid_request without executing — same reasoning as the
+        // notification branch above (no observable outcome, no audit row).
+        if request.id.is_null() {
+            tracing::warn!(
+                %user_sub,
+                r#"tools/call sent with "id": null; rejecting as invalid_request"#
+            );
+            return Json(jsonrpc::Response::error(
+                Value::Null,
+                jsonrpc::ErrorObject::invalid_request(),
+            ))
+            .into_response();
+        }
+        let id = request.id.response_id();
         let user_agent = headers
             .get(USER_AGENT)
             .or_else(|| headers.get(header::HeaderName::from_static("x-mcp-client")))

@@ -4,9 +4,7 @@
 //! in `post_handler` instead because tools need access to identity and the
 //! loaded config; everything else stays here.
 
-use serde_json::Value;
-
-use super::jsonrpc::{ErrorObject, Request, Response};
+use super::jsonrpc::{ErrorObject, Request, RequestId, Response};
 use super::protocol::{EmptyResult, InitializeResult, ToolsListResult};
 
 /// Dispatch a stateless request. Returns `Some(response)` for requests, `None`
@@ -14,33 +12,38 @@ use super::protocol::{EmptyResult, InitializeResult, ToolsListResult};
 /// not handled here — see `tools::dispatch_call` for the stateful path.
 pub fn dispatch(request: Request) -> Option<Response> {
     let Request { id, method, .. } = request;
-    let is_notification = id.is_none();
-    let response_id = || id.clone().unwrap_or(Value::Null);
 
-    // Build the would-be response, then drop it if the call carried no `id`
-    // — per JSON-RPC, notifications never get a reply, regardless of method.
+    // Per JSON-RPC 2.0, only an omitted `id` marks a notification — the reply
+    // is suppressed regardless of method. An explicit `"id": null` is NOT a
+    // notification; MCP treats it as invalid_request (handled just below).
+    if matches!(id, RequestId::Absent) {
+        return None;
+    }
+
+    let response_id = id.response_id();
+
+    // MCP requires a non-null id on requests. Reject explicit null before we
+    // do any method-specific work so misuse is caught uniformly.
+    if matches!(id, RequestId::Null) {
+        return Some(Response::error(response_id, ErrorObject::invalid_request()));
+    }
+
     let response = match method.as_str() {
-        "initialize" => Response::result(response_id(), &InitializeResult::new()),
+        "initialize" => Response::result(response_id, &InitializeResult::new()),
         // A notification by definition; if a client (wrongly) sends it with an
         // `id`, it's a request and JSON-RPC requires we answer rather than hang it.
-        "notifications/initialized" => {
-            Response::error(response_id(), ErrorObject::invalid_request())
-        }
-        "ping" => Response::result(response_id(), &EmptyResult {}),
-        "tools/list" => Response::result(response_id(), &ToolsListResult::current()),
+        "notifications/initialized" => Response::error(response_id, ErrorObject::invalid_request()),
+        "ping" => Response::result(response_id, &EmptyResult {}),
+        "tools/list" => Response::result(response_id, &ToolsListResult::current()),
         // `tools/call` is routed elsewhere — see `super::post_handler`.
         "tools/call" => Response::error(
-            response_id(),
+            response_id,
             ErrorObject::internal("tools/call must be routed via tools::dispatch_call"),
         ),
-        other => Response::error(response_id(), ErrorObject::method_not_found(other)),
+        other => Response::error(response_id, ErrorObject::method_not_found(other)),
     };
 
-    if is_notification {
-        None
-    } else {
-        Some(response)
-    }
+    Some(response)
 }
 
 #[cfg(test)]
@@ -49,7 +52,7 @@ mod tests {
     use crate::transport::jsonrpc::INTERNAL_ERROR;
     use crate::transport::jsonrpc::METHOD_NOT_FOUND;
     use crate::transport::protocol;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     fn dispatch_value(value: Value) -> Response {
         dispatch(serde_json::from_value(value).unwrap()).expect("expected a response")
@@ -88,6 +91,22 @@ mod tests {
             crate::transport::jsonrpc::INVALID_REQUEST
         );
         assert_eq!(value["id"], 9);
+    }
+
+    /// `"id": null` is neither a valid request id (MCP forbids null) nor a
+    /// notification (only an omitted id qualifies). It must surface as
+    /// invalid_request rather than being silently dropped like a notification.
+    #[test]
+    fn explicit_null_id_is_invalid_request_not_a_notification() {
+        let response = dispatch_value(
+            json!({"jsonrpc": "2.0", "id": null, "method": "initialize", "params": {}}),
+        );
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            value["error"]["code"],
+            crate::transport::jsonrpc::INVALID_REQUEST
+        );
+        assert_eq!(value["id"], Value::Null);
     }
 
     #[test]

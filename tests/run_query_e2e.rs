@@ -811,6 +811,64 @@ async fn tools_call_as_notification_does_not_execute() {
     );
 }
 
+/// A `tools/call` with an explicit `"id": null` is *not* a JSON-RPC
+/// notification — the id member is present, just with a value MCP forbids
+/// (§ requests require a non-null id). It must be rejected as
+/// `invalid_request`, NOT executed, and NOT audited. Regression guard for
+/// the follow-up to #136: without preserving id-member presence across
+/// deserialization, null-id `tools/call` would be silently accepted like
+/// the omitted-id case and still hit the DB.
+#[tokio::test]
+async fn tools_call_with_null_id_is_invalid_request_and_does_not_execute() {
+    let booted = boot_gateway().await;
+    let (url, bearer, pool, sub) = (
+        booted.url.as_str(),
+        booted.bearer.as_str(),
+        &booted.state_db,
+        booted.user_sub.as_str(),
+    );
+
+    let resp = client()
+        .post(format!("{url}/mcp"))
+        .bearer_auth(bearer)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "method": "tools/call",
+            "params": {
+                "name": "run_query",
+                "arguments": {
+                    "server": "target",
+                    "database": "app",
+                    "sql": "SELECT 1::int8 AS n",
+                },
+            },
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["error"]["code"], -32600,
+        "explicit null id must surface as invalid_request, got {body}"
+    );
+    assert_eq!(
+        body["id"],
+        Value::Null,
+        "response id must be null when the request id was null"
+    );
+
+    let row = db_mcp_gateway::audit::latest_for_user_tool(pool, sub, "run_query")
+        .await
+        .expect("audit lookup query runs");
+    assert!(
+        row.is_none(),
+        "tools/call with a null id must never execute the tool or write an audit row, got {row:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Concurrency cap tests — 429 (per-identity) and 503 (global)
 //
