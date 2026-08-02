@@ -1441,3 +1441,75 @@ async fn database_mutations_flush_all_cached_authz_for_all_users() {
         .await;
     h.cleanup().await;
 }
+
+/// `GET /admin/v1/users` used to return every live row (#136). It now takes a
+/// bounded window, defaulting to `Page::DEFAULT_LIMIT` and clamping an
+/// oversized ask rather than rejecting it.
+#[tokio::test]
+async fn list_honours_limit_query_param() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let admin_sub = format!("admin-page-{}", Uuid::new_v4().simple());
+    let jwt = mint_session(
+        &sessions,
+        &auth_cfg.session_signing_key,
+        &admin_sub,
+        "admin@example.com",
+        &[ADMIN_GROUP.to_string()],
+    )
+    .await;
+
+    for _ in 0..3 {
+        let target_sub = format!("page-{}", Uuid::new_v4().simple());
+        h.track(target_sub.clone());
+        let resp = client()
+            .post(format!("{}/admin/v1/users", h.base_url))
+            .bearer_auth(&jwt)
+            .json(&json!({
+                "user_sub": target_sub,
+                "user_email": "page@example.com",
+                "groups": ["engineers"],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    let page: Value = client()
+        .get(format!("{}/admin/v1/users?limit=2", h.base_url))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        page.as_array().map(Vec::len),
+        Some(2),
+        "limit must bound the response: {page}"
+    );
+
+    // Clamped, not rejected — same treatment every other caller-supplied
+    // bound gets in this gateway.
+    let huge = client()
+        .get(format!("{}/admin/v1/users?limit=999999999", h.base_url))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(huge.status(), StatusCode::OK);
+
+    // A non-numeric limit is a genuine client mistake, not a clamp case.
+    let bad = client()
+        .get(format!("{}/admin/v1/users?limit=abc", h.base_url))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    let err: Value = bad.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "invalid_request", "{err}");
+
+    h.cleanup().await;
+}

@@ -4,7 +4,7 @@ use serde_json::Value as JsonValue;
 use sqlx::MySqlPool;
 use uuid::Uuid;
 
-use super::super::{GrantAction, GrantTarget, PermissionsGrant, RepoError};
+use super::super::{GrantAction, GrantTarget, Page, PermissionsGrant, RepoError};
 use super::rows::grant_from_row;
 
 pub(super) async fn create_grant(
@@ -93,6 +93,7 @@ pub(super) async fn list_grants(
     pool: &MySqlPool,
     user_id: Option<Uuid>,
     database_id: Option<Uuid>,
+    page: Page,
 ) -> Result<Vec<PermissionsGrant>, RepoError> {
     // pg's `$1::uuid IS NULL OR …` collapse trick depends on pg's
     // ability to type-tag a NULL. Mysql's parameter typing happens at
@@ -106,12 +107,15 @@ pub(super) async fn list_grants(
          WHERE revoked_at IS NULL \
            AND (? IS NULL OR user_id = ?) \
            AND (? IS NULL OR database_id = ?) \
-         ORDER BY created_at",
+         ORDER BY created_at, id \
+         LIMIT ? OFFSET ?",
     )
     .bind(user_id.map(|u| u.to_string()))
     .bind(user_id.map(|u| u.to_string()))
     .bind(database_id.map(|d| d.to_string()))
     .bind(database_id.map(|d| d.to_string()))
+    .bind(page.limit())
+    .bind(page.offset())
     .fetch_all(pool)
     .await?;
     rows.iter().map(grant_from_row).collect()

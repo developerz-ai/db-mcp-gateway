@@ -46,6 +46,7 @@ use crate::state::permissions::PermissionsRepo;
 
 use super::error::AdminError;
 use super::middleware::{AdminActor, tx_upsert_actor};
+use super::page_query::invalid_query;
 
 pub use dto::{CreateGrantRequest, GrantResponse, ListGrantsQuery, UpdateGrantRequest};
 
@@ -53,8 +54,8 @@ use sql::{
     tx_create_grant, tx_get_grant_by_id, tx_revoke_grant, tx_update_grant, tx_user_sub_for_id,
 };
 use validation::{
-    constraints_to_json, grant_payload, internal, invalid_body, invalid_id, invalid_query,
-    map_create_grant_error, parse_action, parse_grant_target,
+    constraints_to_json, grant_payload, internal, invalid_body, invalid_id, map_create_grant_error,
+    parse_action, parse_grant_target,
 };
 
 /// Shared state cloned into every grants-route handler. The `cache` field is
@@ -139,7 +140,7 @@ pub async fn list(
     let Query(query) = query.map_err(|_| invalid_query(&actor.request_id))?;
     let grants = state
         .repo
-        .list_grants(query.user_id, query.database_id)
+        .list_grants(query.user_id, query.database_id, query.page.to_page())
         .await
         .map_err(|err| internal("list_grants", err, &actor.request_id))?;
     Ok(Json(grants.into_iter().map(GrantResponse::from).collect()))

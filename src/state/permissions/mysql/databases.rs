@@ -3,7 +3,7 @@
 use sqlx::MySqlPool;
 use uuid::Uuid;
 
-use super::super::{DbType, PermissionsDatabase, RepoError};
+use super::super::{DbType, Page, PermissionsDatabase, RepoError};
 use super::rows::database_from_row;
 
 pub(super) async fn create_database(
@@ -45,6 +45,28 @@ pub(super) async fn get_database(
 }
 
 pub(super) async fn list_databases(
+    pool: &MySqlPool,
+    page: Page,
+) -> Result<Vec<PermissionsDatabase>, RepoError> {
+    let rows = sqlx::query(
+        // `(server, db_name)` is unique among live rows, so it is already a
+        // total order — no extra tiebreak needed.
+        "SELECT id, server, db_name, db_type, created_at, updated_at, deleted_at \
+         FROM permissions_databases \
+         WHERE deleted_at IS NULL \
+         ORDER BY server, db_name \
+         LIMIT ? OFFSET ?",
+    )
+    .bind(page.limit())
+    .bind(page.offset())
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(database_from_row).collect()
+}
+
+/// See [`super::super::PermissionsRepo::all_live_databases`] — deliberately
+/// unpaginated; the authz resolver needs the complete set.
+pub(super) async fn all_live_databases(
     pool: &MySqlPool,
 ) -> Result<Vec<PermissionsDatabase>, RepoError> {
     let rows = sqlx::query(

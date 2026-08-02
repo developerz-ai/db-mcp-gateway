@@ -1,8 +1,8 @@
 //! CRUD handler functions for `/admin/v1/users`.
 
 use axum::Json;
-use axum::extract::rejection::{JsonRejection, PathRejection};
-use axum::extract::{Extension, Path, State};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use uuid::Uuid;
@@ -14,6 +14,7 @@ use crate::authz::PermissionsCache;
 
 use super::super::error::AdminError;
 use super::super::middleware::{AdminActor, tx_upsert_actor};
+use super::super::page_query::{PageQuery, invalid_query};
 use super::tx::{
     tx_get_user_by_id, tx_get_user_by_sub, tx_soft_delete_user, tx_update_user, tx_upsert_user,
 };
@@ -98,10 +99,12 @@ pub async fn create(
 pub async fn list(
     State(state): State<UsersState>,
     Extension(actor): Extension<AdminActor>,
+    page: Result<Query<PageQuery>, QueryRejection>,
 ) -> Result<Json<Vec<UserResponse>>, AdminError> {
+    let Query(page) = page.map_err(|_| invalid_query(&actor.request_id))?;
     let users = state
         .repo
-        .list_users()
+        .list_users(page.to_page())
         .await
         .map_err(|err| internal("list_users", err, &actor.request_id))?;
     Ok(Json(users.into_iter().map(UserResponse::from).collect()))

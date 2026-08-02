@@ -9,6 +9,8 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+use super::super::page_query::PageQuery;
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
@@ -105,4 +107,8 @@ pub struct ListGrantsQuery {
     pub user_id: Option<Uuid>,
     #[serde(default)]
     pub database_id: Option<Uuid>,
+    /// `?limit=&offset=`, flattened so they sit alongside the filters rather
+    /// than nested. `deny_unknown_fields` above still rejects typos.
+    #[serde(flatten)]
+    pub page: PageQuery,
 }

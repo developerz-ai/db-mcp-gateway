@@ -10,9 +10,18 @@
 
 use db_mcp_gateway::state;
 use db_mcp_gateway::state::permissions::{
-    DbType, GrantAction, GrantTarget, PermissionsRepo, pg::PgPermissionsRepo,
+    DbType, GrantAction, GrantTarget, Page, PermissionsRepo, pg::PgPermissionsRepo,
 };
 use sqlx::PgPool;
+
+/// The widest page the repo allows. Presence/absence assertions below care
+/// about "is this row in the table at all", so they must not depend on it
+/// landing inside the default 100-row window of a dev DB that accumulates
+/// rows across runs (order is `created_at` ascending — the newest row is
+/// last, so it is exactly the one a narrow page drops).
+fn wide_page() -> Page {
+    Page::new(Some(Page::MAX_LIMIT), None)
+}
 use uuid::Uuid;
 
 fn state_db_url() -> String {
@@ -104,7 +113,10 @@ async fn get_user_by_sub_skips_soft_deleted() {
         repo.get_user_by_sub(&sub).await.expect("get").is_some(),
         "live user should be found"
     );
-    let listed_before = repo.list_users().await.expect("list users before delete");
+    let listed_before = repo
+        .list_users(wide_page())
+        .await
+        .expect("list users before delete");
     assert!(
         listed_before.iter().any(|u| u.id == user.id),
         "live user should appear in list_users"
@@ -115,7 +127,10 @@ async fn get_user_by_sub_skips_soft_deleted() {
         repo.get_user_by_sub(&sub).await.expect("get").is_none(),
         "soft-deleted user must not surface"
     );
-    let listed_after = repo.list_users().await.expect("list users after delete");
+    let listed_after = repo
+        .list_users(wide_page())
+        .await
+        .expect("list users after delete");
     assert!(
         !listed_after.iter().any(|u| u.id == user.id),
         "soft-deleted user must not appear in list_users"
@@ -146,12 +161,12 @@ async fn database_crud_and_list_filters_soft_deleted() {
     assert_eq!(pg_db.db_type, DbType::Postgres);
     assert_eq!(mysql_db.db_type, DbType::Mysql);
 
-    let listed = repo.list_databases().await.expect("list");
+    let listed = repo.list_databases(wide_page()).await.expect("list");
     assert!(listed.iter().any(|d| d.id == pg_db.id));
     assert!(listed.iter().any(|d| d.id == mysql_db.id));
 
     assert!(repo.soft_delete_database(pg_db.id).await.expect("del"));
-    let after = repo.list_databases().await.expect("list2");
+    let after = repo.list_databases(wide_page()).await.expect("list2");
     assert!(
         !after.iter().any(|d| d.id == pg_db.id),
         "soft-deleted db must drop from list"
@@ -301,4 +316,97 @@ async fn raw_insert_with_both_specific_and_wildcard_is_rejected_by_check() {
 
     cleanup_user(&p, &sub).await;
     cleanup_database(&p, &server).await;
+}
+
+/// `limit`/`offset` must actually bound and shift the window. Asserted
+/// against a wide-page baseline rather than absolute positions, so other rows
+/// in a shared dev DB can't make this flaky.
+#[tokio::test]
+async fn list_users_honours_limit_and_offset() {
+    let repo = PgPermissionsRepo::new(pool().await);
+    for _ in 0..3 {
+        repo.upsert_user(&format!("page-{}", Uuid::new_v4()), "page@example.com", &[])
+            .await
+            .expect("seed user");
+    }
+
+    let baseline = repo.list_users(wide_page()).await.expect("baseline");
+    assert!(baseline.len() >= 3, "seeded at least three users");
+
+    let first_two = repo
+        .list_users(Page::new(Some(2), None))
+        .await
+        .expect("limited");
+    assert_eq!(first_two.len(), 2, "limit must bound the row count");
+    assert_eq!(
+        first_two.iter().map(|u| u.id).collect::<Vec<_>>(),
+        baseline.iter().take(2).map(|u| u.id).collect::<Vec<_>>(),
+        "first page must be the head of the full ordering"
+    );
+
+    let shifted = repo
+        .list_users(Page::new(Some(2), Some(1)))
+        .await
+        .expect("offset");
+    assert_eq!(
+        shifted.iter().map(|u| u.id).collect::<Vec<_>>(),
+        baseline
+            .iter()
+            .skip(1)
+            .take(2)
+            .map(|u| u.id)
+            .collect::<Vec<_>>(),
+        "offset must shift the window by exactly that many rows"
+    );
+}
+
+/// Paging all the way through must visit every row exactly once — the
+/// property a non-deterministic `ORDER BY` tiebreak would silently break.
+///
+/// Asserted as "no duplicates, and every seeded row shows up", not as equality
+/// with a baseline snapshot: sibling tests insert into `permissions_users`
+/// concurrently, and with `created_at` ascending those land at the *end* of
+/// the ordering. A row appearing mid-walk is therefore expected and harmless;
+/// a row appearing twice, or a seeded row never appearing, is the actual bug.
+#[tokio::test]
+async fn paging_covers_every_row_without_duplicates() {
+    let repo = PgPermissionsRepo::new(pool().await);
+    let mut seeded = Vec::new();
+    for _ in 0..3 {
+        let user = repo
+            .upsert_user(&format!("cover-{}", Uuid::new_v4()), "c@example.com", &[])
+            .await
+            .expect("seed user");
+        seeded.push(user.id);
+    }
+
+    let mut walked = Vec::new();
+    let mut offset = 0u32;
+    loop {
+        let page = repo
+            .list_users(Page::new(Some(2), Some(offset)))
+            .await
+            .expect("page");
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 2, "page overran its limit");
+        walked.extend(page.iter().map(|u| u.id));
+        offset += 2;
+    }
+
+    let mut unique = walked.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        walked.len(),
+        "a row was returned on more than one page"
+    );
+    for id in seeded {
+        assert!(
+            walked.contains(&id),
+            "seeded user {id} was skipped by the page walk"
+        );
+    }
 }

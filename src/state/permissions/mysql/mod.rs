@@ -36,7 +36,7 @@ use sqlx::MySqlPool;
 use uuid::Uuid;
 
 use super::{
-    DbType, GrantAction, GrantTarget, PermissionsDatabase, PermissionsGrant, PermissionsRepo,
+    DbType, GrantAction, GrantTarget, Page, PermissionsDatabase, PermissionsGrant, PermissionsRepo,
     PermissionsUser, RepoError,
 };
 
@@ -79,8 +79,8 @@ impl PermissionsRepo for MysqlPermissionsRepo {
         users::update_user(&self.pool, id, user_email, groups).await
     }
 
-    async fn list_users(&self) -> Result<Vec<PermissionsUser>, RepoError> {
-        users::list_users(&self.pool).await
+    async fn list_users(&self, page: Page) -> Result<Vec<PermissionsUser>, RepoError> {
+        users::list_users(&self.pool, page).await
     }
 
     async fn soft_delete_user(&self, id: Uuid) -> Result<bool, RepoError> {
@@ -100,8 +100,12 @@ impl PermissionsRepo for MysqlPermissionsRepo {
         databases::get_database(&self.pool, id).await
     }
 
-    async fn list_databases(&self) -> Result<Vec<PermissionsDatabase>, RepoError> {
-        databases::list_databases(&self.pool).await
+    async fn list_databases(&self, page: Page) -> Result<Vec<PermissionsDatabase>, RepoError> {
+        databases::list_databases(&self.pool, page).await
+    }
+
+    async fn all_live_databases(&self) -> Result<Vec<PermissionsDatabase>, RepoError> {
+        databases::all_live_databases(&self.pool).await
     }
 
     async fn update_database(
@@ -143,8 +147,9 @@ impl PermissionsRepo for MysqlPermissionsRepo {
         &self,
         user_id: Option<Uuid>,
         database_id: Option<Uuid>,
+        page: Page,
     ) -> Result<Vec<PermissionsGrant>, RepoError> {
-        grants::list_grants(&self.pool, user_id, database_id).await
+        grants::list_grants(&self.pool, user_id, database_id, page).await
     }
 
     async fn update_grant(

@@ -155,6 +155,59 @@ pub enum RepoError {
     DecodeGroups(#[source] serde_json::Error),
 }
 
+/// A bounded window over a list endpoint's results.
+///
+/// The admin list queries used to `fetch_all` with no `LIMIT` (#136), so one
+/// request loaded every row into memory and serialized it into a single JSON
+/// response — cost growing without bound as the install grows.
+///
+/// A bare cap was the other option and is worse: it returns a silently
+/// incomplete list, which an operator has no way to distinguish from "that's
+/// all of them". Paging is explicit about there being more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Page {
+    limit: i64,
+    offset: i64,
+}
+
+impl Page {
+    /// Rows returned when the caller doesn't ask for a specific `limit`.
+    pub const DEFAULT_LIMIT: u32 = 100;
+    /// Hard ceiling on `limit`. Mirrors the clamping used elsewhere for
+    /// caller-supplied bounds (`tools::GATEWAY_ROW_LIMIT_CEILING`,
+    /// `exec::adapter::effective_timeout_ms`): an oversized ask is clamped,
+    /// not rejected, so a client that guesses high still gets a usable page.
+    pub const MAX_LIMIT: u32 = 1000;
+
+    /// Clamp caller input into a usable window. `limit` lands in
+    /// `1..=MAX_LIMIT` — zero would burn a round trip to return nothing.
+    pub fn new(limit: Option<u32>, offset: Option<u32>) -> Self {
+        let limit = limit
+            .unwrap_or(Self::DEFAULT_LIMIT)
+            .clamp(1, Self::MAX_LIMIT);
+        Self {
+            limit: i64::from(limit),
+            offset: i64::from(offset.unwrap_or(0)),
+        }
+    }
+
+    /// Bind value for `LIMIT`. `i64` because that is what both Postgres and
+    /// MySQL want for a bound limit/offset.
+    pub fn limit(self) -> i64 {
+        self.limit
+    }
+
+    pub fn offset(self) -> i64 {
+        self.offset
+    }
+}
+
+impl Default for Page {
+    fn default() -> Self {
+        Self::new(None, None)
+    }
+}
+
 /// CRUD surface for the permissions store. Implementations: [`pg::PgPermissionsRepo`].
 ///
 /// Trait methods mirror the admin API verbs (#52–#54) plus the read paths the
@@ -179,7 +232,8 @@ pub trait PermissionsRepo: Send + Sync + std::fmt::Debug {
     /// PATCH read-before-write that captures `before` for the audit row).
     async fn get_user(&self, id: Uuid) -> Result<Option<PermissionsUser>, RepoError>;
 
-    async fn list_users(&self) -> Result<Vec<PermissionsUser>, RepoError>;
+    /// One page of live users, newest-first-stable order. Admin API only.
+    async fn list_users(&self, page: Page) -> Result<Vec<PermissionsUser>, RepoError>;
 
     /// Partial update used by `PATCH /admin/v1/users/:id`. `None` means
     /// "leave field unchanged". Returns the post-update row, or `None` when
@@ -202,7 +256,19 @@ pub trait PermissionsRepo: Send + Sync + std::fmt::Debug {
 
     async fn get_database(&self, id: Uuid) -> Result<Option<PermissionsDatabase>, RepoError>;
 
-    async fn list_databases(&self) -> Result<Vec<PermissionsDatabase>, RepoError>;
+    /// One page of live databases. Admin API only.
+    async fn list_databases(&self, page: Page) -> Result<Vec<PermissionsDatabase>, RepoError>;
+
+    /// **Every** live database, unpaginated, for the authz resolver.
+    ///
+    /// `authz::loader` indexes the full set by id to resolve `Specific` grant
+    /// targets; a grant whose database is missing from that index is dropped
+    /// as non-applicable. Paginating this would therefore silently revoke
+    /// grants whose database happened to fall outside the window — an authz
+    /// bug strictly worse than the unbounded read it would be fixing. Bounded
+    /// in practice by the number of registered databases, which is operator
+    /// -controlled config, not user-generated volume.
+    async fn all_live_databases(&self) -> Result<Vec<PermissionsDatabase>, RepoError>;
 
     /// Partial update used by `PATCH /admin/v1/databases/:id`. `None` means
     /// "leave field unchanged". Returns the post-update row, or `None` when
@@ -242,6 +308,7 @@ pub trait PermissionsRepo: Send + Sync + std::fmt::Debug {
         &self,
         user_id: Option<Uuid>,
         database_id: Option<Uuid>,
+        page: Page,
     ) -> Result<Vec<PermissionsGrant>, RepoError>;
 
     /// Partial update used by `PATCH /admin/v1/grants/:id`. The target

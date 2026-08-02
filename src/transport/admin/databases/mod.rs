@@ -32,8 +32,8 @@ mod validation;
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::rejection::{JsonRejection, PathRejection};
-use axum::extract::{Extension, Path, State};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde_json::{Value as JsonValue, json};
@@ -48,6 +48,7 @@ use crate::state::permissions::{PermissionsDatabase, PermissionsRepo};
 
 use super::error::AdminError;
 use super::middleware::{AdminActor, tx_upsert_actor};
+use super::page_query::{PageQuery, invalid_query};
 
 pub use dto::{CreateDatabaseRequest, DatabaseResponse, UpdateDatabaseRequest};
 
@@ -145,10 +146,12 @@ pub async fn create(
 pub async fn list(
     State(state): State<DatabasesState>,
     Extension(actor): Extension<AdminActor>,
+    page: Result<Query<PageQuery>, QueryRejection>,
 ) -> Result<Json<Vec<DatabaseResponse>>, AdminError> {
+    let Query(page) = page.map_err(|_| invalid_query(&actor.request_id))?;
     let databases = state
         .repo
-        .list_databases()
+        .list_databases(page.to_page())
         .await
         .map_err(|err| internal("list_databases", err, &actor.request_id))?;
     Ok(Json(

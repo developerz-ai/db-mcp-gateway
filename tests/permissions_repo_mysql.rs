@@ -6,7 +6,7 @@
 //! backend, validating that callers don't need to know which is in use.
 
 use db_mcp_gateway::state::permissions::mysql::MysqlPermissionsRepo;
-use db_mcp_gateway::state::permissions::{DbType, GrantAction, GrantTarget, PermissionsRepo};
+use db_mcp_gateway::state::permissions::{DbType, GrantAction, GrantTarget, Page, PermissionsRepo};
 use db_mcp_gateway::state::{self};
 use serde_json::json;
 use sqlx::MySqlPool;
@@ -267,7 +267,7 @@ async fn list_grants_database_filter_excludes_wildcards_and_revoked() {
     .expect("wildcard grant");
 
     let filtered = r
-        .list_grants(Some(user.id), Some(db.id))
+        .list_grants(Some(user.id), Some(db.id), Page::default())
         .await
         .expect("list ok");
     assert_eq!(
@@ -280,7 +280,7 @@ async fn list_grants_database_filter_excludes_wildcards_and_revoked() {
     // Revoking the specific grant empties the filtered listing (live rows only).
     assert!(r.revoke_grant(specific.id).await.expect("revoke ok"));
     let after = r
-        .list_grants(Some(user.id), Some(db.id))
+        .list_grants(Some(user.id), Some(db.id), Page::default())
         .await
         .expect("list ok");
     assert!(
@@ -305,7 +305,7 @@ async fn get_user_by_sub_skips_soft_deleted() {
         r.get_user_by_sub(&sub).await.expect("get").is_some(),
         "live user should be found"
     );
-    let before = r.list_users().await.expect("list before");
+    let before = r.list_users(Page::default()).await.expect("list before");
     assert!(before.iter().any(|u| u.id == user.id));
 
     assert!(
@@ -316,7 +316,7 @@ async fn get_user_by_sub_skips_soft_deleted() {
         r.get_user_by_sub(&sub).await.expect("get").is_none(),
         "soft-deleted user must not surface"
     );
-    let after = r.list_users().await.expect("list after");
+    let after = r.list_users(Page::default()).await.expect("list after");
     assert!(!after.iter().any(|u| u.id == user.id));
     assert!(
         !r.soft_delete_user(user.id).await.expect("redelete"),
@@ -343,7 +343,7 @@ async fn database_crud_and_list_filters_soft_deleted() {
     assert_eq!(pg_db.db_type, DbType::Postgres);
     assert_eq!(mysql_db.db_type, DbType::Mysql);
 
-    let listed = r.list_databases().await.expect("list");
+    let listed = r.list_databases(Page::default()).await.expect("list");
     assert!(listed.iter().any(|d| d.id == pg_db.id));
     assert!(listed.iter().any(|d| d.id == mysql_db.id));
 
@@ -357,7 +357,7 @@ async fn database_crud_and_list_filters_soft_deleted() {
     assert_eq!(renamed.db_type, DbType::Mysql);
 
     assert!(r.soft_delete_database(pg_db.id).await.expect("del"));
-    let after = r.list_databases().await.expect("list2");
+    let after = r.list_databases(Page::default()).await.expect("list2");
     assert!(
         !after.iter().any(|d| d.id == pg_db.id),
         "soft-deleted db must drop from list"

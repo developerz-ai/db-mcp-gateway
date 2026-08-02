@@ -47,7 +47,7 @@ pub async fn load_db_grants_for(
     // One round-trip for all live databases, then index by id for the
     // Specific-target lookup. N+1 with get_database would be observable
     // even at a few-grants-per-user — keep this O(1) per grant.
-    let databases = repo.list_databases().await?;
+    let databases = repo.all_live_databases().await?;
     let db_by_id: HashMap<_, _> = databases.iter().map(|d| (d.id, d)).collect();
 
     let mut out = Vec::with_capacity(db_grants.len());

@@ -16,10 +16,6 @@ pub(super) fn invalid_id(request_id: &str) -> AdminError {
     AdminError::invalid("invalid grant id").with_request_id(request_id)
 }
 
-pub(super) fn invalid_query(request_id: &str) -> AdminError {
-    AdminError::invalid("invalid query parameters").with_request_id(request_id)
-}
-
 /// Parse the request body's target fields into a `GrantTarget`, rejecting
 /// every illegal combination the storage XOR CHECK would later catch. Surfaces
 /// `invalid_request` instead of a generic 500 from the DB constraint.

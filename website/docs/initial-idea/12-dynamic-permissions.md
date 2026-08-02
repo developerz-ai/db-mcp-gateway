@@ -105,6 +105,10 @@ If `admin.enabled` is false, the entire `/admin/*` route is `404`. Belt-and-susp
 
 All endpoints require a valid SSO JWT with the admin group claim. Every write commits a `permissions_audit` row **before** the response goes out.
 
+**List endpoints are paginated.** `GET /admin/v1/{users,databases,grants}` accept `?limit=` and `?offset=`. `limit` defaults to **100** and is clamped to a maximum of **1000** — an oversized ask is clamped, not rejected, matching how the gateway treats every other caller-supplied bound. A non-numeric value is a client mistake and returns `invalid_request` (400). Ordering is stable and total (`created_at, id` for users and grants; `(server, db_name)` for databases), so walking pages visits every row exactly once. Without this an install's entire permissions table loaded into memory and serialized into one response.
+
+Pagination deliberately does *not* apply to the resolver's internal read of all live databases: `authz::loader` indexes the complete set to resolve `Specific` grant targets, and a windowed read would silently drop grants whose database fell outside it.
+
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/admin/v1/users` | Register a user (SSO subject + email + cached groups) |
