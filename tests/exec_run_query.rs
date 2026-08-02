@@ -343,7 +343,9 @@ async fn previously_nulled_types_decode_to_real_values() {
         );
     }
     assert_eq!(col("u"), "11111111-2222-3333-4444-555555555555");
-    assert_eq!(col("ts"), "2026-08-02 10:30:00");
+    // `timestamp` renders ISO-8601 with the `T` separator, no zone —
+    // the spec (03-mcp-tools.md) requires it.
+    assert_eq!(col("ts"), "2026-08-02T10:30:00");
     assert_eq!(col("d"), "2026-08-02");
     assert_eq!(col("t"), "10:30:00");
     assert_eq!(col("b"), "\\x0011ff");

@@ -102,7 +102,11 @@ fn decode_value(row: &PgRow, idx: usize) -> Value {
         return Value::from(v.to_rfc3339());
     }
     if let Ok(v) = row.try_get::<chrono::NaiveDateTime, _>(idx) {
-        return Value::from(v.to_string());
+        // `NaiveDateTime::to_string()` emits a *space* between date and time.
+        // The spec (03-mcp-tools.md) documents `timestamp` as ISO-8601, which
+        // demands the `T` separator. `%.f` preserves fractional seconds when
+        // present and elides them when zero, matching Postgres round-tripping.
+        return Value::from(v.format("%Y-%m-%dT%H:%M:%S%.f").to_string());
     }
     if let Ok(v) = row.try_get::<chrono::NaiveDate, _>(idx) {
         return Value::from(v.to_string());
