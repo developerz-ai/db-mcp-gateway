@@ -145,6 +145,11 @@ async fn op_running_against(client: &Client, collection: &str) -> bool {
 /// Poll `op_running_against` until it returns `want` or the deadline passes.
 /// Returns the last observed value. Reuses the caller's `Client` — see
 /// `op_running_against` for why.
+///
+/// 20 ms cadence — a currentOp round-trip on localhost is a couple of ms, and
+/// the "did the op appear" check needs to sample fast enough that a sub-100ms
+/// aggregate on a fast CI runner still gets caught in-flight. 50 ms turned out
+/// to be too coarse in practice.
 async fn poll_until(client: &Client, collection: &str, want: bool, deadline: Duration) -> bool {
     let start = std::time::Instant::now();
     loop {
@@ -152,7 +157,7 @@ async fn poll_until(client: &Client, collection: &str, want: bool, deadline: Dur
         if seen == want || start.elapsed() >= deadline {
             return seen;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -168,14 +173,23 @@ async fn poll_until(client: &Client, collection: &str, want: bool, deadline: Dur
 async fn dropped_execute_future_kills_the_mongo_op() {
     let monitor = side_client();
     let coll = unique_collection();
-    // Enough documents that an unindexed sort takes a comfortable few
-    // hundred ms to a couple of seconds — long enough to observe in
-    // currentOp before the test aborts, short enough not to make CI slow.
+    // Enough documents that an unindexed sort on a per-doc computed field
+    // takes a comfortable few hundred ms to a couple of seconds — long enough
+    // to observe in currentOp before the test aborts, short enough not to
+    // make CI slow. On a fast CI runner a trivial sort of a few hundred k
+    // trivial docs finishes inside a single poll interval, so the pipeline
+    // adds `$addFields` + `$reduce` per doc to guarantee CPU-bound work
+    // regardless of runner speed.
     seed(&monitor, &coll, 200_000).await;
 
     let adapter = Arc::new(adapter().await);
-    let sql =
-        format!(r#"{{"aggregate":"{coll}","pipeline":[{{"$sort":{{"i":-1}}}}],"cursor":{{}}}}"#);
+    // `$reduce` walks a 500-element `$range` per doc → ~100M cheap ops for
+    // 200k docs, dominating the pipeline cost. Sort on the computed field
+    // `h` prevents any index shortcut. Kept inline as a JSON string so the
+    // full pipeline is legible next to the intent above.
+    let sql = format!(
+        r#"{{"aggregate":"{coll}","pipeline":[{{"$addFields":{{"h":{{"$reduce":{{"input":{{"$range":[0,500]}},"initialValue":0,"in":{{"$add":["$$value","$$this"]}}}}}}}}}},{{"$sort":{{"h":-1,"i":-1}}}}],"cursor":{{}}}}"#
+    );
 
     let adapter_task = adapter.clone();
     let sql_task = sql.clone();

@@ -13,6 +13,12 @@
 //! No mocking and no docker — the unreachable database is a real TCP listener
 //! that accepts and then never speaks Postgres. That is a genuine socket
 //! behaviour, just cheaper to arrange than a wedged Postgres.
+//!
+//! Audit assertion intentionally skipped in both tests: they exercise the
+//! exec layer's `AdapterRegistry` in isolation via `get_or_open`, never
+//! entering the tool-dispatch path where audit rows are written. Audit
+//! coverage for the tool path lives in the integration tests (see
+//! `tests/run_query_e2e.rs` and `tests/cancellation_real_db.rs`).
 
 use std::time::{Duration, Instant};
 
