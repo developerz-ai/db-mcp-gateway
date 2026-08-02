@@ -42,9 +42,10 @@ The gateway speaks **MCP over Streamable HTTP** (the 2025-03+ MCP transport), no
 |---|---|---|
 | **Absent** (member omitted) | JSON-RPC notification — no reply expected | `202 Accepted`, no body. `tools/call` never has a notification form, so a `tools/call` with no `id` is declined without executing a query. |
 | **Null** (`"id": null` explicit) | MCP forbids null request ids (JSON-RPC 2.0 also `SHOULD NOT` be null). Not a notification. | `invalid_request` JSON-RPC error with `"id": null`. `tools/call` is rejected before any authz/query/audit work — the caller could never observe the outcome, so executing would just run an unowned query. |
-| **Present** (string / number / other value) | A real request | Normal request/response, id echoed back on the reply. |
+| **Present, string or integer number** | A real request with a well-typed MCP `RequestId` | Normal request/response, id echoed back on the reply. |
+| **Present, unsupported type** (boolean, array, object, fractional number) | MCP defines `RequestId` as `string \| number`; JSON-RPC 2.0 also says numbers `SHOULD NOT` be fractional. Neither a valid request id nor a notification. | `invalid_request` JSON-RPC error with the sender's id echoed verbatim. `tools/call` is rejected before any authz/query/audit work — same reasoning as the null case. |
 
-The distinction lives in `RequestId` (`Absent` / `Null` / `Present`) so the same rule can be enforced identically in stateless dispatch and in the `tools/call` fast path.
+The distinction lives in `RequestId` (`Absent` / `Null` / `Present`, with `Present` validated by `is_invalid_type`) so the same rule can be enforced identically in stateless dispatch and in the `tools/call` fast path.
 
 Protocol version: `2025-06-18`. The framing is hand-rolled JSON-RPC; it gets swapped for an official MCP server SDK when one stabilizes (see [11-roadmap](11-roadmap.md)). Transport owns framing only — auth, tool dispatch, and audit are separate layers below.
 

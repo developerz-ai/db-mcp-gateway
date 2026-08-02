@@ -273,6 +273,22 @@ async fn post_handler(
             ))
             .into_response();
         }
+        // MCP `RequestId` is `string | number` (integer). Booleans, arrays,
+        // objects, and fractional numbers are still parsed into `Present`,
+        // but the tools path must reject them for the same reason as null —
+        // there is no correct query/audit outcome for a non-conforming id.
+        // Echo the original id so the client can correlate the failure.
+        if request.id.is_invalid_type() {
+            tracing::warn!(
+                %user_sub,
+                "tools/call sent with an unsupported id type; rejecting as invalid_request"
+            );
+            return Json(jsonrpc::Response::error(
+                request.id.response_id(),
+                jsonrpc::ErrorObject::invalid_request(),
+            ))
+            .into_response();
+        }
         let id = request.id.response_id();
         let user_agent = headers
             .get(USER_AGENT)

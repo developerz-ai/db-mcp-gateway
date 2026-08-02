@@ -125,6 +125,69 @@ async fn notification_is_acknowledged_without_body() {
     assert_eq!(response.status(), 202);
 }
 
+/// MCP `RequestId` is `string | number`. A `tools/call` sent with a boolean,
+/// array, object, or fractional-number id has no valid interpretation, so it
+/// must be rejected as `invalid_request` before any authz/query/audit work —
+/// same reasoning as the explicit-null case, and the id is echoed back so the
+/// caller can correlate the failure.
+#[tokio::test]
+async fn tools_call_with_unsupported_id_type_is_invalid_request() {
+    let url = spawn_gateway().await;
+    for id in [
+        json!(true),
+        json!([1, 2]),
+        json!({"nested": true}),
+        json!(1.5),
+    ] {
+        let response = client()
+            .post(&url)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": "list_servers"}
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body["error"]["code"], -32600,
+            "id {id}: expected invalid_request"
+        );
+        assert_eq!(
+            body["id"], id,
+            "id {id}: response must echo original id verbatim"
+        );
+    }
+}
+
+/// Same coverage for the stateless dispatch path (`initialize`): rejecting
+/// unsupported id types must happen before method-specific work regardless
+/// of which handler the method would route to.
+#[tokio::test]
+async fn stateless_method_with_unsupported_id_type_is_invalid_request() {
+    let url = spawn_gateway().await;
+    let response = client()
+        .post(&url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": [1, 2, 3],
+            "method": "initialize",
+            "params": {}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], -32600);
+    assert_eq!(body["id"], json!([1, 2, 3]));
+}
+
 #[tokio::test]
 async fn sse_endpoint_emits_greeting() {
     let url = spawn_gateway().await;

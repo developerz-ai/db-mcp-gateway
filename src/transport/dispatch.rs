@@ -29,6 +29,14 @@ pub fn dispatch(request: Request) -> Option<Response> {
         return Some(Response::error(response_id, ErrorObject::invalid_request()));
     }
 
+    // MCP `RequestId` is `string | number` (integer). Booleans, arrays,
+    // objects, and fractional numbers are parsed into `Present` so we can
+    // echo the value back, but rejected here before method dispatch —
+    // otherwise they'd flow through as if valid ids.
+    if id.is_invalid_type() {
+        return Some(Response::error(response_id, ErrorObject::invalid_request()));
+    }
+
     let response = match method.as_str() {
         "initialize" => Response::result(response_id, &InitializeResult::new()),
         // A notification by definition; if a client (wrongly) sends it with an
@@ -108,6 +116,34 @@ mod tests {
             crate::transport::jsonrpc::INVALID_REQUEST
         );
         assert_eq!(value["id"], Value::Null);
+    }
+
+    /// MCP `RequestId` is `string | number`. Anything else parsed into
+    /// `Present` (booleans, arrays, objects, fractional numbers) must be
+    /// rejected as invalid_request before it hits a method handler, and
+    /// the original id must be echoed so the caller can correlate.
+    #[test]
+    fn unsupported_id_types_are_invalid_request() {
+        for id in [
+            json!(true),
+            json!([1, 2]),
+            json!({"nested": true}),
+            json!(1.5),
+        ] {
+            let response = dispatch_value(json!({
+                "jsonrpc": "2.0", "id": id, "method": "initialize", "params": {}
+            }));
+            let value = serde_json::to_value(&response).unwrap();
+            assert_eq!(
+                value["error"]["code"],
+                crate::transport::jsonrpc::INVALID_REQUEST,
+                "id {id} should be invalid_request",
+            );
+            assert_eq!(
+                value["id"], id,
+                "invalid-type response must echo id verbatim"
+            );
+        }
     }
 
     #[test]

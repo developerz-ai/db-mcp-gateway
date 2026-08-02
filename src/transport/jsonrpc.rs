@@ -24,7 +24,12 @@ pub const INTERNAL_ERROR: i32 = -32603;
 ///   (requests require a non-null id) and discouraged by JSON-RPC 2.0
 ///   (`SHOULD NOT` be null). Treated as an invalid request, never as a
 ///   notification.
-/// - `Present`: a valid id (string, number, or other JSON value).
+/// - `Present`: any other JSON value. MCP defines `RequestId` as
+///   `string | number`, so booleans / arrays / objects / fractional
+///   numbers are still parsed into `Present` but rejected as
+///   `invalid_request` at the transport boundary via
+///   [`RequestId::is_invalid_type`]. The invalid value is preserved so
+///   the error response can echo it back verbatim.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum RequestId {
     #[default]
@@ -45,6 +50,25 @@ impl RequestId {
     /// MCP (§ requests require a non-null id).
     pub fn is_null(&self) -> bool {
         matches!(self, RequestId::Null)
+    }
+
+    /// True when `id` is `Present` with a JSON type MCP doesn't accept.
+    ///
+    /// MCP's `RequestId` is `string | number`; JSON-RPC 2.0 also says
+    /// numbers `SHOULD NOT` be fractional. Booleans, arrays, objects, and
+    /// fractional numbers therefore reach this method as `true`, and the
+    /// transport rejects them with `invalid_request` before any
+    /// method-specific work (mirrors `is_null` — both are "the parser
+    /// accepted it, but the protocol doesn't"). Very large integers that
+    /// overflow both `i64` and `u64` deserialize as `f64` and are also
+    /// treated as fractional here; no real client uses ids that big.
+    pub fn is_invalid_type(&self) -> bool {
+        match self {
+            RequestId::Present(Value::String(_)) => false,
+            RequestId::Present(Value::Number(n)) => !(n.is_i64() || n.is_u64()),
+            RequestId::Present(_) => true,
+            _ => false,
+        }
     }
 
     /// Id value to echo in a response envelope. Absent/Null both collapse
@@ -199,6 +223,45 @@ mod tests {
             serde_json::from_value(json!({"jsonrpc": "2.0", "method": "x"})).unwrap();
         assert!(absent.is_notification());
         assert!(!absent.id.is_null());
+    }
+
+    /// MCP `RequestId` is `string | number` (integer). The parser accepts
+    /// any JSON value into `Present` so the transport can echo the value
+    /// back in the error response, but `is_invalid_type` flags the
+    /// non-conforming cases the transport must reject.
+    #[test]
+    fn flags_unsupported_id_types_as_invalid() {
+        for id in [json!(true), json!(false), json!([]), json!({}), json!(1.5)] {
+            let request: Request =
+                serde_json::from_value(json!({"jsonrpc": "2.0", "id": id, "method": "x"})).unwrap();
+            assert!(
+                request.id.is_invalid_type(),
+                "expected {id} to be flagged as invalid MCP RequestId type",
+            );
+            // Round-tripped verbatim so error responses echo the sender's id.
+            assert_eq!(request.id.response_id(), id);
+            // Invalid-type is disjoint from notification and null.
+            assert!(!request.id.is_notification());
+            assert!(!request.id.is_null());
+        }
+    }
+
+    #[test]
+    fn accepts_string_and_integer_ids() {
+        for id in [
+            json!("req-1"),
+            json!(1),
+            json!(0),
+            json!(-1),
+            json!(u64::MAX),
+        ] {
+            let request: Request =
+                serde_json::from_value(json!({"jsonrpc": "2.0", "id": id, "method": "x"})).unwrap();
+            assert!(
+                !request.id.is_invalid_type(),
+                "expected {id} to be accepted as a valid MCP RequestId",
+            );
+        }
     }
 
     #[test]
