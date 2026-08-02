@@ -82,13 +82,13 @@ Your team deploys it once. Developers add one URL to their AI agent's MCP config
 
 | If you're… | Read |
 |---|---|
-| 💡 Trying to understand what this is | [`docs/initial-idea/01-overview.md`](docs/initial-idea/01-overview.md) |
+| 💡 Trying to understand what this is | [`website/docs/initial-idea/01-overview.md`](website/docs/initial-idea/01-overview.md) |
 | 🛠️ A developer whose org already runs it | [`docs/usage/first-query.md`](docs/usage/first-query.md) (5-min walkthrough) → [`docs/usage/claude-code.md`](docs/usage/claude-code.md) (reference) |
 | 🏗️ A platform/SRE deploying it | [`docs/deployment/quickstart.md`](docs/deployment/quickstart.md) |
 | 🤖 Adding it to a non-Claude MCP client | [`docs/usage/other-agents.md`](docs/usage/other-agents.md) |
 | 📦 Cutting a release | [`docs/deployment/releasing.md`](docs/deployment/releasing.md) |
-| 🚫 Wondering what it *won't* do | [`docs/initial-idea/10-non-goals.md`](docs/initial-idea/10-non-goals.md) |
-| 🗺️ Tracking what's built vs planned | [`docs/initial-idea/11-roadmap.md`](docs/initial-idea/11-roadmap.md) |
+| 🚫 Wondering what it *won't* do | [`website/docs/initial-idea/10-non-goals.md`](website/docs/initial-idea/10-non-goals.md) |
+| 🗺️ Tracking what's built vs planned | [`website/docs/initial-idea/11-roadmap.md`](website/docs/initial-idea/11-roadmap.md) |
 | 📊 Performance benchmarks | [`docs/benchmarks.md`](docs/benchmarks.md) |
 | ⚖️ vs alternatives | [`docs/comparison.md`](docs/comparison.md) |
 

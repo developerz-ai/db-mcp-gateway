@@ -8,7 +8,7 @@
 //!
 //! Why a freshness TTL: [`super::SessionStore::revoke`] only evicts the entry
 //! on the replica that handled the logout. Under HA (multiple replicas behind a
-//! load balancer — see `docs/initial-idea/02-architecture.md#ha`) a session
+//! load balancer — see `website/docs/initial-idea/02-architecture.md#ha`) a session
 //! revoked on replica B stays cached on replica A until A's entry ages out. The
 //! TTL caps that window: after `ttl`, A's next lookup re-reads the state DB and
 //! honors `revoked_at`. Single-replica deployments still observe revocation on

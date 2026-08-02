@@ -255,7 +255,7 @@ async fn run_query_inner(
             // rows nobody asked for, then rollback the (now-aborted) tx.
             // Cleanup failures are logged at `warn` but do NOT fail the
             // request — see [`truncate::cancel_and_rollback`] and
-            // `docs/initial-idea/05-credentials.md` for the contract.
+            // `website/docs/initial-idea/05-credentials.md` for the contract.
             cancel_and_rollback(tx, cancel_pool, pid).await;
         } else {
             tx.commit().await.map_err(classify)?;

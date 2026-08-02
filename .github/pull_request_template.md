@@ -20,7 +20,7 @@
 ## Spec changes
 
 <!--
-docs/initial-idea/ is the source of truth. If behavior changed, the spec must change in the same PR.
+website/docs/initial-idea/ is the source of truth. If behavior changed, the spec must change in the same PR.
 List the files updated, or write "no spec changes — behavior matches existing spec".
 -->
 

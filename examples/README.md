@@ -50,4 +50,4 @@ Detailed guide: [`docs/deployment/quickstart.md`](../docs/deployment/quickstart.
 
 - **Gateway admins:** [`docs/deployment/config-reference.md`](../docs/deployment/config-reference.md) for the full config schema, [`docs/deployment/logging.md`](../docs/deployment/logging.md) for audit retention and sinks.
 - **Developers:** [`docs/usage/claude-code.md`](../docs/usage/claude-code.md) for scope flags, troubleshooting, and multi-DB access patterns.
-- **Architecture:** [`docs/initial-idea/`](../docs/initial-idea/) for design docs.
+- **Architecture:** [`website/docs/initial-idea/`](../website/docs/initial-idea/) for design docs.

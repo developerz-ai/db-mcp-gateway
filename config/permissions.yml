@@ -5,8 +5,8 @@
 # group names below (devs / devops / cto). Per-dev mapping lives in
 # ../infrastructure/scripts/lib/sso/dev-mapping.ts — collective ownership in v1.
 #
-# Schema: docs/initial-idea/08-config.md.
-# Spec for grants + constraint merge: docs/initial-idea/06-permissions.md.
+# Schema: website/docs/initial-idea/08-config.md.
+# Spec for grants + constraint merge: website/docs/initial-idea/06-permissions.md.
 
 servers:
   - name: worker-db

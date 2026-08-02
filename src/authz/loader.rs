@@ -2,7 +2,7 @@
 //! same `config::Grant` shape the YAML loader produces, so [`super::merge`]
 //! can fold both sources without caring where each grant came from.
 //!
-//! Spec: docs/initial-idea/12-dynamic-permissions.md §"Two sources, one
+//! Spec: website/docs/initial-idea/12-dynamic-permissions.md §"Two sources, one
 //! engine". Symmetric merge — neither source is privileged.
 //!
 //! Soft-deleted databases drop here, not at evaluate time. A re-created db

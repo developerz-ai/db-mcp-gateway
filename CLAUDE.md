@@ -2,7 +2,7 @@
 
 Self-hosted MCP gateway. AI agents get audited, SSO-gated, read-only DB access. Never holds a DB credential on the client side.
 
-Spec: `docs/initial-idea/`. Behavior change → update spec in the same PR.
+Spec: `website/docs/initial-idea/`. Behavior change → update spec in the same PR.
 
 ## Response Rules
 
@@ -21,7 +21,7 @@ Spec: `docs/initial-idea/`. Behavior change → update spec in the same PR.
 2. Every DB call traces to an SSO-verified identity → audit row.
 3. Read-only by default. Writes require explicit per-grant opt-in AND a target-DB role with write privileges. Gateway will NOT provision write grants.
 4. Audit is synchronous. Audit write fails → request fails. No best-effort audit.
-5. Permissions in YAML (reviewed by PR) **or** via SSO-gated admin API (writes audited synchronously to `permissions_audit`). No in-band admin UI. See [12-dynamic-permissions](docs/initial-idea/12-dynamic-permissions.md).
+5. Permissions in YAML (reviewed by PR) **or** via SSO-gated admin API (writes audited synchronously to `permissions_audit`). No in-band admin UI. See [12-dynamic-permissions](website/docs/initial-idea/12-dynamic-permissions.md).
 
 ## Stack
 
@@ -78,7 +78,7 @@ Files ≤300 LOC. Split by responsibility.
 
 The bar: idiomatic, boring, readable Rust. No spaghetti, no premature abstraction. A function reads top to bottom without chasing state. Equally-correct options → pick the one easier to delete. `clippy -D warnings` is the floor, not the ceiling.
 
-- Errors typed. `thiserror` for domain; `anyhow` only at `main.rs` boundary. Every client error has a stable code (see `docs/initial-idea/03-mcp-tools.md`).
+- Errors typed. `thiserror` for domain; `anyhow` only at `main.rs` boundary. Every client error has a stable code (see `website/docs/initial-idea/03-mcp-tools.md`).
 - No `unwrap`/`expect` outside `main` and tests. Panic in hot path crashes every user. Propagate with `?`; branch with `match`/`if let`/`let ... else`.
 - Newtype over bare primitives when a value has meaning (`RequestId(String)`, not `String`). Make illegal states unrepresentable — `enum` over contradictory `bool`+`Option`. Validate input into a type once at the edge; don't re-validate downstream.
 - Derive, don't hand-roll (`Debug`, `Clone`, serde). Every public type derives `Debug` at minimum. Keep `pub` surface minimal.
@@ -90,7 +90,7 @@ The bar: idiomatic, boring, readable Rust. No spaghetti, no premature abstractio
 - Async end-to-end. No `std::sync::Mutex` on request path — use `tokio::sync`. No `block_on`, no blocking I/O in async fns (offload with `spawn_blocking`). Never hold a `std::sync` guard across `.await`. Slow query on DB A must never block DB B. One noisy user must not starve others.
 - Cancellation safety. Agent disconnect → tokio task dropped → `pg_cancel_backend` → audit row `outcome: cancelled`. Test it; easy to write code that holds the conn until the query finishes anyway.
 - No backwards-compat shims pre-v1.
-- Comment the non-obvious *why*, never the *what*. Rename until code doesn't need the *what*. `///` on public items whose contract isn't obvious from the signature. Architecture decisions go in `docs/initial-idea/`, not code comments.
+- Comment the non-obvious *why*, never the *what*. Rename until code doesn't need the *what*. `///` on public items whose contract isn't obvious from the signature. Architecture decisions go in `website/docs/initial-idea/`, not code comments.
 
 ## Testing
 
@@ -161,7 +161,7 @@ docker-compose.dev.yml
 
 ## Docs
 
-- `docs/initial-idea/` — spec, numbered. `00-seed.md` = original framing.
+- `website/docs/initial-idea/` — spec, numbered. `00-seed.md` = original framing.
 - `docs/usage/` — developer-facing. Treat additions as public-API changes.
 - `docs/deployment/` — operator-facing.
 - Architecture decisions land in the spec, not in code comments.

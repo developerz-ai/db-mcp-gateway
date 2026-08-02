@@ -56,7 +56,7 @@ An agent owns *its own files and its own tests*; whole-crate green is the coordi
 
 1. **Understand.** Restate the goal in a line and name which Non-negotiables it touches: credentials never leave the gateway; every DB call → SSO identity → audit row; read-only by default (writes need per-grant opt-in **and** a target-DB write role — the gateway never provisions write grants); audit is synchronous; permissions by YAML-PR or the SSO-gated admin API, never an in-band UI. URLs in the ask → `WebFetch`, extract the *mechanism*, translate onto this stack (Rust, tokio, axum, sqlx, hand-rolled JSON-RPC over HTTP+SSE).
 
-2. **Distrust the paperwork.** Check any spec page or status note against the code and `git log` before planning work off it. This repo has already drifted: `CLAUDE.md` points at `docs/initial-idea/`, but the spec actually lives in **`website/docs/initial-idea/`** (`docs/` now holds only `sec/`). Merged PR titles are the cheapest ground truth. State plainly which claims you falsified, so nobody re-implements shipped work or "fixes" working code.
+2. **Distrust the paperwork.** Check any spec page or status note against the code and `git log` before planning work off it. Specs and status notes go stale: this repo has drifted before, and a page describing the target is not evidence the target shipped. Merged PR titles are the cheapest ground truth. State plainly which claims you falsified, so nobody re-implements shipped work or "fixes" working code.
 
 3. **Diagnose against a real deployment — early, not at the end.** Evidence beats reasoning and costs one command. All read-only:
    - `mcp__glitchtip` — the org's error tracker (`glitchtip.infra.developerz.ai`); an existing issue usually names the module and the release.

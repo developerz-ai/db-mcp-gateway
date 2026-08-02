@@ -3,7 +3,7 @@
 //!
 //! Owns framing + auth wiring: JSON-RPC parsing, method dispatch, SSE, and the
 //! bearer-auth middleware on /mcp POST. DB execution and audit live elsewhere.
-//! See docs/initial-idea/02-architecture.md.
+//! See website/docs/initial-idea/02-architecture.md.
 
 pub mod admin;
 pub mod app_state;
