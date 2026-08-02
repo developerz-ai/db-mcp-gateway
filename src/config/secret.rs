@@ -5,7 +5,13 @@
 //! credentials in this binary. Anything that goes over the wire uses
 //! credential-free view types (see e.g. `tools::list_servers::SafeServerView`).
 //!
-//! Reference syntax (resolved at startup; see `Password::resolve`):
+//! Resolution happens twice: once at boot so an unresolvable ref fails fast,
+//! and again when a pool opens lazily, so rotating a file-mounted secret does
+//! not need a restart. Use [`Password::resolve`] on the boot path and
+//! [`Password::resolve_async`] on the request path — the latter keeps a slow
+//! secret mount from parking a runtime worker thread.
+//!
+//! Reference syntax:
 //!
 //! - `${ENV:NAME}`  — value from the process environment
 //! - `${FILE:/path}` — value read from a file (sealed-secret mount, ConfigMap, etc.)
