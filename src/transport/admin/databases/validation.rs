@@ -3,7 +3,7 @@
 //! Reject bad input early with the stable admin-error envelope so clients
 //! see `invalid_request` + `request_id` instead of Axum's default 400/422.
 
-use crate::state::permissions::DbType;
+use crate::state::permissions::{DbType, RepoError};
 
 use super::super::error::AdminError;
 
@@ -77,6 +77,44 @@ pub(super) fn internal<E>(stage: &'static str, _err: E, request_id: &str) -> Adm
         "admin databases endpoint failed"
     );
     AdminError::internal().with_request_id(request_id)
+}
+
+/// Map create/update failures on `permissions_databases` so the one
+/// constraint a client can actually trip comes back as `invalid_request`
+/// (400) instead of `internal` (500).
+///
+/// `23505` unique_violation — migration `0004_permissions.sql` has
+/// `permissions_databases_server_db_name_live_idx` UNIQUE on
+/// `(server, db_name) WHERE deleted_at IS NULL`. Registering a pair that
+/// already exists, or renaming one onto another, is caller-correctable
+/// input, not a gateway bug (#136). Mirrors
+/// [`super::super::grants::validation::map_create_grant_error`], whose
+/// "no `23505` mapping" note holds only because `permissions_grants` has
+/// no UNIQUE index — this table does.
+///
+/// The index is partial, so a soft-deleted pair does not conflict: the
+/// same `(server, db_name)` can be registered again after a DELETE.
+///
+/// Anything else (pool exhaustion, encoder bug, …) stays `internal`. The
+/// message is built from the caller's own already-validated input, never
+/// from the DB error string, which would quote the offending values —
+/// same redaction rule as [`internal`] above.
+pub(super) fn map_duplicate_database_error(
+    err: RepoError,
+    stage: &'static str,
+    server: &str,
+    db_name: &str,
+    request_id: &str,
+) -> AdminError {
+    if let RepoError::Sqlx(sqlx::Error::Database(db_err)) = &err
+        && db_err.code().as_deref() == Some("23505")
+    {
+        return AdminError::invalid(format!(
+            "database `{db_name}` on server `{server}` is already registered"
+        ))
+        .with_request_id(request_id);
+    }
+    internal(stage, err, request_id)
 }
 
 #[cfg(test)]

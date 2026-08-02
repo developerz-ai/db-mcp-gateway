@@ -52,7 +52,10 @@ use super::middleware::{AdminActor, tx_upsert_actor};
 pub use dto::{CreateDatabaseRequest, DatabaseResponse, UpdateDatabaseRequest};
 
 use sql::{tx_create_database, tx_get_database_by_id, tx_soft_delete_database, tx_update_database};
-use validation::{internal, invalid_body, invalid_id, parse_db_type, trimmed_non_empty};
+use validation::{
+    internal, invalid_body, invalid_id, map_duplicate_database_error, parse_db_type,
+    trimmed_non_empty,
+};
 
 /// Shared state cloned into every databases-route handler. The `cache` field
 /// is `Option<PermissionsCache>` for parity with [`super::users::UsersState`]
@@ -97,7 +100,15 @@ pub async fn create(
 
     let database = tx_create_database(&mut tx, &server, &db_name, db_type)
         .await
-        .map_err(|err| internal("create_database", err, &actor.request_id))?;
+        .map_err(|err| {
+            map_duplicate_database_error(
+                err,
+                "create_database",
+                &server,
+                &db_name,
+                &actor.request_id,
+            )
+        })?;
 
     // Upsert the actor's own row in the same tx as the audit write (atomicity).
     let actor_id = tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
@@ -200,7 +211,17 @@ pub async fn patch(
 
     let after = tx_update_database(&mut tx, id, server.as_deref(), db_name.as_deref(), db_type)
         .await
-        .map_err(|err| internal("update_database", err, &actor.request_id))?
+        .map_err(|err| {
+            // PATCH is partial, so the pair that collided is whichever field
+            // the body set, falling back to the row's current value.
+            map_duplicate_database_error(
+                err,
+                "update_database",
+                server.as_deref().unwrap_or(&before.server),
+                db_name.as_deref().unwrap_or(&before.db_name),
+                &actor.request_id,
+            )
+        })?
         // Race: someone soft-deleted between our read and our write.
         // Surface as 404 — the PATCH didn't apply.
         .ok_or_else(|| AdminError::not_found().with_request_id(&actor.request_id))?;
