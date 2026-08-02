@@ -244,7 +244,20 @@ async fn post_handler(
     // request context (IP / agent client) that the audit row records;
     // everything else is pure.
     if request.method == "tools/call" {
-        let is_notification = request.id.is_none();
+        // Unlike other JSON-RPC methods, `tools/call` has no notification
+        // form in the MCP spec — it always runs a DB query whose result (or
+        // authz/execution error) only reaches the caller via the response
+        // body. A client that omits `id` can never observe the outcome, so
+        // executing anyway just means running a real query nobody can see
+        // the result of (#136 audit: was silently executed and audited under
+        // a synthetic "null" id). Decline before touching config/registry/DB.
+        if request.id.is_none() {
+            tracing::warn!(
+                %user_sub,
+                "tools/call sent as a notification (no id); declining without executing"
+            );
+            return StatusCode::ACCEPTED.into_response();
+        }
         let id = request.id.clone().unwrap_or(Value::Null);
         let user_agent = headers
             .get(USER_AGENT)
@@ -265,11 +278,7 @@ async fn post_handler(
             request.params,
         )
         .await;
-        return if is_notification {
-            StatusCode::ACCEPTED.into_response()
-        } else {
-            Json(response).into_response()
-        };
+        return Json(response).into_response();
     }
 
     match dispatch::dispatch(request) {

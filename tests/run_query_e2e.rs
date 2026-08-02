@@ -763,6 +763,54 @@ async fn run_query_preserves_client_id_but_audit_row_carries_gateway_uuid() {
     );
 }
 
+/// A `tools/call` sent as a JSON-RPC notification (no `id`) must NOT execute
+/// the tool: the caller can never observe the result, so running the query
+/// anyway just means work nobody can see the outcome of (#136 audit — this
+/// used to dispatch normally, audit under a synthetic id, and return 202).
+/// Assert both halves: HTTP-level 202 with an empty body, AND no audit row
+/// was ever written for this user/tool.
+#[tokio::test]
+async fn tools_call_as_notification_does_not_execute() {
+    let booted = boot_gateway().await;
+    let (url, bearer, pool, sub) = (
+        booted.url.as_str(),
+        booted.bearer.as_str(),
+        &booted.state_db,
+        booted.user_sub.as_str(),
+    );
+
+    let resp = client()
+        .post(format!("{url}/mcp"))
+        .bearer_auth(bearer)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": "run_query",
+                "arguments": {
+                    "server": "target",
+                    "database": "app",
+                    "sql": "SELECT 1::int8 AS n",
+                },
+            },
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
+    let body = resp.bytes().await.unwrap();
+    assert!(body.is_empty(), "notification response must have no body");
+
+    let row = db_mcp_gateway::audit::latest_for_user_tool(pool, sub, "run_query")
+        .await
+        .expect("audit lookup query runs");
+    assert!(
+        row.is_none(),
+        "tools/call as a notification must never execute the tool or write an audit row, got {row:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Concurrency cap tests — 429 (per-identity) and 503 (global)
 //
