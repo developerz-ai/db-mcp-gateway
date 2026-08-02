@@ -133,7 +133,7 @@ src/
   state/            # state DB queries, migrations
   errors.rs         # typed error enum
 config/example.yaml # commented example
-docs/
+website/docs/
   initial-idea/     # canonical spec
   usage/            # developer-facing
   deployment/       # operator-facing
