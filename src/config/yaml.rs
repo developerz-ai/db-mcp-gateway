@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::schema::{Permission, Server};
+use super::schema::{Permission, Server, ServerKind};
 use super::secret::SecretError;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -275,6 +275,8 @@ impl ConfigFile {
                     )));
                 }
                 validate_role(&db.role).map_err(ConfigFileError::Invalid)?;
+                reject_superuser_role(&db.role, server.kind, &db.name, &server.name)
+                    .map_err(ConfigFileError::Invalid)?;
                 // `Some("")` would silently override the `None → name` fallback
                 // and force mongo to authenticate against an empty `authSource`,
                 // surfacing as a cryptic runtime auth failure instead of a boot
@@ -359,6 +361,48 @@ fn grant_database_exists(servers: &[Server], server_name: &str, db_name: &str) -
         .find(|s| s.name == server_name)
         .map(|s| s.databases.iter().any(|d| d.name == db_name))
         .unwrap_or(false)
+}
+
+/// The stock superuser/root account each backend ships with. Connecting as one
+/// defeats the whole per-database least-privilege model — the gateway's
+/// read-only guarantee then rests entirely on the SQL guard, with no
+/// defense-in-depth underneath it, and a guard escape becomes a full compromise
+/// of the target. CLAUDE.md states it flatly: "Never run as DB superuser.
+/// Per-DB read-only roles, full stop." Rejected at boot rather than trusted to
+/// review (#136).
+///
+/// This matches on the stock *name*, not on actual privilege — a superuser
+/// renamed to `app` still passes, and this check can't see the grants behind
+/// it. It closes the overwhelmingly common case (someone points the gateway at
+/// the account their DB shipped with); the real guarantee remains the
+/// least-privilege role the operator provisions target-side.
+fn stock_superuser_roles(kind: ServerKind) -> &'static [&'static str] {
+    match kind {
+        ServerKind::Postgres => &["postgres"],
+        ServerKind::Mysql => &["root"],
+        ServerKind::Mssql => &["sa"],
+        ServerKind::Mongo => &["root", "admin"],
+    }
+}
+
+fn reject_superuser_role(
+    role: &str,
+    kind: ServerKind,
+    db_name: &str,
+    server_name: &str,
+) -> Result<(), String> {
+    // Role names are case-insensitive in practice across these backends, and an
+    // operator writing `Postgres` means the same account as `postgres`.
+    let lowered = role.to_ascii_lowercase();
+    if stock_superuser_roles(kind).contains(&lowered.as_str()) {
+        return Err(format!(
+            "database `{db_name}` in server `{server_name}` connects as `{role}`, \
+             the stock superuser for `{kind:?}`. The gateway must never hold a \
+             superuser credential — create a per-database read-only role and use \
+             that instead (see docs/initial-idea/05-credentials.md)"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_role(role: &str) -> Result<(), String> {
@@ -635,6 +679,67 @@ servers:
             ConfigFile::from_yaml_str(yaml),
             Err(ConfigFileError::Invalid(_))
         ));
+    }
+
+    /// CLAUDE.md: "Never run as DB superuser. Per-DB read-only roles, full
+    /// stop." Booting against the stock superuser used to be accepted (#136).
+    #[test]
+    fn rejects_the_stock_superuser_role_per_backend() {
+        // Only wired kinds are reachable here — `has_adapter` rejects the rest
+        // first. `stock_superuser_roles` covers those directly, below.
+        for (kind, role) in [
+            ("postgres", "postgres"),
+            ("mongo", "root"),
+            ("mongo", "admin"),
+        ] {
+            let yaml = format!(
+                "servers:\n  - name: s\n    kind: {kind}\n    host: h\n    \
+                 databases:\n      - {{ name: d, role: {role}, password: x }}\n"
+            );
+            let err = ConfigFile::from_yaml_str(&yaml)
+                .expect_err("`{role}` on {kind} must be rejected at boot");
+            let ConfigFileError::Invalid(message) = err else {
+                panic!("expected an Invalid config error for {kind}/{role}");
+            };
+            assert!(
+                message.contains("superuser"),
+                "error should name the problem, got: {message}"
+            );
+        }
+    }
+
+    /// Kinds without an adapter never reach the role check through config
+    /// (`has_adapter` rejects them first), so pin their mapping directly —
+    /// it must already be right on the day their adapter lands.
+    #[test]
+    fn every_backend_declares_its_stock_superuser() {
+        assert!(reject_superuser_role("root", ServerKind::Mysql, "d", "s").is_err());
+        assert!(reject_superuser_role("sa", ServerKind::Mssql, "d", "s").is_err());
+        assert!(reject_superuser_role("app_ro", ServerKind::Mysql, "d", "s").is_ok());
+    }
+
+    /// Case is not a hiding place: these backends treat role names
+    /// case-insensitively, so `Postgres` is the same account as `postgres`.
+    #[test]
+    fn superuser_rejection_is_case_insensitive() {
+        let yaml = "servers:\n  - name: s\n    kind: postgres\n    host: h\n    \
+                    databases:\n      - { name: d, role: PostgreS, password: x }\n";
+        assert!(matches!(
+            ConfigFile::from_yaml_str(yaml),
+            Err(ConfigFileError::Invalid(_))
+        ));
+    }
+
+    /// The rule is per-backend: `root` is MySQL's superuser, not Postgres', and
+    /// a Postgres role legitimately named `root` must still boot.
+    #[test]
+    fn superuser_names_do_not_leak_across_backends() {
+        let yaml = "servers:\n  - name: s\n    kind: postgres\n    host: h\n    \
+                    databases:\n      - { name: d, role: root, password: x }\n";
+        assert!(
+            ConfigFile::from_yaml_str(yaml).is_ok(),
+            "`root` is not the Postgres superuser"
+        );
     }
 
     /// The headline example from #16: a typo in a `Constraints` field used to

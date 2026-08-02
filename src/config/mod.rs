@@ -143,6 +143,11 @@ pub enum ConfigError {
     },
     #[error("invalid MCP_PATH `{0}`: must be a non-empty absolute path (e.g. `/mcp`)")]
     McpPath(String),
+    #[error(
+        "invalid MCP_PATH `{0}`: that path is already served by the gateway \
+         (probes, OAuth, discovery metadata, or the admin API). Pick another, e.g. `/mcp`"
+    )]
+    McpPathReserved(String),
     #[error("invalid STATE_DB_POOL_SIZE `{value}`: {source}")]
     StateDbPoolSize {
         value: String,
@@ -286,6 +291,31 @@ fn tls_from_env() -> Result<TlsConfig, ConfigError> {
     })
 }
 
+/// Paths the gateway mounts itself. `mcp_path` gets both a `GET` (SSE) and a
+/// `POST` handler, so overlapping any of these makes axum panic while building
+/// the router — a boot crash with a router-internals message instead of a
+/// config error naming the offending setting (#136). Kept in sync by hand with
+/// `transport::router`; `RESERVED_MCP_PATH_PREFIXES` covers the two families
+/// whose members are generated rather than listed.
+const RESERVED_MCP_PATHS: &[&str] = &[
+    "/healthz",
+    "/readyz",
+    "/metrics",
+    "/auth/login",
+    "/auth/callback",
+    "/auth/logout",
+    "/authorize",
+    "/token",
+    "/revoke",
+    "/register",
+];
+
+/// Route families the gateway owns wholesale: the admin API (`/admin/v1/…`,
+/// mounted only when `admin.enabled`, but reserved unconditionally so toggling
+/// it can't turn a working config into a boot panic) and RFC 8414/9728
+/// discovery metadata.
+const RESERVED_MCP_PATH_PREFIXES: &[&str] = &["/admin", "/.well-known"];
+
 fn validate_mcp_path(path: String) -> Result<String, ConfigError> {
     let trimmed = path.trim();
     if trimmed.is_empty()
@@ -294,6 +324,13 @@ fn validate_mcp_path(path: String) -> Result<String, ConfigError> {
         || trimmed.contains(char::is_whitespace)
     {
         return Err(ConfigError::McpPath(path));
+    }
+    let collides = RESERVED_MCP_PATHS.contains(&trimmed)
+        || RESERVED_MCP_PATH_PREFIXES
+            .iter()
+            .any(|prefix| trimmed == *prefix || trimmed.starts_with(&format!("{prefix}/")));
+    if collides {
+        return Err(ConfigError::McpPathReserved(path));
     }
     Ok(trimmed.to_string())
 }
@@ -314,6 +351,55 @@ mod tests {
             assert!(
                 validate_mcp_path(bad.into()).is_err(),
                 "expected `{bad}` to be rejected"
+            );
+        }
+    }
+
+    /// Mounting the MCP endpoint on a path the gateway already serves made
+    /// axum panic while building the router — a boot crash naming router
+    /// internals rather than the offending setting (#136).
+    #[test]
+    fn paths_the_gateway_already_serves_are_rejected() {
+        for reserved in [
+            "/healthz",
+            "/readyz",
+            "/metrics",
+            "/authorize",
+            "/token",
+            "/revoke",
+            "/register",
+            "/auth/login",
+            "/auth/callback",
+            "/auth/logout",
+            "/admin",
+            "/admin/v1/users",
+            "/.well-known/openid-configuration",
+        ] {
+            assert!(
+                matches!(
+                    validate_mcp_path(reserved.into()),
+                    Err(ConfigError::McpPathReserved(_))
+                ),
+                "expected `{reserved}` to be rejected as reserved"
+            );
+        }
+    }
+
+    /// Prefix reservation must match on path segments, not raw string prefix —
+    /// `/adminy` is nobody else's route.
+    #[test]
+    fn paths_merely_resembling_reserved_ones_are_allowed() {
+        for ok in [
+            "/adminy",
+            "/healthzz",
+            "/mcp/healthz",
+            "/tokens",
+            "/.well-knownish",
+        ] {
+            assert_eq!(
+                validate_mcp_path(ok.into()).as_deref().ok(),
+                Some(ok),
+                "expected `{ok}` to be accepted"
             );
         }
     }
