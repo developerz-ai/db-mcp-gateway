@@ -4,7 +4,7 @@
 //! in `post_handler` instead because tools need access to identity and the
 //! loaded config; everything else stays here.
 
-use super::jsonrpc::{ErrorObject, Request, RequestId, Response};
+use super::jsonrpc::{ErrorObject, Request, Response};
 use super::protocol::{EmptyResult, InitializeResult, ToolsListResult};
 
 /// Dispatch a stateless request. Returns `Some(response)` for requests, `None`
@@ -16,7 +16,8 @@ pub fn dispatch(request: Request) -> Option<Response> {
     // Per JSON-RPC 2.0, only an omitted `id` marks a notification — the reply
     // is suppressed regardless of method. An explicit `"id": null` is NOT a
     // notification; MCP treats it as invalid_request (handled just below).
-    if matches!(id, RequestId::Absent) {
+    // Delegate the distinction to `RequestId` so this rule lives in one place.
+    if id.is_notification() {
         return None;
     }
 
@@ -24,7 +25,7 @@ pub fn dispatch(request: Request) -> Option<Response> {
 
     // MCP requires a non-null id on requests. Reject explicit null before we
     // do any method-specific work so misuse is caught uniformly.
-    if matches!(id, RequestId::Null) {
+    if id.is_null() {
         return Some(Response::error(response_id, ErrorObject::invalid_request()));
     }
 

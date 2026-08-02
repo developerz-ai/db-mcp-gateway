@@ -36,6 +36,16 @@ The gateway speaks **MCP over Streamable HTTP** (the 2025-03+ MCP transport), no
 - `POST` carries client→server JSON-RPC 2.0 messages; the gateway replies with a JSON-RPC response (`application/json`), or `202 Accepted` for notifications.
 - `GET` opens the server→client SSE stream for server-initiated messages. On connect it emits a non-normative `greeting` event (protocol version + server identity) so a plain `curl` confirms liveness, then holds open with keep-alives.
 
+**Request `id` semantics.** The JSON-RPC `id` member is treated as a three-way distinction rather than a `null`/non-`null` flag, because JSON-RPC 2.0 and MCP disagree about what an explicit `"id": null` means and the gateway must not silently reinterpret one as the other:
+
+| `id` on the wire | Meaning | Gateway response |
+|---|---|---|
+| **Absent** (member omitted) | JSON-RPC notification — no reply expected | `202 Accepted`, no body. `tools/call` never has a notification form, so a `tools/call` with no `id` is declined without executing a query. |
+| **Null** (`"id": null` explicit) | MCP forbids null request ids (JSON-RPC 2.0 also `SHOULD NOT` be null). Not a notification. | `invalid_request` JSON-RPC error with `"id": null`. `tools/call` is rejected before any authz/query/audit work — the caller could never observe the outcome, so executing would just run an unowned query. |
+| **Present** (string / number / other value) | A real request | Normal request/response, id echoed back on the reply. |
+
+The distinction lives in `RequestId` (`Absent` / `Null` / `Present`) so the same rule can be enforced identically in stateless dispatch and in the `tools/call` fast path.
+
 Protocol version: `2025-06-18`. The framing is hand-rolled JSON-RPC; it gets swapped for an official MCP server SDK when one stabilizes (see [11-roadmap](11-roadmap.md)). Transport owns framing only — auth, tool dispatch, and audit are separate layers below.
 
 ## Layers inside the gateway
