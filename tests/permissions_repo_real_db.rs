@@ -323,11 +323,17 @@ async fn raw_insert_with_both_specific_and_wildcard_is_rejected_by_check() {
 /// in a shared dev DB can't make this flaky.
 #[tokio::test]
 async fn list_users_honours_limit_and_offset() {
-    let repo = PgPermissionsRepo::new(pool().await);
+    let p = pool().await;
+    let repo = PgPermissionsRepo::new(p.clone());
+    // Retain the seeded subs so we can hard-delete them after the assertions —
+    // rows would otherwise pile up on the shared dev DB across test reruns.
+    let mut seeded_subs = Vec::with_capacity(3);
     for _ in 0..3 {
-        repo.upsert_user(&format!("page-{}", Uuid::new_v4()), "page@example.com", &[])
+        let sub = format!("page-{}", Uuid::new_v4());
+        repo.upsert_user(&sub, "page@example.com", &[])
             .await
             .expect("seed user");
+        seeded_subs.push(sub);
     }
 
     let baseline = repo.list_users(wide_page()).await.expect("baseline");
@@ -358,6 +364,10 @@ async fn list_users_honours_limit_and_offset() {
             .collect::<Vec<_>>(),
         "offset must shift the window by exactly that many rows"
     );
+
+    for sub in &seeded_subs {
+        cleanup_user(&p, sub).await;
+    }
 }
 
 /// Paging all the way through must visit every row exactly once — the
@@ -370,14 +380,18 @@ async fn list_users_honours_limit_and_offset() {
 /// a row appearing twice, or a seeded row never appearing, is the actual bug.
 #[tokio::test]
 async fn paging_covers_every_row_without_duplicates() {
-    let repo = PgPermissionsRepo::new(pool().await);
+    let p = pool().await;
+    let repo = PgPermissionsRepo::new(p.clone());
     let mut seeded = Vec::new();
+    let mut seeded_subs = Vec::new();
     for _ in 0..3 {
+        let sub = format!("cover-{}", Uuid::new_v4());
         let user = repo
-            .upsert_user(&format!("cover-{}", Uuid::new_v4()), "c@example.com", &[])
+            .upsert_user(&sub, "c@example.com", &[])
             .await
             .expect("seed user");
         seeded.push(user.id);
+        seeded_subs.push(sub);
     }
 
     let mut walked = Vec::new();
@@ -408,5 +422,9 @@ async fn paging_covers_every_row_without_duplicates() {
             walked.contains(&id),
             "seeded user {id} was skipped by the page walk"
         );
+    }
+
+    for sub in &seeded_subs {
+        cleanup_user(&p, sub).await;
     }
 }

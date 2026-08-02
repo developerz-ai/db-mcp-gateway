@@ -32,6 +32,41 @@ fn unique_sub(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4().simple())
 }
 
+/// Hard-delete a seeded user plus every grant that touches them. Same rationale
+/// as `cleanup_user` in the pg suite: the shared dev DB otherwise accumulates
+/// rows across reruns, and the partial-uniqueness emulation lets soft-deleted
+/// rows linger and inflate the table.
+async fn cleanup_user(pool: &MySqlPool, user_sub: &str) {
+    let _ = sqlx::query(
+        "DELETE FROM permissions_grants \
+         WHERE user_id IN (SELECT id FROM permissions_users WHERE user_sub = ?)",
+    )
+    .bind(user_sub)
+    .execute(pool)
+    .await;
+    let _ = sqlx::query("DELETE FROM permissions_users WHERE user_sub = ?")
+        .bind(user_sub)
+        .execute(pool)
+        .await;
+}
+
+/// Companion for `cleanup_user` — deletes everything a test seeded on a
+/// per-test-unique `server` name (grants first for the FK, then the databases
+/// themselves).
+async fn cleanup_server(pool: &MySqlPool, server: &str) {
+    let _ = sqlx::query(
+        "DELETE FROM permissions_grants \
+         WHERE database_id IN (SELECT id FROM permissions_databases WHERE server = ?)",
+    )
+    .bind(server)
+    .execute(pool)
+    .await;
+    let _ = sqlx::query("DELETE FROM permissions_databases WHERE server = ?")
+        .bind(server)
+        .execute(pool)
+        .await;
+}
+
 /// Upsert + get-by-sub round-trip. Same contract as pg: the row exists
 /// after upsert, the fields match what we sent.
 #[tokio::test]
@@ -370,6 +405,236 @@ async fn database_crud_and_list_filters_soft_deleted() {
         !r.soft_delete_database(pg_db.id).await.expect("redel"),
         "second delete should affect 0 rows"
     );
+}
+
+/// Parity with pg's `list_users_honours_limit_and_offset`. `Page::new(limit,
+/// offset)` must actually bound and shift the window on the mysql backend too;
+/// asserted against a wide-page baseline so sibling tests in the shared DB
+/// can't make it flaky.
+#[tokio::test]
+async fn mysql_list_users_honours_limit_and_offset() {
+    let p = pool().await;
+    let r = MysqlPermissionsRepo::new(p.clone());
+    // Retain the seeded subs for cleanup after assertions.
+    let mut seeded_subs = Vec::with_capacity(3);
+    for _ in 0..3 {
+        let sub = unique_sub("mysql-page");
+        r.upsert_user(&sub, "page@example.com", &[])
+            .await
+            .expect("seed user");
+        seeded_subs.push(sub);
+    }
+
+    let wide = Page::new(Some(Page::MAX_LIMIT), None);
+    let baseline = r.list_users(wide).await.expect("baseline");
+    assert!(baseline.len() >= 3, "seeded at least three users");
+
+    let first_two = r
+        .list_users(Page::new(Some(2), None))
+        .await
+        .expect("limited");
+    assert_eq!(first_two.len(), 2, "limit must bound the row count");
+    assert_eq!(
+        first_two.iter().map(|u| u.id).collect::<Vec<_>>(),
+        baseline.iter().take(2).map(|u| u.id).collect::<Vec<_>>(),
+        "first page must be the head of the full ordering"
+    );
+
+    let shifted = r
+        .list_users(Page::new(Some(2), Some(1)))
+        .await
+        .expect("offset");
+    assert_eq!(
+        shifted.iter().map(|u| u.id).collect::<Vec<_>>(),
+        baseline
+            .iter()
+            .skip(1)
+            .take(2)
+            .map(|u| u.id)
+            .collect::<Vec<_>>(),
+        "offset must shift the window by exactly that many rows"
+    );
+
+    for sub in &seeded_subs {
+        cleanup_user(&p, sub).await;
+    }
+}
+
+/// Parity with pg's `paging_covers_every_row_without_duplicates`. Walking the
+/// full listing in windows must visit every seeded row without ever returning
+/// the same id twice — the property a non-deterministic tiebreak on the mysql
+/// `ORDER BY` would silently break.
+#[tokio::test]
+async fn mysql_paging_covers_every_row_without_duplicates() {
+    let p = pool().await;
+    let r = MysqlPermissionsRepo::new(p.clone());
+    let mut seeded = Vec::new();
+    let mut seeded_subs = Vec::new();
+    for _ in 0..3 {
+        let sub = unique_sub("mysql-cover");
+        let user = r
+            .upsert_user(&sub, "c@example.com", &[])
+            .await
+            .expect("seed user");
+        seeded.push(user.id);
+        seeded_subs.push(sub);
+    }
+
+    let mut walked = Vec::new();
+    let mut offset = 0u32;
+    loop {
+        let page = r
+            .list_users(Page::new(Some(2), Some(offset)))
+            .await
+            .expect("page");
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 2, "page overran its limit");
+        walked.extend(page.iter().map(|u| u.id));
+        offset += 2;
+    }
+
+    let mut unique = walked.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        walked.len(),
+        "a row was returned on more than one page"
+    );
+    for id in seeded {
+        assert!(
+            walked.contains(&id),
+            "seeded user {id} was skipped by the page walk"
+        );
+    }
+
+    for sub in &seeded_subs {
+        cleanup_user(&p, sub).await;
+    }
+}
+
+/// Parity with pg pagination coverage for `list_databases`: an oversized limit
+/// clamps to `MAX_LIMIT`, a narrow limit bounds the returned rows, and a
+/// matched offset shifts the window against the same wide-page baseline.
+#[tokio::test]
+async fn mysql_list_databases_honours_limit_and_offset() {
+    let p = pool().await;
+    let r = MysqlPermissionsRepo::new(p.clone());
+    // Same server label for all three so a single `cleanup_server` sweeps them
+    // (and any grant that happens to reference them).
+    let server = format!("mysql-dbpage-{}", Uuid::new_v4().simple());
+    for i in 0..3 {
+        r.create_database(&server, &format!("db-{i}"), DbType::Postgres)
+            .await
+            .expect("seed db");
+    }
+
+    let wide = Page::new(Some(Page::MAX_LIMIT), None);
+    let baseline = r.list_databases(wide).await.expect("baseline");
+    let seeded_positions: Vec<usize> = baseline
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.server == server)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(seeded_positions.len(), 3, "three seeded dbs must appear");
+
+    let first_two = r
+        .list_databases(Page::new(Some(2), None))
+        .await
+        .expect("limited");
+    assert_eq!(first_two.len(), 2, "limit must bound the row count");
+    assert_eq!(
+        first_two.iter().map(|d| d.id).collect::<Vec<_>>(),
+        baseline.iter().take(2).map(|d| d.id).collect::<Vec<_>>(),
+        "first page must be the head of the full ordering"
+    );
+
+    let shifted = r
+        .list_databases(Page::new(Some(2), Some(1)))
+        .await
+        .expect("offset");
+    assert_eq!(
+        shifted.iter().map(|d| d.id).collect::<Vec<_>>(),
+        baseline
+            .iter()
+            .skip(1)
+            .take(2)
+            .map(|d| d.id)
+            .collect::<Vec<_>>(),
+        "offset must shift the window by exactly that many rows"
+    );
+
+    cleanup_server(&p, &server).await;
+}
+
+/// Parity with pg pagination coverage for `list_grants`. Seeds three grants
+/// for one user, walks them in two-row pages, and asserts every seeded id
+/// shows up once — same duplicate-free / total-ordering property as
+/// `list_users`, since the filter path uses the same `ORDER BY`.
+#[tokio::test]
+async fn mysql_list_grants_pagination_covers_every_row_without_duplicates() {
+    let p = pool().await;
+    let r = MysqlPermissionsRepo::new(p.clone());
+    let sub = unique_sub("mysql-grantpage");
+    let user = r
+        .upsert_user(&sub, "gp@example.com", &[])
+        .await
+        .expect("user upsert");
+    let server = format!("mysql-grantpage-{}", Uuid::new_v4().simple());
+
+    let mut seeded_grant_ids = Vec::with_capacity(3);
+    for i in 0..3 {
+        let db = r
+            .create_database(&server, &format!("db-{i}"), DbType::Postgres)
+            .await
+            .expect("db create");
+        let grant = r
+            .create_grant(
+                user.id,
+                GrantTarget::Specific { database_id: db.id },
+                GrantAction::QueryRead,
+                json!({}),
+            )
+            .await
+            .expect("grant create");
+        seeded_grant_ids.push(grant.id);
+    }
+
+    let mut walked = Vec::new();
+    let mut offset = 0u32;
+    loop {
+        let page = r
+            .list_grants(Some(user.id), None, Page::new(Some(2), Some(offset)))
+            .await
+            .expect("page");
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 2, "page overran its limit");
+        walked.extend(page.iter().map(|g| g.id));
+        offset += 2;
+    }
+
+    let mut unique = walked.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        walked.len(),
+        "a grant was returned on more than one page"
+    );
+    for id in &seeded_grant_ids {
+        assert!(
+            walked.contains(id),
+            "seeded grant {id} was skipped by the page walk"
+        );
+    }
+
+    cleanup_user(&p, &sub).await;
+    cleanup_server(&p, &server).await;
 }
 
 /// Parity with pg's `raw_insert_with_both_specific_and_wildcard_is_rejected_by_check`.

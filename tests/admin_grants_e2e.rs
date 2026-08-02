@@ -687,6 +687,38 @@ async fn list_filter_by_user_id() {
     h.cleanup().await;
 }
 
+/// A typo in a `GET /admin/v1/grants` query key (e.g. `usr_id` instead of
+/// `user_id`) must return `invalid_request` (400) rather than silently
+/// listing every grant. Regression guard for the flattened-PageQuery bug:
+/// `#[serde(deny_unknown_fields)]` does not fire through `#[serde(flatten)]`,
+/// so `ListGrantsQuery` has to hold `limit`/`offset` inline for the unknown-
+/// field rejection to actually work.
+#[tokio::test]
+async fn list_rejects_unknown_query_key() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
+
+    let resp = client()
+        .get(format!(
+            "{}/admin/v1/grants?usr_id={}",
+            h.base_url,
+            Uuid::new_v4()
+        ))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "unknown query key must be rejected, not silently ignored"
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "invalid_request");
+
+    h.cleanup().await;
+}
+
 /// **Headline acceptance.** A grant change made via the admin API must show
 /// up on the next resolver lookup without a restart. Pre-warm the cache,
 /// POST a grant, then read through the cache again — the new grant must

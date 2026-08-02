@@ -138,9 +138,10 @@ pub async fn list(
     query: Result<Query<ListGrantsQuery>, QueryRejection>,
 ) -> Result<Json<Vec<GrantResponse>>, AdminError> {
     let Query(query) = query.map_err(|_| invalid_query(&actor.request_id))?;
+    let page = query.to_page();
     let grants = state
         .repo
-        .list_grants(query.user_id, query.database_id, query.page.to_page())
+        .list_grants(query.user_id, query.database_id, page)
         .await
         .map_err(|err| internal("list_grants", err, &actor.request_id))?;
     Ok(Json(grants.into_iter().map(GrantResponse::from).collect()))
