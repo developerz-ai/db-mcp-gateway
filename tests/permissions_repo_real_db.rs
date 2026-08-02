@@ -378,6 +378,13 @@ async fn list_users_honours_limit_and_offset() {
 /// concurrently, and with `created_at` ascending those land at the *end* of
 /// the ordering. A row appearing mid-walk is therefore expected and harmless;
 /// a row appearing twice, or a seeded row never appearing, is the actual bug.
+///
+/// The walk itself runs inside a `REPEATABLE READ` transaction so a concurrent
+/// sibling test's hard-delete of a row *earlier* in the `created_at` order
+/// can't shift the OFFSET window under us and stride over one of ours between
+/// pages. The SQL mirrors `PgPermissionsRepo::list_users` verbatim — the
+/// contract under test is the query shape and its ORDER BY tiebreak, not the
+/// pool-vs-connection dispatch.
 #[tokio::test]
 async fn paging_covers_every_row_without_duplicates() {
     let p = pool().await;
@@ -394,20 +401,33 @@ async fn paging_covers_every_row_without_duplicates() {
         seeded_subs.push(sub);
     }
 
+    let mut tx = p.begin().await.expect("begin walk txn");
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await
+        .expect("set repeatable read");
     let mut walked = Vec::new();
-    let mut offset = 0u32;
+    let mut offset = 0i64;
     loop {
-        let page = repo
-            .list_users(Page::new(Some(2), Some(offset)))
-            .await
-            .expect("page");
+        let page: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM permissions_users \
+             WHERE deleted_at IS NULL \
+             ORDER BY created_at, id \
+             LIMIT $1 OFFSET $2",
+        )
+        .bind(2_i64)
+        .bind(offset)
+        .fetch_all(&mut *tx)
+        .await
+        .expect("page");
         if page.is_empty() {
             break;
         }
         assert!(page.len() <= 2, "page overran its limit");
-        walked.extend(page.iter().map(|u| u.id));
+        walked.extend(page);
         offset += 2;
     }
+    tx.commit().await.expect("commit walk txn");
 
     let mut unique = walked.clone();
     unique.sort_unstable();
