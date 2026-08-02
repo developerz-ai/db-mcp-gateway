@@ -292,6 +292,13 @@ pub trait PermissionsRepo: Send + Sync + std::fmt::Debug {
     ) -> Result<PermissionsGrant, RepoError>;
 
     /// Resolver's lookup path. Returns only live (non-revoked) grants.
+    ///
+    /// Unpaginated, and must stay that way, for the same reason as
+    /// [`Self::all_live_databases`]: `authz::loader` turns this into the
+    /// caller's complete grant set, so a windowed read would silently drop
+    /// authority the operator granted. Bounded in practice by grants-per-user,
+    /// which an admin controls — not by total install size, which is what
+    /// [`Self::list_grants`] pages over.
     async fn list_grants_for_user(&self, user_id: Uuid)
     -> Result<Vec<PermissionsGrant>, RepoError>;
 
