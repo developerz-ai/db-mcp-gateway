@@ -868,6 +868,7 @@ async fn duplicate_server_db_name_is_400_not_500() {
     );
 
     let err: Value = second.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "invalid_request", "{err}");
     let message = err["error"]["message"].as_str().unwrap_or_default();
     assert!(
         message.contains("already registered"),
@@ -979,6 +980,9 @@ async fn patch_renaming_onto_an_existing_pair_is_400_not_500() {
     // effective `(server, db_name)` pair from the caller's own input, and
     // must NOT leak the constraint/index/SQLSTATE that raised the error.
     let err: Value = resp.json().await.unwrap();
+    // The stable machine-readable code, not just the status — clients branch
+    // on this (spec 12 §"Validation + error semantics").
+    assert_eq!(err["error"]["code"], "invalid_request", "{err}");
     let message = err["error"]["message"].as_str().unwrap_or_default();
     assert!(
         message.contains("prod") && message.contains(names[0].as_str()),
