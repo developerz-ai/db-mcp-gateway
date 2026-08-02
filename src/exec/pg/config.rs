@@ -37,9 +37,12 @@ pub(super) fn build_connect_options(
 /// `ConfigFile::resolve_secrets` already failed fast on every unresolvable
 /// ref — but pools are opened lazily, so a `${FILE:…}` mount that disappears
 /// after boot (rotation gone wrong) still needs a structured error here.
-pub(crate) fn resolve_password(password: &Password) -> Result<SecretString, ExecError> {
+pub(crate) async fn resolve_password(password: &Password) -> Result<SecretString, ExecError> {
     use crate::config::SecretError;
-    password.resolve().map_err(|err| match err {
+    // `resolve_async`, not `resolve`: this runs on the request path when a
+    // pool opens lazily, and the `${FILE:…}` arm would otherwise block the
+    // runtime worker for the length of the read (#136).
+    password.resolve_async().await.map_err(|err| match err {
         SecretError::EnvNotSet(name) | SecretError::EnvNotUtf8(name) => {
             ExecError::PasswordUnresolved {
                 kind: "env",
@@ -74,10 +77,11 @@ pub(crate) fn resolve_password(password: &Password) -> Result<SecretString, Exec
 mod tests {
     use super::*;
 
-    #[test]
-    fn resolve_password_handles_each_form() {
+    #[tokio::test]
+    async fn resolve_password_handles_each_form() {
         assert_eq!(
             resolve_password(&Password::Literal("hunter2".into()))
+                .await
                 .unwrap()
                 .expose_secret(),
             "hunter2"
@@ -90,6 +94,7 @@ mod tests {
         }
         assert_eq!(
             resolve_password(&Password::EnvVar(env_name.into()))
+                .await
                 .unwrap()
                 .expose_secret(),
             "from-env"
@@ -98,7 +103,7 @@ mod tests {
             std::env::remove_var(env_name);
         }
         assert!(matches!(
-            resolve_password(&Password::EnvVar(env_name.into())),
+            resolve_password(&Password::EnvVar(env_name.into())).await,
             Err(ExecError::PasswordUnresolved { kind: "env", .. })
         ));
 
@@ -108,7 +113,9 @@ mod tests {
         match resolve_password(&Password::SecretBackend {
             scheme: "vault".into(),
             reference: "secret/path".into(),
-        }) {
+        })
+        .await
+        {
             Err(ExecError::PasswordUnresolved { kind, reference }) => {
                 assert_eq!(kind, "backend");
                 assert_eq!(reference, "vault");

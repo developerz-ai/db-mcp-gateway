@@ -435,3 +435,41 @@ async fn unrenderable_type_is_marked_not_nulled() {
         .expect("query runs");
     assert_eq!(cast.rows[0][0], "{1,2,3}");
 }
+
+/// A query that matches no rows must still report the column names it
+/// selected. Without this the caller cannot tell "your filter matched nothing"
+/// from "that table has no such columns" — the row loop never runs, so
+/// `columns` was left empty (#136).
+#[tokio::test]
+async fn zero_row_result_still_reports_column_names() {
+    let a = adapter().await;
+    let result = a
+        .execute(query(
+            "SELECT 1::int8 AS n, 'x'::text AS label WHERE false",
+            None,
+            10,
+        ))
+        .await
+        .expect("empty SELECT runs");
+
+    assert!(result.rows.is_empty(), "query should match no rows");
+    assert_eq!(
+        result.columns,
+        vec!["n".to_string(), "label".to_string()],
+        "column names must survive an empty result set"
+    );
+    assert!(!result.truncated);
+}
+
+/// The non-empty path must keep taking names from the rows themselves — the
+/// describe fallback is only for the empty case.
+#[tokio::test]
+async fn non_empty_result_column_names_are_unchanged() {
+    let a = adapter().await;
+    let result = a
+        .execute(query("SELECT 42::int8 AS answer", None, 10))
+        .await
+        .expect("query runs");
+    assert_eq!(result.columns, vec!["answer".to_string()]);
+    assert_eq!(result.rows.len(), 1);
+}

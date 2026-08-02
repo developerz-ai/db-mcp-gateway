@@ -72,7 +72,7 @@ impl MongoAdapter {
     /// `PgAdapter::open` — misconfiguration surfaces on first use, not at
     /// boot.
     pub async fn open(server: &Server, database: &Database) -> Result<Self, ExecError> {
-        let password = resolve_password(&database.password)?;
+        let password = resolve_password(&database.password).await?;
 
         // Structured credentials avoid any URI-string assembly: a
         // password containing `:` or `@` can't accidentally rewrite the
