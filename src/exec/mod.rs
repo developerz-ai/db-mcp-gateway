@@ -51,9 +51,11 @@ type AdapterMap = HashMap<AdapterKey, AdapterSlot>;
 /// keyed on `(server.name, database.name)` so a slow query on DB A can never
 /// block DB B (each adapter owns its own pool).
 ///
-/// Dispatch is on `server.kind`: today only `Postgres` is wired; other
-/// `ServerKind` variants return `ExecError::UnsupportedAdapter` until their
-/// adapters land (#57 mongo, #59 mysql).
+/// Dispatch is on `server.kind`: `Postgres` and `Mongo` are wired; the
+/// remaining `ServerKind` variants return `ExecError::UnsupportedAdapter`
+/// until their adapters land (#59 mysql). `ServerKind::has_adapter` is the
+/// shared source of truth — config validation rejects unwired kinds at boot,
+/// so that arm is a backstop a validated config never reaches.
 #[derive(Clone, Default)]
 pub struct AdapterRegistry {
     inner: Arc<RwLock<AdapterMap>>,

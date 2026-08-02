@@ -20,8 +20,14 @@ use db_mcp_gateway::config::{ConfigFile, Database, Server};
 use db_mcp_gateway::exec::AdapterRegistry;
 
 /// `PgAdapter`'s pool acquire timeout — how long a connect to an unresponsive
-/// host takes to give up. Not exported, so it is restated here; the assertions
-/// below only depend on it being the same for both servers.
+/// host takes to give up. Not exported, so it is restated here.
+///
+/// Keep it in sync. The assertion thresholds at 1.5x this value, so it only
+/// discriminates while the real timeout `R` sits inside `0.75x..1.5x` of what
+/// is stated here: the fixed code costs ~`R` and must land under the
+/// threshold, the serialized code costs ~`2R` and must land over it. Drift the
+/// real value above 1.5x and correct code fails; below 0.75x and serialized
+/// code slips through.
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A listener that completes the TCP handshake and then goes silent, so a
