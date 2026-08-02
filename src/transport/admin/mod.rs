@@ -18,6 +18,7 @@ pub mod databases;
 pub mod error;
 pub mod grants;
 pub mod middleware;
+pub mod page_query;
 pub mod users;
 
 use std::sync::Arc;

@@ -3,7 +3,7 @@
 use sqlx::MySqlPool;
 use uuid::Uuid;
 
-use super::super::{PermissionsUser, RepoError};
+use super::super::{Page, PermissionsUser, RepoError};
 use super::rows::user_from_row;
 
 pub(super) async fn upsert_user(
@@ -113,13 +113,21 @@ pub(super) async fn update_user(
     row.map(|r| user_from_row(&r)).transpose()
 }
 
-pub(super) async fn list_users(pool: &MySqlPool) -> Result<Vec<PermissionsUser>, RepoError> {
+pub(super) async fn list_users(
+    pool: &MySqlPool,
+    page: Page,
+) -> Result<Vec<PermissionsUser>, RepoError> {
     let rows = sqlx::query(
+        // `created_at, id` — created_at alone is not unique, and a
+        // non-deterministic tiebreak lets a row repeat or vanish across pages.
         "SELECT id, user_sub, user_email, groups_json, created_at, updated_at, deleted_at \
          FROM permissions_users \
          WHERE deleted_at IS NULL \
-         ORDER BY created_at",
+         ORDER BY created_at, id \
+         LIMIT ? OFFSET ?",
     )
+    .bind(page.limit())
+    .bind(page.offset())
     .fetch_all(pool)
     .await?;
     rows.iter().map(user_from_row).collect()

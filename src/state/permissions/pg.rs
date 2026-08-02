@@ -12,7 +12,7 @@ use sqlx::{PgPool, Row, postgres::PgRow};
 use uuid::Uuid;
 
 use super::{
-    DbType, GrantAction, GrantTarget, PermissionsDatabase, PermissionsGrant, PermissionsRepo,
+    DbType, GrantAction, GrantTarget, Page, PermissionsDatabase, PermissionsGrant, PermissionsRepo,
     PermissionsUser, RepoError,
 };
 
@@ -112,13 +112,19 @@ impl PermissionsRepo for PgPermissionsRepo {
         row.map(|r| user_from_row(&r)).transpose()
     }
 
-    async fn list_users(&self) -> Result<Vec<PermissionsUser>, RepoError> {
+    async fn list_users(&self, page: Page) -> Result<Vec<PermissionsUser>, RepoError> {
         let rows = sqlx::query(
+            // `created_at, id` — created_at alone is not unique, and a
+            // non-deterministic tiebreak lets a row repeat or vanish across
+            // pages.
             "SELECT id, user_sub, user_email, groups, created_at, updated_at, deleted_at \
              FROM permissions_users \
              WHERE deleted_at IS NULL \
-             ORDER BY created_at",
+             ORDER BY created_at, id \
+             LIMIT $1 OFFSET $2",
         )
+        .bind(page.limit())
+        .bind(page.offset())
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(user_from_row).collect()
@@ -166,7 +172,24 @@ impl PermissionsRepo for PgPermissionsRepo {
         row.map(|r| database_from_row(&r)).transpose()
     }
 
-    async fn list_databases(&self) -> Result<Vec<PermissionsDatabase>, RepoError> {
+    async fn list_databases(&self, page: Page) -> Result<Vec<PermissionsDatabase>, RepoError> {
+        let rows = sqlx::query(
+            // `(server, db_name)` is unique among live rows, so it is already
+            // a total order — no extra tiebreak needed.
+            "SELECT id, server, db_name, db_type, created_at, updated_at, deleted_at \
+             FROM permissions_databases \
+             WHERE deleted_at IS NULL \
+             ORDER BY server, db_name \
+             LIMIT $1 OFFSET $2",
+        )
+        .bind(page.limit())
+        .bind(page.offset())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(database_from_row).collect()
+    }
+
+    async fn all_live_databases(&self) -> Result<Vec<PermissionsDatabase>, RepoError> {
         let rows = sqlx::query(
             "SELECT id, server, db_name, db_type, created_at, updated_at, deleted_at \
              FROM permissions_databases \
@@ -280,6 +303,7 @@ impl PermissionsRepo for PgPermissionsRepo {
         &self,
         user_id: Option<Uuid>,
         database_id: Option<Uuid>,
+        page: Page,
     ) -> Result<Vec<PermissionsGrant>, RepoError> {
         // Optional filters via `IS NULL OR =` so we don't dynamically build SQL.
         // sqlx binds NULL for absent filters; both branches of each OR collapse
@@ -292,10 +316,13 @@ impl PermissionsRepo for PgPermissionsRepo {
              WHERE revoked_at IS NULL \
                AND ($1::uuid IS NULL OR user_id = $1) \
                AND ($2::uuid IS NULL OR database_id = $2) \
-             ORDER BY created_at",
+             ORDER BY created_at, id \
+             LIMIT $3 OFFSET $4",
         )
         .bind(user_id)
         .bind(database_id)
+        .bind(page.limit())
+        .bind(page.offset())
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(grant_from_row).collect()

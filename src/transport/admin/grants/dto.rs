@@ -9,11 +9,12 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 use crate::config::Constraints;
-use crate::state::permissions::{GrantTarget, PermissionsGrant};
+use crate::state::permissions::{GrantTarget, Page, PermissionsGrant};
 
 /// `GrantTarget` is an XOR in the storage schema (migration 0004's
 /// `permissions_grants_target_xor_wildcard_check`): exactly one of
@@ -95,9 +96,16 @@ impl From<PermissionsGrant> for GrantResponse {
     }
 }
 
-/// `?user_id=&database_id=` filter for `GET /admin/v1/grants`. Both optional;
-/// AND-combined when both are set. Bad UUIDs surface via Axum's `Query`
+/// `?user_id=&database_id=` filter for `GET /admin/v1/grants`, plus the shared
+/// `?limit=&offset=` pagination window. Bad UUIDs surface via Axum's `Query`
 /// rejection — translated to `invalid_request` by the handler.
+///
+/// All four fields sit at the top level rather than pulling `limit`/`offset`
+/// in via `#[serde(flatten)] PageQuery`: serde documents that
+/// `deny_unknown_fields` is silently disabled by `flatten` (unknown keys leak
+/// through into the flattened map), which would let a typo like `?usr_id=`
+/// bypass the stable `invalid_request` rejection. Keep it inline so the
+/// unknown-field guard actually fires.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListGrantsQuery {
@@ -105,4 +113,16 @@ pub struct ListGrantsQuery {
     pub user_id: Option<Uuid>,
     #[serde(default)]
     pub database_id: Option<Uuid>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+impl ListGrantsQuery {
+    /// Build the validated pagination window at the transport boundary — same
+    /// clamp/default semantics as [`super::super::page_query::PageQuery::to_page`].
+    pub fn to_page(&self) -> Page {
+        Page::new(self.limit, self.offset)
+    }
 }
