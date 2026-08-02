@@ -218,7 +218,7 @@ async fn post_handler(
     let request = match serde_json::from_str::<jsonrpc::Request>(&body) {
         Ok(request) if request.jsonrpc == jsonrpc::JSONRPC_VERSION => request,
         Ok(request) => {
-            let id = request.id.unwrap_or(Value::Null);
+            let id = request.id.response_id();
             return Json(jsonrpc::Response::error(
                 id,
                 jsonrpc::ErrorObject::invalid_request(),
@@ -244,8 +244,52 @@ async fn post_handler(
     // request context (IP / agent client) that the audit row records;
     // everything else is pure.
     if request.method == "tools/call" {
-        let is_notification = request.id.is_none();
-        let id = request.id.clone().unwrap_or(Value::Null);
+        // Unlike other JSON-RPC methods, `tools/call` has no notification
+        // form in the MCP spec — it always runs a DB query whose result (or
+        // authz/execution error) only reaches the caller via the response
+        // body. A client that omits `id` can never observe the outcome, so
+        // executing anyway just means running a real query nobody can see
+        // the result of (#136 audit: was silently executed and audited under
+        // a synthetic "null" id). Decline before touching config/registry/DB.
+        if request.id.is_notification() {
+            tracing::warn!(
+                %user_sub,
+                "tools/call sent as a notification (no id); declining without executing"
+            );
+            return StatusCode::ACCEPTED.into_response();
+        }
+        // MCP requires a non-null id on requests. An explicit `"id": null` is
+        // neither a valid request nor a notification, so we surface it as
+        // invalid_request without executing — same reasoning as the
+        // notification branch above (no observable outcome, no audit row).
+        if request.id.is_null() {
+            tracing::warn!(
+                %user_sub,
+                r#"tools/call sent with "id": null; rejecting as invalid_request"#
+            );
+            return Json(jsonrpc::Response::error(
+                Value::Null,
+                jsonrpc::ErrorObject::invalid_request(),
+            ))
+            .into_response();
+        }
+        // MCP `RequestId` is `string | number` (integer). Booleans, arrays,
+        // objects, and fractional numbers are still parsed into `Present`,
+        // but the tools path must reject them for the same reason as null —
+        // there is no correct query/audit outcome for a non-conforming id.
+        // Echo the original id so the client can correlate the failure.
+        if request.id.is_invalid_type() {
+            tracing::warn!(
+                %user_sub,
+                "tools/call sent with an unsupported id type; rejecting as invalid_request"
+            );
+            return Json(jsonrpc::Response::error(
+                request.id.response_id(),
+                jsonrpc::ErrorObject::invalid_request(),
+            ))
+            .into_response();
+        }
+        let id = request.id.response_id();
         let user_agent = headers
             .get(USER_AGENT)
             .or_else(|| headers.get(header::HeaderName::from_static("x-mcp-client")))
@@ -265,11 +309,7 @@ async fn post_handler(
             request.params,
         )
         .await;
-        return if is_notification {
-            StatusCode::ACCEPTED.into_response()
-        } else {
-            Json(response).into_response()
-        };
+        return Json(response).into_response();
     }
 
     match dispatch::dispatch(request) {
