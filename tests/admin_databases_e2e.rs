@@ -829,3 +829,169 @@ async fn anonymous_gets_401() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// Registering a `(server, db_name)` pair that already exists is caller-
+/// correctable input, not a gateway bug. It used to hit the
+/// `permissions_databases_server_db_name_live_idx` UNIQUE index and come back
+/// as `internal` (500) — #136. Spec 12 §"Error mapping" makes constraint
+/// violations `invalid_request` (400).
+#[tokio::test]
+async fn duplicate_server_db_name_is_400_not_500() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
+
+    let db_name = format!("app-{}", Uuid::new_v4().simple());
+    let body = json!({ "server": "prod", "db_name": db_name, "db_type": "postgres" });
+
+    let first = client()
+        .post(format!("{}/admin/v1/databases", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let created: Value = first.json().await.unwrap();
+    h.track_db(created["id"].as_str().unwrap().parse().unwrap());
+
+    let second = client()
+        .post(format!("{}/admin/v1/databases", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        StatusCode::BAD_REQUEST,
+        "duplicate registration must be a client error, not a 500"
+    );
+
+    let err: Value = second.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "invalid_request", "{err}");
+    let message = err["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("already registered"),
+        "error should say what is wrong, got: {err}"
+    );
+    // The message is built from the caller's own input, never the DB error
+    // string — no constraint/index internals may leak out.
+    assert!(
+        !message.contains("permissions_databases") && !message.contains("23505"),
+        "error leaked DB internals: {err}"
+    );
+
+    h.cleanup().await;
+}
+
+/// The UNIQUE index is partial (`WHERE deleted_at IS NULL`), so a soft-deleted
+/// pair must be re-registerable. Pins that the new 400 mapping doesn't turn a
+/// legitimate re-create into a rejection.
+#[tokio::test]
+async fn soft_deleted_pair_can_be_registered_again() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
+
+    let db_name = format!("app-{}", Uuid::new_v4().simple());
+    let body = json!({ "server": "prod", "db_name": db_name, "db_type": "postgres" });
+
+    let created: Value = client()
+        .post(format!("{}/admin/v1/databases", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first_id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    h.track_db(first_id);
+
+    let deleted = client()
+        .delete(format!("{}/admin/v1/databases/{first_id}", h.base_url))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+    let again = client()
+        .post(format!("{}/admin/v1/databases", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        again.status(),
+        StatusCode::CREATED,
+        "a soft-deleted pair does not occupy the partial unique index"
+    );
+    let recreated: Value = again.json().await.unwrap();
+    h.track_db(recreated["id"].as_str().unwrap().parse().unwrap());
+
+    h.cleanup().await;
+}
+
+/// Renaming one database onto another live pair trips the same index through
+/// the UPDATE path, so PATCH needs the same mapping as POST.
+#[tokio::test]
+async fn patch_renaming_onto_an_existing_pair_is_400_not_500() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
+
+    let mut ids = Vec::new();
+    let mut names = Vec::new();
+    for _ in 0..2 {
+        let db_name = format!("app-{}", Uuid::new_v4().simple());
+        let created: Value = client()
+            .post(format!("{}/admin/v1/databases", h.base_url))
+            .bearer_auth(&jwt)
+            .json(&json!({ "server": "prod", "db_name": db_name, "db_type": "postgres" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+        h.track_db(id);
+        ids.push(id);
+        names.push(db_name);
+    }
+
+    // Rename the second onto the first's name.
+    let resp = client()
+        .patch(format!("{}/admin/v1/databases/{}", h.base_url, ids[1]))
+        .bearer_auth(&jwt)
+        .json(&json!({ "db_name": names[0] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "renaming onto an existing pair must be a client error, not a 500"
+    );
+
+    // Same redaction discipline as the POST path (see
+    // `duplicate_server_db_name_is_400_not_500`): the message must name the
+    // effective `(server, db_name)` pair from the caller's own input, and
+    // must NOT leak the constraint/index/SQLSTATE that raised the error.
+    let err: Value = resp.json().await.unwrap();
+    // The stable machine-readable code, not just the status — clients branch
+    // on this (spec 12 §"Validation + error semantics").
+    assert_eq!(err["error"]["code"], "invalid_request", "{err}");
+    let message = err["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("prod") && message.contains(names[0].as_str()),
+        "PATCH error must identify the conflicting pair: {err}"
+    );
+    assert!(
+        !message.contains("permissions_databases") && !message.contains("23505"),
+        "PATCH error leaked DB internals: {err}"
+    );
+
+    h.cleanup().await;
+}

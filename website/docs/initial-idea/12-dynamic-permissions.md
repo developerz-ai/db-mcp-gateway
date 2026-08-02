@@ -162,7 +162,10 @@ The grants handlers validate at the API layer **before** the DB CHECKs would cat
 | Action parse | unknown action string | `invalid_request` (400) before any SQL runs |
 | FK violation (`23503`) | `user_id` or `database_id` missing / soft-deleted | `invalid_request` (400), stable `invalid grant reference` message; DB error text never echoed (non-negotiable #1) |
 | CHECK violation (`23514`) | belt-and-suspenders for a future migration adding a CHECK the handler doesn't pre-validate | `invalid_request` (400) |
+| UNIQUE violation (`23505`) | on `/databases`: registering a `(server, db_name)` pair that already exists, or PATCHing one onto another | `invalid_request` (400), message names the pair from the caller's own input; DB error text never echoed |
 | Anything else | pool exhaustion, encoder bug, audit failure | `internal` (500), body carries `request_id` only; underlying error stays in gateway logs |
+
+The `(server, db_name)` UNIQUE index is partial (`WHERE deleted_at IS NULL`), so a soft-deleted pair does not occupy it — the same pair can be registered again after a DELETE.
 
 ### PATCH cannot change the target
 
