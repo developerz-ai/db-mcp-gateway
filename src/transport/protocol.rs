@@ -1,6 +1,6 @@
 //! MCP protocol constants and the typed payloads the gateway returns.
 //!
-//! Wire transport is Streamable HTTP — see docs/initial-idea/02-architecture.md.
+//! Wire transport is Streamable HTTP — see website/docs/initial-idea/02-architecture.md.
 
 use serde::Serialize;
 use serde_json::{Value, json};

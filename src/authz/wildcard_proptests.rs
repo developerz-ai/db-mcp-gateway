@@ -1,7 +1,7 @@
 //! Property tests for `database = "*"` wildcard grants (#55).
 //!
 //! Codifies the three wildcard properties spec 12 §"Wildcard" calls out
-//! (`docs/initial-idea/12-dynamic-permissions.md` lines 189–191):
+//! (`website/docs/initial-idea/12-dynamic-permissions.md` lines 189–191):
 //!
 //!  1. *Wildcards do not widen permissions on a database the user has a
 //!     more-specific grant on — the per-database grant's constraints intersect

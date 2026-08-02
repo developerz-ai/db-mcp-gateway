@@ -1,6 +1,6 @@
 //! Audit log writer.
 //!
-//! Spec: docs/initial-idea/07-logging-retention.md. CLAUDE.md
+//! Spec: website/docs/initial-idea/07-logging-retention.md. CLAUDE.md
 //! non-negotiable: every tool dispatch traces to an SSO-verified identity →
 //! audit row, and audit-write failures **fail the request**. No best-effort.
 //!

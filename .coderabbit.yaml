@@ -3,13 +3,13 @@
 # db-mcp-gateway — CodeRabbit configuration
 #
 # Self-hosted MCP gateway giving AI agents audited, SSO-gated, read-only DB access.
-# Authority: CLAUDE.md (Non-negotiables) > docs/initial-idea/** (spec).
+# Authority: CLAUDE.md (Non-negotiables) > website/docs/initial-idea/** (spec).
 
 language: en-US
 early_access: false
 enable_free_tier: true
 
-tone_instructions: "db-mcp-gateway: Rust, axum, sqlx, tokio. CLAUDE.md Non-negotiables are absolute: no creds in logs/errors/responses, no skipped audit, no mocked target DB, no admin UI. Spec: docs/initial-idea/**. Cite the rule. Concrete diffs, skip nits."
+tone_instructions: "db-mcp-gateway: Rust, axum, sqlx, tokio. CLAUDE.md Non-negotiables are absolute: no creds in logs/errors/responses, no skipped audit, no mocked target DB, no admin UI. Spec: website/docs/initial-idea/**. Cite the rule. Concrete diffs, skip nits."
 
 reviews:
   profile: assertive
@@ -54,7 +54,7 @@ reviews:
     - path: "**/*"
       instructions: |
         Review only changed files and code directly affected by the change.
-        Ignore unrelated files. Behaviour changes must update docs/initial-idea/**
+        Ignore unrelated files. Behaviour changes must update website/docs/initial-idea/**
         in the same PR. Flag missing tests for new public behaviour.
 
     # Rust source — global conventions from CLAUDE.md
@@ -64,7 +64,7 @@ reviews:
         - No `unwrap`/`expect` outside `main.rs` and `#[cfg(test)]`. Panic in
           the hot path crashes every user.
         - Errors typed with `thiserror`. `anyhow` only at the `main.rs` boundary.
-        - Every client-visible error has a stable code (see docs/initial-idea/03-mcp-tools.md).
+        - Every client-visible error has a stable code (see website/docs/initial-idea/03-mcp-tools.md).
         - `tracing` spans, never `println!`. Every tool dispatch span carries
           `request_id`, `user`, `server`, `database`.
         - Async end-to-end. No `std::sync::Mutex` on the request path — use
@@ -80,7 +80,7 @@ reviews:
     # Auth — security review required
     - path: "src/auth/**"
       instructions: |
-        SECURITY REVIEW REQUIRED. Spec: docs/initial-idea/04-auth-sso.md.
+        SECURITY REVIEW REQUIRED. Spec: website/docs/initial-idea/04-auth-sso.md.
         Verify: OIDC discovery, JWT signature + iss + aud + exp + nbf checks,
         JWKS caching with rotation, session cache TTL, no token material logged.
         Flag any path that promotes one user's session to another.
@@ -88,7 +88,7 @@ reviews:
     # Authz — security review required, pure logic
     - path: "src/authz/**"
       instructions: |
-        SECURITY REVIEW REQUIRED. Spec: docs/initial-idea/06-permissions.md.
+        SECURITY REVIEW REQUIRED. Spec: website/docs/initial-idea/06-permissions.md.
         Constraint merge: most restrictive value always wins. Property tests
         with `proptest` are mandatory for the merge function. Read-only is the
         default; write requires explicit per-grant opt-in AND a target-DB role
@@ -98,7 +98,7 @@ reviews:
     # Tools — every new tool requires security review
     - path: "src/tools/**"
       instructions: |
-        SECURITY REVIEW REQUIRED for new tools. Spec: docs/initial-idea/03-mcp-tools.md.
+        SECURITY REVIEW REQUIRED for new tools. Spec: website/docs/initial-idea/03-mcp-tools.md.
         Stable error codes. Tool dispatch span with request_id, user, server,
         database. No business logic in the dispatch arm — delegate to a layer.
 
@@ -121,7 +121,7 @@ reviews:
       instructions: |
         SECURITY REVIEW REQUIRED. Audit is synchronous: the audit row commits
         BEFORE the success response goes out. Audit write fails → request fails.
-        No best-effort audit. Append-only. Spec: docs/initial-idea/07-logging-retention.md.
+        No best-effort audit. Append-only. Spec: website/docs/initial-idea/07-logging-retention.md.
         Two-phase commit semantics with the state DB. Flag any code path that
         completes a tool call without an audit row, including the forbidden,
         cancelled, and error outcomes.
@@ -129,7 +129,7 @@ reviews:
     # Config — YAML, validated at boot, secrets resolution
     - path: "src/config/**"
       instructions: |
-        Spec: docs/initial-idea/08-config.md. YAML parsed with serde, validated
+        Spec: website/docs/initial-idea/08-config.md. YAML parsed with serde, validated
         at boot — config errors fail at startup, never at query time. Secrets
         resolved from env/file refs, never logged. Hot reload on SIGHUP.
 
@@ -144,13 +144,13 @@ reviews:
       instructions: |
         MCP over Streamable HTTP. JSON-RPC 2.0 framing. Notifications never
         get a response; requests always do (including error responses).
-        Spec: docs/initial-idea/02-architecture.md.
+        Spec: website/docs/initial-idea/02-architecture.md.
 
     # Errors module
     - path: "src/errors.rs"
       instructions: |
         Every variant must have a stable wire code documented in
-        docs/initial-idea/03-mcp-tools.md. Never embed credentials, raw
+        website/docs/initial-idea/03-mcp-tools.md. Never embed credentials, raw
         connection strings, or backend error strings that may leak them.
 
     # Integration tests — real Postgres, audit assertion
@@ -165,7 +165,7 @@ reviews:
         — call it out in a comment.
 
     # Spec
-    - path: "docs/initial-idea/**"
+    - path: "website/docs/initial-idea/**"
       instructions: |
         Canonical spec. Behaviour changes to the gateway must land in the same
         PR as the code. Architecture decisions live here, not in code comments.
@@ -224,7 +224,7 @@ knowledge_base:
     filePatterns:
       - "**/CLAUDE.md"
       - "**/CODING_STANDARDS.md"
-      - "docs/initial-idea/**"
+      - "website/docs/initial-idea/**"
 
   learnings:
     scope: auto

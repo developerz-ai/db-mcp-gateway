@@ -1,5 +1,5 @@
 # Example gateway config. Copy to config.yaml, fill in, point the gateway at it with --config.
-# Schema and validation rules: docs/initial-idea/08-config.md
+# Schema and validation rules: website/docs/initial-idea/08-config.md
 #
 # Secret references (resolved at startup; unresolved refs abort boot):
 #   ${ENV:VAR_NAME}           process environment lookup
@@ -37,7 +37,7 @@ servers:
         password: vault:secret/prod/db/app_ro_password
         description: "Main customer-facing app DB"
         # `sql_capture` and `pool:` are in the spec but not yet enforced.
-        # Parser rejects them until the features ship. See docs/initial-idea/08-config.md.
+        # Parser rejects them until the features ship. See website/docs/initial-idea/08-config.md.
         # sql_capture: redacted          # planned: full | redacted | metadata_only
         # pool:
         #   max_connections: 5

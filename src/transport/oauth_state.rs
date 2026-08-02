@@ -7,7 +7,7 @@
 //! The first two are in-process by design — both are seconds-to-minutes legs of
 //! a single browser round-trip, so a restart mid-login is a retry, not a
 //! sign-out. An HA deployment must still pin the OAuth dance to one replica or
-//! sticky-route it (see `docs/initial-idea/02-architecture.md#ha`).
+//! sticky-route it (see `website/docs/initial-idea/02-architecture.md#ha`).
 //!
 //! [`RefreshTokens`] is the exception: a chain is meant to outlive the process
 //! (that is the whole point of `REFRESH_TTL_DAYS`), so production persists it in
@@ -362,7 +362,7 @@ impl AuthCodes {
 /// accepting the wider group-staleness window that implies. The fuller fix —
 /// re-validating the identity against the IdP on every refresh — needs an IdP
 /// refresh token (`offline_access`) the bridge doesn't currently hold, and is
-/// deferred; see `docs/initial-idea/04-auth-sso.md`.
+/// deferred; see `website/docs/initial-idea/04-auth-sso.md`.
 pub const DEFAULT_REFRESH_TTL: Duration = Duration::from_secs(24 * 3600);
 
 /// Whether a refresh chain born at `issued_at` has reached its absolute `ttl` as

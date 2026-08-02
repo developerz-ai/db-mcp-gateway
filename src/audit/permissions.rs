@@ -1,6 +1,6 @@
 //! Synchronous writer for the admin-API audit trail (#51).
 //!
-//! Spec: docs/initial-idea/12-dynamic-permissions.md §"permissions_audit
+//! Spec: website/docs/initial-idea/12-dynamic-permissions.md §"permissions_audit
 //! table". Same invariant as [`super::log`] for query audit (CLAUDE.md
 //! non-negotiable #4): write fails → request fails. Admin endpoints
 //! (#52..#54) MUST propagate the typed `Err` and roll back their data

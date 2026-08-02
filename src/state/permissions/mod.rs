@@ -1,6 +1,6 @@
 //! DB-backed permissions store.
 //!
-//! Spec: docs/initial-idea/12-dynamic-permissions.md (issues #46 / #47).
+//! Spec: website/docs/initial-idea/12-dynamic-permissions.md (issues #46 / #47).
 //! This module exposes the [`PermissionsRepo`] trait — the contract the admin
 //! API (#52–#54) and resolver (#49) will code against — plus a Postgres impl
 //! in [`pg`]. A mysql impl arrives in #50; that's the second-impl trigger that

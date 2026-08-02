@@ -49,7 +49,7 @@ servers:
 #   - history_read: separate grant for get_query_history
 #
 # Most restrictive value wins when multiple grants match a request.
-# See docs/initial-idea/06-permissions.md for constraint-merge rules.
+# See website/docs/initial-idea/06-permissions.md for constraint-merge rules.
 permissions:
   # Backend engineers can read schema and query prod/staging
   - group: backend-engineers

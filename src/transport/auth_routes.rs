@@ -1,7 +1,7 @@
 //! HTTP routes for the login/callback/logout dance.
 //!
 //! Shape is intentionally simple while the MCP auth spec stabilizes — see
-//! docs/initial-idea/04-auth-sso.md. /auth/login hands the agent an IdP URL
+//! website/docs/initial-idea/04-auth-sso.md. /auth/login hands the agent an IdP URL
 //! and a `state` token; the browser completes SSO and lands at /auth/callback
 //! which returns the gateway-issued session JWT. /auth/logout revokes it.
 

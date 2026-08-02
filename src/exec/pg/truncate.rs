@@ -29,7 +29,7 @@ use sqlx::{PgPool, Postgres, Transaction};
 /// without a warning — equivalent to success. Cancellation execution errors
 /// and `rollback` errors are logged at `warn` for operator observability but
 /// never surfaced to the client. Contract documented in
-/// `docs/initial-idea/05-credentials.md`.
+/// `website/docs/initial-idea/05-credentials.md`.
 pub(super) async fn cancel_and_rollback(
     tx: Transaction<'_, Postgres>,
     cancel_pool: &PgPool,

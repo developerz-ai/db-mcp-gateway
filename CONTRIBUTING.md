@@ -98,7 +98,7 @@ assert!(audit_row_for_request(&state_db, request_id).await.exists);
 ### 3. Behavior Changes
 
 If you change behavior:
-- Update the spec in `docs/initial-idea/` in the **same PR**.
+- Update the spec in `website/docs/initial-idea/` in the **same PR**.
 - Examples: new MCP tool, new authz constraint, new config field.
 
 ### 4. Security Sensitive Changes
