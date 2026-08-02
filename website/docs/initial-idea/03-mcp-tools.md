@@ -40,6 +40,20 @@ Args: `server`, `database`, `sql`, optional `limit`, optional `reason`. Executes
 
 **`EXPLAIN ANALYZE` is rejected.** `EXPLAIN ANALYZE` executes the query and can therefore run write-containing CTEs on a read-only role, defeating the read-only guarantee. The sql guard rejects it before the query reaches the DB; the caller receives `forbidden_sql`.
 
+**`null` means SQL NULL — always.** A value the gateway cannot render as JSON is never returned as `null`, because an agent acting on the result cannot tell a fabricated null from a real one. Such a cell comes back as `{"unsupported_type": "<pg type>"}` instead, naming the type so the caller can cast it (`SELECT my_col::text`).
+
+Rendering rules for the non-obvious types:
+
+| Postgres type | JSON |
+|---|---|
+| `numeric` / `decimal` | string, e.g. `"1234.5600"` — never a float, so money keeps full precision |
+| `timestamptz` | RFC 3339 string, normalised to UTC |
+| `timestamp` / `date` / `time` | ISO-8601 string, no zone invented |
+| `uuid` | string |
+| `bytea` | Postgres' own `\x`-prefixed hex string |
+| `json` / `jsonb` | inlined as JSON |
+| arrays, enums, ranges, user-defined | `{"unsupported_type": "…"}` |
+
 ### `explain`
 
 Args: `server`, `database`, `sql`, optional `reason`. Returns `EXPLAIN` (or vendor equivalent) without executing. Lets the agent estimate cost before running expensive queries. Honours the same `require_reason` constraint as `run_query`.
