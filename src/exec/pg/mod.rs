@@ -93,7 +93,7 @@ impl PgAdapter {
     /// only errors here (the registry calls this on first request to that
     /// DB), not at boot.
     pub async fn open(server: &Server, database: &Database) -> Result<Self, ExecError> {
-        let password = resolve_password(&database.password)?;
+        let password = resolve_password(&database.password).await?;
         let opts = build_connect_options(server, database, &password);
         // Same DSN for both pools — the cancel pool is a Postgres client like
         // any other, it just never runs anything but `pg_cancel_backend(...)`.
@@ -229,6 +229,25 @@ async fn run_query_inner(
                 rows.push(decode_row(&row));
             }
             // Stream is dropped here so the borrow on `tx` ends.
+        }
+
+        // A zero-row result never enters the loop above, so `columns` would
+        // stay empty and the caller could not tell "your filter matched
+        // nothing" from "that table has no such columns" (#136). Ask the
+        // server to describe the statement — Parse/Describe only, the query
+        // does not run a second time.
+        //
+        // Best-effort on purpose: the query already succeeded, so a failure
+        // here must not turn a good 0-row answer into an error. Worst case we
+        // fall back to the previous (empty) behaviour.
+        if columns.is_empty()
+            && let Ok(described) = tx.describe(query.sql).await
+        {
+            columns = described
+                .columns()
+                .iter()
+                .map(|c| c.name().to_string())
+                .collect();
         }
 
         if truncated {

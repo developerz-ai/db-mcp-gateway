@@ -42,6 +42,8 @@ Args: `server`, `database`, `sql`, optional `limit`, optional `reason`. Executes
 
 **`null` means SQL NULL — always.** A value the gateway cannot render as JSON is never returned as `null`, because an agent acting on the result cannot tell a fabricated null from a real one. Such a cell comes back as `{"unsupported_type": "<pg type>"}` instead, naming the type so the caller can cast it (`SELECT my_col::text`).
 
+**Zero-row results still name their columns — best-effort.** A successful query that matches no rows returns `rows: []`, `truncated: false`, and `columns` populated with the selected column names in their left-to-right order — same shape as a non-empty result. This lets the caller distinguish "your filter matched nothing" from "that table has no such columns" without a second round-trip. Column naming for zero-row Postgres results relies on a best-effort `Describe` after the row stream completes and before the transaction commits; in the rare case that `Describe` fails, the query still succeeds but `columns` comes back as `[]` (`rows: []` and `truncated: false` are unaffected).
+
 Rendering rules for the non-obvious types:
 
 | Postgres type | JSON |

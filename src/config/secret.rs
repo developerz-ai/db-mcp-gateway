@@ -5,7 +5,13 @@
 //! credentials in this binary. Anything that goes over the wire uses
 //! credential-free view types (see e.g. `tools::list_servers::SafeServerView`).
 //!
-//! Reference syntax (resolved at startup; see `Password::resolve`):
+//! Resolution happens twice: once at boot so an unresolvable ref fails fast,
+//! and again when a pool opens lazily, so rotating a file-mounted secret does
+//! not need a restart. Use [`Password::resolve`] on the boot path and
+//! [`Password::resolve_async`] on the request path — the latter keeps a slow
+//! secret mount from parking a runtime worker thread.
+//!
+//! Reference syntax:
 //!
 //! - `${ENV:NAME}`  — value from the process environment
 //! - `${FILE:/path}` — value read from a file (sealed-secret mount, ConfigMap, etc.)
@@ -17,7 +23,7 @@
 //! so footguns like `${OLD_VAR_NAME}` (legacy syntax) don't silently become a
 //! literal password.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use secrecy::SecretString;
 use serde::Deserialize;
@@ -177,19 +183,48 @@ impl Password {
                         source,
                     }
                 })?);
-                // Sealed-secrets / `printf > file` / editors all leave a
-                // trailing newline — strip CR/LF on both ends but preserve
-                // anything an operator might have meaningfully padded with.
-                let trimmed = raw.trim_end_matches(['\n', '\r']);
-                if trimmed.is_empty() {
-                    return Err(SecretError::FileEmpty(path.clone()));
-                }
-                Ok(SecretString::from(trimmed))
+                Self::secret_from_file_contents(&raw, path)
             }
             Password::SecretBackend { scheme, .. } => {
                 Err(SecretError::BackendNotImplemented(scheme.clone()))
             }
         }
+    }
+
+    /// Async twin of [`Self::resolve`], for callers on the request path.
+    ///
+    /// Only the `File` variant differs: [`Self::resolve`] reads it with
+    /// `std::fs`, which parks the whole runtime worker thread for the duration
+    /// of the syscall. Pools open lazily on the first request to a database
+    /// (`PgAdapter::open` → `resolve_password`), so that blocking read sits on
+    /// an async task — and a slow or hung secret mount (NFS, a CSI driver
+    /// re-materializing a rotated secret) stalls every other task scheduled on
+    /// that worker, not just this one (#136). The other variants touch no
+    /// filesystem — `EnvVar` reads process memory — so they delegate.
+    pub async fn resolve_async(&self) -> Result<SecretString, SecretError> {
+        let Password::File(path) = self else {
+            return self.resolve();
+        };
+        let raw = Zeroizing::new(tokio::fs::read_to_string(path).await.map_err(|source| {
+            SecretError::FileUnreadable {
+                path: path.clone(),
+                source,
+            }
+        })?);
+        Self::secret_from_file_contents(&raw, path)
+    }
+
+    /// Shared tail of both read paths, so the trimming and empty-file rules
+    /// can't drift between them.
+    fn secret_from_file_contents(raw: &str, path: &Path) -> Result<SecretString, SecretError> {
+        // Sealed-secrets / `printf > file` / editors all leave a trailing
+        // newline — strip CR/LF on both ends but preserve anything an operator
+        // might have meaningfully padded with.
+        let trimmed = raw.trim_end_matches(['\n', '\r']);
+        if trimmed.is_empty() {
+            return Err(SecretError::FileEmpty(path.to_path_buf()));
+        }
+        Ok(SecretString::from(trimmed))
     }
 }
 
@@ -374,5 +409,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `resolve_async` is what the request path uses; it must agree with the
+    /// sync twin on every variant, including the trimming and empty-file rules
+    /// they now share.
+    #[tokio::test]
+    async fn resolve_async_matches_resolve_on_every_variant() {
+        use secrecy::ExposeSecret;
+
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        // Trailing newline is the common sealed-secret / `printf >` shape.
+        writeln!(f, "s3cr3t").expect("write secret");
+        let file_ref = Password::File(f.path().to_path_buf());
+        assert_eq!(
+            file_ref
+                .resolve_async()
+                .await
+                .expect("async read")
+                .expose_secret(),
+            file_ref.resolve().expect("sync read").expose_secret(),
+            "async and sync file reads must agree, newline trimming included"
+        );
+        assert_eq!(
+            file_ref
+                .resolve_async()
+                .await
+                .expect("async read")
+                .expose_secret(),
+            "s3cr3t"
+        );
+
+        // Non-file variants touch no filesystem and simply delegate.
+        let literal = Password::Literal("hunter2".into());
+        assert_eq!(
+            literal
+                .resolve_async()
+                .await
+                .expect("literal")
+                .expose_secret(),
+            "hunter2"
+        );
+
+        // An empty file is still an error on the async path.
+        let empty = tempfile::NamedTempFile::new().expect("temp file");
+        let empty_ref = Password::File(empty.path().to_path_buf());
+        assert!(matches!(
+            empty_ref.resolve_async().await,
+            Err(SecretError::FileEmpty(_))
+        ));
+
+        // And a missing file surfaces as unreadable, not as a panic.
+        let missing = Password::File(PathBuf::from("/nonexistent/db-mcp-secret"));
+        assert!(matches!(
+            missing.resolve_async().await,
+            Err(SecretError::FileUnreadable { .. })
+        ));
     }
 }
