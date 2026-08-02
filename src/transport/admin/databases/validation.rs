@@ -95,6 +95,14 @@ pub(super) fn internal<E>(stage: &'static str, _err: E, request_id: &str) -> Adm
 /// The index is partial, so a soft-deleted pair does not conflict: the
 /// same `(server, db_name)` can be registered again after a DELETE.
 ///
+/// We match on `constraint()` too, not just `code()`. Any future UNIQUE
+/// index added to `permissions_databases` (e.g. a per-tenant one) would
+/// share SQLSTATE `23505` — surfacing "already registered" for a violation
+/// on an unrelated constraint would mislead the caller and, worse, leak
+/// the existence of an index the API doesn't document. Unknown
+/// constraints stay on the redacted `internal` path per spec 12
+/// §"Error mapping".
+///
 /// Anything else (pool exhaustion, encoder bug, …) stays `internal`. The
 /// message is built from the caller's own already-validated input, never
 /// from the DB error string, which would quote the offending values —
@@ -108,6 +116,7 @@ pub(super) fn map_duplicate_database_error(
 ) -> AdminError {
     if let RepoError::Sqlx(sqlx::Error::Database(db_err)) = &err
         && db_err.code().as_deref() == Some("23505")
+        && db_err.constraint() == Some("permissions_databases_server_db_name_live_idx")
     {
         return AdminError::invalid(format!(
             "database `{db_name}` on server `{server}` is already registered"

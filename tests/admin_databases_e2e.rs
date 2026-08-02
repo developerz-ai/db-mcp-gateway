@@ -974,5 +974,20 @@ async fn patch_renaming_onto_an_existing_pair_is_400_not_500() {
         "renaming onto an existing pair must be a client error, not a 500"
     );
 
+    // Same redaction discipline as the POST path (see
+    // `duplicate_server_db_name_is_400_not_500`): the message must name the
+    // effective `(server, db_name)` pair from the caller's own input, and
+    // must NOT leak the constraint/index/SQLSTATE that raised the error.
+    let err: Value = resp.json().await.unwrap();
+    let message = err["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("prod") && message.contains(names[0].as_str()),
+        "PATCH error must identify the conflicting pair: {err}"
+    );
+    assert!(
+        !message.contains("permissions_databases") && !message.contains("23505"),
+        "PATCH error leaked DB internals: {err}"
+    );
+
     h.cleanup().await;
 }
