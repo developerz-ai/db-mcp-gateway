@@ -111,7 +111,8 @@ pub enum ConfigFileError {
         "database `{db_name}` in server `{server_name}` connects as `{role}`, \
          the stock superuser for `{kind:?}`. The gateway must never hold a \
          superuser credential — create a per-database read-only role and use \
-         that instead (see docs/initial-idea/05-credentials.md)"
+         that instead (see \
+         https://developerz-ai.github.io/db-mcp-gateway/docs/initial-idea/credentials)"
     )]
     StockSuperuserRole {
         role: String,
