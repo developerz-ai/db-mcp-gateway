@@ -473,3 +473,30 @@ async fn non_empty_result_column_names_are_unchanged() {
     assert_eq!(result.columns, vec!["answer".to_string()]);
     assert_eq!(result.rows.len(), 1);
 }
+
+/// The describe fallback must also work when the query carries binds. Text
+/// binds land at the OID layer as `unknown`; `SELECT $1 = $2 AS equal` would
+/// give the planner nothing to infer from without the bind-type hints SQLx
+/// attaches to `query.bind(...)`. This pins that path: zero-row + bound query
+/// still surfaces the column name, and stays `truncated: false`.
+#[tokio::test]
+async fn zero_row_bound_query_still_reports_column_names() {
+    let a = adapter().await;
+    let result = a
+        .execute(ExecQuery {
+            sql: "SELECT $1 = $2 AS equal WHERE FALSE",
+            binds: &["a", "b"],
+            statement_timeout_ms: None,
+            row_limit: 10,
+        })
+        .await
+        .expect("bound empty SELECT runs");
+
+    assert!(result.rows.is_empty(), "query should match no rows");
+    assert_eq!(
+        result.columns,
+        vec!["equal".to_string()],
+        "column name from a bound zero-row query must survive"
+    );
+    assert!(!result.truncated);
+}
