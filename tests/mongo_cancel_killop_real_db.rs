@@ -215,6 +215,14 @@ async fn dropped_execute_future_kills_the_mongo_op() {
     // DB is a no-op.
     task.abort();
 
+    // Await the aborted handle to distinguish "truly cancelled mid-execute"
+    // from "execute finished on its own before abort took effect". `abort()`
+    // is non-blocking; if the aggregation completed first, the JoinHandle
+    // yields `Ok(_)` and this run did NOT exercise `KillOpOnDrop` — the
+    // currentOp-disappearance check would still pass but for the wrong
+    // reason. Held for assertion after cleanup so drop_collection always runs.
+    let join_result = task.await;
+
     // Poll for the op to disappear from currentOp. `killOp` is two
     // round-trips (currentOp lookup + killOp itself) on a detached spawn,
     // so give it more headroom than the pg cancellation test's single
@@ -230,6 +238,13 @@ async fn dropped_execute_future_kills_the_mongo_op() {
         started,
         "aggregate against {coll} never appeared in currentOp — \
          is target-mongo up? (run `bin/dev up`) or did 200k docs sort too fast?"
+    );
+    assert!(
+        matches!(&join_result, Err(e) if e.is_cancelled()),
+        "expected the spawned execute task to be cancelled mid-query, got \
+         {join_result:?} — MongoAdapter::execute finished before abort took \
+         effect, so this run did NOT exercise KillOpOnDrop. Increase pipeline \
+         cost or seed size."
     );
     assert!(
         !still_running,
