@@ -162,8 +162,8 @@ docker-compose.dev.yml
 ## Docs
 
 - `website/docs/initial-idea/` — spec, numbered. `00-seed.md` = original framing.
-- `docs/usage/` — developer-facing. Treat additions as public-API changes.
-- `docs/deployment/` — operator-facing.
+- `website/docs/usage/` — developer-facing. Treat additions as public-API changes.
+- `website/docs/deployment/` — operator-facing.
 - Architecture decisions land in the spec, not in code comments.
 
 ## Note
