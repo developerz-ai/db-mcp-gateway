@@ -1,0 +1,66 @@
+# Dependabot keeps the SHA pins in `.github/workflows/**` current.
+#
+# Pinning actions to commit SHAs closes the supply-chain hole (a moving tag or
+# branch can be repointed at new code), but it also freezes security fixes —
+# nothing tells you a pinned action shipped a patch. Dependabot is the other
+# half of that trade: it opens a PR that bumps the SHA and updates the trailing
+# `# v5` comment, so pins stay both fixed and fresh.
+#
+# Grouped so a quiet week is one PR, not eight.
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(actions)"
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # Rust deps. CLAUDE.md pins to "latest stable at implementation time", so
+  # these are reviewed bumps, not auto-merges. Security advisories are already
+  # caught by the `audit` CI job (cargo-audit); this covers the rest.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # Patch/minor together — the noisy, usually-safe majority. Major bumps
+      # stay separate so a breaking change gets its own review.
+      cargo-minor:
+        update-types:
+          - minor
+          - patch
+
+  # The docs site (`website/`) has its own npm tree.
+  - package-ecosystem: npm
+    directory: /website
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(website)"
+    groups:
+      npm-minor:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(docker)"

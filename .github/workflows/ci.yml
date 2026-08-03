@@ -24,9 +24,10 @@ jobs:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
         with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -37,11 +38,12 @@ jobs:
     # past 15 min. release.yml already went to 60 for the same reason.
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: build
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -123,9 +125,11 @@ jobs:
       # DBs (see exec layer, #4).
       STATE_DB_URL: postgres://gateway:gateway@localhost:5432/gateway
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: build
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -139,13 +143,15 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
+        with:
+          toolchain: stable
       # Prebuilt cargo-audit binary instead of `cargo install` (source compile
       # every run). taiki-e/install-action pulls the release binary; the audit
       # invocation and audit.toml ignore semantics below are unchanged.
       - name: install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
         with:
           tool: cargo-audit
       # RUSTSEC-2023-0071 (rsa via sqlx-mysql). NOT unreachable — MySQL is a
@@ -208,25 +214,25 @@ jobs:
         # produces, so the per-arch tags below and the final manifest tag in
         # `merge` are derived from one value.
         run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: log in to ghcr
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: log in to docr
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: registry.digitalocean.com
           username: ${{ secrets.DOCR_TOKEN }}
           password: ${{ secrets.DOCR_TOKEN }}
       - name: image labels
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: |
             ghcr.io/${{ github.repository }}
@@ -236,7 +242,7 @@ jobs:
           tags: |
             type=raw,value=${{ env.PLATFORM_PAIR }}-${{ steps.sha.outputs.short }}
       - name: build & push per-arch
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -263,22 +269,22 @@ jobs:
         id: sha
         # Mirror the build job's derive so both read the same per-arch tag.
         run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: log in to ghcr
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: log in to docr
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: registry.digitalocean.com
           username: ${{ secrets.DOCR_TOKEN }}
           password: ${{ secrets.DOCR_TOKEN }}
       - name: derive ghcr image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ghcr.io/${{ github.repository }}
           # Three tags per commit:
@@ -301,7 +307,7 @@ jobs:
             "ghcr.io/${{ github.repository }}:linux-arm64-${{ steps.sha.outputs.short }}"
       - name: derive docr image metadata
         id: meta-docr
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: registry.digitalocean.com/developerz-ai/db-mcp-gateway
           # Mirror the GHCR tag set exactly. DOCR is the registry Image Updater

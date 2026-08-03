@@ -194,7 +194,12 @@ reviews:
     # CI workflows
     - path: ".github/workflows/**"
       instructions: |
-        Runner: `blacksmith-2vcpu-ubuntu-2404`. Pin actions to major versions.
+        Runner: `blacksmith-2vcpu-ubuntu-2404`. Pin every action to a full
+        commit SHA with the version in a trailing comment
+        (`uses: owner/action@<40-hex> # v3`) — a tag or branch can be
+        repointed at new code. Flag any `@v<N>`, `@main`, `@master` or
+        `@stable` ref. Dependabot (`.github/dependabot.yml`) keeps the pins
+        current, so a stale SHA is expected, not a finding.
         `concurrency:` set on every workflow that builds or deploys.
         Required jobs: fmt, clippy (`-D warnings`), test (with Postgres
         service container), audit.
