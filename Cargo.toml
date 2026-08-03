@@ -39,12 +39,8 @@ serde = { version = "1", features = ["derive"] }
 # relies on this — mongo's wire convention is "the first key of the
 # command document is the command name."
 serde_json = { version = "1", features = ["preserve_order"] }
-# Not `serde_yaml`: dtolnay archived it in March 2024, so the crate that parses
-# every config this gateway boots from receives no fixes. The popular forks are
-# no better — `serde_yml` is archived too, and `serde_yaml_ng`/`serde_norway`
-# have been idle for roughly a year with a fraction of the audit surface.
-# `serde-saphyr` is the serde front-end for saphyr (the yaml-rust2 successor)
-# and the only actively maintained option. See #136.
+# Not `serde_yaml` — rationale in website/docs/initial-idea/08-config.md
+# §"YAML parser". Must be parsed via `config::yaml::non_leaking_options`.
 serde-saphyr = "1"
 clap = { version = "4", features = ["derive", "env"] }
 

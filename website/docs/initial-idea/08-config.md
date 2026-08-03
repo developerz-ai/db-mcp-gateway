@@ -111,15 +111,35 @@ logging:
 - `admin.enabled` defaults to `false` — absent or false leaves `/admin/v1/*` unmounted (404). When `enabled: true`, `admin.group` is required and must be non-empty/non-whitespace, else boot aborts (every authenticated caller would otherwise be an admin). Full surface in [12-dynamic-permissions.md](12-dynamic-permissions.md).
 - `permissions_store.driver: mysql` combined with `admin.enabled: true` is rejected at boot — admin handlers are pg-only today. Use `driver: pg` (the default when the block is absent) for the admin path, or `mysql` with YAML grants only.
 
+## YAML parser
+
+`serde-saphyr` — the serde front-end for [saphyr](https://github.com/saphyr-rs/saphyr), the `yaml-rust2` successor.
+
+Not `serde_yaml`, which dtolnay archived in March 2024. The crate that parses every config this gateway boots from cannot be one that receives no fixes.
+
+The forks were considered and rejected. `serde_yml`, the most-downloaded of them, is archived too. `serde_yaml_ng` and `serde_norway` are each about a year idle with a fraction of the audit surface, and the ecosystem never migrated — `serde_yaml` still outpulls every fork combined. Moving to one of those would trade a heavily-scrutinised frozen crate for a lightly-scrutinised quiet one, which is motion rather than progress. `serde-saphyr` is the only actively maintained option, and reached 1.0 in July 2026.
+
+Config YAML is parsed **only** through `config::yaml::non_leaking_options`, never `serde_saphyr::from_str`. See the next section for why.
+
 ## Parse errors never quote the file
 
 A config file is mostly credentials, so a parse failure is a disclosure risk: the natural error message ("expected u16, found `hunter2`") prints the very value the operator was trying to keep out of the logs.
 
-The rule is that a parse error carries a **position, never content**. Boot logs `path:line:column: invalid configuration` and nothing more. The parser is configured to match — snippet rendering (a rustc-style window of the surrounding source, which would pull in *neighbouring* lines) is disabled, so the offending scalar and its neighbours are absent from the error value itself, not merely suppressed at the point of printing.
+The rule is that a parse error may carry a **position and the schema's expectations, never the file's content**:
 
-Both halves are load-bearing and independently tested: the error type stays value-free even though the parser is, and the parser stays value-free even though the error type is. Either alone is one refactor away from a password in a log line.
+```
+Error: /etc/gateway/config.yml:3:11: invalid configuration (expected one of postgres, mysql, mssql, mongo)
+```
 
-Operators lose nothing — `:line:column` points straight at the offending value, and they already have the file.
+The position and the alternatives both come from the gateway's own types. The operator's text does not appear.
+
+Three separate mechanisms enforce this, because each one alone has been observed to fail:
+
+1. **Snippet rendering is disabled** (`config::yaml::non_leaking_options`). The parser otherwise attaches a rustc-style window of the *surrounding* source, which discloses neighbouring lines — on this file, other credentials — even when the error itself is elsewhere.
+2. **The error keeps no parser text.** Only a position and the schema-derived expectation list are extracted; the parser's own message is read and dropped. The extraction keeps only the text *after* `expected one of`, which is safe by construction: serde puts the input token before that marker and the schema's alternatives after it. Safety rests on never copying the region the token can occupy, not on redacting the token — a redaction rule would have to keep pace with the parser's phrasing, whereas this can only ever fail closed by finding no marker.
+3. **The error has no `source` chain.** This is the one that was originally missed. `main` returns `anyhow::Result`, and `anyhow` renders every `source()` link under `Caused by:` when `main` returns `Err` — so a "suppressed" message that remained reachable through the chain still printed to the terminal in full. Suppressing at `Display` is not sufficient; the chain must be severed. Attaching a `#[source]` to the parse variant re-opens this, and a test asserts the chain has no second link.
+
+Operators lose nothing that helps them: `:line:column` points straight at the offending value in a file they already have, and the expectation list names what the field accepts.
 
 ## Hot reload
 

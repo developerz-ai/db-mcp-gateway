@@ -84,33 +84,37 @@ pub enum ConfigFileError {
         #[source]
         source: std::io::Error,
     },
-    /// `Display` deliberately omits the raw parser message and surfaces only
-    /// `path` + `:line:column`, so an operator can find the offending line
-    /// without its value being printed into the boot log.
+    /// Carries a *position* and the *schema's* expectations — never a byte of
+    /// the file's content.
     ///
-    /// Under `serde-saphyr` with [`non_leaking_options`] the parser text is
-    /// itself value-free — "invalid u16 at line 5, column 11" names the
-    /// expected type and the position, never the scalar that failed. That is a
-    /// tightening: `serde_yaml` used to echo the offending value, so this
-    /// variant's `message`/`source` were a deliberate, contained leak that
-    /// only chain-walking callers could reach. They no longer carry it at all.
+    /// This variant deliberately has no `#[source]` and keeps no rendered
+    /// parser text. It used to hold both, on the reasoning that `Display`
+    /// suppressed them and only callers who opted into walking the chain would
+    /// see them. That reasoning was wrong: `main` returns `anyhow::Result`, and
+    /// `anyhow`'s `Debug` renders the whole `Caused by:` chain when `main`
+    /// returns `Err`. A password mis-pasted into an enum-typed field printed
+    /// verbatim to the terminal on boot:
     ///
-    /// Both layers are load-bearing. Keep `Display` value-free even though the
-    /// parser is, and keep [`non_leaking_options`] even though `Display` is —
-    /// either one alone is one refactor away from a credential in a log line.
-    #[error("{path}{location}: invalid configuration")]
+    /// ```text
+    /// Caused by:
+    ///     unknown variant `hunter2`, expected one of postgres, mysql, ...
+    /// ```
+    ///
+    /// So the chain is severed here instead. Attaching a `#[source]` to this
+    /// variant re-opens it — the leak is one attribute away, which is why there
+    /// is a test for it.
+    ///
+    /// [`Self::expected`] survives because it is derived from our own schema
+    /// (variant and field names), never from user input — see
+    /// [`schema_expectation`].
+    #[error("{path}{location}: invalid configuration{expected}")]
     Parse {
         path: PathBuf,
         /// `:line:column` when the parser knows it, empty otherwise.
         location: String,
-        /// Pre-rendered `source` text. Kept for callers that walk the error
-        /// chain; never rendered by `Display` (see the variant doc comment).
-        message: String,
-        /// Boxed: `serde_saphyr::Error` is a large enum, and inlining it makes
-        /// every `Result<_, ConfigFileError>` in this module pay for it
-        /// (`clippy::result_large_err`).
-        #[source]
-        source: Box<serde_saphyr::Error>,
+        /// `" (expected one of …)"` when the parser named the schema's
+        /// alternatives, empty otherwise. Safe to render: schema-derived.
+        expected: String,
     },
     #[error("invalid config: {0}")]
     Invalid(String),
@@ -142,14 +146,40 @@ impl ConfigFileError {
             .location()
             .map(|loc| format!(":{}:{}", loc.line(), loc.column()))
             .unwrap_or_default();
-        let message = source.to_string();
+        // `source` is read for position and expectations, then dropped. Storing
+        // it would put the file's own bytes back into the error — see the
+        // `Parse` doc comment.
+        let expected = schema_expectation(&source.to_string())
+            .map(|list| format!(" ({list})"))
+            .unwrap_or_default();
         ConfigFileError::Parse {
             path,
             location,
-            message,
-            source: Box::new(source),
+            expected,
         }
     }
+}
+
+/// Pull the schema-derived tail out of a parser message, discarding everything
+/// before it.
+///
+/// serde puts the *input* token first and the *schema's* alternatives second —
+/// ``unknown variant `hunter2`, expected one of postgres, mysql`` — so keeping
+/// only the text from `expected one of` onward is safe by construction: past
+/// that marker, every word comes from our own enum and struct definitions.
+///
+/// The safety therefore does not rest on redacting the token. It rests on never
+/// copying the part of the string the token can appear in. A denylist would
+/// have to keep pace with the parser's phrasing; this cannot silently start
+/// leaking if that phrasing changes — it can only stop finding the marker and
+/// return `None`.
+fn schema_expectation(message: &str) -> Option<String> {
+    const MARKER: &str = "expected one of ";
+    let tail = &message[message.find(MARKER)?..];
+    // serde-saphyr appends its own " at line N, column M"; ours is already in
+    // `location`, so drop the duplicate.
+    let list = tail.split(" at line ").next().unwrap_or(tail);
+    Some(list.trim_end_matches([' ', ',']).to_string())
 }
 
 /// Parser options for every config parse in this module.
@@ -218,16 +248,13 @@ impl ConfigFile {
             source,
         })?;
         Self::from_yaml_str(&raw).map_err(|err| match err {
+            // Re-stamp the placeholder path from `from_yaml_str` with the real one.
             ConfigFileError::Parse {
-                location,
-                message,
-                source,
-                ..
+                location, expected, ..
             } => ConfigFileError::Parse {
                 path: path.to_path_buf(),
                 location,
-                message,
-                source,
+                expected,
             },
             other => other,
         })
@@ -849,19 +876,11 @@ permissions:
             rendered.contains(":14:") || rendered.contains(":13:"),
             "expected `:14:` or `:13:` line marker in: {rendered}"
         );
-        // The full reason — misspelled key + suggestions — stays reachable for
-        // callers that walk the chain.
-        let ConfigFileError::Parse { source, .. } = err else {
-            panic!("expected Parse, got {err:?}");
-        };
-        let detail = source.to_string();
+        // The schema's own field list is safe to show, and is the half that
+        // actually helps — it names the key the operator meant.
         assert!(
-            detail.contains("statemnt_timeout_ms"),
-            "missing misspelled key in source: {detail}"
-        );
-        assert!(
-            detail.contains("statement_timeout_ms"),
-            "missing suggestion in source: {detail}"
+            rendered.contains("statement_timeout_ms"),
+            "operator lost the suggestion list: {rendered}"
         );
     }
 
@@ -883,19 +902,15 @@ servers:
 ";
         let err = ConfigFile::from_yaml_str(yaml).expect_err("typo must be rejected");
         let rendered = format!("{err}");
-        // Same contract: Display stays scalar-free, suggestions live in source.
+        // Same contract: the operator's own text never comes back, the schema's
+        // does.
         assert!(
             !rendered.contains("descriptoin"),
-            "Display must not echo raw serde text: {rendered}"
+            "echoed the operator's typo back: {rendered}"
         );
-        let ConfigFileError::Parse { source, .. } = err else {
-            panic!("expected Parse, got {err:?}");
-        };
-        let detail = source.to_string();
-        assert!(detail.contains("descriptoin"), "missing key: {detail}");
         assert!(
-            detail.contains("description"),
-            "missing suggestion: {detail}"
+            rendered.contains("description"),
+            "missing suggestion: {rendered}"
         );
     }
 
@@ -1096,27 +1111,27 @@ permissions:
 ";
         let err = ConfigFile::from_yaml_str(yaml).expect_err("typo must be rejected");
         let rendered = format!("{err}");
+        // An enum-typed field is the one place a mis-pasted secret would be
+        // echoed as the "got" token, so the got half is dropped entirely.
         assert!(
             !rendered.contains("query_reed"),
-            "Display must not echo raw serde text: {rendered}"
+            "echoed the operator's token back: {rendered}"
         );
-        let ConfigFileError::Parse { source, .. } = err else {
-            panic!("expected Parse, got {err:?}");
-        };
-        let detail = source.to_string();
-        assert!(detail.contains("query_reed"), "missing got: {detail}");
-        assert!(detail.contains("query_read"), "missing expected: {detail}");
+        assert!(
+            rendered.contains("query_read"),
+            "operator lost the variant list: {rendered}"
+        );
     }
 
     /// C4: a parse error must never carry the offending scalar — it may be a
     /// password mis-pasted into a typed field.
     ///
-    /// Tightened by the `serde_yaml` → `serde-saphyr` swap. `serde_yaml` echoed
-    /// the bad value in its message, so this test only asserted that `Display`
-    /// suppressed it while `source` was allowed to keep it. `serde-saphyr` with
-    /// [`non_leaking_options`] reports "invalid u16 at line 5, column 11" — the
-    /// expected type and the position, never the value — so the scalar is now
-    /// absent from every layer, and that is what we pin.
+    /// Tightened by the `serde_yaml` → `serde-saphyr` swap. This used to assert
+    /// only that `Display` suppressed the value while `source` was allowed to
+    /// keep it — a distinction that turned out not to exist, because `main`
+    /// returns `anyhow::Result` and `anyhow` prints the whole `Caused by:`
+    /// chain. The variant now carries no parser text at all, so the value is
+    /// absent from every layer, which is what this pins.
     #[test]
     fn parse_error_display_omits_raw_serde_text() {
         // `port` wants u16; the string value is the kind of scalar serde would
@@ -1138,27 +1153,39 @@ servers:
             rendered.contains("invalid configuration"),
             "Display should be the generic operator line: {rendered}"
         );
-        let ConfigFileError::Parse {
-            source,
-            message,
-            location,
-            ..
-        } = &err
-        else {
+        let ConfigFileError::Parse { location, .. } = &err else {
             panic!("expected Parse, got {err:?}");
         };
 
-        // Not even chain-walking callers see the value any more.
-        for (label, text) in [("source", source.to_string()), ("message", message.clone())] {
-            assert!(
-                !text.contains("sup3r-s3cret-looking-scalar"),
-                "{label} leaked the offending scalar: {text}"
-            );
-        }
+        // The chain is what actually reaches a terminal on boot. Walk the whole
+        // of it the way `anyhow` does, rather than trusting `Display` alone.
+        assert!(
+            !error_chain(&err).contains("sup3r-s3cret-looking-scalar"),
+            "error chain leaked the offending scalar: {}",
+            error_chain(&err)
+        );
 
         // Suppressing the value is only acceptable because the position
         // survives — that is what an operator actually navigates by.
         assert_eq!(location, ":5:11", "operators lost the offending position");
+    }
+
+    /// Render an error the way `anyhow` does when `main` returns `Err`: the
+    /// `Display` of every link in the `source` chain, concatenated.
+    ///
+    /// The leak this guards against was invisible to a `format!("{err}")`
+    /// assertion — it lived one `source()` hop away and still printed to the
+    /// terminal. Tests that care about disclosure must look here, not at
+    /// `Display`.
+    fn error_chain(err: &dyn std::error::Error) -> String {
+        let mut out = err.to_string();
+        let mut cursor = err.source();
+        while let Some(link) = cursor {
+            out.push_str(" | ");
+            out.push_str(&link.to_string());
+            cursor = link.source();
+        }
+        out
     }
 
     /// C4, second half — added with the `serde_yaml` → `serde-saphyr` swap,
@@ -1175,36 +1202,68 @@ servers:
     /// value, this one pins every *other* line in the file.
     #[test]
     fn parse_error_never_carries_secrets_from_neighbouring_lines() {
-        // The error is on `port` (u16 vs string). `password` is a *different*,
-        // perfectly valid line — no correct error message has any reason to
-        // mention it.
+        // The secret sits in a real `Database.password` — a valid line the
+        // parser accepts — so the only failure is `port`. An earlier draft put
+        // `password:` directly on the server, where it is an *unknown field*;
+        // that aborts on the unknown key and never reaches `port`, so the
+        // fixture was testing a different code path than it claimed to.
         let yaml = "\
 servers:
   - name: prod
     kind: postgres
     host: a
-    password: \"unrelated-neighbour-secret\"
     port: \"not-a-number\"
+    databases:
+      - name: app
+        role: ro
+        password: \"unrelated-neighbour-secret\"
 ";
         let err = ConfigFile::from_yaml_str(yaml).expect_err("type mismatch must be rejected");
 
-        let rendered = format!("{err}");
+        let chain = error_chain(&err);
         assert!(
-            !rendered.contains("unrelated-neighbour-secret"),
-            "Display pulled in a neighbouring line's secret: {rendered}"
+            !chain.contains("unrelated-neighbour-secret"),
+            "error chain pulled in a neighbouring line's secret: {chain}"
         );
+        assert!(
+            matches!(err, ConfigFileError::Parse { .. }),
+            "expected Parse, got {err:?}"
+        );
+    }
 
-        let ConfigFileError::Parse {
-            source, message, ..
-        } = &err
-        else {
-            panic!("expected Parse, got {err:?}");
-        };
-        for (label, text) in [("source", source.to_string()), ("message", message.clone())] {
-            assert!(
-                !text.contains("unrelated-neighbour-secret"),
-                "{label} pulled in a neighbouring line's secret: {text}"
-            );
-        }
+    /// The leak that motivated severing the chain: `main` returns
+    /// `anyhow::Result`, and `anyhow` renders every `source()` link under
+    /// `Caused by:` when `main` returns `Err`. A parse error that keeps the
+    /// parser's text therefore reaches the terminal no matter how careful
+    /// `Display` is.
+    ///
+    /// `Parse` has no `#[source]` for exactly this reason. Adding one back
+    /// re-opens the hole silently, so this asserts the chain has no second link
+    /// at all rather than checking for any particular secret.
+    #[test]
+    fn parse_error_has_no_source_chain_for_anyhow_to_render() {
+        let yaml = "\
+servers:
+  - name: prod
+    kind: \"hunter2-MISPASTED-PASSWORD\"
+    host: a
+";
+        let err = ConfigFile::from_yaml_str(yaml).expect_err("bad variant must be rejected");
+
+        assert!(
+            std::error::Error::source(&err).is_none(),
+            "Parse grew a source chain; anyhow will print it under `Caused by:`"
+        );
+        assert!(
+            !error_chain(&err).contains("hunter2-MISPASTED-PASSWORD"),
+            "the operator's token reached the rendered chain: {}",
+            error_chain(&err)
+        );
+        // The schema half still helps them fix it.
+        assert!(
+            error_chain(&err).contains("postgres"),
+            "operator lost the variant list: {}",
+            error_chain(&err)
+        );
     }
 }
