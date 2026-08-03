@@ -8,6 +8,20 @@ docs/
 *.md
 !README.md
 
+# Key material must never enter the build context. `tests/data/test_idp_key.pem`
+# is one today: harmless in itself (a throwaway IdP key in a public repo, and
+# the runtime stage copies only the binary), but `COPY . .` pulled it into the
+# builder layer, and `cache-to: type=gha` exports those layers. The binary
+# embeds exactly one external file — `config/example.yaml` — so nothing here is
+# reachable from `cargo build --release`. Deny by extension, not by path, so the
+# next key added anywhere is covered without anyone remembering this file.
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.crt
+
 # The Docusaurus site is ~400 MB with node_modules and is never part of the
 # binary. Left in, it dominated the build context and made a docs-only push
 # invalidate the `COPY . .` layer, forcing a cold release rebuild.
