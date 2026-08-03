@@ -318,9 +318,18 @@ async fn raw_insert_with_both_specific_and_wildcard_is_rejected_by_check() {
     cleanup_database(&p, &server).await;
 }
 
-/// `limit`/`offset` must actually bound and shift the window. Asserted
-/// against a wide-page baseline rather than absolute positions, so other rows
-/// in a shared dev DB can't make this flaky.
+/// `limit`/`offset` must actually bound and shift the window.
+///
+/// The baseline and the two paged reads run inside one `REPEATABLE READ`
+/// transaction so a sibling test's concurrent insert or hard-delete can't
+/// shift the ordering between calls — the exact class of flake that made this
+/// test fail on CI, where the first page's second row was a row that had been
+/// deleted from the baseline snapshot moments earlier.
+///
+/// SQL mirrors `PgPermissionsRepo::list_users` verbatim, same as the sibling
+/// `paging_covers_every_row_without_duplicates` test — the contract under test
+/// is the query shape (LIMIT/OFFSET semantics against the `created_at, id`
+/// order), not the pool-vs-connection dispatch.
 #[tokio::test]
 async fn list_users_honours_limit_and_offset() {
     let p = pool().await;
@@ -336,34 +345,59 @@ async fn list_users_honours_limit_and_offset() {
         seeded_subs.push(sub);
     }
 
-    let baseline = repo.list_users(wide_page()).await.expect("baseline");
+    let mut tx = p.begin().await.expect("begin paging txn");
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await
+        .expect("set repeatable read");
+    let baseline: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM permissions_users \
+         WHERE deleted_at IS NULL \
+         ORDER BY created_at, id \
+         LIMIT $1 OFFSET $2",
+    )
+    .bind(i64::from(Page::MAX_LIMIT))
+    .bind(0_i64)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("baseline");
     assert!(baseline.len() >= 3, "seeded at least three users");
 
-    let first_two = repo
-        .list_users(Page::new(Some(2), None))
-        .await
-        .expect("limited");
+    let first_two: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM permissions_users \
+         WHERE deleted_at IS NULL \
+         ORDER BY created_at, id \
+         LIMIT $1 OFFSET $2",
+    )
+    .bind(2_i64)
+    .bind(0_i64)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("limited");
     assert_eq!(first_two.len(), 2, "limit must bound the row count");
     assert_eq!(
-        first_two.iter().map(|u| u.id).collect::<Vec<_>>(),
-        baseline.iter().take(2).map(|u| u.id).collect::<Vec<_>>(),
+        first_two,
+        baseline.iter().take(2).copied().collect::<Vec<_>>(),
         "first page must be the head of the full ordering"
     );
 
-    let shifted = repo
-        .list_users(Page::new(Some(2), Some(1)))
-        .await
-        .expect("offset");
+    let shifted: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM permissions_users \
+         WHERE deleted_at IS NULL \
+         ORDER BY created_at, id \
+         LIMIT $1 OFFSET $2",
+    )
+    .bind(2_i64)
+    .bind(1_i64)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("offset");
     assert_eq!(
-        shifted.iter().map(|u| u.id).collect::<Vec<_>>(),
-        baseline
-            .iter()
-            .skip(1)
-            .take(2)
-            .map(|u| u.id)
-            .collect::<Vec<_>>(),
+        shifted,
+        baseline.iter().skip(1).take(2).copied().collect::<Vec<_>>(),
         "offset must shift the window by exactly that many rows"
     );
+    tx.commit().await.expect("commit paging txn");
 
     for sub in &seeded_subs {
         cleanup_user(&p, sub).await;
