@@ -163,7 +163,10 @@ impl ConfigFileError {
 /// it afterwards — there is nothing to forget to redact.
 ///
 /// `location()` is unaffected, so operators still get `:line:column`.
-fn non_leaking_options() -> serde_saphyr::Options {
+///
+/// `pub(super)` so sibling modules that parse config types reach for the same
+/// options rather than the leaky default — see the note on `from_yaml_str`.
+pub(super) fn non_leaking_options() -> serde_saphyr::Options {
     serde_saphyr::options! {
         with_snippet: false,
     }
@@ -232,6 +235,10 @@ impl ConfigFile {
 
     /// Parse + structural validation only. See `from_file` for the contract;
     /// use `load_yaml_str` for the fail-fast variant.
+    ///
+    /// The single place config YAML is parsed. Any new parse site must go
+    /// through [`non_leaking_options`] too — `serde_saphyr::from_str` defaults
+    /// to attaching source snippets, which on this file means credentials.
     pub fn from_yaml_str(raw: &str) -> Result<Self, ConfigFileError> {
         let parsed: ConfigFile = serde_saphyr::from_str_with_options(raw, non_leaking_options())
             .map_err(|source| ConfigFileError::parse_from(PathBuf::from("<inline>"), source))?;
