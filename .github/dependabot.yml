@@ -6,7 +6,11 @@
 # half of that trade: it opens a PR that bumps the SHA and updates the trailing
 # `# v5` comment, so pins stay both fixed and fresh.
 #
-# Grouped so a quiet week is one PR, not eight.
+# Grouped so a quiet week is one PR, not eight — but every group is limited to
+# minor+patch. A major bump is a breaking change wearing a version number, and
+# batching five of them into one PR makes the whole batch unreviewable: you
+# either take all the breakage or none of it. Majors therefore arrive as
+# individual PRs, one decision each.
 version: 2
 
 updates:
@@ -22,6 +26,13 @@ updates:
       actions:
         patterns:
           - "*"
+        # Without this the first run produced one PR carrying five majors
+        # (checkout v5→v7, three docker actions, build-push-action v6→v7) —
+        # in the ecosystem whose jobs hold `DOCR_TOKEN` and package-write
+        # scope, which is the last place to review breakage in bulk.
+        update-types:
+          - minor
+          - patch
 
   # Rust deps. CLAUDE.md pins to "latest stable at implementation time", so
   # these are reviewed bumps, not auto-merges. Security advisories are already
@@ -57,6 +68,15 @@ updates:
           - minor
           - patch
 
+  # The builder base image in `Dockerfile`.
+  #
+  # NOT auto-mergeable, and deliberately ungrouped so it always arrives alone.
+  # The base image tag must match `rust-toolchain.toml`'s `channel` exactly —
+  # the Dockerfile says so at the `FROM` line, and when they drift the toolchain
+  # file wins and rustup re-downloads inside the builder on every cache miss.
+  # Dependabot cannot see that cross-file constraint: its first run opened a
+  # bare 1.96→1.97 base bump against a toolchain pinned to 1.96.0. Bump both in
+  # the same PR, and expect new clippy lints under `-D warnings`.
   - package-ecosystem: docker
     directory: /
     schedule:
