@@ -25,6 +25,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
         with:
           toolchain: stable
@@ -38,12 +40,19 @@ jobs:
       - name: actions are SHA-pinned
         run: |
           # Anchored to line start so this step's own pattern (which contains
-          # the literal `uses:`) doesn't match itself.
-          unpinned=$(grep -rhoP '^\s*-?\s*uses:\s*\K\S+' .github/workflows/*.yml \
-            | grep -v '^\./' | grep -vE '@[0-9a-f]{40}$' || true)
+          # the literal `uses:`) doesn't match itself. Recursive scan covers
+          # both `.yml` and `.yaml` — GitHub loads both, so a new `.yaml`
+          # workflow with a mutable ref must not slip past this gate.
+          # The allow-line regex validates the FULL `uses:` line: pin ref +
+          # `@` + 40-hex SHA + trailing `# <version>` comment. `# stable`
+          # is accepted for toolchain-channel actions (e.g. dtolnay/rust-toolchain).
+          unpinned=$(grep -rhP --include='*.yml' --include='*.yaml' \
+            '^\s*-?\s*uses:\s*' .github/workflows \
+            | grep -vP '^\s*-?\s*uses:\s*\./' \
+            | grep -vP '^\s*-?\s*uses:\s*[^[:space:]#]+@[0-9a-f]{40}\s+#\s+\S+\s*$' || true)
           if [ -n "$unpinned" ]; then
             echo "::error::unpinned action ref(s) — pin to a 40-char commit SHA with the version in a trailing comment:"
-            printf '  %s\n' $unpinned
+            printf '  %s\n' "$unpinned"
             exit 1
           fi
 
@@ -55,6 +64,8 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
         with:
           toolchain: stable
@@ -142,6 +153,8 @@ jobs:
       STATE_DB_URL: postgres://gateway:gateway@localhost:5432/gateway
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
         with:
           toolchain: stable
@@ -160,6 +173,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # stable
         with:
           toolchain: stable

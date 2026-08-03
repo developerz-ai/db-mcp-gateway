@@ -205,6 +205,11 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # softprops/action-gh-release reads its own GITHUB_TOKEN via the
+          # `contents: write` job permission — no need to leave the checkout
+          # token in the workspace for later steps.
+          persist-credentials: false
       - name: derive image version
         id: ver
         # Tag is vX.Y.Z; the published image tags drop the leading v

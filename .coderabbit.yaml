@@ -194,13 +194,21 @@ reviews:
     # CI workflows
     - path: ".github/workflows/**"
       instructions: |
-        Runner: `blacksmith-2vcpu-ubuntu-2404`. Pin every action to a full
-        commit SHA with the version in a trailing comment
-        (`uses: owner/action@<40-hex> # v3`) — a tag or branch can be
-        repointed at new code. Flag any `@v<N>`, `@main`, `@master` or
-        `@stable` ref. Dependabot (`.github/dependabot.yml`) keeps the pins
-        current, so a stale SHA is expected, not a finding.
+        Runners: Blacksmith family only. `blacksmith-2vcpu-ubuntu-2404` is
+        the default; larger sizes (`blacksmith-4vcpu-…`, `blacksmith-8vcpu-…`)
+        and native `-arm` variants are allowed for CPU-bound jobs (clippy,
+        test, image builds). Flag any non-Blacksmith runner (`ubuntu-latest`,
+        `ubuntu-22.04`, etc.).
+        Pin every action to a full commit SHA with the version in a trailing
+        comment (`uses: owner/action@<40-hex> # v3`, or `# stable` for
+        toolchain-channel actions like `dtolnay/rust-toolchain`) — a tag or
+        branch can be repointed at new code. Flag any `@v<N>`, `@main`,
+        `@master`, or `@stable` ref that lacks a 40-char SHA. Dependabot
+        (`.github/dependabot.yml`) keeps the pins current, so a stale SHA
+        is expected, not a finding.
         `concurrency:` set on every workflow that builds or deploys.
+        `persist-credentials: false` on every `actions/checkout` step
+        (leaves the workflow token out of the workspace for later steps).
         Required jobs: fmt, clippy (`-D warnings`), test (with Postgres
         service container), audit.
 
