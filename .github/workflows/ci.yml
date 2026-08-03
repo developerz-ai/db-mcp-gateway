@@ -30,6 +30,22 @@ jobs:
           toolchain: stable
           components: rustfmt
       - run: cargo fmt --all -- --check
+      # Pinning every action to a SHA is only worth anything if it stays that
+      # way. Review alone won't hold the line — a single `@v3` merged later
+      # silently restores the mutable-tag exposure. Lives in `fmt` because it
+      # is the cheapest job that already has a checkout. Local `./…` actions
+      # are same-repo and exempt.
+      - name: actions are SHA-pinned
+        run: |
+          # Anchored to line start so this step's own pattern (which contains
+          # the literal `uses:`) doesn't match itself.
+          unpinned=$(grep -rhoP '^\s*-?\s*uses:\s*\K\S+' .github/workflows/*.yml \
+            | grep -v '^\./' | grep -vE '@[0-9a-f]{40}$' || true)
+          if [ -n "$unpinned" ]; then
+            echo "::error::unpinned action ref(s) — pin to a 40-char commit SHA with the version in a trailing comment:"
+            printf '  %s\n' $unpinned
+            exit 1
+          fi
 
   clippy:
     runs-on: blacksmith-4vcpu-ubuntu-2404
