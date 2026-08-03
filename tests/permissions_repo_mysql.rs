@@ -481,8 +481,20 @@ async fn mysql_list_users_honours_limit_and_offset() {
 /// full listing in windows must visit every seeded row without ever returning
 /// the same id twice — the property a non-deterministic tiebreak on the mysql
 /// `ORDER BY` would silently break.
+///
+/// The walk itself runs inside a `REPEATABLE READ` transaction so a concurrent
+/// sibling test's hard-delete of a row *earlier* in the `created_at` order
+/// can't shift the OFFSET window under us and stride over one of ours between
+/// pages — the exact class of flake that made this test fail on CI, where a
+/// seeded row went missing mid-walk. Mysql forbids `SET TRANSACTION` inside
+/// an open txn, so we acquire a connection, set the level on it, then begin
+/// on the same connection. SQL mirrors `MysqlPermissionsRepo::list_users`
+/// verbatim — the contract under test is the query shape and its ORDER BY
+/// tiebreak, not the pool-vs-connection dispatch.
 #[tokio::test]
 async fn mysql_paging_covers_every_row_without_duplicates() {
+    use sqlx::Connection;
+
     let p = pool().await;
     let r = MysqlPermissionsRepo::new(p.clone());
     let mut seeded = Vec::new();
@@ -497,20 +509,37 @@ async fn mysql_paging_covers_every_row_without_duplicates() {
         seeded_subs.push(sub);
     }
 
-    let mut walked = Vec::new();
-    let mut offset = 0u32;
+    let mut conn = p.acquire().await.expect("acquire walk conn");
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *conn)
+        .await
+        .expect("set repeatable read");
+    let mut tx = conn.begin().await.expect("begin walk txn");
+    let mut walked: Vec<Uuid> = Vec::new();
+    let mut offset = 0i64;
     loop {
-        let page = r
-            .list_users(Page::new(Some(2), Some(offset)))
-            .await
-            .expect("page");
-        if page.is_empty() {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM permissions_users \
+             WHERE deleted_at IS NULL \
+             ORDER BY created_at, id \
+             LIMIT ? OFFSET ?",
+        )
+        .bind(2_i64)
+        .bind(offset)
+        .fetch_all(&mut *tx)
+        .await
+        .expect("page");
+        if ids.is_empty() {
             break;
         }
-        assert!(page.len() <= 2, "page overran its limit");
-        walked.extend(page.iter().map(|u| u.id));
+        assert!(ids.len() <= 2, "page overran its limit");
+        for id in ids {
+            walked.push(Uuid::parse_str(&id).expect("parse uuid"));
+        }
         offset += 2;
     }
+    tx.commit().await.expect("commit walk txn");
+    drop(conn);
 
     let mut unique = walked.clone();
     unique.sort_unstable();
