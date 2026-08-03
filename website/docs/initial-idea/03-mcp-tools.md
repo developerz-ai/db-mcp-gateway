@@ -66,7 +66,7 @@ Args: `server`, `database`, `sql`, optional `reason`. Returns `EXPLAIN` (or vend
 
 Design intent, kept here because it is the canonical spec; no dispatch arm exists yet, so calling it fails. `GrantAction::HistoryRead` *is* wired end-to-end, which means a `history_read` grant can be created today and does nothing.
 
-Args: optional `database`, optional `since`, optional `limit`. Returns *the caller's own* recent queries (SQL + timestamp + duration + row count). Lets the agent recover context across sessions without exposing other users' queries.
+Args: `server`, `database`, optional `since`, optional `limit`. Returns *the caller's own* recent queries (SQL + timestamp + duration + row count). Lets the agent recover context across sessions without exposing other users' queries.
 
 ## Errors
 
