@@ -29,7 +29,7 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 # at boot in `transport::tls::install_crypto_provider`.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.7", features = ["trace", "cors"] }
 futures = "0.3.32"            # Stream combinators for the SSE response
 
 # serialization + config
