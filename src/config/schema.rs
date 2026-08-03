@@ -194,7 +194,13 @@ mod tests {
             kind: postgres
             host: localhost
         "#;
-        let server: Server = serde_yaml::from_str(yaml).unwrap();
+        // Production options, not `from_str`'s defaults — a test that parses a
+        // config type should exercise the parser the gateway actually boots
+        // with, and this keeps `with_snippet: false` the only configuration
+        // any config YAML is ever parsed under.
+        let server: Server =
+            serde_saphyr::from_str_with_options(yaml, crate::config::yaml::non_leaking_options())
+                .unwrap();
         assert_eq!(server.port, 5432);
         assert_eq!(server.tls, Tls::Required);
         assert!(server.databases.is_empty());

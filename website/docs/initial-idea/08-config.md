@@ -111,6 +111,44 @@ logging:
 - `admin.enabled` defaults to `false` — absent or false leaves `/admin/v1/*` unmounted (404). When `enabled: true`, `admin.group` is required and must be non-empty/non-whitespace, else boot aborts (every authenticated caller would otherwise be an admin). Full surface in [12-dynamic-permissions.md](12-dynamic-permissions.md).
 - `permissions_store.driver: mysql` combined with `admin.enabled: true` is rejected at boot — admin handlers are pg-only today. Use `driver: pg` (the default when the block is absent) for the admin path, or `mysql` with YAML grants only.
 
+## YAML parser
+
+Config YAML is parsed **only** through `config::yaml::non_leaking_options` — never `serde_saphyr::from_str`. A config file is mostly credentials, so a parse failure is a disclosure risk.
+
+Crate: `serde-saphyr`, the serde front-end for [saphyr](https://github.com/saphyr-rs/saphyr) (`yaml-rust2` successor).
+
+| Candidate | Status | Verdict |
+|---|---|---|
+| `serde_yaml` | archived Mar 2024 | rejected — no fixes, and it parses every boot |
+| `serde_yml` | archived | rejected — the popular fork is dead too |
+| `serde_yaml_ng` | ~1 yr idle | rejected — less audit surface than what it replaces |
+| `serde_norway` | ~1 yr idle | rejected — same |
+| **`serde-saphyr`** | **1.0, active** | **chosen** |
+
+The ecosystem never migrated off `serde_yaml`; it still outpulls every fork combined. Swapping to an idle fork trades a scrutinised frozen crate for an unscrutinised quiet one.
+
+## Parse errors never quote the file
+
+A parse error carries a **position and the schema's expectations, never the file's content**. Both come from the gateway's own types:
+
+```text
+Error: /etc/gateway/config.yml:3:11: invalid configuration (expected one of postgres, mysql, mssql, mongo)
+```
+
+Three independent controls enforce this. Each has been observed to fail alone.
+
+| Control | Without it |
+|---|---|
+| Snippet rendering disabled (`non_leaking_options`) | Parser attaches a window of *surrounding* source — discloses neighbouring credentials even when the error is elsewhere |
+| Error stores no parser text — only position + the text *after* `expected one of` | The offending scalar rides along in the message |
+| `Parse` has no `#[source]` | `main` returns `anyhow::Result`; `anyhow` prints every `source()` link under `Caused by:`, so a "suppressed" message still reaches the terminal |
+
+The third was missed originally: suppressing at `Display` is not sufficient, the chain must be severed. Re-attaching a `#[source]` reopens it, so a test asserts the chain has no second link.
+
+Extraction is an allowlist, not a redaction. serde puts the input token *before* `expected one of` and the schema's alternatives *after* it, so copying only the tail is safe by construction — a redaction rule would have to track the parser's phrasing, whereas this can only fail closed by finding no marker.
+
+Operators lose nothing: `:line:column` points at the offending value in a file they already have, and the list names what the field accepts.
+
 ## Hot reload
 
 `SIGHUP` re-reads the file. On success, swaps live config atomically. On failure, keeps the old config and logs the error — never half-applies. Pools for removed databases drain; new pools for added databases come up lazily.

@@ -39,7 +39,9 @@ serde = { version = "1", features = ["derive"] }
 # relies on this — mongo's wire convention is "the first key of the
 # command document is the command name."
 serde_json = { version = "1", features = ["preserve_order"] }
-serde_yaml = "0.9"
+# Not `serde_yaml` — rationale in website/docs/initial-idea/08-config.md
+# §"YAML parser". Must be parsed via `config::yaml::non_leaking_options`.
+serde-saphyr = "1"
 clap = { version = "4", features = ["derive", "env"] }
 
 # db
