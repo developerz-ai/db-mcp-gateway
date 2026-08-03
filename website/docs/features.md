@@ -94,9 +94,11 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 - **How it works:** Append-only log in gateway's state database, optionally archived to S3/GCS/Azure
 - **Compliance benefit:** Complete query history for security reviews and compliance audits
 
-### Query History API
-- **What it does:** Users can retrieve their own query history via `get_query_history` MCP tool
-- **How it works:** Returns only queries initiated by the authenticated user
+### Query History API — *planned, not yet implemented*
+
+- **Status:** Designed but not built — tracked in [#169](https://github.com/developerz-ai/db-mcp-gateway/issues/169). The audit log below already records every query; what's missing is the MCP tool that lets a user read their own back.
+- **What it will do:** Users retrieve their own query history via a `get_query_history` MCP tool
+- **How it will work:** Returns only queries initiated by the authenticated user
 - **Privacy benefit:** Users see their own history, not teammates' queries
 - **Operations benefit:** Self-service audit access reduces support burden
 
@@ -111,7 +113,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 ## 🤖 MCP Integration
 
 ### Complete MCP Tool Surface
-- **What it does:** Seven MCP tools cover all database interaction patterns
+- **What it does:** Six MCP tools cover all database interaction patterns
 - **Tools included:**
   - `list_servers` - Enumerate target servers visible to the caller
   - `list_databases` - Enumerate available databases on a server
@@ -119,7 +121,6 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
   - `sample_table` - Preview data with configurable sample size
   - `run_query` - Execute SQL with safety limits
   - `explain` - Get query execution plans
-  - `get_query_history` - Retrieve user's own query log
 
 ### Multi-Database Support
 - **What it does:** Single gateway instance supports PostgreSQL, MySQL, and MongoDB

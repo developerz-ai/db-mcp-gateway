@@ -62,9 +62,11 @@ Args: `server`, `database`, `sql`, optional `reason`. Returns `EXPLAIN` (or vend
 
 **`EXPLAIN ANALYZE` is rejected** — same reason as in `run_query`. Use plain `EXPLAIN` instead.
 
-### `get_query_history`
+### `get_query_history` — **not yet implemented** ([#169](https://github.com/developerz-ai/db-mcp-gateway/issues/169))
 
-Args: optional `database`, optional `since`, optional `limit`. Returns *the caller's own* recent queries (SQL + timestamp + duration + row count). Lets the agent recover context across sessions without exposing other users' queries.
+Design intent, kept here because it is the canonical spec; no dispatch arm exists yet, so calling it fails. `GrantAction::HistoryRead` *is* wired end-to-end, which means a `history_read` grant can be created today and does nothing.
+
+Args: `server`, `database`, optional `since`, optional `limit`. Returns *the caller's own* recent queries (SQL + timestamp + duration + row count). Lets the agent recover context across sessions without exposing other users' queries.
 
 ## Errors
 

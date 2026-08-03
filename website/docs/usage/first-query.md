@@ -1,6 +1,6 @@
 # Your first query
 
-A 5-minute walkthrough for a new engineer whose org has already deployed the gateway. Start to finish: install Claude Code → sign in → run a real query against a real DB → read your own audit row.
+A 5-minute walkthrough for a new engineer whose org has already deployed the gateway. Start to finish: install Claude Code → sign in → run a real query against a real DB. There's an optional last step for operators who want to peek at the audit row directly — it needs `psql` and state-DB access, so most engineers can stop after step 5.
 
 If you're standing the gateway up, you want [../deployment/quickstart.md](../deployment/quickstart.md) instead. If you've already done a first query and want the day-to-day reference, jump back to [claude-code.md](claude-code.md). For MongoDB targets the path is the same — see [multi-db.md](multi-db.md) for what changes at the `sql` field and which commands are allowed.
 
@@ -15,7 +15,7 @@ If you're standing the gateway up, you want [../deployment/quickstart.md](../dep
 | An SSO account at your org's IdP | The same login you use for the rest of your internal tools |
 | Membership in at least one group with a grant | Without this you authenticate fine but `list_servers` returns nothing — see [Gotchas](#gotchas) |
 
-That's it. You don't need: a DB password, a VPN profile (unless your gateway is private), the `psql` CLI, or any local DB driver.
+That's it. You don't need: a DB password, a VPN profile (unless your gateway is private), or any local DB driver. The optional audit-row peek in step 6 needs `psql` plus operator-granted state-DB access — skip that step if you don't have both.
 
 ## 1. Add the gateway as an MCP server
 
@@ -104,17 +104,11 @@ Claude: [calls run_query staging/app]
 
 That's it. You ran a real query against a real DB without ever touching a credential.
 
-## 6. (Optional) Read your own audit row
+## 6. (Optional, operator-run) Read your own audit row
 
-Every `run_query` call writes a row to the gateway's audit log **before** the result comes back. You can ask the agent for your own recent calls:
+Every `run_query` call writes a row to the gateway's audit log **before** the result comes back — user, SQL, reason, row count, duration, outcome.
 
-```text
-Show me my last 3 queries through db-gateway.
-```
-
-The agent calls `get_query_history`, which returns *only your own* SQL + timestamp + duration + row count. Other users' queries are not visible.
-
-If your operators have given you direct read access to the audit table, the row also lives in the state DB and can be pulled with `psql` — see [../initial-idea/07-logging-retention.md](../initial-idea/07-logging-retention.md).
+There is no MCP tool to read that history back yet: `get_query_history` is designed but not implemented ([#169](https://github.com/developerz-ai/db-mcp-gateway/issues/169)), so asking your agent for it will fail. Until it lands, the row lives in the state DB and can only be pulled with `psql` — so this step needs both the `psql` CLI locally *and* operator-granted read access to the audit table. If either is missing, skip it; most engineers stop at step 5. See [../initial-idea/07-logging-retention.md](../initial-idea/07-logging-retention.md) for the schema and access model.
 
 ## Gotchas
 
