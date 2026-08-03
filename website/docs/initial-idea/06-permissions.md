@@ -22,9 +22,9 @@ A request is allowed iff *some* grant matches. Denies are not explicit — absen
 | Action | What it unlocks |
 |---|---|
 | `schema_read` | `list_databases`, `describe_schema` |
-| `query_read` | `run_query` with read-only enforcement, `explain`, `sample_table` (size-capped), `get_query_history` |
+| `query_read` | `run_query` with read-only enforcement, `explain`, `sample_table` (size-capped) |
 | `query_write` | `run_query` with write grants (requires the DB role to also have write privileges) |
-| `history_read` | Read your *own* query history. Other users' history is never readable here — admin-only via state DB |
+| `history_read` | Read your *own* query history. Other users' history is never readable here — admin-only via state DB. **The tool that consumes this grant (`get_query_history`) is not implemented yet ([#169](https://github.com/developerz-ai/db-mcp-gateway/issues/169)), so granting it currently does nothing.** |
 
 `query_read` implies `schema_read`. `query_write` implies `query_read`.
 

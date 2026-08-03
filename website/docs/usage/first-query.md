@@ -106,15 +106,9 @@ That's it. You ran a real query against a real DB without ever touching a creden
 
 ## 6. (Optional) Read your own audit row
 
-Every `run_query` call writes a row to the gateway's audit log **before** the result comes back. You can ask the agent for your own recent calls:
+Every `run_query` call writes a row to the gateway's audit log **before** the result comes back — user, SQL, reason, row count, duration, outcome.
 
-```text
-Show me my last 3 queries through db-gateway.
-```
-
-The agent calls `get_query_history`, which returns *only your own* SQL + timestamp + duration + row count. Other users' queries are not visible.
-
-If your operators have given you direct read access to the audit table, the row also lives in the state DB and can be pulled with `psql` — see [../initial-idea/07-logging-retention.md](../initial-idea/07-logging-retention.md).
+There is no MCP tool to read that history back yet: `get_query_history` is designed but not implemented ([#169](https://github.com/developerz-ai/db-mcp-gateway/issues/169)), so asking your agent for it will fail. Until it lands, the row lives in the state DB and can be pulled with `psql` if your operators have given you direct read access to the audit table — see [../initial-idea/07-logging-retention.md](../initial-idea/07-logging-retention.md).
 
 ## Gotchas
 
