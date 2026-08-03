@@ -111,6 +111,16 @@ logging:
 - `admin.enabled` defaults to `false` — absent or false leaves `/admin/v1/*` unmounted (404). When `enabled: true`, `admin.group` is required and must be non-empty/non-whitespace, else boot aborts (every authenticated caller would otherwise be an admin). Full surface in [12-dynamic-permissions.md](12-dynamic-permissions.md).
 - `permissions_store.driver: mysql` combined with `admin.enabled: true` is rejected at boot — admin handlers are pg-only today. Use `driver: pg` (the default when the block is absent) for the admin path, or `mysql` with YAML grants only.
 
+## Parse errors never quote the file
+
+A config file is mostly credentials, so a parse failure is a disclosure risk: the natural error message ("expected u16, found `hunter2`") prints the very value the operator was trying to keep out of the logs.
+
+The rule is that a parse error carries a **position, never content**. Boot logs `path:line:column: invalid configuration` and nothing more. The parser is configured to match — snippet rendering (a rustc-style window of the surrounding source, which would pull in *neighbouring* lines) is disabled, so the offending scalar and its neighbours are absent from the error value itself, not merely suppressed at the point of printing.
+
+Both halves are load-bearing and independently tested: the error type stays value-free even though the parser is, and the parser stays value-free even though the error type is. Either alone is one refactor away from a password in a log line.
+
+Operators lose nothing — `:line:column` points straight at the offending value, and they already have the file.
+
 ## Hot reload
 
 `SIGHUP` re-reads the file. On success, swaps live config atomically. On failure, keeps the old config and logs the error — never half-applies. Pools for removed databases drain; new pools for added databases come up lazily.

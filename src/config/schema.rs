@@ -194,7 +194,7 @@ mod tests {
             kind: postgres
             host: localhost
         "#;
-        let server: Server = serde_yaml::from_str(yaml).unwrap();
+        let server: Server = serde_saphyr::from_str(yaml).unwrap();
         assert_eq!(server.port, 5432);
         assert_eq!(server.tls, Tls::Required);
         assert!(server.databases.is_empty());

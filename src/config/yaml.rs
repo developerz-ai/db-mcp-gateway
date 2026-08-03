@@ -84,22 +84,33 @@ pub enum ConfigFileError {
         #[source]
         source: std::io::Error,
     },
-    /// `Display` deliberately omits the raw serde_yaml message: that text can
-    /// echo an offending scalar (e.g. a password mis-pasted into a typed field)
-    /// verbatim into the boot log. We surface only `path` + `:line:column` so
-    /// operators can find the offending line without the value being printed.
-    /// The full serde reason stays reachable via the `source` chain for callers
-    /// (tests, structured loggers) that opt into walking it.
+    /// `Display` deliberately omits the raw parser message and surfaces only
+    /// `path` + `:line:column`, so an operator can find the offending line
+    /// without its value being printed into the boot log.
+    ///
+    /// Under `serde-saphyr` with [`non_leaking_options`] the parser text is
+    /// itself value-free — "invalid u16 at line 5, column 11" names the
+    /// expected type and the position, never the scalar that failed. That is a
+    /// tightening: `serde_yaml` used to echo the offending value, so this
+    /// variant's `message`/`source` were a deliberate, contained leak that
+    /// only chain-walking callers could reach. They no longer carry it at all.
+    ///
+    /// Both layers are load-bearing. Keep `Display` value-free even though the
+    /// parser is, and keep [`non_leaking_options`] even though `Display` is —
+    /// either one alone is one refactor away from a credential in a log line.
     #[error("{path}{location}: invalid configuration")]
     Parse {
         path: PathBuf,
-        /// `:line:column` when serde_yaml knows it, empty otherwise.
+        /// `:line:column` when the parser knows it, empty otherwise.
         location: String,
         /// Pre-rendered `source` text. Kept for callers that walk the error
         /// chain; never rendered by `Display` (see the variant doc comment).
         message: String,
+        /// Boxed: `serde_saphyr::Error` is a large enum, and inlining it makes
+        /// every `Result<_, ConfigFileError>` in this module pay for it
+        /// (`clippy::result_large_err`).
         #[source]
-        source: serde_yaml::Error,
+        source: Box<serde_saphyr::Error>,
     },
     #[error("invalid config: {0}")]
     Invalid(String),
@@ -126,7 +137,7 @@ impl ConfigFileError {
     /// Build a `Parse` error with location information extracted up-front.
     /// Operators read `Display` first; making them dig through `source()`
     /// for line numbers is the polish #16 is fixing.
-    fn parse_from(path: PathBuf, source: serde_yaml::Error) -> Self {
+    fn parse_from(path: PathBuf, source: serde_saphyr::Error) -> Self {
         let location = source
             .location()
             .map(|loc| format!(":{}:{}", loc.line(), loc.column()))
@@ -136,8 +147,25 @@ impl ConfigFileError {
             path,
             location,
             message,
-            source,
+            source: Box::new(source),
         }
+    }
+}
+
+/// Parser options for every config parse in this module.
+///
+/// `serde-saphyr` defaults `with_snippet` to `true`, which wraps a failure in a
+/// rustc-style window of the surrounding source. For a config file that is
+/// mostly credentials, that turns any parse error into a credential disclosure:
+/// a type error on one line drags its *neighbours* into the error value, and
+/// from there into whatever walks the `source` chain. Disabling it keeps the
+/// secret out of the error in the first place, which is stronger than redacting
+/// it afterwards — there is nothing to forget to redact.
+///
+/// `location()` is unaffected, so operators still get `:line:column`.
+fn non_leaking_options() -> serde_saphyr::Options {
+    serde_saphyr::options! {
+        with_snippet: false,
     }
 }
 
@@ -205,7 +233,7 @@ impl ConfigFile {
     /// Parse + structural validation only. See `from_file` for the contract;
     /// use `load_yaml_str` for the fail-fast variant.
     pub fn from_yaml_str(raw: &str) -> Result<Self, ConfigFileError> {
-        let parsed: ConfigFile = serde_yaml::from_str(raw)
+        let parsed: ConfigFile = serde_saphyr::from_str_with_options(raw, non_leaking_options())
             .map_err(|source| ConfigFileError::parse_from(PathBuf::from("<inline>"), source))?;
         parsed.validate()?;
         Ok(parsed)
@@ -808,8 +836,8 @@ permissions:
             !rendered.contains("statemnt_timeout_ms"),
             "Display must not echo raw serde text: {rendered}"
         );
-        // serde_yaml reports the line of the offending key. Exact column varies
-        // by serde_yaml version; assert just on a `:line:column` shape.
+        // The parser reports the line of the offending key. Exact column varies
+        // by parser version; assert just on a `:line:column` shape.
         assert!(
             rendered.contains(":14:") || rendered.contains(":13:"),
             "expected `:14:` or `:13:` line marker in: {rendered}"
@@ -1073,9 +1101,15 @@ permissions:
         assert!(detail.contains("query_read"), "missing expected: {detail}");
     }
 
-    /// C4: the rendered `Display` of a parse error must never carry the raw
-    /// serde_yaml text — an offending scalar (potentially a secret) could ride
-    /// along. The reason stays reachable only via the `source` chain.
+    /// C4: a parse error must never carry the offending scalar — it may be a
+    /// password mis-pasted into a typed field.
+    ///
+    /// Tightened by the `serde_yaml` → `serde-saphyr` swap. `serde_yaml` echoed
+    /// the bad value in its message, so this test only asserted that `Display`
+    /// suppressed it while `source` was allowed to keep it. `serde-saphyr` with
+    /// [`non_leaking_options`] reports "invalid u16 at line 5, column 11" — the
+    /// expected type and the position, never the value — so the scalar is now
+    /// absent from every layer, and that is what we pin.
     #[test]
     fn parse_error_display_omits_raw_serde_text() {
         // `port` wants u16; the string value is the kind of scalar serde would
@@ -1097,13 +1131,73 @@ servers:
             rendered.contains("invalid configuration"),
             "Display should be the generic operator line: {rendered}"
         );
-        // The scalar is still available for chain-walking callers.
-        let ConfigFileError::Parse { source, .. } = err else {
+        let ConfigFileError::Parse {
+            source,
+            message,
+            location,
+            ..
+        } = &err
+        else {
             panic!("expected Parse, got {err:?}");
         };
+
+        // Not even chain-walking callers see the value any more.
+        for (label, text) in [("source", source.to_string()), ("message", message.clone())] {
+            assert!(
+                !text.contains("sup3r-s3cret-looking-scalar"),
+                "{label} leaked the offending scalar: {text}"
+            );
+        }
+
+        // Suppressing the value is only acceptable because the position
+        // survives — that is what an operator actually navigates by.
+        assert_eq!(location, ":5:11", "operators lost the offending position");
+    }
+
+    /// C4, second half — added with the `serde_yaml` → `serde-saphyr` swap,
+    /// and the reason [`non_leaking_options`] exists.
+    ///
+    /// `serde-saphyr` defaults `with_snippet` to `true`, which attaches a
+    /// rustc-style window of the *surrounding* source to the error. On a config
+    /// file that is mostly credentials, that turns a type error on one line into
+    /// a disclosure of its neighbours: caught in review by this exact fixture,
+    /// which printed `password: "unrelated-neighbour-secret"` before the option
+    /// was turned off.
+    ///
+    /// Strictly stronger than the test above — that one pins the *offending*
+    /// value, this one pins every *other* line in the file.
+    #[test]
+    fn parse_error_never_carries_secrets_from_neighbouring_lines() {
+        // The error is on `port` (u16 vs string). `password` is a *different*,
+        // perfectly valid line — no correct error message has any reason to
+        // mention it.
+        let yaml = "\
+servers:
+  - name: prod
+    kind: postgres
+    host: a
+    password: \"unrelated-neighbour-secret\"
+    port: \"not-a-number\"
+";
+        let err = ConfigFile::from_yaml_str(yaml).expect_err("type mismatch must be rejected");
+
+        let rendered = format!("{err}");
         assert!(
-            source.to_string().contains("sup3r-s3cret-looking-scalar"),
-            "source should retain the full serde reason"
+            !rendered.contains("unrelated-neighbour-secret"),
+            "Display pulled in a neighbouring line's secret: {rendered}"
         );
+
+        let ConfigFileError::Parse {
+            source, message, ..
+        } = &err
+        else {
+            panic!("expected Parse, got {err:?}");
+        };
+        for (label, text) in [("source", source.to_string()), ("message", message.clone())] {
+            assert!(
+                !text.contains("unrelated-neighbour-secret"),
+                "{label} pulled in a neighbouring line's secret: {text}"
+            );
+        }
     }
 }
