@@ -49,3 +49,7 @@ config/*.local.yaml
 .claude-task-master/
 claudetm.log
 goal.txt
+
+# cargo-chef writes this inside the builder stage; only a local
+# `cargo chef prepare` would leave one in the working tree.
+recipe.json
