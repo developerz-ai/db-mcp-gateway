@@ -23,7 +23,7 @@ test-support = []
 [dependencies]
 # async runtime + http
 tokio = { version = "1", features = ["full"] }
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.8", features = ["macros"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 # rustls 0.23 requires explicit CryptoProvider selection — we pick aws-lc-rs
 # at boot in `transport::tls::install_crypto_provider`.
