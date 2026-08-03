@@ -131,7 +131,7 @@ src/
   exec/             # per-DB pools, query exec, timeouts, row caps
   audit/            # writer, pruner, archive, sinks
   state/            # state DB queries, migrations
-  errors.rs         # typed error enum
+                    # no central errors.rs — each layer owns its typed error
 config/example.yaml # commented example
 website/docs/
   initial-idea/     # canonical spec
