@@ -146,14 +146,24 @@ reviews:
         get a response; requests always do (including error responses).
         Spec: website/docs/initial-idea/02-architecture.md.
 
-    # Error modules — there is no single `src/errors.rs`; each layer owns its
-    # own typed error (`auth::errors`, `transport::errors`, plus enums defined
-    # alongside their layer, e.g. `exec::adapter::ExecError`).
+    # Error modules — no single `src/errors.rs`; each layer owns its own typed
+    # error. Some live in dedicated `error*.rs` files (`auth::errors`,
+    # `transport::errors`); most sit alongside the layer they belong to (e.g.
+    # `exec::adapter::ExecError`, `audit::AuditError`). Both rules apply the
+    # same requirements so every layer-local error enum is covered.
     - path: "src/**/error*.rs"
       instructions: |
         Every variant must have a stable wire code documented in
         website/docs/initial-idea/03-mcp-tools.md. Never embed credentials, raw
         connection strings, or backend error strings that may leak them.
+
+    - path: "src/{audit/mod.rs,audit/permissions.rs,auth/config.rs,authz/loader.rs,config/mod.rs,config/secret.rs,config/yaml.rs,exec/adapter.rs,exec/sql_guard.rs,state/mod.rs,state/permissions/mod.rs,transport/oauth_state.rs,transport/tls.rs}"
+      instructions: |
+        Contains a layer-local error enum (e.g. `ExecError`, `AuditError`,
+        `ConfigError`). Every variant must have a stable wire code documented
+        in website/docs/initial-idea/03-mcp-tools.md. Never embed credentials,
+        raw connection strings, or backend error strings that may leak them.
+        Update this glob when adding or renaming a layer-local error enum.
 
     # Integration tests — real Postgres, audit assertion
     - path: "tests/**/*.rs"
