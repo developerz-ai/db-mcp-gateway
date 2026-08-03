@@ -549,12 +549,37 @@ async fn mysql_paging_covers_every_row_without_duplicates() {
         walked.len(),
         "a row was returned on more than one page"
     );
-    for id in seeded {
+    for id in &seeded {
         assert!(
-            walked.contains(&id),
+            walked.contains(id),
             "seeded user {id} was skipped by the page walk"
         );
     }
+
+    // The walk above issues raw SQL so every page shares one snapshot. That is
+    // what fixed the mid-walk flake, but it also means the walk no longer
+    // exercises `PermissionsRepo::list_users` — and the `created_at, id`
+    // tiebreak this test exists to pin lives in the repo query, not here. A
+    // copy that drifts from the query it mirrors would leave the regression
+    // undetected. One repo call is a single snapshot by construction, so it
+    // re-couples the assertion to the real `ORDER BY` without reopening the
+    // flake.
+    let listed = r.list_users(wide_page()).await.expect("repo listing");
+    let repo_order: Vec<Uuid> = listed
+        .iter()
+        .map(|u| u.id)
+        .filter(|id| seeded.contains(id))
+        .collect();
+    let walk_order: Vec<Uuid> = walked
+        .iter()
+        .copied()
+        .filter(|id| seeded.contains(id))
+        .collect();
+    assert_eq!(
+        repo_order, walk_order,
+        "the raw page walk has drifted from PermissionsRepo::list_users — \
+         update the SQL above to match `mysql::users::list_users`"
+    );
 
     for sub in &seeded_subs {
         cleanup_user(&p, sub).await;
