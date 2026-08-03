@@ -72,27 +72,27 @@ jobs:
         # otherwise the artifact refs would point at ...:vX.Y.Z, which doesn't
         # match what the merger reads back.
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           # Build context is `.`; keep the checkout token out of the build
           # workspace (matches ci.yml's image-publish checkout).
           persist-credentials: false
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: log in to ghcr
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: log in to docr
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.DOCR_REGISTRY }}
           username: ${{ secrets.DOCR_TOKEN }}
           password: ${{ secrets.DOCR_TOKEN }}
       - name: image labels
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -106,7 +106,7 @@ jobs:
           tags: |
             type=raw,value=${{ env.PLATFORM_PAIR }}-${{ steps.ver.outputs.version }}
       - name: build & push per-arch
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -136,22 +136,22 @@ jobs:
         # Mirror the build job's derive; keep both jobs reading the same
         # semver (e.g. `1.4.5` not `v1.4.5`).
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: log in to ghcr
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: log in to docr
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.DOCR_REGISTRY }}
           username: ${{ secrets.DOCR_TOKEN }}
           password: ${{ secrets.DOCR_TOKEN }}
       - name: derive ghcr image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           # v1.4.5 → tags: 1.4.5, 1.4, 1, latest
@@ -169,7 +169,7 @@ jobs:
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:linux-arm64-${{ steps.ver.outputs.version }}"
       - name: derive docr image metadata
         id: meta-docr
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.DOCR_REGISTRY }}/${{ env.DOCR_IMAGE_NAME }}
           # mirror the GHCR tag set so the same :<semver> / :latest refs work in DOCR
@@ -204,7 +204,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # softprops/action-gh-release reads its own GITHUB_TOKEN via the
+          # `contents: write` job permission — no need to leave the checkout
+          # token in the workspace for later steps.
+          persist-credentials: false
       - name: derive image version
         id: ver
         # Tag is vX.Y.Z; the published image tags drop the leading v
@@ -212,7 +217,7 @@ jobs:
         # otherwise the notes point at ghcr...:vX.Y.Z, which does not exist.
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       - name: create github release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           generate_release_notes: true
           body: |
