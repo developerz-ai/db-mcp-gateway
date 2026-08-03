@@ -21,6 +21,14 @@ docs/
 *.pfx
 *.jks
 *.crt
+*.der
+*.pk8
+*.asc
+*.gpg
+# SSH keys carry no extension, so match the conventional names too.
+id_rsa*
+id_ed25519*
+id_ecdsa*
 
 # The Docusaurus site is ~400 MB with node_modules and is never part of the
 # binary. Left in, it dominated the build context and made a docs-only push
