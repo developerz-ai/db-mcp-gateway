@@ -12,6 +12,18 @@ use serde_json::json;
 use sqlx::MySqlPool;
 use uuid::Uuid;
 
+/// Page wide enough that a presence/absence assertion is really asking "is
+/// this row in the table at all".
+///
+/// Mirrors `wide_page()` in `tests/permissions_repo_real_db.rs`. Listings are
+/// ordered by `created_at` ascending, so the row a test just created is the
+/// *last* one — exactly the row a narrow page drops once a dev DB accumulates
+/// more than `Page::DEFAULT_LIMIT` rows across runs. These tests are not about
+/// pagination; the ones that are pass an explicit `Page::new(..)`.
+fn wide_page() -> Page {
+    Page::new(Some(Page::MAX_LIMIT), None)
+}
+
 fn mysql_dsn() -> String {
     std::env::var("PERMISSIONS_DB_DSN").unwrap_or_else(|_| {
         "mysql://permissions:permissions-dev-only@localhost:3307/permissions".to_string()
@@ -345,7 +357,7 @@ async fn get_user_by_sub_skips_soft_deleted() {
         r.get_user_by_sub(&sub).await.expect("get").is_some(),
         "live user should be found"
     );
-    let before = r.list_users(Page::default()).await.expect("list before");
+    let before = r.list_users(wide_page()).await.expect("list before");
     assert!(before.iter().any(|u| u.id == user.id));
 
     assert!(
@@ -356,7 +368,7 @@ async fn get_user_by_sub_skips_soft_deleted() {
         r.get_user_by_sub(&sub).await.expect("get").is_none(),
         "soft-deleted user must not surface"
     );
-    let after = r.list_users(Page::default()).await.expect("list after");
+    let after = r.list_users(wide_page()).await.expect("list after");
     assert!(!after.iter().any(|u| u.id == user.id));
     assert!(
         !r.soft_delete_user(user.id).await.expect("redelete"),
@@ -383,7 +395,7 @@ async fn database_crud_and_list_filters_soft_deleted() {
     assert_eq!(pg_db.db_type, DbType::Postgres);
     assert_eq!(mysql_db.db_type, DbType::Mysql);
 
-    let listed = r.list_databases(Page::default()).await.expect("list");
+    let listed = r.list_databases(wide_page()).await.expect("list");
     assert!(listed.iter().any(|d| d.id == pg_db.id));
     assert!(listed.iter().any(|d| d.id == mysql_db.id));
 
@@ -397,7 +409,7 @@ async fn database_crud_and_list_filters_soft_deleted() {
     assert_eq!(renamed.db_type, DbType::Mysql);
 
     assert!(r.soft_delete_database(pg_db.id).await.expect("del"));
-    let after = r.list_databases(Page::default()).await.expect("list2");
+    let after = r.list_databases(wide_page()).await.expect("list2");
     assert!(
         !after.iter().any(|d| d.id == pg_db.id),
         "soft-deleted db must drop from list"
