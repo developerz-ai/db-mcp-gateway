@@ -4,7 +4,7 @@
 # Matches rust-toolchain.toml exactly. When the two drift, the toolchain file
 # wins and rustup re-downloads inside the builder on every cache miss — bump
 # both together.
-FROM rust:1.96-slim-bookworm AS builder
+FROM rust:1.97-slim-bookworm AS builder
 WORKDIR /src
 
 # Cache deps separately from source. Copy only manifests first.
