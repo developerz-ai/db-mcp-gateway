@@ -17,3 +17,8 @@ website/
 tmp/
 .codegraph/
 .claude-task-master/
+
+# The planner stage generates this itself. A `cargo chef prepare` run in the
+# working tree would otherwise ship a stale copy in the build context, busting
+# the planner's `COPY . .` layer on a file the build immediately overwrites.
+recipe.json
