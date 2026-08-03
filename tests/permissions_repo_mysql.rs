@@ -12,6 +12,18 @@ use serde_json::json;
 use sqlx::MySqlPool;
 use uuid::Uuid;
 
+/// Page wide enough that a presence/absence assertion is really asking "is
+/// this row in the table at all".
+///
+/// Mirrors `wide_page()` in `tests/permissions_repo_real_db.rs`. Listings are
+/// ordered by `created_at` ascending, so the row a test just created is the
+/// *last* one — exactly the row a narrow page drops once a dev DB accumulates
+/// more than `Page::DEFAULT_LIMIT` rows across runs. These tests are not about
+/// pagination; the ones that are pass an explicit `Page::new(..)`.
+fn wide_page() -> Page {
+    Page::new(Some(Page::MAX_LIMIT), None)
+}
+
 fn mysql_dsn() -> String {
     std::env::var("PERMISSIONS_DB_DSN").unwrap_or_else(|_| {
         "mysql://permissions:permissions-dev-only@localhost:3307/permissions".to_string()
@@ -345,7 +357,7 @@ async fn get_user_by_sub_skips_soft_deleted() {
         r.get_user_by_sub(&sub).await.expect("get").is_some(),
         "live user should be found"
     );
-    let before = r.list_users(Page::default()).await.expect("list before");
+    let before = r.list_users(wide_page()).await.expect("list before");
     assert!(before.iter().any(|u| u.id == user.id));
 
     assert!(
@@ -356,7 +368,7 @@ async fn get_user_by_sub_skips_soft_deleted() {
         r.get_user_by_sub(&sub).await.expect("get").is_none(),
         "soft-deleted user must not surface"
     );
-    let after = r.list_users(Page::default()).await.expect("list after");
+    let after = r.list_users(wide_page()).await.expect("list after");
     assert!(!after.iter().any(|u| u.id == user.id));
     assert!(
         !r.soft_delete_user(user.id).await.expect("redelete"),
@@ -383,7 +395,7 @@ async fn database_crud_and_list_filters_soft_deleted() {
     assert_eq!(pg_db.db_type, DbType::Postgres);
     assert_eq!(mysql_db.db_type, DbType::Mysql);
 
-    let listed = r.list_databases(Page::default()).await.expect("list");
+    let listed = r.list_databases(wide_page()).await.expect("list");
     assert!(listed.iter().any(|d| d.id == pg_db.id));
     assert!(listed.iter().any(|d| d.id == mysql_db.id));
 
@@ -397,7 +409,7 @@ async fn database_crud_and_list_filters_soft_deleted() {
     assert_eq!(renamed.db_type, DbType::Mysql);
 
     assert!(r.soft_delete_database(pg_db.id).await.expect("del"));
-    let after = r.list_databases(Page::default()).await.expect("list2");
+    let after = r.list_databases(wide_page()).await.expect("list2");
     assert!(
         !after.iter().any(|d| d.id == pg_db.id),
         "soft-deleted db must drop from list"
@@ -469,8 +481,20 @@ async fn mysql_list_users_honours_limit_and_offset() {
 /// full listing in windows must visit every seeded row without ever returning
 /// the same id twice — the property a non-deterministic tiebreak on the mysql
 /// `ORDER BY` would silently break.
+///
+/// The walk itself runs inside a `REPEATABLE READ` transaction so a concurrent
+/// sibling test's hard-delete of a row *earlier* in the `created_at` order
+/// can't shift the OFFSET window under us and stride over one of ours between
+/// pages — the exact class of flake that made this test fail on CI, where a
+/// seeded row went missing mid-walk. Mysql forbids `SET TRANSACTION` inside
+/// an open txn, so we acquire a connection, set the level on it, then begin
+/// on the same connection. SQL mirrors `MysqlPermissionsRepo::list_users`
+/// verbatim — the contract under test is the query shape and its ORDER BY
+/// tiebreak, not the pool-vs-connection dispatch.
 #[tokio::test]
 async fn mysql_paging_covers_every_row_without_duplicates() {
+    use sqlx::Connection;
+
     let p = pool().await;
     let r = MysqlPermissionsRepo::new(p.clone());
     let mut seeded = Vec::new();
@@ -485,20 +509,37 @@ async fn mysql_paging_covers_every_row_without_duplicates() {
         seeded_subs.push(sub);
     }
 
-    let mut walked = Vec::new();
-    let mut offset = 0u32;
+    let mut conn = p.acquire().await.expect("acquire walk conn");
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *conn)
+        .await
+        .expect("set repeatable read");
+    let mut tx = conn.begin().await.expect("begin walk txn");
+    let mut walked: Vec<Uuid> = Vec::new();
+    let mut offset = 0i64;
     loop {
-        let page = r
-            .list_users(Page::new(Some(2), Some(offset)))
-            .await
-            .expect("page");
-        if page.is_empty() {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM permissions_users \
+             WHERE deleted_at IS NULL \
+             ORDER BY created_at, id \
+             LIMIT ? OFFSET ?",
+        )
+        .bind(2_i64)
+        .bind(offset)
+        .fetch_all(&mut *tx)
+        .await
+        .expect("page");
+        if ids.is_empty() {
             break;
         }
-        assert!(page.len() <= 2, "page overran its limit");
-        walked.extend(page.iter().map(|u| u.id));
+        assert!(ids.len() <= 2, "page overran its limit");
+        for id in ids {
+            walked.push(Uuid::parse_str(&id).expect("parse uuid"));
+        }
         offset += 2;
     }
+    tx.commit().await.expect("commit walk txn");
+    drop(conn);
 
     let mut unique = walked.clone();
     unique.sort_unstable();
@@ -508,12 +549,37 @@ async fn mysql_paging_covers_every_row_without_duplicates() {
         walked.len(),
         "a row was returned on more than one page"
     );
-    for id in seeded {
+    for id in &seeded {
         assert!(
-            walked.contains(&id),
+            walked.contains(id),
             "seeded user {id} was skipped by the page walk"
         );
     }
+
+    // The walk above issues raw SQL so every page shares one snapshot. That is
+    // what fixed the mid-walk flake, but it also means the walk no longer
+    // exercises `PermissionsRepo::list_users` — and the `created_at, id`
+    // tiebreak this test exists to pin lives in the repo query, not here. A
+    // copy that drifts from the query it mirrors would leave the regression
+    // undetected. One repo call is a single snapshot by construction, so it
+    // re-couples the assertion to the real `ORDER BY` without reopening the
+    // flake.
+    let listed = r.list_users(wide_page()).await.expect("repo listing");
+    let repo_order: Vec<Uuid> = listed
+        .iter()
+        .map(|u| u.id)
+        .filter(|id| seeded.contains(id))
+        .collect();
+    let walk_order: Vec<Uuid> = walked
+        .iter()
+        .copied()
+        .filter(|id| seeded.contains(id))
+        .collect();
+    assert_eq!(
+        repo_order, walk_order,
+        "the raw page walk has drifted from PermissionsRepo::list_users — \
+         update the SQL above to match `mysql::users::list_users`"
+    );
 
     for sub in &seeded_subs {
         cleanup_user(&p, sub).await;
