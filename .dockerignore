@@ -8,6 +8,28 @@ docs/
 *.md
 !README.md
 
+# Key material must never enter the build context. `tests/data/test_idp_key.pem`
+# is one today: harmless in itself (a throwaway IdP key in a public repo, and
+# the runtime stage copies only the binary), but `COPY . .` pulled it into the
+# builder layer, and `cache-to: type=gha` exports those layers. The binary
+# embeds exactly one external file — `config/example.yaml` — so nothing here is
+# reachable from `cargo build --release`. Deny by extension, not by path, so the
+# next key added anywhere is covered without anyone remembering this file.
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.crt
+*.der
+*.pk8
+*.asc
+*.gpg
+# SSH keys carry no extension, so match the conventional names too.
+id_rsa*
+id_ed25519*
+id_ecdsa*
+
 # The Docusaurus site is ~400 MB with node_modules and is never part of the
 # binary. Left in, it dominated the build context and made a docs-only push
 # invalidate the `COPY . .` layer, forcing a cold release rebuild.
@@ -17,3 +39,8 @@ website/
 tmp/
 .codegraph/
 .claude-task-master/
+
+# The planner stage generates this itself. A `cargo chef prepare` run in the
+# working tree would otherwise ship a stale copy in the build context, busting
+# the planner's `COPY . .` layer on a file the build immediately overwrites.
+recipe.json
