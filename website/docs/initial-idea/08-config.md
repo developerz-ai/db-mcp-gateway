@@ -113,33 +113,41 @@ logging:
 
 ## YAML parser
 
-`serde-saphyr` — the serde front-end for [saphyr](https://github.com/saphyr-rs/saphyr), the `yaml-rust2` successor.
+Config YAML is parsed **only** through `config::yaml::non_leaking_options` — never `serde_saphyr::from_str`. A config file is mostly credentials, so a parse failure is a disclosure risk.
 
-Not `serde_yaml`, which dtolnay archived in March 2024. The crate that parses every config this gateway boots from cannot be one that receives no fixes.
+Crate: `serde-saphyr`, the serde front-end for [saphyr](https://github.com/saphyr-rs/saphyr) (`yaml-rust2` successor).
 
-The forks were considered and rejected. `serde_yml`, the most-downloaded of them, is archived too. `serde_yaml_ng` and `serde_norway` are each about a year idle with a fraction of the audit surface, and the ecosystem never migrated — `serde_yaml` still outpulls every fork combined. Moving to one of those would trade a heavily-scrutinised frozen crate for a lightly-scrutinised quiet one, which is motion rather than progress. `serde-saphyr` is the only actively maintained option, and reached 1.0 in July 2026.
+| Candidate | Status | Verdict |
+|---|---|---|
+| `serde_yaml` | archived Mar 2024 | rejected — no fixes, and it parses every boot |
+| `serde_yml` | archived | rejected — the popular fork is dead too |
+| `serde_yaml_ng` | ~1 yr idle | rejected — less audit surface than what it replaces |
+| `serde_norway` | ~1 yr idle | rejected — same |
+| **`serde-saphyr`** | **1.0, active** | **chosen** |
 
-Config YAML is parsed **only** through `config::yaml::non_leaking_options`, never `serde_saphyr::from_str`. See the next section for why.
+The ecosystem never migrated off `serde_yaml`; it still outpulls every fork combined. Swapping to an idle fork trades a scrutinised frozen crate for an unscrutinised quiet one.
 
 ## Parse errors never quote the file
 
-A config file is mostly credentials, so a parse failure is a disclosure risk: the natural error message ("expected u16, found `hunter2`") prints the very value the operator was trying to keep out of the logs.
+A parse error carries a **position and the schema's expectations, never the file's content**. Both come from the gateway's own types:
 
-The rule is that a parse error may carry a **position and the schema's expectations, never the file's content**:
-
-```
+```text
 Error: /etc/gateway/config.yml:3:11: invalid configuration (expected one of postgres, mysql, mssql, mongo)
 ```
 
-The position and the alternatives both come from the gateway's own types. The operator's text does not appear.
+Three independent controls enforce this. Each has been observed to fail alone.
 
-Three separate mechanisms enforce this, because each one alone has been observed to fail:
+| Control | Without it |
+|---|---|
+| Snippet rendering disabled (`non_leaking_options`) | Parser attaches a window of *surrounding* source — discloses neighbouring credentials even when the error is elsewhere |
+| Error stores no parser text — only position + the text *after* `expected one of` | The offending scalar rides along in the message |
+| `Parse` has no `#[source]` | `main` returns `anyhow::Result`; `anyhow` prints every `source()` link under `Caused by:`, so a "suppressed" message still reaches the terminal |
 
-1. **Snippet rendering is disabled** (`config::yaml::non_leaking_options`). The parser otherwise attaches a rustc-style window of the *surrounding* source, which discloses neighbouring lines — on this file, other credentials — even when the error itself is elsewhere.
-2. **The error keeps no parser text.** Only a position and the schema-derived expectation list are extracted; the parser's own message is read and dropped. The extraction keeps only the text *after* `expected one of`, which is safe by construction: serde puts the input token before that marker and the schema's alternatives after it. Safety rests on never copying the region the token can occupy, not on redacting the token — a redaction rule would have to keep pace with the parser's phrasing, whereas this can only ever fail closed by finding no marker.
-3. **The error has no `source` chain.** This is the one that was originally missed. `main` returns `anyhow::Result`, and `anyhow` renders every `source()` link under `Caused by:` when `main` returns `Err` — so a "suppressed" message that remained reachable through the chain still printed to the terminal in full. Suppressing at `Display` is not sufficient; the chain must be severed. Attaching a `#[source]` to the parse variant re-opens this, and a test asserts the chain has no second link.
+The third was missed originally: suppressing at `Display` is not sufficient, the chain must be severed. Re-attaching a `#[source]` reopens it, so a test asserts the chain has no second link.
 
-Operators lose nothing that helps them: `:line:column` points straight at the offending value in a file they already have, and the expectation list names what the field accepts.
+Extraction is an allowlist, not a redaction. serde puts the input token *before* `expected one of` and the schema's alternatives *after* it, so copying only the tail is safe by construction — a redaction rule would have to track the parser's phrasing, whereas this can only fail closed by finding no marker.
+
+Operators lose nothing: `:line:column` points at the offending value in a file they already have, and the list names what the field accepts.
 
 ## Hot reload
 
