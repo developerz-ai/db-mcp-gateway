@@ -79,6 +79,14 @@ admin:
 permissions_store:
   driver: pg                 # or 'mysql' — see boot-gate below
 
+# Optional. Absent ⇒ no static bearer tokens accepted (OIDC sessions only).
+# Headless-client credentials — name + one permissions group + secret ref.
+# Full design: 14-service-tokens.md.
+service_accounts:
+  - name: ci-bot
+    group: svc-ci-bot        # must exist in permissions:; never the admin group
+    token: ${ENV:SERVICE_TOKEN_CI_BOT}
+
 logging:
   hot_retention_days: 90
   archive:

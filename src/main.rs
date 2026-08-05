@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use db_mcp_gateway::auth::{AuthConfig, OidcClient, ServiceTokenStore, SessionCacheConfig, SessionStore};
+use db_mcp_gateway::auth::{
+    AuthConfig, OidcClient, ServiceTokenStore, SessionCacheConfig, SessionStore,
+};
 use db_mcp_gateway::authz::PermissionsCache;
 use db_mcp_gateway::config::{ConfigFile, TlsConfig};
 use db_mcp_gateway::exec::AdapterRegistry;
