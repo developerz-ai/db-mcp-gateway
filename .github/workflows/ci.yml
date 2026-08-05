@@ -60,8 +60,10 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     # A Cargo.lock change misses the cache, and a cold build of this graph
     # (aws-lc-rs, mongodb, sqlx ×2 backends, sentry, axum) on 2 vCPU runs well
-    # past 15 min. release.yml already went to 60 for the same reason.
-    timeout-minutes: 40
+    # past 15 min. release.yml already went to 60 for the same reason. After
+    # the rust-cache-clear added below, every PR run now pays the cold-build
+    # cost on the first clippy invocation, so we add 10 min of headroom.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -74,6 +76,12 @@ jobs:
         with:
           shared-key: build
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Wipe stale depfiles that Rust-cache restored from a main-branch build.
+      # Without this, `cargo clippy --all-targets` against a PR whose branch
+      # diverged before a test file was added (or removed) fails with
+      # `error[E0063]: missing field … in initializer` against depfiles that
+      # reference a `.rs` that no longer exists on the PR branch.
+      - run: cargo clean -p db-mcp-gateway
       - run: cargo clippy --all-targets --all-features -- -D warnings
       # --all-targets enables cfg(test), which makes imports used only by
       # #[cfg(any(test, debug_assertions))] helpers look live. The release
@@ -84,7 +92,10 @@ jobs:
 
   test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 40
+    # After the rust-cache-clear step below, this job pays the cold-build cost
+    # on every PR invocation; 50 min gives ~10 min of headroom over the
+    # observed 35-40 min peak.
+    timeout-minutes: 50
     services:
       postgres:
         image: postgres:16
@@ -162,6 +173,11 @@ jobs:
         with:
           shared-key: build
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Wipe stale depfiles that Rust-cache restored from a main-branch build —
+      # see the matching comment in the clippy job above for the cache-poisoning
+      # rationale. The `--all-targets` test invocation below hits the same
+      # pattern.
+      - run: cargo clean -p db-mcp-gateway
       # No separate `cargo build` step — `cargo test --all-targets` builds the
       # same targets, so the extra invocation was a wasted fingerprint pass.
       - run: cargo test --all-targets
