@@ -11,11 +11,12 @@
 pub mod permissions;
 pub mod pruner;
 
-// Only `latest_for_user_tool` below needs these, and it is cfg'd out of release
-// builds — so the imports must carry the same cfg or a release build warns.
-#[cfg(any(test, debug_assertions))]
+// `latest_for_user_tool` is cfg'd out of release builds, but its chrono
+// types are also used by the production `query_user_history` reader added
+// with #169. One import covers both.
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use sqlx::Row;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -190,4 +191,71 @@ pub async fn latest_for_user_tool(
             db_type: r.get("db_type"),
         }
     }))
+}
+
+/// One row in the `get_query_history` response. Field names match the wire
+/// contract documented at `website/docs/initial-idea/03-mcp-tools.md`
+/// §get_query_history.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HistoryEntry {
+    pub request_id: String,
+    pub sql: Option<String>,
+    pub reason: Option<String>,
+    pub occurred_at: String,
+    pub elapsed_ms: Option<i64>,
+    pub row_count: Option<i64>,
+    pub outcome: String,
+}
+
+/// SECURITY-CRITICAL — used by `tools::get_query_history`. Reads
+/// `audit_calls` rows for a *single* caller, scoped by the SSO-verified
+/// `user_sub` (NOT a client-supplied field — see the caller's
+/// `#[serde(deny_unknown_fields)]` Arguments). Filters by server+database
+/// so the response is target-scoped. Optional `since` is a pre-parsed
+/// `DateTime<Utc>`; `limit` is pre-clamped to `GATEWAY_ROW_LIMIT_CEILING`.
+///
+/// The composite index `(user_sub, occurred_at DESC)` from migration 0003
+/// covers the WHERE + ORDER BY exactly — no separate scan.
+pub async fn query_user_history(
+    pool: &PgPool,
+    user_sub: &str,
+    server: &str,
+    database: &str,
+    since: Option<DateTime<Utc>>,
+    limit: u32,
+) -> Result<Vec<HistoryEntry>, sqlx::Error> {
+    // `$4::timestamptz` so the bind type is unambiguous when `since` is
+    // NULL — sqlx otherwise can't tell `TIMESTAMPTZ` from `TEXT`.
+    let limit_i64 = i64::from(limit);
+    let rows = sqlx::query(
+        "SELECT request_id, sql, reason, outcome, elapsed_ms, row_count, occurred_at \
+         FROM audit_calls \
+         WHERE user_sub = $1 AND server_name = $2 AND database_name = $3 \
+           AND ($4::timestamptz IS NULL OR occurred_at >= $4::timestamptz) \
+         ORDER BY occurred_at DESC \
+         LIMIT $5",
+    )
+    .bind(user_sub)
+    .bind(server)
+    .bind(database)
+    .bind(since)
+    .bind(limit_i64)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let occurred: DateTime<Utc> = r.try_get("occurred_at").unwrap_or_else(|_| Utc::now());
+            HistoryEntry {
+                request_id: r.get("request_id"),
+                sql: r.try_get("sql").ok(),
+                reason: r.try_get("reason").ok(),
+                outcome: r.get("outcome"),
+                elapsed_ms: r.try_get("elapsed_ms").ok(),
+                row_count: r.try_get("row_count").ok(),
+                occurred_at: occurred.to_rfc3339(),
+            }
+        })
+        .collect())
 }

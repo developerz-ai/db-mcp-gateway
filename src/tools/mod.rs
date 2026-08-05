@@ -12,6 +12,7 @@
 pub mod audit_dispatch;
 pub mod describe_schema;
 pub mod explain;
+pub mod get_query_history;
 pub mod list_databases;
 pub mod list_servers;
 pub mod run_query;
@@ -76,6 +77,7 @@ pub use audit_dispatch::RequestContext;
 // never drift apart.
 pub use crate::transport::protocol::DESCRIBE_SCHEMA_TOOL as DESCRIBE_SCHEMA;
 pub use crate::transport::protocol::EXPLAIN_TOOL as EXPLAIN;
+pub use crate::transport::protocol::GET_QUERY_HISTORY_TOOL as GET_QUERY_HISTORY;
 pub use crate::transport::protocol::LIST_DATABASES_TOOL as LIST_DATABASES;
 pub use crate::transport::protocol::LIST_SERVERS_TOOL as LIST_SERVERS;
 pub use crate::transport::protocol::RUN_QUERY_TOOL as RUN_QUERY;
@@ -225,6 +227,18 @@ pub async fn dispatch_call(
                     identity,
                     config,
                     registry,
+                    permissions_cache,
+                    state_db,
+                    request_ctx,
+                    call.arguments,
+                )
+                .await
+            }
+            GET_QUERY_HISTORY => {
+                get_query_history::run(
+                    id,
+                    identity,
+                    config,
                     permissions_cache,
                     state_db,
                     request_ctx,
