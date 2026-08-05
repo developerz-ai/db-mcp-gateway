@@ -3,9 +3,17 @@
 //! `tools/call get_query_history` and assert (a) the caller's own rows come
 //! back, (b) a *smuggled* `user` field in the JSON-RPC arguments is rejected
 //! at the boundary, and (c) the limit ceiling clamps a hostile
-//! `limit: u32::MAX` request.
+//! `limit: u32::MAX` request and the response is actually capped at the
+//! ceiling rather than silently returning the whole audit slice.
 //!
-//! Every integration test that hits a tool asserts an audit row exists.
+//! Every integration test that calls a tool asserts an audit row was (or
+//! was not) written by the dispatch chokepoint. The only intentional
+//! no-audit exception is the smuggled-`user` case: `deny_unknown_fields`
+//! fires during argument deserialization, BEFORE the tool body runs and
+//! BEFORE `audit_dispatch` is reached — the JSON-RPC `invalid_params`
+//! envelope is the only signal. That is pinned as a no-audit assertion
+//! (see `history_rejects_smuggled_user_field`) so a future refactor that
+//! routes this through `audit_dispatch` updates the test on purpose.
 
 mod common;
 
@@ -13,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{MockUser, spawn_mock_idp};
-use db_mcp_gateway::audit::{AuditRow, log};
+use db_mcp_gateway::audit::{AuditRow, latest_for_user_tool, log};
 use db_mcp_gateway::auth::{AuthConfig, OidcClient, ServiceTokenStore, SessionStore};
 use db_mcp_gateway::config::{Config, ConfigFile};
 use db_mcp_gateway::exec::AdapterRegistry;
@@ -204,6 +212,37 @@ async fn write_audit_row(
         .expect("shift occurred_at");
 }
 
+/// Seed `count` audit rows for `user_sub` against `(server='target',
+/// database='app')` in a single bulk INSERT driven by `generate_series`.
+/// Used to push the caller's history past the per-call ceiling so
+/// truncation can be observed at the integration level. One INSERT with
+/// `generate_series` is ~1s for 100k rows; the per-row `write_audit_row`
+/// helper (which UPDATEs `occurred_at` individually) would take minutes.
+/// `tool` is set to `run_query` so the bulk seed is visibly distinct from
+/// any `get_query_history` audit row the dispatch chokepoint writes — the
+/// integration test's `latest_for_user_tool(..., "get_query_history")`
+/// lookup therefore reads the dispatch's row, not the seed.
+async fn bulk_seed_audit_rows(pool: &sqlx::PgPool, user_sub: &str, count: i64) {
+    let email = format!("{user_sub}@example.com");
+    sqlx::query(
+        "INSERT INTO audit_calls \
+         (id, request_id, user_sub, user_email, groups, tool, server_name, database_name, \
+          sql, reason, outcome, elapsed_ms, row_count, truncated, error_message, \
+          agent_client, ip, db_type) \
+         SELECT gen_random_uuid(), gen_random_uuid()::text, $1, $2, \
+                '[\"historians\"]'::jsonb, 'run_query', 'target', 'app', \
+                'SELECT ' || i::text, NULL, 'success', 1, 1, false, \
+                NULL, NULL, NULL, 'postgres' \
+         FROM generate_series(1, $3) AS i",
+    )
+    .bind(user_sub)
+    .bind(&email)
+    .bind(count)
+    .execute(pool)
+    .await
+    .expect("bulk seed audit rows");
+}
+
 async fn call_history(url: &str, bearer: &str, arguments: Value) -> Value {
     client()
         .post(format!("{url}/mcp"))
@@ -274,6 +313,21 @@ async fn history_returns_only_callers_own_rows() {
         assert!(entry["occurred_at"].is_string());
         assert_eq!(entry["outcome"], "success");
     }
+
+    // Audit invariant: the dispatch chokepoint wrote exactly one
+    // `get_query_history` row attributed to the authenticated user.
+    let row = latest_for_user_tool(pool, sub, "get_query_history")
+        .await
+        .expect("audit lookup runs")
+        .expect("history read wrote an audit row");
+    assert_eq!(row.outcome, "success");
+    assert_eq!(row.user_sub, sub);
+    assert_eq!(row.user_email, format!("{sub}@example.com"));
+    assert_eq!(row.groups, vec!["historians".to_string()]);
+    assert_eq!(row.server.as_deref(), Some("target"));
+    assert_eq!(row.database.as_deref(), Some("app"));
+    // History read carries no SQL — that column is documented as NULL.
+    assert_eq!(row.sql, None);
 }
 
 /// THE SECURITY TEST at the integration boundary. A caller smuggles a
@@ -284,7 +338,12 @@ async fn history_returns_only_callers_own_rows() {
 #[tokio::test]
 async fn history_rejects_smuggled_user_field() {
     let booted = boot_gateway().await;
-    let (url, bearer) = (booted.url.as_str(), booted.bearer.as_str());
+    let (url, bearer, pool, sub) = (
+        booted.url.as_str(),
+        booted.bearer.as_str(),
+        &booted.state_db,
+        booted.user_sub.as_str(),
+    );
 
     let resp = call_history(
         url,
@@ -308,17 +367,48 @@ async fn history_rejects_smuggled_user_field() {
         err["code"].as_i64() == Some(-32602), // JSON-RPC invalid params
         "expected invalid_params (-32602), got {err}",
     );
+
+    // Documented no-audit exception: `deny_unknown_fields` fires during
+    // `serde_json::from_value::<Arguments>` — argument deserialization is
+    // rejected before the tool body runs and before `audit_dispatch` is
+    // reached. The JSON-RPC `invalid_params` envelope above is the only
+    // signal back to the caller. Pin the absence so a future refactor that
+    // DOES route this through `audit_dispatch` updates the test on purpose.
+    let smuggled_row = latest_for_user_tool(pool, sub, "get_query_history")
+        .await
+        .expect("audit lookup runs");
+    assert!(
+        smuggled_row.is_none(),
+        "smuggled-user rejection must NOT write an audit row \
+         (deny_unknown_fields fires before audit_dispatch) — got {smuggled_row:?}",
+    );
 }
 
 /// A caller asking for `u32::MAX` rows gets the ceiling, not the whole
-/// audit table slice they happen to be entitled to. (We can't assert the
-/// *exact* number here without seeding > ceiling rows; the unit test on
-/// `effective_limit` covers the clamp logic. Here we just confirm the call
-/// succeeds and `truncated: true` is set.)
+/// audit table slice they happen to be entitled to. The clamp logic has a
+/// unit test on `effective_limit`; this integration test proves the
+/// dispatch chokepoint actually applies it — by seeding more rows than the
+/// ceiling for the authenticated user, calling `history` with `u32::MAX`,
+/// and asserting the response is *provably capped* (length == ceiling, NOT
+/// the whole slice) and `truncated` is `true`. Without the seed the test
+/// would pass on an empty result — a hostile caller could otherwise slide
+/// through with a 0-row response.
 #[tokio::test]
 async fn history_clamps_hostile_limit_to_ceiling() {
     let booted = boot_gateway().await;
-    let (url, bearer) = (booted.url.as_str(), booted.bearer.as_str());
+    let (url, bearer, pool, sub) = (
+        booted.url.as_str(),
+        booted.bearer.as_str(),
+        &booted.state_db,
+        booted.user_sub.as_str(),
+    );
+
+    // The gateway ceiling is the only thing between a caller asking for
+    // `u32::MAX` rows and the dispatcher returning the whole audit slice
+    // they happen to be entitled to. Seed one row past the ceiling so the
+    // response is unambiguously capped.
+    let ceiling = db_mcp_gateway::tools::GATEWAY_ROW_LIMIT_CEILING as i64;
+    bulk_seed_audit_rows(pool, sub, ceiling + 1).await;
 
     let resp = call_history(
         url,
@@ -332,10 +422,28 @@ async fn history_clamps_hostile_limit_to_ceiling() {
     .await;
     assert_eq!(resp["result"]["isError"], false, "{resp}");
     let body = payload(&resp);
+    let entries = body["entries"].as_array().expect("entries array");
+    assert_eq!(
+        entries.len() as i64,
+        ceiling,
+        "ceiling clamp must cap the response at exactly the ceiling — got {} entries (ceiling = {ceiling})",
+        entries.len(),
+    );
     assert_eq!(
         body["truncated"], true,
         "ceiling clamp must flag truncation"
     );
+
+    // Audit invariant: the dispatch chokepoint wrote exactly one
+    // `get_query_history` row attributed to the authenticated user, with
+    // `truncated = true` mirroring the response payload.
+    let row = latest_for_user_tool(pool, sub, "get_query_history")
+        .await
+        .expect("audit lookup runs")
+        .expect("ceiling-clamp call wrote an audit row");
+    assert_eq!(row.outcome, "success");
+    assert_eq!(row.user_sub, sub);
+    assert_eq!(row.truncated, Some(true));
 }
 
 #[tokio::test]
@@ -448,4 +556,18 @@ permissions:
     assert_eq!(resp["result"]["isError"], true, "{resp}");
     let body = payload(&resp);
     assert_eq!(body["code"], "forbidden");
+
+    // Audit invariant: the denied authz call still flows through
+    // `audit_dispatch` (the authz check happens INSIDE the tool body, not
+    // before it), so the audit row MUST be written with `outcome = 'forbidden'`
+    // and the server/database the caller tried to reach.
+    let row = latest_for_user_tool(&pool, &user_sub, "get_query_history")
+        .await
+        .expect("audit lookup runs")
+        .expect("denied call wrote an audit row");
+    assert_eq!(row.outcome, "forbidden");
+    assert_eq!(row.user_sub, user_sub);
+    assert_eq!(row.server.as_deref(), Some("target"));
+    assert_eq!(row.database.as_deref(), Some("app"));
+    assert_eq!(row.groups, vec!["query-only".to_string()]);
 }

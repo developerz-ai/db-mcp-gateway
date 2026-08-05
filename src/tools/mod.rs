@@ -69,7 +69,7 @@ pub(crate) fn db_type_for_server(config: &ConfigFile, server_name: &str) -> Opti
 /// `Vec<Vec<Value>>` and JSON response size a single request can force the
 /// gateway to build, even after the #136 row-cap-cancel fix stops the *DB
 /// connection* from being pinned by an oversized ask.
-pub(crate) const GATEWAY_ROW_LIMIT_CEILING: u32 = 100_000;
+pub const GATEWAY_ROW_LIMIT_CEILING: u32 = 100_000;
 
 pub use audit_dispatch::RequestContext;
 
