@@ -17,6 +17,20 @@
 use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret as _, SecretString};
 
+/// Strict boot-time shape check: `dbmcp_svc_` + exactly 64 lowercase
+/// ASCII-hex characters. Anything else (short, overlong, non-hex,
+/// mixed-case, missing prefix) is rejected with `WeakToken`.
+fn is_well_formed_token(token: &str) -> bool {
+    let Some(body) = token.strip_prefix(TOKEN_PREFIX) else {
+        return false;
+    };
+    if body.len() != TOKEN_BODY_CHARS {
+        return false;
+    }
+    body.bytes()
+        .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+}
+
 use super::pkce::ct_eq;
 use super::session::{Identity, SessionId};
 use crate::config::ServiceAccount;
@@ -28,11 +42,10 @@ use crate::config::secret::SecretError;
 /// authenticating as nothing. `bin/mint-service-token` emits this shape.
 pub const TOKEN_PREFIX: &str = "dbmcp_svc_";
 
-/// Shortest accepted token, in characters: the prefix plus 32 random
-/// characters (128 bits of entropy at hex density — the mint verb emits 64).
-/// Shorter values are rejected at boot so a weak token can never reach the
-/// compare loop.
-pub const MIN_TOKEN_CHARS: usize = TOKEN_PREFIX.len() + 32;
+/// Exact body length: 64 lowercase-ASCII-hex characters (32 bytes of CSPRNG
+/// entropy). Enforced at boot so a weak, mis-pasted, or out-of-shape token
+/// cannot reach the compare loop. `bin/mint-service-token` emits this shape.
+pub const TOKEN_BODY_CHARS: usize = 64;
 
 /// One resolved service account: name, group, and the live token value.
 /// `Debug` shows name + group (operator-useful, not secret) and redacts the
@@ -63,8 +76,9 @@ pub enum ServiceTokenError {
     Resolve(String, #[source] SecretError),
 
     #[error(
-        "service account `{0}`: token must start with `{TOKEN_PREFIX}` and be at least \
-         {MIN_TOKEN_CHARS} characters — generate one with `bin/mint-service-token {0}`"
+        "service account `{0}`: token must be `{TOKEN_PREFIX}` followed by exactly \
+         {TOKEN_BODY_CHARS} lowercase hexadecimal characters — generate one with \
+         `bin/mint-service-token {0}`"
     )]
     WeakToken(String),
 
@@ -98,7 +112,7 @@ impl ServiceTokenStore {
                 .resolve()
                 .map_err(|source| ServiceTokenError::Resolve(account.name.clone(), source))?;
             let exposed = token.expose_secret();
-            if !(exposed.starts_with(TOKEN_PREFIX) && exposed.len() >= MIN_TOKEN_CHARS) {
+            if !is_well_formed_token(exposed) {
                 return Err(ServiceTokenError::WeakToken(account.name.clone()));
             }
             // Reject shared values now so `authenticate` never has to pick
@@ -174,9 +188,17 @@ mod tests {
     }
 
     fn good_token(suffix: &str) -> String {
-        // Prefix + 32+ chars of body, differentiated by the suffix so each
-        // test token is distinct.
-        format!("{TOKEN_PREFIX}{suffix:0>32}")
+        // Prefix + exactly TOKEN_BODY_CHARS lowercase hex, differentiated by
+        // the suffix so each test token is distinct. Pads with `0` and
+        // truncates if the suffix is the wrong width — the suffix is always
+        // short hex in practice, so this just keeps the helper call sites
+        // readable.
+        let mut body = String::with_capacity(TOKEN_BODY_CHARS);
+        body.push_str(&"0".repeat(TOKEN_BODY_CHARS));
+        let s = suffix.as_bytes();
+        let start = body.len() - s.len();
+        body.replace_range(start.., std::str::from_utf8(s).unwrap());
+        format!("{TOKEN_PREFIX}{body}")
     }
 
     #[test]
@@ -208,7 +230,7 @@ mod tests {
         near.replace_range(near.len() - 1.., "z");
         assert!(store.authenticate(&near).is_none());
         // Truncated / extended / empty.
-        let short = &good_token("a")[..MIN_TOKEN_CHARS - 1];
+        let short = &good_token("a")[..TOKEN_PREFIX.len() + TOKEN_BODY_CHARS - 1];
         assert!(store.authenticate(short).is_none());
         assert!(
             store
@@ -244,6 +266,42 @@ mod tests {
         let weak = format!("{TOKEN_PREFIX}tooshort");
         let err = ServiceTokenStore::from_config(&[account("ci-bot", "svc-ci", &weak)])
             .expect_err("short token must fail the build");
+        assert!(matches!(err, ServiceTokenError::WeakToken(name) if name == "ci-bot"));
+    }
+
+    /// 32-character hex body — the old minimum — must now be rejected so
+    /// only the exact 64-hex shape can boot a store.
+    #[test]
+    fn thirty_two_char_body_is_rejected_at_boot() {
+        let body = "0".repeat(32);
+        let weak = format!("{TOKEN_PREFIX}{body}");
+        let err = ServiceTokenStore::from_config(&[account("ci-bot", "svc-ci", &weak)])
+            .expect_err("32-char body must fail the build");
+        assert!(matches!(err, ServiceTokenError::WeakToken(name) if name == "ci-bot"));
+    }
+
+    /// Overlong body — even if every byte is hex — must be rejected so a
+    /// paste-of-junk-from-an-issue can't reach the compare loop.
+    #[test]
+    fn overlong_body_is_rejected_at_boot() {
+        let body = "a".repeat(TOKEN_BODY_CHARS + 8);
+        let weak = format!("{TOKEN_PREFIX}{body}");
+        let err = ServiceTokenStore::from_config(&[account("ci-bot", "svc-ci", &weak)])
+            .expect_err("overlong body must fail the build");
+        assert!(matches!(err, ServiceTokenError::WeakToken(name) if name == "ci-bot"));
+    }
+
+    /// A 64-char body that includes a non-hex byte must be rejected —
+    /// `is_ascii_hexdigit` is the body-shape rule. Pinned with a body
+    /// length that matches `TOKEN_BODY_CHARS` so the test isolates the
+    /// hex rule from the length rule.
+    #[test]
+    fn non_hex_body_is_rejected_at_boot() {
+        let mut body = "a".repeat(TOKEN_BODY_CHARS - 1);
+        body.push('z'); // `z` is not an ASCII hex digit.
+        let weak = format!("{TOKEN_PREFIX}{body}");
+        let err = ServiceTokenStore::from_config(&[account("ci-bot", "svc-ci", &weak)])
+            .expect_err("non-hex body must fail the build");
         assert!(matches!(err, ServiceTokenError::WeakToken(name) if name == "ci-bot"));
     }
 

@@ -24,10 +24,11 @@ The prefix is enforced at boot, and it is load-bearing, not cosmetic:
   instead of a credential that silently authenticates as nothing.
 
 Comparison is constant-time (`auth::pkce::ct_eq`, the same primitive PKCE
-verification uses), and the boot path rejects anything under
-prefix + 32 chars so a weak token never reaches the compare loop. Token
-material never appears in `Debug`/`Display`/errors — same discipline as
-`config::secret::Password`, with tests pinning the redaction.
+verification uses), and the boot path rejects anything other than the exact
+`dbmcp_svc_` + 64 lowercase hex shape — short, overlong, missing prefix,
+non-hex, or mixed-case tokens abort boot with a `WeakToken` error naming the
+mint verb. Token material never appears in `Debug`/`Display`/errors — same
+discipline as `config::secret::Password`, with tests pinning the redaction.
 
 ### Permissions group — mandatory, exactly one
 
@@ -92,13 +93,25 @@ about tokens is callable over HTTP — the lifecycle is GitOps:
   the value in the org secret store, and PRs the `service_accounts:` stanza
   (name + group + secret **reference** — never the value). The gateway
   refuses to boot on a stanza whose ref does not resolve.
-- **Rotate** — mint a new value, update the secret, roll the deployment,
-  then update the client. A rolling deploy overlaps old and new pods, so the
-  old value keeps working until old pods drain; clients see no gap.
-- **Revoke** — remove the stanza (or empty the secret) and roll. There is no
-  instant revocation; the exposure window is the rollout time. That is the
-  honest price of a stateless compare, and it is documented rather than
-  papered over.
+- **Rotate** — overlap is mandatory, because each pod only loads one token at
+  boot. Sequence: (1) mint a new value with the same `<name>` (or a
+  temporary `<name>-next` if the audit identity must change too); (2) add a
+  *second* `service_accounts:` entry to the gateway YAML so new pods accept
+  the new value; (3) roll the deployment and wait until the rollout
+  completes; (4) update every client to use the new value; (5) remove the
+  old `service_accounts:` entry and roll again. If the temporary entry uses
+  a different `<name>`, audit rows for the rotation window attribute to
+  `<name>-next` instead of `<name>` — pick deliberately and document the
+  trade-off in the PR.
+- **Revoke** — remove the complete `service_accounts:` stanza (the name,
+  the group, and the token reference together) and roll. Emptying or
+  unsetting the secret is **not** a valid revocation: unresolved or empty
+  secret references abort boot (`SecretError::EnvNotSet` /
+  `SecretError::FileMissing`), and a gateway that refuses to start on a
+  misconfigured stanza is a feature, not a bypass. There is no instant
+  revocation; the exposure window is the rollout time. That is the honest
+  price of a stateless compare, and it is documented rather than papered
+  over.
 
 `/auth/logout` with a service token is a harmless no-op (204) and does not
 revoke anything — there is no session row to revoke.
