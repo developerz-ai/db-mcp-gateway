@@ -64,7 +64,7 @@ One reason to change per layer. Don't blur.
 | Layer | Owns | Module |
 |---|---|---|
 | Transport | MCP framing, JSON-RPC, HTTP+SSE | `src/transport/` |
-| Auth | OIDC, JWT, session cache | `src/auth/` |
+| Auth | OIDC, JWT, session cache, service tokens | `src/auth/` |
 | Authz | (user, groups, server, db, action) → allow + constraints | `src/authz/` |
 | Tools | MCP tool dispatch | `src/tools/` |
 | Exec | Per-DB pool, statement timeout, row cap, cancellation | `src/exec/` |
@@ -147,7 +147,7 @@ docker-compose.dev.yml
 - Add an admin web UI for permissions.
 - Mock the target DB in query-path tests.
 - Skip the audit write for performance.
-- Add a "service account" auth path without a permissions group + audit identity.
+- Add a "service account" auth path without a permissions group + audit identity. The shipped path is `service_accounts:` (spec 14, `src/auth/service_token.rs`): a static `dbmcp_svc_` bearer mapped to exactly one `permissions:` group, audited as `service:<name>`, boot-gated off the admin group, with no in-band mint/revoke. Any future service-auth mechanism must carry the same two properties and land with a spec update.
 - Promote a request from one user's session to another.
 - Run as DB superuser. Per-DB read-only roles, full stop.
 - Force-push `main`.
