@@ -215,10 +215,17 @@ State that is *meant* to outlive the process is in the state DB: **dynamic clien
 - Revocation: server-side, in the state DB. Logout (`POST /auth/logout`) revokes the session row **and** purges every refresh-token chain for that identity — otherwise a logged-out client could silently mint a fresh session via the refresh grant. Clients may also revoke a single token out-of-band via `POST /revoke` (RFC 7009). Every `/mcp` request resolves the session through a small in-memory cache fronting the state DB: a cache hit newer than `SESSION_CACHE_TTL_SECONDS` (default 30s) is served without a DB read; an older hit re-reads and re-validates against `revoked_at`. The replica that processes the revoke evicts its own entry immediately, so the next call there is rejected at once.
   - **Multi-replica (HA) caveat.** A revoke only evicts the cache on the replica that handled it. On other replicas the session stays honored until their cached entry ages past `SESSION_CACHE_TTL_SECONDS` (≤30s by default), at which point the next lookup re-reads the DB and sees the revoke. Lower the TTL to tighten this cross-replica window (`0` = re-validate every request) at the cost of more state-DB reads; raise it to spend fewer reads for a wider window. The cache is also size-bounded, so a flood of distinct sessions can't grow it without limit.
 
+## Service tokens (headless clients)
+
+Everything above assumes a human with a browser. A headless client — CI job, agent runner, another service — has neither, so it authenticates with a **service token**: a static bearer declared in `service_accounts:` in the YAML config, carrying a name (audit identity `service:<name>`), exactly one permissions group, and a `${ENV:…}` / `${FILE:…}` secret reference.
+
+`bearer_auth` tries the boot-resolved service-token store first (constant-time compare), then the session-JWT path unchanged. Service identities never touch the sessions table — no expiry, no in-band revocation — and never hold the admin group (boot-enforced), so the `/admin/*` middleware is untouched. Mint/rotate/revoke is GitOps: `bin/mint-service-token`, a secret-store update, a PR, a rollout.
+
+Full design and operator runbook: [14 — Service tokens](14-service-tokens.md).
+
 ## Group resolution
 
 Group membership comes from one of:
-
 - OIDC `groups` claim (preferred — set IdP to include it)
 - SCIM sync to the state DB (for IdPs that don't expose groups in tokens)
 - Directory API lookup at token-issue time (Google Workspace fallback)

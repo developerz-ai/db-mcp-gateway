@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# bin/mint-service-token — mint a static bearer token for a headless client
+# (spec 14, `service_accounts:` in the gateway YAML).
+#
+#   bin/mint-service-token <name>
+#
+# Prints a fresh `dbmcp_svc_<64 hex>` token, the YAML stanza to add, and the
+# env-var name to store the value under. Run by a human operator, never by
+# the gateway: there is deliberately no in-band mint API.
+#
+# After minting:
+#   1. Store the token value in the org secret store (Vaultwarden) — the
+#      value is shown ONCE here and is not recoverable from the gateway.
+#   2. Deliver it to the pod as a k8s Secret / SealedSecret mounted env var
+#      (or file + `${FILE:…}` ref).
+#   3. Add the printed stanza to the gateway config YAML (reviewed by PR),
+#      with a matching `permissions:` block for the group.
+#   4. Roll the deployment. The old token keeps working until every old pod
+#      drains, so rotation is: mint new -> update secret -> roll -> update
+#      the client.
+set -euo pipefail
+
+name="${1:-}"
+if [[ ! "$name" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]; then
+  echo "usage: bin/mint-service-token <name>" >&2
+  echo "  <name> must match ^[a-z0-9][a-z0-9-]{0,62}\$ — it becomes the audit identity service:<name>" >&2
+  exit 2
+fi
+
+# 32 bytes of CSPRNG entropy, hex-encoded (64 chars) — twice the boot-enforced
+# minimum. TOKEN_PREFIX + length are enforced at gateway boot, so a token this
+# script emits always satisfies the store's checks.
+token="dbmcp_svc_$(openssl rand -hex 32)"
+# Env-var name derived from the service name: ci-bot -> SERVICE_TOKEN_CI_BOT.
+env_var="SERVICE_TOKEN_$(tr 'a-z-' 'A-Z_' <<< "$name")"
+
+cat <<EOF
+token (store this — shown once): ${token}
+
+1. Put the value in Vaultwarden (org secret store of record), then deliver it
+   to the gateway pod as env var ${env_var} (SealedSecret) — or as a mounted
+   file and use \${FILE:/run/secrets/...} below instead.
+
+2. Add to the gateway YAML (the group needs its own permissions: block):
+
+service_accounts:
+  - name: ${name}
+    group: svc-${name}
+    token: \${ENV:${env_var}}
+
+permissions:
+  - group: svc-${name}
+    grants: []   # fill in the minimal grants this service needs
+
+3. Roll the deployment. Revocation = remove the stanza (or unset the env) and
+   roll again. Rotation = mint a new value, update the secret, roll, then
+   update the client — old pods keep honoring the old value until they drain.
+EOF

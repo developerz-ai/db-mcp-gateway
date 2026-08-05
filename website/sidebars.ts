@@ -56,6 +56,7 @@ const sidebars: SidebarsConfig = {
         'initial-idea/config',
         'initial-idea/deployment',
         'initial-idea/dynamic-permissions',
+        'initial-idea/service-tokens',
         'initial-idea/docs-site',
       ],
     },
