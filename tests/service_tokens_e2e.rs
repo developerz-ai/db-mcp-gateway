@@ -268,6 +268,18 @@ async fn service_token_with_empty_grants_sees_nothing() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let payload = tool_payload(resp).await;
     assert_eq!(payload["servers"], json!([]), "{payload}");
+
+    // Audit attribution: the row names the service identity, carries the
+    // empty-grant group, and uses the synthesized .invalid email — this is
+    // the only proof that a zero-grant service token still flows through
+    // the synchronous audit write.
+    let row = latest_for_user_tool(&gw.state_db, "service:analytics-bot", "list_servers")
+        .await
+        .expect("audit lookup query runs")
+        .expect("zero-grant call wrote an audit row");
+    assert_eq!(row.outcome, "success");
+    assert_eq!(row.user_email, "analytics-bot@service-accounts.invalid");
+    assert_eq!(row.groups, vec!["svc-analytics".to_string()]);
 }
 
 /// The 401 contract is unchanged: an unconfigured-but-well-formed service
@@ -375,4 +387,16 @@ async fn logout_is_a_noop_for_service_tokens() {
         reqwest::StatusCode::OK,
         "logout must not revoke a service token"
     );
+
+    // Audit attribution: the post-logout dispatch is still attributed to the
+    // service identity — proves logout did not damage the identity behind
+    // the static token (there is no session row to revoke in the first
+    // place, but the audit row is the receipt).
+    let row = latest_for_user_tool(&gw.state_db, "service:ci-bot", "list_servers")
+        .await
+        .expect("audit lookup query runs")
+        .expect("post-logout call wrote an audit row");
+    assert_eq!(row.outcome, "success");
+    assert_eq!(row.user_email, "ci-bot@service-accounts.invalid");
+    assert_eq!(row.groups, vec!["svc-ci".to_string()]);
 }

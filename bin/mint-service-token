@@ -15,9 +15,13 @@
 #      (or file + `${FILE:…}` ref).
 #   3. Add the printed stanza to the gateway config YAML (reviewed by PR),
 #      with a matching `permissions:` block for the group.
-#   4. Roll the deployment. The old token keeps working until every old pod
-#      drains, so rotation is: mint new -> update secret -> roll -> update
-#      the client.
+#   4. Roll the deployment.
+#
+# Rotation requires an explicit overlap phase because each pod only loads
+# one token at boot: mint new -> add a SECOND service_accounts entry -> roll
+# -> update clients -> remove the OLD entry -> roll again. If the temp entry
+# uses a different <name>, audit rows during the rotation window attribute
+# to that name instead of the original — document the choice in the PR.
 set -euo pipefail
 
 name="${1:-}"
@@ -27,9 +31,9 @@ if [[ ! "$name" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]; then
   exit 2
 fi
 
-# 32 bytes of CSPRNG entropy, hex-encoded (64 chars) — twice the boot-enforced
-# minimum. TOKEN_PREFIX + length are enforced at gateway boot, so a token this
-# script emits always satisfies the store's checks.
+# 32 bytes of CSPRNG entropy, hex-encoded (64 chars) — matches the exact
+# shape the boot validator requires (`dbmcp_svc_` + 64 lowercase hex). A
+# token this script emits always satisfies the store's checks.
 token="dbmcp_svc_$(openssl rand -hex 32)"
 # Env-var name derived from the service name: ci-bot -> SERVICE_TOKEN_CI_BOT.
 env_var="SERVICE_TOKEN_$(tr 'a-z-' 'A-Z_' <<< "$name")"
@@ -52,7 +56,9 @@ permissions:
   - group: svc-${name}
     grants: []   # fill in the minimal grants this service needs
 
-3. Roll the deployment. Revocation = remove the stanza (or unset the env) and
-   roll again. Rotation = mint a new value, update the secret, roll, then
-   update the client — old pods keep honoring the old value until they drain.
+3. Roll the deployment. Revocation = remove the complete stanza (name +
+   group + token ref) and roll again; emptying or unsetting the env is NOT
+   revocation (unresolved refs abort boot). Rotation needs an explicit
+   overlap: mint new, add a SECOND stanza, roll, update clients, remove the
+   OLD stanza, roll again.
 EOF

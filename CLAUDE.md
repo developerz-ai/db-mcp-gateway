@@ -147,7 +147,7 @@ docker-compose.dev.yml
 - Add an admin web UI for permissions.
 - Mock the target DB in query-path tests.
 - Skip the audit write for performance.
-- Add a "service account" auth path without a permissions group + audit identity. The shipped path is `service_accounts:` (spec 14, `src/auth/service_token.rs`): a static `dbmcp_svc_` bearer mapped to exactly one `permissions:` group, audited as `service:<name>`, boot-gated off the admin group, with no in-band mint/revoke. Any future service-auth mechanism must carry the same two properties and land with a spec update.
+- Add a "service account" auth path without a permissions group + audit identity. The shipped path is `service_accounts:` (spec 14, `src/auth/service_token.rs`): a static `dbmcp_svc_` bearer mapped to exactly one `permissions:` group, audited as `service:<name>`, boot-gated off the admin group, with no in-band mint/revoke. A boot-validated service identity is the one explicit exception to the per-call SSO-verification rule (rule 2): its identity is fixed in YAML at boot and the audit row attributes the dispatch to `service:<name>` without a fresh IdP round-trip on every call. The exception preserves the audit contract (synchronous write, `service:<name>` identity, `user_email` synthesized), the YAML-only configuration contract (no in-band grant edits), the single non-admin permissions group, and the no-in-band-mint/revoke rule. Any future service-auth mechanism must carry the same four properties and land with a spec update; spec 14 and the auth/audit tests enforce them.
 - Promote a request from one user's session to another.
 - Run as DB superuser. Per-DB read-only roles, full stop.
 - Force-push `main`.

@@ -70,6 +70,13 @@ permissions:
           statement_timeout_ms: 5000
           row_limit: 1000
 
+  # Service-token group (spec 14). Each entry is the single permissions
+  # group a `service_accounts:` token acts as. Empty `grants:` is valid —
+  # it recognizes a group that authorizes nothing (authentication never
+  # implies authorization).
+  - group: svc-ci-bot
+    grants: []               # fill in the minimal grants this service needs
+
 # Optional. Absent ⇒ /admin/v1/* returns 404, YAML-only permissions path.
 admin:
   enabled: true
