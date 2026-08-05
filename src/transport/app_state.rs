@@ -15,7 +15,7 @@ use sqlx::PgPool;
 use super::client_registry::ClientRegistry;
 use super::oauth_state::{AuthCodes, PendingFlows, RefreshTokens};
 use super::probes::ShutdownFlag;
-use crate::auth::{AuthConfig, OidcClient, SessionStore};
+use crate::auth::{AuthConfig, OidcClient, ServiceTokenStore, SessionStore};
 use crate::authz::PermissionsCache;
 use crate::config::ConfigFile;
 use crate::exec::AdapterRegistry;
@@ -71,6 +71,7 @@ impl AppState {
                 permissions: Vec::new(),
                 admin: None,
                 permissions_store: None,
+                service_accounts: Vec::new(),
             }),
             adapter_registry: AdapterRegistry::new(),
             state_db: None,
@@ -98,4 +99,8 @@ pub struct AuthFacade {
     /// MCP clients can silently renew an expired session without a fresh
     /// browser login. Rotated on every use (OAuth 2.1 public-client rule).
     pub refresh: RefreshTokens,
+    /// Static bearer tokens for headless clients (spec 14), resolved from
+    /// `service_accounts:` at boot. Empty when the config declares none —
+    /// `bearer_auth` then falls straight through to the session-JWT path.
+    pub service_tokens: ServiceTokenStore,
 }

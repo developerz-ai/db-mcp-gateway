@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionCacheConfig, SessionStore};
+use db_mcp_gateway::auth::{AuthConfig, OidcClient, ServiceTokenStore, SessionCacheConfig, SessionStore};
 use db_mcp_gateway::authz::PermissionsCache;
 use db_mcp_gateway::config::{ConfigFile, TlsConfig};
 use db_mcp_gateway::exec::AdapterRegistry;
@@ -108,6 +108,18 @@ async fn run() -> anyhow::Result<()> {
         "config loaded; all secret refs resolved"
     );
 
+    // Service tokens (spec 14): resolve every `service_accounts:` ref now so a
+    // weak/unresolvable token aborts boot instead of silently rejecting that
+    // client's every call. Empty config → empty store → JWT-only auth, the
+    // pre-#185 behavior.
+    let service_tokens = ServiceTokenStore::from_config(&config_file.service_accounts)?;
+    if !config_file.service_accounts.is_empty() {
+        tracing::info!(
+            service_accounts = config_file.service_accounts.len(),
+            "service tokens resolved"
+        );
+    }
+
     let config = Config::from_env()?;
     let auth_config = AuthConfig::from_env()?;
 
@@ -187,6 +199,7 @@ async fn run() -> anyhow::Result<()> {
             // in-memory store silently capped the real "stay signed in" window at
             // time-until-next-rollout.
             refresh: RefreshTokens::with_db(state_db.clone(), refresh_ttl),
+            service_tokens,
         }),
         config: Arc::new(config_file),
         adapter_registry: AdapterRegistry::new(),
