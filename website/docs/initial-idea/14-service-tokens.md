@@ -92,7 +92,15 @@ about tokens is callable over HTTP — the lifecycle is GitOps:
 - **Mint** — a human operator runs `bin/mint-service-token <name>`, stores
   the value in the org secret store, and PRs the `service_accounts:` stanza
   (name + group + secret **reference** — never the value). The gateway
-  refuses to boot on a stanza whose ref does not resolve.
+  refuses to boot on a stanza whose ref does not resolve. **Inline literal
+  tokens are NOT permitted in YAML** — the `service_accounts[].token` field
+  must be a `${ENV:…}` or `${FILE:…}` reference, identical to the
+  `password:` policy documented in
+  [config-reference.md § ServiceAccount](../deployment/config-reference.md#serviceaccount).
+  Inline literal tokens remain valid only in programmatic test fixtures
+  constructed via `ConfigFile::from_yaml_str` /
+  `ServiceTokenStore::from_config` directly; the YAML loader rejects them
+  in production config.
 - **Rotate** — overlap is mandatory, because each pod only loads one token at
   boot, AND the YAML validator (`src/config/yaml.rs`) rejects duplicate
   service-account names — the new value cannot reuse the original `<name>`.
@@ -114,8 +122,10 @@ about tokens is callable over HTTP — the lifecycle is GitOps:
   the group, and the token reference together) and roll. Emptying or
   unsetting the secret is **not** a valid revocation: unresolved or empty
   secret references abort boot (`SecretError::EnvNotSet` /
-  `SecretError::FileMissing`), and a gateway that refuses to start on a
-  misconfigured stanza is a feature, not a bypass. There is no instant
+  `SecretError::FileUnreadable` for unreadable / missing files, and
+  `SecretError::FileEmpty` for a present-but-empty file), and a gateway
+  that refuses to start on a misconfigured stanza is a feature, not a
+  bypass. There is no instant
   revocation; the exposure window is the rollout time. That is the honest
   price of a stateless compare, and it is documented rather than papered
   over.

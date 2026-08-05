@@ -87,13 +87,32 @@ assert_not_contains() {
 
 # Run the script; capture stdout, stderr, and exit status into separate vars so
 # each assertion can compare the right stream.
+#
+# The stderr capture file MUST be created via `mktemp` (CWE-377): a predictable
+# path in /tmp like `/tmp/mint-stderr.$$` is pre-creatable by a local account
+# as a symlink, and the `2>` redirect at line ~93 would silently write into a
+# file owned by the attacker. `mktemp` atomically creates a 0600 temp file
+# with an unguessable name. A `trap 'rm -f "$STDERR_TMP"' EXIT` guarantees the
+# temp file is removed BOTH on the normal exit path AND when the test is
+# interrupted (Ctrl-C, assertion failure, any `set -e` trip). The `mktemp`/
+# `trap` pair fixes the world-writable-path + leaked-on-interrupt failure
+# modes while preserving the existing stderr-capture and exit-status
+# behavior the assertions depend on.
+STDERR_TMP=""
 run_mint() {
   local arg="$1"
+  # Atomic, unique, 0600 temp file. Honours $TMPDIR for hermetic CI.
+  STDERR_TMP="$(mktemp "${TMPDIR:-/tmp}/mint-stderr.XXXXXX")"
+  # Cleanup is also wired through the EXIT trap below — `rm -f` is idempotent
+  # so a normal exit that already removed the file is a no-op, and an
+  # interrupted test (Ctrl-C, `set -e` trip) still cleans up.
+  trap 'rm -f "${STDERR_TMP:-}"' EXIT
   set +e
-  OUT="$( "$SCRIPT" "$arg" 2> /tmp/mint-stderr.$$ )"
+  OUT="$( "$SCRIPT" "$arg" 2> "$STDERR_TMP" )"
   EXIT=$?
-  ERR="$(cat /tmp/mint-stderr.$$)"
-  rm -f /tmp/mint-stderr.$$
+  ERR="$(cat "$STDERR_TMP")"
+  rm -f "$STDERR_TMP"
+  STDERR_TMP=""
   set -e
 }
 

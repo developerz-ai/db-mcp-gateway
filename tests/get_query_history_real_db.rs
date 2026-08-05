@@ -243,6 +243,26 @@ async fn bulk_seed_audit_rows(pool: &sqlx::PgPool, user_sub: &str, count: i64) {
     .expect("bulk seed audit rows");
 }
 
+/// Exact audit-row count for a (user_sub, tool) pair. Companion to
+/// `latest_for_user_tool`, which only proves that AT LEAST ONE row exists
+/// for the dispatch — it does NOT prove the chokepoint wrote exactly one
+/// row per dispatch. A duplicate-audit-write regression (e.g. a fallback
+/// path that INSERTs without `ON CONFLICT (id) DO NOTHING`) would slip past
+/// every `latest_for_user_tool` presence check. Counting first and asserting
+/// `== 1` BEFORE the row-field assertions is the structural fix: a future
+/// regression that writes two rows trips the count assertion immediately
+/// with a debuggable error, instead of silently passing because the latest
+/// row's fields happen to match.
+#[cfg(any(test, debug_assertions))]
+async fn audit_count_for_user_tool(pool: &sqlx::PgPool, user_sub: &str, tool: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM audit_calls WHERE user_sub = $1 AND tool = $2")
+        .bind(user_sub)
+        .bind(tool)
+        .fetch_one(pool)
+        .await
+        .expect("audit count")
+}
+
 async fn call_history(url: &str, bearer: &str, arguments: Value) -> Value {
     client()
         .post(format!("{url}/mcp"))
@@ -316,6 +336,22 @@ async fn history_returns_only_callers_own_rows() {
 
     // Audit invariant: the dispatch chokepoint wrote exactly one
     // `get_query_history` row attributed to the authenticated user.
+    //
+    // Count FIRST and assert `== 1` before the row-field checks. A future
+    // regression that writes a duplicate row (e.g. a fallback insert that
+    // forgets `ON CONFLICT (id) DO NOTHING`) would still pass the
+    // `latest_for_user_tool` presence check below — `latest` only proves
+    // "at least one row exists", not "exactly one was written". The count
+    // check trips the duplicate-write regression immediately with a clear
+    // message; the row-field checks below then verify the *latest* row is
+    // well-formed (a duplicate write is allowed to fail here too — the
+    // count check has already produced a debuggable error).
+    assert_eq!(
+        audit_count_for_user_tool(pool, sub, "get_query_history").await,
+        1,
+        "the dispatch chokepoint must write exactly one audit row per \
+         get_query_history dispatch (duplicate-write regression guard)",
+    );
     let row = latest_for_user_tool(pool, sub, "get_query_history")
         .await
         .expect("audit lookup runs")
@@ -437,6 +473,18 @@ async fn history_clamps_hostile_limit_to_ceiling() {
     // Audit invariant: the dispatch chokepoint wrote exactly one
     // `get_query_history` row attributed to the authenticated user, with
     // `truncated = true` mirroring the response payload.
+    //
+    // Count FIRST (duplicate-write regression guard — see
+    // `audit_count_for_user_tool`); `latest_for_user_tool` would still
+    // pass on a regression that wrote two rows, because `latest` only
+    // proves "at least one row exists", not "exactly one was written".
+    assert_eq!(
+        audit_count_for_user_tool(pool, sub, "get_query_history").await,
+        1,
+        "the dispatch chokepoint must write exactly one audit row per \
+         ceiling-clamped get_query_history dispatch (duplicate-write \
+         regression guard)",
+    );
     let row = latest_for_user_tool(pool, sub, "get_query_history")
         .await
         .expect("audit lookup runs")
@@ -561,6 +609,18 @@ permissions:
     // `audit_dispatch` (the authz check happens INSIDE the tool body, not
     // before it), so the audit row MUST be written with `outcome = 'forbidden'`
     // and the server/database the caller tried to reach.
+    //
+    // Count FIRST (duplicate-write regression guard — see
+    // `audit_count_for_user_tool`); `latest_for_user_tool` would still
+    // pass on a regression that wrote two rows, because `latest` only
+    // proves "at least one row exists", not "exactly one was written".
+    assert_eq!(
+        audit_count_for_user_tool(&pool, &user_sub, "get_query_history").await,
+        1,
+        "the dispatch chokepoint must write exactly one audit row per \
+         forbidden get_query_history dispatch (duplicate-write regression \
+         guard)",
+    );
     let row = latest_for_user_tool(&pool, &user_sub, "get_query_history")
         .await
         .expect("audit lookup runs")
