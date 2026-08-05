@@ -47,8 +47,9 @@ servers:
 #   - query_read: everything in schema_read + run_query, explain, sample_table
 #   - query_write: everything in query_read + write capability (if target DB role grants it)
 #   - history_read: standalone grant (query_read does NOT imply it) for
-#     get_query_history — a tool that is not implemented yet (see issue #169),
-#     so this grant currently unlocks nothing.
+#     get_query_history — reads the caller's own queries from the audit
+#     table. Scoping is on the SSO-verified identity, never a
+#     client-supplied user field. See issue #169.
 #
 # Most restrictive value wins when multiple grants match a request.
 # See website/docs/initial-idea/06-permissions.md for constraint-merge rules.

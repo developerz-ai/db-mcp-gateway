@@ -20,6 +20,7 @@ pub const DESCRIBE_SCHEMA_TOOL: &str = "describe_schema";
 pub const SAMPLE_TABLE_TOOL: &str = "sample_table";
 pub const EXPLAIN_TOOL: &str = "explain";
 pub const RUN_QUERY_TOOL: &str = "run_query";
+pub const GET_QUERY_HISTORY_TOOL: &str = "get_query_history";
 
 /// Response to `initialize` — the MCP handshake greeting.
 #[derive(Debug, Serialize)]
@@ -183,6 +184,30 @@ impl ToolsListResult {
                             "reason":   { "type": "string" }
                         },
                         "required": ["server", "database", "sql"],
+                        "additionalProperties": false
+                    }),
+                },
+                Tool {
+                    name: GET_QUERY_HISTORY_TOOL,
+                    description: "Return the caller's recent queries against a configured \
+                                  (server, database): SQL, timestamp, duration, row count, and \
+                                  outcome. Lets the agent recover context across sessions. \
+                                  Scoping is on the SSO-verified identity, NEVER on a \
+                                  client-supplied user field.",
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "server":   { "type": "string" },
+                            "database": { "type": "string" },
+                            "since":    { "type": "string", "format": "date-time",
+                                           "description": "RFC 3339 timestamp; only entries \
+                                                            occurred at or after this instant are \
+                                                            returned." },
+                            "limit":    { "type": "integer", "minimum": 1,
+                                           "description": "Max entries to return; clamped to \
+                                                            the gateway ceiling." }
+                        },
+                        "required": ["server", "database"],
                         "additionalProperties": false
                     }),
                 },

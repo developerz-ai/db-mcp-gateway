@@ -94,11 +94,11 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 - **How it works:** Append-only log in gateway's state database, optionally archived to S3/GCS/Azure
 - **Compliance benefit:** Complete query history for security reviews and compliance audits
 
-### Query History API — *planned, not yet implemented*
+### Query History API
 
-- **Status:** Designed but not built — tracked in [#169](https://github.com/developerz-ai/db-mcp-gateway/issues/169). The audit log below already records every query; what's missing is the MCP tool that lets a user read their own back.
-- **What it will do:** Users retrieve their own query history via a `get_query_history` MCP tool
-- **How it will work:** Returns only queries initiated by the authenticated user
+- **Status:** Shipped via [#169](https://github.com/developerz-ai/db-mcp-gateway/issues/169). The `get_query_history` MCP tool reads from the same audit log; users see only their own queries.
+- **What it does:** Lets a user retrieve their own recent queries (SQL, timestamp, duration, row count, outcome) for a configured `(server, database)`.
+- **How it works:** Reads `audit_calls` rows scoped by `user_sub = $1 AND server_name = $2 AND database_name = $3` (the SSO-verified identity, never a client-supplied field). Requires the standalone `history_read` grant.
 - **Privacy benefit:** Users see their own history, not teammates' queries
 - **Operations benefit:** Self-service audit access reduces support burden
 

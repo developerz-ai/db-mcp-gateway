@@ -24,7 +24,7 @@ A request is allowed iff *some* grant matches. Denies are not explicit — absen
 | `schema_read` | `list_databases`, `describe_schema` |
 | `query_read` | `run_query` with read-only enforcement, `explain`, `sample_table` (size-capped) |
 | `query_write` | `run_query` with write grants (requires the DB role to also have write privileges) |
-| `history_read` | **Planned:** read your *own* query history once `get_query_history` is implemented ([#169](https://github.com/developerz-ai/db-mcp-gateway/issues/169)). This grant currently has no effect. Admin-only history access remains via the state DB. |
+| `history_read` | Read your *own* query history via the `get_query_history` tool ([#169](https://github.com/developerz-ai/db-mcp-gateway/issues/169)). Scoping is on the SSO-verified identity, never a client-supplied user field. Admin-only history access remains via the state DB. |
 
 `query_read` implies `schema_read`. `query_write` implies `query_read`.
 
