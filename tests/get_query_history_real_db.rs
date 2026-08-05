@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use common::{MockUser, spawn_mock_idp};
 use db_mcp_gateway::audit::{AuditRow, log};
-use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
+use db_mcp_gateway::auth::{AuthConfig, OidcClient, ServiceTokenStore, SessionStore};
 use db_mcp_gateway::config::{Config, ConfigFile};
 use db_mcp_gateway::exec::AdapterRegistry;
 use db_mcp_gateway::state;
@@ -96,6 +96,7 @@ async fn boot_gateway() -> BootedGateway {
                 config: Arc::new(auth_config),
                 sessions,
                 oidc,
+                service_tokens: ServiceTokenStore::default(),
                 flows: PendingFlows::default(),
                 codes: db_mcp_gateway::transport::AuthCodes::default(),
                 refresh: db_mcp_gateway::transport::RefreshTokens::default(),
@@ -392,6 +393,7 @@ permissions:
                 config: Arc::new(auth_config),
                 sessions,
                 oidc,
+                service_tokens: ServiceTokenStore::default(),
                 flows: PendingFlows::default(),
                 codes: db_mcp_gateway::transport::AuthCodes::default(),
                 refresh: db_mcp_gateway::transport::RefreshTokens::default(),
