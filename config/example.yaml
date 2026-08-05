@@ -134,6 +134,13 @@ permissions:
         constraints:
           require_reason: true
 
+  # Service-token group (spec 14). Each entry is the single permissions
+  # group a `service_accounts:` token acts as. Empty `grants:` is valid —
+  # it recognizes a group that authorizes nothing (authentication never
+  # implies authorization).
+  - group: svc-ci-bot
+    grants: []
+
 # Spec 14 — service tokens: static bearer credentials for headless clients
 # (CI jobs, agent runners) that cannot drive the browser SSO flow. Each entry
 # is a name (audit identity `service:<name>`), exactly one permissions group
