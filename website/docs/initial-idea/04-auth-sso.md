@@ -226,6 +226,7 @@ Full design and operator runbook: [14 — Service tokens](14-service-tokens.md).
 ## Group resolution
 
 Group membership comes from one of:
+
 - OIDC `groups` claim (preferred — set IdP to include it)
 - SCIM sync to the state DB (for IdPs that don't expose groups in tokens)
 - Directory API lookup at token-issue time (Google Workspace fallback)

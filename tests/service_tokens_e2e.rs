@@ -175,7 +175,13 @@ async fn boot_gateway() -> BootedGateway {
 
 /// `tools/call` with an optional bearer. Returns the raw HTTP response so
 /// both the 401 contract and the JSON-RPC body are assertable.
-async fn call_tool(gw: &BootedGateway, bearer: Option<&str>, id: u32, tool: &str, args: Value) -> reqwest::Response {
+async fn call_tool(
+    gw: &BootedGateway,
+    bearer: Option<&str>,
+    id: u32,
+    tool: &str,
+    args: Value,
+) -> reqwest::Response {
     let mut request = gw.client.post(format!("{}/mcp", gw.url)).json(&json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -320,8 +326,19 @@ async fn human_session_jwt_still_works_with_service_accounts_configured() {
         .unwrap();
     let login_url = login["login_url"].as_str().unwrap().to_string();
     let authorize = gw.client.get(&login_url).send().await.unwrap();
-    let callback = authorize.headers()["location"].to_str().unwrap().to_string();
-    let cb: Value = gw.client.get(&callback).send().await.unwrap().json().await.unwrap();
+    let callback = authorize.headers()["location"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let cb: Value = gw
+        .client
+        .get(&callback)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let session_token = cb["session_token"].as_str().unwrap().to_string();
 
     let resp = call_tool(&gw, Some(&session_token), 6, "list_servers", json!({})).await;

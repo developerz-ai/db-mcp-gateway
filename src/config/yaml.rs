@@ -489,7 +489,10 @@ fn validate_service_name(name: &str) -> Result<(), ConfigFileError> {
         && name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
     if valid {
         return Ok(());
     }
@@ -1394,8 +1397,7 @@ service_accounts:
     fn rejects_bad_service_account_names() {
         for bad in ["Ci-bot", "-ci-bot", "ci bot", "ci_bot", &"x".repeat(64)] {
             let yaml = SERVICE_YAML.replace("name: ci-bot", &format!("name: \"{bad}\""));
-            let err = ConfigFile::from_yaml_str(&yaml)
-                .expect_err("name `{bad}` must reject");
+            let err = ConfigFile::from_yaml_str(&yaml).expect_err("name `{bad}` must reject");
             let ConfigFileError::Invalid(msg) = err else {
                 panic!("expected Invalid for `{bad}`, got {err:?}");
             };
@@ -1432,9 +1434,7 @@ service_accounts:
     /// admin reuse is not widened).
     #[test]
     fn rejects_service_account_mapped_to_the_admin_group() {
-        let yaml = format!(
-            "{SERVICE_YAML}\nadmin:\n  enabled: true\n  group: svc-ci\n"
-        );
+        let yaml = format!("{SERVICE_YAML}\nadmin:\n  enabled: true\n  group: svc-ci\n");
         let err = ConfigFile::from_yaml_str(&yaml).expect_err("admin-group mapping must reject");
         let ConfigFileError::Invalid(msg) = err else {
             panic!("expected Invalid, got {err:?}");
@@ -1447,9 +1447,7 @@ service_accounts:
     /// `admin.group` non-empty rule which also applies only when enabled.
     #[test]
     fn accepts_admin_group_name_when_admin_disabled() {
-        let yaml = format!(
-            "{SERVICE_YAML}\nadmin:\n  enabled: false\n  group: svc-ci\n"
-        );
+        let yaml = format!("{SERVICE_YAML}\nadmin:\n  enabled: false\n  group: svc-ci\n");
         ConfigFile::from_yaml_str(&yaml).expect("disabled admin makes the group check moot");
     }
 

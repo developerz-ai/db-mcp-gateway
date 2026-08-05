@@ -77,9 +77,13 @@ pub enum ServiceTokenError {
 /// The boot-resolved set of service tokens. Linear scan on authenticate: the
 /// configured count is expected to stay in the single digits, and a scan keeps
 /// every comparison constant-time without a hash map keyed by secret material.
+///
+/// `Arc`-shared: `AppState` clones per request, and a `Vec<SecretString>`
+/// clone would copy live token material across the heap on every call. The
+/// values are immutable after boot, so one allocation serves every request.
 #[derive(Debug, Default, Clone)]
 pub struct ServiceTokenStore {
-    tokens: Vec<ResolvedServiceToken>,
+    tokens: std::sync::Arc<[ResolvedServiceToken]>,
 }
 
 impl ServiceTokenStore {
@@ -100,7 +104,10 @@ impl ServiceTokenStore {
             // Reject shared values now so `authenticate` never has to pick
             // between two identities for one presented token.
             for existing in &tokens {
-                if ct_eq(existing.token.expose_secret().as_bytes(), exposed.as_bytes()) {
+                if ct_eq(
+                    existing.token.expose_secret().as_bytes(),
+                    exposed.as_bytes(),
+                ) {
                     return Err(ServiceTokenError::DuplicateToken(
                         existing.name.clone(),
                         account.name.clone(),
@@ -113,7 +120,9 @@ impl ServiceTokenStore {
                 token,
             });
         }
-        Ok(Self { tokens })
+        Ok(Self {
+            tokens: tokens.into(),
+        })
     }
 
     /// Match a presented bearer against the store. `Some(identity)` on an
@@ -188,8 +197,9 @@ mod tests {
 
     #[test]
     fn unknown_or_near_miss_tokens_do_not_match() {
-        let store = ServiceTokenStore::from_config(&[account("ci-bot", "svc-ci", &good_token("a"))])
-            .expect("valid account builds a store");
+        let store =
+            ServiceTokenStore::from_config(&[account("ci-bot", "svc-ci", &good_token("a"))])
+                .expect("valid account builds a store");
 
         // `None` here means "fall through to the JWT path", not acceptance.
         assert!(store.authenticate(&good_token("b")).is_none());
@@ -200,7 +210,11 @@ mod tests {
         // Truncated / extended / empty.
         let short = &good_token("a")[..MIN_TOKEN_CHARS - 1];
         assert!(store.authenticate(short).is_none());
-        assert!(store.authenticate(&format!("{}x", good_token("a"))).is_none());
+        assert!(
+            store
+                .authenticate(&format!("{}x", good_token("a")))
+                .is_none()
+        );
         assert!(store.authenticate("").is_none());
     }
 
@@ -272,8 +286,9 @@ mod tests {
     /// never render token material.
     #[test]
     fn debug_never_prints_token_material() {
-        let store = ServiceTokenStore::from_config(&[account("ci-bot", "svc-ci", &good_token("c"))])
-            .expect("valid account builds a store");
+        let store =
+            ServiceTokenStore::from_config(&[account("ci-bot", "svc-ci", &good_token("c"))])
+                .expect("valid account builds a store");
         let rendered = format!("{store:?}");
         assert!(rendered.contains("ci-bot"), "{rendered}");
         assert!(rendered.contains("redacted"), "{rendered}");
@@ -286,8 +301,9 @@ mod tests {
     /// when synthesized).
     #[test]
     fn service_identity_debug_redacts_email() {
-        let store = ServiceTokenStore::from_config(&[account("ci-bot", "svc-ci", &good_token("d"))])
-            .expect("valid account builds a store");
+        let store =
+            ServiceTokenStore::from_config(&[account("ci-bot", "svc-ci", &good_token("d"))])
+                .expect("valid account builds a store");
         let identity = store.authenticate(&good_token("d")).expect("match");
         let rendered = format!("{identity:?}");
         assert!(rendered.contains("service:ci-bot"), "{rendered}");
