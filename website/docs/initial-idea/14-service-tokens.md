@@ -94,15 +94,22 @@ about tokens is callable over HTTP — the lifecycle is GitOps:
   (name + group + secret **reference** — never the value). The gateway
   refuses to boot on a stanza whose ref does not resolve.
 - **Rotate** — overlap is mandatory, because each pod only loads one token at
-  boot. Sequence: (1) mint a new value with the same `<name>` (or a
-  temporary `<name>-next` if the audit identity must change too); (2) add a
-  *second* `service_accounts:` entry to the gateway YAML so new pods accept
-  the new value; (3) roll the deployment and wait until the rollout
-  completes; (4) update every client to use the new value; (5) remove the
-  old `service_accounts:` entry and roll again. If the temporary entry uses
-  a different `<name>`, audit rows for the rotation window attribute to
-  `<name>-next` instead of `<name>` — pick deliberately and document the
-  trade-off in the PR.
+  boot, AND the YAML validator (`src/config/yaml.rs`) rejects duplicate
+  service-account names — the new value cannot reuse the original `<name>`.
+  Sequence: (1) mint a new value under a DISTINCT temporary name
+  (`<name>-next` is the recommended convention); (2) add a *second*
+  `service_accounts:` entry (with its own matching `permissions:` block)
+  to the gateway YAML so new pods accept the new value; (3) roll the
+  deployment and wait until the rollout completes; (4) update every
+  client to use the new value; (5) remove the old `service_accounts:`
+  entry and roll again. **Audit-identity trade-off**: because the
+  temporary entry uses a different name, audit rows for the rotation
+  window attribute to `service:<name>-next` instead of `service:<name>` —
+  pick deliberately and document the trade-off in the PR. If preserving
+  the exact `service:<name>` audit identity across rotation is required,
+  configuration support for multiple tokens under one name must be added
+  first; until then same-name rotation is not supported and must not be
+  documented.
 - **Revoke** — remove the complete `service_accounts:` stanza (the name,
   the group, and the token reference together) and roll. Emptying or
   unsetting the secret is **not** a valid revocation: unresolved or empty
