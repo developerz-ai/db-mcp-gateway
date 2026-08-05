@@ -104,11 +104,17 @@ Claude: [calls run_query staging/app]
 
 That's it. You ran a real query against a real DB without ever touching a credential.
 
-## 6. (Optional, operator-run) Read your own audit row
+## 6. (Optional) Read your own audit row
 
 Every `run_query` call writes a row to the gateway's audit log **before** the result comes back — user, SQL, reason, row count, duration, outcome.
 
-There is no MCP tool to read that history back yet: `get_query_history` is designed but not implemented ([#169](https://github.com/developerz-ai/db-mcp-gateway/issues/169)), so asking your agent for it will fail. Until it lands, the row lives in the state DB and can only be pulled with `psql` — so this step needs both the `psql` CLI locally *and* operator-granted read access to the audit table. If either is missing, skip it; most engineers stop at step 5. See [../initial-idea/07-logging-retention.md](../initial-idea/07-logging-retention.md) for the schema and access model.
+With the `get_query_history` tool shipped in [#169](https://github.com/developerz-ai/db-mcp-gateway/issues/169), ask your agent to call it for the `(server, database)` you ran against:
+
+```
+get_query_history(server="...", database="...", limit=20)
+```
+
+It returns only *your* queries (scoped by the SSO-verified identity — no client-supplied user field). If you can't call it, the operator hasn't granted `history_read` to your group yet; ask the platform team to add one. See [../initial-idea/07-logging-retention.md](../initial-idea/07-logging-retention.md) for the schema and access model.
 
 ## Gotchas
 

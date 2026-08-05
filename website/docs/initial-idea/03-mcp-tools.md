@@ -62,11 +62,19 @@ Args: `server`, `database`, `sql`, optional `reason`. Returns `EXPLAIN` (or vend
 
 **`EXPLAIN ANALYZE` is rejected** — same reason as in `run_query`. Use plain `EXPLAIN` instead.
 
-### `get_query_history` — **not yet implemented** ([#169](https://github.com/developerz-ai/db-mcp-gateway/issues/169))
+### `get_query_history`
 
-Design intent, kept here because it is the canonical spec; no dispatch arm exists yet, so calling it fails. `GrantAction::HistoryRead` *is* wired end-to-end, which means a `history_read` grant can be created today and does nothing.
+Args: `server`, `database`, optional `since` (RFC 3339), optional `limit`. Returns *the caller's own* recent queries (request id, SQL, reason, timestamp, duration, row count, outcome) for that `(server, database)`, ordered newest-first. Lets the agent recover context across sessions without exposing other users' queries.
 
-Args: `server`, `database`, optional `since`, optional `limit`. Returns *the caller's own* recent queries (SQL + timestamp + duration + row count). Lets the agent recover context across sessions without exposing other users' queries.
+**Scoping is the security-critical contract.** The filter is on the SSO-verified identity (`identity.user_sub`) from the session middleware — NEVER on a client-supplied `user` field. The arguments struct uses `#[serde(deny_unknown_fields)]`; any attempt to pass `user` (or any other unknown key) is rejected with JSON-RPC `invalid_params` before the request reaches the audit table. The `WHERE` clause is `user_sub = $1 AND server_name = $2 AND database_name = $3` (the composite index `audit_calls_user_occurred_idx` from migration 0003 covers it).
+
+`limit` defaults to 100 and is clamped to `GATEWAY_ROW_LIMIT_CEILING` (100,000); a hostile `u32::MAX` request is clamped, not honoured. When the response is truncated, the `truncated` flag is `true`.
+
+`since` is parsed at the edge as RFC 3339; a malformed value is rejected with `invalid_params` rather than silently dropping the filter.
+
+Requires the `history_read` grant, which is standalone (per [#170](https://github.com/developerz-ai/db-mcp-gateway/issues/170) — `query_read` does not imply it). A caller without an explicit `history_read` grant for `(server, database)` gets `forbidden`. The call itself is audited like any other tool dispatch (`tool = "get_query_history"`, `sql = NULL`).
+
+**Implemented with [#169](https://github.com/developerz-ai/db-mcp-gateway/issues/169).**
 
 ## Errors
 
