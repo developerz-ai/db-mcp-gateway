@@ -18,10 +18,13 @@
 #   4. Roll the deployment.
 #
 # Rotation requires an explicit overlap phase because each pod only loads
-# one token at boot: mint new -> add a SECOND service_accounts entry -> roll
-# -> update clients -> remove the OLD entry -> roll again. If the temp entry
-# uses a different <name>, audit rows during the rotation window attribute
-# to that name instead of the original — document the choice in the PR.
+# one token at boot AND src/config/yaml.rs rejects duplicate service-account
+# names — the new value CANNOT reuse the original <name>. Mint fresh against a
+# DISTINCT temporary name (e.g. `<name>-next`): mint new -> add a SECOND
+# service_accounts entry (with a distinct name + matching `permissions:` block)
+# -> roll -> update clients -> remove the OLD entry -> roll again. Audit rows
+# during the rotation window attribute to the temporary name (`service:<name>-next`)
+# instead of the original — document the choice in the PR.
 set -euo pipefail
 
 name="${1:-}"
@@ -59,6 +62,8 @@ permissions:
 3. Roll the deployment. Revocation = remove the complete stanza (name +
    group + token ref) and roll again; emptying or unsetting the env is NOT
    revocation (unresolved refs abort boot). Rotation needs an explicit
-   overlap: mint new, add a SECOND stanza, roll, update clients, remove the
-   OLD stanza, roll again.
+   overlap: mint fresh against a DISTINCT temporary name (e.g. <name>-next
+   — the same <name> is rejected by src/config/yaml.rs as a duplicate),
+   add a SECOND stanza under that distinct name, roll, update clients,
+   remove the OLD stanza, roll again.
 EOF
