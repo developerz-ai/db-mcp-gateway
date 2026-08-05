@@ -13,6 +13,7 @@ pub mod secret;
 pub mod yaml;
 
 pub use schema::{Action, Constraints, Database, Grant, Permission, Server, ServerKind, Tls};
+pub use schema::ServiceAccount;
 pub use secret::{Password, SecretError};
 pub use yaml::{
     AdminBlock, ConfigFile, ConfigFileError, ConfigLoadError, PermissionsStoreBlock,

@@ -128,6 +128,7 @@ async fn boot_gateway_with(yaml: &str, groups: Vec<String>) -> BootedGateway {
                 flows: PendingFlows::default(),
                 codes: db_mcp_gateway::transport::AuthCodes::default(),
                 refresh: db_mcp_gateway::transport::RefreshTokens::default(),
+                service_tokens: Default::default(),
             }),
             config: Arc::new(config_file),
             state_db: Some(pool.clone()),

@@ -1,9 +1,15 @@
 //! Bearer-auth middleware for the MCP POST endpoint.
 //!
-//! Extracts `Authorization: Bearer <jwt>`, verifies the gateway-issued
-//! session JWT, then resolves the session in the store (which honors
-//! revocation and expiry). On success, an `Identity` is attached to request
-//! extensions for downstream handlers and the audit layer to read.
+//! Two credential kinds are accepted, tried in order:
+//!
+//! 1. **Service token** — a static bearer from `service_accounts:` (spec 14),
+//!    matched constant-time against the boot-resolved store. Carries its own
+//!    permissions group + audit identity; no session row exists.
+//! 2. **Session JWT** — the gateway-issued JWT from the OIDC login flow,
+//!    verified then resolved in the store (which honors revocation and expiry).
+//!
+//! On success, an `Identity` is attached to request extensions for downstream
+//! handlers and the audit layer to read.
 
 use axum::Json;
 use axum::extract::{Request, State};
@@ -33,9 +39,15 @@ pub async fn bearer_auth(State(state): State<AppState>, mut req: Request, next: 
         Err(err) => return unauthorized(&state, &req, err),
     };
 
-    let identity = match resolve_identity(auth, &token).await {
-        Ok(id) => id,
-        Err(err) => return unauthorized(&state, &req, err),
+    // Service tokens first: an exact static match needs no DB round-trip, and
+    // a non-match costs nothing (constant-time compare against a handful of
+    // configured values) before the JWT path runs unchanged.
+    let identity = match auth.service_tokens.authenticate(&token) {
+        Some(identity) => identity,
+        None => match resolve_identity(auth, &token).await {
+            Ok(id) => id,
+            Err(err) => return unauthorized(&state, &req, err),
+        },
     };
 
     tracing::debug!(user_sub = %identity.user_sub, session = ?identity.session_id, "request authenticated");
