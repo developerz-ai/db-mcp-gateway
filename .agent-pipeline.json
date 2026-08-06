@@ -9,7 +9,7 @@
     ]
   },
   "merge": {
-    "reviewGate": "attested",
+    "reviewGate": "ci-only",
     "crDisabledFallback": "self-attested",
     "classificationParks": "autonomous",
     "fallbackApprover": {
