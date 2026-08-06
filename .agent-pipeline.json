@@ -10,14 +10,7 @@
   },
   "merge": {
     "reviewGate": "ci-only",
-    "crDisabledFallback": "self-attested",
-    "classificationParks": "autonomous",
-    "fallbackApprover": {
-      "appId": 4320965,
-      "installationId": 147124714,
-      "privateKeyEnv": "MERGE_ATTESTOR_PRIVATE_KEY",
-      "waitMs": 1200000
-    }
+    "classificationParks": "autonomous"
   },
   "labels": { "ready": "ready", "afk": "afk", "hitl": "hitl" },
   "memory": { "teamHandoffDir": ".agent-setup/openclaw-profile/memory/handoff" },
