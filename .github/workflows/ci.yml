@@ -222,26 +222,39 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - name: reject literal service tokens in committed YAML
-        # git grep searches only tracked files — exactly the committed-config
-        # surface. It exits 1 on no-match (pass) and 2 on tooling error, so
-        # capture matches into a var with a `|| true` guard and test the var,
-        # never the exit code, to tell "no match" from "grep broken".
+      - name: reject literal service tokens in committed config
+        # git grep scans every TRACKED file (not just YAML) — the credential
+        # surface is broader than .yaml/.yml (.env.example, JSON, shell
+        # scripts, Dockerfile all commit). Exit codes: 0 = match (FAIL),
+        # 1 = no match (the ONLY pass), anything else incl. 128 fatal (FAIL —
+        # a broken grep must NEVER read as clean; fail-closed rule, #190;
+        # verified empirically — git grep returns 128, not 2, on a fatal
+        # regex error, so the lens-suggested `rc -eq 2` check was still
+        # fail-open). Pathspec exclusions are the
+        # only places a literal token legitimately lives: test fixtures,
+        # spec/docs examples, the example config, this workflow, the loader
+        # unit-test fixtures.
         run: |
-          set -euo pipefail
-          # Pathspec exclusions cover every place a literal token legitimately
-          # lives: test fixtures, docs/spec examples, the commented example
-          # config, this workflow, and the loader source itself.
+          set +e
           matches="$(git grep -nE "dbmcp_svc_[0-9a-f]{64}" \
-              -- "*.yaml" "*.yml" \
-              ":!tests/**" ":!website/**" ":!config/example.yaml" \
-              ":!.github/**" ":!src/config/yaml.rs" || true)"
-          if [ -n "$matches" ]; then
-            echo "::error::literal dbmcp_svc_ service token(s) in committed YAML — reference the secret via ENV: or FILE: (spec 14)"
+              -- ":!tests/**" ":!website/**" ":!config/example.yaml" \
+              ":!.github/**" ":!src/config/yaml.rs")"
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ] && [ -n "$matches" ]; then
+            echo "::error::literal dbmcp_svc_ service token(s) in committed config — reference the secret via ENV: or FILE: (spec 14). ADVISORY guard: it fails this job; block merges by making secret-scan a required branch-protection check (#190 follow-up)."
             printf '%s\n' "$matches"
             exit 1
           fi
-          echo "no literal service tokens in committed YAML"
+          if [ "$rc" -ne 1 ]; then
+            echo "::error::git grep tooling failure (rc=$rc) — secret-scan cannot read as clean (fail-closed, #190)"
+            exit 1
+          fi
+          echo "no literal service tokens in committed config (git grep rc=1)"
+      - name: secret-scan regex regression
+        # Pins the guard regex intent (#190) so a future loosening is caught.
+        # Wired into CI so it actually runs (was dead code otherwise).
+        run: bash tests/bin/secret-scan-regex.test.sh
 
   # Publish a multi-arch image on push to main, tagged with the short commit
   # SHA (what Argo Image Updater pins to, #17) + a moving `main` tag. Gated by

@@ -98,10 +98,13 @@ about tokens is callable over HTTP — the lifecycle is GitOps:
   [config-reference.md § ServiceAccount](../deployment/config-reference.md#serviceaccount).
   The YAML loader accepts inline literal tokens (`Password::Literal`) for
   dev/test parity with `Database.password` and does **not** reject them at
-  boot — so credential-free committed config is enforced at the CI layer,
-  not at boot: the `secret-scan` job in `.github/workflows/ci.yml` rejects
-  any literal `dbmcp_svc_<64hex>` token in committed YAML (test fixtures
-  under `tests/**` are excluded). Inline literals therefore remain valid
+  boot — so credential-free committed config is guarded at the CI layer,
+  not at boot: the `secret-scan` job in `.github/workflows/ci.yml` scans
+  every tracked file (not just YAML) and FAILS on any literal
+  `dbmcp_svc_<64hex>` token (test fixtures under `tests/**` are excluded).
+  It is ADVISORY — it fails the job on every PR, but does not by itself
+  block a merge until made a required branch-protection check (#190
+  follow-up). Inline literals therefore remain valid
   only in programmatic test fixtures constructed via
   `ConfigFile::from_yaml_str` / `ServiceTokenStore::from_config` directly.
 - **Rotate** — overlap is mandatory, because each pod only loads one token at

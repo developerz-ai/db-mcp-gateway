@@ -14,10 +14,11 @@
 # network, no DB, no cargo. Requires bash >= 4 (uses [[ ... =~ ... ]]).
 set -euo pipefail
 
-# The exact pattern the CI guard greps with. Anchored here so a token-shaped
-# *substring* of a longer run does not pass: a real token is exactly
-# `dbmcp_svc_` + 64 lowercase hex and nothing more on either side.
-PATTERN='^dbmcp_svc_[0-9a-f]{64}$'
+# The exact UNANCHORED ERE the CI guard greps with (ci.yml :: secret-scan).
+# Mirroring the guard verbatim means a 64-hex substring of a longer run also
+# matches here, exactly as the guard would flag it — boot rejects malformed
+# bodies via ServiceTokenError::WeakToken anyway, so over-matching is safe.
+PATTERN='dbmcp_svc_[0-9a-f]{64}'
 
 PASS=0
 FAIL=0
@@ -77,7 +78,10 @@ assert_match "mixed hex, 64 total" "$GOOD_TOKEN3"
 echo
 echo "-- malformed tokens do NOT match (guard stays silent) --"
 assert_no_match "63 hex (too short)" "dbmcp_svc_$(hex_run 63 0)"
-assert_no_match "65 hex (too long)" "dbmcp_svc_$(hex_run 65 0)"
+# 65 hex contains a 64-hex substring, so the unanchored guard MATCHES it
+# (over-match is safe — boot rejects the malformed body anyway). Mirrors the
+# guard exactly; the earlier anchored variant misrepresented this.
+assert_match "65 hex (substring match)" "dbmcp_svc_$(hex_run 65 0)"
 assert_no_match "uppercase hex rejected" "dbmcp_svc_$(hex_run 64 A)"
 assert_no_match "non-hex body rejected" "dbmcp_svc_$(hex_run 64 z)"
 assert_no_match "wrong prefix rejected" "dbmsvc___$(hex_run 64 0)"
