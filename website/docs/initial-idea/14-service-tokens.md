@@ -92,15 +92,21 @@ about tokens is callable over HTTP — the lifecycle is GitOps:
 - **Mint** — a human operator runs `bin/mint-service-token <name>`, stores
   the value in the org secret store, and PRs the `service_accounts:` stanza
   (name + group + secret **reference** — never the value). The gateway
-  refuses to boot on a stanza whose ref does not resolve. **Inline literal
-  tokens are NOT permitted in YAML** — the `service_accounts[].token` field
-  must be a `${ENV:…}` or `${FILE:…}` reference, identical to the
-  `password:` policy documented in
+  refuses to boot on a stanza whose ref does not resolve. In production,
+  `service_accounts[].token` carries a `${ENV:…}` or `${FILE:…}` reference,
+  identical to the `password:` policy documented in
   [config-reference.md § ServiceAccount](../deployment/config-reference.md#serviceaccount).
-  Inline literal tokens remain valid only in programmatic test fixtures
-  constructed via `ConfigFile::from_yaml_str` /
-  `ServiceTokenStore::from_config` directly; the YAML loader rejects them
-  in production config.
+  The YAML loader accepts inline literal tokens (`Password::Literal`) for
+  dev/test parity with `Database.password` and does **not** reject them at
+  boot — so credential-free committed config is guarded at the CI layer,
+  not at boot: the `secret-scan` job in `.github/workflows/ci.yml` scans
+  every tracked file (not just YAML) and FAILS on any literal
+  `dbmcp_svc_<64hex>` token (test fixtures under `tests/**` are excluded).
+  It is ADVISORY — it fails the job on every PR, but does not by itself
+  block a merge until made a required branch-protection check (#190
+  follow-up). Inline literals therefore remain valid
+  only in programmatic test fixtures constructed via
+  `ConfigFile::from_yaml_str` / `ServiceTokenStore::from_config` directly.
 - **Rotate** — overlap is mandatory, because each pod only loads one token at
   boot, AND the YAML validator (`src/config/yaml.rs`) rejects duplicate
   service-account names — the new value cannot reuse the original `<name>`.

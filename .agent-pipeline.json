@@ -21,7 +21,6 @@
   },
   "labels": { "ready": "ready", "afk": "afk", "hitl": "hitl" },
   "memory": { "teamHandoffDir": ".agent-setup/openclaw-profile/memory/handoff" },
-  "policy": { "module": "scripts/execute-prd/lib/policy-module.ts" },
   "repoSync": {
     "reportsDir": ".infra-sync/reports",
     "ciProvider": "github-actions",
