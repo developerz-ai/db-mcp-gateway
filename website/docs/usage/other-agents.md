@@ -65,4 +65,26 @@ Any client implementing the spec accepts:
 - **Result size is server-capped.** If a result is truncated, the response carries `truncated: true` — the agent should surface that, not hide it.
 - **Reason capture happens via tool errors.** If a tool returns `reason_required`, the client should ask the user, then retry with `reason: "..."` in the args.
 
-If your client doesn't support OAuth flows yet, talk to your platform team — they can issue a long-lived service token for that client only. Service tokens are auditable to a named system identity (e.g. `ci-bot`), not to a human, and are gated by their own group in the permissions config.
+## Headless clients (no browser): service tokens
+
+If your client runs unattended — a CI job, an agent runner, another service — it cannot drive the browser SSO flow. It authenticates with a **service token** instead: a static bearer your platform team issues out-of-band.
+
+```json
+{
+  "mcpServers": {
+    "db-gateway": {
+      "url": "https://db.internal.acme.com",
+      "type": "http",
+      "headers": {
+        "Authorization": "Bearer dbmcp_svc_..."
+      }
+    }
+  }
+}
+```
+
+- Service tokens are auditable to a named system identity (`service:<name>` in the audit log), not to a human, and are gated by their own group in the permissions config — a token reaches exactly what its group's grants allow, nothing else.
+- They never expire and cannot be revoked in-band; rotation and revocation are operator actions (config edit + rollout). Treat the value like any other long-lived credential: store it in your secret manager, never in a repo.
+- Service tokens are for tool calls only — they cannot reach the `/admin/*` surface and cannot mint login sessions.
+
+Operators: the mint/rotate/revoke runbook is [spec 14](../initial-idea/14-service-tokens.md) (`bin/mint-service-token`).

@@ -134,6 +134,26 @@ permissions:
         constraints:
           require_reason: true
 
+  # Service-token group (spec 14). Each entry is the single permissions
+  # group a `service_accounts:` token acts as. Empty `grants:` is valid —
+  # it recognizes a group that authorizes nothing (authentication never
+  # implies authorization).
+  - group: svc-ci-bot
+    grants: []
+
+# Spec 14 — service tokens: static bearer credentials for headless clients
+# (CI jobs, agent runners) that cannot drive the browser SSO flow. Each entry
+# is a name (audit identity `service:<name>`), exactly one permissions group
+# (declared above; convention: `svc-<name>`), and a secret REFERENCE — never
+# the token value. Mint with `bin/mint-service-token <name>`; the value must
+# start with `dbmcp_svc_`. Boot aborts if the group is missing from
+# `permissions:` or equals the admin group. There is no in-band lifecycle:
+# rotate/revoke = update the secret + edit this list + roll the deployment.
+# service_accounts:
+#   - name: ci-bot
+#     group: svc-ci-bot
+#     token: ${ENV:SERVICE_TOKEN_CI_BOT}
+
 logging:
   hot_retention_days: 90
   archive:

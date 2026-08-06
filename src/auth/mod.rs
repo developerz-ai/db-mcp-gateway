@@ -10,11 +10,13 @@ pub mod errors;
 pub mod jwt;
 pub mod oidc;
 pub mod pkce;
+mod service_token;
 pub mod session;
 pub mod session_cache;
 
 pub use config::AuthConfig;
 pub use errors::AuthError;
 pub use oidc::{OidcClient, VerifiedIdentity};
+pub use service_token::{ServiceTokenError, ServiceTokenStore};
 pub use session::{Identity, Session, SessionId, SessionStore};
 pub use session_cache::SessionCacheConfig;

@@ -121,6 +121,7 @@ async fn boot_gateway(group: &str) -> BootedGateway {
                 flows: PendingFlows::default(),
                 codes: db_mcp_gateway::transport::AuthCodes::default(),
                 refresh: db_mcp_gateway::transport::RefreshTokens::default(),
+                service_tokens: Default::default(),
             }),
             config: Arc::new(config_file),
             state_db: Some(pool.clone()),

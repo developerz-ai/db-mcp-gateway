@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::schema::{Permission, Server, ServerKind};
+use super::schema::{Permission, Server, ServerKind, ServiceAccount};
 use super::secret::SecretError;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -29,6 +29,10 @@ pub struct ConfigFile {
     /// rows) stays Postgres regardless.
     #[serde(default)]
     pub permissions_store: Option<PermissionsStoreBlock>,
+    /// Headless service identities (spec 14). Absent → no static bearer
+    /// token is accepted; the OIDC session path is the only way in.
+    #[serde(default)]
+    pub service_accounts: Vec<ServiceAccount>,
 }
 
 /// Admin API gating. Mirrors spec 12 §"Admin API" YAML schema.
@@ -295,6 +299,12 @@ impl ConfigFile {
                 let _ = db.password.resolve()?;
             }
         }
+        for account in &self.service_accounts {
+            // Same fail-fast contract as DB passwords: an unresolvable
+            // service-token ref aborts boot here. The request path reads the
+            // value back out of `ServiceTokenStore`, built at startup.
+            let _ = account.token.resolve()?;
+        }
         Ok(())
     }
 
@@ -421,8 +431,75 @@ impl ConfigFile {
                 }
             }
         }
+
+        let mut service_names: HashSet<&str> = HashSet::new();
+        for account in &self.service_accounts {
+            validate_service_name(&account.name)?;
+            if !service_names.insert(account.name.as_str()) {
+                return Err(ConfigFileError::Invalid(format!(
+                    "duplicate service account name `{}`",
+                    account.name
+                )));
+            }
+            if account.group.trim().is_empty() {
+                return Err(ConfigFileError::Invalid(format!(
+                    "service account `{}` must name a permissions group",
+                    account.name
+                )));
+            }
+            // A token whose group has no `permissions:` block is almost always
+            // a typo'd group name; it would authenticate cleanly and then
+            // silently reach nothing. Same fail-fast rule as grants on unknown
+            // servers above.
+            if !group_names.contains(account.group.as_str()) {
+                return Err(ConfigFileError::Invalid(format!(
+                    "service account `{}` maps to group `{}`, which has no `permissions:` \
+                     block — declare the group there first (an empty `grants:` list \
+                     recognizes the group while granting nothing)",
+                    account.name, account.group
+                )));
+            }
+            // The admin middleware gates on group membership alone, so this
+            // boot gate is what keeps a service token off `/admin/*` without
+            // widening that middleware. Rejected at boot, not trusted to review.
+            if let Some(admin) = &self.admin
+                && admin.enabled
+                && account.group == admin.group
+            {
+                return Err(ConfigFileError::Invalid(format!(
+                    "service account `{}` maps to group `{}`, which is the admin group — \
+                     a service token must never authorize `/admin/*`; give the service \
+                     its own group",
+                    account.name, account.group
+                )));
+            }
+        }
         Ok(())
     }
+}
+
+/// Service-account names land in audit fields (`service:<name>` sub,
+/// `<name>@service-accounts.invalid` email), so keep them DNS-label-shaped:
+/// lowercase alphanumerics and dashes, starting with an alphanumeric, 63 max.
+/// Anything fancier buys nothing and makes audit queries/noising regexes
+/// messier.
+fn validate_service_name(name: &str) -> Result<(), ConfigFileError> {
+    let valid = !name.is_empty()
+        && name.len() <= 63
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+    if valid {
+        return Ok(());
+    }
+    Err(ConfigFileError::Invalid(format!(
+        "service account name `{name}` must match ^[a-z0-9][a-z0-9-]{{0,62}}$ \
+         (lowercase; it becomes the audit identity `service:{name}`)"
+    )))
 }
 
 fn grant_database_exists(servers: &[Server], server_name: &str, db_name: &str) -> bool {
@@ -1264,6 +1341,128 @@ servers:
             error_chain(&err).contains("postgres"),
             "operator lost the variant list: {}",
             error_chain(&err)
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // service_accounts (spec 14)
+    // ------------------------------------------------------------------
+
+    const SERVICE_YAML: &str = r#"
+servers:
+  - name: prod
+    kind: postgres
+    host: a
+    databases:
+      - { name: app, role: ro, password: x }
+permissions:
+  - group: svc-ci
+    grants:
+      - { server: prod, database: app, action: query_read }
+service_accounts:
+  - name: ci-bot
+    group: svc-ci
+    token: dbmcp_svc_0123456789abcdef0123456789abcdef
+"#;
+
+    #[test]
+    fn parses_service_accounts() {
+        let config = ConfigFile::from_yaml_str(SERVICE_YAML).expect("service accounts parse");
+        assert_eq!(config.service_accounts.len(), 1);
+        let account = &config.service_accounts[0];
+        assert_eq!(account.name, "ci-bot");
+        assert_eq!(account.group, "svc-ci");
+        // The token is a `Password` (Deserialize-only secret ref) — match the
+        // variant rather than ever printing it.
+        assert!(matches!(account.token, crate::config::Password::Literal(_)));
+    }
+
+    #[test]
+    fn rejects_duplicate_service_account_names() {
+        let yaml = SERVICE_YAML.replace(
+            "token: dbmcp_svc_0123456789abcdef0123456789abcdef",
+            "token: dbmcp_svc_0123456789abcdef0123456789abcdef\n  - name: ci-bot\n    group: svc-ci\n    token: dbmcp_svc_fedcba9876543210fedcba9876543210",
+        );
+        let err = ConfigFile::from_yaml_str(&yaml).expect_err("duplicate name must reject");
+        let ConfigFileError::Invalid(msg) = err else {
+            panic!("expected Invalid, got {err:?}");
+        };
+        assert!(msg.contains("duplicate service account"), "{msg}");
+        assert!(msg.contains("ci-bot"), "{msg}");
+    }
+
+    /// The name becomes the audit identity (`service:<name>`), so charset and
+    /// length are bounded at boot, not trusted to review.
+    #[test]
+    fn rejects_bad_service_account_names() {
+        for bad in ["Ci-bot", "-ci-bot", "ci bot", "ci_bot", &"x".repeat(64)] {
+            let yaml = SERVICE_YAML.replace("name: ci-bot", &format!("name: \"{bad}\""));
+            let err = ConfigFile::from_yaml_str(&yaml).expect_err("name `{bad}` must reject");
+            let ConfigFileError::Invalid(msg) = err else {
+                panic!("expected Invalid for `{bad}`, got {err:?}");
+            };
+            assert!(msg.contains("service account name"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn rejects_service_account_with_blank_group() {
+        let yaml = SERVICE_YAML.replace("group: svc-ci\n    token", "group: \"  \"\n    token");
+        let err = ConfigFile::from_yaml_str(&yaml).expect_err("blank group must reject");
+        let ConfigFileError::Invalid(msg) = err else {
+            panic!("expected Invalid, got {err:?}");
+        };
+        assert!(msg.contains("must name a permissions group"), "{msg}");
+    }
+
+    /// A token bound to a group with no `permissions:` block authenticates
+    /// cleanly and then reaches nothing — almost always a typo. Fail at boot,
+    /// same rule as grants on unknown servers.
+    #[test]
+    fn rejects_service_account_group_without_permissions_block() {
+        let yaml = SERVICE_YAML.replace("group: svc-ci\n    token", "group: svc-typo\n    token");
+        let err = ConfigFile::from_yaml_str(&yaml).expect_err("undeclared group must reject");
+        let ConfigFileError::Invalid(msg) = err else {
+            panic!("expected Invalid, got {err:?}");
+        };
+        assert!(msg.contains("svc-typo"), "{msg}");
+        assert!(msg.contains("permissions:"), "{msg}");
+    }
+
+    /// The admin middleware gates on group membership alone, so the boot gate
+    /// is what keeps a service token off `/admin/*` (spec 14; issue #185 AC:
+    /// admin reuse is not widened).
+    #[test]
+    fn rejects_service_account_mapped_to_the_admin_group() {
+        let yaml = format!("{SERVICE_YAML}\nadmin:\n  enabled: true\n  group: svc-ci\n");
+        let err = ConfigFile::from_yaml_str(&yaml).expect_err("admin-group mapping must reject");
+        let ConfigFileError::Invalid(msg) = err else {
+            panic!("expected Invalid, got {err:?}");
+        };
+        assert!(msg.contains("admin group"), "{msg}");
+    }
+
+    /// With the admin surface disabled the same group name is harmless — the
+    /// route never mounts — so the gate stays off, mirroring the
+    /// `admin.group` non-empty rule which also applies only when enabled.
+    #[test]
+    fn accepts_admin_group_name_when_admin_disabled() {
+        let yaml = format!("{SERVICE_YAML}\nadmin:\n  enabled: false\n  group: svc-ci\n");
+        ConfigFile::from_yaml_str(&yaml).expect("disabled admin makes the group check moot");
+    }
+
+    /// Service-token refs join the same fail-fast boot contract as DB
+    /// passwords: `load_yaml_str` must abort on an unresolvable ref.
+    #[test]
+    fn load_aborts_on_unresolved_service_token_ref() {
+        let yaml = SERVICE_YAML.replace(
+            "token: dbmcp_svc_0123456789abcdef0123456789abcdef",
+            "token: ${ENV:DB_MCP_SVC_TEST_DEFINITELY_UNSET}",
+        );
+        let err = ConfigFile::load_yaml_str(&yaml).expect_err("unresolved ref must abort load");
+        assert!(
+            matches!(err, ConfigLoadError::Secret(SecretError::EnvNotSet(_))),
+            "expected ConfigLoadError::Secret(EnvNotSet), got {err:?}"
         );
     }
 }

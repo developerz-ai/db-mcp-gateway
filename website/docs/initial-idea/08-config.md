@@ -70,6 +70,13 @@ permissions:
           statement_timeout_ms: 5000
           row_limit: 1000
 
+  # Service-token group (spec 14). Each entry is the single permissions
+  # group a `service_accounts:` token acts as. Empty `grants:` is valid —
+  # it recognizes a group that authorizes nothing (authentication never
+  # implies authorization).
+  - group: svc-ci-bot
+    grants: []               # fill in the minimal grants this service needs
+
 # Optional. Absent ⇒ /admin/v1/* returns 404, YAML-only permissions path.
 admin:
   enabled: true
@@ -78,6 +85,14 @@ admin:
 # Optional. Absent ⇒ pg (state DB) backs users/databases/grants.
 permissions_store:
   driver: pg                 # or 'mysql' — see boot-gate below
+
+# Optional. Absent ⇒ no static bearer tokens accepted (OIDC sessions only).
+# Headless-client credentials — name + one permissions group + secret ref.
+# Full design: 14-service-tokens.md.
+service_accounts:
+  - name: ci-bot
+    group: svc-ci-bot        # must exist in permissions:; never the admin group
+    token: ${ENV:SERVICE_TOKEN_CI_BOT}
 
 logging:
   hot_retention_days: 90

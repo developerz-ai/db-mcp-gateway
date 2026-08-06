@@ -10,7 +10,8 @@ checks at boot.
 Boot-time validation (issue #16):
 
 - Unknown keys inside `servers[].*`, `databases[].*`, `permissions[].*`,
-  `grants[].*`, and `constraints.*` are **errors** with a line:column pointer
+  `grants[].*`, `constraints.*`, and `service_accounts[].*` are **errors**
+  with a line:column pointer
   and the list of expected fields. A typo like `statemnt_timeout_ms` aborts
   startup rather than silently dropping the constraint.
 - Unknown keys at the top level (`gateway:`, `auth:`, `logging:`, …) are
@@ -26,6 +27,7 @@ Boot-time validation (issue #16):
 | `permissions` | list of [Permission](#permission) | no (defaults `[]`) | Group→grant mapping. Empty list means no caller can reach anything. |
 | `admin` | [Admin](#admin) | no | `/admin/v1/*` surface gating — see [admin-api.md](admin-api.md). |
 | `permissions_store` | [PermissionsStore](#permissionsstore) | no | Storage backend for users/databases/grants. Absent → state DB (pg). |
+| `service_accounts` | list of [ServiceAccount](#serviceaccount) | no (defaults `[]`) | Static bearer tokens for headless clients — see [spec 14](../initial-idea/14-service-tokens.md). |
 
 > Other top-level keys (`gateway:`, `auth:`, `logging:`) are accepted for
 > forward-compat with the full spec but not parsed. Their settings come from
@@ -107,6 +109,18 @@ Boot-time validation (issue #16):
 | `driver` | `pg` \| `mysql` | **yes** | — | `pg` (default if the block is absent) shares the state DB. `mysql` opens a separate pool via `PERMISSIONS_DB_DSN` env at boot. |
 
 > **Boot-gate**: `driver: mysql` + `admin.enabled: true` is rejected — admin handlers haven't been ported to mysql. Use pg for the admin path, or mysql with YAML grants only.
+
+## ServiceAccount
+
+`#[serde(deny_unknown_fields)]`. A static bearer credential for a headless client (CI job, agent runner). Full design + mint/rotate/revoke runbook: [spec 14](../initial-idea/14-service-tokens.md).
+
+| Key | Type | Required | Default | Notes |
+|---|---|---|---|---|
+| `name` | string | **yes** | — | Stable service identity; becomes the audit identity `service:<name>`. Must match `^[a-z0-9][a-z0-9-]{0,62}$`, unique across the list. |
+| `group` | string | **yes** | — | The single permissions group the token acts as. Must be declared in `permissions:` (an empty `grants:` list recognizes a group that grants nothing) and must not equal `admin.group` when the admin surface is enabled — both abort boot. |
+| `token` | [secret ref](#secret-references) | **yes** | — | `${ENV:…}` or `${FILE:…}` (spec 14 — YAML carries the secret reference, never the bearer value). Inline literal tokens are NOT permitted in YAML; they remain valid only in programmatic test fixtures constructed via `ConfigFile::from_yaml_str` / `ServiceTokenStore::from_config` directly. Resolved value must match `dbmcp_svc_` followed by exactly 64 lowercase hexadecimal characters (`0-9a-f`) — mint with `bin/mint-service-token <name>`. Short, overlong, non-hex, or mixed-case bodies abort boot with `ServiceTokenError::WeakToken`. Two accounts resolving to the same value abort boot (audit attribution would be ambiguous). |
+
+Minting the first production token is an operator action, not a deploy side effect: run `bin/mint-service-token <name>`, store the value in the secret store, deliver it as a SealedSecret env/file, PR the stanza, roll.
 
 ## Grant
 

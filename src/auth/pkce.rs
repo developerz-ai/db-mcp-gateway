@@ -36,7 +36,9 @@ pub fn verify(verifier: &str, challenge: &str) -> bool {
     ct_eq(challenge_for(verifier).as_bytes(), challenge.as_bytes())
 }
 
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+/// Constant-time byte comparison, shared with `service_token` (bearer-token
+/// match). Constant-time so a mismatch can't be probed byte-by-byte.
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

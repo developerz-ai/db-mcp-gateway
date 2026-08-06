@@ -93,6 +93,32 @@ pub struct Database {
     pub auth_database: Option<String>,
 }
 
+/// A headless (non-interactive) caller: a named service identity carrying a
+/// static bearer token, one permissions group, and nothing else. Design:
+/// website/docs/initial-idea/14-service-tokens.md.
+///
+/// The token is a secret reference — never an inline literal in production —
+/// resolved once at boot into `auth::ServiceTokenStore`. There is no in-band
+/// mint/revoke API: issuance and revocation are GitOps edits to this list
+/// plus a secret-store update, so every change is reviewed by PR.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceAccount {
+    /// Stable service identity (`ci-bot`). Becomes the audit identity
+    /// `service:<name>`; charset/length rules are enforced at boot so audit
+    /// fields stay clean and unambiguous.
+    pub name: String,
+    /// The single permissions group this token acts as. Must be declared in
+    /// `permissions:` (an empty-grants block is the way to recognize a group
+    /// that grants nothing) and must never be the admin group — both checked
+    /// at boot, which is what keeps service tokens off the `/admin/*` surface
+    /// without touching the admin middleware.
+    pub group: String,
+    /// `${ENV:…}` / `${FILE:…}` reference (inline literal tolerated for
+    /// dev/test, same rule as `Database.password`).
+    pub token: Password,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Permission {
