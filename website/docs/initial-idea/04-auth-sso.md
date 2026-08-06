@@ -217,7 +217,7 @@ State that is *meant* to outlive the process is in the state DB: **dynamic clien
 
 ## Service tokens (headless clients)
 
-Everything above assumes a human with a browser. A headless client — CI job, agent runner, another service — has neither, so it authenticates with a **service token**: a static bearer declared in `service_accounts:` in the YAML config, carrying a name (audit identity `service:<name>`), exactly one permissions group, and a `${ENV:…}` / `${FILE:…}` secret reference.
+Everything above assumes a human with a browser. A headless client — CI job, agent runner, another service — has neither, so it authenticates with a **service token**: a static bearer declared in `service_accounts:` in the YAML config, carrying a name (audit identity `service:<name>`), exactly one permissions group, and a `${ENV:…}` / `${FILE:…}` secret reference (the loader also accepts inline literals for dev/test parity with `Database.password`; committed config stays credential-free via the `secret-scan` CI gate, not boot enforcement — see spec 14).
 
 `bearer_auth` tries the boot-resolved service-token store first (constant-time compare), then the session-JWT path unchanged. Service identities never touch the sessions table — no expiry, no in-band revocation — and never hold the admin group (boot-enforced), so the `/admin/*` middleware is untouched. Mint/rotate/revoke is GitOps: `bin/mint-service-token`, a secret-store update, a PR, a rollout.
 

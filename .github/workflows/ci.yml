@@ -208,6 +208,41 @@ jobs:
       # mitigation plan are in .cargo/audit.toml.
       - run: cargo audit --ignore RUSTSEC-2023-0071
 
+  # Spec 14 invariant: no literal dbmcp_svc_ service tokens in committed YAML.
+  # The loader deliberately accepts Password::Literal for dev/test parity with
+  # Database.password (issue #190), so it cannot enforce credential-free
+  # committed config at boot — this job enforces it at the CI layer instead.
+  # Standalone today: it reports PR status but is not wired into build.needs
+  # and is not a required check (do not make it required without also running
+  # it on every PR, or it hard-locks merges).
+  secret-scan:
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: reject literal service tokens in committed YAML
+        # git grep searches only tracked files — exactly the committed-config
+        # surface. It exits 1 on no-match (pass) and 2 on tooling error, so
+        # capture matches into a var with a `|| true` guard and test the var,
+        # never the exit code, to tell "no match" from "grep broken".
+        run: |
+          set -euo pipefail
+          # Pathspec exclusions cover every place a literal token legitimately
+          # lives: test fixtures, docs/spec examples, the commented example
+          # config, this workflow, and the loader source itself.
+          matches="$(git grep -nE "dbmcp_svc_[0-9a-f]{64}" \
+              -- "*.yaml" "*.yml" \
+              ":!tests/**" ":!website/**" ":!config/example.yaml" \
+              ":!.github/**" ":!src/config/yaml.rs" || true)"
+          if [ -n "$matches" ]; then
+            echo "::error::literal dbmcp_svc_ service token(s) in committed YAML — reference the secret via ENV: or FILE: (spec 14)"
+            printf '%s\n' "$matches"
+            exit 1
+          fi
+          echo "no literal service tokens in committed YAML"
+
   # Publish a multi-arch image on push to main, tagged with the short commit
   # SHA (what Argo Image Updater pins to, #17) + a moving `main` tag. Gated by
   # the quality jobs above so an unpublishable commit never ships an image.
