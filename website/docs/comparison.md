@@ -62,7 +62,7 @@ claude mcp add db-gateway https://db.internal.com
 - Development environments with no compliance requirements
 - Local development with personal databases
 - Teams already managing database access well
-- Latency-critical applications (`<5ms` overhead unacceptable)
+- Latency-critical applications where any proxy hop is unacceptable
 
 **Choose db-mcp-gateway When:**
 - Production databases require compliance and audit
@@ -106,26 +106,26 @@ groups:
 | **Security Features** | Basic (DIY) | Complete (SSO + audit) |
 | **Multi-Database** | Reinvent per DB type | Built-in (PG + MySQL + Mongo) |
 | **Compliance Ready** | ❌ Build yourself | ✅ Built-in |
-| **Performance** | Optimizable | Production-optimized |
-| **Error Handling** | Custom | Battle-tested |
+| **Performance** | Yours to tune | [Not measured](benchmarks.md) |
+| **Error Handling** | Custom | Typed errors with stable codes |
 
 ### Total Cost of Ownership
 
-**Custom Implementation Costs:**
-- Initial development: 2-5 days
-- Security features: +5-10 days
-- Multi-database support: +3-5 days per database type
-- Compliance features: +5-10 days
-- Ongoing maintenance: 1-2 days/quarter
-- **Total Year 1:** 15-30 days + ongoing maintenance
+We have not measured this, so we are not going to publish a number for it.
+What a custom wrapper actually costs depends almost entirely on how much of
+the following you end up rebuilding — which is the honest comparison:
 
-**db-mcp-gateway Costs:**
-- Initial deployment: 1-2 days
-- Configuration setup: 1 day per environment
-- Operations: Minimal (Docker container)
-- **Total Year 1:** 2-3 days + upstream updates
+| Capability | Custom wrapper | db-mcp-gateway |
+|---|---|---|
+| OIDC login + session handling | You build and maintain it | Ships |
+| Per-query identity in an audit row | You build and maintain it | Ships |
+| Read-only enforcement that survives a clever query | You build and maintain it | Ships |
+| Statement timeouts, row caps, cancellation | You build and maintain it | Ships |
+| A second database engine | Rebuild per engine | Add a `servers:` entry |
+| Keeping all of the above correct as agents change | Yours | Upstream's |
 
-**Break-Even Point:** 4-6 months
+If none of those rows matter to you, a wrapper is genuinely the cheaper
+option and you should write one.
 
 ### When to Use Each
 
@@ -185,7 +185,7 @@ groups:
 | Feature | PgBouncer | db-mcp-gateway |
 |---------|-----------|----------------|
 | **Primary Goal** | Connection pooling efficiency | Security + compliance |
-| **Overhead** | `<1ms` | +5ms (security features) |
+| **Work done per query** | Pool checkout | Authz check, query guard, synchronous audit write |
 | **User Tracking** | Connection name only | Full query attribution |
 | **Configuration** | INI files | YAML + git |
 | **Multi-Database** | PostgreSQL only | PG + MySQL + Mongo |
@@ -325,7 +325,9 @@ groups:
 3. **Update agent configs** to point to gateway URL
 4. **Decommission custom wrapper** after validation period
 
-**Effort Estimate:** 1-2 days for typical custom implementation
+Effort depends entirely on how many permissions you have to map and how
+many agent configs point at the old wrapper. We have no representative
+sample to estimate from, so we are not going to invent one.
 
 ---
 
@@ -341,7 +343,7 @@ groups:
 | **MCP Protocol** | ❌ No | ✅ Yes | ❌ No | ❌ No | ✅ Yes |
 | **Configuration** | Ad-hoc | Custom code | SQL/Tables | INI files | ✅ YAML + Git |
 | **Maintenance** | Ongoing | High | Medium | Low | ✅ Low (upstream) |
-| **Performance** | ✅ Best | Variable | ✅ Excellent | ✅ Excellent | ✅ Good (+5ms) |
+| **Performance** | Not measured | Not measured | Not measured | Not measured | [Not measured](benchmarks.md) |
 | **Compliance** | ❌ DIY | ⚠️ DIY | ❌ Limited | ❌ Limited | ✅ Built-in |
 
 ---
@@ -358,6 +360,8 @@ groups:
 - Pure performance optimization is the goal (use ProxySQL/PgBouncer)
 - Simple development environments without compliance needs (use direct access)
 - Enterprise-wide data governance beyond databases (use Immuta/Collibra)
-- Maximum performance is critical (`<5ms` overhead unacceptable)
+- Maximum performance is critical and you cannot accept an unquantified
+  proxy hop — we have not [measured ours](benchmarks.md) yet, so budget for
+  measuring it yourself before committing
 
 **The sweet spot:** Production databases + AI agents + compliance requirements + operational simplicity.
