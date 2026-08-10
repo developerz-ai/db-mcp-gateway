@@ -11,12 +11,18 @@ use std::time::Instant;
 
 use sqlx::{Row, postgres::PgPoolOptions};
 
-use crate::workload::{POSTGRES_SEED, Shape};
+use crate::workload::{Shape, postgres_seed};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DirectError {
     #[error("direct database access failed: {0}")]
     Db(#[from] sqlx::Error),
+    /// The query succeeded but returned nothing. `RowNotFound` would render as
+    /// a database failure, which points an operator at connectivity instead of
+    /// at the query shape — and a benchmark measuring an empty result set is
+    /// measuring a no-op.
+    #[error("shape {shape} returned no rows at iteration {iteration}")]
+    EmptyResult { shape: &'static str, iteration: u64 },
 }
 
 /// A pooled direct-to-Postgres client.
@@ -38,13 +44,18 @@ impl DirectClient {
         Ok(DirectClient { pool })
     }
 
-    /// Create and populate the benchmark table. Idempotent — the DDL drops
-    /// first, so a re-run measures the same bytes rather than appending.
+    /// Create and populate the benchmark table.
+    ///
+    /// **Destructive.** The DDL opens with `DROP TABLE IF EXISTS bench_rows`,
+    /// so any existing `bench_rows` in the target database is discarded. Point
+    /// the harness at a disposable database only. The drop is what makes a
+    /// re-run measure the same bytes rather than appending to the previous
+    /// run's data.
     pub async fn seed(&self) -> Result<(), DirectError> {
         // `execute` on a multi-statement string runs it as one implicit
         // transaction, which is what we want: a half-seeded table would make
         // every subsequent number meaningless.
-        sqlx::raw_sql(POSTGRES_SEED).execute(&self.pool).await?;
+        sqlx::raw_sql(&postgres_seed()).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -70,7 +81,10 @@ impl DirectClient {
         // gateway side.
         debug_assert!(touched > 0 || rows.is_empty());
         if rows.is_empty() {
-            return Err(DirectError::Db(sqlx::Error::RowNotFound));
+            return Err(DirectError::EmptyResult {
+                shape: shape.name(),
+                iteration,
+            });
         }
 
         Ok(elapsed)

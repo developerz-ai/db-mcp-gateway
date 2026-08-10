@@ -22,6 +22,7 @@ mod report;
 mod stats;
 mod workload;
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -29,6 +30,35 @@ use clap::Parser;
 
 use driver::{Path, Plan};
 use workload::Shape;
+
+/// A string that refuses to reveal itself in `Debug` output.
+///
+/// `Cli` derives `Debug` (clap needs it for `--help` diagnostics), and any
+/// `{:?}` of a struct containing a bare `String` for `service_token` or the
+/// password-bearing `direct_url` would print the credential verbatim. `FromStr`
+/// is what clap uses to parse an `#[arg]` field, so this newtype drops in
+/// without an explicit `value_parser`.
+#[derive(Clone)]
+struct Redacted(String);
+
+impl Redacted {
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for Redacted {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
+    }
+}
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"<redacted>\"")
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -43,12 +73,13 @@ struct Cli {
     /// Service-account bearer token (`dbmcp_svc_…`). Passed by env from the
     /// wrapper script so it never lands in shell history or a process listing.
     #[arg(long, env = "BENCH_SERVICE_TOKEN", hide_env_values = true)]
-    service_token: String,
+    service_token: Redacted,
 
     /// Postgres URL for the direct baseline — the same database the gateway
-    /// is configured to reach.
+    /// is configured to reach. Redacted in `Debug` because the DSN carries a
+    /// password.
     #[arg(long, env = "BENCH_DIRECT_URL", hide_env_values = true)]
-    direct_url: String,
+    direct_url: Redacted,
 
     #[arg(long, default_value = "target")]
     server: String,
@@ -110,14 +141,15 @@ async fn main() -> anyhow::Result<()> {
         warmup: cli.warmup,
     };
 
-    let direct = Arc::new(direct::DirectClient::connect(&cli.direct_url, cli.concurrent).await?);
+    let direct =
+        Arc::new(direct::DirectClient::connect(cli.direct_url.expose(), cli.concurrent).await?);
     eprintln!("seeding {} rows…", workload::SEED_ROWS);
     direct.seed().await?;
 
     let gw = Arc::new(gateway::GatewayClient::new(
         &cli.gateway_url,
         &cli.mcp_path,
-        cli.service_token.clone(),
+        cli.service_token.expose().to_string(),
         cli.server.clone(),
         cli.database.clone(),
     )?);
@@ -160,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("p50 {:.3}ms", base_second.summary.p50_ms);
 
         let drift = driver::drift_pct(&base_first.summary, &base_second.summary);
-        if drift > 5.0 {
+        if drift > report::MAX_TRUSTED_DRIFT_PCT {
             eprintln!(
                 "  WARNING: baseline drifted {drift:.1}% between runs — the host did not \
                  hold still, treat this shape's delta as indicative only"

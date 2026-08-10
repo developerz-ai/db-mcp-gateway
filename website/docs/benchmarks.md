@@ -43,7 +43,7 @@ So this is deliberately deferred rather than half-done.
 ## Measure it yourself — the harness ships with the gateway
 
 You do not have to take our word for any of this, and you do not have to
-install anything beyond `docker` and `cargo`:
+install anything beyond `docker`, `cargo`, `curl`, and `openssl`:
 
 ```bash
 ./benchmarks/gateway_overhead.sh --queries 5000 --concurrent 8
@@ -59,12 +59,13 @@ It is also built to resist flattering itself: it runs the baseline again
 *after* the gateway phase and marks any result untrustworthy if the two
 baselines disagree by more than 5%, counts errors instead of retrying them,
 and records the machine and commit into every result file. Full list of
-countermeasures in [`benchmarks/README.md`](https://github.com/developerz-ai/db-mcp-gateway/blob/main/benchmarks/README.md).
+countermeasures in `benchmarks/README.md` in the repository.
 
-We have run it. We are not publishing what it said, because on our current
-host the numbers moved by 23–51% between two identical runs — that is a
-measurement we cannot stand behind, not a result. On a quiet machine the same
-command produces something we can.
+We have run it, and we are not publishing what it said. On the shared VPS we
+tried, the baseline drifted enough between the two calibration runs that the
+harness marked its own output untrustworthy — which is exactly the guard we
+built in to keep us from publishing numbers we cannot stand behind. Run the
+harness on your own hardware.
 
 ## What we will publish when we do measure
 

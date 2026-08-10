@@ -180,7 +180,11 @@ jobs:
       - run: cargo clean -p db-mcp-gateway
       # No separate `cargo build` step — `cargo test --all-targets` builds the
       # same targets, so the extra invocation was a wasted fingerprint pass.
-      - run: cargo test --all-targets
+      # `--all-features` gates the bench-harness tests in `benchmarks/harness/*`
+      # which are otherwise skipped (matches the clippy job above; no runtime
+      # image is produced from this invocation, so the bench-harness bin never
+      # ships).
+      - run: cargo test --all-targets --all-features
 
   audit:
     runs-on: blacksmith-2vcpu-ubuntu-2404

@@ -15,8 +15,12 @@ pub const SEED_ROWS: i64 = 50_000;
 
 /// DDL + seed, run once per benchmark session against the target database.
 /// Deterministic: `generate_series` rather than random data, so two runs on
-/// two machines execute over identical bytes.
-pub const POSTGRES_SEED: &str = r#"
+/// two machines execute over identical bytes. Derived from `SEED_ROWS` so the
+/// seeded row count and the query predicates cannot disagree — one constant
+/// owns the size of the table.
+pub fn postgres_seed() -> String {
+    format!(
+        "\
 DROP TABLE IF EXISTS bench_rows;
 CREATE TABLE bench_rows (
     id    bigint PRIMARY KEY,
@@ -25,10 +29,12 @@ CREATE TABLE bench_rows (
 );
 INSERT INTO bench_rows (id, label, val)
 SELECT g, 'label-' || g, (g * 7919) % 100000
-FROM generate_series(1, 50000) AS g;
+FROM generate_series(1, {SEED_ROWS}) AS g;
 CREATE INDEX bench_rows_val_idx ON bench_rows (val);
 ANALYZE bench_rows;
-"#;
+"
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -142,6 +148,18 @@ mod tests {
         // A cap at or below the row count would silently truncate and make the
         // two paths incomparable.
         assert!(Shape::RangeScan.limit() > 1000);
+    }
+
+    #[test]
+    fn seed_sql_uses_the_shared_row_count() {
+        // Guards the SEED_ROWS ↔ postgres_seed() invariant. If a future edit
+        // hardcodes a different number in the DDL, RangeScan would scan past
+        // the seeded data and PointLookup would query missing ids.
+        let sql = postgres_seed();
+        assert!(
+            sql.contains(&format!("generate_series(1, {SEED_ROWS})")),
+            "seed SQL must derive its row count from SEED_ROWS ({SEED_ROWS}):\n{sql}"
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ so that anyone, including us, can produce their own.
 ./benchmarks/gateway_overhead.sh --queries 5000 --concurrent 8 --warmup 500
 ```
 
-Needs `docker` and `cargo`. Nothing else — no k6, no wrk, no JMeter.
+Needs `docker`, `cargo`, `curl`, and `openssl`. Nothing else — no k6, no wrk, no JMeter.
 
 The script starts the dev stack if it is not already up, builds and boots a
 **release** gateway against `benchmarks/gateway.bench.yaml`, measures, prints a
@@ -77,7 +77,7 @@ or the gateway will truncate and the comparison becomes meaningless.
 
 ## Layout
 
-```
+```text
 gateway_overhead.sh    runner: stack up, boot gateway, measure, tear down
 gateway.bench.yaml     gateway config (dev credentials only)
 harness/

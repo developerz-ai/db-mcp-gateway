@@ -15,6 +15,12 @@ use crate::env::Environment;
 use crate::stats::{Overhead, Summary};
 use crate::workload::Shape;
 
+/// Baseline drift above this percentage means the host moved between the two
+/// baseline runs, and the gateway delta measured in between is not comparable.
+/// One constant so the `trustworthy()` decision, the console warning in
+/// `main.rs`, and the caveat prose in the Markdown table cannot drift apart.
+pub const MAX_TRUSTED_DRIFT_PCT: f64 = 5.0;
+
 #[derive(Debug, Serialize)]
 pub struct Measurement {
     pub shape: Shape,
@@ -61,7 +67,9 @@ impl Measurement {
 
     /// Whether this row is solid enough to publish without a caveat.
     fn trustworthy(&self) -> bool {
-        self.baseline_drift_pct <= 5.0 && self.gateway_errors == 0 && self.direct_errors == 0
+        self.baseline_drift_pct <= MAX_TRUSTED_DRIFT_PCT
+            && self.gateway_errors == 0
+            && self.direct_errors == 0
     }
 }
 
@@ -152,8 +160,10 @@ impl Report {
         out.push_str("| Query | p50 | p95 | p99 | p50 ratio | Baseline drift | Trustworthy |\n");
         out.push_str("|---|---|---|---|---|---|---|\n");
         for m in &self.measurements {
+            // `{:+.2}` puts the sign inside the formatter so a percentile where
+            // the gateway edges out the baseline prints `-0.42ms`, not `+-0.42ms`.
             out.push_str(&format!(
-                "| {} | +{:.2}ms | +{:.2}ms | +{:.2}ms | {:.2}× | {:.1}% | {} |\n",
+                "| {} | {:+.2}ms | {:+.2}ms | {:+.2}ms | {:.2}× | {:.1}% | {} |\n",
                 m.description,
                 m.overhead.p50_delta_ms,
                 m.overhead.p95_delta_ms,
@@ -170,10 +180,11 @@ impl Report {
             .filter(|m| !m.trustworthy())
             .collect();
         if !shaky.is_empty() {
-            out.push_str(
-                "\n> Rows marked **no** had baseline drift above 5% or non-zero errors. \
-                          The host moved during the run; treat those deltas as indicative only.\n",
-            );
+            out.push_str(&format!(
+                "\n> Rows marked **no** had baseline drift above {MAX_TRUSTED_DRIFT_PCT}% or \
+                 non-zero errors. The host moved during the run; treat those deltas as \
+                 indicative only.\n",
+            ));
         }
 
         out.push_str("\n### Not measured\n\n");
@@ -254,6 +265,29 @@ mod tests {
             "shaky row must be flagged in markdown"
         );
         assert!(md.contains("indicative only"), "and explained");
+    }
+
+    #[test]
+    fn negative_overhead_renders_without_a_double_sign() {
+        // p99 gateway faster than direct → overhead is negative. The formatter
+        // must own the sign so the table never emits `+-0.42ms`.
+        let m = Measurement::new(
+            Shape::PointLookup,
+            plan(),
+            phase(2.0, 0),
+            phase(1.5, 0),
+            phase(2.0, 0),
+            0.0,
+        );
+        let md = Report::new(Environment::capture(), vec![m]).markdown();
+        assert!(
+            !md.contains("+-"),
+            "sign flag must own the sign, saw a stacked sign in:\n{md}"
+        );
+        assert!(
+            md.contains("-0.50ms"),
+            "expected the negative delta to appear as `-0.50ms`:\n{md}"
+        );
     }
 
     #[test]

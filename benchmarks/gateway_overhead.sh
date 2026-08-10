@@ -9,7 +9,7 @@
 # then tears down everything it started. Anything already running when this
 # script starts is left alone.
 #
-# Requires: docker, cargo. Nothing else — no k6, no wrk.
+# Requires: docker, cargo, curl, openssl. Nothing else — no k6, no wrk.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -62,13 +62,19 @@ else
 fi
 
 echo "-- waiting for Postgres"
+postgres_ready=0
 for _ in $(seq 1 60); do
   if docker compose -f docker-compose.dev.yml exec -T target-db \
        pg_isready -U app -d app >/dev/null 2>&1; then
+    postgres_ready=1
     break
   fi
   sleep 1
 done
+if [[ "$postgres_ready" -ne 1 ]]; then
+  echo "target-db did not become ready in 60s" >&2
+  exit 1
+fi
 
 # Minted per run and never written to disk. A benchmark has no reason to hold
 # a durable credential.
@@ -94,13 +100,23 @@ echo "-- booting gateway"
 ./target/release/db-mcp-gateway --config benchmarks/gateway.bench.yaml &
 GATEWAY_PID=$!
 
+# PID check first — an /healthz reply from a stale process on port 8899 must
+# not satisfy readiness for a gateway that already exited.
+gateway_ready=0
 for _ in $(seq 1 60); do
-  if curl -fsS "http://127.0.0.1:8899/healthz" >/dev/null 2>&1; then break; fi
   if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
     echo "gateway exited during boot" >&2; exit 1
   fi
+  if curl -fsS "http://127.0.0.1:8899/healthz" >/dev/null 2>&1; then
+    gateway_ready=1
+    break
+  fi
   sleep 1
 done
+if [[ "$gateway_ready" -ne 1 ]]; then
+  echo "gateway did not become ready in 60s" >&2
+  exit 1
+fi
 
 echo "-- measuring (queries=$QUERIES concurrent=$CONCURRENT warmup=$WARMUP)"
 ./target/release/bench-harness \
