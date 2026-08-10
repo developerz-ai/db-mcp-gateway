@@ -88,7 +88,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 # transport pinned to rustls to match the rest of the stack (aws-lc-rs) and
 # keep openssl out of the dep graph — see `cargo tree -i openssl-sys` (empty).
 # DSN is read from SENTRY_DSN at runtime; unset → disabled no-op client.
-sentry = { version = "0.48", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
+sentry = { version = "0.49", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 # credential-scrubbing regexes for the sentry `before_send` hook. No `unicode`
 # feature: DSN/password patterns are ASCII, keeping the dep light.
 regex = { version = "1", default-features = false }
