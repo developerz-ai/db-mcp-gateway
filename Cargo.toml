@@ -60,7 +60,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 url = "2"
 # PKCE S256 for the MCP OAuth bridge: base64url-no-pad(sha256(verifier))
 # compared against the client's code_challenge.
-sha2 = "0.10"
+sha2 = "0.11"
 base64 = "0.22"
 # DB-credential hygiene: keep resolved passwords in a heap buffer that zeroes
 # on drop and refuses to `Debug`-print in the clear. `secrecy::SecretString`
