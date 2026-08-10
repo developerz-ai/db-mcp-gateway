@@ -61,7 +61,7 @@ url = "2"
 # PKCE S256 for the MCP OAuth bridge: base64url-no-pad(sha256(verifier))
 # compared against the client's code_challenge.
 sha2 = "0.10"
-base64 = "0.22"
+base64 = "0.23"
 # DB-credential hygiene: keep resolved passwords in a heap buffer that zeroes
 # on drop and refuses to `Debug`-print in the clear. `secrecy::SecretString`
 # wraps the value end to end; `&str` is exposed only at the driver boundary.
