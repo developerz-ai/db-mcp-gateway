@@ -53,3 +53,7 @@ goal.txt
 # cargo-chef writes this inside the builder stage; only a local
 # `cargo chef prepare` would leave one in the working tree.
 recipe.json
+
+# Benchmark output. Raw results are environment-specific and only meaningful
+# next to the machine they came from — regenerate with benchmarks/gateway_overhead.sh.
+benchmarks/results/

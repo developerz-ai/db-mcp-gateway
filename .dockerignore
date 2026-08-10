@@ -44,3 +44,8 @@ tmp/
 # working tree would otherwise ship a stale copy in the build context, busting
 # the planner's `COPY . .` layer on a file the build immediately overwrites.
 recipe.json
+
+# Benchmark harness: never built into the runtime image (see Cargo.toml
+# `bench-harness` feature). Keeping it out of the context also keeps a
+# benchmark config out of a shipped layer.
+benchmarks/

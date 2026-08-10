@@ -19,6 +19,15 @@ path = "src/main.rs"
 # normal library surface; this crate's integration tests enable it via the self
 # dev-dependency below.
 test-support = []
+# Builds `benchmarks/harness` (see benchmarks/README.md). Off by default so the
+# load generator never enters a release build or the runtime image — it exists
+# to measure the gateway, not to ship with it.
+bench-harness = []
+
+[[bin]]
+name = "bench-harness"
+path = "benchmarks/harness/main.rs"
+required-features = ["bench-harness"]
 
 [dependencies]
 # async runtime + http

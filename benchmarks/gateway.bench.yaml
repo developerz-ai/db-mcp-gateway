@@ -1,0 +1,46 @@
+# Gateway config used by the benchmark harness.
+#
+# Points at the local dev stack (`bin/dev up`). Every value here is a
+# development credential that is already public in docker-compose.dev.yml — no
+# real secret belongs in this file, and the harness never runs against a real
+# target.
+#
+# Constraints are set deliberately WIDE: the point is to measure the gateway's
+# own overhead, not to measure it hitting a row cap or a statement timeout. A
+# truncated response would make the gateway and direct paths incomparable.
+
+servers:
+  - name: target
+    kind: postgres
+    description: Local dev target-db (docker-compose.dev.yml)
+    host: localhost
+    port: 5434
+    tls: insecure
+    databases:
+      - name: app
+        role: app
+        password: app-dev-only
+        description: Benchmark target
+
+permissions:
+  # The benchmark service account acts as exactly this group.
+  - group: svc-bench
+    grants:
+      - server: target
+        database: app
+        action: query_read
+        constraints:
+          # Above the 1000 rows the range-scan shape returns, so nothing is
+          # truncated. Below it, the two paths would return different data.
+          row_limit: 5000
+          # Generous: a timeout would turn a slow sample into an error and
+          # quietly remove the tail we are trying to measure.
+          statement_timeout_ms: 30000
+          # Off — a required reason adds a field to every request and would
+          # measure our own test scaffolding.
+          require_reason: false
+
+service_accounts:
+  - name: bench
+    group: svc-bench
+    token: ${ENV:SERVICE_TOKEN_BENCH}
