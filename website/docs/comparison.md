@@ -124,8 +124,8 @@ the following you end up rebuilding — which is the honest comparison:
 | A second database engine | Rebuild per engine | Add a `servers:` entry |
 | Keeping all of the above correct as agents change | Yours | Upstream's |
 
-If none of those rows matter to you, a wrapper is genuinely the cheaper
-option and you should write one.
+If none of those rows matter to you, a wrapper may be cheaper, and you
+should evaluate that option.
 
 ### When to Use Each
 
@@ -185,7 +185,7 @@ option and you should write one.
 | Feature | PgBouncer | db-mcp-gateway |
 |---------|-----------|----------------|
 | **Primary Goal** | Connection pooling efficiency | Security + compliance |
-| **Work done per query** | Pool checkout | Authz check, query guard, synchronous audit write |
+| **Gateway-specific work per query** | Pool checkout | Authz check, query guard, synchronous audit write |
 | **User Tracking** | Connection name only | Full query attribution |
 | **Configuration** | INI files | YAML + git |
 | **Multi-Database** | PostgreSQL only | PG + MySQL + Mongo |
@@ -325,9 +325,9 @@ option and you should write one.
 3. **Update agent configs** to point to gateway URL
 4. **Decommission custom wrapper** after validation period
 
-Effort depends entirely on how many permissions you have to map and how
-many agent configs point at the old wrapper. We have no representative
-sample to estimate from, so we are not going to invent one.
+Effort depends on factors such as permission mapping, agent configurations,
+validation, and deployment. We have no representative sample to estimate
+from, so we are not going to invent one.
 
 ---
 

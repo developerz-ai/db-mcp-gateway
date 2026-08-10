@@ -20,7 +20,7 @@ Facts about the code path, not claims about its cost:
 | One authorization evaluation over the caller's merged grants | `src/authz/` |
 | One SQL guard pass over the parsed statement | `src/exec/` |
 | One query against a per-`(server, database)` connection pool | `src/exec/` |
-| One **synchronous** audit write that must commit before the response is sent | `src/audit/` |
+| One **primary synchronous** audit write on the normal success path that must commit before the response is sent; cancellation or primary-write failure can schedule a detached fallback write | `src/audit/` |
 
 That last row is the one that matters for any performance question. The
 audit write is on the critical path *by design* — an audit failure fails the
@@ -32,11 +32,11 @@ changing what the product guarantees.
 
 ## Why there are no numbers yet
 
-Measuring is not the hard part; a harness needs no tooling we do not already
-have. Publishing *meaningful* numbers needs a dedicated, quiet machine — the
-kind of isolated runner where a p99 means something. Numbers taken on a
-shared VPS would be honest and still useless, because they would measure the
-neighbours as much as the gateway.
+We have deferred publication until we can run a harness with the required
+tooling. Publishing *meaningful* numbers needs a dedicated, quiet machine —
+the kind of isolated runner where a p99 means something. Numbers taken on a
+shared VPS can be affected by co-tenancy and may be less reproducible than
+measurements from an isolated runner.
 
 So this is deliberately deferred rather than half-done.
 
@@ -57,8 +57,8 @@ Tracked in [#196](https://github.com/developerz-ai/db-mcp-gateway/issues/196):
 
 ## In the meantime
 
-Measure it yourself, on your hardware, against your data. That number will
-be more useful to you than any number we could publish — and if it surprises
-you in either direction, please
+Measure it yourself, on your hardware, against your data. That number may
+be more relevant to your deployment than a generic published result — and if
+it surprises you in either direction, please
 [open an issue](https://github.com/developerz-ai/db-mcp-gateway/issues/new);
 a real report from a real deployment is worth more than our synthetic run.
