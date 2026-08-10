@@ -40,12 +40,36 @@ measurements from an isolated runner.
 
 So this is deliberately deferred rather than half-done.
 
+## Measure it yourself — the harness ships with the gateway
+
+You do not have to take our word for any of this, and you do not have to
+install anything beyond `docker` and `cargo`:
+
+```bash
+./benchmarks/gateway_overhead.sh --queries 5000 --concurrent 8
+```
+
+That brings up a disposable stack, boots a **release** build of the real
+gateway, and times the same three query shapes down two paths — through the
+gateway, and straight at Postgres — on your hardware, at the same moment.
+It prints a Markdown report and writes raw JSON, then tears down whatever it
+started.
+
+It is also built to resist flattering itself: it runs the baseline again
+*after* the gateway phase and marks any result untrustworthy if the two
+baselines disagree by more than 5%, counts errors instead of retrying them,
+and records the machine and commit into every result file. Full list of
+countermeasures in [`benchmarks/README.md`](https://github.com/developerz-ai/db-mcp-gateway/blob/main/benchmarks/README.md).
+
+We have run it. We are not publishing what it said, because on our current
+host the numbers moved by 23–51% between two identical runs — that is a
+measurement we cannot stand behind, not a result. On a quiet machine the same
+command produces something we can.
+
 ## What we will publish when we do measure
 
 Tracked in [#196](https://github.com/developerz-ai/db-mcp-gateway/issues/196):
 
-- A harness committed under `benchmarks/`, runnable by anyone, driving the
-  real released binary over the real auth path — not a stripped-down build.
 - Gateway overhead against a direct connection to the same database on the
   same host, as a distribution (p50/p95/p99), never a single scalar.
 - Behaviour under concurrency, per database engine, and across multiple
