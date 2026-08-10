@@ -15,13 +15,16 @@ use crate::workload::{Shape, postgres_seed};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DirectError {
-    #[error("direct database access failed: {0}")]
+    // Stable bracketed prefix so a report consumer (or a `grep` over the
+    // harness log) can classify failures without pattern-matching the
+    // downstream SQLx prose, which changes between driver versions.
+    #[error("[BENCH_DIRECT_DB] direct database access failed: {0}")]
     Db(#[from] sqlx::Error),
     /// The query succeeded but returned nothing. `RowNotFound` would render as
     /// a database failure, which points an operator at connectivity instead of
     /// at the query shape — and a benchmark measuring an empty result set is
     /// measuring a no-op.
-    #[error("shape {shape} returned no rows at iteration {iteration}")]
+    #[error("[BENCH_DIRECT_EMPTY_RESULT] shape {shape} returned no rows at iteration {iteration}")]
     EmptyResult { shape: &'static str, iteration: u64 },
 }
 

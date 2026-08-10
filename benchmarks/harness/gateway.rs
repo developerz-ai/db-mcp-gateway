@@ -145,10 +145,15 @@ fn validate_response(response: &Value) -> Result<(), GatewayError> {
         .and_then(Value::as_str)
         .and_then(|text| serde_json::from_str::<Value>(text).ok())
         .filter(|payload| {
-            payload
-                .get("rows")
-                .and_then(Value::as_array)
-                .is_some_and(|rows| !rows.is_empty())
+            // `truncated` must be explicitly `false`. A truncated envelope
+            // carries a partial row set, and the direct baseline never
+            // truncates — comparing the two would report gateway overhead
+            // measured against a smaller response than the baseline paid for.
+            payload.get("truncated").and_then(Value::as_bool) == Some(false)
+                && payload
+                    .get("rows")
+                    .and_then(Value::as_array)
+                    .is_some_and(|rows| !rows.is_empty())
         })
         .ok_or(GatewayError::MalformedPayload)?;
 
@@ -213,6 +218,31 @@ mod tests {
     fn populated_envelope_is_accepted() {
         let response = envelope(json!({"columns": ["id"], "rows": [[1]], "truncated": false}));
         validate_response(&response).expect("row present");
+    }
+
+    #[test]
+    fn truncated_envelope_with_rows_is_rejected() {
+        // A gateway response with rows and `truncated: true` used to slip
+        // through because the filter only checked for a non-empty `rows`.
+        // Timing it would compare a partial result against the direct path's
+        // complete result — the gateway would look artificially fast.
+        let response = envelope(json!({"columns": ["id"], "rows": [[1]], "truncated": true}));
+        assert!(matches!(
+            validate_response(&response),
+            Err(GatewayError::MalformedPayload)
+        ));
+    }
+
+    #[test]
+    fn envelope_missing_truncated_is_rejected() {
+        // Defensive: the gateway always emits `truncated`, but if a future
+        // change dropped it the harness must refuse to time the response
+        // rather than silently treat "unknown" as complete.
+        let response = envelope(json!({"columns": ["id"], "rows": [[1]]}));
+        assert!(matches!(
+            validate_response(&response),
+            Err(GatewayError::MalformedPayload)
+        ));
     }
 
     #[test]

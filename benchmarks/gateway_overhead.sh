@@ -102,12 +102,19 @@ GATEWAY_PID=$!
 
 # PID check first — an /healthz reply from a stale process on port 8899 must
 # not satisfy readiness for a gateway that already exited.
+#
+# Wall-clock deadline (not `seq 1 60`) because `curl` without `--max-time` can
+# hang on a stalled socket for far longer than one iteration, blowing past the
+# advertised 60 s bound. `--connect-timeout` caps the TCP handshake, `--max-time`
+# caps the whole request; a single stalled probe can no longer wedge the loop.
 gateway_ready=0
-for _ in $(seq 1 60); do
+deadline=$(( $(date +%s) + 60 ))
+while (( $(date +%s) < deadline )); do
   if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
     echo "gateway exited during boot" >&2; exit 1
   fi
-  if curl -fsS "http://127.0.0.1:8899/healthz" >/dev/null 2>&1; then
+  if curl -fsS --connect-timeout 2 --max-time 5 \
+       "http://127.0.0.1:8899/healthz" >/dev/null 2>&1; then
     gateway_ready=1
     break
   fi
