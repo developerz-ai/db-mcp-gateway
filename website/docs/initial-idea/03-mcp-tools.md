@@ -68,7 +68,7 @@ Args: `server`, `database`, optional `since` (RFC 3339), optional `limit`. Retur
 
 **Scoping is the security-critical contract.** The filter is on the SSO-verified identity (`identity.user_sub`) from the session middleware — NEVER on a client-supplied `user` field. The arguments struct uses `#[serde(deny_unknown_fields)]`; any attempt to pass `user` (or any other unknown key) is rejected with JSON-RPC `invalid_params` before the request reaches the audit table. The `WHERE` clause is `user_sub = $1 AND server_name = $2 AND database_name = $3` (the composite index `audit_calls_user_occurred_idx` from migration 0003 covers it).
 
-`limit` defaults to 100 and is clamped to `GATEWAY_ROW_LIMIT_CEILING` (100,000); a hostile `u32::MAX` request is clamped, not honoured. When the response is truncated, the `truncated` flag is `true`.
+`limit` defaults to 100 and is clamped to `GATEWAY_ROW_LIMIT_CEILING` (100,000); a hostile `u32::MAX` request is clamped, not honoured. The `truncated` flag reports exactly that clamp: it is `true` when the caller's `limit` exceeded the ceiling and was lowered. It does **not** mean "more entries exist" — a caller who asks for 10 of their 50 entries gets 10 with `truncated: false`, because nothing was withheld beyond what they asked for. To see further back, widen `since` rather than raising `limit`.
 
 `since` is parsed at the edge as RFC 3339; a malformed value is rejected with `invalid_params` rather than silently dropping the filter.
 

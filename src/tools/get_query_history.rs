@@ -62,9 +62,13 @@ pub use crate::audit::HistoryEntry;
 #[derive(Debug, Serialize)]
 struct SuccessPayload {
     entries: Vec<HistoryEntry>,
-    /// True iff the caller asked for more than the effective ceiling — i.e.
-    /// the response is capped and earlier entries exist beyond it. Agents
-    /// can use this to widen the `since` window instead of raising `limit`.
+    /// Whether the caller's `limit` was lowered by the gateway ceiling.
+    ///
+    /// This reports a *clamp*, not "more entries exist". A caller who asks
+    /// for 10 of their 50 entries gets 10 with `truncated: false` — nothing
+    /// was withheld beyond what they asked for. Only a request above
+    /// `GATEWAY_ROW_LIMIT_CEILING` sets it. Agents that want more history
+    /// should widen `since` rather than raise `limit`.
     truncated: bool,
 }
 
@@ -78,6 +82,16 @@ fn effective_limit(caller: Option<u32>) -> u32 {
     caller
         .unwrap_or(DEFAULT_HISTORY_LIMIT)
         .min(super::GATEWAY_ROW_LIMIT_CEILING)
+}
+
+/// Whether `effective_limit` lowered what the caller asked for.
+///
+/// Split out from the response assembly so the distinction it encodes is
+/// testable: this is a *clamp* signal, not a "there is more data" signal.
+/// Conflating the two is easy to do by accident and would tell an agent to
+/// keep raising `limit` against a ceiling that will never yield more.
+fn limit_was_clamped(caller: Option<u32>, effective: u32) -> bool {
+    caller.is_some_and(|asked| asked > effective)
 }
 
 /// Parse an RFC 3339 timestamp at the edge. Any failure becomes a typed
@@ -217,9 +231,7 @@ async fn compute_outcome(
         }
     };
 
-    // `truncated = true` iff the caller asked for more than the effective
-    // ceiling — i.e. the response is capped.
-    let truncated = args.limit.is_some_and(|l| l > limit);
+    let truncated = limit_was_clamped(args.limit, limit);
     let text = match serde_json::to_string(&SuccessPayload { entries, truncated }) {
         Ok(t) => t,
         Err(_) => return error_outcome(id, "internal", "failed to serialize result"),
@@ -258,6 +270,35 @@ mod tests {
     #[test]
     fn effective_limit_uses_default_when_absent() {
         assert_eq!(effective_limit(None), DEFAULT_HISTORY_LIMIT);
+    }
+
+    /// `truncated` means "your limit was clamped", never "there is more
+    /// data". An agent that reads it the second way retries with a bigger
+    /// `limit` against a ceiling that cannot yield more, instead of widening
+    /// `since`. Pin every branch of that distinction.
+    #[test]
+    fn truncated_reports_the_ceiling_clamp_only() {
+        let ceiling = super::super::GATEWAY_ROW_LIMIT_CEILING;
+
+        // Above the ceiling: clamped, so flagged.
+        assert!(limit_was_clamped(
+            Some(u32::MAX),
+            effective_limit(Some(u32::MAX))
+        ));
+
+        // Exactly at the ceiling: honoured verbatim, nothing clamped.
+        assert!(!limit_was_clamped(
+            Some(ceiling),
+            effective_limit(Some(ceiling))
+        ));
+
+        // A small limit is honoured — even when more entries exist, which
+        // this flag deliberately says nothing about.
+        assert!(!limit_was_clamped(Some(10), effective_limit(Some(10))));
+
+        // No caller limit: the default applies and nothing was asked for
+        // that could be clamped.
+        assert!(!limit_was_clamped(None, effective_limit(None)));
     }
 
     /// `since` parsing is the edge that decides whether a malformed value
