@@ -65,7 +65,7 @@ it yourself](website/docs/benchmarks.md).
 
 **For Backend Developers:** Query production databases safely using natural language. No database passwords on your laptop, every query attributed to your identity.
 
-**For Data Analytics:** Self-service access to every database the gateway fronts, through a single interface, with built-in resource limits.
+**For Data Analytics:** Self-service access to every supported query target the gateway fronts, through a single interface, with built-in resource limits.
 
 **For Security/Compliance:** Centralized database access control with user attribution, query logging, and enforceable constraints (timeouts, row limits, schema filtering).
 
