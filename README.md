@@ -19,7 +19,7 @@ before any result goes back.
 
 ## Install
 
-**v1.5.0 — stable, in production use.** One image, one YAML file, one Postgres:
+**v1.5.0 — stable, in production use.** One image, one YAML file, and one Postgres for the gateway's own state:
 
 ```bash
 docker pull ghcr.io/developerz-ai/db-mcp-gateway:1.5.0
@@ -84,7 +84,7 @@ it yourself](website/docs/benchmarks.md).
 - **Read-only by default, writes opt-in per grant** — per-database least-privilege roles; a `query_write` grant permits data writes (INSERT/UPDATE/DELETE), never schema changes. Statement timeouts and row caps enforced at the DB *and* gateway layer.
 - **Permissions in YAML** — group × server × database × action, with per-grant constraints (`require_reason`, `row_limit`, `statement_timeout_ms`, allow/deny schemas, time windows). Reviewed by PR, with the full change history git already gives you.
 - **Synchronous audit log** — user, SQL, reason, row count, duration, outcome. The write commits *before* the response is sent; if it fails, the request fails. Hot retention in Postgres, optional S3/GCS/Azure archive, OTLP/syslog/stdout sinks.
-- **Boring deployment** — `docker pull`, one YAML file, one Postgres. No agent runtime, no query builder, no credential vault to operate.
+- **Boring deployment** — `docker pull`, one YAML file, and one Postgres for the gateway's own state. The databases your agents query are your existing ones; the [local quickstart](website/docs/deployment/quickstart.md#run-it-locally) stands up a throwaway target too, so you can try it end to end without pointing at anything real. No agent runtime, no query builder, no credential vault to operate.
 
 [Complete feature documentation →](website/docs/features.md)
 
