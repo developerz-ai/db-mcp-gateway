@@ -115,7 +115,7 @@ The dispatch line (`message = "tool dispatched"`) carries additionally:
 | `tool` | string | Tool name (`run_query`, `explain`, …) |
 | `server` | string | Logical server name from call args, empty for tools that aren't server-scoped |
 | `db` | string | Logical database name from call args, empty for tools that aren't database-scoped |
-| `outcome` | string | One of the spec 03 codes (`success` / `forbidden` / `forbidden_sql` / `timeout` / `syntax_error` / `unavailable` / `rate_limited` / `service_overloaded` / `internal`) |
+| `outcome` | string | One of the spec 03 codes (`success` / `forbidden` / `forbidden_sql` / `invalid_arguments` / `timeout` / `syntax_error` / `unavailable` / `rate_limited` / `service_overloaded` / `internal`) |
 | `duration_ms` | integer | Wall-clock the tool itself took. `0` for outcomes where no tool work ran (e.g. `forbidden` before dispatch). |
 
 The audit-write-failure line adds:

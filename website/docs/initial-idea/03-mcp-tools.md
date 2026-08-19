@@ -68,7 +68,7 @@ Args: `server`, `database`, optional `since` (RFC 3339), optional `limit`. Retur
 
 **Scoping is the security-critical contract.** The filter is on the SSO-verified identity (`identity.user_sub`) from the session middleware — NEVER on a client-supplied `user` field. The arguments struct uses `#[serde(deny_unknown_fields)]`; any attempt to pass `user` (or any other unknown key) is rejected with JSON-RPC `invalid_params` before the request reaches the audit table. The `WHERE` clause is `user_sub = $1 AND server_name = $2 AND database_name = $3` (the composite index `audit_calls_user_occurred_idx` from migration 0003 covers it).
 
-`limit` defaults to 100 and is clamped to `GATEWAY_ROW_LIMIT_CEILING` (100,000); a hostile `u32::MAX` request is clamped, not honoured. When the response is truncated, the `truncated` flag is `true`.
+`limit` defaults to 100 and is clamped to `GATEWAY_ROW_LIMIT_CEILING` (100,000); a hostile `u32::MAX` request is clamped, not honoured. The `truncated` flag reports exactly that clamp: it is `true` when the caller's `limit` exceeded the ceiling and was lowered. It does **not** mean "more entries exist" — a caller who asks for 10 of their 50 entries gets 10 with `truncated: false`, because nothing was withheld beyond what they asked for. To see further back, widen `since` rather than raising `limit`.
 
 `since` is parsed at the edge as RFC 3339; a malformed value is rejected with `invalid_params` rather than silently dropping the filter.
 
@@ -85,6 +85,7 @@ Errors are structured JSON, not free-text strings. Shape: `{ "error": { "categor
 | `unauthenticated` | 401 | Token missing/expired — agent triggers re-login |
 | `forbidden` | 403 | Authenticated but permission denied for this server/db/action |
 | `forbidden_sql` | 403 | SQL rejected before reaching the DB: statement not covered by the grant (a write without `query_write`, or a schema mod / `COPY` / multi-statement in any mode), `EXPLAIN ANALYZE`, or dangerous function (`pg_read_file`, `lo_export`, …) |
+| `invalid_arguments` | 400 | Post-deserialisation argument validation failed (`limit: 0`, malformed `since`, other per-tool bounds). JSON-RPC envelope carries `invalid_params` (-32602); the audit row records the code so the boundary rejection is still accountable. |
 | `reason_required` | 400 | Policy requires a reason for this call; none provided |
 | `timeout` | 408 | Statement timeout fired (30 s ceiling) |
 | `row_limit_exceeded` | 200 | Result truncated at configured cap (flag in response, not an error response) |
