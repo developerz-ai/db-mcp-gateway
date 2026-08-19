@@ -12,6 +12,7 @@
 pub mod audit_dispatch;
 pub mod describe_schema;
 pub mod explain;
+pub mod get_query_history;
 pub mod list_databases;
 pub mod list_servers;
 pub mod run_query;
@@ -76,6 +77,7 @@ pub use audit_dispatch::RequestContext;
 // never drift apart.
 pub use crate::transport::protocol::DESCRIBE_SCHEMA_TOOL as DESCRIBE_SCHEMA;
 pub use crate::transport::protocol::EXPLAIN_TOOL as EXPLAIN;
+pub use crate::transport::protocol::GET_QUERY_HISTORY_TOOL as GET_QUERY_HISTORY;
 pub use crate::transport::protocol::LIST_DATABASES_TOOL as LIST_DATABASES;
 pub use crate::transport::protocol::LIST_SERVERS_TOOL as LIST_SERVERS;
 pub use crate::transport::protocol::RUN_QUERY_TOOL as RUN_QUERY;
@@ -232,6 +234,18 @@ pub async fn dispatch_call(
                 )
                 .await
             }
+            GET_QUERY_HISTORY => {
+                get_query_history::run(
+                    id,
+                    identity,
+                    config,
+                    permissions_cache,
+                    state_db,
+                    request_ctx,
+                    call.arguments,
+                )
+                .await
+            }
             other => Response::error(
                 id,
                 ErrorObject::invalid_params(format!("unknown tool: {other}")),
@@ -257,4 +271,65 @@ fn span_targets(call: &CallParams) -> (&str, &str) {
     let server = args.get("server").and_then(Value::as_str).unwrap_or("");
     let database = args.get("database").and_then(Value::as_str).unwrap_or("");
     (server, database)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::SessionId;
+    use crate::transport::protocol::ToolsListResult;
+    use serde_json::json;
+
+    fn identity() -> Identity {
+        Identity {
+            session_id: SessionId::new(),
+            user_sub: "sub-1".to_string(),
+            user_email: "dev@example.com".to_string(),
+            groups: vec!["engineers".to_string()],
+            issued_at: chrono::Utc::now(),
+        }
+    }
+
+    /// `tools/list` is a promise; `dispatch_call`'s match is the only thing
+    /// that keeps it. Nothing in the type system ties them together, so
+    /// deleting a handler leaves the advertisement behind and the gateway
+    /// starts offering agents a tool that answers `unknown tool` — which is
+    /// exactly what happened between #187 and #189 (see #212).
+    ///
+    /// Every advertised name is dispatched here with empty arguments. What
+    /// each tool then *does* varies (`invalid_params` for missing arguments,
+    /// an audit-unavailable error with no state DB), and none of that is
+    /// asserted — the single claim is that no name falls through to the
+    /// catch-all arm.
+    #[tokio::test]
+    async fn every_advertised_tool_has_a_dispatch_arm() {
+        let identity = identity();
+        let config = ConfigFile::from_yaml_str("servers: []\n").expect("empty config parses");
+        let registry = AdapterRegistry::new();
+        let request_ctx = RequestContext::default();
+
+        for tool in ToolsListResult::current().tools {
+            let response = dispatch_call(
+                json!(1),
+                Some(&identity),
+                &config,
+                &registry,
+                None,
+                None,
+                &request_ctx,
+                Some(json!({ "name": tool.name, "arguments": {} })),
+            )
+            .await;
+
+            if let Some(err) = response.error {
+                assert!(
+                    !err.message.contains("unknown tool"),
+                    "`{}` is advertised in tools/list but tools/call cannot \
+                     dispatch it: {}",
+                    tool.name,
+                    err.message,
+                );
+            }
+        }
+    }
 }
