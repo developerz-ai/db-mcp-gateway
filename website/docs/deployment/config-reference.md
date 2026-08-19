@@ -40,7 +40,7 @@ Boot-time validation (issue #16):
 | Key | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `name` | string | **yes** | — | Stable identifier used in grants, audit, and `list_servers`. |
-| `kind` | `postgres` \| `mongo` \| `mysql` \| `mssql` | **yes** | — | `postgres` and `mongo` work today (#56–#58); `mysql` / `mssql` parse but abort on first dispatch with `UnsupportedAdapter`. |
+| `kind` | `postgres` \| `mongo` \| `mysql` \| `mssql` | **yes** | — | `postgres` and `mongo` work today (#56–#58); `mysql` / `mssql` parse but are **rejected by boot validation** — the process refuses to start (`ServerKind::has_adapter`). Unrelated to `permissions_store.driver: mysql`, which is supported. |
 | `host` | string | **yes** | — | DNS or IP of the target DB. |
 | `port` | u16 | no | `5432` | |
 | `tls` | `required` \| `insecure` | no | `required` | `insecure` logs a warning every minute when used in prod. |
