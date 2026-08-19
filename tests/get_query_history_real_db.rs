@@ -55,16 +55,26 @@ struct BootedGateway {
     user_sub: String,
 }
 
+/// The default gateway: a caller in `historians`, which holds `history_read`.
 async fn boot_gateway() -> BootedGateway {
+    boot_gateway_with("historians", "test-user", E2E_YAML).await
+}
+
+/// Boot a gateway whose caller belongs to `group`, against `yaml`.
+///
+/// Parameterized rather than copied: every field added to `AppState` would
+/// otherwise need the same edit in two places, and the copy silently rots
+/// when only one is updated.
+async fn boot_gateway_with(group: &str, sub_prefix: &str, yaml: &str) -> BootedGateway {
     let pool = state::connect(&state_db_url(), 5)
         .await
         .expect("state DB up (run `bin/dev up`)");
 
-    let user_sub = format!("test-user-{}", Uuid::new_v4().simple());
+    let user_sub = format!("{sub_prefix}-{}", Uuid::new_v4().simple());
     let user = MockUser {
         sub: user_sub.clone(),
         email: format!("{user_sub}@example.com"),
-        groups: vec!["historians".to_string()],
+        groups: vec![group.to_string()],
     };
     let idp = spawn_mock_idp("test-client", "test-secret", user).await;
 
@@ -87,7 +97,7 @@ async fn boot_gateway() -> BootedGateway {
         bind: addr,
         ..Config::default()
     };
-    let config_file = ConfigFile::from_yaml_str(E2E_YAML).expect("e2e yaml is well-formed");
+    let config_file = ConfigFile::from_yaml_str(yaml).expect("e2e yaml is well-formed");
 
     let app = transport::router(
         &config,
@@ -204,6 +214,47 @@ async fn write_audit_row(
         .expect("shift occurred_at");
 }
 
+/// CLAUDE.md: "Every integration test that hits a tool asserts an audit row
+/// exists. Tool failed authz → audit row with `outcome: forbidden`."
+///
+/// The dispatch audit row is what makes this tool accountable — without it a
+/// caller could read other users' query metadata with no trace. A regression
+/// that dropped the audit write would otherwise pass every assertion in this
+/// file, since they all stop at the JSON-RPC envelope.
+///
+/// `sql` must be NULL: this tool takes no SQL, and a non-NULL value would mean
+/// the dispatch header was populated from the wrong tool's arguments.
+async fn assert_dispatch_audited(pool: &sqlx::PgPool, user_sub: &str, outcome: &str) {
+    #[derive(sqlx::FromRow)]
+    struct DispatchRow {
+        outcome: String,
+        sql: Option<String>,
+        server_name: Option<String>,
+        database_name: Option<String>,
+    }
+
+    let row: Option<DispatchRow> = sqlx::query_as(
+        "SELECT outcome, sql, server_name, database_name \
+         FROM audit_calls \
+         WHERE user_sub = $1 AND tool = 'get_query_history' \
+         ORDER BY occurred_at DESC LIMIT 1",
+    )
+    .bind(user_sub)
+    .fetch_optional(pool)
+    .await
+    .expect("audit query");
+
+    let row = row.unwrap_or_else(|| panic!("no `get_query_history` audit row for {user_sub}"));
+    assert_eq!(row.outcome, outcome, "audit row outcome for {user_sub}");
+    assert!(
+        row.sql.is_none(),
+        "get_query_history writes no SQL, got {:?}",
+        row.sql,
+    );
+    assert_eq!(row.server_name.as_deref(), Some("target"));
+    assert_eq!(row.database_name.as_deref(), Some("app"));
+}
+
 async fn call_history(url: &str, bearer: &str, arguments: Value) -> Value {
     client()
         .post(format!("{url}/mcp"))
@@ -274,6 +325,8 @@ async fn history_returns_only_callers_own_rows() {
         assert!(entry["occurred_at"].is_string());
         assert_eq!(entry["outcome"], "success");
     }
+
+    assert_dispatch_audited(pool, sub, "success").await;
 }
 
 /// THE SECURITY TEST at the integration boundary. A caller smuggles a
@@ -336,23 +389,15 @@ async fn history_clamps_hostile_limit_to_ceiling() {
         body["truncated"], true,
         "ceiling clamp must flag truncation"
     );
+
+    assert_dispatch_audited(&booted.state_db, &booted.user_sub, "success").await;
 }
 
 #[tokio::test]
 async fn history_forbidden_without_grant() {
-    // Boot a gateway whose user has `query_read` only — NOT `history_read`.
-    // Per #170 the grant is standalone; `query_read` does not imply it.
-    let pool = state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up");
-    let user_sub = format!("queryonly-{}", Uuid::new_v4().simple());
-    let user = MockUser {
-        sub: user_sub.clone(),
-        email: format!("{user_sub}@example.com"),
-        groups: vec!["query-only".to_string()],
-    };
-    let idp = spawn_mock_idp("test-client", "test-secret", user).await;
-    let yaml = r#"
+    // A caller with `query_read` only — NOT `history_read`. Per #170 the
+    // grant is standalone; `query_read` does not imply it.
+    const QUERY_ONLY_YAML: &str = r#"
 servers:
   - name: target
     kind: postgres
@@ -368,84 +413,44 @@ permissions:
     grants:
       - { server: target, database: app, action: query_read }
 "#;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let gateway_url = format!("http://{addr}");
-    let auth_config = AuthConfig {
-        issuer: idp.issuer.clone(),
-        client_id: idp.client_id.clone(),
-        client_secret: idp.client_secret.clone(),
-        audience: idp.client_id.clone(),
-        redirect_url: format!("{gateway_url}/auth/callback"),
-        ..AuthConfig::default()
-    };
-    let sessions = SessionStore::new(pool.clone());
-    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient");
-    let config = Config {
-        bind: addr,
-        ..Config::default()
-    };
-    let config_file = ConfigFile::from_yaml_str(yaml).expect("yaml");
-    let app = transport::router(
-        &config,
-        AppState {
-            auth: Some(AuthFacade {
-                config: Arc::new(auth_config),
-                sessions,
-                oidc,
-                flows: PendingFlows::default(),
-                codes: db_mcp_gateway::transport::AuthCodes::default(),
-                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
-                service_tokens: Default::default(),
-            }),
-            config: Arc::new(config_file),
-            state_db: Some(pool.clone()),
-            adapter_registry: AdapterRegistry::new(),
-            shutdown: Default::default(),
-            metrics: None,
-            permissions_cache: None,
-            permissions_repo: None,
-            mcp_path: std::sync::Arc::from("/mcp"),
-            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
-        },
-    )
-    .expect("router");
-    tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await;
-    });
-    let c = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-    let login: Value = c
-        .post(format!("{gateway_url}/auth/login"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let login_url = login["login_url"].as_str().unwrap();
-    let authorize = c.get(login_url).send().await.unwrap();
-    let callback = authorize.headers()["location"]
-        .to_str()
-        .unwrap()
-        .to_string();
-    let cb: Value = c.get(&callback).send().await.unwrap().json().await.unwrap();
-    let bearer = cb["session_token"].as_str().unwrap().to_string();
+    let booted = boot_gateway_with("query-only", "queryonly", QUERY_ONLY_YAML).await;
 
     let resp = call_history(
-        &gateway_url,
-        &bearer,
+        &booted.url,
+        &booted.bearer,
         json!({ "server": "target", "database": "app" }),
     )
     .await;
     assert_eq!(resp["result"]["isError"], true, "{resp}");
     let body = payload(&resp);
     assert_eq!(body["code"], "forbidden");
+
+    // A denial is exactly the event an audit log exists to record.
+    assert_dispatch_audited(&booted.state_db, &booted.user_sub, "forbidden").await;
+}
+
+/// The advertised schema says `"limit": { "minimum": 1 }`. A `limit: 0` that
+/// reached the query would return `entries: []` — indistinguishable from "you
+/// have no history", which is a wrong answer rather than an error. Reject it
+/// at the boundary, where the rest of this tool's input validation lives.
+#[tokio::test]
+async fn history_rejects_zero_limit() {
+    let booted = boot_gateway().await;
+
+    let resp = call_history(
+        &booted.url,
+        &booted.bearer,
+        json!({ "server": "target", "database": "app", "limit": 0 }),
+    )
+    .await;
+    assert!(
+        resp["error"].is_object(),
+        "expected JSON-RPC error envelope, got {resp}",
+    );
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32602),
+        "expected invalid_params, got {}",
+        resp["error"],
+    );
 }

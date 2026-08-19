@@ -139,6 +139,17 @@ pub async fn run(
             );
         }
     };
+    // The advertised schema declares `"limit": { "minimum": 1 }`; enforce it
+    // here so the typed value carries the constraint. Left unchecked, a
+    // `limit: 0` flows through as an empty `entries` array — a wrong answer
+    // ("you have no history") dressed as a right one, which is worse than an
+    // error. Validated once, at the edge, like `since`.
+    if args.limit == Some(0) {
+        return Response::error(
+            id,
+            ErrorObject::invalid_params("`limit` must be at least 1"),
+        );
+    }
     let limit = effective_limit(args.limit);
 
     let header = AuditHeader {
@@ -210,6 +221,12 @@ async fn compute_outcome(
         return error_outcome(id, "forbidden", "no grants for this server/database");
     };
 
+    // Defense-in-depth, not a live path: `audit_dispatch` refuses a dispatch
+    // with no state DB before it ever polls this future, so today nothing
+    // reaches here. Kept for the same reason `AdapterRegistry`'s
+    // `UnsupportedAdapter` arm is kept behind config validation — the guard
+    // is one refactor away from mattering, and a `compute_outcome` that
+    // silently assumed a pool would be a worse failure than a dead branch.
     let Some(state_db) = state_db else {
         return error_outcome(id, "unavailable", "state DB unavailable");
     };
