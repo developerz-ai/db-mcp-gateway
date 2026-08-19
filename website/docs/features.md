@@ -123,7 +123,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
   - `explain` - Get query execution plans
 
 ### Multi-Database Support
-- **What it does:** Single gateway instance supports PostgreSQL, MySQL, and MongoDB
+- **What it does:** Single gateway instance fronts PostgreSQL and MongoDB targets (MySQL/MSSQL are rejected at boot — see [multi-db](usage/multi-db.md))
 - **How it works:** Abstracted database drivers with unified MCP interface
 - **Operations benefit:** One deployment serves mixed database environments
 - **Workflow benefit:** AI agents can cross-reference data across database types

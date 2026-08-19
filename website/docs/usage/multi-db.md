@@ -14,7 +14,7 @@ Pair with [`first-query.md`](first-query.md) for the Postgres-only quickstart; t
 | `maxTimeMS` injection for statement timeout (#58) | works |
 | Cancellation: drop the cursor → mongo kills server-side (#58) | works |
 | `outcome = "cancelled"` audit row on agent disconnect (#58) | works |
-| MySQL or MSSQL query targets | not implemented; `server.kind: mysql\|mssql` aborts at first dispatch with a typed `UnsupportedAdapter` error |
+| MySQL or MSSQL query targets | not implemented; `server.kind: mysql\|mssql` is **rejected at boot** — the gateway refuses to start rather than accepting a config every query would fail |
 
 ## Declaring a mongo target
 

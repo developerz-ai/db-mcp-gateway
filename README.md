@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="website/static/img/logo.png" alt="db-mcp-gateway" width="200">
+  <img src="https://raw.githubusercontent.com/developerz-ai/db-mcp-gateway/main/website/static/img/logo.png" alt="db-mcp-gateway" width="200">
 </p>
 
 <h1 align="center">db-mcp-gateway</h1>
@@ -33,7 +33,29 @@ Your team deploys it once. Developers add one URL to their AI agent's MCP config
 
 ## 🚧 Status
 
-**v1.1.1 — stable.** In production use. Pull it: `docker pull ghcr.io/developerz-ai/db-mcp-gateway:1.1.1` — multi-arch (`linux/amd64`, `linux/arm64`). Targets: PostgreSQL and MongoDB (MySQL/MSSQL rejected at boot). See [`docs/deployment/releasing.md`](docs/deployment/releasing.md) for the compatibility policy.
+**v1.1.1 — stable.** In production use. Pull it: `docker pull ghcr.io/developerz-ai/db-mcp-gateway:1.1.1` — multi-arch (`linux/amd64`, `linux/arm64`). Targets: PostgreSQL and MongoDB (MySQL/MSSQL rejected at boot). See [`website/docs/deployment/releasing.md`](website/docs/deployment/releasing.md) for the compatibility policy.
+
+---
+
+## Supported databases
+
+"MySQL" means two unrelated things here, so both are stated once, in one table.
+**Query targets** are what an agent can read through the gateway. The
+**permissions store** is where the gateway keeps its own grant metadata — an
+agent never touches it.
+
+| | PostgreSQL | MongoDB | MySQL | MSSQL |
+|---|---|---|---|---|
+| **Query target** — agents can query it | yes | yes | no — [rejected at boot](website/docs/usage/multi-db.md) | no — rejected at boot |
+| **Permissions store** — gateway's own state | yes | no, by design | resolver path only, [no admin API](website/docs/deployment/admin-api.md) | no |
+
+A `server.kind` of `mysql` or `mssql` refuses to start rather than booting
+clean and failing every query, so a wrong config is caught at deploy time and
+not by a user. MySQL and MSSQL query adapters are on the roadmap.
+
+**Performance:** we publish no benchmark numbers. We removed the ones we had
+because nobody had measured them — [here is what happened and how to measure
+it yourself](website/docs/benchmarks.md).
 
 ---
 
@@ -43,7 +65,7 @@ Your team deploys it once. Developers add one URL to their AI agent's MCP config
 
 **For Backend Developers:** Query production databases safely using natural language. No database passwords on your laptop, every query attributed to your identity.
 
-**For Data Analytics:** Self-service access to multiple databases (PostgreSQL, MySQL, MongoDB) through a single interface with built-in resource limits.
+**For Data Analytics:** Self-service access to every database the gateway fronts, through a single interface, with built-in resource limits.
 
 **For Security/Compliance:** Centralized database access control with user attribution, query logging, and enforceable constraints (timeouts, row limits, schema filtering).
 
@@ -53,10 +75,10 @@ Your team deploys it once. Developers add one URL to their AI agent's MCP config
 
 - **AI Agent Database Access:** Claude Code agents query production databases for debugging and analysis without ever handling database credentials
 - **Analytics Without Direct Access:** Business analysts ask questions in natural language, gateway enforces read-only and resource limits automatically
-- **Multi-Database Workflows:** AI agents query across PostgreSQL, MySQL, and MongoDB with unified security and audit trail
+- **Multi-Database Workflows:** AI agents query across PostgreSQL and MongoDB with unified security and audit trail
 - **Production Debugging with Compliance:** On-call engineers investigate incidents with enforced reason logging and time limits
 
-**[Read detailed use cases →](docs/use-cases.md)**
+**[Read detailed use cases →](website/docs/use-cases.md)**
 
 ---
 
@@ -72,9 +94,9 @@ Your team deploys it once. Developers add one URL to their AI agent's MCP config
 
 **🤖 MCP-Native:** Purpose-built for AI agents with complete tool surface (list databases, describe schema, run queries, explain plans, query history).
 
-**🏗️ Multi-Database:** Single gateway supports PostgreSQL, MySQL, and MongoDB with consistent security model and unified audit trail.
+**🏗️ Multi-Database:** One gateway fronts every [supported target](#supported-databases) with one security model and one audit trail.
 
-**[Read complete feature documentation →](docs/features.md)**
+**[Read complete feature documentation →](website/docs/features.md)**
 
 ---
 
@@ -83,14 +105,14 @@ Your team deploys it once. Developers add one URL to their AI agent's MCP config
 | If you're… | Read |
 |---|---|
 | 💡 Trying to understand what this is | [`website/docs/initial-idea/01-overview.md`](website/docs/initial-idea/01-overview.md) |
-| 🛠️ A developer whose org already runs it | [`docs/usage/first-query.md`](docs/usage/first-query.md) (5-min walkthrough) → [`docs/usage/claude-code.md`](docs/usage/claude-code.md) (reference) |
-| 🏗️ A platform/SRE deploying it | [`docs/deployment/quickstart.md`](docs/deployment/quickstart.md) |
-| 🤖 Adding it to a non-Claude MCP client | [`docs/usage/other-agents.md`](docs/usage/other-agents.md) |
-| 📦 Cutting a release | [`docs/deployment/releasing.md`](docs/deployment/releasing.md) |
+| 🛠️ A developer whose org already runs it | [`website/docs/usage/first-query.md`](website/docs/usage/first-query.md) (5-min walkthrough) → [`website/docs/usage/claude-code.md`](website/docs/usage/claude-code.md) (reference) |
+| 🏗️ A platform/SRE deploying it | [`website/docs/deployment/quickstart.md`](website/docs/deployment/quickstart.md) |
+| 🤖 Adding it to a non-Claude MCP client | [`website/docs/usage/other-agents.md`](website/docs/usage/other-agents.md) |
+| 📦 Cutting a release | [`website/docs/deployment/releasing.md`](website/docs/deployment/releasing.md) |
 | 🚫 Wondering what it *won't* do | [`website/docs/initial-idea/10-non-goals.md`](website/docs/initial-idea/10-non-goals.md) |
 | 🗺️ Tracking what's built vs planned | [`website/docs/initial-idea/11-roadmap.md`](website/docs/initial-idea/11-roadmap.md) |
-| 📊 Performance benchmarks | [`docs/benchmarks.md`](docs/benchmarks.md) |
-| ⚖️ vs alternatives | [`docs/comparison.md`](docs/comparison.md) |
+| 📊 Performance benchmarks | [`website/docs/benchmarks.md`](website/docs/benchmarks.md) |
+| ⚖️ vs alternatives | [`website/docs/comparison.md`](website/docs/comparison.md) |
 
 ---
 
@@ -141,7 +163,7 @@ Pinned to a version (recommended in prod):
 docker pull ghcr.io/developerz-ai/db-mcp-gateway:1.1.1
 ```
 
-Multi-arch (amd64 + arm64). Built reproducibly from a `v*` git tag — see [`docs/deployment/releasing.md`](docs/deployment/releasing.md).
+Multi-arch (amd64 + arm64). Built reproducibly from a `v*` git tag — see [`website/docs/deployment/releasing.md`](website/docs/deployment/releasing.md).
 
 ---
 
@@ -151,7 +173,7 @@ Multi-arch (amd64 + arm64). Built reproducibly from a `v*` git tag — see [`doc
 claude mcp add --transport http db-gateway --scope project https://db.internal.acme.com
 ```
 
-That's the whole client-side setup. First call triggers SSO. Walk through it end-to-end in [`docs/usage/first-query.md`](docs/usage/first-query.md), or jump to the full reference in [`docs/usage/claude-code.md`](docs/usage/claude-code.md).
+That's the whole client-side setup. First call triggers SSO. Walk through it end-to-end in [`website/docs/usage/first-query.md`](website/docs/usage/first-query.md), or jump to the full reference in [`website/docs/usage/claude-code.md`](website/docs/usage/claude-code.md).
 
 ---
 
