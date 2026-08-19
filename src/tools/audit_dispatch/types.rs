@@ -11,9 +11,9 @@ use crate::transport::jsonrpc::Response;
 #[derive(Debug)]
 pub struct Outcome {
     pub response: Response,
-    /// `"success"` or a spec 03 error code (`forbidden`, `timeout`,
-    /// `syntax_error`, `unavailable`, `reason_required`, `internal`,
-    /// `forbidden_sql`).
+    /// `"success"` or a spec 03 error code (`forbidden`, `forbidden_sql`,
+    /// `invalid_arguments`, `reason_required`, `timeout`, `syntax_error`,
+    /// `unavailable`, `internal`).
     pub code: &'static str,
     pub elapsed_ms: Option<i64>,
     /// Rows returned to the agent (after any truncation). `None` for tools

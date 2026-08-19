@@ -433,6 +433,12 @@ permissions:
 /// reached the query would return `entries: []` — indistinguishable from "you
 /// have no history", which is a wrong answer rather than an error. Reject it
 /// at the boundary, where the rest of this tool's input validation lives.
+///
+/// The rejection MUST still leave an audit row (`outcome: invalid_arguments`).
+/// Without it, a caller sweeping bad `limit` values to probe the tool's
+/// bounds against another user's server leaves no trail — .coderabbit.yaml
+/// §src/audit: "flag any code path that completes a tool call without an
+/// audit row".
 #[tokio::test]
 async fn history_rejects_zero_limit() {
     let booted = boot_gateway().await;
@@ -453,4 +459,35 @@ async fn history_rejects_zero_limit() {
         "expected invalid_params, got {}",
         resp["error"],
     );
+
+    assert_dispatch_audited(&booted.state_db, &booted.user_sub, "invalid_arguments").await;
+}
+
+/// Mirror the `limit: 0` audit-row requirement for the `since` parse failure:
+/// a caller sweeping malformed timestamps against a server they can see must
+/// still leave a `outcome: invalid_arguments` row. The two paths share
+/// `invalid_arguments_outcome`, so this is defence-in-depth against a future
+/// change that specialises one path and forgets the audit hook.
+#[tokio::test]
+async fn history_rejects_malformed_since_and_audits_it() {
+    let booted = boot_gateway().await;
+
+    let resp = call_history(
+        &booted.url,
+        &booted.bearer,
+        json!({ "server": "target", "database": "app", "since": "yesterday" }),
+    )
+    .await;
+    assert!(
+        resp["error"].is_object(),
+        "expected JSON-RPC error envelope, got {resp}",
+    );
+    assert_eq!(
+        resp["error"]["code"].as_i64(),
+        Some(-32602),
+        "expected invalid_params, got {}",
+        resp["error"],
+    );
+
+    assert_dispatch_audited(&booted.state_db, &booted.user_sub, "invalid_arguments").await;
 }

@@ -30,6 +30,14 @@ use super::audit_dispatch::{
     AuditHeader, Outcome, RequestContext, audit_dispatch, error_outcome, success_outcome,
 };
 
+/// Outcome code for post-deserialisation argument validation failures
+/// (`limit: 0`, malformed `since`). Spec 03 §Errors: audit-visible code
+/// paired with a JSON-RPC `invalid_params` (-32602) envelope, so a caller
+/// probing the boundary still leaves an audit trail. `deny_unknown_fields`
+/// deserialisation failures land BEFORE we know `(server, database)` and
+/// stay outside audit — mirrored in the spec.
+const INVALID_ARGUMENTS_CODE: &str = "invalid_arguments";
+
 const TOOL_NAME: &str = "get_query_history";
 /// Hard floor on entries returned when no caller `limit` is supplied.
 /// History is "recover context across sessions", not "bulk export" — small
@@ -94,6 +102,27 @@ fn limit_was_clamped(caller: Option<u32>, effective: u32) -> bool {
     caller.is_some_and(|asked| asked > effective)
 }
 
+/// Build an `Outcome` for a post-deserialisation argument rejection.
+///
+/// The wire response keeps the JSON-RPC `invalid_params` envelope (-32602)
+/// — this is a structural, transport-layer error, not a tool result — while
+/// the audit row records `outcome = "invalid_arguments"` so a caller
+/// probing the boundary with `limit: 0` or a malformed `since` still leaves
+/// a trail. `error_outcome` is the wrong shape here: it wraps the response
+/// as a `tool_error` (`isError: true` inside the tool result), which would
+/// change the wire contract for callers already relying on the JSON-RPC
+/// error envelope (see `history_rejects_smuggled_user_field`).
+fn invalid_arguments_outcome(id: Value, message: &str) -> Outcome {
+    Outcome {
+        response: Response::error(id, ErrorObject::invalid_params(message)),
+        code: INVALID_ARGUMENTS_CODE,
+        elapsed_ms: None,
+        row_count: None,
+        truncated: None,
+        error_message: Some(message.to_string()),
+    }
+}
+
 /// Parse an RFC 3339 timestamp at the edge. Any failure becomes a typed
 /// `invalid_params` so a malformed `since` doesn't silently mean "no filter"
 /// (which would let a caller pull history beyond their intended window).
@@ -128,30 +157,12 @@ pub async fn run(
         }
     };
 
-    let since = match parse_since(args.since.as_deref()) {
-        Ok(ts) => ts,
-        Err(()) => {
-            return Response::error(
-                id,
-                ErrorObject::invalid_params(
-                    "`since` must be an RFC 3339 timestamp (e.g. 2026-08-05T00:00:00Z)",
-                ),
-            );
-        }
-    };
-    // The advertised schema declares `"limit": { "minimum": 1 }`; enforce it
-    // here so the typed value carries the constraint. Left unchecked, a
-    // `limit: 0` flows through as an empty `entries` array — a wrong answer
-    // ("you have no history") dressed as a right one, which is worse than an
-    // error. Validated once, at the edge, like `since`.
-    if args.limit == Some(0) {
-        return Response::error(
-            id,
-            ErrorObject::invalid_params("`limit` must be at least 1"),
-        );
-    }
-    let limit = effective_limit(args.limit);
-
+    // Build the header before any post-deserialisation validation so a
+    // `since` / `limit` rejection can still be routed through
+    // `audit_dispatch`. Missing that row would leave the boundary probes
+    // (a caller sweeping bad `limit` values against another user's server)
+    // undetectable — .coderabbit.yaml §src/audit: "flag any code path that
+    // completes a tool call without an audit row".
     let header = AuditHeader {
         tool: TOOL_NAME,
         server: Some(&args.server),
@@ -161,6 +172,30 @@ pub async fn run(
         reason: None,
         db_type: super::db_type_for_server(config, &args.server),
     };
+
+    let since = match parse_since(args.since.as_deref()) {
+        Ok(ts) => ts,
+        Err(()) => {
+            let outcome = invalid_arguments_outcome(
+                id.clone(),
+                "`since` must be an RFC 3339 timestamp (e.g. 2026-08-05T00:00:00Z)",
+            );
+            let work = async move { outcome };
+            return audit_dispatch(id, identity, state_db, request_ctx, header, work).await;
+        }
+    };
+    // The advertised schema declares `"limit": { "minimum": 1 }`; enforce it
+    // here so the typed value carries the constraint. Left unchecked, a
+    // `limit: 0` flows through as an empty `entries` array — a wrong answer
+    // ("you have no history") dressed as a right one, which is worse than an
+    // error. Validated once, at the edge, like `since`, and audited through
+    // the same chokepoint so a `limit: 0` sweep leaves a trail.
+    if args.limit == Some(0) {
+        let outcome = invalid_arguments_outcome(id.clone(), "`limit` must be at least 1");
+        let work = async move { outcome };
+        return audit_dispatch(id, identity, state_db, request_ctx, header, work).await;
+    }
+    let limit = effective_limit(args.limit);
     let db_grants = match load_or_empty(permissions_cache, identity).await {
         Ok(g) => g,
         Err(err) => {

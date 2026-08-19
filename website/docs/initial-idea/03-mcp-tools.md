@@ -85,6 +85,7 @@ Errors are structured JSON, not free-text strings. Shape: `{ "error": { "categor
 | `unauthenticated` | 401 | Token missing/expired — agent triggers re-login |
 | `forbidden` | 403 | Authenticated but permission denied for this server/db/action |
 | `forbidden_sql` | 403 | SQL rejected before reaching the DB: statement not covered by the grant (a write without `query_write`, or a schema mod / `COPY` / multi-statement in any mode), `EXPLAIN ANALYZE`, or dangerous function (`pg_read_file`, `lo_export`, …) |
+| `invalid_arguments` | 400 | Post-deserialisation argument validation failed (`limit: 0`, malformed `since`, other per-tool bounds). JSON-RPC envelope carries `invalid_params` (-32602); the audit row records the code so the boundary rejection is still accountable. |
 | `reason_required` | 400 | Policy requires a reason for this call; none provided |
 | `timeout` | 408 | Statement timeout fired (30 s ceiling) |
 | `row_limit_exceeded` | 200 | Result truncated at configured cap (flag in response, not an error response) |
