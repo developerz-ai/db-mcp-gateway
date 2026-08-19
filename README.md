@@ -19,10 +19,10 @@ before any result goes back.
 
 ## Install
 
-**v1.1.1 — stable, in production use.** One image, one YAML file, one Postgres:
+**v1.5.0 — stable, in production use.** One image, one YAML file, one Postgres:
 
 ```bash
-docker pull ghcr.io/developerz-ai/db-mcp-gateway:1.1.1
+docker pull ghcr.io/developerz-ai/db-mcp-gateway:1.5.0
 ```
 
 Public on GHCR, no auth needed to pull. Multi-arch (`linux/amd64`,
@@ -96,7 +96,7 @@ it yourself](website/docs/benchmarks.md).
 |---|---|
 | **Platform / SRE** | Agent database access without credential exposure, and one place to revoke it |
 | **A backend developer** | Production queries for debugging with no password on your laptop, every one attributed to you |
-| **Data / analytics** | Self-service access across every supported target through one interface, with resource limits already enforced |
+| **Data / analytics engineers** | Agent-assisted access to supported targets through one interface, with resource limits already enforced |
 | **Security / compliance** | Per-query SSO attribution, enforced reason logging, and an audit trail you did not have to build |
 
 [Detailed use cases →](website/docs/use-cases.md)
