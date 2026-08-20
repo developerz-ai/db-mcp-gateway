@@ -102,10 +102,10 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 - **Privacy benefit:** Users see their own history, not teammates' queries
 - **Operations benefit:** Self-service audit access reduces support burden
 
-### Retention (hot tier shipped; archive/stream on the roadmap)
+### Retention (hot tier + stdout stream shipped; archive and syslog/OTLP/Kafka on the roadmap)
 
-- **What it does today:** Audit logs live in the gateway's Postgres with a configurable TTL (default 90 days) and an hourly pruner that deletes past it.
-- **Not shipped:** Cold-tier archive (S3/GCS/Azure) and streaming sinks (OTLP/syslog/stdout) for SIEM integration are [roadmap Phase 4](initial-idea/11-roadmap.md) — there is no `archive` or `stream` config key yet.
+- **What it does today:** Audit logs live in the gateway's Postgres with a configurable TTL (default 90 days) and an hourly pruner that deletes past it. Operators can also mirror every full audit row out to stdout for SIEM ingestion via `logging.stream: [{kind: stdout}]` — see [SIEM Integration](#siem-integration-stdout-shipped-syslogotlpkafka-on-the-roadmap) below.
+- **Not shipped:** Cold-tier archive (S3/GCS/Azure) and the remaining streaming sink kinds (`syslog`, `otlp`, `kafka`) are [roadmap Phase 4](initial-idea/11-roadmap.md) — there is no `archive` config key yet, and the parser rejects the unshipped `stream` kinds.
 - **Operations benefit:** Hot data stays fast today; cold-tier retention lands when Phase 4 ships.
 
 ---
@@ -165,10 +165,10 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 - **Security benefit:** No user accounts to manage, leverage existing corporate directory
 - **Operations benefit:** User onboarding/offboarding handled centrally, not per application
 
-### SIEM Integration (roadmap, not shipped)
+### SIEM Integration (stdout shipped; syslog/OTLP/Kafka on the roadmap)
 
-- **What it will do:** Stream audit logs to a SIEM via OTLP, syslog, or stdout sinks
-- **Status:** No streaming sink is implemented and there is no config key for one; [roadmap Phase 4](initial-idea/11-roadmap.md). The application logs the gateway process itself emits (JSON-per-line to stdout) are operational logs, not an audit export, and don't satisfy this.
+- **What it does today:** `logging.stream: [{kind: stdout}]` in YAML emits every full audit row as a distinct `target: "audit_stream"` tracing event — separate from the gateway's own operational logs (application logs are JSON-per-line to stdout too, but that's an operational log, not an audit export, and doesn't satisfy this on its own).
+- **Not shipped:** `syslog`, `otlp`, and `kafka` sink kinds — the config parser rejects them; [roadmap Phase 4](initial-idea/11-roadmap.md). This list mirrors the retention spec's [`Storage` table](initial-idea/07-logging-retention.md#storage).
 
 ### Multi-Cloud Archive (roadmap, not shipped)
 

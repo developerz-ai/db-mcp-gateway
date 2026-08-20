@@ -181,7 +181,16 @@ pub async fn run(
                 "`since` must be an RFC 3339 timestamp (e.g. 2026-08-05T00:00:00Z)",
             );
             let work = async move { outcome };
-            return audit_dispatch(id, identity, state_db, request_ctx, header, work).await;
+            return audit_dispatch(
+                id,
+                identity,
+                state_db,
+                request_ctx,
+                header,
+                &config.logging.stream,
+                work,
+            )
+            .await;
         }
     };
     // The advertised schema declares `"limit": { "minimum": 1 }`; enforce it
@@ -193,7 +202,16 @@ pub async fn run(
     if args.limit == Some(0) {
         let outcome = invalid_arguments_outcome(id.clone(), "`limit` must be at least 1");
         let work = async move { outcome };
-        return audit_dispatch(id, identity, state_db, request_ctx, header, work).await;
+        return audit_dispatch(
+            id,
+            identity,
+            state_db,
+            request_ctx,
+            header,
+            &config.logging.stream,
+            work,
+        )
+        .await;
     }
     let limit = effective_limit(args.limit);
     let db_grants = match load_or_empty(permissions_cache, identity).await {
@@ -202,7 +220,16 @@ pub async fn run(
             tracing::error!(%err, "permissions cache load failed");
             let resp = error_outcome(id.clone(), "internal", "permissions_cache_load_failed");
             let work = async move { resp };
-            return audit_dispatch(id, identity, state_db, request_ctx, header, work).await;
+            return audit_dispatch(
+                id,
+                identity,
+                state_db,
+                request_ctx,
+                header,
+                &config.logging.stream,
+                work,
+            )
+            .await;
         }
     };
     let work = compute_outcome(
@@ -215,7 +242,16 @@ pub async fn run(
         limit,
         state_db,
     );
-    audit_dispatch(id, identity, state_db, request_ctx, header, work).await
+    audit_dispatch(
+        id,
+        identity,
+        state_db,
+        request_ctx,
+        header,
+        &config.logging.stream,
+        work,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -9,20 +9,116 @@
 //!
 //! This test exercises the production code path:
 //!   1. Build a real `state_db` pool.
-//!   2. Call `audit_dispatch` with a `work` future that never resolves.
-//!   3. Spawn on a tokio task, give it a moment to reach `.await`.
-//!   4. Abort the task (drops the dispatch future).
-//!   5. Wait briefly for the detached audit-write spawn to land.
-//!   6. Assert the audit row exists with `outcome = "cancelled"`.
+//!   2. Call `audit_dispatch` with a `work` future that pings a `Notify` on
+//!      its first poll and then pends forever.
+//!   3. Spawn on a tokio task; wait on the notify to prove the dispatch
+//!      reached `work.await` (so the guard is armed).
+//!   4. Abort the task and await its `JoinHandle` — the returned
+//!      `JoinError::is_cancelled` proves the task's drop-guard has run.
+//!   5. Poll for the audit row with a bounded timeout — the guard's
+//!      detached `tokio::spawn` writes it whenever the runtime schedules it.
+//!   6. Assert the row exists with `outcome = "cancelled"`.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use db_mcp_gateway::audit;
 use db_mcp_gateway::auth::{Identity, SessionId};
+use db_mcp_gateway::config::StreamSinkConfig;
 use db_mcp_gateway::state;
 use db_mcp_gateway::tools::audit_dispatch::{AuditHeader, RequestContext, audit_dispatch};
 use serde_json::Value;
+use tokio::sync::Notify;
+use tracing_subscriber::fmt::MakeWriter;
 use uuid::Uuid;
+
+/// How long the drop-guard's detached audit write is allowed to take before we
+/// give up polling. Generous because the state DB may be under load in CI and
+/// this is fire-and-forget from a spawned task — but bounded so a genuine
+/// regression (guard never fires) fails the test in a finite time.
+const POLL_TIMEOUT: Duration = Duration::from_secs(5);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Poll `latest_for_user_tool` until it returns `Some` or the deadline elapses.
+/// Replaces the old fixed-sleep pattern — the detached `tokio::spawn` fired
+/// from `CancelledAuditGuard::drop` completes on its own schedule, so waiting
+/// on the row's existence is what we actually care about.
+async fn wait_for_audit_row(
+    pool: &sqlx::PgPool,
+    user_sub: &str,
+    tool: &str,
+) -> Option<audit::AuditRow> {
+    let deadline = tokio::time::Instant::now() + POLL_TIMEOUT;
+    loop {
+        if let Some(row) = audit::latest_for_user_tool(pool, user_sub, tool)
+            .await
+            .expect("audit query runs")
+        {
+            return Some(row);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Poll the captured tracing output for an `audit_stream` event carrying the
+/// given `request_id`. The stream fan-out fires from the drop-guard's
+/// detached spawn, so waiting on the buffer is the honest equivalent of
+/// waiting on the audit row. Returns the parsed event on success or the
+/// full captured text on timeout, so the caller can render it in a panic.
+///
+/// Collects *all* matching records rather than stopping at the first: spec
+/// 07 guarantees "one JSON-per-line record on stdout" per dispatch, so a
+/// silent duplicate is a regression. Panics rather than returning if the
+/// count is >1 — `find` would have hidden the second record.
+async fn wait_for_audit_stream_event(buf: &BufWriter, request_id: &str) -> Result<Value, String> {
+    let deadline = tokio::time::Instant::now() + POLL_TIMEOUT;
+    loop {
+        let raw = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let matches: Vec<Value> = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|v| {
+                v["target"].as_str() == Some("audit_stream")
+                    && v["request_id"].as_str() == Some(request_id)
+            })
+            .collect();
+        match matches.len() {
+            0 => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(raw);
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            1 => return Ok(matches.into_iter().next().unwrap()),
+            n => panic!(
+                "expected exactly 1 audit_stream event for request_id {request_id}, got {n} in:\n{raw}"
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for BufWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for BufWriter {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
 
 fn state_db_url() -> String {
     std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
@@ -55,8 +151,15 @@ async fn dropped_dispatch_leaves_cancelled_audit_row() {
     let id = Value::from(Uuid::new_v4().to_string());
     let ctx = RequestContext::default();
 
-    // The hanging work future: `pending` never resolves, so the
-    // dispatch's `work.await` is the cancellation point.
+    // `armed` signals the moment `work.await` is first polled — at that
+    // point `CancelledAuditGuard` is already on the stack (it's built
+    // synchronously before the await). Waiting on this notify replaces the
+    // old 50 ms guess and makes the test immune to scheduler jitter: if the
+    // task never reaches the await, we'd see the notify never fire rather
+    // than a silently-passing test that never exercised the drop path.
+    let armed = Arc::new(Notify::new());
+    let armed_for_work = armed.clone();
+
     let pool_for_dispatch = p.clone();
     let id_in = id.clone();
     let user_in = user.clone();
@@ -70,34 +173,41 @@ async fn dropped_dispatch_leaves_cancelled_audit_row() {
             reason: None,
             db_type: Some("mongo"),
         };
+        // First poll of this future runs the notify (sync) then parks on
+        // `pending().await`. So a `notified().await` from the test proves
+        // the dispatch reached `work.await` and the guard is armed.
+        let work = async move {
+            armed_for_work.notify_one();
+            std::future::pending::<db_mcp_gateway::tools::audit_dispatch::Outcome>().await
+        };
         let _ = audit_dispatch(
             id_in,
             &identity,
             Some(&pool_for_dispatch),
             &ctx,
             header,
-            std::future::pending::<db_mcp_gateway::tools::audit_dispatch::Outcome>(),
+            &[],
+            work,
         )
         .await;
     });
 
-    // Let the dispatch reach the `work.await`. 50ms is plenty: the path
-    // before the await is pure local work (build the guard, no I/O).
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Wait for the guard to arm, then abort. Awaiting the task (JoinError
+    // with `is_cancelled`) proves abort finished tearing the task down,
+    // which is what fires `CancelledAuditGuard::drop`. The detached audit
+    // write inside Drop runs on the runtime and lands whenever it lands —
+    // poll for it below rather than sleep on a fixed timer.
+    armed.notified().await;
     task.abort();
-    // Wait for the abort to propagate AND for the drop-spawned audit
-    // write to complete. Two reasons we sleep more than the path
-    // demands: tokio's `abort` is async, and `audit::log` does a real
-    // INSERT round-trip on the state DB.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let join = task.await;
+    assert!(
+        join.as_ref().err().is_some_and(|e| e.is_cancelled()),
+        "task should have been cancelled, got {join:?}"
+    );
 
-    // The cancelled row should be visible. `latest_for_user_tool` filters
-    // by (user_sub, tool) — we used a per-test user so no other row
-    // collides.
-    let row = audit::latest_for_user_tool(&p, &user, "run_query")
+    let row = wait_for_audit_row(&p, &user, "run_query")
         .await
-        .expect("audit query runs");
-    let row = row.expect("cancelled audit row was written");
+        .expect("cancelled audit row was written");
     assert_eq!(row.outcome, "cancelled");
     assert_eq!(row.user_sub, user);
     assert_eq!(row.tool, "run_query");
@@ -110,6 +220,102 @@ async fn dropped_dispatch_leaves_cancelled_audit_row() {
     );
 
     // Cleanup so reruns don't pile up cancellation rows for this user.
+    sqlx::query("DELETE FROM audit_calls WHERE user_sub = $1")
+        .bind(&user)
+        .execute(&p)
+        .await
+        .unwrap();
+}
+
+/// Cancellation with a configured `stdout` sink: the detached fallback
+/// runs `audit::log` first and then `audit::stream::send`, so the streamed
+/// event must be emitted after the durable cancelled row lands. Regression
+/// guard for spec 07 — a cancellation must not silently skip SIEM export
+/// when the operator has wired stdout streaming.
+#[tokio::test]
+async fn dropped_dispatch_streams_cancelled_row_when_stdout_configured() {
+    let p = pool().await;
+    let user = format!("cancel-test-stream-{}", Uuid::new_v4().simple());
+    let request_id = Uuid::new_v4();
+    let id = Value::from(Uuid::new_v4().to_string());
+    let ctx = RequestContext {
+        request_id,
+        ..RequestContext::default()
+    };
+
+    let buf = BufWriter::default();
+    // Global subscriber so the detached `tokio::spawn` fired from the
+    // guard's Drop lands under the same capture — `set_default`'s
+    // thread-local guard doesn't cover tasks spawned onto other worker
+    // threads, and the multi-thread runtime is where axum actually runs.
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .json()
+        .flatten_event(true)
+        .with_current_span(false)
+        .with_span_list(false)
+        .with_target(true)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // Same synchronization pattern as the sibling test above — see there
+    // for why fixed sleeps are unsafe.
+    let armed = Arc::new(Notify::new());
+    let armed_for_work = armed.clone();
+
+    let pool_for_dispatch = p.clone();
+    let id_in = id.clone();
+    let user_in = user.clone();
+    let task = tokio::spawn(async move {
+        let identity = identity(&user_in);
+        let header = AuditHeader {
+            tool: "run_query",
+            server: Some("prod"),
+            database: Some("app"),
+            sql: Some("SELECT 1"),
+            reason: None,
+            db_type: Some("postgres"),
+        };
+        let work = async move {
+            armed_for_work.notify_one();
+            std::future::pending::<db_mcp_gateway::tools::audit_dispatch::Outcome>().await
+        };
+        let _ = audit_dispatch(
+            id_in,
+            &identity,
+            Some(&pool_for_dispatch),
+            &ctx,
+            header,
+            &[StreamSinkConfig::Stdout],
+            work,
+        )
+        .await;
+    });
+
+    armed.notified().await;
+    task.abort();
+    let join = task.await;
+    assert!(
+        join.as_ref().err().is_some_and(|e| e.is_cancelled()),
+        "task should have been cancelled, got {join:?}"
+    );
+
+    let row = wait_for_audit_row(&p, &user, "run_query")
+        .await
+        .expect("cancelled audit row was written");
+    assert_eq!(row.outcome, "cancelled");
+    assert_eq!(row.request_id, request_id.to_string());
+
+    // The stream event fires from the same detached spawn — right after
+    // `audit::log` succeeds. Poll the buffer with the same bounded window
+    // instead of praying that 500 ms was enough.
+    let event = wait_for_audit_stream_event(&buf, &request_id.to_string())
+        .await
+        .unwrap_or_else(|raw| panic!("no audit_stream event for cancelled row in:\n{raw}"));
+    assert_eq!(event["outcome"].as_str(), Some("cancelled"));
+    assert_eq!(event["user_sub"].as_str(), Some(&*user));
+
     sqlx::query("DELETE FROM audit_calls WHERE user_sub = $1")
         .bind(&user)
         .execute(&p)
@@ -151,7 +357,7 @@ async fn completed_dispatch_does_not_leave_cancelled_row() {
             error_message: None,
         }
     };
-    let _ = audit_dispatch(id, &identity, Some(&p), &ctx, header, work).await;
+    let _ = audit_dispatch(id, &identity, Some(&p), &ctx, header, &[], work).await;
     // Give the detached write (audit::log) time to land.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -214,7 +420,7 @@ async fn audit_row_request_id_is_gateway_uuid_not_client_id() {
             error_message: None,
         }
     };
-    let _ = audit_dispatch(id.clone(), &identity, Some(&p), &ctx, header, work).await;
+    let _ = audit_dispatch(id.clone(), &identity, Some(&p), &ctx, header, &[], work).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let row = audit::latest_for_user_tool(&p, &user, "run_query")

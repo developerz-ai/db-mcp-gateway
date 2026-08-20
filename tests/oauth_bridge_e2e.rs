@@ -313,6 +313,7 @@ async fn spawn_authless_gateway_with_caps(
             admin: None,
             permissions_store: None,
             service_accounts: Vec::new(),
+            logging: Default::default(),
         }),
         adapter_registry: AdapterRegistry::new(),
         state_db: None,

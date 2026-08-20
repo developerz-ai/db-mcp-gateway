@@ -80,15 +80,29 @@ async fn run() -> anyhow::Result<()> {
     // JSON-per-line on stdout for Loki (see docs/deployment/logging.md for
     // the field contract). `flatten_event` hoists `tracing::info!(k = v, …)`
     // fields to the top level so Alloy doesn't need a nested-field stage;
-    // `with_target(false)` drops the noisy module path; spans don't render
-    // because every per-request field is also emitted on the event itself.
+    // spans don't render because every per-request field is also emitted on
+    // the event itself. `with_target(true)` preserves the event's `target`
+    // — the module path by default, but explicitly set on `audit_stream`
+    // events (see `src/audit/stream.rs`) so operators can route the SIEM
+    // export separately from operational logs. Dropping it here would
+    // silently break the spec 07 §Stream contract.
+    //
+    // Writes go through `tracing_appender::non_blocking` so a slow stdout
+    // consumer (a paused terminal, a jammed log pipeline, a full pipe) never
+    // blocks the request path — every `tracing::info!` on the hot path,
+    // including the `audit_stream` fan-out in `src/audit/stream.rs`, is
+    // fire-and-forget. `_log_guard` MUST live for the lifetime of `run` so
+    // the queue drains on shutdown; drop it early and the appender thread
+    // exits mid-flight, silently dropping the tail of the audit stream.
+    let (non_blocking_stdout, _log_guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .json()
         .flatten_event(true)
         .with_current_span(false)
         .with_span_list(false)
-        .with_target(false)
+        .with_target(true)
+        .with_writer(non_blocking_stdout)
         .init();
 
     // rustls 0.23 needs an explicit CryptoProvider; install before any TLS

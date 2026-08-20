@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 use crate::audit::{self, AuditError, AuditRow};
 use crate::auth::Identity;
+use crate::config::StreamSinkConfig;
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
 /// Per-call counter — `tool` is the tool name, `outcome` is the spec 03 code
@@ -67,6 +68,9 @@ struct CancelledAuditGuard {
     /// Tool name kept separately for the metric counter emitted from the
     /// drop path (audit row's `tool` field is moved into the spawn).
     tool: &'static str,
+    /// Owned copy — the spawned task outlives the borrow `audit_dispatch`
+    /// holds. Cheap: at most a handful of enum variants.
+    stream_sinks: Vec<StreamSinkConfig>,
 }
 
 impl CancelledAuditGuard {
@@ -136,20 +140,24 @@ impl Drop for CancelledAuditGuard {
         // does not stall the detached task forever. The row shares `id`
         // with any prior primary write, so `ON CONFLICT (id) DO NOTHING`
         // in `insert_row` makes this second attempt idempotent.
+        let stream_sinks = self.stream_sinks.clone();
         tokio::spawn(async move {
-            if let Err(err) = audit::log(&pool, &row).await {
-                tracing::error!(%err, "fallback audit row write failed");
+            match audit::log(&pool, &row).await {
+                Ok(()) => audit::stream::send(&stream_sinks, &row),
+                Err(err) => tracing::error!(%err, "fallback audit row write failed"),
             }
         });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn audit_dispatch<Fut>(
     id: Value,
     identity: &Identity,
     state_db: Option<&PgPool>,
     request_ctx: &RequestContext,
     header: AuditHeader<'_>,
+    stream_sinks: &[StreamSinkConfig],
     work: Fut,
 ) -> Response
 where
@@ -222,6 +230,7 @@ where
         }),
         state_db: Some(state_db.clone()),
         tool: header.tool,
+        stream_sinks: stream_sinks.to_vec(),
     };
     let outcome = work.await;
     // Work completed — mirror the outcome onto the guard's row so that if
@@ -325,7 +334,12 @@ where
         };
     }
 
-    // Primary audit landed. Release the guard so its Drop is a no-op.
+    // Primary audit landed. Stream fan-out happens only now — never before
+    // the durable write succeeds, and never on this function's error return
+    // above (a row that isn't the system of record yet must not be streamed
+    // as if it were).
+    audit::stream::send(stream_sinks, &row);
+    // Release the guard so its Drop is a no-op.
     cancel_guard.disarm();
     outcome.response
 }
@@ -430,6 +444,7 @@ mod tests {
             row: Some(empty_row()),
             state_db: None, // no pool needed for this pure test
             tool: "run_query",
+            stream_sinks: Vec::new(),
         };
         let out = outcome_success();
         guard.record_outcome(&out);
@@ -452,6 +467,7 @@ mod tests {
             row: None,
             state_db: None,
             tool: "run_query",
+            stream_sinks: Vec::new(),
         };
         guard.record_outcome(&outcome_success());
         assert!(guard.row.is_none());

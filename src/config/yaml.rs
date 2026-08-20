@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::schema::{Permission, Server, ServerKind, ServiceAccount};
+use super::schema::{LoggingBlock, Permission, Server, ServerKind, ServiceAccount};
 use super::secret::SecretError;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +33,9 @@ pub struct ConfigFile {
     /// token is accepted; the OIDC session path is the only way in.
     #[serde(default)]
     pub service_accounts: Vec<ServiceAccount>,
+    /// Spec 07 §Storage. Absent → no stream sinks, the pre-#218 behavior.
+    #[serde(default)]
+    pub logging: LoggingBlock,
 }
 
 /// Admin API gating. Mirrors spec 12 §"Admin API" YAML schema.
@@ -1464,5 +1467,45 @@ service_accounts:
             matches!(err, ConfigLoadError::Secret(SecretError::EnvNotSet(_))),
             "expected ConfigLoadError::Secret(EnvNotSet), got {err:?}"
         );
+    }
+
+    #[test]
+    fn absent_logging_block_means_no_stream_sinks() {
+        let config = ConfigFile::from_yaml_str("servers: []\n").expect("no logging block parses");
+        assert!(config.logging.stream.is_empty());
+    }
+
+    #[test]
+    fn parses_stdout_stream_sink() {
+        let config =
+            ConfigFile::from_yaml_str("servers: []\nlogging:\n  stream:\n    - kind: stdout\n")
+                .expect("stdout stream sink parses");
+        assert_eq!(
+            config.logging.stream,
+            vec![crate::config::StreamSinkConfig::Stdout]
+        );
+    }
+
+    /// `syslog`/`otlp` are documented as roadmap in spec 07 but not
+    /// implemented (#218) — the parser must reject them, not silently accept
+    /// config that does nothing. This is exactly the failure mode #217 fixed
+    /// in the docs; the config layer must not reopen it.
+    #[test]
+    fn rejects_unimplemented_stream_sink_kinds() {
+        for kind in ["syslog", "otlp", "kafka"] {
+            let yaml = format!("servers: []\nlogging:\n  stream:\n    - kind: {kind}\n");
+            ConfigFile::from_yaml_str(&yaml).expect_err(&format!(
+                "`{kind}` stream sink must reject — not implemented"
+            ));
+        }
+    }
+
+    /// Archive isn't implemented yet either (#218) — an operator who copies
+    /// spec 07's `archive:` block into their YAML must get a boot error, not
+    /// a gateway that silently accepts a key it never reads.
+    #[test]
+    fn rejects_archive_key_under_logging() {
+        let yaml = "servers: []\nlogging:\n  archive:\n    kind: s3\n    bucket: b\n";
+        ConfigFile::from_yaml_str(yaml).expect_err("archive: must reject — not implemented");
     }
 }
