@@ -68,24 +68,35 @@ async fn wait_for_audit_row(
 /// detached spawn, so waiting on the buffer is the honest equivalent of
 /// waiting on the audit row. Returns the parsed event on success or the
 /// full captured text on timeout, so the caller can render it in a panic.
+///
+/// Collects *all* matching records rather than stopping at the first: spec
+/// 07 guarantees "one JSON-per-line record on stdout" per dispatch, so a
+/// silent duplicate is a regression. Panics rather than returning if the
+/// count is >1 — `find` would have hidden the second record.
 async fn wait_for_audit_stream_event(buf: &BufWriter, request_id: &str) -> Result<Value, String> {
     let deadline = tokio::time::Instant::now() + POLL_TIMEOUT;
     loop {
         let raw = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        if let Some(event) = raw
+        let matches: Vec<Value> = raw
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .find(|v| {
+            .filter(|v| {
                 v["target"].as_str() == Some("audit_stream")
                     && v["request_id"].as_str() == Some(request_id)
             })
-        {
-            return Ok(event);
+            .collect();
+        match matches.len() {
+            0 => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(raw);
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            1 => return Ok(matches.into_iter().next().unwrap()),
+            n => panic!(
+                "expected exactly 1 audit_stream event for request_id {request_id}, got {n} in:\n{raw}"
+            ),
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(raw);
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
