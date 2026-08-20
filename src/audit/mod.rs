@@ -4,12 +4,13 @@
 //! non-negotiable: every tool dispatch traces to an SSO-verified identity →
 //! audit row, and audit-write failures **fail the request**. No best-effort.
 //!
-//! Retention pruner lives in `audit::pruner`. Archive + stream sinks
-//! (S3/GCS/OTLP/Kafka per spec 07) are out of scope for #8 and land in
-//! follow-up issues.
+//! Retention pruner lives in `audit::pruner`. Stream sinks live in
+//! `audit::stream` — only `stdout` ships so far (#218); syslog/OTLP and the
+//! archive tier (S3/GCS/Azure) remain out of scope, tracked in #218.
 
 pub mod permissions;
 pub mod pruner;
+pub mod stream;
 
 // `latest_for_user_tool` is cfg'd out of release builds, but its chrono
 // types are also used by the production `query_user_history` reader added

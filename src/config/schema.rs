@@ -182,6 +182,34 @@ impl Action {
     }
 }
 
+/// `logging:` block (spec 07 §Storage). Only `stream` exists today —
+/// `hot_retention_days` stays env-driven (`AUDIT_RETENTION_DAYS`) until #16
+/// folds retention into YAML, and `archive` isn't implemented yet (#218
+/// tracks it). Absent `logging:` in YAML is identical to an empty one: no
+/// stream sinks, which is the pre-#218 behavior.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingBlock {
+    #[serde(default)]
+    pub stream: Vec<StreamSinkConfig>,
+}
+
+/// One configured stream sink (spec 07 §Storage "Stream" tier). Fire-and-
+/// forget export of every audit row, independent of and additional to the
+/// mandatory hot-tier Postgres write — a sink outage must never fail an
+/// agent's request. `stdout` is the only variant shipped so far; `syslog`
+/// and `otlp` are tracked in #218.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum StreamSinkConfig {
+    /// Emit the full audit row as a structured `tracing` event (target
+    /// `audit_stream`) so it rides the gateway's existing JSON-per-line
+    /// stdout log — no new transport, just a distinct, filterable target
+    /// operators can route to Splunk/Datadog alongside application logs.
+    Stdout,
+}
+
 fn default_port() -> u16 {
     5432
 }

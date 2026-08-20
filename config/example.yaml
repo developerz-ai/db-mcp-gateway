@@ -154,13 +154,11 @@ permissions:
 #     group: svc-ci-bot
 #     token: ${ENV:SERVICE_TOKEN_CI_BOT}
 
+# Hot-tier retention (the pruner's TTL) is still env-driven — AUDIT_RETENTION_DAYS,
+# default 90 — pending #16's full config-to-YAML migration. `logging.stream` below is
+# real; `archive` (S3/GCS/Azure) and the `syslog`/`otlp` stream kinds are roadmap
+# Phase 4 (#218) and are NOT valid config yet — the parser rejects unknown keys.
 logging:
-  hot_retention_days: 90
-  archive:
-    kind: s3
-    bucket: example-db-mcp-audit
-    prefix: gateway/
-    region: us-east-1
   stream:
-    - kind: otlp
-      endpoint: https://otel.internal:4317
+    - kind: stdout   # emits the full audit row as a `target: "audit_stream"`
+                      # tracing event, distinct from the operational log lines.

@@ -165,10 +165,10 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 - **Security benefit:** No user accounts to manage, leverage existing corporate directory
 - **Operations benefit:** User onboarding/offboarding handled centrally, not per application
 
-### SIEM Integration (roadmap, not shipped)
+### SIEM Integration (stdout shipped; syslog/OTLP on the roadmap)
 
-- **What it will do:** Stream audit logs to a SIEM via OTLP, syslog, or stdout sinks
-- **Status:** No streaming sink is implemented and there is no config key for one; [roadmap Phase 4](initial-idea/11-roadmap.md). The application logs the gateway process itself emits (JSON-per-line to stdout) are operational logs, not an audit export, and don't satisfy this.
+- **What it does today:** `logging.stream: [{kind: stdout}]` in YAML emits every full audit row as a distinct `target: "audit_stream"` tracing event — separate from the gateway's own operational logs (application logs are JSON-per-line to stdout too, but that's an operational log, not an audit export, and doesn't satisfy this on its own).
+- **Not shipped:** `syslog` and `otlp` sink kinds — the config parser rejects them; [roadmap Phase 4](initial-idea/11-roadmap.md).
 
 ### Multi-Cloud Archive (roadmap, not shipped)
 

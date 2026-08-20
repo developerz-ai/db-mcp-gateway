@@ -35,12 +35,14 @@ Phased plan from skeleton to a deployable gateway. Each phase is mergeable indep
 - Config validation with friendly errors at startup.
 - Docker image build + push pipeline.
 
-## Phase 4 — Audit retention + archive
+## Phase 4 — Audit retention + archive (partial — see note)
 
-- Hot retention pruner background task.
-- S3 / GCS / Azure Blob archive exporter.
-- SQL capture policies (`full` / `redacted` / `metadata_only`).
-- Optional OTLP / syslog / stdout streaming sinks.
+- Hot retention pruner background task. **Done.**
+- Streaming sinks (`logging.stream` in YAML): `stdout` **done** (#218) — emits
+  the full audit row as a `target: "audit_stream"` tracing event. `syslog`
+  and `otlp` remain unimplemented; the config parser rejects them.
+- S3 / GCS / Azure Blob archive exporter. Not started.
+- SQL capture policies (`full` / `redacted` / `metadata_only`). Not started.
 
 ## Phase 5 — Beyond Postgres (partial — see note)
 

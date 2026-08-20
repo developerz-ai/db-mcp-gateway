@@ -31,6 +31,7 @@ async fn spawn_gateway() -> String {
             admin: None,
             permissions_store: None,
             service_accounts: Vec::new(),
+            logging: Default::default(),
         }),
         adapter_registry: AdapterRegistry::new(),
         state_db: None,

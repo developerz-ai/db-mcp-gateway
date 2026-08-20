@@ -76,6 +76,7 @@ async fn dropped_dispatch_leaves_cancelled_audit_row() {
             Some(&pool_for_dispatch),
             &ctx,
             header,
+            &[],
             std::future::pending::<db_mcp_gateway::tools::audit_dispatch::Outcome>(),
         )
         .await;
@@ -151,7 +152,7 @@ async fn completed_dispatch_does_not_leave_cancelled_row() {
             error_message: None,
         }
     };
-    let _ = audit_dispatch(id, &identity, Some(&p), &ctx, header, work).await;
+    let _ = audit_dispatch(id, &identity, Some(&p), &ctx, header, &[], work).await;
     // Give the detached write (audit::log) time to land.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -214,7 +215,7 @@ async fn audit_row_request_id_is_gateway_uuid_not_client_id() {
             error_message: None,
         }
     };
-    let _ = audit_dispatch(id.clone(), &identity, Some(&p), &ctx, header, work).await;
+    let _ = audit_dispatch(id.clone(), &identity, Some(&p), &ctx, header, &[], work).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let row = audit::latest_for_user_tool(&p, &user, "run_query")

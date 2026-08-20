@@ -259,6 +259,7 @@ async fn cancelled_dispatch_cancels_pg_backend_and_writes_audit_row() {
             Some(&state_pool_task),
             &ctx,
             header,
+            &[],
             work,
         )
         .await

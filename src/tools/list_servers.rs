@@ -60,12 +60,30 @@ pub async fn run(
             tracing::error!(%err, "permissions cache load failed");
             let resp = error_outcome(id.clone(), "internal", "permissions_cache_load_failed");
             let work = async move { resp };
-            return audit_dispatch(id, identity, state_db, request_ctx, header, work).await;
+            return audit_dispatch(
+                id,
+                identity,
+                state_db,
+                request_ctx,
+                header,
+                &config.logging.stream,
+                work,
+            )
+            .await;
         }
     };
     let work_id = id.clone();
     let work = async move { compute_outcome(work_id, identity, config, &db_grants) };
-    audit_dispatch(id, identity, state_db, request_ctx, header, work).await
+    audit_dispatch(
+        id,
+        identity,
+        state_db,
+        request_ctx,
+        header,
+        &config.logging.stream,
+        work,
+    )
+    .await
 }
 
 fn compute_outcome(
