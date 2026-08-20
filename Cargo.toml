@@ -83,6 +83,13 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Non-blocking stdout writer for the JSON-per-line subscriber. `tracing`
+# `info!` calls on the request path (including the `audit_stream` fan-out in
+# `src/audit/stream.rs`) must never block on a slow stdout consumer —
+# CLAUDE.md §"Async end-to-end" rules out blocking I/O in async fns.
+# `non_blocking` spawns a dedicated worker thread; the returned `WorkerGuard`
+# is held for the process lifetime and flushes the queue on drop.
+tracing-appender = "0.2"
 
 # metrics — facade + Prometheus exporter for /metrics
 metrics = "0.24"
