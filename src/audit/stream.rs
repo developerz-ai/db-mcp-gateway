@@ -6,6 +6,15 @@
 //! Callers invoke [`send`] only after the durable write has already
 //! succeeded (see `tools::audit_dispatch`) — a row that isn't yet the system
 //! of record must not be streamed as if it were.
+//!
+//! Payload: the row is streamed as-is, matching the durable `audit_calls`
+//! row byte-for-byte. Redaction (`sql_capture: redacted | metadata_only`)
+//! is a per-database policy applied at the audit-row layer (spec 07/08),
+//! not per-sink — so `stdout`, `syslog`, and the durable row all see the
+//! same policy-redacted `sql`, and no sink can silently drift into a
+//! different field list.
+
+use std::time::Duration;
 
 use chrono::SecondsFormat;
 
@@ -17,6 +26,16 @@ use crate::config::StreamSinkConfig;
 /// `informational` (6) matches "audit row streamed", not an error.
 const SYSLOG_PRI: u8 = 16 * 8 + 6;
 const SYSLOG_APP_NAME: &str = "db-mcp-gateway";
+
+/// Hard ceiling on any single syslog-delivery step (DNS resolution, local
+/// UDP bind, `send_to`). Bounds the lifetime of every detached delivery
+/// task so a wedged resolver or a broken network can't accumulate
+/// long-lived tasks under sustained audit-event volume — each attempt
+/// either succeeds, fails, or times out within this budget and drops.
+/// 5s is comfortably above healthy DNS + loopback UDP send latency
+/// (single-digit milliseconds on well-behaved networks) while still small
+/// enough that a wedged path sheds tasks fast.
+const SYSLOG_STEP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Fan `row` out to every configured sink. `stdout` is a local `tracing`
 /// emission — nothing to spawn. `syslog` touches the network (DNS + a UDP
@@ -97,14 +116,34 @@ fn format_rfc5424(row: &AuditRow) -> String {
 /// the sidecar spec 07 describes). Binds a fresh ephemeral socket per call
 /// rather than pooling one in shared state: simplest correct thing, and
 /// audit-row volume doesn't warrant the plumbing yet.
+///
+/// Every step (DNS, bind, send) is wrapped in [`SYSLOG_STEP_TIMEOUT`] so a
+/// wedged resolver or a black-holed network can't keep the detached task
+/// alive indefinitely. A timed-out step logs and drops — no retry, no
+/// queue: audit-row rate is low enough that the next event just tries
+/// again, and the durable row is already committed.
 fn send_syslog(host: &str, port: u16, row: &AuditRow) {
     let message = format_rfc5424(row);
     let host = host.to_string();
     tokio::spawn(async move {
-        let mut addrs = match tokio::net::lookup_host((host.as_str(), port)).await {
-            Ok(addrs) => addrs,
-            Err(err) => {
+        let lookup = tokio::time::timeout(
+            SYSLOG_STEP_TIMEOUT,
+            tokio::net::lookup_host((host.as_str(), port)),
+        )
+        .await;
+        let mut addrs = match lookup {
+            Ok(Ok(addrs)) => addrs,
+            Ok(Err(err)) => {
                 tracing::error!(%err, host, port, "syslog stream sink: DNS resolution failed");
+                return;
+            }
+            Err(_) => {
+                tracing::error!(
+                    host,
+                    port,
+                    timeout_ms = SYSLOG_STEP_TIMEOUT.as_millis() as u64,
+                    "syslog stream sink: DNS resolution timed out"
+                );
                 return;
             }
         };
@@ -123,15 +162,40 @@ fn send_syslog(host: &str, port: u16, row: &AuditRow) {
         } else {
             "0.0.0.0:0"
         };
-        let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
-            Ok(socket) => socket,
-            Err(err) => {
+        let bind =
+            tokio::time::timeout(SYSLOG_STEP_TIMEOUT, tokio::net::UdpSocket::bind(bind_addr)).await;
+        let socket = match bind {
+            Ok(Ok(socket)) => socket,
+            Ok(Err(err)) => {
                 tracing::error!(%err, "syslog stream sink: local UDP bind failed");
                 return;
             }
+            Err(_) => {
+                tracing::error!(
+                    timeout_ms = SYSLOG_STEP_TIMEOUT.as_millis() as u64,
+                    "syslog stream sink: local UDP bind timed out"
+                );
+                return;
+            }
         };
-        if let Err(err) = socket.send_to(message.as_bytes(), addr).await {
-            tracing::error!(%err, host, port, "syslog stream sink: send failed");
+        let send = tokio::time::timeout(
+            SYSLOG_STEP_TIMEOUT,
+            socket.send_to(message.as_bytes(), addr),
+        )
+        .await;
+        match send {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                tracing::error!(%err, host, port, "syslog stream sink: send failed");
+            }
+            Err(_) => {
+                tracing::error!(
+                    host,
+                    port,
+                    timeout_ms = SYSLOG_STEP_TIMEOUT.as_millis() as u64,
+                    "syslog stream sink: send timed out"
+                );
+            }
         }
     });
 }

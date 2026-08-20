@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::schema::{LoggingBlock, Permission, Server, ServerKind, ServiceAccount};
+use super::schema::{
+    LoggingBlock, Permission, Server, ServerKind, ServiceAccount, StreamSinkConfig,
+};
 use super::secret::SecretError;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -475,6 +477,28 @@ impl ConfigFile {
                      its own group",
                     account.name, account.group
                 )));
+            }
+        }
+
+        // Stream sinks that touch the network need per-variant boot validation
+        // so a typo/omission fails at startup rather than as a silent drop
+        // inside the detached delivery task. `stdout` is a local `tracing`
+        // emission with no config surface, so nothing to validate for it.
+        for (idx, sink) in self.logging.stream.iter().enumerate() {
+            match sink {
+                StreamSinkConfig::Stdout => {}
+                StreamSinkConfig::Syslog { host, port } => {
+                    if host.trim().is_empty() {
+                        return Err(ConfigFileError::Invalid(format!(
+                            "logging.stream[{idx}] syslog `host` must be non-blank"
+                        )));
+                    }
+                    if *port == 0 {
+                        return Err(ConfigFileError::Invalid(format!(
+                            "logging.stream[{idx}] syslog `port` must be non-zero"
+                        )));
+                    }
+                }
             }
         }
         Ok(())
@@ -1510,6 +1534,45 @@ service_accounts:
             ConfigFile::from_yaml_str(yaml)
                 .expect_err("syslog sink missing host or port must reject at boot");
         }
+    }
+
+    /// Spec 08 §"Resolution order": validation errors refuse to start. A
+    /// blank/whitespace-only syslog `host` deserializes cleanly (the type is
+    /// `String`), then the detached delivery task fails DNS on every audit
+    /// event and drops silently. Reject at the config boundary instead —
+    /// same meaning-when-present rule as `admin.group` and `auth_database`.
+    #[test]
+    fn rejects_syslog_stream_sink_with_blank_host() {
+        for host in ["\"\"", "\"   \""] {
+            let yaml = format!(
+                "servers: []\nlogging:\n  stream:\n    - kind: syslog\n      host: {host}\n      port: 514\n"
+            );
+            let err = ConfigFile::from_yaml_str(&yaml)
+                .expect_err("blank syslog host must reject at boot");
+            let ConfigFileError::Invalid(msg) = err else {
+                panic!("expected Invalid, got {err:?}");
+            };
+            assert!(msg.contains("syslog"), "{msg}");
+            assert!(msg.contains("host"), "{msg}");
+            assert!(msg.contains("non-blank"), "{msg}");
+        }
+    }
+
+    /// Port `0` is the wildcard "any port" for socket binds, not a valid
+    /// destination — a `send_to` targeting it fails at delivery time. Reject
+    /// at boot so operators see the misconfiguration at startup, not in the
+    /// error log after requests start flowing.
+    #[test]
+    fn rejects_syslog_stream_sink_with_zero_port() {
+        let yaml = "servers: []\nlogging:\n  stream:\n    - kind: syslog\n      host: syslog.internal\n      port: 0\n";
+        let err =
+            ConfigFile::from_yaml_str(yaml).expect_err("port 0 syslog sink must reject at boot");
+        let ConfigFileError::Invalid(msg) = err else {
+            panic!("expected Invalid, got {err:?}");
+        };
+        assert!(msg.contains("syslog"), "{msg}");
+        assert!(msg.contains("port"), "{msg}");
+        assert!(msg.contains("non-zero"), "{msg}");
     }
 
     /// Multiple sinks are independent and additive — a common real config
