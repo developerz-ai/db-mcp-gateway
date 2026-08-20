@@ -17,6 +17,12 @@ authenticates them through the SSO you already run, checks each query against
 permissions reviewed by pull request, and commits an append-only audit row
 before any result goes back.
 
+The denial is the product:
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/developerz-ai/db-mcp-gateway/main/website/static/img/denial-demo.gif" alt="An agent reads a table it's granted, then gets denied on a write it isn't — both calls land as audit rows." width="720">
+</p>
+
 ## Install
 
 **v1.5.0 — stable, in production use.** One image, one YAML file, and one Postgres for the gateway's own state:
