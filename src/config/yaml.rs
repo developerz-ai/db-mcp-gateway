@@ -144,6 +144,28 @@ pub enum ConfigFileError {
         db_name: String,
         server_name: String,
     },
+    /// Blank/whitespace-only `host` on a `logging.stream[].kind: syslog` sink.
+    /// Split out from `Invalid` so callers (structured loggers, tests, future
+    /// admin surfaces) classify this outcome by variant rather than
+    /// substring-matching a message that's free to evolve. Same rationale as
+    /// [`Self::StockSuperuserRole`]. The `index` names the sink position so an
+    /// operator with several sinks can point at the offending one.
+    #[error(
+        "logging.stream[{index}] syslog `host` must be non-blank — a blank \
+         host deserializes cleanly but fails DNS on every audit event inside \
+         the detached delivery task, which drops silently"
+    )]
+    SyslogSinkBlankHost { index: usize },
+    /// Port `0` on a `logging.stream[].kind: syslog` sink. Port 0 is the
+    /// wildcard "any port" for socket binds, not a valid destination — a
+    /// `send_to` targeting it fails at delivery time. Rejected at boot for the
+    /// same operator-visibility reason as [`Self::SyslogSinkBlankHost`].
+    #[error(
+        "logging.stream[{index}] syslog `port` must be non-zero — port 0 is a \
+         bind wildcard, not a valid destination, and every send would fail at \
+         delivery time"
+    )]
+    SyslogSinkZeroPort { index: usize },
 }
 
 impl ConfigFileError {
@@ -484,19 +506,19 @@ impl ConfigFile {
         // so a typo/omission fails at startup rather than as a silent drop
         // inside the detached delivery task. `stdout` is a local `tracing`
         // emission with no config surface, so nothing to validate for it.
-        for (idx, sink) in self.logging.stream.iter().enumerate() {
+        //
+        // Failures land as typed variants (`SyslogSinkBlankHost`,
+        // `SyslogSinkZeroPort`) rather than free-text `Invalid`, so callers
+        // can distinguish "blank host" from "port 0" without parsing text.
+        for (index, sink) in self.logging.stream.iter().enumerate() {
             match sink {
                 StreamSinkConfig::Stdout => {}
                 StreamSinkConfig::Syslog { host, port } => {
                     if host.trim().is_empty() {
-                        return Err(ConfigFileError::Invalid(format!(
-                            "logging.stream[{idx}] syslog `host` must be non-blank"
-                        )));
+                        return Err(ConfigFileError::SyslogSinkBlankHost { index });
                     }
                     if *port == 0 {
-                        return Err(ConfigFileError::Invalid(format!(
-                            "logging.stream[{idx}] syslog `port` must be non-zero"
-                        )));
+                        return Err(ConfigFileError::SyslogSinkZeroPort { index });
                     }
                 }
             }
@@ -1541,6 +1563,9 @@ service_accounts:
     /// `String`), then the detached delivery task fails DNS on every audit
     /// event and drops silently. Reject at the config boundary instead —
     /// same meaning-when-present rule as `admin.group` and `auth_database`.
+    ///
+    /// Asserts the typed `SyslogSinkBlankHost` variant so callers classify
+    /// this outcome by variant rather than by substring-matching the message.
     #[test]
     fn rejects_syslog_stream_sink_with_blank_host() {
         for host in ["\"\"", "\"   \""] {
@@ -1549,12 +1574,12 @@ service_accounts:
             );
             let err = ConfigFile::from_yaml_str(&yaml)
                 .expect_err("blank syslog host must reject at boot");
-            let ConfigFileError::Invalid(msg) = err else {
-                panic!("expected Invalid, got {err:?}");
-            };
-            assert!(msg.contains("syslog"), "{msg}");
-            assert!(msg.contains("host"), "{msg}");
-            assert!(msg.contains("non-blank"), "{msg}");
+            match err {
+                ConfigFileError::SyslogSinkBlankHost { index } => {
+                    assert_eq!(index, 0);
+                }
+                other => panic!("expected SyslogSinkBlankHost, got {other:?}"),
+            }
         }
     }
 
@@ -1562,17 +1587,20 @@ service_accounts:
     /// destination — a `send_to` targeting it fails at delivery time. Reject
     /// at boot so operators see the misconfiguration at startup, not in the
     /// error log after requests start flowing.
+    ///
+    /// Asserts the typed `SyslogSinkZeroPort` variant — same variant-not-text
+    /// rationale as `rejects_syslog_stream_sink_with_blank_host`.
     #[test]
     fn rejects_syslog_stream_sink_with_zero_port() {
         let yaml = "servers: []\nlogging:\n  stream:\n    - kind: syslog\n      host: syslog.internal\n      port: 0\n";
         let err =
             ConfigFile::from_yaml_str(yaml).expect_err("port 0 syslog sink must reject at boot");
-        let ConfigFileError::Invalid(msg) = err else {
-            panic!("expected Invalid, got {err:?}");
-        };
-        assert!(msg.contains("syslog"), "{msg}");
-        assert!(msg.contains("port"), "{msg}");
-        assert!(msg.contains("non-zero"), "{msg}");
+        match err {
+            ConfigFileError::SyslogSinkZeroPort { index } => {
+                assert_eq!(index, 0);
+            }
+            other => panic!("expected SyslogSinkZeroPort, got {other:?}"),
+        }
     }
 
     /// Multiple sinks are independent and additive — a common real config
