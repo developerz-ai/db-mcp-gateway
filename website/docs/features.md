@@ -105,7 +105,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 ### Retention (hot tier shipped; archive/stream on the roadmap)
 
 - **What it does today:** Audit logs live in the gateway's Postgres with a configurable TTL (default 90 days) and an hourly pruner that deletes past it.
-- **Not shipped:** Cold-tier archive (S3/GCS/Azure) and streaming sinks (OTLP/syslog/stdout) for SIEM integration are [roadmap Phase 4](initial-idea/11-roadmap.md) — there is no `archive` or `stream` config key yet, and the gateway refuses to boot on an unknown key.
+- **Not shipped:** Cold-tier archive (S3/GCS/Azure) and streaming sinks (OTLP/syslog/stdout) for SIEM integration are [roadmap Phase 4](initial-idea/11-roadmap.md) — there is no `archive` or `stream` config key yet.
 - **Operations benefit:** Hot data stays fast today; cold-tier retention lands when Phase 4 ships.
 
 ---
