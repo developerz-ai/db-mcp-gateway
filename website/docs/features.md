@@ -91,7 +91,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 ### Synchronous Audit Log
 - **What it does:** Every database query logged before result returned to client
 - **What it captures:** User identity, SQL statement, reason (if required), row count, duration, outcome
-- **How it works:** Append-only log in gateway's state database, optionally archived to S3/GCS/Azure
+- **How it works:** Append-only log in gateway's state database, with a configurable retention TTL and an hourly pruner
 - **Compliance benefit:** Complete query history for security reviews and compliance audits
 
 ### Query History API
@@ -102,18 +102,19 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 - **Privacy benefit:** Users see their own history, not teammates' queries
 - **Operations benefit:** Self-service audit access reduces support burden
 
-### Multiple Retention Options
-- **What it does:** Audit logs stored in PostgreSQL (hot) with optional cloud archive (cold)
-- **How it works:** OTLP, syslog, stdout sinks for SIEM integration; S3/GCS/Azure for long-term retention
-- **Compliance benefit:** Meets data retention requirements without database bloat
-- **Operations benefit:** Hot data stays fast, cold data stays cheap
+### Retention (hot tier shipped; archive/stream on the roadmap)
+
+- **What it does today:** Audit logs live in the gateway's Postgres with a configurable TTL (default 90 days) and an hourly pruner that deletes past it.
+- **Not shipped:** Cold-tier archive (S3/GCS/Azure) and streaming sinks (OTLP/syslog/stdout) for SIEM integration are [roadmap Phase 4](initial-idea/11-roadmap.md) — there is no `archive` or `stream` config key yet.
+- **Operations benefit:** Hot data stays fast today; cold-tier retention lands when Phase 4 ships.
 
 ---
 
 ## 🤖 MCP Integration
 
 ### Complete MCP Tool Surface
-- **What it does:** Six MCP tools cover all database interaction patterns
+
+- **What it does:** Seven MCP tools cover all database interaction patterns
 - **Tools included:**
   - `list_servers` - Enumerate target servers visible to the caller
   - `list_databases` - Enumerate available databases on a server
@@ -121,6 +122,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
   - `sample_table` - Preview data with configurable sample size
   - `run_query` - Execute SQL with safety limits
   - `explain` - Get query execution plans
+  - `get_query_history` - Retrieve a user's own recent queries from the audit log
 
 ### Multi-Database Support
 - **What it does:** Single gateway instance fronts PostgreSQL and MongoDB targets (MySQL/MSSQL are rejected at boot — see [multi-db](usage/multi-db.md))
@@ -159,22 +161,19 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 ## 🔌 Enterprise Integration
 
 ### SSO Integration
-- **What it does:** OIDC-compliant SSO with major identity providers
-- **Supported providers:** Google Workspace, Okta, Microsoft Entra, Authentik, Keycloak
+- **What it does:** SSO via any OIDC-compliant identity provider — the gateway speaks generic OIDC, not provider-specific integrations
 - **Security benefit:** No user accounts to manage, leverage existing corporate directory
 - **Operations benefit:** User onboarding/offboarding handled centrally, not per application
 
-### SIEM Integration
-- **What it does:** Audit logs exported to SIEM systems via OTLP, syslog, or stdout
-- **How it works:** Configurable export formats and endpoints for security monitoring
-- **Security benefit:** Query audit data centralized with other security events
-- **Compliance benefit:** Unified security monitoring across infrastructure
+### SIEM Integration (roadmap, not shipped)
 
-### Multi-Cloud Support
-- **What it does:** Archive audit logs to any major cloud storage provider
-- **Supported:** AWS S3, Google Cloud Storage, Azure Blob Storage
-- **Operations benefit:** Leverage existing cloud contracts and retention policies
-- **Compliance benefit:** Meet data residency requirements with regional storage
+- **What it will do:** Stream audit logs to a SIEM via OTLP, syslog, or stdout sinks
+- **Status:** No streaming sink is implemented and there is no config key for one; [roadmap Phase 4](initial-idea/11-roadmap.md). The application logs the gateway process itself emits (JSON-per-line to stdout) are operational logs, not an audit export, and don't satisfy this.
+
+### Multi-Cloud Archive (roadmap, not shipped)
+
+- **What it will do:** Archive audit logs to S3, Google Cloud Storage, or Azure Blob Storage past the hot-tier retention window
+- **Status:** No archive exporter is implemented and there is no `archive` config key; [roadmap Phase 4](initial-idea/11-roadmap.md).
 
 ---
 

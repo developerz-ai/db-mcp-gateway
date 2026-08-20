@@ -86,10 +86,10 @@ it yourself](website/docs/benchmarks.md).
 ## What it does
 
 - **MCP tool surface** — `list_servers`, `list_databases`, `describe_schema`, `sample_table`, `run_query`, `explain`, `get_query_history`.
-- **OIDC SSO** — Okta, Google Workspace, Entra, Authentik, Keycloak. Browser-flow login from the agent.
+- **OIDC SSO** — Any OIDC-compliant identity provider (e.g. Okta, Google Workspace, Entra, Authentik, Keycloak). Browser-flow login from the agent.
 - **Read-only by default, writes opt-in per grant** — per-database least-privilege roles; a `query_write` grant permits data writes (INSERT/UPDATE/DELETE), never schema changes. Statement timeouts and row caps enforced at the DB *and* gateway layer.
 - **Permissions in YAML** — group × server × database × action, with per-grant constraints (`require_reason`, `row_limit`, `statement_timeout_ms`, allow/deny schemas, time windows). Reviewed by PR, with the full change history git already gives you.
-- **Synchronous audit log** — user, SQL, reason, row count, duration, outcome. The write commits *before* the response is sent; if it fails, the request fails. Hot retention in Postgres, optional S3/GCS/Azure archive, OTLP/syslog/stdout sinks.
+- **Synchronous audit log** — user, SQL, reason, row count, duration, outcome. The write commits *before* the response is sent; if it fails, the request fails. Retained in the gateway's Postgres with a configurable TTL and an hourly pruner. Archive to object storage and SIEM streaming are [roadmap Phase 4](website/docs/initial-idea/11-roadmap.md), not shipped.
 - **Boring deployment** — `docker pull`, one YAML file, and one Postgres for the gateway's own state. The databases your agents query are your existing ones; the [local quickstart](website/docs/deployment/quickstart.md#run-it-locally) stands up a throwaway target too, so you can try it end to end without pointing at anything real. No agent runtime, no query builder, no credential vault to operate.
 
 [Complete feature documentation →](website/docs/features.md)
