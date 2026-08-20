@@ -17,6 +17,12 @@ authenticates them through the SSO you already run, checks each query against
 permissions reviewed by pull request, and commits an append-only audit row
 before any result goes back.
 
+## The denial is the product
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/developerz-ai/db-mcp-gateway/main/website/static/img/denial-demo.gif" alt="Live gateway: service:demo-bot in the query_read group reads customers, then the same account's INSERT is rejected as forbidden_sql — both calls commit as audit_calls rows before the response returns." width="720">
+</p>
+
 ## Install
 
 **v1.5.0 — stable, in production use.** One image, one YAML file, and one Postgres for the gateway's own state:
