@@ -102,10 +102,10 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 - **Privacy benefit:** Users see their own history, not teammates' queries
 - **Operations benefit:** Self-service audit access reduces support burden
 
-### Retention (hot tier shipped; archive/stream on the roadmap)
+### Retention (hot tier + stdout stream shipped; archive and syslog/OTLP/Kafka on the roadmap)
 
-- **What it does today:** Audit logs live in the gateway's Postgres with a configurable TTL (default 90 days) and an hourly pruner that deletes past it.
-- **Not shipped:** Cold-tier archive (S3/GCS/Azure) and streaming sinks (OTLP/syslog/stdout) for SIEM integration are [roadmap Phase 4](initial-idea/11-roadmap.md) — there is no `archive` or `stream` config key yet.
+- **What it does today:** Audit logs live in the gateway's Postgres with a configurable TTL (default 90 days) and an hourly pruner that deletes past it. Operators can also mirror every full audit row out to stdout for SIEM ingestion via `logging.stream: [{kind: stdout}]` — see [SIEM Integration](#siem-integration-stdout-shipped-syslogotlpkafka-on-the-roadmap) below.
+- **Not shipped:** Cold-tier archive (S3/GCS/Azure) and the remaining streaming sink kinds (`syslog`, `otlp`, `kafka`) are [roadmap Phase 4](initial-idea/11-roadmap.md) — there is no `archive` config key yet, and the parser rejects the unshipped `stream` kinds.
 - **Operations benefit:** Hot data stays fast today; cold-tier retention lands when Phase 4 ships.
 
 ---

@@ -49,7 +49,7 @@ fn dispatch_log_line_matches_field_contract() {
         .flatten_event(true)
         .with_current_span(false)
         .with_span_list(false)
-        .with_target(false)
+        .with_target(true)
         .with_writer(buf.clone())
         .finish();
 
@@ -104,10 +104,16 @@ fn dispatch_log_line_matches_field_contract() {
         log.get("spans").is_none(),
         "subscriber emitted a `spans` key — with_span_list(false) should drop it"
     );
-    assert!(
-        log.get("target").is_none(),
-        "subscriber emitted a `target` key — with_target(false) should drop it"
-    );
+    // `with_target(true)` preserves the tracing target — for operational log
+    // sites that's the module path, and for the audit stream fan-out
+    // (`src/audit/stream.rs`) it's the explicit `"audit_stream"` label the
+    // SIEM contract in spec 07 §Stream depends on. Dropping this field
+    // would silently strip that routing key.
+    let target = log
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("missing `target` in log line: {line}"));
+    assert!(!target.is_empty(), "target must be non-empty: {line}");
 }
 
 /// `run_query`'s pre-dispatch event fires inside the `tool_dispatch` span,
@@ -126,7 +132,7 @@ fn run_query_dispatch_event_carries_request_id() {
         .flatten_event(true)
         .with_current_span(false)
         .with_span_list(false)
-        .with_target(false)
+        .with_target(true)
         .with_writer(buf.clone())
         .finish();
 
