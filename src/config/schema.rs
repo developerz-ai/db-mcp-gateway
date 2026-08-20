@@ -197,8 +197,8 @@ pub struct LoggingBlock {
 /// One configured stream sink (spec 07 §Storage "Stream" tier). Fire-and-
 /// forget export of every audit row, independent of and additional to the
 /// mandatory hot-tier Postgres write — a sink outage must never fail an
-/// agent's request. `stdout` is the only variant shipped so far; `syslog`
-/// and `otlp` are tracked in #218.
+/// agent's request. `stdout` and `syslog` are shipped; `otlp` is tracked in
+/// #218.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[serde(deny_unknown_fields)]
@@ -208,6 +208,11 @@ pub enum StreamSinkConfig {
     /// stdout log — no new transport, just a distinct, filterable target
     /// operators can route to Splunk/Datadog alongside application logs.
     Stdout,
+    /// Send an RFC 5424 message over UDP to a syslog receiver. `host`/`port`
+    /// mirror `Server`'s shape rather than a combined `"host:port"` string —
+    /// consistent with the rest of this schema, and it sidesteps parsing a
+    /// address format at deserialize time.
+    Syslog { host: String, port: u16 },
 }
 
 fn default_port() -> u16 {

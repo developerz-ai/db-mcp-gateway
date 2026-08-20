@@ -5,7 +5,7 @@
 //! audit row, and audit-write failures **fail the request**. No best-effort.
 //!
 //! Retention pruner lives in `audit::pruner`. Stream sinks live in
-//! `audit::stream` — only `stdout` ships so far (#218); syslog/OTLP and the
+//! `audit::stream` — `stdout` and `syslog` ship (#218); `otlp` and the
 //! archive tier (S3/GCS/Azure) remain out of scope, tracked in #218.
 
 pub mod permissions;
@@ -35,7 +35,10 @@ pub const AUDIT_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 /// `Option` because not every tool / outcome populates them (e.g.
 /// `list_servers` has no `row_count`; a successful call has no
 /// `error_message`).
-#[derive(Debug, Clone)]
+///
+/// `Serialize` backs `audit::stream`'s network sinks (syslog's MSG body) —
+/// this is exactly what's already durable in `audit_calls`, nothing more.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AuditRow {
     /// Row primary key. Callers on the request path (see
     /// `tools::audit_dispatch`) generate this once per dispatch and share

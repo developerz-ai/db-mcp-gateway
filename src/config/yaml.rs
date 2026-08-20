@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::schema::{LoggingBlock, Permission, Server, ServerKind, ServiceAccount};
+use super::schema::{
+    LoggingBlock, Permission, Server, ServerKind, ServiceAccount, StreamSinkConfig,
+};
 use super::secret::SecretError;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -142,6 +144,28 @@ pub enum ConfigFileError {
         db_name: String,
         server_name: String,
     },
+    /// Blank/whitespace-only `host` on a `logging.stream[].kind: syslog` sink.
+    /// Split out from `Invalid` so callers (structured loggers, tests, future
+    /// admin surfaces) classify this outcome by variant rather than
+    /// substring-matching a message that's free to evolve. Same rationale as
+    /// [`Self::StockSuperuserRole`]. The `index` names the sink position so an
+    /// operator with several sinks can point at the offending one.
+    #[error(
+        "logging.stream[{index}] syslog `host` must be non-blank — a blank \
+         host deserializes cleanly but fails DNS on every audit event inside \
+         the detached delivery task, which drops silently"
+    )]
+    SyslogSinkBlankHost { index: usize },
+    /// Port `0` on a `logging.stream[].kind: syslog` sink. Port 0 is the
+    /// wildcard "any port" for socket binds, not a valid destination — a
+    /// `send_to` targeting it fails at delivery time. Rejected at boot for the
+    /// same operator-visibility reason as [`Self::SyslogSinkBlankHost`].
+    #[error(
+        "logging.stream[{index}] syslog `port` must be non-zero — port 0 is a \
+         bind wildcard, not a valid destination, and every send would fail at \
+         delivery time"
+    )]
+    SyslogSinkZeroPort { index: usize },
 }
 
 impl ConfigFileError {
@@ -475,6 +499,28 @@ impl ConfigFile {
                      its own group",
                     account.name, account.group
                 )));
+            }
+        }
+
+        // Stream sinks that touch the network need per-variant boot validation
+        // so a typo/omission fails at startup rather than as a silent drop
+        // inside the detached delivery task. `stdout` is a local `tracing`
+        // emission with no config surface, so nothing to validate for it.
+        //
+        // Failures land as typed variants (`SyslogSinkBlankHost`,
+        // `SyslogSinkZeroPort`) rather than free-text `Invalid`, so callers
+        // can distinguish "blank host" from "port 0" without parsing text.
+        for (index, sink) in self.logging.stream.iter().enumerate() {
+            match sink {
+                StreamSinkConfig::Stdout => {}
+                StreamSinkConfig::Syslog { host, port } => {
+                    if host.trim().is_empty() {
+                        return Err(ConfigFileError::SyslogSinkBlankHost { index });
+                    }
+                    if *port == 0 {
+                        return Err(ConfigFileError::SyslogSinkZeroPort { index });
+                    }
+                }
             }
         }
         Ok(())
@@ -1486,13 +1532,95 @@ service_accounts:
         );
     }
 
-    /// `syslog`/`otlp` are documented as roadmap in spec 07 but not
-    /// implemented (#218) — the parser must reject them, not silently accept
-    /// config that does nothing. This is exactly the failure mode #217 fixed
-    /// in the docs; the config layer must not reopen it.
+    #[test]
+    fn parses_syslog_stream_sink() {
+        let config = ConfigFile::from_yaml_str(
+            "servers: []\nlogging:\n  stream:\n    - kind: syslog\n      host: syslog.internal\n      port: 514\n",
+        )
+        .expect("syslog stream sink parses");
+        assert_eq!(
+            config.logging.stream,
+            vec![crate::config::StreamSinkConfig::Syslog {
+                host: "syslog.internal".to_string(),
+                port: 514
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_syslog_stream_sink_missing_required_fields() {
+        for yaml in [
+            "servers: []\nlogging:\n  stream:\n    - kind: syslog\n      port: 514\n",
+            "servers: []\nlogging:\n  stream:\n    - kind: syslog\n      host: syslog.internal\n",
+        ] {
+            ConfigFile::from_yaml_str(yaml)
+                .expect_err("syslog sink missing host or port must reject at boot");
+        }
+    }
+
+    /// Spec 08 §"Resolution order": validation errors refuse to start. A
+    /// blank/whitespace-only syslog `host` deserializes cleanly (the type is
+    /// `String`), then the detached delivery task fails DNS on every audit
+    /// event and drops silently. Reject at the config boundary instead —
+    /// same meaning-when-present rule as `admin.group` and `auth_database`.
+    ///
+    /// Asserts the typed `SyslogSinkBlankHost` variant so callers classify
+    /// this outcome by variant rather than by substring-matching the message.
+    #[test]
+    fn rejects_syslog_stream_sink_with_blank_host() {
+        for host in ["\"\"", "\"   \""] {
+            let yaml = format!(
+                "servers: []\nlogging:\n  stream:\n    - kind: syslog\n      host: {host}\n      port: 514\n"
+            );
+            let err = ConfigFile::from_yaml_str(&yaml)
+                .expect_err("blank syslog host must reject at boot");
+            match err {
+                ConfigFileError::SyslogSinkBlankHost { index } => {
+                    assert_eq!(index, 0);
+                }
+                other => panic!("expected SyslogSinkBlankHost, got {other:?}"),
+            }
+        }
+    }
+
+    /// Port `0` is the wildcard "any port" for socket binds, not a valid
+    /// destination — a `send_to` targeting it fails at delivery time. Reject
+    /// at boot so operators see the misconfiguration at startup, not in the
+    /// error log after requests start flowing.
+    ///
+    /// Asserts the typed `SyslogSinkZeroPort` variant — same variant-not-text
+    /// rationale as `rejects_syslog_stream_sink_with_blank_host`.
+    #[test]
+    fn rejects_syslog_stream_sink_with_zero_port() {
+        let yaml = "servers: []\nlogging:\n  stream:\n    - kind: syslog\n      host: syslog.internal\n      port: 0\n";
+        let err =
+            ConfigFile::from_yaml_str(yaml).expect_err("port 0 syslog sink must reject at boot");
+        match err {
+            ConfigFileError::SyslogSinkZeroPort { index } => {
+                assert_eq!(index, 0);
+            }
+            other => panic!("expected SyslogSinkZeroPort, got {other:?}"),
+        }
+    }
+
+    /// Multiple sinks are independent and additive — a common real config
+    /// (mirror to stdout for local debugging AND ship to the SIEM).
+    #[test]
+    fn parses_multiple_stream_sinks() {
+        let config = ConfigFile::from_yaml_str(
+            "servers: []\nlogging:\n  stream:\n    - kind: stdout\n    - kind: syslog\n      host: syslog.internal\n      port: 514\n",
+        )
+        .expect("multiple stream sinks parse");
+        assert_eq!(config.logging.stream.len(), 2);
+    }
+
+    /// `otlp` is documented as roadmap in spec 07 but not implemented
+    /// (#218) — the parser must reject it, not silently accept config that
+    /// does nothing. This is exactly the failure mode #217 fixed in the
+    /// docs; the config layer must not reopen it.
     #[test]
     fn rejects_unimplemented_stream_sink_kinds() {
-        for kind in ["syslog", "otlp", "kafka"] {
+        for kind in ["otlp", "kafka"] {
             let yaml = format!("servers: []\nlogging:\n  stream:\n    - kind: {kind}\n");
             ConfigFile::from_yaml_str(&yaml).expect_err(&format!(
                 "`{kind}` stream sink must reject — not implemented"
