@@ -156,9 +156,12 @@ permissions:
 
 # Hot-tier retention (the pruner's TTL) is still env-driven — AUDIT_RETENTION_DAYS,
 # default 90 — pending #16's full config-to-YAML migration. `logging.stream` below is
-# real; `archive` (S3/GCS/Azure) and the `syslog`/`otlp` stream kinds are roadmap
-# Phase 4 (#218) and are NOT valid config yet — the parser rejects unknown keys.
+# real for `stdout` and `syslog`; `archive` (S3/GCS/Azure) and the `otlp` stream kind
+# are roadmap Phase 4 (#218) and are NOT valid config yet — the parser rejects them.
 logging:
   stream:
-    - kind: stdout   # emits the full audit row as a `target: "audit_stream"`
-                      # tracing event, distinct from the operational log lines.
+    - kind: stdout      # emits the full audit row as a `target: "audit_stream"`
+                         # tracing event, distinct from the operational log lines.
+    - kind: syslog       # RFC 5424 over UDP — fire-and-forget, never blocks a request.
+      host: syslog.internal
+      port: 514

@@ -7,18 +7,26 @@
 //! succeeded (see `tools::audit_dispatch`) — a row that isn't yet the system
 //! of record must not be streamed as if it were.
 
+use chrono::SecondsFormat;
+
 use super::AuditRow;
 use crate::config::StreamSinkConfig;
 
-/// Fan `row` out to every configured sink. Synchronous but non-blocking in
-/// practice: each sink here is a local `tracing` emission, not a network
-/// call, so there's nothing to spawn or await yet. A future sink that does
-/// hit the network (syslog, OTLP) must keep this contract — fire-and-forget,
-/// logged on failure, never a delay or error the caller has to handle.
+/// RFC 5424 PRI: `facility * 8 + severity`. `local0` (16) is the
+/// conventional facility for application-generated audit/security events;
+/// `informational` (6) matches "audit row streamed", not an error.
+const SYSLOG_PRI: u8 = 16 * 8 + 6;
+const SYSLOG_APP_NAME: &str = "db-mcp-gateway";
+
+/// Fan `row` out to every configured sink. `stdout` is a local `tracing`
+/// emission — nothing to spawn. `syslog` touches the network (DNS + a UDP
+/// send), so it spawns a detached task: this function returns immediately
+/// either way, keeping the fire-and-forget contract callers rely on.
 pub fn send(sinks: &[StreamSinkConfig], row: &AuditRow) {
     for sink in sinks {
         match sink {
             StreamSinkConfig::Stdout => send_stdout(row),
+            StreamSinkConfig::Syslog { host, port } => send_syslog(host, *port, row),
         }
     }
 }
@@ -63,10 +71,76 @@ fn send_stdout(row: &AuditRow) {
     );
 }
 
+/// Format one audit row as an RFC 5424 syslog message, MSG body = the row
+/// as JSON (same data the durable `audit_calls` row holds — see
+/// [`AuditRow`]'s `Serialize` doc). Pure and synchronous so it's unit-
+/// testable without a socket; [`send_syslog`] is the only caller.
+fn format_rfc5424(row: &AuditRow) -> String {
+    let timestamp = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
+    let pid = std::process::id();
+    // `unwrap_or_default()` can't actually trigger for this struct (no
+    // non-string map keys, no NaN floats) but keeps a serialization
+    // regression from panicking the fire-and-forget path — same reasoning
+    // as `send_stdout`'s `groups` encoding.
+    let body = serde_json::to_string(row).unwrap_or_default();
+    // <PRI>VERSION TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG
+    // HOSTNAME and STRUCTURED-DATA are RFC 5424 NILVALUE ("-") — the
+    // gateway doesn't track its own hostname, and the JSON body already
+    // carries every field, so there's nothing structured data would add.
+    format!("<{SYSLOG_PRI}>1 {timestamp} - {SYSLOG_APP_NAME} {pid} audit - {body}")
+}
+
+/// Best-effort UDP send. Spawns a detached task so DNS resolution and the
+/// send itself never delay the caller — a broken or unreachable syslog
+/// receiver must not slow down, let alone fail, the agent's request
+/// (CLAUDE.md non-negotiable #4 applies to the durable write only; this is
+/// the sidecar spec 07 describes). Binds a fresh ephemeral socket per call
+/// rather than pooling one in shared state: simplest correct thing, and
+/// audit-row volume doesn't warrant the plumbing yet.
+fn send_syslog(host: &str, port: u16, row: &AuditRow) {
+    let message = format_rfc5424(row);
+    let host = host.to_string();
+    tokio::spawn(async move {
+        let mut addrs = match tokio::net::lookup_host((host.as_str(), port)).await {
+            Ok(addrs) => addrs,
+            Err(err) => {
+                tracing::error!(%err, host, port, "syslog stream sink: DNS resolution failed");
+                return;
+            }
+        };
+        let Some(addr) = addrs.next() else {
+            tracing::error!(
+                host,
+                port,
+                "syslog stream sink: host resolved to no addresses"
+            );
+            return;
+        };
+        // Bind an unspecified local port on the matching family — `send_to`
+        // below targets `addr` explicitly, so no `connect()` is needed.
+        let bind_addr = if addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
+            Ok(socket) => socket,
+            Err(err) => {
+                tracing::error!(%err, "syslog stream sink: local UDP bind failed");
+                return;
+            }
+        };
+        if let Err(err) = socket.send_to(message.as_bytes(), addr).await {
+            tracing::error!(%err, host, port, "syslog stream sink: send failed");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tracing_subscriber::fmt::MakeWriter;
     use uuid::Uuid;
 
@@ -195,5 +269,81 @@ mod tests {
         assert_eq!(log["agent_client"].as_str(), Some("mcp-cli/1.2"));
         assert_eq!(log["ip"].as_str(), Some("10.0.0.5"));
         assert_eq!(log["db_type"].as_str(), Some("postgres"));
+    }
+
+    /// Pure formatting, no socket needed: PRI/version/header shape, and the
+    /// MSG body is exactly the row's JSON serialization.
+    #[test]
+    fn format_rfc5424_has_the_expected_header_and_json_body() {
+        let row = sample_row();
+        let formatted = format_rfc5424(&row);
+
+        assert!(formatted.starts_with("<134>1 "), "{formatted}");
+        // HOSTNAME(-) APP-NAME PROCID MSGID STRUCTURED-DATA(-), then MSG.
+        assert!(
+            formatted.contains(" - db-mcp-gateway "),
+            "missing APP-NAME/nil HOSTNAME: {formatted}"
+        );
+        assert!(
+            formatted.contains(" audit - {"),
+            "missing MSGID/nil SD: {formatted}"
+        );
+
+        let msg_start = formatted.find('{').expect("MSG body is JSON");
+        let body: serde_json::Value =
+            serde_json::from_str(&formatted[msg_start..]).expect("MSG body parses as JSON");
+        assert_eq!(body["request_id"].as_str(), Some("req-stream-1"));
+        assert_eq!(body["tool"].as_str(), Some("run_query"));
+        assert_eq!(body["outcome"].as_str(), Some("success"));
+    }
+
+    /// End-to-end: `send` with a `Syslog` sink actually puts a datagram on
+    /// the wire. Binds a real UDP socket to localhost and receives from it
+    /// — spawning is detached (fire-and-forget), so the test polls briefly
+    /// rather than assuming the send lands before `send` returns.
+    #[tokio::test]
+    async fn syslog_sink_delivers_udp_datagram_to_configured_host_port() {
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral UDP listener");
+        let port = listener.local_addr().unwrap().port();
+
+        send(
+            &[StreamSinkConfig::Syslog {
+                host: "127.0.0.1".to_string(),
+                port,
+            }],
+            &sample_row(),
+        );
+
+        let mut buf = [0u8; 4096];
+        let (n, _from) = tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut buf))
+            .await
+            .expect("received a datagram within 2s — the spawned send should be near-instant on loopback")
+            .expect("recv_from succeeds");
+        let received = String::from_utf8_lossy(&buf[..n]);
+        assert!(received.starts_with("<134>1 "), "{received}");
+        assert!(received.contains("req-stream-1"), "{received}");
+        assert!(received.contains("run_query"), "{received}");
+    }
+
+    /// An unresolvable host must not panic the spawned task — it logs and
+    /// returns. Nothing to assert on the wire; this just proves `send`
+    /// itself returns immediately regardless (the caller never awaits or
+    /// blocks on DNS failure).
+    #[test]
+    fn syslog_sink_with_bad_host_does_not_block_the_caller() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            send(
+                &[StreamSinkConfig::Syslog {
+                    host: "this-host-does-not-resolve.invalid".to_string(),
+                    port: 514,
+                }],
+                &sample_row(),
+            );
+            // `send` already returned above without awaiting the spawned
+            // task — the assertion is simply that we got here.
+        });
     }
 }

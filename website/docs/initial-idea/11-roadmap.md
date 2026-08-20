@@ -38,9 +38,11 @@ Phased plan from skeleton to a deployable gateway. Each phase is mergeable indep
 ## Phase 4 — Audit retention + archive (partial — see note)
 
 - Hot retention pruner background task. **Done.**
-- Streaming sinks (`logging.stream` in YAML): `stdout` **done** (#218) — emits
-  the full audit row as a `target: "audit_stream"` tracing event. `syslog`
-  and `otlp` remain unimplemented; the config parser rejects them.
+- Streaming sinks (`logging.stream` in YAML): `stdout` and `syslog` **done**
+  (#218) — `stdout` emits the full audit row as a `target: "audit_stream"`
+  tracing event; `syslog` sends the same row as an RFC 5424 message over
+  UDP, fire-and-forget. `otlp` remains unimplemented; the config parser
+  rejects it.
 - S3 / GCS / Azure Blob archive exporter. Not started.
 - SQL capture policies (`full` / `redacted` / `metadata_only`). Not started.
 

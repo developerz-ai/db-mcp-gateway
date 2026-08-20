@@ -50,7 +50,7 @@ Per-database setting:
 |---|---|---|---|---|
 | **Hot** | Gateway's state Postgres | 90 days (configurable) | Fast operator queries, dashboards | Shipped |
 | **Archive** | S3 / GCS / Azure Blob, optional | 1y / 7y / forever | Compliance retention | Not shipped — [roadmap Phase 4](11-roadmap.md) |
-| **Stream** | Optional sink: `stdout` (config: `logging.stream: [{kind: stdout}]`), syslog, OTLP, Kafka | live | Plug into existing SIEM/Splunk/Datadog | `stdout` shipped (#218); syslog/OTLP/Kafka not shipped |
+| **Stream** | Optional sink: `stdout`, `syslog` (config: `logging.stream: [{kind: stdout}, {kind: syslog, host: ..., port: ...}]`), OTLP, Kafka | live | Plug into existing SIEM/Splunk/Datadog | `stdout` + `syslog` shipped (#218); OTLP/Kafka not shipped |
 
 Hot and stream are independent — you can send everything to Splunk *and* keep 90 days in Postgres. Archive is a periodic batch job that exports hot entries to compressed JSONL files keyed by date.
 

@@ -1486,13 +1486,50 @@ service_accounts:
         );
     }
 
-    /// `syslog`/`otlp` are documented as roadmap in spec 07 but not
-    /// implemented (#218) — the parser must reject them, not silently accept
-    /// config that does nothing. This is exactly the failure mode #217 fixed
-    /// in the docs; the config layer must not reopen it.
+    #[test]
+    fn parses_syslog_stream_sink() {
+        let config = ConfigFile::from_yaml_str(
+            "servers: []\nlogging:\n  stream:\n    - kind: syslog\n      host: syslog.internal\n      port: 514\n",
+        )
+        .expect("syslog stream sink parses");
+        assert_eq!(
+            config.logging.stream,
+            vec![crate::config::StreamSinkConfig::Syslog {
+                host: "syslog.internal".to_string(),
+                port: 514
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_syslog_stream_sink_missing_required_fields() {
+        for yaml in [
+            "servers: []\nlogging:\n  stream:\n    - kind: syslog\n      port: 514\n",
+            "servers: []\nlogging:\n  stream:\n    - kind: syslog\n      host: syslog.internal\n",
+        ] {
+            ConfigFile::from_yaml_str(yaml)
+                .expect_err("syslog sink missing host or port must reject at boot");
+        }
+    }
+
+    /// Multiple sinks are independent and additive — a common real config
+    /// (mirror to stdout for local debugging AND ship to the SIEM).
+    #[test]
+    fn parses_multiple_stream_sinks() {
+        let config = ConfigFile::from_yaml_str(
+            "servers: []\nlogging:\n  stream:\n    - kind: stdout\n    - kind: syslog\n      host: syslog.internal\n      port: 514\n",
+        )
+        .expect("multiple stream sinks parse");
+        assert_eq!(config.logging.stream.len(), 2);
+    }
+
+    /// `otlp` is documented as roadmap in spec 07 but not implemented
+    /// (#218) — the parser must reject it, not silently accept config that
+    /// does nothing. This is exactly the failure mode #217 fixed in the
+    /// docs; the config layer must not reopen it.
     #[test]
     fn rejects_unimplemented_stream_sink_kinds() {
-        for kind in ["syslog", "otlp", "kafka"] {
+        for kind in ["otlp", "kafka"] {
             let yaml = format!("servers: []\nlogging:\n  stream:\n    - kind: {kind}\n");
             ConfigFile::from_yaml_str(&yaml).expect_err(&format!(
                 "`{kind}` stream sink must reject — not implemented"

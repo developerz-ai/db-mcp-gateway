@@ -308,3 +308,70 @@ async fn no_configured_sinks_streams_nothing() {
 
     cleanup(&p, &user).await;
 }
+
+/// The same wiring proof as the `stdout` test above, for `syslog`: a
+/// configured sink delivers a real UDP datagram AND the durable row lands.
+/// The RFC 5424 formatting itself is unit-tested in `audit::stream`; this
+/// test is only about `audit_dispatch` actually reaching the sink.
+#[tokio::test]
+async fn configured_syslog_sink_delivers_udp_and_still_writes_the_durable_row() {
+    let p = pool().await;
+    let user = format!("stream-test-syslog-{}", Uuid::new_v4().simple());
+    let request_id = Uuid::new_v4();
+    let id: Value = json!(1);
+    let ctx = RequestContext {
+        request_id,
+        ..RequestContext::default()
+    };
+    let identity = identity(&user);
+    let header = AuditHeader {
+        tool: "run_query",
+        server: Some("prod"),
+        database: Some("app"),
+        sql: Some("SELECT 1"),
+        reason: None,
+        db_type: Some("postgres"),
+    };
+    let outcome = success_outcome(id.clone(), "{}".to_string(), Some(4), Some(1), Some(false));
+
+    let listener = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral UDP listener");
+    let port = listener.local_addr().unwrap().port();
+
+    let _response = audit_dispatch(
+        id,
+        &identity,
+        Some(&p),
+        &ctx,
+        header,
+        &[StreamSinkConfig::Syslog {
+            host: "127.0.0.1".to_string(),
+            port,
+        }],
+        std::future::ready(outcome),
+    )
+    .await;
+
+    let mut buf = [0u8; 4096];
+    let (n, _from) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        listener.recv_from(&mut buf),
+    )
+    .await
+    .expect("received a syslog datagram within 2s")
+    .expect("recv_from succeeds");
+    let received = String::from_utf8_lossy(&buf[..n]);
+    assert!(received.starts_with("<134>1 "), "{received}");
+    assert!(received.contains(&request_id.to_string()), "{received}");
+    assert!(received.contains("run_query"), "{received}");
+
+    let row = audit::latest_for_user_tool(&p, &user, "run_query")
+        .await
+        .expect("audit query runs")
+        .expect("durable audit row was written");
+    assert_eq!(row.outcome, "success");
+    assert_eq!(row.request_id, request_id.to_string());
+
+    cleanup(&p, &user).await;
+}
