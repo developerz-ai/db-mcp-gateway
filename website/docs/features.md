@@ -103,6 +103,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 - **Operations benefit:** Self-service audit access reduces support burden
 
 ### Retention (hot tier shipped; archive/stream on the roadmap)
+
 - **What it does today:** Audit logs live in the gateway's Postgres with a configurable TTL (default 90 days) and an hourly pruner that deletes past it.
 - **Not shipped:** Cold-tier archive (S3/GCS/Azure) and streaming sinks (OTLP/syslog/stdout) for SIEM integration are [roadmap Phase 4](initial-idea/11-roadmap.md) — there is no `archive` or `stream` config key yet, and the gateway refuses to boot on an unknown key.
 - **Operations benefit:** Hot data stays fast today; cold-tier retention lands when Phase 4 ships.
@@ -112,6 +113,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 ## 🤖 MCP Integration
 
 ### Complete MCP Tool Surface
+
 - **What it does:** Seven MCP tools cover all database interaction patterns
 - **Tools included:**
   - `list_servers` - Enumerate target servers visible to the caller
@@ -164,10 +166,12 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 - **Operations benefit:** User onboarding/offboarding handled centrally, not per application
 
 ### SIEM Integration (roadmap, not shipped)
+
 - **What it will do:** Stream audit logs to a SIEM via OTLP, syslog, or stdout sinks
 - **Status:** No streaming sink is implemented and there is no config key for one; [roadmap Phase 4](initial-idea/11-roadmap.md). The application logs the gateway process itself emits (JSON-per-line to stdout) are operational logs, not an audit export, and don't satisfy this.
 
 ### Multi-Cloud Archive (roadmap, not shipped)
+
 - **What it will do:** Archive audit logs to S3, Google Cloud Storage, or Azure Blob Storage past the hot-tier retention window
 - **Status:** No archive exporter is implemented and there is no `archive` config key; [roadmap Phase 4](initial-idea/11-roadmap.md).
 
