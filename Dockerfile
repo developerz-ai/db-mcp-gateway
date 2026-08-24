@@ -9,7 +9,7 @@
 # rather than pulled as `lukemathwalker/cargo-chef:*`, keeping the build's
 # supply chain to crates.io plus the official image. Version-pinned for the
 # same reason every GitHub Action is SHA-pinned.
-FROM rust:1.96.0-slim-bookworm AS chef
+FROM rust:1.98.0-slim-bookworm AS chef
 RUN cargo install cargo-chef --locked --version 0.1.77
 WORKDIR /src
 
