@@ -68,3 +68,86 @@ pub async fn connect_permissions_mysql(
 
     Ok(pool)
 }
+
+/// Classify a connect-time [`sqlx::Error`] into a short, **credential-free**
+/// token safe to log and to ship to GlitchTip.
+///
+/// [`StateDbError::Connect`]'s `Display`/`Debug` can embed the DSN, so the boot
+/// path may never render it (CLAUDE.md non-negotiable #1). What it rendered
+/// instead — `std::any::type_name_of_val(&source)` — is the constant
+/// `"sqlx_core::error::Error"` for every failure, which is why a month of
+/// production boot failures could not be told apart: a refused connection, an
+/// expired password and a 5s pool timeout all logged the same nine words.
+///
+/// Only the variant discriminant escapes, plus two pieces that are enum-shaped
+/// rather than free text: `io::ErrorKind` (e.g. `ConnectionRefused`) and the
+/// database's five-character SQLSTATE (e.g. `28P01` = invalid password). The
+/// source's *message* is never included — `Configuration` and `Tls` in
+/// particular can carry the URL and the host.
+pub fn connect_error_class(err: &sqlx::Error) -> String {
+    match err {
+        // The message is `error with configuration: <the URL>` — class only.
+        sqlx::Error::Configuration(_) => "configuration".to_owned(),
+        sqlx::Error::Io(io) => format!("io/{:?}", io.kind()),
+        sqlx::Error::Tls(_) => "tls".to_owned(),
+        sqlx::Error::Protocol(_) => "protocol".to_owned(),
+        sqlx::Error::Database(db) => match db.code() {
+            Some(code) => format!("database/{code}"),
+            None => "database".to_owned(),
+        },
+        sqlx::Error::PoolTimedOut => "pool_timed_out".to_owned(),
+        sqlx::Error::PoolClosed => "pool_closed".to_owned(),
+        sqlx::Error::WorkerCrashed => "worker_crashed".to_owned(),
+        // `sqlx::Error` is `#[non_exhaustive]` and the rest are query-time
+        // shapes (decode, column lookup, …) that connect cannot produce.
+        _ => "other".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure classification — no database, no network.
+
+    use super::connect_error_class;
+
+    #[test]
+    fn classifies_connect_failures_without_leaking_the_source_message() {
+        assert_eq!(
+            connect_error_class(&sqlx::Error::Io(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused
+            ))),
+            "io/ConnectionRefused"
+        );
+        assert_eq!(
+            connect_error_class(&sqlx::Error::PoolTimedOut),
+            "pool_timed_out"
+        );
+        assert_eq!(connect_error_class(&sqlx::Error::PoolClosed), "pool_closed");
+        // Query-time variants collapse to one token rather than panicking or
+        // rendering anything.
+        assert_eq!(connect_error_class(&sqlx::Error::RowNotFound), "other");
+    }
+
+    #[test]
+    fn never_renders_a_dsn_bearing_source() {
+        // `Configuration` and `Tls` wrap a boxed source whose `Display` is the
+        // connection string on a malformed-URL failure. The class must not
+        // carry one character of it.
+        let dsn = "postgres://app:hunter2@db.internal:5432/app";
+
+        for err in [
+            sqlx::Error::Configuration(Box::<dyn std::error::Error + Send + Sync>::from(
+                dsn.to_owned(),
+            )),
+            sqlx::Error::Tls(Box::<dyn std::error::Error + Send + Sync>::from(
+                dsn.to_owned(),
+            )),
+            sqlx::Error::Protocol(dsn.to_owned()),
+        ] {
+            let class = connect_error_class(&err);
+            assert!(!class.contains("hunter2"), "password leaked: {class}");
+            assert!(!class.contains("db.internal"), "host leaked: {class}");
+            assert!(!class.contains("postgres://"), "dsn leaked: {class}");
+        }
+    }
+}

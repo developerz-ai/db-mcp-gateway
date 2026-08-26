@@ -105,9 +105,21 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 # keep openssl out of the dep graph — see `cargo tree -i openssl-sys` (empty).
 # DSN is read from SENTRY_DSN at runtime; unset → disabled no-op client.
 sentry = { version = "0.48", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
-# credential-scrubbing regexes for the sentry `before_send` hook. No `unicode`
-# feature: DSN/password patterns are ASCII, keeping the dep light.
-regex = { version = "1", default-features = false }
+# credential-scrubbing regexes for the sentry `before_send` hook. The full
+# `unicode` feature stays off (the patterns are ASCII), but every feature those
+# patterns *use* must be named here: `unicode-case` for `(?i)`, `unicode-perl`
+# for `\w` / `\s` / `\b`. Both were previously absent and arrived only by
+# accident — `unicode-case` from a dev-dependency (so `cargo test` was green)
+# and `unicode-perl` from sentry-backtrace. The shipping build has no
+# dev-dependencies, so `(?i)` failed to compile there and the scrubber fell
+# back to redacting every string: 40 GlitchTip events, each one
+# `***REDACTED***: ***REDACTED***`. `bin/lint` now asserts both features are
+# present in the no-dev-dependency graph.
+regex = { version = "1", default-features = false, features = [
+  "std",
+  "unicode-case",
+  "unicode-perl",
+] }
 
 [dev-dependencies]
 # Self dev-dependency: enables `test-support` for this crate's own integration
