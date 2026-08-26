@@ -62,6 +62,19 @@ const SECRET_PATTERN: &str = r"(?i)(password|passwd|pwd|secret|token|dsn)\s*[:=]
 /// `MY_STATE_DB_URL` (`_`→`S` is not a word boundary).
 const SENSITIVE_KEY_PATTERN: &str = r"(?i)\b(STATE_DB_URL|TARGET_DB_URL|PERMISSIONS_DB_DSN|OIDC_CLIENT_SECRET|SESSION_SIGNING_KEY)\s*[:=]\s*\S+";
 
+/// The scrubber could not be built. One failure mode only: a pattern that does
+/// not compile under this build's `regex` features. Names the constant so the
+/// operator does not have to diff three regexes against a feature list.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "credential-scrubbing pattern `{name}` failed to compile; this build's `regex` features do not cover it — see the `regex` dependency in Cargo.toml and `bin/check-scrub-features`"
+)]
+pub(crate) struct ScrubberError {
+    name: &'static str,
+    #[source]
+    source: regex::Error,
+}
+
 /// The compiled patterns, owned by the `before_send` hook for the life of the
 /// process. Construction is the only place compilation can fail, so every
 /// method below is total — there is no "scrubber that might not work" state to
@@ -77,11 +90,11 @@ impl Scrubber {
     /// this fails is a build whose `regex` features do not cover what they use
     /// (`unicode-case` for `(?i)`, `unicode-perl` for `\w`/`\s`/`\b`) — a
     /// dependency defect, surfaced at boot by [`init`].
-    fn new() -> Result<Self, regex::Error> {
+    fn new() -> Result<Self, ScrubberError> {
         Ok(Self {
-            url_creds: Regex::new(URL_CREDS_PATTERN)?,
-            sensitive_key: Regex::new(SENSITIVE_KEY_PATTERN)?,
-            secret: Regex::new(SECRET_PATTERN)?,
+            url_creds: compile("URL_CREDS_PATTERN", URL_CREDS_PATTERN)?,
+            sensitive_key: compile("SENSITIVE_KEY_PATTERN", SENSITIVE_KEY_PATTERN)?,
+            secret: compile("SECRET_PATTERN", SECRET_PATTERN)?,
         })
     }
 
@@ -238,7 +251,7 @@ impl Scrubber {
 /// The returned [`ClientInitGuard`] is `#[must_use]` for a reason: dropping it
 /// early flushes-and-shuts the transport. The caller binds it to a name that
 /// outlives the runtime.
-pub(crate) fn init() -> Result<ClientInitGuard, regex::Error> {
+pub(crate) fn init() -> Result<ClientInitGuard, ScrubberError> {
     // Compile before anything can be captured: the client is only opened once
     // every outgoing event is guaranteed to pass through a working scrubber.
     let scrubber = Scrubber::new()?;
@@ -273,6 +286,11 @@ pub(crate) fn init() -> Result<ClientInitGuard, regex::Error> {
     };
 
     Ok(sentry::init(opts))
+}
+
+/// Compile one named pattern, tagging a failure with the constant's name.
+fn compile(name: &'static str, pattern: &str) -> Result<Regex, ScrubberError> {
+    Regex::new(pattern).map_err(|source| ScrubberError { name, source })
 }
 
 /// Parse a raw DSN string the way [`init`] does: empty/whitespace/malformed →

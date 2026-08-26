@@ -158,7 +158,16 @@ Env keys whose values must never leak (the scrubber targets their shapes, not th
 STATE_DB_URL  TARGET_DB_URL  PERMISSIONS_DB_DSN  OIDC_CLIENT_SECRET  SESSION_SIGNING_KEY
 ```
 
-**Only the secret portion is replaced.** A string that matches nothing comes back byte-identical; a whole field collapsing to `***REDACTED***` is a scrubber failure, not a scrub. The three patterns are compiled once at boot, and a pattern that does not compile **aborts the process** — a scrubber that cannot scrub is a build defect, and the gateway must not open an event stream it cannot clean. The patterns rely on `regex` features (`unicode-case` for `(?i)`, `unicode-perl` for `\w`/`\s`/`\b`) that the `Cargo.toml` dependency must name explicitly; `bin/check-scrub-features` asserts they are present in the *no-dev-dependency* graph, which is the one the release image builds.
+Scrubber contract:
+
+| Rule | Detail |
+|---|---|
+| Replace only the secret portion | The match is rewritten; the rest of the string is untouched. |
+| Non-matching text is preserved byte-for-byte | An event that carries no secret ships exactly as the SDK built it. |
+| A whole field collapsing to `***REDACTED***` is a failure, not a scrub | It destroys the event and fingerprints every distinct error into one issue. |
+| Patterns compile once, at boot | A pattern that does not compile **aborts the process** — a scrubber that cannot scrub is a build defect, and the gateway must not open an event stream it cannot clean. |
+| The `regex` features the patterns use are named explicitly | `unicode-case` for `(?i)`, `unicode-perl` for `\w` / `\s` / `\b`. |
+| `bin/check-scrub-features` asserts those features in the **no-dev-dependency** graph | That is the graph the release image builds; dev-dependencies mask a missing feature from `cargo test`. |
 
 ### Runtime injection
 

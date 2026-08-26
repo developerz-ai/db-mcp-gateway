@@ -46,12 +46,9 @@ fn main() -> anyhow::Result<()> {
     // via the before_send hook in `sentry_scrub`. `init` compiles the scrubber's
     // patterns up front and fails if this build's `regex` features don't cover
     // them — refuse to boot rather than open an event stream that cannot scrub.
-    let _sentry_guard = sentry_scrub::init().map_err(|err| {
-        anyhow::anyhow!(
-            "GlitchTip credential scrubber failed to compile its patterns \
-             (check the `regex` features in Cargo.toml): {err}"
-        )
-    })?;
+    // `ScrubberError` already names the pattern and the fix, so it needs no
+    // context added here.
+    let _sentry_guard = sentry_scrub::init()?;
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
