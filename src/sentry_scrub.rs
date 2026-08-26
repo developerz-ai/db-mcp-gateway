@@ -433,7 +433,7 @@ mod tests {
     #[test]
     fn benign_error_text_never_collapses_to_the_sentinel() {
         let scrubber = scrubber();
-        let boot_error = "state DB: failed to connect (io/ConnectionRefused; DSN withheld)";
+        let boot_error = "state DB: failed to connect (pool_timed_out; DSN withheld)";
 
         let mut event = sentry::protocol::Event::default();
         event.exception.values.push(sentry::protocol::Exception {
