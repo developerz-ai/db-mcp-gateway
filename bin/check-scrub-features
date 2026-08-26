@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# bin/check-scrub-features — assert the GlitchTip credential scrubber's regex
+# features are present in the graph that actually ships.
+#
+# `src/sentry_scrub.rs` compiles its patterns at runtime, so a missing `regex`
+# feature is invisible to fmt, clippy and `cargo test` alike. The shipping
+# binary is built WITHOUT dev-dependencies — and dev-dependencies were the only
+# thing pulling `unicode-case` into the graph. `(?i)` therefore failed to
+# compile in the release image alone, the scrubber fell back to redacting every
+# string, and a month of GlitchTip events arrived as
+# `***REDACTED***: ***REDACTED***` while CI stayed green.
+#
+# `-e no-dev` is the whole point: check the graph that ships, not the one that
+# tests.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+shipping_features=$(cargo tree -e features -i regex-syntax -e no-dev)
+
+status=0
+for feature in unicode-case unicode-perl; do
+  if ! grep -qF "regex-syntax feature \"$feature\"" <<<"$shipping_features"; then
+    echo "✗ regex-syntax feature '$feature' missing from the no-dev-dependency graph."
+    status=1
+  fi
+done
+
+if [ "$status" -ne 0 ]; then
+  echo "  src/sentry_scrub.rs needs it: 'unicode-case' for (?i), 'unicode-perl' for \\w/\\s/\\b."
+  echo "  Without it the gateway refuses to boot. Name it in the 'regex' dependency in Cargo.toml."
+  exit 1
+fi

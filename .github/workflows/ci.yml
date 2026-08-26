@@ -89,6 +89,12 @@ jobs:
       # unused-import warnings that only ever surfaced in a `docker build`.
       # Lint the shipping configuration too.
       - run: cargo clippy --release --all-features -- -D warnings
+      # The credential scrubber compiles its regexes at runtime, so a `regex`
+      # feature missing from the *shipping* graph passes fmt, clippy and
+      # `cargo test` and only surfaces in production. It did: `unicode-case`
+      # came in via a dev-dependency, so `(?i)` failed to compile in the release
+      # image alone and every GlitchTip event arrived fully redacted.
+      - run: bin/check-scrub-features
 
   test:
     runs-on: blacksmith-4vcpu-ubuntu-2404

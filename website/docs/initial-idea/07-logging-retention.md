@@ -158,6 +158,17 @@ Env keys whose values must never leak (the scrubber targets their shapes, not th
 STATE_DB_URL  TARGET_DB_URL  PERMISSIONS_DB_DSN  OIDC_CLIENT_SECRET  SESSION_SIGNING_KEY
 ```
 
+Scrubber contract:
+
+| Rule | Detail |
+|---|---|
+| Replace only the secret portion | The match is rewritten; the rest of the string is untouched. |
+| Non-matching text is preserved byte-for-byte | An event that carries no secret ships exactly as the SDK built it. |
+| A whole field collapsing to `***REDACTED***` is a failure, not a scrub | It destroys the event and fingerprints every distinct error into one issue. |
+| Patterns compile once, at boot | A pattern that does not compile **aborts the process** — a scrubber that cannot scrub is a build defect, and the gateway must not open an event stream it cannot clean. |
+| The `regex` features the patterns use are named explicitly | `unicode-case` for `(?i)`, `unicode-perl` for `\w` / `\s` / `\b`. |
+| `bin/check-scrub-features` asserts those features in the **no-dev-dependency** graph | That is the graph the release image builds; dev-dependencies mask a missing feature from `cargo test`. |
+
 ### Runtime injection
 
 The DSN is injected at runtime via a Kubernetes sealed-secret (not baked into the image). Operator setup lives in [deployment/logging](../deployment/logging.md). With no secret mounted, `SENTRY_DSN` is absent and the client is a no-op — a missing GlitchTip config must never prevent the gateway from serving traffic.

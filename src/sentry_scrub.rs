@@ -21,11 +21,19 @@
 //! primary rule (credentials never travel in errors/logs) — the scrubber exists
 //! for the day something slips past that.
 //!
+//! The three patterns are compiled **once, at boot**, by [`Scrubber::new`]. A
+//! pattern that does not compile aborts the process instead of degrading: the
+//! previous shape compiled them lazily and substituted the redaction sentinel
+//! for the whole string when compilation failed, which silently destroyed every
+//! field of every event for a month (see the `unicode-case` note on the `regex`
+//! dependency in `Cargo.toml`). A scrubber that cannot scrub is a build defect,
+//! not a runtime condition, and it must be impossible to ship quietly.
+//!
 //! Error tracking **only**: [`init`] pins `traces_sample_rate` to `0.0`.
 //! GlitchTip cannot ingest transactions/spans/replay, so any perf data would
 //! be silently dropped or mis-stored.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use regex::Regex;
 use sentry::types::Dsn;
@@ -54,8 +62,186 @@ const SECRET_PATTERN: &str = r"(?i)(password|passwd|pwd|secret|token|dsn)\s*[:=]
 /// `MY_STATE_DB_URL` (`_`→`S` is not a word boundary).
 const SENSITIVE_KEY_PATTERN: &str = r"(?i)\b(STATE_DB_URL|TARGET_DB_URL|PERMISSIONS_DB_DSN|OIDC_CLIENT_SECRET|SESSION_SIGNING_KEY)\s*[:=]\s*\S+";
 
+/// The scrubber could not be built. One failure mode only: a pattern that does
+/// not compile under this build's `regex` features. Names the constant so the
+/// operator does not have to diff three regexes against a feature list.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "credential-scrubbing pattern `{name}` failed to compile; this build's `regex` features do not cover it — see the `regex` dependency in Cargo.toml and `bin/check-scrub-features`"
+)]
+pub(crate) struct ScrubberError {
+    name: &'static str,
+    #[source]
+    source: regex::Error,
+}
+
+/// The compiled patterns, owned by the `before_send` hook for the life of the
+/// process. Construction is the only place compilation can fail, so every
+/// method below is total — there is no "scrubber that might not work" state to
+/// branch on at send time.
+struct Scrubber {
+    url_creds: Regex,
+    sensitive_key: Regex,
+    secret: Regex,
+}
+
+impl Scrubber {
+    /// Compile the three patterns. The literals are static, so the only way
+    /// this fails is a build whose `regex` features do not cover what they use
+    /// (`unicode-case` for `(?i)`, `unicode-perl` for `\w`/`\s`/`\b`) — a
+    /// dependency defect, surfaced at boot by [`init`].
+    fn new() -> Result<Self, ScrubberError> {
+        Ok(Self {
+            url_creds: compile("URL_CREDS_PATTERN", URL_CREDS_PATTERN)?,
+            sensitive_key: compile("SENSITIVE_KEY_PATTERN", SENSITIVE_KEY_PATTERN)?,
+            secret: compile("SECRET_PATTERN", SECRET_PATTERN)?,
+        })
+    }
+
+    /// Redact connection-string credentials and secret assignments in `s`.
+    ///
+    /// Applied in three passes: URL userinfo first (so `dsn: postgres://u:p@h`
+    /// loses `u:p` even though `dsn:…` also matches a later pass), then the
+    /// sensitive-key allowlist (whole-value redact for the named env keys),
+    /// then `key=value` secrets by keyword. Each pass replaces only the secret
+    /// *portion* — text that matches nothing comes back byte-identical.
+    fn scrub_str(&self, s: &str) -> String {
+        let after_url = self.url_creds.replace_all(s, format!("$1{REDACTED}@"));
+        let after_key = self
+            .sensitive_key
+            .replace_all(&after_url, format!("$1={REDACTED}"));
+        self.secret
+            .replace_all(&after_key, format!("$1={REDACTED}"))
+            .into_owned()
+    }
+
+    /// Recursively redact every JSON string leaf.
+    fn scrub_json(&self, value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(s) => *s = self.scrub_str(s),
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|v| self.scrub_json(v)),
+            serde_json::Value::Object(map) => map.values_mut().for_each(|v| self.scrub_json(v)),
+            _ => {}
+        }
+    }
+
+    /// `before_send`: scrub every credential-bearing string on the event, then
+    /// pass it through. Returns `Some` always — we redact, never drop.
+    ///
+    /// Fields touched (the ones that can carry operator- or driver-injected text):
+    /// - [`sentry::protocol::Event::message`] — the free-form message.
+    /// - each `exception.values[].value` (the rendered error message) **and** the
+    ///   exception `ty` (class name) — both per the goal "exception values/type".
+    /// - each `breadcrumbs.values[].message` plus every string leaf in its `data` map.
+    /// - `tags` (every value), `user` (`id` / `email` / `username` string fields plus
+    ///   the forwards-compat `other` JSON map), and `request` (`url`, `method`,
+    ///   `data`, `query_string`, `cookies`, plus the `headers` / `env` string maps).
+    ///   `send_default_pii: false` only suppresses SDK *auto*-PII; anything manually
+    ///   attached to these fields must still be scrubbed.
+    /// - every [`serde_json::Value::String`] reachable in `extra` (nested maps and
+    ///   arrays walked recursively).
+    /// - every value in `Context::Other` maps under `contexts`.
+    fn scrub_event(
+        &self,
+        mut event: sentry::protocol::Event<'static>,
+    ) -> Option<sentry::protocol::Event<'static>> {
+        if let Some(msg) = event.message.as_mut() {
+            *msg = self.scrub_str(msg);
+        }
+
+        for ex in event.exception.values.iter_mut() {
+            ex.ty = self.scrub_str(&ex.ty);
+            if let Some(val) = ex.value.as_mut() {
+                *val = self.scrub_str(val);
+            }
+        }
+
+        for bc in event.breadcrumbs.values.iter_mut() {
+            if let Some(msg) = bc.message.as_mut() {
+                *msg = self.scrub_str(msg);
+            }
+            // `Breadcrumb::data` (`Map<String, Value>`) carries arbitrary nested
+            // JSON (HTTP method/url, query params, custom state). Same scrubber as
+            // `extra` / `Context::Other` — a secret in `data` must not slip past.
+            for value in bc.data.values_mut() {
+                self.scrub_json(value);
+            }
+        }
+
+        // `extra` and `Context::Other` hold arbitrary JSON; walk to every string leaf.
+        for value in event.extra.values_mut() {
+            self.scrub_json(value);
+        }
+        for ctx in event.contexts.values_mut() {
+            if let sentry::protocol::Context::Other(map) = ctx {
+                for value in map.values_mut() {
+                    self.scrub_json(value);
+                }
+            }
+        }
+
+        // `tags` is a flat string->string map. Operator-set tags can carry secrets;
+        // `send_default_pii: false` does not touch them. Scrub every value.
+        for value in event.tags.values_mut() {
+            *value = self.scrub_str(value);
+        }
+
+        // `user` and `request` hold *manually*-attached data (`send_default_pii`
+        // only suppresses SDK auto-PII), so scrub their free-text string fields with
+        // the same `scrub_str`, and any forwards-compat JSON map with `scrub_json`.
+        if let Some(user) = event.user.as_mut() {
+            if let Some(id) = user.id.as_mut() {
+                *id = self.scrub_str(id);
+            }
+            if let Some(email) = user.email.as_mut() {
+                *email = self.scrub_str(email);
+            }
+            if let Some(username) = user.username.as_mut() {
+                *username = self.scrub_str(username);
+            }
+            // `ip_address` is a typed IP, not free text — nothing to scrub.
+            for value in user.other.values_mut() {
+                self.scrub_json(value);
+            }
+        }
+
+        if let Some(req) = event.request.as_mut() {
+            // `url` is a typed `Url`, not a `String`: round-trip through the string
+            // scrubber and reparse. If the scrubbed form no longer parses, drop it
+            // (`ok()` -> `None`) rather than risk shipping an unscrubbed URL.
+            if let Some(url) = req.url.take() {
+                req.url = self.scrub_str(url.as_str()).parse().ok();
+            }
+            if let Some(method) = req.method.as_mut() {
+                *method = self.scrub_str(method);
+            }
+            if let Some(data) = req.data.as_mut() {
+                *data = self.scrub_str(data);
+            }
+            if let Some(query) = req.query_string.as_mut() {
+                *query = self.scrub_str(query);
+            }
+            if let Some(cookies) = req.cookies.as_mut() {
+                *cookies = self.scrub_str(cookies);
+            }
+            for value in req.headers.values_mut() {
+                *value = self.scrub_str(value);
+            }
+            for value in req.env.values_mut() {
+                *value = self.scrub_str(value);
+            }
+        }
+
+        Some(event)
+    }
+}
+
 /// Initialize the global GlitchTip client and return a guard that must live
 /// for the entire program (it flushes the send queue on drop).
+///
+/// Fails only when the scrubber's patterns do not compile in this build — the
+/// caller turns that into a boot abort, because an event stream that cannot be
+/// scrubbed must never be opened.
 ///
 /// DSN comes from `SENTRY_DSN`; an unset, empty, or malformed value yields a
 /// **disabled** client — the app still runs, nothing is shipped. `SENTRY_ENVIRONMENT`
@@ -65,7 +251,11 @@ const SENSITIVE_KEY_PATTERN: &str = r"(?i)\b(STATE_DB_URL|TARGET_DB_URL|PERMISSI
 /// The returned [`ClientInitGuard`] is `#[must_use]` for a reason: dropping it
 /// early flushes-and-shuts the transport. The caller binds it to a name that
 /// outlives the runtime.
-pub(crate) fn init() -> ClientInitGuard {
+pub(crate) fn init() -> Result<ClientInitGuard, ScrubberError> {
+    // Compile before anything can be captured: the client is only opened once
+    // every outgoing event is guaranteed to pass through a working scrubber.
+    let scrubber = Scrubber::new()?;
+
     let dsn = std::env::var("SENTRY_DSN")
         .ok()
         .and_then(|raw| parse_dsn(&raw));
@@ -75,14 +265,14 @@ pub(crate) fn init() -> ClientInitGuard {
         .unwrap_or_else(|| "development".to_owned());
 
     // The field is `Option<Arc<dyn Fn(Event) -> Option<Event> + Send + Sync>>`.
-    // Bind the trait object at a typed let-site so the fn→trait-object coercion
-    // resolves there, not at the struct-literal field (avoids relying on the
-    // field-position coercion site).
+    // Bind the trait object at a typed let-site so the closure→trait-object
+    // coercion resolves there, not at the struct-literal field (avoids relying
+    // on the field-position coercion site).
     let before_send: Arc<
         dyn Fn(sentry::protocol::Event<'static>) -> Option<sentry::protocol::Event<'static>>
             + Send
             + Sync,
-    > = Arc::new(scrub_event);
+    > = Arc::new(move |event| scrubber.scrub_event(event));
 
     let opts = ClientOptions {
         dsn,
@@ -95,7 +285,12 @@ pub(crate) fn init() -> ClientInitGuard {
         ..ClientOptions::default()
     };
 
-    sentry::init(opts)
+    Ok(sentry::init(opts))
+}
+
+/// Compile one named pattern, tagging a failure with the constant's name.
+fn compile(name: &'static str, pattern: &str) -> Result<Regex, ScrubberError> {
+    Regex::new(pattern).map_err(|source| ScrubberError { name, source })
 }
 
 /// Parse a raw DSN string the way [`init`] does: empty/whitespace/malformed →
@@ -110,180 +305,23 @@ fn parse_dsn(raw: &str) -> Option<Dsn> {
     trimmed.parse::<Dsn>().ok()
 }
 
-/// `before_send`: scrub every credential-bearing string on the event, then
-/// pass it through. Returns `Some` always — we redact, never drop, on the
-/// happy path.
-///
-/// Fields touched (the ones that can carry operator- or driver-injected text):
-/// - [`Event::message`] — the free-form message.
-/// - each `exception.values[].value` (the rendered error message) **and** the
-///   exception `ty` (class name) — both per the goal "exception values/type".
-/// - each `breadcrumbs.values[].message` plus every string leaf in its `data` map.
-/// - `tags` (every value), `user` (`id` / `email` / `username` string fields plus
-///   the forwards-compat `other` JSON map), and `request` (`url`, `method`,
-///   `data`, `query_string`, `cookies`, plus the `headers` / `env` string maps).
-///   `send_default_pii: false` only suppresses SDK *auto*-PII; anything manually
-///   attached to these fields must still be scrubbed.
-/// - every [`serde_json::Value::String`] reachable in `extra` (nested maps and
-///   arrays walked recursively).
-/// - every value in `Context::Other` maps under `contexts`.
-fn scrub_event(
-    mut event: sentry::protocol::Event<'static>,
-) -> Option<sentry::protocol::Event<'static>> {
-    if let Some(msg) = event.message.as_mut() {
-        *msg = scrub_str(msg);
-    }
-
-    for ex in event.exception.values.iter_mut() {
-        ex.ty = scrub_str(&ex.ty);
-        if let Some(val) = ex.value.as_mut() {
-            *val = scrub_str(val);
-        }
-    }
-
-    for bc in event.breadcrumbs.values.iter_mut() {
-        if let Some(msg) = bc.message.as_mut() {
-            *msg = scrub_str(msg);
-        }
-        // `Breadcrumb::data` (`Map<String, Value>`) carries arbitrary nested
-        // JSON (HTTP method/url, query params, custom state). Same scrubber as
-        // `extra` / `Context::Other` — a secret in `data` must not slip past.
-        for value in bc.data.values_mut() {
-            scrub_json(value);
-        }
-    }
-
-    // `extra` and `Context::Other` hold arbitrary JSON; walk to every string leaf.
-    for value in event.extra.values_mut() {
-        scrub_json(value);
-    }
-    for ctx in event.contexts.values_mut() {
-        if let sentry::protocol::Context::Other(map) = ctx {
-            for value in map.values_mut() {
-                scrub_json(value);
-            }
-        }
-    }
-
-    // `tags` is a flat string->string map. Operator-set tags can carry secrets;
-    // `send_default_pii: false` does not touch them. Scrub every value.
-    for value in event.tags.values_mut() {
-        *value = scrub_str(value);
-    }
-
-    // `user` and `request` hold *manually*-attached data (`send_default_pii`
-    // only suppresses SDK auto-PII), so scrub their free-text string fields with
-    // the same `scrub_str`, and any forwards-compat JSON map with `scrub_json`.
-    if let Some(user) = event.user.as_mut() {
-        if let Some(id) = user.id.as_mut() {
-            *id = scrub_str(id);
-        }
-        if let Some(email) = user.email.as_mut() {
-            *email = scrub_str(email);
-        }
-        if let Some(username) = user.username.as_mut() {
-            *username = scrub_str(username);
-        }
-        // `ip_address` is a typed IP, not free text — nothing to scrub.
-        for value in user.other.values_mut() {
-            scrub_json(value);
-        }
-    }
-
-    if let Some(req) = event.request.as_mut() {
-        // `url` is a typed `Url`, not a `String`: round-trip through the string
-        // scrubber and reparse. If the scrubbed form no longer parses, drop it
-        // (`ok()` -> `None`) rather than risk shipping an unscrubbed URL.
-        if let Some(url) = req.url.take() {
-            req.url = scrub_str(url.as_str()).parse().ok();
-        }
-        if let Some(method) = req.method.as_mut() {
-            *method = scrub_str(method);
-        }
-        if let Some(data) = req.data.as_mut() {
-            *data = scrub_str(data);
-        }
-        if let Some(query) = req.query_string.as_mut() {
-            *query = scrub_str(query);
-        }
-        if let Some(cookies) = req.cookies.as_mut() {
-            *cookies = scrub_str(cookies);
-        }
-        for value in req.headers.values_mut() {
-            *value = scrub_str(value);
-        }
-        for value in req.env.values_mut() {
-            *value = scrub_str(value);
-        }
-    }
-
-    Some(event)
-}
-
-/// Redact connection-string credentials and secret assignments in `s`.
-///
-/// Applied in three passes: URL userinfo first (so `dsn: postgres://u:p@h`
-/// loses `u:p` even though `dsn:…` also matches a later pass), then the
-/// sensitive-key allowlist (whole-value redact for the named env keys), then
-/// `key=value` secrets by keyword. If a regex somehow fails to compile —
-/// impossible for these static literals, but the no-panic convention forbids
-/// `expect` — we fail **closed**: the whole string becomes [`REDACTED`] rather
-/// than risk shipping unscrubbed.
-fn scrub_str(s: &str) -> String {
-    let (Some(url_re), Some(key_re), Some(secret_re)) =
-        (url_creds_re(), sensitive_key_re(), secret_re())
-    else {
-        return REDACTED.to_owned();
-    };
-    let after_url = url_re.replace_all(s, format!("$1{REDACTED}@"));
-    let after_key = key_re.replace_all(&after_url, format!("$1={REDACTED}"));
-    secret_re
-        .replace_all(&after_key, format!("$1={REDACTED}"))
-        .into_owned()
-}
-
-/// Recursively redact every JSON string leaf.
-fn scrub_json(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::String(s) => *s = scrub_str(s),
-        serde_json::Value::Array(items) => items.iter_mut().for_each(scrub_json),
-        serde_json::Value::Object(map) => map.values_mut().for_each(scrub_json),
-        _ => {}
-    }
-}
-
-/// Compiled once, on first use. Patterns are static literals, so compilation
-/// can only fail on a programmer error; stored as `Result` (no `expect`,
-/// per the no-panic-in-prod convention) and consumed fail-closed by
-/// [`scrub_str`].
-fn url_creds_re() -> Option<&'static Regex> {
-    static RE: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(URL_CREDS_PATTERN))
-        .as_ref()
-        .ok()
-}
-
-/// See [`url_creds_re`].
-fn secret_re() -> Option<&'static Regex> {
-    static RE: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(SECRET_PATTERN)).as_ref().ok()
-}
-
-/// See [`url_creds_re`].
-fn sensitive_key_re() -> Option<&'static Regex> {
-    static RE: OnceLock<Result<Regex, regex::Error>> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(SENSITIVE_KEY_PATTERN))
-        .as_ref()
-        .ok()
-}
-
 #[cfg(test)]
 mod tests {
     //! No network, no real DB. Scrubber is pure string work, and DSN parsing
     //! is exercised via the pure [`parse_dsn`] helper → no test mutates the
     //! process env → parallel-safe.
+    //!
+    //! These run under `cargo test`, whose dependency graph includes
+    //! dev-dependencies and therefore more `regex` features than the shipping
+    //! binary gets. That is exactly how the fail-closed bug stayed green here
+    //! while production redacted every event, so the *feature* half of this
+    //! contract is enforced outside cargo test, by `bin/lint`.
 
     use super::*;
+
+    fn scrubber() -> Scrubber {
+        Scrubber::new().expect("scrubber patterns compile")
+    }
 
     #[test]
     fn scrubs_postgres_dsn_in_event_message() {
@@ -300,7 +338,9 @@ mod tests {
             serde_json::json!({ "url": format!("postgresql://app:{secret}@db:5432/x") }),
         );
 
-        let scrubbed = scrub_event(event).expect("scrubber always returns Some");
+        let scrubbed = scrubber()
+            .scrub_event(event)
+            .expect("scrubber always returns Some");
         let msg = scrubbed.message.as_deref().expect("message preserved");
         assert!(msg.contains("***REDACTED***"), "message redacted: {msg}");
         assert!(!msg.contains(secret), "password leaked into message: {msg}");
@@ -313,13 +353,15 @@ mod tests {
 
     #[test]
     fn scrubs_password_assignment() {
+        let scrubber = scrubber();
+
         // `key=value` form (the contract under test).
-        let out = scrub_str("password=hunter2 ok");
+        let out = scrubber.scrub_str("password=hunter2 ok");
         assert!(out.contains("***REDACTED***"), "{out}");
         assert!(!out.contains("hunter2"), "{out}");
 
         // `key: value` form, mixed case.
-        let out = scrub_str("OIDC_CLIENT_SECRET: s3cr3t-value");
+        let out = scrubber.scrub_str("OIDC_CLIENT_SECRET: s3cr3t-value");
         assert!(out.contains("***REDACTED***"), "{out}");
         assert!(!out.contains("s3cr3t-value"), "{out}");
 
@@ -327,11 +369,11 @@ mod tests {
         // userinfo and no secret keyword. The internal hostname must not leak.
         // (CodeRabbit: SESSION_SIGNING_KEY / STATE_DB_URL bypassed the old
         // scrubber.)
-        let out = scrub_str("SESSION_SIGNING_KEY=jwt-hs256-base64-secret");
+        let out = scrubber.scrub_str("SESSION_SIGNING_KEY=jwt-hs256-base64-secret");
         assert!(out.contains("***REDACTED***"), "{out}");
         assert!(!out.contains("jwt-hs256-base64-secret"), "{out}");
 
-        let out = scrub_str("STATE_DB_URL=postgres://db.internal/app");
+        let out = scrubber.scrub_str("STATE_DB_URL=postgres://db.internal/app");
         assert!(out.contains("***REDACTED***"), "{out}");
         assert!(
             !out.contains("db.internal"),
@@ -340,20 +382,20 @@ mod tests {
 
         // A userinfo-bearing STATE_DB_URL is also fully redacted (allowlist
         // whole-value pass, not just the URL userinfo strip).
-        let out = scrub_str("STATE_DB_URL=postgres://app:s3cr3t@db.internal/app");
+        let out = scrubber.scrub_str("STATE_DB_URL=postgres://app:s3cr3t@db.internal/app");
         assert!(out.contains("***REDACTED***"), "{out}");
         assert!(!out.contains("s3cr3t"), "{out}");
         assert!(!out.contains("db.internal"), "{out}");
 
         // `: value` separator, mixed case, and a sibling non-sensitive key
         // left intact.
-        let out = scrub_str("state_db_url: postgres://db.internal/app ok=1");
+        let out = scrubber.scrub_str("state_db_url: postgres://db.internal/app ok=1");
         assert!(out.contains("***REDACTED***"), "{out}");
         assert!(out.contains("ok=1"), "benign sibling key clobbered: {out}");
 
         // `MY_STATE_DB_URL` is not the allowlisted key — left alone by this
         // pass (its value carries no creds here).
-        let out = scrub_str("MY_STATE_DB_URL=harmless");
+        let out = scrubber.scrub_str("MY_STATE_DB_URL=harmless");
         assert!(!out.contains("***REDACTED***"), "false positive: {out}");
 
         // Each DB scheme family loses its userinfo, host stays.
@@ -366,7 +408,7 @@ mod tests {
             "mariadb://u:p@h/db",
             "redis://u:p@h:6379",
         ] {
-            let out = scrub_str(raw);
+            let out = scrubber.scrub_str(raw);
             assert!(out.contains("***REDACTED***"), "{raw} -> {out}");
             assert!(!out.contains(":p@"), "userinfo leaked: {raw} -> {out}");
         }
@@ -374,12 +416,40 @@ mod tests {
 
     #[test]
     fn does_not_redact_benign_text() {
+        let scrubber = scrubber();
         // No creds, no secret keys → untouched.
         let raw = "query returned 42 rows from table users in 3ms";
-        assert_eq!(scrub_str(raw), raw);
+        assert_eq!(scrubber.scrub_str(raw), raw);
         // A URL without credentials is left intact.
         let raw = "see https://example.com/docs for details";
-        assert_eq!(scrub_str(raw), raw);
+        assert_eq!(scrubber.scrub_str(raw), raw);
+    }
+
+    /// The production regression (GlitchTip issue DB-MCP-GATEWAY-2, 40 events,
+    /// every one titled `***REDACTED***: ***REDACTED***`): the whole string
+    /// must never collapse to the sentinel. A scrubber that redacts everything
+    /// leaks nothing but tells nobody anything, and every distinct error
+    /// fingerprints into one unreadable issue.
+    #[test]
+    fn benign_error_text_never_collapses_to_the_sentinel() {
+        let scrubber = scrubber();
+        let boot_error = "state DB: failed to connect (pool_timed_out; DSN withheld)";
+
+        let mut event = sentry::protocol::Event::default();
+        event.exception.values.push(sentry::protocol::Exception {
+            ty: "Error".to_owned(),
+            value: Some(boot_error.to_owned()),
+            ..Default::default()
+        });
+
+        let scrubbed = scrubber.scrub_event(event).expect("Some");
+        let ex = &scrubbed.exception.values[0];
+        assert_eq!(ex.ty, "Error", "exception type replaced wholesale");
+        assert_eq!(
+            ex.value.as_deref(),
+            Some(boot_error),
+            "exception value replaced wholesale"
+        );
     }
 
     #[test]
@@ -391,7 +461,7 @@ mod tests {
             ..Default::default()
         });
 
-        let scrubbed = scrub_event(event).expect("Some");
+        let scrubbed = scrubber().scrub_event(event).expect("Some");
         let ex = &scrubbed.exception.values[0];
         assert!(!ex.ty.contains("leak-me"), "type leaked: {}", ex.ty);
         let val = ex.value.as_deref().expect("value preserved");
@@ -432,7 +502,9 @@ mod tests {
         let mut event = sentry::protocol::Event::default();
         event.breadcrumbs.values.push(bc);
 
-        let scrubbed = scrub_event(event).expect("scrubber always returns Some");
+        let scrubbed = scrubber()
+            .scrub_event(event)
+            .expect("scrubber always returns Some");
         let out = &scrubbed.breadcrumbs.values[0];
 
         // `message` redacted.
@@ -518,7 +590,9 @@ mod tests {
         );
         event.request = Some(request);
 
-        let scrubbed = scrub_event(event).expect("scrubber always returns Some");
+        let scrubbed = scrubber()
+            .scrub_event(event)
+            .expect("scrubber always returns Some");
 
         // Serialize the whole event: proves no secret leaks through *any* of the
         // newly-scrubbed fields, and that redaction actually fired.

@@ -43,8 +43,12 @@ fn main() -> anyhow::Result<()> {
     // so it outlives every path through `main`, including the `Err` returns here
     // and inside `block_on` (drop runs after `block_on` resolves → 2s flush).
     // CLAUDE.md non-negotiable #1: every outgoing event is credential-scrubbed
-    // via the before_send hook in `sentry_scrub`.
-    let _sentry_guard = sentry_scrub::init();
+    // via the before_send hook in `sentry_scrub`. `init` compiles the scrubber's
+    // patterns up front and fails if this build's `regex` features don't cover
+    // them — refuse to boot rather than open an event stream that cannot scrub.
+    // `ScrubberError` already names the pattern and the fix, so it needs no
+    // context added here.
+    let _sentry_guard = sentry_scrub::init()?;
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -325,20 +329,26 @@ async fn run() -> anyhow::Result<()> {
 /// DSN — and therefore the password — when the URL is malformed or auth is
 /// rejected. `main` returns `anyhow::Result`, and a returned error is rendered
 /// to stderr through its source chain on process exit, so propagating that
-/// `#[source]` would print the credential. We log the error *type* only (same
-/// discipline as the admin handlers in `transport/admin/`) and return a
-/// source-free error. `Migrate` failures name only migration versions, never
-/// credentials, so they're surfaced in full for operator debugging. CLAUDE.md
-/// non-negotiable #1.
+/// `#[source]` would print the credential. We log the error *type* plus the
+/// credential-free class from [`state::connect_error_class`] (same discipline
+/// as the admin handlers in `transport/admin/`) and return a source-free error
+/// that names the class — `error_type` alone is the constant
+/// `sqlx_core::error::Error`, so it told the operator nothing and made every
+/// distinct boot failure one indistinguishable GlitchTip issue. The class
+/// travels in the returned message for exactly that reason. `Migrate` failures
+/// name only migration versions, never credentials, so they're surfaced in full
+/// for operator debugging. CLAUDE.md non-negotiable #1.
 fn boot_db_error(store: &'static str, err: state::StateDbError) -> anyhow::Error {
     match err {
         state::StateDbError::Connect(source) => {
+            let class = state::connect_error_class(&source);
             tracing::error!(
                 store,
                 error_type = std::any::type_name_of_val(&source),
+                error_class = %class,
                 "boot database bring-up failed at connect"
             );
-            anyhow::anyhow!("{store}: failed to connect (see logs; DSN withheld)")
+            anyhow::anyhow!("{store}: failed to connect ({class}; DSN withheld)")
         }
         state::StateDbError::Migrate(source) => {
             anyhow::Error::new(source).context(format!("{store}: migrations failed"))
