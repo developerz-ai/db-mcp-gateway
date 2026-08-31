@@ -208,7 +208,7 @@ jobs:
       # every run). taiki-e/install-action pulls the release binary; the audit
       # invocation and audit.toml ignore semantics below are unchanged.
       - name: install cargo-audit
-        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2
+        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
         with:
           tool: cargo-audit
       # RUSTSEC-2023-0071 (rsa via sqlx-mysql). NOT unreachable — MySQL is a
