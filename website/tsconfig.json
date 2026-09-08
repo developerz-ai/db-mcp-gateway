@@ -1,11 +1,26 @@
 // This file is not used by "docusaurus start/build" commands.
 // It is here to improve your IDE experience (type-checking, autocompletion...),
 // and can also run the package.json "typecheck" script manually.
+//
+// Inlined from "@docusaurus/tsconfig" instead of `extends`-ing it: that package
+// still ships `baseUrl`, which TypeScript 7 removed (TS5102), so extending it
+// fails to compile at all. Keep in sync with @docusaurus/tsconfig on upgrade —
+// once Docusaurus drops `baseUrl`, this can go back to a plain `extends`.
 {
-  "extends": "@docusaurus/tsconfig",
   "compilerOptions": {
-    "baseUrl": ".",
-    "ignoreDeprecations": "6.0",
+    "allowJs": true,
+    "esModuleInterop": true,
+    "jsx": "preserve",
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "moduleResolution": "bundler",
+    "module": "esnext",
+    "noEmit": true,
+    // Relative, resolved against this file's directory — `baseUrl` is gone in TS 7.
+    "paths": {
+      "@site/*": ["./*"]
+    },
+    "skipLibCheck": true,
     "strict": true
   },
   "exclude": [".docusaurus", "build"]
