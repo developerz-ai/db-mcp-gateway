@@ -55,7 +55,7 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # db
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "mysql", "uuid", "chrono", "json", "bigdecimal"] }
-sqlparser = { version = "0.52", features = ["visitor"] }
+sqlparser = { version = "0.62", features = ["visitor"] }
 async-trait = "0.1"
 # Mongo target adapter (#57 scaffold + #58 exec). Disable default features so
 # we never pull native-tls's openssl link; rustls matches the rest of the
