@@ -21,7 +21,8 @@ env:
 
 jobs:
   fmt:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # GitHub-hosted runner (org rule: private repos on Ubicloud, public on GitHub-hosted).
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -57,7 +58,7 @@ jobs:
           fi
 
   clippy:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     # A Cargo.lock change misses the cache, and a cold build of this graph
     # (aws-lc-rs, mongodb, sqlx ×2 backends, sentry, axum) on 2 vCPU runs well
     # past 15 min. release.yml already went to 60 for the same reason. After
@@ -97,7 +98,7 @@ jobs:
       - run: bin/check-scrub-features
 
   test:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     # After the rust-cache-clear step below, this job pays the cold-build cost
     # on every PR invocation; 50 min gives ~10 min of headroom over the
     # observed 35-40 min peak.
@@ -193,7 +194,7 @@ jobs:
       - run: cargo test --all-targets --all-features
 
   audit:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
@@ -226,7 +227,7 @@ jobs:
   # and is not a required check (do not make it required without also running
   # it on every PR, or it hard-locks merges).
   secret-scan:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -305,9 +306,9 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: blacksmith-4vcpu-ubuntu-2404
+            runner: ubuntu-latest
           - platform: linux/arm64
-            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
     steps:
       - name: prepare platform pair
         run: |
@@ -364,7 +365,7 @@ jobs:
   # any external client) is configured to read.
   merge:
     needs: [build]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read

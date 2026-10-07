@@ -44,10 +44,9 @@ jobs:
   # registries' round-tripping semantics.
   build:
     runs-on: ${{ matrix.runner }}
-    # arm64 is a 2-vCPU runner (no larger arm size provisioned). A release whose
-    # Cargo.lock changed busts the cached cargo layer and forces a cold full
-    # recompile there, which overran the old 30-min cap (v1.2.1). amd64 (8-vCPU)
-    # finishes in ~12m regardless, so a higher ceiling only affects cold arm64.
+    # A release whose Cargo.lock changed busts the cached cargo layer and forces
+    # a cold full recompile, which overran the old 30-min cap on arm64 (v1.2.1).
+    # The 60-min ceiling covers a cold build on either GitHub-hosted runner.
     timeout-minutes: 60
     permissions:
       contents: read
@@ -57,9 +56,10 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: blacksmith-8vcpu-ubuntu-2404
+            # GitHub-hosted runner (org rule: private repos on Ubicloud, public on GitHub-hosted).
+            runner: ubuntu-latest
           - platform: linux/arm64
-            runner: blacksmith-2vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
     steps:
       - name: prepare platform pair
         run: |
@@ -125,7 +125,7 @@ jobs:
 
   merge:
     needs: [build]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
@@ -198,7 +198,7 @@ jobs:
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}"
 
   github_release:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [merge]
     permissions:

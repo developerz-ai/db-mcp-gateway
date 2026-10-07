@@ -159,7 +159,7 @@ Reviewers check for:
 
 ## CI & Tooling
 
-The repo uses GitHub Actions (Blacksmith CI runners). You can reproduce CI locally:
+The repo uses GitHub Actions (GitHub-hosted runners). You can reproduce CI locally:
 
 ```bash
 bin/ci      # Exactly what GitHub Actions runs

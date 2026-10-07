@@ -37,7 +37,8 @@ jobs:
   # artifact upload.
   build:
     if: github.event_name == 'pull_request'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # GitHub-hosted runner (org rule: private repos on Ubicloud, public on GitHub-hosted).
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
@@ -59,7 +60,7 @@ jobs:
 
   deploy:
     if: github.event_name != 'pull_request'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     # Job-level permissions replace workflow-level (they do not merge), so
     # contents: read must be repeated here for actions/checkout to keep repo

@@ -194,11 +194,10 @@ reviews:
     # CI workflows
     - path: ".github/workflows/**"
       instructions: |
-        Runners: Blacksmith family only. `blacksmith-2vcpu-ubuntu-2404` is
-        the default; larger sizes (`blacksmith-4vcpu-…`, `blacksmith-8vcpu-…`)
-        and native `-arm` variants are allowed for CPU-bound jobs (clippy,
-        test, image builds). Flag any non-Blacksmith runner (`ubuntu-latest`,
-        `ubuntu-22.04`, etc.).
+        Runners: GitHub-hosted only (public repo — org rule: private repos on
+        Ubicloud, public on GitHub-hosted). `ubuntu-latest` is the default;
+        `ubuntu-24.04-arm` for native arm64 jobs. Flag any Blacksmith,
+        Ubicloud or self-hosted runner label.
         Pin every action to a full commit SHA with the version in a trailing
         comment (`uses: owner/action@<40-hex> # v3`, or `# stable` for
         toolchain-channel actions like `dtolnay/rust-toolchain`) — a tag or
