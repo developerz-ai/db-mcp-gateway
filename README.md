@@ -25,10 +25,10 @@ before any result goes back.
 
 ## Install
 
-**v1.5.0 — stable, in production use.** One image, one YAML file, and one Postgres for the gateway's own state:
+**v1.6.0 — stable, in production use.** One image, one YAML file, and one Postgres for the gateway's own state:
 
 ```bash
-docker pull ghcr.io/developerz-ai/db-mcp-gateway:1.5.0
+docker pull ghcr.io/developerz-ai/db-mcp-gateway:1.6.0
 ```
 
 Public on GHCR, no auth needed to pull. Multi-arch (`linux/amd64`,
