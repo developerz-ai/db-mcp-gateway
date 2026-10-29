@@ -193,14 +193,14 @@ async fn compute_outcome(
     // rejector (`src/exec/mongo/rejector.rs`) as the equivalent guard. Mongo
     // writes are not offered here — a `query_write` grant on a mongo DB still
     // hits the read-only rejector.
-    if matches!(server.kind, crate::config::ServerKind::Postgres) {
-        if let Err(err) = sql_guard::check_sql(&args.sql, access) {
-            return error_outcome(
-                id,
-                "forbidden_sql",
-                &format!("SQL rejected by gateway: {err}"),
-            );
-        }
+    if matches!(server.kind, crate::config::ServerKind::Postgres)
+        && let Err(err) = sql_guard::check_sql(&args.sql, access)
+    {
+        return error_outcome(
+            id,
+            "forbidden_sql",
+            &format!("SQL rejected by gateway: {err}"),
+        );
     }
 
     let row_limit = effective_row_limit(args.limit, constraints.row_limit);
