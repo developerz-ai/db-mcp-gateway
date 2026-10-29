@@ -287,10 +287,10 @@ impl Visitor for GuardVisitor {
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<GuardError> {
-        if let Expr::Function(f) = expr {
-            if let Err(err) = check_denied_name(&f.name) {
-                return ControlFlow::Break(err);
-            }
+        if let Expr::Function(f) = expr
+            && let Err(err) = check_denied_name(&f.name)
+        {
+            return ControlFlow::Break(err);
         }
         ControlFlow::Continue(())
     }
