@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use regex::Regex;
 use sentry::types::Dsn;
-use sentry::{ClientInitGuard, ClientOptions};
+use sentry::{ClientInitGuard, ClientOptions, TracesSamplingStrategy};
 
 /// Sentinel substituted for every detected secret.
 const REDACTED: &str = "***REDACTED***";
@@ -274,16 +274,16 @@ pub(crate) fn init() -> Result<ClientInitGuard, ScrubberError> {
             + Sync,
     > = Arc::new(move |event| scrubber.scrub_event(event));
 
-    let opts = ClientOptions {
-        dsn,
-        environment: Some(environment.into()),
-        release: Some(env!("CARGO_PKG_VERSION").into()),
-        send_default_pii: false,
-        // GlitchTip has no tracing/profiling/replay ingest; keep it off.
-        traces_sample_rate: 0.0,
-        before_send: Some(before_send),
-        ..ClientOptions::default()
-    };
+    // `ClientOptions` is `#[non_exhaustive]` since sentry 0.49, so it is built
+    // by assignment rather than a struct literal.
+    let mut opts = ClientOptions::default();
+    opts.dsn = dsn;
+    opts.environment = Some(environment.into());
+    opts.release = Some(env!("CARGO_PKG_VERSION").into());
+    opts.send_default_pii = false;
+    // GlitchTip has no tracing/profiling/replay ingest; keep it off.
+    opts.traces_sampling_strategy = TracesSamplingStrategy::Disabled;
+    opts.before_send = Some(before_send);
 
     Ok(sentry::init(opts))
 }
@@ -473,10 +473,9 @@ mod tests {
     /// relies on (`is_enabled` gates on `options.dsn.is_some()`).
     #[test]
     fn client_disabled_when_dsn_unset() {
-        let guard = sentry::init(sentry::ClientOptions {
-            dsn: None,
-            ..Default::default()
-        });
+        let mut opts = sentry::ClientOptions::default();
+        opts.dsn = None;
+        let guard = sentry::init(opts);
         assert!(!guard.is_enabled(), "client with no DSN must be disabled");
     }
 
