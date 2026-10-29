@@ -55,7 +55,7 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # db
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "mysql", "uuid", "chrono", "json", "bigdecimal"] }
-sqlparser = { version = "0.52", features = ["visitor"] }
+sqlparser = { version = "0.62", features = ["visitor"] }
 async-trait = "0.1"
 # Mongo target adapter (#57 scaffold + #58 exec). Disable default features so
 # we never pull native-tls's openssl link; rustls matches the rest of the
@@ -104,7 +104,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 # transport pinned to rustls to match the rest of the stack (aws-lc-rs) and
 # keep openssl out of the dep graph — see `cargo tree -i openssl-sys` (empty).
 # DSN is read from SENTRY_DSN at runtime; unset → disabled no-op client.
-sentry = { version = "0.48", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
+sentry = { version = "0.49", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 # credential-scrubbing regexes for the sentry `before_send` hook. The full
 # `unicode` feature stays off (the patterns are ASCII), but every feature those
 # patterns *use* must be named here: `unicode-case` for `(?i)`, `unicode-perl`

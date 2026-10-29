@@ -37,7 +37,7 @@
 //! close, and the reason the walk is now visitor-driven, not hand-recursion.
 
 use sqlparser::ast::{
-    Expr, ObjectName, OnInsert, Query, SetExpr, Statement, TableFactor, UtilityOption, Visit,
+    Expr, ObjectName, OnInsert, Query, Set, SetExpr, Statement, TableFactor, UtilityOption, Visit,
     Visitor,
 };
 use sqlparser::dialect::PostgreSqlDialect;
@@ -185,8 +185,10 @@ fn check_statement_shape(stmt: &Statement, access: Access) -> Result<(), GuardEr
         Statement::StartTransaction { .. } => Err(GuardError::NotAllowed("BEGIN/START")),
         Statement::Commit { .. } => Err(GuardError::NotAllowed("COMMIT")),
         Statement::Rollback { .. } => Err(GuardError::NotAllowed("ROLLBACK")),
-        Statement::SetTransaction { .. } => Err(GuardError::NotAllowed("SET TRANSACTION")),
-        Statement::SetVariable { .. } => Err(GuardError::NotAllowed("SET")),
+        Statement::Set(Set::SetTransaction { .. }) => {
+            Err(GuardError::NotAllowed("SET TRANSACTION"))
+        }
+        Statement::Set(_) => Err(GuardError::NotAllowed("SET")),
         Statement::Copy { .. } => Err(GuardError::NotAllowed("COPY")),
         _ => Err(GuardError::NotAllowed("unsupported")),
     }
@@ -326,7 +328,15 @@ fn body_has_select_into(body: &SetExpr) -> bool {
 /// component so schema-qualified calls (`pg_catalog.pg_read_file(...)`) are
 /// caught too. Case-insensitive to match SQL identifier semantics.
 fn check_denied_name(name: &ObjectName) -> Result<(), GuardError> {
-    let fn_name = name.0.last().map(|i| i.value.as_str()).unwrap_or("");
+    // A non-identifier name part (a dialect's `IDENTIFIER(...)`-style computed
+    // name) cannot be matched against the denylist, so it is refused outright.
+    let fn_name = match name.0.last() {
+        None => "",
+        Some(part) => match part.as_ident() {
+            Some(ident) => ident.value.as_str(),
+            None => return Err(GuardError::NotAllowed("computed function name")),
+        },
+    };
     match DENIED_FUNCTIONS
         .iter()
         .find(|&&d| d.eq_ignore_ascii_case(fn_name))
@@ -496,6 +506,19 @@ mod tests {
         rejected_not_allowed("UPDATE users SET email = 'x'", "UPDATE");
         rejected_not_allowed("DELETE FROM users", "DELETE");
         rejected_not_allowed("TRUNCATE users", "TRUNCATE");
+    }
+
+    /// sqlparser 0.55+ folds every `SET` form into `Statement::Set(Set)`; the
+    /// guard must still name the family rather than fall to "unsupported".
+    #[test]
+    fn set_statements_rejected_by_family() {
+        rejected_not_allowed(
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "SET TRANSACTION",
+        );
+        rejected_not_allowed("SET search_path = public", "SET");
+        rejected_not_allowed("SET ROLE postgres", "SET");
+        rejected_not_allowed("SET SESSION AUTHORIZATION postgres", "SET");
     }
 
     #[test]
