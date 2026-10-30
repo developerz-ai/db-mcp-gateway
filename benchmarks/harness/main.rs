@@ -155,13 +155,13 @@ async fn main() -> anyhow::Result<()> {
     )?);
 
     let environment = env::Environment::capture();
-    if let Some(steal) = environment.cpu_steal_pct_since_boot {
-        if steal > 1.0 {
-            eprintln!(
-                "WARNING: {steal:.2}% CPU steal since boot — this host shares cycles \
+    if let Some(steal) = environment.cpu_steal_pct_since_boot
+        && steal > 1.0
+    {
+        eprintln!(
+            "WARNING: {steal:.2}% CPU steal since boot — this host shares cycles \
                  with other tenants and its percentiles describe them too."
-            );
-        }
+        );
     }
     if environment.git_dirty {
         eprintln!("WARNING: working tree is dirty; the recorded commit does not identify this run");

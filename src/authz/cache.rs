@@ -74,10 +74,10 @@ impl PermissionsCache {
     pub async fn get_for(&self, identity: &Identity) -> Result<Arc<Vec<Grant>>, LoadError> {
         {
             let map = self.inner.read().await;
-            if let Some(entry) = map.get(&identity.user_sub) {
-                if entry.loaded_at.elapsed() < self.ttl {
-                    return Ok(entry.grants.clone());
-                }
+            if let Some(entry) = map.get(&identity.user_sub)
+                && entry.loaded_at.elapsed() < self.ttl
+            {
+                return Ok(entry.grants.clone());
             }
         }
         loop {

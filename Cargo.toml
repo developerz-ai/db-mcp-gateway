@@ -2,7 +2,7 @@
 name = "db-mcp-gateway"
 version = "1.6.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Self-hosted MCP gateway for credentialled, audited, policy-scoped database access by AI agents — read-only by default, writes opt-in per grant"
 license = "MIT"
 repository = "https://github.com/developerz-ai/db-mcp-gateway"
@@ -70,7 +70,7 @@ url = "2"
 # PKCE S256 for the MCP OAuth bridge: base64url-no-pad(sha256(verifier))
 # compared against the client's code_challenge.
 sha2 = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 # DB-credential hygiene: keep resolved passwords in a heap buffer that zeroes
 # on drop and refuses to `Debug`-print in the clear. `secrecy::SecretString`
 # wraps the value end to end; `&str` is exposed only at the driver boundary.
