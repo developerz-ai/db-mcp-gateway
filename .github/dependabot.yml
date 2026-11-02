@@ -11,6 +11,9 @@
 # batching five of them into one PR makes the whole batch unreviewable: you
 # either take all the breakage or none of it. Majors therefore arrive as
 # individual PRs, one decision each.
+#
+# The 14-day cooldown lets a compromised release get caught before it reaches
+# us. Security updates are unaffected.
 version: 2
 
 updates:
@@ -20,6 +23,8 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 14
     commit-message:
       prefix: "chore(actions)"
     groups:
@@ -43,6 +48,8 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 14
     commit-message:
       prefix: "chore(deps)"
     groups:
@@ -60,6 +67,8 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 3
+    cooldown:
+      default-days: 14
     commit-message:
       prefix: "chore(website)"
     groups:
@@ -82,5 +91,7 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    cooldown:
+      default-days: 14
     commit-message:
       prefix: "chore(docker)"
