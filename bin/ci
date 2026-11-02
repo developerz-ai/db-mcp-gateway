@@ -20,6 +20,20 @@ cd "$(dirname "$0")/.."
 
 skipped_jobs=()
 
+# Every job the gate runs, in the order it runs them. `pending_jobs` holds the
+# ones the gate has not reached yet: when the gate stops early, the EXIT trap
+# names all of them, so no job is ever silently not run.
+pending_jobs=(
+  'workflow SHA pins'
+  'secret-scan (tracked service-token scan)'
+  'secret-scan regex regression'
+  'orchestration regression'
+  'fmt + clippy'
+  'test'
+  'cargo audit'
+  'pages typecheck/build/artifact guard'
+)
+
 unavailable() { echo "Required prerequisite unavailable: $*" >&2; exit 75; }
 not_run() {
   local notice="NOT RUN: $1 - $2 ($3)"
@@ -27,25 +41,40 @@ not_run() {
   skipped_jobs+=("$notice")
 }
 
-# Jobs the gate has not reached yet. If the gate stops early, the EXIT trap
-# names them: a job is never silently not run.
-audit_reached=0
-pages_reached=0
+# The gate reached a job: it leaves the pending list whether it passed or
+# failed. The name is checked so a reordered script cannot silently rename a
+# job the trap still has to report.
+job_reached() {
+  if [[ ${pending_jobs[0]:-} != "$1" ]]; then
+    echo "Internal error: expected job '${pending_jobs[0]:-}', reached '$1'" >&2
+    exit 70
+  fi
+  pending_jobs=("${pending_jobs[@]:1}")
+}
+
+# Name every job the gate did not reach. The notice is the one a toolchain
+# skip uses, so a job that never ran is never silently dropped.
 finish() {
   local rc=$?
-  local missed=()
-  local job
+  local -a missed=()
+  local job notice
   if (( rc == 0 )); then
     return 0
   fi
-  if (( audit_reached == 0 )); then missed+=('cargo audit'); fi
-  if (( pages_reached == 0 )); then missed+=('pages typecheck/build/artifact guard'); fi
+  if (( ${#pending_jobs[@]} > 0 )); then
+    for job in "${pending_jobs[@]}"; do
+      missed+=("NOT RUN: $job - the gate stopped before this job (fix the failing job and re-run)")
+    done
+  fi
   if (( ${#missed[@]} == 0 )); then
     return 0
   fi
+  for notice in "${missed[@]}"; do
+    echo "$notice" >&2
+  done
   echo 'Jobs not reached (the gate stopped before them):' >&2
-  for job in "${missed[@]}"; do
-    echo "  - $job" >&2
+  for notice in "${missed[@]}"; do
+    echo "  $notice" >&2
   done
   return 0
 }
@@ -76,6 +105,7 @@ scan_lines() {
     return 1
   fi
 }
+job_reached 'workflow SHA pins'
 echo '→ workflow SHA pins'
 uses=$(scan_lines -rhP --include='*.yml' --include='*.yaml' \
   '^\s*-?\s*uses:\s*' .github/workflows)
@@ -93,6 +123,7 @@ if [[ -n $unpinned ]]; then
   exit 1
 fi
 
+job_reached 'secret-scan (tracked service-token scan)'
 echo '→ tracked service-token scan'
 rc=0
 # Quiet mode and suppressed stderr keep matching lines AND tooling diagnostics
@@ -107,14 +138,18 @@ elif (( rc != 1 )); then
   echo "Tracked-token scanner tooling failure (rc=$rc); refusing to pass" >&2
   exit 1
 fi
+job_reached 'secret-scan regex regression'
 bash tests/bin/secret-scan-regex.test.sh
 # Fixtures replace their own regression entry; no production bypass/recursion flag.
+job_reached 'orchestration regression'
 bash tests/bin/check.test.sh
+job_reached 'fmt + clippy'
 bin/lint
+job_reached 'test'
 bin/test
 
 echo '→ cargo audit'
-audit_reached=1
+job_reached 'cargo audit'
 if command -v cargo-audit >/dev/null 2>&1; then
   # CI's exact command (.github/workflows/ci.yml, audit job). The single
   # ignore is the one .cargo/audit.toml already justifies; stating it on the
@@ -127,7 +162,7 @@ else
 fi
 
 echo '→ website typecheck, build and Pages artifact guard'
-pages_reached=1
+job_reached 'pages typecheck/build/artifact guard'
 # GATE-SCOPED prerequisites: absent -> this job is skipped, not the gate.
 pages_reason=''
 pages_fix=''

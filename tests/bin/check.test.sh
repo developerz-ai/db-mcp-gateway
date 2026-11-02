@@ -37,7 +37,13 @@ case "$name $*" in
       printf '%s\n' 'PRIVATE_TOKEN_DIAGNOSTIC' >&2
     fi
     exit "${SCAN_RC:-1}" ;;
-  'docker compose '*ps*) echo running ;;
+  'docker compose '*ps*)
+    # Realistic service/state/health fields: 'running' alone is discarded by
+    # the health check, so the fixture would prove nothing about it.
+    printf '%s\n' 'state-db running unhealthy' 'target-db running healthy' ;;
+  'docker compose '*config*)
+    # A malformed compose file is a configuration fault, not an environment one.
+    exit "${COMPOSE_CONFIG_RC:-0}" ;;
   'docker compose -f docker-compose.dev.yml up -d --wait')
     [[ "$name $*" != "${FAIL_AT:-}" ]] || exit 42
     touch "$CALLS.ready" ;;
@@ -83,6 +89,36 @@ assert_output() {
     exit 1
   fi
 }
+not_output() {
+  if grep -qF -- "$1" "$work/output"; then
+    printf 'FAIL: expected output NOT to contain: %s\n' "$1"
+    exit 1
+  fi
+}
+# The final summary must repeat every skipped job's notice. Asserting over the
+# whole output would also pass on the initial notice alone, so the assertion is
+# scoped to the summary section.
+assert_summary() {
+  local needle=$1 section
+  section=$(grep -A 40 \
+    '^Jobs not run (their toolchain is absent; every other job was graded):$' \
+    "$work/output" || true)
+  if ! grep -qF -- "$needle" <<<"$section"; then
+    printf 'FAIL: final summary does not contain: %s\n' "$needle"
+    exit 1
+  fi
+}
+# A job the gate never reached gets the required notice, and the notice is
+# repeated in the final list of jobs that never ran.
+assert_not_run() {
+  local needle=$1 count
+  count=$(grep -cF -- "$needle" "$work/output" || true)
+  if (( count < 2 )); then
+    printf 'FAIL: expected the not-run notice twice (notice + final list), got %s: %s\n' \
+      "$count" "$needle"
+    exit 1
+  fi
+}
 
 fixture
 run_gate 0
@@ -112,6 +148,20 @@ not_called 'cargo test --all-targets --all-features'
 not_called 'cargo audit --ignore RUSTSEC-2023-0071'
 # The 75 names the unreachable resource instead of one generic message.
 assert_output 'Required prerequisite unavailable: dev stack'
+# The per-service diagnostics are part of the report: the unhealthy service is
+# named with its health, and a healthy service is not listed.
+assert_output 'state-db (health: unhealthy)'
+not_output 'target-db'
+# A malformed compose file is a broken change, not an unreachable resource: its
+# own status is preserved, so the platform blames the change and not the box.
+fixture
+rc=0
+(cd "$work/repo" && PATH="$work/tools" CALLS="$work/calls" \
+  FAIL_AT='docker compose -f docker-compose.dev.yml up -d --wait' COMPOSE_CONFIG_RC=1 \
+  bash bin/test) > "$work/output" 2>&1 || rc=$?
+[[ $rc == 1 ]] || { echo "FAIL: a malformed compose file must keep its own status, got $rc"; exit 1; }
+assert_output 'docker compose configuration is invalid'
+not_called 'cargo test --all-targets --all-features'
 # Direct bin/test must also classify unavailable Docker as setup failure.
 fixture
 rm "$work/tools/docker"
@@ -171,6 +221,7 @@ run_gate 0
 not_called 'cargo audit --ignore RUSTSEC-2023-0071'
 assert_output 'NOT RUN: cargo audit - cargo-audit is not on PATH (install: cargo install cargo-audit)'
 assert_output 'Jobs not run'
+assert_summary 'NOT RUN: cargo audit - cargo-audit is not on PATH (install: cargo install cargo-audit)'
 assert_output '✓ Local quality checks passed for the gates that ran (no publishing or deployment)'
 # The rest of the gate still ran.
 called 'cargo test --all-targets --all-features'
@@ -182,6 +233,7 @@ run_gate 0
 not_called 'npm run typecheck'
 not_called 'npm run build'
 assert_output 'NOT RUN: pages typecheck/build/artifact guard - Node 20+ is not on PATH'
+assert_summary 'NOT RUN: pages typecheck/build/artifact guard - Node 20+ is not on PATH'
 called 'cargo test --all-targets --all-features'
 
 fixture
@@ -190,6 +242,7 @@ run_gate 0
 not_called 'npm run typecheck'
 not_called 'npm run build'
 assert_output 'NOT RUN: pages typecheck/build/artifact guard - npm is not on PATH'
+assert_summary 'NOT RUN: pages typecheck/build/artifact guard - npm is not on PATH'
 called 'cargo audit --ignore RUSTSEC-2023-0071'
 
 for dependency in tsc docusaurus; do
@@ -199,6 +252,7 @@ for dependency in tsc docusaurus; do
   not_called 'npm run typecheck'
   not_called 'npm run build'
   assert_output 'NOT RUN: pages typecheck/build/artifact guard - website dependencies are absent (prepare: cd website && npm ci)'
+  assert_summary 'NOT RUN: pages typecheck/build/artifact guard - website dependencies are absent (prepare: cd website && npm ci)'
 done
 
 fixture
@@ -206,6 +260,7 @@ run_gate 0 NODE_RC=1
 not_called 'npm run typecheck'
 not_called 'npm run build'
 assert_output 'NOT RUN: pages typecheck/build/artifact guard - an older Node than 20 is on PATH'
+assert_summary 'NOT RUN: pages typecheck/build/artifact guard - an older Node than 20 is on PATH'
 
 for rc in 0 2 128; do
   fixture
@@ -229,6 +284,14 @@ fixture
 printf '%s\n' '- uses: ./local-action' '- uses: owner/action@v1' > "$work/repo/.github/workflows/new.yaml"
 run_gate 1
 not_called 'cargo fmt --all -- --check'
+# The gate stopped at the SHA-pin scan: every job it never reached is named
+# with the required notice and repeated in the final list.
+assert_output 'Jobs not reached'
+for job in 'secret-scan (tracked service-token scan)' 'secret-scan regex regression' \
+  'orchestration regression' 'fmt + clippy' 'test' 'cargo audit' \
+  'pages typecheck/build/artifact guard'; do
+  assert_not_run "NOT RUN: $job - the gate stopped before this job"
+done
 fixture
 # A grep failure must not be converted to an empty/clean pin scan.
 printf '#!/usr/bin/env bash\nexit 2\n' > "$work/tools/broken-grep"

@@ -113,6 +113,9 @@ Only a REQUIRED resource returns exit 75 — the Rust toolchain (cargo, rustfmt,
 clippy), git, GNU grep with PCRE, the Docker CLI, the Docker daemon, Docker
 Compose, or a dev stack that never became healthy. Those make the gate unable
 to grade anything at all, so it refuses to grade instead of returning a verdict.
+A malformed compose file or any other compose command failure keeps its own
+exit status instead: 75 is reserved for an unreachable resource or a confirmed
+health failure, so the platform blames the change and not the box.
 
 The gate performs no installation: `bin/setup` does not install website
 dependencies or cargo-audit; prepare both separately. The artifact scanner must

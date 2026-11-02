@@ -45,7 +45,11 @@ dependencies. Prepare both separately to have every job run.
 `bin/test` always runs `docker compose -f docker-compose.dev.yml up -d --wait`
 before cargo, including when the state DB is already running. All four services
 (`state-db`, `target-db`, `permissions-mysql`, `target-mongo`) must be healthy.
-Failed stack setup returns 75 without invoking cargo; test arguments are forwarded
+A stack that never became healthy returns 75 without invoking cargo, and the
+report names every unhealthy service with its state and health. 75 is reserved
+for an unreachable resource or a confirmed health failure: a malformed compose
+file or any other compose command failure keeps its own exit status, so the
+platform blames the change and not the box. Test arguments are forwarded
 unchanged.
 
 Registry login, image/manifest pushes, release publication, artifact upload and
@@ -83,6 +87,8 @@ red. Exit 1 cannot carry that difference, so one code is reserved:
 - Every job that did not run is named in the output and repeated in the final
   summary, which then reads
   `✓ Local quality checks passed for the gates that ran (no publishing or deployment)`
-  instead of claiming a full pass.
+  instead of claiming a full pass. A gate that stops early names the jobs it
+  never reached the same way: each gets a `NOT RUN: <job> - <reason>` notice
+  and an entry in the final list.
 - Changed a dependency? Re-run `bin/setup` before `bin/check`, or you are proving a stale tree.
 - Add the test that fails first, then the fix — a green run that never went red proves nothing.

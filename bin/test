@@ -48,16 +48,34 @@ unhealthy_services() {
 # A running state DB alone does not imply the other integration stores are ready.
 # Compose up is idempotent and waits for every service's healthcheck.
 echo "→ ensuring dev stack is healthy for tests"
-if ! "${compose[@]}" up -d --wait; then
+up_rc=0
+"${compose[@]}" up -d --wait || up_rc=$?
+if (( up_rc != 0 )); then
+  # The daemon may have died while the stack came up: that is a resource fault.
+  if ! docker info >/dev/null 2>&1; then
+    echo 'Required prerequisite unavailable: Docker daemon' >&2
+    exit 75
+  fi
+  # A malformed compose file is a broken change, not an unreachable resource.
+  # Its own status is preserved, so the platform blames the change and not the
+  # box. Exit 75 stays reserved for a resource or a health failure.
+  config_rc=0
+  "${compose[@]}" config --quiet >/dev/null || config_rc=$?
+  if (( config_rc != 0 )); then
+    echo "docker compose configuration is invalid (rc=$config_rc); not an environment fault" >&2
+    exit "$config_rc"
+  fi
   unhealthy=$(unhealthy_services || true)
   if [[ -n $unhealthy ]]; then
     echo 'Required prerequisite unavailable: dev stack service(s) never became healthy:' >&2
     printf '%s\n' "$unhealthy" >&2
     echo 'Inspect with: docker compose -f docker-compose.dev.yml logs' >&2
-  else
-    echo 'Required prerequisite unavailable: dev stack did not become healthy (docker compose up -d --wait failed)' >&2
+    exit 75
   fi
-  exit 75
+  # A command failure with no unhealthy service to show for it: keep compose's
+  # own status instead of calling it an environment fault.
+  echo "docker compose up -d --wait failed (rc=$up_rc) without an unhealthy service" >&2
+  exit "$up_rc"
 fi
 
 exec cargo test --all-targets --all-features "$@"

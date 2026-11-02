@@ -92,9 +92,13 @@ bin/test    # All targets + all features, including bench-harness tests; starts 
 
 Before invoking cargo, `bin/test` always runs the idempotent
 `docker compose -f docker-compose.dev.yml up -d --wait`, waiting for all four
-services to become healthy even when the state DB is already running. Failed
-stack setup returns **75** without running cargo; test arguments pass through
-unchanged.
+services to become healthy even when the state DB is already running. A stack
+that never became healthy returns **75** without running cargo, and the report
+names every unhealthy service with its state and health. **75** is reserved for
+an unreachable resource or a confirmed health failure: a malformed compose file
+or any other compose command failure keeps its own exit status, so a broken
+compose file is blamed on the change and not on the box. Test arguments pass
+through unchanged.
 
 **Run a single test:**
 ```bash
@@ -211,7 +215,10 @@ A job that runs and fails keeps its own non-zero exit code — a red gate is
 never converted into a skip. Every job that did not run is named in the output
 and repeated in the final summary; the summary then reads
 `✓ Local quality checks passed for the gates that ran (no publishing or deployment)`
-rather than claiming a full pass.
+rather than claiming a full pass. A gate that stops early names the jobs it
+never reached the same way — each gets a `NOT RUN: <job> - <reason>` notice and
+an entry in the final list — so a stopped gate never hides the work that did
+not run.
 
 `bin/setup` prepares native/Rust dependencies and starts the four Compose
 services; it does **not** install cargo-audit or website dependencies. Prepare
