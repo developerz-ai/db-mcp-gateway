@@ -7,7 +7,7 @@
 
 ## Stack
 
-Rust + Cargo. The gate is `bin/check` (`cd "$(dirname "$0")/.." && export PATH="$HOME/.cargo/bin:$PATH" && bin/ci`): a change that does not pass it is not proven, whatever its description says.
+Rust + Cargo. The gate is `bin/check`, run from the repository root: `export PATH="$HOME/.cargo/bin:$PATH" && bin/ci`. A change that does not pass it is not proven, whatever its description says.
 
 ## Review conventions
 
@@ -30,15 +30,15 @@ Rust + Cargo. The gate is `bin/check` (`cd "$(dirname "$0")/.." && export PATH="
 - `bin/ci` = `bin/lint` + `bin/test` + `cargo audit` (skipped with a `— SKIPPED` notice when `cargo-audit` is absent). `bin/test` boots the dev stack (state DB, target DB, MySQL, Mongo) and runs `cargo test --all-targets`; the target DB is never mocked.
 - `bin/lint` = `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo clippy --release --all-features -- -D warnings`, `bin/check-scrub-features`.
 - CI jobs: `fmt`, `clippy`, `test`, `audit`, `secret-scan`. The first four gate the image build; `secret-scan` is standalone today, so its green is not a required check. `cargo audit` ignores exactly one advisory, `RUSTSEC-2023-0071` — a new ignore is a finding.
-- `secret-scan` greps every tracked file for `dbmcp_svc_[0-9a-f]{64}` and fails closed when the grep itself errors. A hit is a leaked service token, not a fixture.
+- `secret-scan` greps every tracked file OUTSIDE its excluded pathspecs (`tests/**`, `website/**`, `config/example.yaml`, `.github/**`, `src/config/yaml.rs`) for `dbmcp_svc_[0-9a-f]{64}` and fails closed when the grep itself errors. A hit is a leaked service token, not a fixture. The excluded paths get no scan coverage at all, so a credential committed there is invisible to CI.
 - The suite is 591 passing tests across 41 binaries. A new MCP tool without an integration test asserting its audit row is incomplete.
 
 ## Never flag
 
-- Generated and vendored output: the Docusaurus site under `website/` and its own `pages.yml` workflow.
+- Generated and vendored output only: the Docusaurus build output (`website/build/`, `website/.docusaurus/`, `website/node_modules/` — gitignored, never committed) and vendored artefacts such as `website/package-lock.json`. Everything else under `website/` is authored, not generated: `website/docs/initial-idea/` is the canonical spec and `website/docs/usage/` is public API — review both, and review `.github/workflows/pages.yml` like any other workflow.
 - Style a formatter owns: rustfmt (edition 2024, max_width 100, Unix newlines) and clippy's `-D warnings` floor — `bin/lint` decides.
 - `bench-harness` and `test-support` off by default, and `benchmarks/results/` gitignored: a benchmark that does not ship is deliberate.
 - The `cargo audit` `— SKIPPED` notice in `bin/ci`: the tool was missing on that box, not the audit passed.
-- The excluded pathspecs in `secret-scan` (`tests/**`, `website/**`, `config/example.yaml`, `.github/**`, `src/config/yaml.rs`): a token there is a fixture, not a leak.
+- The excluded pathspecs in `secret-scan` (`tests/**`, `website/**`, `config/example.yaml`, `.github/**`, `src/config/yaml.rs`): a token there is a fixture, not a leak — ONLY when it is demonstrably inert (repeated digits, a repeating `0123456789abcdef` run: a placeholder no server ever issued). A plausible, high-entropy `dbmcp_svc_` token in an excluded path is a LIVE credential: report it in EVERY path, excluded or not. The exclusion removes CI coverage; it does not turn a leak into a fixture. CLAUDE.md's credential non-disclosure rule applies to all paths.
 - The service-account exception to per-call SSO verification (spec 14): deliberate, audited as `service:<name>` — flag a change that drops the audit contract, not the exception.
 - The pinned toolchain in `rust-toolchain.toml` and the SHA-pinned GitHub Actions — deliberate; flag drift between the Dockerfile and the toolchain file, not the pinning itself.
