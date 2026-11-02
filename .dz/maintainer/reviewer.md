@@ -7,7 +7,7 @@
 
 ## Stack
 
-Rust + Cargo. The gate is `bin/check` (`cd "$(dirname "$0")/.." && export PATH="$HOME/.cargo/bin:$PATH" && bin/ci`): a change that does not pass it is not proven, whatever its description says.
+Rust + Cargo. The gate is `bin/check` (`export PATH="$HOME/.cargo/bin:$PATH" && bin/ci`): a change that does not pass it is not proven, whatever its description says.
 
 ## Review conventions
 
