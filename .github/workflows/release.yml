@@ -72,7 +72,7 @@ jobs:
         # otherwise the artifact refs would point at ...:vX.Y.Z, which doesn't
         # match what the merger reads back.
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Build context is `.`; keep the checkout token out of the build
           # workspace (matches ci.yml's image-publish checkout).
@@ -204,7 +204,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # softprops/action-gh-release reads its own GITHUB_TOKEN via the
           # `contents: write` job permission — no need to leave the checkout
