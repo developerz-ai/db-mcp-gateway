@@ -1,9 +1,5 @@
 {
   "mcpServers": {
-    "glitchtip": {
-      "type": "http",
-      "url": "https://glitchtip.infra.developerz.ai/mcp"
-    },
     "sentry-mcp": {
       "type": "stdio",
       "command": "bunx",
