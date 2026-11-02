@@ -1,19 +1,182 @@
 #!/usr/bin/env bash
-# bin/ci — reproduce the CI pipeline locally. Run before pushing.
+# Local quality gates equivalent to CI; never installs or publishes artifacts.
+#
+# Exit codes:
+#   0   every job that ran passed
+#   75  a REQUIRED resource is unreachable, so the gate cannot grade
+#   *   a job that ran and failed keeps its own non-zero status
+#
+# Missing prerequisites come in two kinds:
+#   REQUIRED    cargo/rustfmt/clippy, git, grep with PCRE, the Docker CLI, the
+#               Docker daemon, Docker Compose, a healthy dev stack. Missing ->
+#               exit 75: the gate cannot grade anything at all.
+#   GATE-SCOPED a toolchain that belongs to exactly one job: cargo-audit (the
+#               audit job) and Node 20+/npm plus the installed website
+#               dependencies (the Pages job). Missing -> that job is reported
+#               'NOT RUN' and every other job is still graded. A skip is never
+#               silent: it is printed and repeated in the final summary.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+skipped_jobs=()
+
+unavailable() { echo "Required prerequisite unavailable: $*" >&2; exit 75; }
+not_run() {
+  local notice="NOT RUN: $1 - $2 ($3)"
+  echo "$notice"
+  skipped_jobs+=("$notice")
+}
+
+# Jobs the gate has not reached yet. If the gate stops early, the EXIT trap
+# names them: a job is never silently not run.
+audit_reached=0
+pages_reached=0
+finish() {
+  local rc=$?
+  local missed=()
+  local job
+  if (( rc == 0 )); then
+    return 0
+  fi
+  if (( audit_reached == 0 )); then missed+=('cargo audit'); fi
+  if (( pages_reached == 0 )); then missed+=('pages typecheck/build/artifact guard'); fi
+  if (( ${#missed[@]} == 0 )); then
+    return 0
+  fi
+  echo 'Jobs not reached (the gate stopped before them):' >&2
+  for job in "${missed[@]}"; do
+    echo "  - $job" >&2
+  done
+  return 0
+}
+trap finish EXIT
+
+# REQUIRED prerequisites: without one of these the gate cannot grade at all.
+for tool in bash cargo docker git grep find \
+  tr mktemp cp chmod rm ln mkdir touch; do  # Shell-regression fixture utilities.
+  command -v "$tool" >/dev/null 2>&1 || unavailable "$tool"
+done
+cargo fmt --version >/dev/null 2>&1 || unavailable rustfmt
+cargo clippy --version >/dev/null 2>&1 || unavailable clippy
+docker compose version >/dev/null 2>&1 || unavailable 'Docker Compose'
+docker info >/dev/null 2>&1 || unavailable 'Docker daemon'
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || unavailable 'Git checkout'
+# GNU grep/PCRE is needed by the workflow's pin-validation patterns.
+rc=0
+grep -P 'probe' <<<'' >/dev/null 2>&1 || rc=$?
+[[ $rc == 1 ]] || unavailable 'grep with PCRE support'
+export CARGO_BUILD_JOBS=2
+
+# Preserve grep's no-match result, but never hide a scanner error behind || true.
+scan_lines() {
+  local rc=0
+  grep "$@" 2>/dev/null || rc=$?
+  if (( rc > 1 )); then
+    echo 'SHA-pin scanner tooling failure' >&2
+    return 1
+  fi
+}
+echo '→ workflow SHA pins'
+uses=$(scan_lines -rhP --include='*.yml' --include='*.yaml' \
+  '^\s*-?\s*uses:\s*' .github/workflows)
+remote=''
+unpinned=''
+# An empty here-string is a blank line, not an action to validate.
+if [[ -n $uses ]]; then
+  remote=$(scan_lines -vP '^\s*-?\s*uses:\s*\./' <<<"$uses")
+fi
+if [[ -n $remote ]]; then
+  unpinned=$(scan_lines -vP '^\s*-?\s*uses:\s*[^[:space:]#]+@[0-9a-f]{40}\s+#\s+\S+\s*$' <<<"$remote")
+fi
+if [[ -n $unpinned ]]; then
+  echo 'Unpinned action: require 40-hex SHA and trailing version comment' >&2
+  exit 1
+fi
+
+echo '→ tracked service-token scan'
+rc=0
+# Quiet mode and suppressed stderr keep matching lines AND tooling diagnostics
+# from exposing credentials. Only rc=1 means clean, exactly as in CI.
+git grep -qE 'dbmcp_svc_[0-9a-f]{64}' \
+  -- ':!tests/**' ':!website/**' ':!config/example.yaml' \
+  ':!.github/**' ':!src/config/yaml.rs' >/dev/null 2>&1 || rc=$?
+if (( rc == 0 )); then
+  echo 'Literal service token detected (redacted); use ENV: or FILE: references' >&2
+  exit 1
+elif (( rc != 1 )); then
+  echo "Tracked-token scanner tooling failure (rc=$rc); refusing to pass" >&2
+  exit 1
+fi
+bash tests/bin/secret-scan-regex.test.sh
+# Fixtures replace their own regression entry; no production bypass/recursion flag.
+bash tests/bin/check.test.sh
 bin/lint
 bin/test
 
-# CI has a fourth job. Without this, a cargo-audit failure was only discovered
-# after pushing. Skipped with a notice rather than failing when the tool is
-# absent, so bin/ci stays runnable on a fresh checkout.
+echo '→ cargo audit'
+audit_reached=1
 if command -v cargo-audit >/dev/null 2>&1; then
-  echo "→ cargo audit"
-  cargo audit
+  # CI's exact command (.github/workflows/ci.yml, audit job). The single
+  # ignore is the one .cargo/audit.toml already justifies; stating it on the
+  # command line keeps the local gate identical to CI instead of leaning on
+  # cargo-audit's config discovery.
+  cargo audit --ignore RUSTSEC-2023-0071
 else
-  echo "→ cargo audit — SKIPPED (install: cargo install cargo-audit)"
+  not_run 'cargo audit' 'cargo-audit is not on PATH' \
+    'install: cargo install cargo-audit'
 fi
 
-echo "✓ CI checks passed"
+echo '→ website typecheck, build and Pages artifact guard'
+pages_reached=1
+# GATE-SCOPED prerequisites: absent -> this job is skipped, not the gate.
+pages_reason=''
+pages_fix=''
+if ! command -v node >/dev/null 2>&1; then
+  pages_reason='Node 20+ is not on PATH'
+  pages_fix='install: Node 20+ and npm'
+elif ! node -e 'if (Number(process.versions.node.split(".")[0]) < 20) process.exit(1)' \
+  >/dev/null 2>&1; then
+  pages_reason='an older Node than 20 is on PATH'
+  pages_fix='install: Node 20+ and npm'
+elif ! command -v npm >/dev/null 2>&1; then
+  pages_reason='npm is not on PATH'
+  pages_fix='install: Node 20+ and npm'
+else
+  for tool in tsc docusaurus; do
+    if [[ ! -x website/node_modules/.bin/$tool ]]; then
+      pages_reason='website dependencies are absent'
+      pages_fix='prepare: cd website && npm ci'
+      break
+    fi
+  done
+fi
+if [[ -n $pages_reason ]]; then
+  not_run 'pages typecheck/build/artifact guard' "$pages_reason" "$pages_fix"
+else
+  (
+    cd website
+    npm run typecheck
+    npm run build
+    [[ -d build ]] || { echo 'Website build directory missing' >&2; exit 1; }
+    # Capture find's status directly: process substitution would hide errors.
+    offenders=$(find build -type f \
+      \( -iname '*.yaml' -o -iname '*.yml' \
+         -o -iname '*.env' -o -iname '.env.*' \
+         -o -iname '*.pem' -o -iname '*.key' \
+         -o -iname '*.toml' -o -iname '*.sql' \))
+    if [[ -n $offenders ]]; then
+      echo 'Sensitive/config asset detected in Pages artifact; refusing to pass' >&2
+      exit 1
+    fi
+  )
+fi
+
+if (( ${#skipped_jobs[@]} == 0 )); then
+  echo '✓ Local quality checks passed (no publishing or deployment)'
+else
+  echo 'Jobs not run (their toolchain is absent; every other job was graded):'
+  for notice in "${skipped_jobs[@]}"; do
+    echo "  $notice"
+  done
+  echo '✓ Local quality checks passed for the gates that ran (no publishing or deployment)'
+fi

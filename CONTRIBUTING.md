@@ -14,9 +14,20 @@ This project adheres to a [Code of Conduct](CODE_OF_CONDUCT.md). By participatin
 
 ### Prerequisites
 
-- **Rust** stable (pinned in `rust-toolchain.toml`)
-- **Docker** and **Docker Compose** (for local dev stack)
-- **PostgreSQL** client tools (psql)
+Required for `bin/check` to grade at all — a missing one returns **75**:
+
+- **Rust** stable (pinned in `rust-toolchain.toml`), with rustfmt and clippy
+- **Docker** and **Docker Compose** (for local dev stack), with a reachable daemon
+- **Git**, Bash and standard shell utilities, including GNU grep with PCRE support
+
+Gate-scoped — each toolchain belongs to exactly one job, so an absent one is
+reported `NOT RUN` and every other job is still graded:
+
+- **cargo-audit** on `PATH` (audit job) — `cargo install cargo-audit`
+- **Node.js 20+** and **npm** (Pages job) — `install: Node 20+ and npm`
+- **Website dependencies** (Pages job) — `cd website && npm ci`
+
+**PostgreSQL** client tools (psql) are for `bin/dev psql` against the dev stack.
 
 ### Local Development
 
@@ -31,6 +42,8 @@ bin/dev up
 This spins up:
 - A "state DB" (gateway metadata, sessions, audit log) on `localhost:5433`
 - A target PostgreSQL instance on `localhost:5434` (for testing gateway queries)
+- A MySQL permissions store on `localhost:3307`
+- A MongoDB target on `localhost:27018`
 
 **Check logs:** `bin/dev logs`  
 **Tear down:** `bin/dev down`  
@@ -74,8 +87,14 @@ See [CLAUDE.md](CLAUDE.md#conventions) for full conventions.
 
 **Run all tests:**
 ```bash
-bin/test    # Unit + integration (auto-brings up dev stack)
+bin/test    # All targets + all features, including bench-harness tests; starts dev stack
 ```
+
+Before invoking cargo, `bin/test` always runs the idempotent
+`docker compose -f docker-compose.dev.yml up -d --wait`, waiting for all four
+services to become healthy even when the state DB is already running. Failed
+stack setup returns **75** without running cargo; test arguments pass through
+unchanged.
 
 **Run a single test:**
 ```bash
@@ -125,9 +144,9 @@ Reviewers check for:
 
 ### Before You Push
 
-1. **Run the full CI locally:**
+1. **Run local quality gates** (see [gate matrix](#local-quality-gate-matrix)):
    ```bash
-   bin/ci    # Runs fmt check, clippy, all tests
+   bin/check    # Delegates to bin/ci; validation only, never publishes
    ```
 
 2. **Commit with a clear message:**
@@ -159,16 +178,59 @@ Reviewers check for:
 
 ## CI & Tooling
 
-The repo uses GitHub Actions (GitHub-hosted runners). You can reproduce CI locally:
+### Local quality gate matrix
 
-```bash
-bin/ci      # Exactly what GitHub Actions runs
-```
+`bin/check` delegates to `bin/ci`. GitHub Actions independently configures the
+quality jobs in [ci.yml](.github/workflows/ci.yml) and validation in
+[pages.yml](.github/workflows/pages.yml); CI does **not** call `bin/check`.
 
-This runs:
-- `bin/fmt --check`
-- `cargo clippy --all-targets --all-features -- -D warnings`
-- `bin/test` (unit + integration)
+| Workflow job / validation | Local gate |
+|---|---|
+| `ci.yml` / `fmt` | `bin/lint`: `cargo fmt --all -- --check`; `bin/ci`: SHA-pin scan of `.yml` and `.yaml` workflows (local actions exempt) |
+| `ci.yml` / `clippy` | `bin/lint`: debug all-target/all-feature clippy and release all-feature clippy, both `-D warnings`; `bin/check-scrub-features` checks the non-dev regex feature graph |
+| `ci.yml` / `test` | `bin/test`: `cargo test --all-targets --all-features`, including bench-harness tests, real-DB setup and argument forwarding |
+| `ci.yml` / `audit` | `cargo audit --ignore RUSTSEC-2023-0071` — CI's exact command; the ignore set is unchanged (only `RUSTSEC-2023-0071`, justified in `.cargo/audit.toml` and `audit.toml`) |
+| `ci.yml` / `secret-scan` | Tracked-token scan, identical path exclusions, redacted diagnostics, fail-closed scanner errors; `bash tests/bin/secret-scan-regex.test.sh` |
+| `pages.yml` / `build` | In `website/`: `npm run typecheck` and `npm run build` |
+| `pages.yml` / pre-upload artifact guard | Post-build sensitive/config-asset denylist over `website/build/` |
+| Local orchestration regression | `bash tests/bin/check.test.sh`: temporary fixture checkouts and command stubs, no real DB mocks or recursive full-gate execution |
+
+The gate installs nothing. It separates two kinds of missing prerequisite:
+
+- **Required** — cargo/rustfmt/clippy, Git, GNU grep with PCRE, the Docker CLI,
+  the Docker daemon, Docker Compose, and a dev stack that never became healthy.
+  A missing one returns **75**: the gate cannot grade anything, so it refuses
+  to grade rather than reporting a verdict.
+- **Gate-scoped** — a toolchain that belongs to exactly one job: cargo-audit
+  (the audit job) and Node 20+/npm plus the installed website dependencies (the
+  Pages job). A missing one makes that one job report
+  `NOT RUN: <job> - <reason> (<how to enable it>)`; the gate keeps grading every
+  other job and still reaches a verdict.
+
+A job that runs and fails keeps its own non-zero exit code — a red gate is
+never converted into a skip. Every job that did not run is named in the output
+and repeated in the final summary; the summary then reads
+`✓ Local quality checks passed for the gates that ran (no publishing or deployment)`
+rather than claiming a full pass.
+
+`bin/setup` prepares native/Rust dependencies and starts the four Compose
+services; it does **not** install cargo-audit or website dependencies. Prepare
+those separately to have every job run.
+
+This closes previously omitted SHA-pin, all-feature test, secret-scan and
+website validation gates; fmt, both clippy configurations and the scrub-feature
+guard already existed in `bin/lint`. The audit job already existed too — what
+changed is that it now runs CI's exact command, `cargo audit --ignore
+RUSTSEC-2023-0071`, instead of a bare `cargo audit` that relied on cargo-audit's
+config discovery. There is no separate Rust typecheck job: clippy supplies that
+check; the separate typecheck is the website's.
+
+Local website validation runs whenever the site toolchain is present, and the
+Pages job is reported `NOT RUN` when it is absent; Pages keeps its existing path
+filters. Local checks deliberately exclude CI cache cleanup, registry login,
+image builds/pushes, manifest pushes, release publication, Pages artifact upload
+and deployment. Those credentialed publishing steps remain CI-only. Local success
+is evidence of validation, not a guarantee of deployment success.
 
 ---
 

@@ -10,8 +10,47 @@ applies: [rust]
 
 ## The one gate
 
-`bin/check` is the gate. CI runs it and the pre-commit hook runs it, so a change that
-passes it locally passes everywhere.
+`bin/check` is the local gate and delegates to `bin/ci`. CI does not invoke it:
+`.github/workflows/ci.yml` independently configures fmt, SHA-pin validation, both
+clippy configurations, scrub-feature validation, all-target/all-feature tests,
+dependency audit and tracked-token scan with its regex regression. The local gate
+runs equivalent quality checks plus isolated shell orchestration regressions.
+
+The gate also runs the Pages-parity job — website typecheck, production build
+and the post-build sensitive-asset denylist from `.github/workflows/pages.yml` —
+whenever the site toolchain is present (Node 20+, npm, installed website
+dependencies). When that toolchain is absent, that one job is reported `NOT RUN`
+and the gate still grades everything else. Pages retains its existing path
+filters; CI stays the authority for the audit and Pages jobs. See
+`CONTRIBUTING.md#local-quality-gate-matrix` for the mapping. Local success does
+not guarantee CI publishing or deployment success.
+
+Prepare Rust (rustfmt and clippy), Git, Bash, GNU grep with PCRE, standard shell
+utilities, Docker Compose and a running Docker daemon. These are REQUIRED: a
+missing one returns 75, because the gate cannot grade anything at all.
+
+Two toolchains are GATE-SCOPED — each belongs to exactly one job: cargo-audit
+(the audit job) and Node 20+/npm plus the installed website dependencies (the
+Pages job). When one is absent, that job reports
+`NOT RUN: <job> - <reason> (<how to enable it>)` and the gate keeps grading
+every other job. The skip is printed and repeated in the final summary; it is
+never silent.
+
+`bin/check` installs nothing. The local audit command is CI's exact command,
+`cargo audit --ignore RUSTSEC-2023-0071`; the ignore set is unchanged (only
+`RUSTSEC-2023-0071`, justified in `.cargo/audit.toml` and `audit.toml`).
+`bin/setup` alone is insufficient: it does not install cargo-audit or website
+dependencies. Prepare both separately to have every job run.
+
+`bin/test` always runs `docker compose -f docker-compose.dev.yml up -d --wait`
+before cargo, including when the state DB is already running. All four services
+(`state-db`, `target-db`, `permissions-mysql`, `target-mongo`) must be healthy.
+Failed stack setup returns 75 without invoking cargo; test arguments are forwarded
+unchanged.
+
+Registry login, image/manifest pushes, release publication, artifact upload and
+Pages deployment are separate credentialed CI-only steps, not local validation.
+CI cache cleanup is also deliberately not reproduced locally.
 
 | Step | Command | What it is |
 |------|---------|------------|
@@ -32,11 +71,18 @@ red. Exit 1 cannot carry that difference, so one code is reserved:
 
 | Exit | Means | What the platform does |
 |------|-------|------------------------|
-| 0 | the change passes | commit it |
-| 75 | a resource the gate NEEDS is unreachable (a database, a service, a credential) — it refused to grade | refuse the commit, and blame the environment, never the change |
+| 0 | every job that ran passed; any job that did not run is named in the summary | commit it |
+| 75 | a REQUIRED resource is unreachable (cargo/rustfmt/clippy, git, grep without PCRE, the Docker CLI/daemon/Compose, a dev stack that never became healthy) — it refused to grade | refuse the commit, and blame the environment, never the change |
 | any other non-zero | the gate ran and the change is red | refuse the commit, and blame the change |
 
-- Guard preconditions FIRST and `exit 75` when one is unmet. `exit 1` there tells the
-  platform your change is broken when it is your environment that is.
+- Guard the REQUIRED preconditions FIRST and `exit 75` when one is unmet. `exit 1`
+  there tells the platform your change is broken when it is your environment that is.
+- A job whose own toolchain is absent is not an environment blocker: report
+  `NOT RUN: <job> - <reason> (<how to enable it>)` and keep grading. A job that
+  runs and fails keeps its own non-zero code — never turn a red job into a skip.
+- Every job that did not run is named in the output and repeated in the final
+  summary, which then reads
+  `✓ Local quality checks passed for the gates that ran (no publishing or deployment)`
+  instead of claiming a full pass.
 - Changed a dependency? Re-run `bin/setup` before `bin/check`, or you are proving a stale tree.
 - Add the test that fails first, then the fix — a green run that never went red proves nothing.

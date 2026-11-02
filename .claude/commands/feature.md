@@ -34,13 +34,13 @@ When you do hive, a big task is not one agent doing more; it is a **team sharing
 
 ### Who runs which checks
 
-**No agent runs `bin/test`, `bin/ci`, or a bare `cargo test`.** `bin/test` is `cargo test --all-targets` over the whole crate *and* brings the docker stack up. Run N times concurrently it does not parallelise — cargo serialises on the `target/` build lock, and whichever runs get through then fight over one `state-db`. Biggest time sink in a parallel run here.
+**No agent runs `bin/test`, `bin/ci`, or a bare `cargo test`.** `bin/test` is `cargo test --all-targets --all-features` over the whole crate *and* brings the docker stack up (always `docker compose -f docker-compose.dev.yml up -d --wait`, waiting for all four services to become healthy; a stack that never becomes healthy returns 75 without running cargo). Run N times concurrently it does not parallelise — cargo serialises on the `target/` build lock, and whichever runs get through then fight over one `state-db`. Biggest time sink in a parallel run here.
 
 | | Agent (per iteration) | Coordinator (once, at the end) |
 |---|---|---|
 | format | `cargo fmt -- <files it edited>` | `cargo fmt --all -- --check` (in `bin/lint`) |
 | lint | `cargo clippy --all-targets --all-features -- -D warnings`, **once when otherwise done** — one cargo target, so clippy is crate-wide by nature; this is the floor | `bin/lint`, which adds the `--release` clippy pass catching imports used only under `cfg(test)` |
-| tests | `cargo test --test <its own integration test>` / `cargo test <module::path>` — named explicitly, never bare | `bin/ci` (`bin/lint` + `bin/test` + `cargo audit`), in the **background** |
+| tests | `cargo test --test <its own integration test>` / `cargo test <module::path>` — named explicitly, never bare | `bin/ci` (SHA-pin scan, tracked-token scan + its regex regression, orchestration regression, `bin/lint`, `bin/test`, `cargo audit --ignore RUSTSEC-2023-0071`, website typecheck/build/artifact guard), in the **background** |
 
 An agent owns *its own files and its own tests*; whole-crate green is the coordinator's job and nobody else's.
 
@@ -94,7 +94,7 @@ An agent owns *its own files and its own tests*; whole-crate green is the coordi
 
    Small feature → one agent, skip the fan-out.
 
-8. **Verify, then PR + merge.** The bar is `bin/ci` green — `bin/lint` (fmt-check, `clippy --all-targets --all-features -D warnings`, **and** the `--release` clippy pass), `bin/test` (unit + integration against real Postgres/MySQL/Mongo), `cargo audit`. Run it **once**, in the **background**; it is minutes long and a foreground call looks hung. Green gate **plus audit rows actually asserted** is the bar — if it isn't logged, it didn't happen.
+8. **Verify, then PR + merge.** The bar is `bin/ci` green — the SHA-pin scan of `.github/workflows`, the tracked-token scan with `bash tests/bin/secret-scan-regex.test.sh`, the orchestration regression `bash tests/bin/check.test.sh`, `bin/lint` (fmt-check, `clippy --all-targets --all-features -D warnings`, **and** the `--release` clippy pass, plus `bin/check-scrub-features`), `bin/test` (`cargo test --all-targets --all-features` — unit + integration against real Postgres/MySQL/Mongo), `cargo audit --ignore RUSTSEC-2023-0071`, and the website typecheck/build/artifact guard. Run it **once**, in the **background**; it is minutes long and a foreground call looks hung. Two kinds of missing prerequisite, and they read differently: a missing **REQUIRED** one (cargo/rustfmt/clippy, git, grep without PCRE, Docker, a dev stack that never became healthy) returns **75** — the gate refused to grade, so fix the box, not the change; a job whose **own** toolchain is absent (cargo-audit; Node/npm + installed website deps) reports `NOT RUN: <job> - <reason>` and the gate still reaches a verdict. Green gate **plus audit rows actually asserted** is the bar — if it isn't logged, it didn't happen.
 
    **Before committing, sweep the agents' leftovers**: scratch `.rs` probes at the repo root, stray `dbg!`/`println!`, a temp YAML config, commented-out tests. Agents create them and rarely clean up.
 
