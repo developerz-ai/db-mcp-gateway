@@ -30,7 +30,6 @@ if ! dpkg -s build-essential openssl curl >/dev/null 2>&1; then
   APT=(apt-get)
   if (( EUID != 0 )); then
     command -v sudo >/dev/null 2>&1 || fail 'Install build-essential, openssl and curl as administrator, then retry.'
-    sudo -n true >/dev/null 2>&1 || fail 'Package installation requires non-interactive sudo. Ask an administrator to install build-essential, openssl and curl, then retry.'
     APT=(sudo -n apt-get)
   fi
   "${APT[@]}" update >/dev/null 2>&1 || fail 'Package index update failed. Check apt repositories and network access, then retry.'
