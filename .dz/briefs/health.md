@@ -17,3 +17,11 @@ For each unhealthy signal, one ask, unless an open issue already carries its exa
 Titles are stable: nothing that changes run to run (sha, run URL, version) goes in one; that goes in the body,
 with the command and its output. Unreadable evidence is no verdict: re-run it, never file it as a defect.
 A red `main` comes first: nothing releases from it.
+
+## Rows
+
+- `main-green` — The `ci.yml` push run on the `origin/main` tip is `success`; a null conclusion or another sha is no verdict.
+- `last-tag-published` — The `release.yml` run on the last tag's sha is `success`; no run on that sha is no verdict.
+- `stamped-version-tagged` — The `version` stamped in `Cargo.toml` equals the last tag, or an open release PR or in-flight run explains it.
+- `github-release-published` — The GitHub Release for the last tag is not a draft, and it is published.
+- `dependabot-not-stuck` — No open Dependabot PR has failed checks and more than 7 days since `updatedAt`.
