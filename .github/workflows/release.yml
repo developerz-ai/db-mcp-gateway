@@ -92,7 +92,7 @@ jobs:
           password: ${{ secrets.DOCR_TOKEN }}
       - name: image labels
         id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -151,7 +151,7 @@ jobs:
           password: ${{ secrets.DOCR_TOKEN }}
       - name: derive ghcr image metadata
         id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           # v1.4.5 → tags: 1.4.5, 1.4, 1, latest
@@ -169,7 +169,7 @@ jobs:
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:linux-arm64-${{ steps.ver.outputs.version }}"
       - name: derive docr image metadata
         id: meta-docr
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.DOCR_REGISTRY }}/${{ env.DOCR_IMAGE_NAME }}
           # mirror the GHCR tag set so the same :<semver> / :latest refs work in DOCR
