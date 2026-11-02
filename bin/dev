@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # bin/dev — local dev stack control.
-#   bin/dev up           start state-db + target-db + target-mongo + permissions-mysql
+#   bin/dev up           start state-db + target-db + target-mongo + permissions-mysql (waits for health)
 #   bin/dev down         stop and remove containers
 #   bin/dev reset        down + remove volumes (fresh DBs)
 #   bin/dev logs [svc]   follow logs
@@ -20,7 +20,7 @@ fi
 COMPOSE=(docker compose -f docker-compose.dev.yml)
 
 case "${1:-up}" in
-  up)    "${COMPOSE[@]}" up -d ;;
+  up)    "${COMPOSE[@]}" up -d --wait ;;
   down)  "${COMPOSE[@]}" down ;;
   reset) "${COMPOSE[@]}" down -v ;;
   # "$@" not "${@:-}": with no service argument the latter expands to a single

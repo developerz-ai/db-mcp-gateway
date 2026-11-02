@@ -57,3 +57,8 @@ recipe.json
 # Benchmark output. Raw results are environment-specific and only meaningful
 # next to the machine they came from — regenerate with benchmarks/gateway_overhead.sh.
 benchmarks/results/
+
+# developerz.ai maintainer agent — scratch it writes for itself while it works
+# (staged CI logs, run artifacts, run provenance). Written BY the agent FOR the
+# agent, cleared and rewritten on every run; never repo content.
+tmp/dz/
