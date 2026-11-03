@@ -338,7 +338,7 @@ jobs:
           password: ${{ secrets.DOCR_TOKEN }}
       - name: image labels
         id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: |
             ghcr.io/${{ github.repository }}
@@ -390,7 +390,7 @@ jobs:
           password: ${{ secrets.DOCR_TOKEN }}
       - name: derive ghcr image metadata
         id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/${{ github.repository }}
           # Three tags per commit:
@@ -413,7 +413,7 @@ jobs:
             "ghcr.io/${{ github.repository }}:linux-arm64-${{ steps.sha.outputs.short }}"
       - name: derive docr image metadata
         id: meta-docr
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: registry.digitalocean.com/developerz-ai/db-mcp-gateway
           # Mirror the GHCR tag set exactly. DOCR is the registry Image Updater
