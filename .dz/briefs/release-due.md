@@ -53,3 +53,5 @@ Never re-tag, move or delete a tag, and never publish by hand. A failed publish 
 ## Rows
 
 - `release-needed` — You judged, from the window above, that a release is needed now and none is in flight. A breaking change files the `Major release pending` issue instead.
+- `major-release-pending` — A breaking change is in the window and no open issue titled `Major release pending` exists. File that issue for a maintainer, with no release steps.
+- `release-publish-failed` — `release.yml` was watched to the end and the publish failed. It is an issue for a maintainer; the fix ships as the next patch.
