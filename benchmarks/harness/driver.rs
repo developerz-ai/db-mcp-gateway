@@ -488,15 +488,23 @@ mod tests {
         }
     }
 
-    /// Slowest request first: each later iteration sleeps less, so with
-    /// concurrency 2 the completion order differs from the issuance order —
-    /// exactly what the completion merge must get right.
+    /// Unevenly spaced sleeps: each later iteration is shorter, but not by a
+    /// constant. An evenly spaced ladder (`120/90/60/30`) ties its last two
+    /// completions — `d1 + d2 == d0 + d3` holds for any arithmetic sequence —
+    /// and which of two timers expiring at the same instant fires first is the
+    /// scheduler's coin flip, not the fixture's. The gaps below keep every
+    /// completion instant distinct by ≥40 ms.
     struct SleepsByIteration;
 
     #[async_trait]
     impl Path for SleepsByIteration {
         async fn run(&self, _shape: Shape, iteration: u64) -> Result<f64, String> {
-            let ms = 120u64.saturating_sub(iteration * 30).max(30);
+            let ms = match iteration {
+                0 => 160,
+                1 => 60,
+                2 => 140,
+                _ => 80,
+            };
             tokio::time::sleep(Duration::from_millis(ms)).await;
             Ok(ms as f64)
         }
@@ -744,9 +752,13 @@ mod tests {
     }
 
     /// samples_ms must be in global completion order. With concurrency 2 and
-    /// per-iteration sleeps of 120/90/60/30 ms, iterations 1, 0, 2, 3 finish
-    /// in that order. Worker-join concatenation would publish either
-    /// [120, 60, 90, 30] or [90, 30, 120, 60] — never this.
+    /// per-iteration sleeps of 160/60/140/80 ms: iteration 1 finishes at
+    /// 60 ms, its worker takes iteration 2 (finishes at 200 ms) while the
+    /// other worker is still in iteration 0 (finishes at 160 ms), which then
+    /// takes iteration 3 (finishes at 240 ms). Iterations 1, 0, 2, 3 finish
+    /// in that order — interleaved across the two workers, which worker-join
+    /// concatenation cannot produce: it would publish [60, 140, 160, 80],
+    /// never this.
     #[tokio::test]
     async fn samples_are_published_in_global_completion_order() {
         let plan = Plan {
@@ -759,7 +771,7 @@ mod tests {
             .expect("path succeeds");
         assert_eq!(
             result.samples_ms,
-            vec![90.0, 120.0, 60.0, 30.0],
+            vec![60.0, 160.0, 140.0, 80.0],
             "the published sequence must be the completion order"
         );
     }

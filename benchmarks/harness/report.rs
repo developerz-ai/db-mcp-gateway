@@ -739,7 +739,7 @@ mod tests {
         assert_eq!(m.direct_recheck_samples_ms.len(), m.direct_recheck.n);
 
         // And they must reach the JSON, not only the struct.
-        let json = serde_json::to_value(&Report::new(Environment::capture(), config(), vec![m]))
+        let json = serde_json::to_value(Report::new(Environment::capture(), config(), vec![m]))
             .expect("report serializes");
         assert_eq!(
             json["measurements"][0]["direct_recheck_samples_ms"]
