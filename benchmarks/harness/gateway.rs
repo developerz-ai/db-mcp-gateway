@@ -4,6 +4,12 @@
 //! service-token auth, real synchronous audit write. Nothing here reaches into
 //! the library to shortcut a layer, because a benchmark of a build we do not
 //! ship is worth less than no benchmark.
+//!
+//! The path is **backend-aware**: the same `tools/call` envelope carries a
+//! SQL string for a postgres target and a mongo command document for a mongo
+//! target. The gateway dispatches on the *configured server's* kind, so the
+//! harness only has to name the right `server`/`database` pair — the shape
+//! carries the query text for whichever backend it belongs to.
 
 use std::time::Instant;
 
@@ -72,6 +78,12 @@ impl GatewayClient {
         })
     }
 
+    /// The MCP endpoint this client posts to. Used by the scaling phase's
+    /// console output so a reader can tell which instance answered.
+    pub fn mcp_url(&self) -> &str {
+        &self.mcp_url
+    }
+
     /// Issue one query and return its wall-clock latency in milliseconds.
     ///
     /// The clock covers request-send through response-parsed, which is what an
@@ -80,20 +92,7 @@ impl GatewayClient {
     /// which is precisely the kind of thing the comparison should surface
     /// rather than subtract away.
     pub async fn run(&self, shape: Shape, iteration: u64) -> Result<f64, GatewayError> {
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": iteration,
-            "method": "tools/call",
-            "params": {
-                "name": "run_query",
-                "arguments": {
-                    "server": self.server,
-                    "database": self.database,
-                    "sql": shape.sql(iteration),
-                    "limit": shape.limit(),
-                }
-            }
-        });
+        let body = run_query_envelope(&self.server, &self.database, shape, iteration);
 
         let started = Instant::now();
         let response: Value = self
@@ -111,6 +110,33 @@ impl GatewayClient {
 
         Ok(elapsed)
     }
+}
+
+/// The `tools/call` envelope for one measured request — the production
+/// builder `GatewayClient::run` sends.
+///
+/// Extracted from `run` so the envelope test exercises this function rather
+/// than re-typing the JSON: a test that assembled its own envelope would
+/// keep passing if `run` drifted away from it (say, back to sending SQL for
+/// every backend).
+fn run_query_envelope(server: &str, database: &str, shape: Shape, iteration: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": iteration,
+        "method": "tools/call",
+        "params": {
+            "name": "run_query",
+            "arguments": {
+                "server": server,
+                "database": database,
+                // One field carries both dialects: SQL for a postgres
+                // target, a mongo command document for a mongo target.
+                // The gateway's server kind decides which it parses.
+                "sql": shape.query(iteration),
+                "limit": shape.limit(),
+            }
+        }
+    })
 }
 
 /// Reject any envelope the benchmark cannot legitimately time.
@@ -261,5 +287,63 @@ mod tests {
             "Debug leaked the service token: {dumped}"
         );
         assert!(dumped.contains("<redacted>"));
+    }
+
+    /// The measured envelope must be the production builder's output: the
+    /// MCP `tools/call` framing, `run_query`, and the shape's own query text
+    /// and row cap in the arguments. For a mongo shape the query text is the
+    /// command document — `shape.sql()` returns the empty string there, so
+    /// this assertion fails if the builder ever sent SQL for both dialects.
+    #[test]
+    fn the_envelope_is_built_by_the_production_builder() {
+        let shape = Shape::MongoPointFind;
+        let body = run_query_envelope("target-mongo", "app", shape, 3);
+        assert_eq!(body["jsonrpc"], json!("2.0"));
+        assert_eq!(body["id"], json!(3));
+        assert_eq!(body["method"], json!("tools/call"));
+        assert_eq!(body["params"]["name"], json!("run_query"));
+        let arguments = &body["params"]["arguments"];
+        assert_eq!(arguments["server"], json!("target-mongo"));
+        assert_eq!(arguments["database"], json!("app"));
+        assert_eq!(
+            arguments["sql"],
+            json!(shape.command(3)),
+            "a mongo shape must carry the command document, not SQL"
+        );
+        assert_eq!(arguments["limit"], json!(shape.limit()));
+
+        // And the postgres dialect stays SQL.
+        let point = Shape::PointLookup;
+        let body = run_query_envelope("target", "app", point, 0);
+        assert_eq!(
+            body["params"]["arguments"]["sql"],
+            json!(point.sql(0)),
+            "a postgres shape must carry SQL"
+        );
+    }
+
+    /// Several gateway base URLs must produce several distinct clients —
+    /// the scaling phase needs one client per instance.
+    #[test]
+    fn each_base_url_yields_its_own_endpoint() {
+        let a = GatewayClient::new(
+            "http://127.0.0.1:9001/",
+            "/mcp",
+            "t".into(),
+            "target".into(),
+            "app".into(),
+        )
+        .expect("client constructs");
+        let b = GatewayClient::new(
+            "http://127.0.0.1:9002",
+            "/mcp",
+            "t".into(),
+            "target".into(),
+            "app".into(),
+        )
+        .expect("client constructs");
+        assert_eq!(a.mcp_url(), "http://127.0.0.1:9001/mcp");
+        assert_eq!(b.mcp_url(), "http://127.0.0.1:9002/mcp");
+        assert_ne!(a.mcp_url(), b.mcp_url());
     }
 }

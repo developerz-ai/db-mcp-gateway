@@ -50,8 +50,8 @@ install anything beyond `docker`, `cargo`, `curl`, and `openssl`:
 ```
 
 That brings up a disposable stack, boots a **release** build of the real
-gateway, and times the same three query shapes down two paths — through the
-gateway, and straight at Postgres — on your hardware, at the same moment.
+gateway, and times the same query shapes down two paths — through the
+gateway, and straight at the database — on your hardware, at the same moment.
 It prints a Markdown report and writes raw JSON, then tears down whatever it
 started.
 
@@ -66,6 +66,33 @@ tried, the baseline drifted enough between the two calibration runs that the
 harness marked its own output untrustworthy — which is exactly the guard we
 built in to keep us from publishing numbers we cannot stand behind. Run the
 harness on your own hardware.
+
+## What the harness covers
+
+| Coverage | How it is measured |
+|---|---|
+| Gateway overhead against a direct connection to the same database, on the same host, as a distribution (p50/p90/p95/p99, plus min/max/mean and the coefficient of variation) | The same query down two paths — through the gateway's `run_query` MCP tool, and straight at the database — with the baseline re-run afterwards to detect host drift |
+| Postgres | The `target-db` container from the dev stack |
+| MongoDB | The `target-mongo` container from the dev stack, through the gateway's mongo adapter (which is read-only by construction) |
+| Behaviour under concurrency | Closed-loop load driver; every phase reports its full distribution and the throughput that phase achieved |
+| Resource utilization under load | The gateway process is sampled per phase for peak RSS and CPU time, and the figures appear in both the JSON result and the Markdown report |
+| Multiple gateway instances | `--instances N` boots N gateway processes and spreads the load over them |
+| MySQL query targets | The gateway has no mysql query adapter, so such a server is refused at boot; the harness loads a config declaring one and asserts that rejection, reported in its own section |
+
+The gateway path in every one of those runs keeps normal authentication (a
+service-token bearer), normal authorization (grants from the bench config)
+and the synchronous audit write on the critical path. No benchmark mode
+skips a layer.
+
+### Two things the harness deliberately does not claim
+
+- **A scaling law.** `--instances N` measures contention between N gateway
+  processes, the load generator and the database sharing one host's cores. It
+  is labelled as contention, not scaling; a scaling result needs a separate
+  load host.
+- **A throughput ceiling.** The reported throughput is what that host
+  achieved while also running the load generator. It is not a capacity
+  figure.
 
 ## What we will publish when we do measure
 
@@ -82,8 +109,8 @@ Tracked in [#196](https://github.com/developerz-ai/db-mcp-gateway/issues/196):
 
 ## In the meantime
 
-Measure it yourself, on your hardware, against your data. That number may
-be more relevant to your deployment than a generic published result — and if
-it surprises you in either direction, please
+Measure it yourself, on your hardware, against your data. That number may be
+more relevant to your deployment than a generic published result — and if it
+surprises you in either direction, please
 [open an issue](https://github.com/developerz-ai/db-mcp-gateway/issues/new);
 a real report from a real deployment is worth more than our synthetic run.
