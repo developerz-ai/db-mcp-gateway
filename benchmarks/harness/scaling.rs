@@ -108,14 +108,16 @@ fn build_clients(
         .collect()
 }
 
-/// Spread the workers across the gateway instances.
+/// Spread the requests across the gateway instances.
 ///
-/// Each worker pins itself to one instance, chosen round-robin by worker
-/// index. That is what "N instances behind a list of URLs" means here: the
-/// load is distributed over the instances, not sent to one of them while the
-/// others idle. There is no load balancer in the harness — the point is to
-/// drive the instances, and the operator's balancer is a different system
-/// with its own overhead.
+/// Routing is **per request**, not per worker: each iteration `i` goes to
+/// instance `i % n` (see [`RoundRobinPath`]). With one worker and several
+/// instances that still visits every instance — successive requests walk the
+/// list — and with several workers the shared iteration counter interleaves
+/// the workers' requests across the list, so no worker is pinned to an
+/// instance and no instance's latency distribution is worker-local. There is
+/// no load balancer in the harness — the point is to drive the instances, and
+/// the operator's balancer is a different system with its own overhead.
 fn round_robin(clients: Vec<Arc<GatewayClient>>) -> Arc<dyn Path> {
     Arc::new(RoundRobinPath { clients })
 }
@@ -148,6 +150,7 @@ impl Path for RoundRobinPath {
 mod tests {
     use super::*;
     use crate::workload::Backend;
+    use serde_json::json;
 
     fn setup<'a>(urls: &'a [String]) -> ScalingSetup<'a> {
         ScalingSetup {
@@ -181,23 +184,102 @@ mod tests {
         assert!(err.contains("no gateway URLs"), "got: {err}");
     }
 
+    /// A stand-in gateway endpoint: records the JSON-RPC id of every
+    /// tools/call it receives, so the production routing path can be
+    /// observed — which instance received which iteration — without a real
+    /// gateway fleet. The response is a valid `run_query` envelope so the
+    /// client accepts it.
+    struct RecordingEndpoint {
+        base_url: String,
+        seen_ids: Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
+    impl RecordingEndpoint {
+        async fn start() -> Self {
+            let seen_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let app = axum::Router::new().route(
+                "/mcp",
+                axum::routing::post({
+                    let seen_ids = Arc::clone(&seen_ids);
+                    move |body: String| {
+                        let seen_ids = Arc::clone(&seen_ids);
+                        async move {
+                            let id = serde_json::from_str::<serde_json::Value>(&body)
+                                .ok()
+                                .and_then(|envelope| envelope["id"].as_u64())
+                                .unwrap_or(u64::MAX);
+                            if let Ok(mut seen) = seen_ids.lock() {
+                                seen.push(id);
+                            }
+                            axum::Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {"content": [{"type": "text",
+                                    "text": "{\"rows\":[[1]],\"truncated\":false}"}]}
+                            }))
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind loopback");
+            let addr = listener.local_addr().expect("local addr");
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            RecordingEndpoint {
+                base_url: format!("http://{addr}"),
+                seen_ids,
+            }
+        }
+
+        /// The ids this endpoint received, sorted.
+        fn received_ids(&self) -> Vec<u64> {
+            let mut ids = self
+                .seen_ids
+                .lock()
+                .map(|seen| seen.clone())
+                .unwrap_or_default();
+            ids.sort_unstable();
+            ids
+        }
+    }
+
     /// The round-robin must spread the load across every instance — a curve
     /// that quietly drove only the first instance would measure one gateway
     /// and call it N.
+    ///
+    /// Driven through `RoundRobinPath::run` itself, against instrumented
+    /// endpoints: the assertion is which instance *received* each iteration,
+    /// not a re-computation of the routing arithmetic. A routing change that
+    /// sent everything to instance zero — or shifted the modulo — cannot
+    /// pass this.
     #[tokio::test]
     async fn the_round_robin_spans_every_instance() {
-        let urls = vec![
-            "http://127.0.0.1:9001".to_string(),
-            "http://127.0.0.1:9002".to_string(),
-            "http://127.0.0.1:9003".to_string(),
-        ];
-        let clients = build_clients(&urls, &setup(&urls)).expect("clients build");
-        let path = round_robin(clients);
-
-        // Three consecutive iterations must land on three distinct instances.
-        let mut slots: Vec<usize> = (0..3u64).map(|i| (i as usize) % 3).collect();
-        slots.sort_unstable();
-        assert_eq!(slots, vec![0, 1, 2]);
+        let mut endpoints = Vec::new();
+        for _ in 0..3 {
+            endpoints.push(RecordingEndpoint::start().await);
+        }
+        let urls: Vec<String> = endpoints.iter().map(|e| e.base_url.clone()).collect();
+        let path = round_robin(build_clients(&urls, &setup(&urls)).expect("clients build"));
         assert_eq!(path.label(), "gateway-scaling");
+
+        for iteration in 0..9u64 {
+            path.run(Shape::PointLookup, iteration)
+                .await
+                .expect("the instrumented endpoint answered");
+        }
+
+        // Instance k must have received exactly the iterations that route
+        // to it: k, k+3, k+6.
+        for (instance, endpoint) in endpoints.iter().enumerate() {
+            let expected: Vec<u64> = (0..9u64).filter(|i| i % 3 == instance as u64).collect();
+            assert_eq!(
+                endpoint.received_ids(),
+                expected,
+                "instance {instance} received the wrong iterations"
+            );
+        }
     }
 }

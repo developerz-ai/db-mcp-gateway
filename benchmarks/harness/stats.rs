@@ -105,22 +105,23 @@ impl Throughput {
     }
 }
 
-/// What the gateway process consumed while a phase ran.
+/// What the gateway processes consumed while a phase ran.
 ///
-/// Read from `/proc` for the gateway's PID: peak resident set size, CPU
-/// seconds burned (user + system), and how many samples were taken. The
+/// Read from `/proc` for the gateway fleet's PIDs: peak resident set size,
+/// CPU seconds burned (user + system), and how many samples were taken. The
 /// sample count matters as much as the numbers — a phase that lasted 40 ms
 /// and caught one sample says almost nothing, and a reader needs to be able
 /// to see that.
 ///
-/// `peak_rss_bytes` is a high-water mark across the samples, not the value
-/// at the end of the phase: RSS rarely falls, so the last sample would
-/// understate a phase that allocated and freed.
+/// `peak_rss_bytes` is a high-water mark over per-sample **sums across the
+/// fleet**, not the largest single process: with several gateway instances
+/// the published figure is what they held together. RSS rarely falls, so the
+/// last sample would understate a phase that allocated and freed.
 ///
-/// `cpu_seconds` is a **difference**, not a cumulative counter: it is the
-/// process's CPU at the phase's last sample minus its CPU at the phase's
-/// first sample. `/proc` reports CPU since the process started, so a
-/// cumulative figure would charge the phase for boot, for both baseline
+/// `cpu_seconds` is a **difference**, not a cumulative counter: each
+/// process's CPU at the phase's last sample minus its CPU at its first,
+/// summed across the fleet. `/proc` reports CPU since the process started,
+/// so a cumulative figure would charge the phase for boot, for both baseline
 /// phases and for every earlier shape's gateway phase.
 #[derive(Debug, Clone, Serialize)]
 pub struct ResourceUsage {
@@ -169,7 +170,7 @@ pub struct ScalingRow {
     pub p99_ms: f64,
     /// Requests that failed during this row's phase.
     pub errors: u64,
-    /// The raw per-request latencies, in measurement order — so the
+    /// The raw per-request latencies, in global completion order — so the
     /// percentiles above can be re-derived from the result file.
     pub samples_ms: Vec<f64>,
 }

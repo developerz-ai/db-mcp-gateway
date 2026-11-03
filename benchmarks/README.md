@@ -34,7 +34,7 @@ whatever it started. A stack that was already running is left alone.
 | `--concurrent N` | `8` | Concurrent in-flight requests |
 | `--warmup N` | `200` | Requests discarded before measuring |
 | `--instances N` | `1` | Gateway instances to boot and spread load over |
-| `--db-name NAME` | `app` | Database name for the measured request |
+| `--db-name NAME` | `app` | Database name for the measured request. Only `app` is supported — the database the dev stack provisions; anything else exits 2 before the stack starts |
 | `--database postgres\|postgresql` | — | Legacy alias for `--backend postgres`; picks the postgres target. **Not** a database name — a bad value exits 2 |
 | `--out PATH` | `benchmarks/results/latest.json` | Where the raw JSON result is written |
 | `--resource-sample-ms N` | `1000` | Interval between gateway resource samples |
@@ -49,7 +49,10 @@ it does not ask for a database called `postgres`.
 
 `--db-name` names the measured database on both backends: the gateway path
 and the direct baseline are pointed at the same one, because a comparison
-across two different databases means nothing.
+across two different databases means nothing. Only `app` is accepted — the
+one database the dev stack provisions and the bench gateway config grants —
+and any other name is rejected before the stack starts rather than seeded
+and then refused.
 
 Prerequisites per backend:
 

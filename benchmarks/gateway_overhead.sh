@@ -78,7 +78,10 @@ Options:
   --instances N             Gateway instances to boot and spread load over
                             (default: 1). On one host this measures contention,
                             not horizontal scaling.
-  --db-name NAME            Database name for the measured request (default: app)
+  --db-name NAME            Database name for the measured request (default:
+                            app). Only `app` is supported — the database the
+                            dev stack provisions and the bench config grants;
+                            any other name exits 2 before the stack starts
   --database postgres|postgresql
                             Legacy alias for `--backend postgres`; picks the
                             postgres target. Not a database name.
@@ -157,6 +160,17 @@ if ! [[ "$QUERIES" =~ ^[0-9]+$ ]] || ! [[ "$CONCURRENT" =~ ^[0-9]+$ ]] \
   exit 2
 fi
 
+# Only the database the dev stack provisions is supported. The bench gateway
+# config declares and grants exactly one database per target (`app`), the
+# direct baseline URLs name the same one, and the containers are bootstrapped
+# with it. Another name would be seeded and only then refused — by the
+# gateway's grants, or by the harness's database-match guard — after the
+# whole stack had been brought up. Reject it here, before anything starts.
+if [[ "$DB_NAME" != "app" ]]; then
+  echo "--db-name must be app — the only database the dev stack provisions (got: $DB_NAME)" >&2
+  exit 2
+fi
+
 if [[ "$BACKEND" == "mongo" ]]; then
   SERVER="$SERVER_MONGO"
 else
@@ -220,8 +234,10 @@ else
   # and remember that we did, so the teardown stops exactly that container.
   if ! "${COMPOSE[@]}" ps --status running 2>/dev/null | grep -q target-mongo; then
     echo "-- starting the mongo container"
-    "${COMPOSE[@]}" up -d --wait target-mongo >/dev/null
-    MONGO_STARTED_BY_US=1
+    # The ownership flag is set BEFORE `up`: under `set -e`, a container that
+    # starts but fails the `--wait` health check would otherwise exit here
+    # with the flag unset and leak a running container past cleanup.
+    MONGO_STARTED_BY_US=1 "${COMPOSE[@]}" up -d --wait target-mongo >/dev/null
   fi
 
   echo "-- waiting for Mongo"
@@ -328,18 +344,16 @@ HARNESS_ARGS=(
 )
 
 if [[ "$BACKEND" == "mongo" ]]; then
-  # Passed both ways on purpose: the env var is the established channel for
-  # credential-bearing URLs (`--direct-url` uses it), and the flag makes the
-  # runner work whether or not the harness wires an env fallback for the
-  # mongo URL. The value is the dev credential already public in
-  # docker-compose.dev.yml — never a real one.
+  # The mongo baseline URL travels by environment ONLY (BENCH_MONGO_DIRECT_URL,
+  # exported above — the harness's Cli declares the same env fallback). A
+  # credential-bearing URL must not sit in a process argument, where `ps`
+  # exposes it to every local user on the host.
   #
   # The baseline names the same database as the gateway path (`--db-name`).
   # The two paths must query one database or the comparison is meaningless,
   # and the harness refuses to run when they disagree — so the name is
   # shared rather than configured twice.
   HARNESS_ARGS+=(
-    --mongo-direct-url "$BENCH_MONGO_DIRECT_URL"
     --mongo-database "$DB_NAME"
   )
 fi

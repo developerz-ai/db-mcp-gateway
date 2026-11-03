@@ -36,6 +36,15 @@ pub struct Measurement {
     pub gateway: Summary,
     /// Second baseline run, after the gateway phase.
     pub direct_recheck: Summary,
+    /// The recheck's raw per-request latencies, in global completion order.
+    ///
+    /// Published alongside `direct_samples_ms` and `gateway_samples_ms` so
+    /// the baseline drift — and the recheck's own percentiles — can be
+    /// re-derived from the result file. Discarding them would leave the
+    /// drift column unauditable: a reader could check the two published
+    /// baselines against each other but never either one against its own
+    /// raw samples.
+    pub direct_recheck_samples_ms: Vec<f64>,
     /// Difference between the two baseline runs, as a percentage of the first.
     pub baseline_drift_pct: f64,
     pub overhead: Overhead,
@@ -49,7 +58,8 @@ pub struct Measurement {
     pub gateway_throughput: Throughput,
     /// What the gateway process consumed during the measured phase.
     pub gateway_resources: ResourceUsage,
-    /// The raw per-request latencies for each path, in measurement order.
+    /// The raw per-request latencies for each path, in global completion
+    /// order.
     ///
     /// Published so the percentiles above can be re-derived from the result
     /// file instead of taken on trust. A `Summary` is lossy: from n, the
@@ -85,6 +95,7 @@ impl Measurement {
             direct: base_first.summary,
             gateway: measured.summary,
             direct_recheck: base_second.summary,
+            direct_recheck_samples_ms: base_second.samples_ms,
             baseline_drift_pct: drift_pct,
             overhead,
             direct_errors: base_first.errors,
@@ -699,6 +710,44 @@ mod tests {
         assert_eq!(nearest_rank(95.0), m.gateway.p95_ms);
         assert_eq!(nearest_rank(99.0), m.gateway.p99_ms);
         assert_eq!(m.gateway_samples_ms.len(), m.gateway.n);
+    }
+
+    /// The recheck's raw samples must be published beside its percentiles:
+    /// discarding them would leave the baseline drift — and the recheck's own
+    /// percentiles — un-re-derivable from the result file.
+    #[test]
+    fn the_rechecks_raw_samples_are_published_beside_its_percentiles() {
+        let recheck_samples: Vec<f64> = (1..=100).map(|i| i as f64).collect();
+        let recheck = PhaseResult {
+            summary: Summary::from_samples(recheck_samples.clone()).expect("non-empty"),
+            errors: 0,
+            first_error: None,
+            duration_ms: 1_000.0,
+            completed: 100,
+            samples_ms: recheck_samples.clone(),
+        };
+        let m = Measurement::new(
+            Shape::PointLookup,
+            plan(),
+            phase(1.0, 0),
+            phase(2.0, 0),
+            recheck,
+            0.0,
+            ResourceUsage::unavailable(),
+        );
+        assert_eq!(m.direct_recheck_samples_ms, recheck_samples);
+        assert_eq!(m.direct_recheck_samples_ms.len(), m.direct_recheck.n);
+
+        // And they must reach the JSON, not only the struct.
+        let json = serde_json::to_value(&Report::new(Environment::capture(), config(), vec![m]))
+            .expect("report serializes");
+        assert_eq!(
+            json["measurements"][0]["direct_recheck_samples_ms"]
+                .as_array()
+                .map(|a| a.len()),
+            Some(100),
+            "{json}"
+        );
     }
 
     /// The effective configuration must travel in the result file and reach

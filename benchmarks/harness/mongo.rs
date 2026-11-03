@@ -276,10 +276,21 @@ fn seed_document(g: i64) -> Document {
 ///
 /// A mongo URI without credentials falls back to the dev stack's public
 /// credentials, which `docker-compose.dev.yml` already publishes.
+///
+/// A `mongodb+srv://` URI is rejected: it needs DNS SRV discovery, which this
+/// parser does not implement and the driver here is not built for — the host
+/// goes in as a literal TCP address. Accepting the scheme would quietly point
+/// the client at the SRV hostname on port 27017 and never resolve anything.
 pub fn parse_mongo_url(url: &str) -> anyhow::Result<(String, u16, String, String, String)> {
+    if url.starts_with("mongodb+srv://") {
+        anyhow::bail!(
+            "mongodb+srv:// is not supported by the direct baseline — it needs DNS SRV \
+             discovery, which this local-only harness does not implement; pass a \
+             mongodb:// URI with an explicit host and port"
+        );
+    }
     let rest = url
         .strip_prefix("mongodb://")
-        .or_else(|| url.strip_prefix("mongodb+srv://"))
         .ok_or_else(|| anyhow::anyhow!("mongo URL must start with `mongodb://`"))?;
 
     // Split off the path — the default database. The harness is told the
@@ -400,6 +411,16 @@ mod tests {
     #[test]
     fn a_non_mongo_uri_is_rejected() {
         assert!(parse_mongo_url("postgres://localhost/app").is_err());
+    }
+
+    /// An SRV URI is rejected, not silently treated as a literal TCP host on
+    /// port 27017 — connecting that way would never resolve the SRV records
+    /// and could never reach an SRV-only deployment.
+    #[test]
+    fn an_srv_uri_is_rejected_rather_than_treated_as_a_tcp_host() {
+        let err = parse_mongo_url("mongodb+srv://cluster.example.com/app")
+            .expect_err("srv URIs are rejected");
+        assert!(err.to_string().contains("mongodb+srv"), "{err}");
     }
 
     use super::*;

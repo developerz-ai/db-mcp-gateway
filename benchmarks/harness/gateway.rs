@@ -92,23 +92,7 @@ impl GatewayClient {
     /// which is precisely the kind of thing the comparison should surface
     /// rather than subtract away.
     pub async fn run(&self, shape: Shape, iteration: u64) -> Result<f64, GatewayError> {
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": iteration,
-            "method": "tools/call",
-            "params": {
-                "name": "run_query",
-                "arguments": {
-                    "server": self.server,
-                    "database": self.database,
-                    // One field carries both dialects: SQL for a postgres
-                    // target, a mongo command document for a mongo target.
-                    // The gateway's server kind decides which it parses.
-                    "sql": shape.query(iteration),
-                    "limit": shape.limit(),
-                }
-            }
-        });
+        let body = run_query_envelope(&self.server, &self.database, shape, iteration);
 
         let started = Instant::now();
         let response: Value = self
@@ -126,6 +110,33 @@ impl GatewayClient {
 
         Ok(elapsed)
     }
+}
+
+/// The `tools/call` envelope for one measured request — the production
+/// builder `GatewayClient::run` sends.
+///
+/// Extracted from `run` so the envelope test exercises this function rather
+/// than re-typing the JSON: a test that assembled its own envelope would
+/// keep passing if `run` drifted away from it (say, back to sending SQL for
+/// every backend).
+fn run_query_envelope(server: &str, database: &str, shape: Shape, iteration: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": iteration,
+        "method": "tools/call",
+        "params": {
+            "name": "run_query",
+            "arguments": {
+                "server": server,
+                "database": database,
+                // One field carries both dialects: SQL for a postgres
+                // target, a mongo command document for a mongo target.
+                // The gateway's server kind decides which it parses.
+                "sql": shape.query(iteration),
+                "limit": shape.limit(),
+            }
+        }
+    })
 }
 
 /// Reject any envelope the benchmark cannot legitimately time.
@@ -278,30 +289,37 @@ mod tests {
         assert!(dumped.contains("<redacted>"));
     }
 
-    /// The measured envelope must carry the shape's own query text — SQL for
-    /// a postgres shape, the command document for a mongo shape — and the
-    /// shape's row cap.
+    /// The measured envelope must be the production builder's output: the
+    /// MCP `tools/call` framing, `run_query`, and the shape's own query text
+    /// and row cap in the arguments. For a mongo shape the query text is the
+    /// command document — `shape.sql()` returns the empty string there, so
+    /// this assertion fails if the builder ever sent SQL for both dialects.
     #[test]
-    fn the_envelope_carries_the_shapes_query_and_limit() {
-        let client = GatewayClient::new(
-            "http://127.0.0.1:8899",
-            "/mcp",
-            "dbmcp_svc_x".into(),
-            "target-mongo".into(),
-            "app".into(),
-        )
-        .expect("client constructs");
-
+    fn the_envelope_is_built_by_the_production_builder() {
         let shape = Shape::MongoPointFind;
-        let body = json!({
-            "server": client.server,
-            "database": client.database,
-            "sql": shape.query(3),
-            "limit": shape.limit(),
-        });
-        assert_eq!(body["sql"], json!(shape.command(3)));
-        assert_eq!(body["limit"], json!(shape.limit()));
-        assert_eq!(body["server"], json!("target-mongo"));
+        let body = run_query_envelope("target-mongo", "app", shape, 3);
+        assert_eq!(body["jsonrpc"], json!("2.0"));
+        assert_eq!(body["id"], json!(3));
+        assert_eq!(body["method"], json!("tools/call"));
+        assert_eq!(body["params"]["name"], json!("run_query"));
+        let arguments = &body["params"]["arguments"];
+        assert_eq!(arguments["server"], json!("target-mongo"));
+        assert_eq!(arguments["database"], json!("app"));
+        assert_eq!(
+            arguments["sql"],
+            json!(shape.command(3)),
+            "a mongo shape must carry the command document, not SQL"
+        );
+        assert_eq!(arguments["limit"], json!(shape.limit()));
+
+        // And the postgres dialect stays SQL.
+        let point = Shape::PointLookup;
+        let body = run_query_envelope("target", "app", point, 0);
+        assert_eq!(
+            body["params"]["arguments"]["sql"],
+            json!(point.sql(0)),
+            "a postgres shape must carry SQL"
+        );
     }
 
     /// Several gateway base URLs must produce several distinct clients —

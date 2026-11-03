@@ -368,6 +368,15 @@ async fn main() -> anyhow::Result<()> {
     println!("{}", report.markdown());
     eprintln!("raw results → {}", cli.out.display());
 
+    // The rejection check is an assertion, not a statistic: a FAIL must fail
+    // the run, or an automated caller cannot enforce it. The report is
+    // written FIRST, so the diagnostic survives the non-zero exit.
+    if let Some(verdict) = &report.mysql_rejection
+        && !verdict.passed()
+    {
+        anyhow::bail!(rejection_check_error(verdict, &cli.out));
+    }
+
     Ok(())
 }
 
@@ -561,6 +570,28 @@ fn check_paths_query_the_same_database(cli: &Cli) -> anyhow::Result<()> {
     )
 }
 
+/// The error for a requested rejection check that did not pass.
+///
+/// `verify` deliberately returns a verdict rather than raising — the report
+/// must be written either way — so this is where the failed assertion becomes
+/// the non-zero exit an automated caller enforces on.
+fn rejection_check_error(
+    verdict: &mysql_reject::MySqlRejection,
+    report_path: &std::path::Path,
+) -> String {
+    let detail = verdict
+        .not_run_reason
+        .as_deref()
+        .unwrap_or("the check ran and returned a failing verdict");
+    format!(
+        "mysql rejection check FAILED — boot rejected: {}, runtime backstop: {}, \
+         detail: {detail}; the full report is preserved at {}",
+        verdict.boot_rejected,
+        verdict.runtime_backstop_ok,
+        report_path.display()
+    )
+}
+
 /// Run the gateway phase for one shape, sampling the gateway processes'
 /// resources while it runs.
 async fn run_gateway_phase(
@@ -571,37 +602,24 @@ async fn run_gateway_phase(
     plan: Plan,
 ) -> anyhow::Result<(driver::PhaseResult, stats::ResourceUsage)> {
     let stop = Arc::new(AtomicBool::new(false));
-    // One sampler thread per gateway process. A run with several instances
-    // samples each of them, so the published resource figures cover the
-    // whole gateway fleet rather than one process.
-    let samplers: Vec<_> = gateway_pids
-        .iter()
-        .map(|pid| {
-            driver::ResourceSampler::new(*pid, cli.resource_sample_ms).spawn(Arc::clone(&stop))
-        })
-        .collect();
+    // One sampler over the whole gateway fleet: every observation sums all
+    // processes' RSS before taking the high-water mark, so a multi-instance
+    // run publishes the fleet's peak memory. The largest single process
+    // would under-report exactly the runs that need several gateways.
+    let sampler = driver::ResourceSampler::new(gateway_pids.to_vec(), cli.resource_sample_ms)
+        .spawn(Arc::clone(&stop));
 
     let result = driver::run_phase(Arc::clone(gw) as Arc<dyn Path>, shape, plan)
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
 
     stop.store(true, Ordering::Relaxed);
-    let mut usage = stats::ResourceUsage::unavailable();
-    for handle in samplers {
-        let Ok(sampler) = handle.join() else {
-            // A panicking sampler thread must not fail the run — the latency
-            // numbers are still valid; only the resource observation is lost.
-            continue;
-        };
-        let observed = sampler.usage();
-        usage.peak_rss_bytes = usage.peak_rss_bytes.max(observed.peak_rss_bytes);
-        // Each instance reports the CPU it burned *during this phase* — a
-        // delta from its own first sample, not its lifetime counter. Summing
-        // the deltas gives the fleet's phase cost; summing lifetime CPU would
-        // charge the phase for boot and every earlier phase.
-        usage.cpu_seconds += observed.cpu_seconds;
-        usage.samples += observed.samples;
-    }
+    let usage = match sampler.join() {
+        // A panicking sampler thread must not fail the run — the latency
+        // numbers are still valid; only the resource observation is lost.
+        Ok(sampler) => sampler.usage(),
+        Err(_) => stats::ResourceUsage::unavailable(),
+    };
 
     Ok((result, usage))
 }
@@ -852,5 +870,37 @@ mod tests {
     fn the_effective_config_records_the_direct_baselines_database() {
         let cli = cli_with(&["--database", "app"]);
         assert_eq!(direct_database(&cli), "app");
+    }
+
+    /// A rejection check that did not pass must fail the run: the error has
+    /// to name the failure and where the diagnostic report went, and a check
+    /// that could not run must say so too. (The report is written before the
+    /// bail, in `main` — this pins the message an automated caller greps for.)
+    #[test]
+    fn a_failed_rejection_check_names_its_failure_and_the_report() {
+        let failed = mysql_reject::MySqlRejection {
+            kind: "mysql",
+            boot_rejected: false,
+            runtime_backstop_ok: true,
+            rejection_message: Some("accepted".to_string()),
+            not_run_reason: None,
+        };
+        assert!(!failed.passed(), "a failed verdict must not read as passed");
+        let message = rejection_check_error(&failed, std::path::Path::new("bench/results.json"));
+        assert!(message.contains("FAILED"), "{message}");
+        assert!(message.contains("bench/results.json"), "{message}");
+
+        let not_run = mysql_reject::MySqlRejection {
+            kind: "mysql",
+            boot_rejected: false,
+            runtime_backstop_ok: false,
+            rejection_message: None,
+            not_run_reason: Some(
+                "could not read the supplied config file: no such file".to_string(),
+            ),
+        };
+        assert!(!not_run.passed());
+        let message = rejection_check_error(&not_run, std::path::Path::new("r.json"));
+        assert!(message.contains("could not read"), "{message}");
     }
 }

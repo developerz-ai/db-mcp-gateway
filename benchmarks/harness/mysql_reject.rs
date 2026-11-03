@@ -111,9 +111,11 @@ fn committed_config_path() -> std::path::PathBuf {
 /// [`DEFAULT_MYSQL_CONFIG`] when that file cannot be read (a harness binary
 /// run outside the checkout).
 ///
-/// Never fails the run: a rejection check that reports "the gateway accepted
+/// Never raises: a rejection check that reports "the gateway accepted
 /// a MySQL target" is a *finding*, not a harness error, so it is returned as
-/// a verdict rather than raised.
+/// a verdict rather than raised. The caller writes the verdict into the
+/// report and then fails the run on it (see `main`) — the diagnostic survives
+/// the non-zero exit.
 pub fn verify(config_path: Option<&Path>) -> MySqlRejection {
     let raw = match config_path {
         Some(path) => match std::fs::read_to_string(path) {
@@ -181,8 +183,16 @@ fn check_boot_rejection(raw: &str) -> BootCheck {
 /// string rather than its own variant, so the text check is what actually
 /// distinguishes this rejection from an unrelated validation failure (a
 /// duplicate server name, a blank role, a superuser role).
+///
+/// The text must also name `Mysql` itself. A `kind: mssql` server fails with
+/// the same sentence — `Mssql` has no adapter either — but this check
+/// verifies the *MySQL* rejection; counting an Mssql rejection would let the
+/// config drift to `kind: mssql` while the verdict still read as a verified
+/// mysql rejection.
 fn is_no_adapter_rejection(err: &ConfigFileError, message: &str) -> bool {
-    matches!(err, ConfigFileError::Invalid(_)) && message.contains("no query adapter")
+    matches!(err, ConfigFileError::Invalid(_))
+        && message.contains("no query adapter")
+        && message.contains("kind `Mysql`")
 }
 
 /// The runtime backstop: `ExecError::UnsupportedAdapter` must map to the
@@ -349,8 +359,50 @@ mod tests {
         assert!(check_runtime_backstop());
     }
 
+    /// An Mssql target is refused at boot too — but with a different kind in
+    /// the message, and this check verifies the *MySQL* rejection. Counting
+    /// an Mssql rejection would let the config drift to `kind: mssql` while
+    /// the verdict still read as a verified mysql rejection.
+    #[test]
+    fn an_mssql_rejection_does_not_satisfy_the_mysql_check() {
+        let yaml = r#"
+servers:
+  - name: mssql-target
+    kind: mssql
+    host: localhost
+    port: 1433
+    databases:
+      - name: app
+        role: ro
+        password: x
+"#;
+        let check = check_boot_rejection(yaml);
+        // mssql is genuinely refused for the same missing-adapter reason —
+        // the sentence is there.
+        assert!(
+            check
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("no query adapter")),
+            "mssql should be refused for a missing adapter: {:?}",
+            check.message
+        );
+        // …but it is not the mysql rejection, and must not pass this check.
+        assert!(
+            !check.rejected,
+            "an Mssql rejection must not satisfy the mysql check: {:?}",
+            check.message
+        );
+    }
+
     /// A mongo target must still boot — the check must not be satisfied by
     /// rejecting everything.
+    ///
+    /// The claim is asserted on the loader itself: "the rejection check did
+    /// not fire" is only meaningful if the config actually loads. Checking
+    /// merely `!rejected` would pass even if `from_yaml_str` refused this
+    /// YAML for some unrelated reason — a validator that rejected *every*
+    /// config would keep this test green while mongo was unbootable.
     #[test]
     fn a_mongo_target_still_boots() {
         let yaml = r#"
@@ -363,6 +415,11 @@ servers:
         role: ro
         password: x
 "#;
+        assert!(
+            ConfigFile::from_yaml_str(yaml).is_ok(),
+            "mongo is a wired query target — the loader must accept this config"
+        );
+        // And with the load proven good, the rejection check must not claim it.
         let check = check_boot_rejection(yaml);
         assert!(!check.rejected, "mongo is a wired query target");
     }
