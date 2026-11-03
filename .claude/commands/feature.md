@@ -1,7 +1,7 @@
 ---
 description: End-to-end feature/bug-sweep workflow for db-mcp-gateway — understand, diagnose against a real deployment, explore in parallel, split into layer-disjoint slices, build with a hive of parallel agents in this one checkout (never worktrees), gate with bin/ci against real Postgres, PR (security-review-labelled where required), squash-merge, release on a v* tag. Tracks in GitHub issues. Reads intent from the prompt.
 argument-hint: <what you want built or fixed, plain language> [+ reference URL(s)]
-allowed-tools: Read, Write, Edit, Glob, Grep, Bash, Agent, Task, SendMessage, TaskCreate, TaskUpdate, TaskList, Skill, WebFetch, mcp__codegraph, mcp__glitchtip
+allowed-tools: Read, Write, Edit, Glob, Grep, Bash, Agent, Task, SendMessage, TaskCreate, TaskUpdate, TaskList, Skill, WebFetch, mcp__codegraph, mcp__sentry-mcp
 ---
 
 # /feature
@@ -59,7 +59,7 @@ An agent owns *its own files and its own tests*; whole-crate green is the coordi
 2. **Distrust the paperwork.** Check any spec page or status note against the code and `git log` before planning work off it. Specs and status notes go stale: this repo has drifted before, and a page describing the target is not evidence the target shipped. Merged PR titles are the cheapest ground truth. State plainly which claims you falsified, so nobody re-implements shipped work or "fixes" working code.
 
 3. **Diagnose against a real deployment — early, not at the end.** Evidence beats reasoning and costs one command. All read-only:
-   - `mcp__glitchtip` — the org's error tracker (`glitchtip.infra.developerz.ai`); an existing issue usually names the module and the release.
+   - `mcp__sentry-mcp` — the org's error tracker (host from `$SENTRY_HOST`); an existing issue usually names the module and the release.
    - The **audit log** is the best forensic surface this product has: no matching row, or `outcome: forbidden`/`cancelled`, tells you which layer bailed. `bin/dev psql state` reads it locally; for a deployed instance ask the operator rather than reaching for a credential.
    - `/metrics` and the JSON `tracing` output — every tool dispatch is a span with `request_id`, `user`, `server`, `database`.
    - Reproduce locally: `bin/dev up`, then `cargo run -- --config config/example.yaml`.
