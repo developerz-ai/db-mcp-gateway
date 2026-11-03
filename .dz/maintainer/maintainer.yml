@@ -5,7 +5,10 @@
 # A merge here can reach a running deployment, so see `auto_merge_scope` under `pr:`.
 version: 1
 
-services: [postgres]
+# No `services:`: this repo brings its own. `bin/test` starts `docker-compose.dev.yml` itself (state
+# DB on 127.0.0.1:5433, target DB on :5434), and a box needs only `docker`. Declaring `postgres` held
+# the work for a box with a Postgres already accepting, which no box in the fleet advertises, so a
+# coding task waited forever as `no_service_capacity`.
 
 tone:
   voice: friendly
