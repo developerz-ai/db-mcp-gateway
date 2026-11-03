@@ -65,7 +65,9 @@ esac
 if [[ "$name $*" == "${FAIL_AT:-}" ]]; then exit 42; fi
 STUB
   chmod +x "$work/tools/stub"
-  for tool in cargo cargo-audit docker node npm git; do
+  # bin/check preflights the host toolchain before the gate runs, so rustc, cc
+  # and make have to resolve on PATH exactly like cargo and docker do.
+  for tool in cargo cargo-audit docker node npm git rustc cc make; do
     ln -s stub "$work/tools/$tool"
   done
   : > "$work/calls"
@@ -199,9 +201,9 @@ assert_output 'Jobs not reached'
 assert_output 'pages typecheck/build/artifact guard'
 
 # REQUIRED prerequisites: absent -> 75, the gate cannot grade.
-# Every tool bin/ci requires, except bash: the harness itself resolves the
-# gate's interpreter through this fixture's PATH.
-for missing in cargo docker git grep find \
+# Every tool bin/check's preflight or bin/ci requires, except bash: the
+# harness itself resolves the gate's interpreter through this fixture's PATH.
+for missing in cargo rustc cc make docker git grep find \
   tr mktemp cp chmod rm ln mkdir touch; do
   fixture
   rm "$work/tools/$missing"

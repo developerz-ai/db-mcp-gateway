@@ -14,11 +14,21 @@ This project adheres to a [Code of Conduct](CODE_OF_CONDUCT.md). By participatin
 
 ### Prerequisites
 
-Required for `bin/check` to grade at all — a missing one returns **75**:
+Host prerequisites — `bin/setup` checks these before it installs anything:
+
+- **Debian/Ubuntu host** for `bin/setup`, with Bash, `dpkg` and `apt-get`. Install Git to clone the repo. If packages are missing, setup needs root or non-interactive `sudo`; alternatively, have an administrator install `build-essential`, `openssl` and `curl` first.
+- **Rust**, including Cargo and rustc, with the pinned toolchain and the `rustfmt` and `clippy` components from `rust-toolchain.toml`. Install through your trusted toolchain manager before setup; setup does not bootstrap Rust.
+- **Docker Engine or Docker Desktop** with **Docker Compose v2** (`docker compose`), including support for `up --wait`. Start the daemon and ensure your user can access it without sudo before setup; setup does not install Docker.
+- **Network access** to host package repositories, Rust dependency registries and container image registries; available local ports listed below.
+- **mise** is optional: setup runs `mise install` when available and otherwise uses host tools. A failed mise install stops setup.
+
+`bin/check` grades the same box, and a missing REQUIRED prerequisite returns
+**75** because the gate cannot grade anything at all:
 
 - **Rust** stable (pinned in `rust-toolchain.toml`), with rustfmt and clippy
 - **Docker** and **Docker Compose** (for local dev stack), with a reachable daemon
 - **Git**, Bash and standard shell utilities, including GNU grep with PCRE support
+- **A C compiler** (`cc`), `make` and `grep`
 
 Gate-scoped — each toolchain belongs to exactly one job, so an absent one is
 reported `NOT RUN` and every other job is still graded:
@@ -27,23 +37,33 @@ reported `NOT RUN` and every other job is still graded:
 - **Node.js 20+** and **npm** (Pages job) — `install: Node 20+ and npm`
 - **Website dependencies** (Pages job) — `cd website && npm ci`
 
-**PostgreSQL** client tools (psql) are for `bin/dev psql` against the dev stack.
+**PostgreSQL** client tools (psql) are for `bin/dev psql` against the dev stack;
+the helpers run psql inside the containers, so a host PostgreSQL client is optional.
 
 ### Local Development
 
-Clone the repo and bring up the dev stack:
+From a fresh checkout with the host prerequisites installed:
 
 ```bash
 git clone https://github.com/developerz-ai/db-mcp-gateway.git
 cd db-mcp-gateway
-bin/dev up
+cp .env.example .env
+./bin/setup
+./bin/dev
+./bin/check
 ```
 
-This spins up:
-- A "state DB" (gateway metadata, sessions, audit log) on `localhost:5433`
-- A target PostgreSQL instance on `localhost:5434` (for testing gateway queries)
-- A MySQL permissions store on `localhost:3307`
-- A MongoDB target on `localhost:27018`
+`bin/setup` checks Cargo and Docker before installing missing host packages, fetches Rust dependencies with `cargo fetch --locked`, and starts all four dependency services, waiting for health. Failures stop at the named stage with an actionable diagnostic; subprocess output is suppressed to avoid exposing environment values. Review any detailed diagnostics locally, and never share credentials.
+
+`bin/dev` defaults to `up`. Running it after setup is safe: it ensures the same dependency services are up, not a second stack. This spins up:
+- State PostgreSQL (gateway metadata, sessions, audit log): `localhost:5433`
+- Target PostgreSQL (testing gateway queries): `localhost:5434`
+- Target MongoDB: `localhost:27018`
+- MySQL permissions store: `localhost:3307`
+
+**Neither setup nor bin/dev starts the gateway.** Follow the [deployment quickstart's local walkthrough](website/docs/deployment/quickstart.md#run-it-locally) for separate gateway startup and the unauthenticated MCP smoke request, which should return HTTP `401`.
+
+`bin/check` first checks required tools and Docker daemon access, then runs `bin/ci` unchanged (format checks, Clippy and integration tests, plus cargo-audit when installed). Exit `75` means a required preflight resource is unavailable and the gate did not run; repair the named prerequisite and retry. Once CI starts, its exit status is preserved: lint, compilation and test failures are not reclassified as infrastructure failures. Exit `0` means the gate passed.
 
 **Check logs:** `bin/dev logs`  
 **Tear down:** `bin/dev down`  
@@ -201,10 +221,10 @@ quality jobs in [ci.yml](.github/workflows/ci.yml) and validation in
 
 The gate installs nothing. It separates two kinds of missing prerequisite:
 
-- **Required** — cargo/rustfmt/clippy, Git, GNU grep with PCRE, the Docker CLI,
-  the Docker daemon, Docker Compose, and a dev stack that never became healthy.
-  A missing one returns **75**: the gate cannot grade anything, so it refuses
-  to grade rather than reporting a verdict.
+- **Required** — cargo/rustc/rustfmt/clippy, a C compiler (`cc`), `make`, Git,
+  GNU grep with PCRE, the Docker CLI, the Docker daemon, Docker Compose, and a
+  dev stack that never became healthy. A missing one returns **75**: the gate
+  cannot grade anything, so it refuses to grade rather than reporting a verdict.
 - **Gate-scoped** — a toolchain that belongs to exactly one job: cargo-audit
   (the audit job) and Node 20+/npm plus the installed website dependencies (the
   Pages job). A missing one makes that one job report

@@ -25,9 +25,10 @@ filters; CI stays the authority for the audit and Pages jobs. See
 `CONTRIBUTING.md#local-quality-gate-matrix` for the mapping. Local success does
 not guarantee CI publishing or deployment success.
 
-Prepare Rust (rustfmt and clippy), Git, Bash, GNU grep with PCRE, standard shell
-utilities, Docker Compose and a running Docker daemon. These are REQUIRED: a
-missing one returns 75, because the gate cannot grade anything at all.
+Prepare Rust (rustc, rustfmt and clippy), a C compiler (`cc`), `make`, Git,
+Bash, GNU grep with PCRE, standard shell utilities, Docker Compose and a
+running Docker daemon. These are REQUIRED: a missing one returns 75, because
+the gate cannot grade anything at all.
 
 Two toolchains are GATE-SCOPED — each belongs to exactly one job: cargo-audit
 (the audit job) and Node 20+/npm plus the installed website dependencies (the
@@ -76,7 +77,7 @@ red. Exit 1 cannot carry that difference, so one code is reserved:
 | Exit | Means | What the platform does |
 |------|-------|------------------------|
 | 0 | every job that ran passed; any job that did not run is named in the summary | commit it |
-| 75 | a REQUIRED resource is unreachable (cargo/rustfmt/clippy, git, grep without PCRE, the Docker CLI/daemon/Compose, a dev stack that never became healthy) — it refused to grade | refuse the commit, and blame the environment, never the change |
+| 75 | a REQUIRED resource is unreachable (cargo/rustc/rustfmt/clippy, cc, make, git, grep without PCRE, the Docker CLI/daemon/Compose, a dev stack that never became healthy) — it refused to grade | refuse the commit, and blame the environment, never the change |
 | any other non-zero | the gate ran and the change is red | refuse the commit, and blame the change |
 
 - Guard the REQUIRED preconditions FIRST and `exit 75` when one is unmet. `exit 1`
