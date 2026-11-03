@@ -14,10 +14,14 @@ applies: [rust]
 `.github/workflows/ci.yml` independently configures fmt with SHA-pin validation,
 both clippy configurations, scrub-feature validation, all-target/all-feature
 tests, dependency audit and the tracked-token scan with its regex regression.
-The local gate runs the checks it can run faithfully — lint, the all-feature
-test invocation, CI's exact audit command, Pages parity — plus isolated shell
-orchestration regressions, and deliberately carries no second copy of the
-workflow's SHA-pin or secret-scan logic: one copy per check cannot drift.
+The local gate runs the checks it can run faithfully — lint, the SHA-pin scan
+and the tracked-token scan (ports of the workflow's greps: the token scan's
+exact command line pinned by the orchestration regression, both scans'
+verdicts exercised by it), CI's exact audit command, the token-regex
+regression from the same script CI runs
+(`tests/bin/secret-scan-regex.test.sh`), the all-feature
+test invocation and Pages parity — plus isolated shell orchestration
+regressions.
 
 The gate also runs the Pages-parity job — website typecheck, production build
 and the post-build sensitive-asset denylist from `.github/workflows/pages.yml` —

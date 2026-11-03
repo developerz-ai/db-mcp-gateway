@@ -12,17 +12,30 @@ trap 'rm -rf "$work"' EXIT
 
 fixture() {
   rm -rf "$work/repo" "$work/tools" "$work/calls.ready"
-  mkdir -p "$work/repo"/{bin,tests/bin,website/node_modules/.bin} "$work/tools"
+  mkdir -p "$work/repo"/{bin,tests/bin,website/node_modules/.bin,.github/workflows} "$work/tools"
   cp bin/{ci,check,lint,test,check-scrub-features} "$work/repo/bin/"
   # Replace only the recursive test entry in the fixture, not the gate itself.
   printf 'echo orchestration >> "$CALLS"\n' > "$work/repo/tests/bin/check.test.sh"
+  # The real token-regex regression, verbatim: the gate must run the same
+  # script CI runs, so the fixture copies it instead of stubbing it.
+  cp tests/bin/secret-scan-regex.test.sh "$work/repo/tests/bin/"
+  # One pinned ref and one local action: both halves of the SHA-pin scan's
+  # filtering must accept them, or the clean run below fails.
+  cat > "$work/repo/.github/workflows/ci.yml" <<'WORKFLOW'
+jobs:
+  fmt:
+    steps:
+      - uses: actions/checkout@1234567890abcdef1234567890abcdef12345678 # v5
+      - uses: ./.github/actions/local-step # local action
+WORKFLOW
   touch "$work/repo/website/node_modules/.bin/"{tsc,docusaurus}
   chmod +x "$work/repo/website/node_modules/.bin/"*
   # Only what the gate still resolves on this PATH: the scripts' dirname, the
-  # interpreter, grep (a bin/check REQUIRED probe, and check-scrub-features'
-  # matcher) and find (the Pages guard). mkdir/rm/touch are the external
+  # interpreter, grep (a bin/check REQUIRED probe, the SHA-pin scan's matcher
+  # and check-scrub-features'), find (the Pages guard) and tr (the token-regex
+  # regression's hex helper). mkdir/rm/touch are the external
   # commands the stub itself runs.
-  for tool in bash dirname grep find mkdir rm touch; do
+  for tool in bash dirname grep find mkdir rm touch tr; do
     ln -s "$(command -v "$tool")" "$work/tools/$tool"
   done
   cat > "$work/tools/stub" <<'STUB'
@@ -32,6 +45,15 @@ name=${0##*/}
 printf '%s %s\n' "$name" "$*" >> "$CALLS"
 case "$name $*" in
   'node -e '*) exit "${NODE_RC:-0}" ;;
+  'git grep '*)
+    # rc=0 with a match line fails the gate; any rc other than 1 fails it
+    # closed; only the default rc=1 (no match) reads as clean. The simulated
+    # token deliberately cannot match the real guard regex.
+    if [[ -n ${TOKEN_HIT:-} ]]; then
+      echo 'config/prod.yaml:9: dbmcp_svc_SIMULATED_TOKEN_FIXTURE_ONLY_NOT_HEX'
+      exit 0
+    fi
+    exit "${GIT_GREP_RC:-1}" ;;
   'docker compose '*ps*)
     # Realistic service/state/health fields: 'running' alone is discarded by
     # the health check, so the fixture would prove nothing about it.
@@ -62,7 +84,7 @@ STUB
   chmod +x "$work/tools/stub"
   # bin/check preflights the host toolchain before the gate runs, so rustc, cc
   # and make have to resolve on PATH exactly like cargo and docker do.
-  for tool in cargo cargo-audit docker node npm rustc cc make; do
+  for tool in cargo cargo-audit docker node npm rustc cc make git; do
     ln -s stub "$work/tools/$tool"
   done
   : > "$work/calls"
@@ -127,9 +149,18 @@ for call in \
   'docker compose -f docker-compose.dev.yml up -d --wait' \
   'cargo test --all-targets --all-features' \
   'cargo audit --ignore RUSTSEC-2023-0071' \
+  'git grep -nE dbmcp_svc_[0-9a-f]{64} -- :!tests/** :!website/** :!config/example.yaml :!.github/** :!src/config/yaml.rs' \
   'npm run typecheck' 'npm run build' 'orchestration'; do
   called "$call"
 done
+# The tracked-token scan's exact command line is pinned in the loop above
+# (git is stubbed, so the call is recorded). The SHA-pin scan's greps are the
+# REAL grep and leave no call trace, so their verdicts are the pin: the happy
+# path passes with a pinned ref and a local action in the fixture workflow,
+# and the unpinned case below fails on a mutable tag.
+assert_output 'no literal service tokens in committed config (git grep rc=1)'
+# The token-regex regression ran the real script copied into the fixture.
+assert_output 'passed, 0 failed'
 # Every job ran: the summary must claim no skip.
 assert_output '✓ Local quality checks passed (no publishing or deployment)'
 not_called 'ps --status running'
@@ -138,6 +169,24 @@ rm "$work/calls.ready"
 (cd "$work/repo" && PATH="$work/tools" CALLS="$work/calls" EXPECT_FILTER='filter with spaces' \
   bash bin/test --test smoke -- --nocapture 'filter with spaces')
 called 'cargo test --all-targets --all-features --test smoke -- --nocapture filter with spaces'
+# The restored ci.yml parity stages, exercised against the real scan code: a
+# mutable action ref fails the SHA-pin scan, a committed token fails the
+# tracked-token scan, and a git grep that cannot run fails closed (#190).
+fixture
+printf 'jobs:\n  fmt:\n    steps:\n      - uses: actions/checkout@v5\n' \
+  > "$work/repo/.github/workflows/ci.yml"
+run_gate 1
+assert_output 'unpinned action ref(s)'
+assert_not_run "NOT RUN: secret-scan - the gate stopped before this job"
+
+fixture
+run_gate 1 TOKEN_HIT=1
+assert_output 'literal dbmcp_svc_ service token(s) in committed config'
+assert_not_run "NOT RUN: pages typecheck/build/artifact guard - the gate stopped before this job"
+
+fixture
+run_gate 1 GIT_GREP_RC=128
+assert_output 'git grep tooling failure (rc=128) — secret-scan cannot read as clean (fail-closed, #190)'
 fixture
 run_gate 75 FAIL_AT='docker compose -f docker-compose.dev.yml up -d --wait'
 not_called 'cargo test --all-targets --all-features'
@@ -193,7 +242,7 @@ done
 fixture
 run_gate 42 FAIL_AT='cargo fmt --all -- --check'
 assert_output 'Jobs not reached'
-for job in 'test' 'cargo audit' 'pages typecheck/build/artifact guard'; do
+for job in 'test' 'cargo audit' 'secret-scan' 'pages typecheck/build/artifact guard'; do
   assert_not_run "NOT RUN: $job - the gate stopped before this job"
 done
 
@@ -225,6 +274,9 @@ assert_output '✓ Local quality checks passed for the gates that ran (no publis
 # The rest of the gate still ran.
 called 'cargo test --all-targets --all-features'
 called 'npm run typecheck'
+# The token-regex regression ran too; bash itself is not stubbed, so its
+# output is the proof it executed.
+assert_output 'passed, 0 failed'
 
 fixture
 rm "$work/tools/node"
@@ -279,7 +331,7 @@ fixture
 printf 'exit 44\n' > "$work/repo/tests/bin/check.test.sh"
 run_gate 44
 # Stopping at the FIRST job names every job the gate never reached.
-for job in 'fmt + clippy' 'test' 'cargo audit' 'pages typecheck/build/artifact guard'; do
+for job in 'fmt + clippy' 'test' 'cargo audit' 'secret-scan' 'pages typecheck/build/artifact guard'; do
   assert_not_run "NOT RUN: $job - the gate stopped before this job"
 done
 printf 'check orchestration regressions passed\n'

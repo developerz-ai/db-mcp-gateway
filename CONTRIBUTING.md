@@ -62,7 +62,7 @@ cp .env.example .env
 
 **Neither setup nor bin/dev starts the gateway.** Follow the [deployment quickstart's local walkthrough](website/docs/deployment/quickstart.md#run-it-locally) for separate gateway startup and the unauthenticated MCP smoke request, which should return HTTP `401`.
 
-`bin/check` first checks required tools and Docker daemon access, then runs `bin/ci` unchanged (format checks, Clippy and integration tests, plus cargo-audit when installed). Exit `75` means a required preflight resource is unavailable and the gate did not run; repair the named prerequisite and retry. Once CI starts, its exit status is preserved: lint, compilation and test failures are not reclassified as infrastructure failures. Exit `0` means the gate passed.
+`bin/check` first checks required tools and Docker daemon access, then runs `bin/ci` unchanged (format checks, Clippy, integration tests, the SHA-pin and secret-scan parity stages, plus cargo-audit when installed). Exit `75` means a required preflight resource is unavailable and the gate did not run; repair the named prerequisite and retry. Once CI starts, its exit status is preserved: lint, compilation and test failures are not reclassified as infrastructure failures. Exit `0` means the gate passed.
 
 **Check logs:** `bin/dev logs`  
 **Tear down:** `bin/dev down`  
@@ -209,11 +209,11 @@ quality jobs in [ci.yml](.github/workflows/ci.yml) and validation in
 
 | Workflow job / validation | Local gate |
 |---|---|
-| `ci.yml` / `fmt` | `bin/lint`: `cargo fmt --all -- --check`. The job's SHA-pin validation is CI-only — the workflow is the single copy |
+| `ci.yml` / `fmt` | `bin/lint`: `cargo fmt --all -- --check`, then the job's SHA-pin scan — same anchoring, 40-hex allow regex and local-action exemption as the workflow's step, failing closed on a broken grep |
 | `ci.yml` / `clippy` | `bin/lint`: debug all-target/all-feature clippy and release all-feature clippy, both `-D warnings`; `bin/check-scrub-features` checks the non-dev regex feature graph |
 | `ci.yml` / `test` | `bin/test`: `cargo test --all-targets --all-features`, including bench-harness tests, real-DB setup and argument forwarding |
 | `ci.yml` / `audit` | `cargo audit --ignore RUSTSEC-2023-0071` — CI's exact command; the ignore set is unchanged (only `RUSTSEC-2023-0071`, justified in `.cargo/audit.toml` and `audit.toml`) |
-| `ci.yml` / `secret-scan` | Not reproduced locally: the tracked-token scan and its regex regression run in CI only, so the regex and path exclusions have a single copy that cannot drift |
+| `ci.yml` / `secret-scan` | The tracked-token scan — same `git grep` regex and pathspec exclusions as the workflow, fail-closed on any non-1 grep status — plus the regex regression run from the same script CI runs (`bash tests/bin/secret-scan-regex.test.sh`) |
 | `pages.yml` / `build` | In `website/`: `npm run typecheck` and `npm run build` |
 | `pages.yml` / pre-upload artifact guard | Post-build sensitive/config-asset denylist over `website/build/` |
 | Local orchestration regression | `bash tests/bin/check.test.sh`: temporary fixture checkouts and command stubs, no real DB mocks or recursive full-gate execution |
@@ -245,9 +245,15 @@ not run.
 services; it does **not** install cargo-audit or website dependencies. Prepare
 those separately to have every job run.
 
-The gate deliberately keeps no second copy of ci.yml's SHA-pin validation or
-secret-scan: those checks live in the workflow alone, and a local
-re-implementation would drift from the regexes and path exclusions it mirrors.
+The gate mirrors ci.yml's SHA-pin validation and secret-scan: a local gate
+that skipped them would let unpinned actions and committed service tokens pass
+before the push. The regex regression is a single copy shared with the
+workflow (both run `tests/bin/secret-scan-regex.test.sh`); the two greps are
+ports of the workflow's steps, and `tests/bin/check.test.sh` pins the
+tracked-token scan's exact command line (git is stubbed in its fixture) and
+exercises both scans' verdicts (a pinned ref passes, a mutable tag fails; a
+token match and a grep failure both fail closed), so drift between the
+workflow and the gate turns red instead of passing silently.
 What the local gate adds beyond `bin/lint` (fmt, both clippy configurations and
 the scrub-feature guard) is the all-target/all-feature test invocation through
 `bin/test`, CI's exact audit command `cargo audit --ignore RUSTSEC-2023-0071`

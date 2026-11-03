@@ -9,9 +9,13 @@
 # bin/check, the documented entry point, owns the REQUIRED-tool refusal: it
 # preflights the toolchain and Docker (exit 75) before exec-ing this script,
 # so no job here re-implements that check. ci.yml's SHA-pin validation and
-# secret-scan are deliberately not mirrored here: the workflow holds the only
-# copy, and a local re-implementation would drift from the regexes and path
-# exclusions it mirrors. A missing GATE-SCOPED toolchain — cargo-audit (the
+# secret-scan are mirrored here: a gate that skipped them would let unpinned
+# actions and committed service tokens pass locally. The token-regex
+# regression runs the same script CI runs — one copy, shared outright — and
+# the two greps are ports of the workflow's steps: the orchestration
+# regression pins the token scan's exact command line and exercises both
+# scans' verdicts, so the copies cannot drift apart silently.
+# A missing GATE-SCOPED toolchain — cargo-audit (the
 # audit job) or Node 20+/npm plus the installed website dependencies (the
 # Pages job) — makes that one job report 'NOT RUN' while every other job is
 # still graded. A skip is never silent: it is printed and repeated in the
@@ -29,6 +33,7 @@ pending_jobs=(
   'fmt + clippy'
   'test'
   'cargo audit'
+  'secret-scan'
   'pages typecheck/build/artifact guard'
 )
 
@@ -86,6 +91,29 @@ job_reached 'orchestration regression'
 bash tests/bin/check.test.sh
 job_reached 'fmt + clippy'
 bin/lint
+echo '→ actions are SHA-pinned'
+# Port of the `actions are SHA-pinned` step in ci.yml's fmt job: same
+# anchoring, same 40-hex allow regex, same local-action exemption. Pinning is
+# only worth anything if it stays that way, so a bare `@v3` merged later must
+# fail here too, not only in CI. Unlike the workflow's `|| true`, a grep that
+# cannot run fails closed — the gate never reads a broken scan as clean.
+# tests/bin/check.test.sh feeds this scan a pinned ref (must pass) and a
+# mutable tag (must fail); the greps here are the real grep, so no stub call
+# is recorded and the verdicts are the pin.
+rc=0
+unpinned=$(grep -rhP --include='*.yml' --include='*.yaml' \
+  '^\s*-?\s*uses:\s*' .github/workflows \
+  | grep -vP '^\s*-?\s*uses:\s*\./' \
+  | grep -vP '^\s*-?\s*uses:\s*[^[:space:]#]+@[0-9a-f]{40}\s+#\s+\S+\s*$') || rc=$?
+if (( rc > 1 )); then
+  echo "grep tooling failure (rc=$rc) — SHA-pin scan cannot read as clean (fail-closed)" >&2
+  exit 1
+fi
+if [[ -n $unpinned ]]; then
+  echo 'unpinned action ref(s) — pin to a 40-char commit SHA with the version in a trailing comment:' >&2
+  printf '  %s\n' "$unpinned" >&2
+  exit 1
+fi
 job_reached 'test'
 bin/test
 
@@ -101,6 +129,36 @@ else
   not_run 'cargo audit' 'cargo-audit is not on PATH' \
     'install: cargo install cargo-audit'
 fi
+
+echo '→ secret-scan'
+job_reached 'secret-scan'
+# Port of ci.yml's secret-scan job (spec 14: no literal dbmcp_svc_ service
+# tokens in committed files; the loader accepts Password::Literal for dev/test
+# parity, so the gates enforce credential-free committed config — #190).
+# Fail-closed exactly as CI: rc=0 with matches fails, any rc other than 1
+# fails, and only rc=1 (no match) reads as clean. Regex and pathspec
+# exclusions are stated exactly as CI states them;
+# tests/bin/check.test.sh pins this command line against drift.
+(
+  set +e
+  matches="$(git grep -nE "dbmcp_svc_[0-9a-f]{64}" \
+      -- ":!tests/**" ":!website/**" ":!config/example.yaml" \
+      ":!.github/**" ":!src/config/yaml.rs")"
+  rc=$?
+  set -e
+  if [[ $rc -eq 0 && -n $matches ]]; then
+    echo 'literal dbmcp_svc_ service token(s) in committed config — reference the secret via ENV: or FILE: (spec 14)' >&2
+    printf '%s\n' "$matches" >&2
+    exit 1
+  fi
+  if [[ $rc -ne 1 ]]; then
+    echo "git grep tooling failure (rc=$rc) — secret-scan cannot read as clean (fail-closed, #190)" >&2
+    exit 1
+  fi
+  echo 'no literal service tokens in committed config (git grep rc=1)'
+)
+# The same regex regression CI runs: one script, one copy, both gates.
+bash tests/bin/secret-scan-regex.test.sh
 
 echo '→ website typecheck, build and Pages artifact guard'
 job_reached 'pages typecheck/build/artifact guard'
