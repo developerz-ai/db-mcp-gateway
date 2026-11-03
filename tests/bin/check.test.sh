@@ -12,15 +12,17 @@ trap 'rm -rf "$work"' EXIT
 
 fixture() {
   rm -rf "$work/repo" "$work/tools" "$work/calls.ready"
-  mkdir -p "$work/repo"/{bin,tests/bin,.github/workflows,website/node_modules/.bin} "$work/tools"
+  mkdir -p "$work/repo"/{bin,tests/bin,website/node_modules/.bin} "$work/tools"
   cp bin/{ci,check,lint,test,check-scrub-features} "$work/repo/bin/"
-  cp tests/bin/secret-scan-regex.test.sh "$work/repo/tests/bin/"
   # Replace only the recursive test entry in the fixture, not the gate itself.
   printf 'echo orchestration >> "$CALLS"\n' > "$work/repo/tests/bin/check.test.sh"
-  printf '%s\n' '- uses: owner/action@0123456789abcdef0123456789abcdef01234567 # v1' > "$work/repo/.github/workflows/ci.yml"
   touch "$work/repo/website/node_modules/.bin/"{tsc,docusaurus}
   chmod +x "$work/repo/website/node_modules/.bin/"*
-  for tool in bash dirname grep find tr mkdir touch mktemp cp chmod rm ln; do
+  # Only what the gate still resolves on this PATH: the scripts' dirname, the
+  # interpreter, grep (a bin/check REQUIRED probe, and check-scrub-features'
+  # matcher) and find (the Pages guard). mkdir/rm/touch are the external
+  # commands the stub itself runs.
+  for tool in bash dirname grep find mkdir rm touch; do
     ln -s "$(command -v "$tool")" "$work/tools/$tool"
   done
   cat > "$work/tools/stub" <<'STUB'
@@ -30,13 +32,6 @@ name=${0##*/}
 printf '%s %s\n' "$name" "$*" >> "$CALLS"
 case "$name $*" in
   'node -e '*) exit "${NODE_RC:-0}" ;;
-  'git rev-parse '*) exit 0 ;;
-  'git grep '*)
-    # Even tooling errors may contain secrets; none may escape the gate.
-    if [[ ${SCAN_RC:-1} != 1 ]]; then
-      printf '%s\n' 'PRIVATE_TOKEN_DIAGNOSTIC' >&2
-    fi
-    exit "${SCAN_RC:-1}" ;;
   'docker compose '*ps*)
     # Realistic service/state/health fields: 'running' alone is discarded by
     # the health check, so the fixture would prove nothing about it.
@@ -67,7 +62,7 @@ STUB
   chmod +x "$work/tools/stub"
   # bin/check preflights the host toolchain before the gate runs, so rustc, cc
   # and make have to resolve on PATH exactly like cargo and docker do.
-  for tool in cargo cargo-audit docker node npm git rustc cc make; do
+  for tool in cargo cargo-audit docker node npm rustc cc make; do
     ln -s stub "$work/tools/$tool"
   done
   : > "$work/calls"
@@ -132,8 +127,7 @@ for call in \
   'docker compose -f docker-compose.dev.yml up -d --wait' \
   'cargo test --all-targets --all-features' \
   'cargo audit --ignore RUSTSEC-2023-0071' \
-  'npm run typecheck' 'npm run build' 'orchestration' \
-  'git grep -qE dbmcp_svc_[0-9a-f]{64} -- :!tests/** :!website/** :!config/example.yaml :!.github/** :!src/config/yaml.rs'; do
+  'npm run typecheck' 'npm run build' 'orchestration'; do
   called "$call"
 done
 # Every job ran: the summary must claim no skip.
@@ -194,17 +188,20 @@ for stage in 'cargo fmt --all -- --check' \
   run_gate 42 FAIL_AT="$stage"
   if [[ $stage != 'npm run build' ]]; then not_called 'npm run build'; fi
 done
-# A job the gate never reached is named, never silently dropped.
+# A job the gate never reached is named, never silently dropped: each pending
+# job's notice appears where the gate stopped AND in the final list.
 fixture
 run_gate 42 FAIL_AT='cargo fmt --all -- --check'
 assert_output 'Jobs not reached'
-assert_output 'pages typecheck/build/artifact guard'
+for job in 'test' 'cargo audit' 'pages typecheck/build/artifact guard'; do
+  assert_not_run "NOT RUN: $job - the gate stopped before this job"
+done
 
-# REQUIRED prerequisites: absent -> 75, the gate cannot grade.
-# Every tool bin/check's preflight or bin/ci requires, except bash: the
-# harness itself resolves the gate's interpreter through this fixture's PATH.
-for missing in cargo rustc cc make docker git grep find \
-  tr mktemp cp chmod rm ln mkdir touch; do
+# REQUIRED prerequisites: absent -> 75, the gate cannot grade. The refusal
+# lives in exactly one place — bin/check's preflight — so the loop covers
+# exactly the tools it probes, except bash: the harness itself resolves the
+# gate's interpreter through this fixture's PATH.
+for missing in cargo rustc cc make docker grep; do
   fixture
   rm "$work/tools/$missing"
   run_gate 75
@@ -264,61 +261,6 @@ not_called 'npm run build'
 assert_output 'NOT RUN: pages typecheck/build/artifact guard - an older Node than 20 is on PATH'
 assert_summary 'NOT RUN: pages typecheck/build/artifact guard - an older Node than 20 is on PATH'
 
-for rc in 0 2 128; do
-  fixture
-  run_gate 1 SCAN_RC="$rc"
-  not_called 'cargo fmt --all -- --check'
-  if grep -qF PRIVATE_TOKEN_DIAGNOSTIC "$work/output"; then
-    echo 'FAIL: token diagnostics leaked'; exit 1
-  fi
-done
-# No uses, local-only uses, and mixed local/remote workflows all remain valid.
-for actions in none local mixed; do
-  fixture
-  case "$actions" in
-    none) printf 'name: no actions\n' > "$work/repo/.github/workflows/ci.yml" ;;
-    local) printf '%s\n' '- uses: ./local-action' > "$work/repo/.github/workflows/ci.yml" ;;
-    mixed) printf '%s\n' '- uses: ./local-action' >> "$work/repo/.github/workflows/ci.yml" ;;
-  esac
-  run_gate 0
-done
-fixture
-printf '%s\n' '- uses: ./local-action' '- uses: owner/action@v1' > "$work/repo/.github/workflows/new.yaml"
-run_gate 1
-not_called 'cargo fmt --all -- --check'
-# The gate stopped at the SHA-pin scan: every job it never reached is named
-# with the required notice and repeated in the final list.
-assert_output 'Jobs not reached'
-for job in 'secret-scan (tracked service-token scan)' 'secret-scan regex regression' \
-  'orchestration regression' 'fmt + clippy' 'test' 'cargo audit' \
-  'pages typecheck/build/artifact guard'; do
-  assert_not_run "NOT RUN: $job - the gate stopped before this job"
-done
-fixture
-# A grep failure must not be converted to an empty/clean pin scan.
-printf '#!/usr/bin/env bash\nexit 2\n' > "$work/tools/broken-grep"
-chmod +x "$work/tools/broken-grep"
-rm "$work/tools/grep"
-ln -s broken-grep "$work/tools/grep"
-run_gate 75
-# Fail each pin-scan stage after the PCRE capability probe succeeds.
-for pattern in '^\s*-?\s*uses:\s*' '^\s*-?\s*uses:\s*\./' \
-  '^\s*-?\s*uses:\s*[^[:space:]#]+@[0-9a-f]{40}\s+#\s+\S+\s*$'; do
-  fixture
-  printf '#!/usr/bin/env bash\nfor arg in "$@"; do\n  [[ $arg != %q ]] || exit 2\ndone\nexec %q "$@"\n' \
-    "$pattern" "$(command -v grep)" > "$work/tools/scanner-grep"
-  chmod +x "$work/tools/scanner-grep"
-  rm "$work/tools/grep"
-  ln -s scanner-grep "$work/tools/grep"
-  run_gate 1
-  not_called 'cargo fmt --all -- --check'
-done
-fixture
-printf '#!/usr/bin/env bash\nexit 45\n' > "$work/tools/broken-find"
-chmod +x "$work/tools/broken-find"
-rm "$work/tools/find"
-ln -s broken-find "$work/tools/find"
-run_gate 45
 # A Pages build that leaves no build directory is refused, not passed.
 fixture
 run_gate 1 NO_BUILD_DIR=1
@@ -328,9 +270,16 @@ for asset in config.yaml config.YML secret.env .env.local cert.pem cert.key conf
   run_gate 1 ASSET="$asset"
 done
 fixture
-printf 'exit 43\n' > "$work/repo/tests/bin/secret-scan-regex.test.sh"
-run_gate 43
+printf '#!/usr/bin/env bash\nexit 45\n' > "$work/tools/broken-find"
+chmod +x "$work/tools/broken-find"
+rm "$work/tools/find"
+ln -s broken-find "$work/tools/find"
+run_gate 45
 fixture
 printf 'exit 44\n' > "$work/repo/tests/bin/check.test.sh"
 run_gate 44
+# Stopping at the FIRST job names every job the gate never reached.
+for job in 'fmt + clippy' 'test' 'cargo audit' 'pages typecheck/build/artifact guard'; do
+  assert_not_run "NOT RUN: $job - the gate stopped before this job"
+done
 printf 'check orchestration regressions passed\n'

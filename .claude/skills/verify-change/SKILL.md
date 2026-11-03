@@ -11,10 +11,13 @@ applies: [rust]
 ## The one gate
 
 `bin/check` is the local gate and delegates to `bin/ci`. CI does not invoke it:
-`.github/workflows/ci.yml` independently configures fmt, SHA-pin validation, both
-clippy configurations, scrub-feature validation, all-target/all-feature tests,
-dependency audit and tracked-token scan with its regex regression. The local gate
-runs equivalent quality checks plus isolated shell orchestration regressions.
+`.github/workflows/ci.yml` independently configures fmt with SHA-pin validation,
+both clippy configurations, scrub-feature validation, all-target/all-feature
+tests, dependency audit and the tracked-token scan with its regex regression.
+The local gate runs the checks it can run faithfully — lint, the all-feature
+test invocation, CI's exact audit command, Pages parity — plus isolated shell
+orchestration regressions, and deliberately carries no second copy of the
+workflow's SHA-pin or secret-scan logic: one copy per check cannot drift.
 
 The gate also runs the Pages-parity job — website typecheck, production build
 and the post-build sensitive-asset denylist from `.github/workflows/pages.yml` —
@@ -25,10 +28,11 @@ filters; CI stays the authority for the audit and Pages jobs. See
 `CONTRIBUTING.md#local-quality-gate-matrix` for the mapping. Local success does
 not guarantee CI publishing or deployment success.
 
-Prepare Rust (rustc, rustfmt and clippy), a C compiler (`cc`), `make`, Git,
-Bash, GNU grep with PCRE, standard shell utilities, Docker Compose and a
-running Docker daemon. These are REQUIRED: a missing one returns 75, because
-the gate cannot grade anything at all.
+Prepare Rust (rustc, rustfmt and clippy), a C compiler (`cc`), `make`, Bash,
+GNU grep, Docker Compose and a running Docker daemon. These are REQUIRED: a
+missing one returns 75, because the gate cannot grade anything at all. The
+refusal lives in `bin/check`'s preflight — the gate's single entry point — so
+missing-tool handling has one owner.
 
 Two toolchains are GATE-SCOPED — each belongs to exactly one job: cargo-audit
 (the audit job) and Node 20+/npm plus the installed website dependencies (the
@@ -77,7 +81,7 @@ red. Exit 1 cannot carry that difference, so one code is reserved:
 | Exit | Means | What the platform does |
 |------|-------|------------------------|
 | 0 | every job that ran passed; any job that did not run is named in the summary | commit it |
-| 75 | a REQUIRED resource is unreachable (cargo/rustc/rustfmt/clippy, cc, make, git, grep without PCRE, the Docker CLI/daemon/Compose, a dev stack that never became healthy) — it refused to grade | refuse the commit, and blame the environment, never the change |
+| 75 | a REQUIRED resource is unreachable (cargo/rustc/rustfmt/clippy, cc, make, grep, the Docker CLI/daemon/Compose, a dev stack that never became healthy) — it refused to grade | refuse the commit, and blame the environment, never the change |
 | any other non-zero | the gate ran and the change is red | refuse the commit, and blame the change |
 
 - Guard the REQUIRED preconditions FIRST and `exit 75` when one is unmet. `exit 1`

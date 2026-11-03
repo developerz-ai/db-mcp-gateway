@@ -27,8 +27,7 @@ Host prerequisites — `bin/setup` checks these before it installs anything:
 
 - **Rust** stable (pinned in `rust-toolchain.toml`), with rustfmt and clippy
 - **Docker** and **Docker Compose** (for local dev stack), with a reachable daemon
-- **Git**, Bash and standard shell utilities, including GNU grep with PCRE support
-- **A C compiler** (`cc`), `make` and `grep`
+- **Bash** and **GNU grep**, a C compiler (`cc`), and `make`
 
 Gate-scoped — each toolchain belongs to exactly one job, so an absent one is
 reported `NOT RUN` and every other job is still graded:
@@ -210,21 +209,23 @@ quality jobs in [ci.yml](.github/workflows/ci.yml) and validation in
 
 | Workflow job / validation | Local gate |
 |---|---|
-| `ci.yml` / `fmt` | `bin/lint`: `cargo fmt --all -- --check`; `bin/ci`: SHA-pin scan of `.yml` and `.yaml` workflows (local actions exempt) |
+| `ci.yml` / `fmt` | `bin/lint`: `cargo fmt --all -- --check`. The job's SHA-pin validation is CI-only — the workflow is the single copy |
 | `ci.yml` / `clippy` | `bin/lint`: debug all-target/all-feature clippy and release all-feature clippy, both `-D warnings`; `bin/check-scrub-features` checks the non-dev regex feature graph |
 | `ci.yml` / `test` | `bin/test`: `cargo test --all-targets --all-features`, including bench-harness tests, real-DB setup and argument forwarding |
 | `ci.yml` / `audit` | `cargo audit --ignore RUSTSEC-2023-0071` — CI's exact command; the ignore set is unchanged (only `RUSTSEC-2023-0071`, justified in `.cargo/audit.toml` and `audit.toml`) |
-| `ci.yml` / `secret-scan` | Tracked-token scan, identical path exclusions, redacted diagnostics, fail-closed scanner errors; `bash tests/bin/secret-scan-regex.test.sh` |
+| `ci.yml` / `secret-scan` | Not reproduced locally: the tracked-token scan and its regex regression run in CI only, so the regex and path exclusions have a single copy that cannot drift |
 | `pages.yml` / `build` | In `website/`: `npm run typecheck` and `npm run build` |
 | `pages.yml` / pre-upload artifact guard | Post-build sensitive/config-asset denylist over `website/build/` |
 | Local orchestration regression | `bash tests/bin/check.test.sh`: temporary fixture checkouts and command stubs, no real DB mocks or recursive full-gate execution |
 
 The gate installs nothing. It separates two kinds of missing prerequisite:
 
-- **Required** — cargo/rustc/rustfmt/clippy, a C compiler (`cc`), `make`, Git,
-  GNU grep with PCRE, the Docker CLI, the Docker daemon, Docker Compose, and a
-  dev stack that never became healthy. A missing one returns **75**: the gate
+- **Required** — cargo/rustc/rustfmt/clippy, a C compiler (`cc`), `make`, GNU
+  grep, the Docker CLI, the Docker daemon, Docker Compose, and a dev stack that
+  never became healthy. A missing one returns **75**: the gate
   cannot grade anything, so it refuses to grade rather than reporting a verdict.
+  The refusal lives in exactly one place — `bin/check`'s preflight; no gate job
+  repeats it.
 - **Gate-scoped** — a toolchain that belongs to exactly one job: cargo-audit
   (the audit job) and Node 20+/npm plus the installed website dependencies (the
   Pages job). A missing one makes that one job report
@@ -244,13 +245,16 @@ not run.
 services; it does **not** install cargo-audit or website dependencies. Prepare
 those separately to have every job run.
 
-This closes previously omitted SHA-pin, all-feature test, secret-scan and
-website validation gates; fmt, both clippy configurations and the scrub-feature
-guard already existed in `bin/lint`. The audit job already existed too — what
-changed is that it now runs CI's exact command, `cargo audit --ignore
-RUSTSEC-2023-0071`, instead of a bare `cargo audit` that relied on cargo-audit's
-config discovery. There is no separate Rust typecheck job: clippy supplies that
-check; the separate typecheck is the website's.
+The gate deliberately keeps no second copy of ci.yml's SHA-pin validation or
+secret-scan: those checks live in the workflow alone, and a local
+re-implementation would drift from the regexes and path exclusions it mirrors.
+What the local gate adds beyond `bin/lint` (fmt, both clippy configurations and
+the scrub-feature guard) is the all-target/all-feature test invocation through
+`bin/test`, CI's exact audit command `cargo audit --ignore RUSTSEC-2023-0071`
+instead of a bare `cargo audit` that leaned on cargo-audit's config discovery,
+the Pages-parity job and the orchestration regression. There is no separate
+Rust typecheck job: clippy supplies that check; the separate typecheck is the
+website's.
 
 Local website validation runs whenever the site toolchain is present, and the
 Pages job is reported `NOT RUN` when it is absent; Pages keeps its existing path
