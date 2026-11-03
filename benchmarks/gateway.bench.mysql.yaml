@@ -1,0 +1,42 @@
+# Gateway config declaring a `kind: mysql` query target.
+#
+# This file exists to be REJECTED. The gateway has no mysql query adapter
+# (`ServerKind::has_adapter` is false for mysql and mssql), so config
+# validation refuses the server at boot:
+#
+#   server `mysql-target` has kind `Mysql`, which has no query adapter yet
+#   (supported kinds: postgres, mongo)
+#
+# The harness loads this file through the gateway's own `ConfigFile::from_yaml_str`
+# and asserts that rejection. It is never booted as a working target and it
+# never points at a real database.
+#
+# No credential belongs here: the password is an env reference, so the file
+# carries nothing secret even though the rejection happens before any secret
+# would be resolved.
+
+servers:
+  - name: mysql-target
+    kind: mysql
+    description: Deliberately undispatchable — proves the boot-time rejection
+    host: localhost
+    port: 3307
+    tls: insecure
+    databases:
+      - name: app
+        # Not `root` — the mysql superuser role is rejected separately, and
+        # this file must fail for exactly one reason.
+        role: bench
+        password: ${ENV:BENCH_MYSQL_TARGET_PASSWORD}
+        description: Never connected to
+
+permissions:
+  - group: svc-bench
+    grants:
+      - server: mysql-target
+        database: app
+        action: query_read
+        constraints:
+          row_limit: 5000
+          statement_timeout_ms: 30000
+          require_reason: false

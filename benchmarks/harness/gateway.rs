@@ -4,6 +4,12 @@
 //! service-token auth, real synchronous audit write. Nothing here reaches into
 //! the library to shortcut a layer, because a benchmark of a build we do not
 //! ship is worth less than no benchmark.
+//!
+//! The path is **backend-aware**: the same `tools/call` envelope carries a
+//! SQL string for a postgres target and a mongo command document for a mongo
+//! target. The gateway dispatches on the *configured server's* kind, so the
+//! harness only has to name the right `server`/`database` pair — the shape
+//! carries the query text for whichever backend it belongs to.
 
 use std::time::Instant;
 
@@ -72,6 +78,12 @@ impl GatewayClient {
         })
     }
 
+    /// The MCP endpoint this client posts to. Used by the scaling phase's
+    /// console output so a reader can tell which instance answered.
+    pub fn mcp_url(&self) -> &str {
+        &self.mcp_url
+    }
+
     /// Issue one query and return its wall-clock latency in milliseconds.
     ///
     /// The clock covers request-send through response-parsed, which is what an
@@ -89,7 +101,10 @@ impl GatewayClient {
                 "arguments": {
                     "server": self.server,
                     "database": self.database,
-                    "sql": shape.sql(iteration),
+                    // One field carries both dialects: SQL for a postgres
+                    // target, a mongo command document for a mongo target.
+                    // The gateway's server kind decides which it parses.
+                    "sql": shape.query(iteration),
                     "limit": shape.limit(),
                 }
             }
@@ -261,5 +276,56 @@ mod tests {
             "Debug leaked the service token: {dumped}"
         );
         assert!(dumped.contains("<redacted>"));
+    }
+
+    /// The measured envelope must carry the shape's own query text — SQL for
+    /// a postgres shape, the command document for a mongo shape — and the
+    /// shape's row cap.
+    #[test]
+    fn the_envelope_carries_the_shapes_query_and_limit() {
+        let client = GatewayClient::new(
+            "http://127.0.0.1:8899",
+            "/mcp",
+            "dbmcp_svc_x".into(),
+            "target-mongo".into(),
+            "app".into(),
+        )
+        .expect("client constructs");
+
+        let shape = Shape::MongoPointFind;
+        let body = json!({
+            "server": client.server,
+            "database": client.database,
+            "sql": shape.query(3),
+            "limit": shape.limit(),
+        });
+        assert_eq!(body["sql"], json!(shape.command(3)));
+        assert_eq!(body["limit"], json!(shape.limit()));
+        assert_eq!(body["server"], json!("target-mongo"));
+    }
+
+    /// Several gateway base URLs must produce several distinct clients —
+    /// the scaling phase needs one client per instance.
+    #[test]
+    fn each_base_url_yields_its_own_endpoint() {
+        let a = GatewayClient::new(
+            "http://127.0.0.1:9001/",
+            "/mcp",
+            "t".into(),
+            "target".into(),
+            "app".into(),
+        )
+        .expect("client constructs");
+        let b = GatewayClient::new(
+            "http://127.0.0.1:9002",
+            "/mcp",
+            "t".into(),
+            "target".into(),
+            "app".into(),
+        )
+        .expect("client constructs");
+        assert_eq!(a.mcp_url(), "http://127.0.0.1:9001/mcp");
+        assert_eq!(b.mcp_url(), "http://127.0.0.1:9002/mcp");
+        assert_ne!(a.mcp_url(), b.mcp_url());
     }
 }

@@ -6,6 +6,12 @@
 //! connect. Anything that makes this path artificially slow makes the
 //! published overhead artificially small, which is the failure mode this whole
 //! exercise exists to avoid.
+//!
+//! The pool-sizing and empty-result discipline is shared with the mongo
+//! baseline ([`crate::mongo`]): both must size their pool to the concurrency
+//! so no request queues for a connection, and both must reject an empty
+//! result rather than time it. Those two rules live in [`pool_size_for`] and
+//! [`ensure_non_empty`] so the two baselines cannot drift apart.
 
 use std::time::Instant;
 
@@ -28,6 +34,34 @@ pub enum DirectError {
     EmptyResult { shape: &'static str, iteration: u64 },
 }
 
+/// Pool size for a baseline path serving `concurrency` concurrent requests.
+///
+/// One connection per in-flight request, never fewer. A pool smaller than the
+/// concurrency would queue requests, and that queueing would be measured as
+/// latency and charged, wrongly, to the database — flattering the gateway.
+/// Never zero: at least one connection, so a `concurrency: 0` still works.
+pub fn pool_size_for(concurrency: u32) -> u32 {
+    concurrency.max(1)
+}
+
+/// Reject an empty result set.
+///
+/// Shared with the mongo baseline: timing a query that returned nothing is
+/// how a benchmark publishes an impossibly good number. The caller supplies
+/// what it observed; this turns "nothing came back" into an error.
+///
+/// `observed` is the number of rows/documents the driver reported.
+pub fn ensure_non_empty(
+    observed: usize,
+    shape: &'static str,
+    iteration: u64,
+) -> Result<(), DirectError> {
+    if observed == 0 {
+        return Err(DirectError::EmptyResult { shape, iteration });
+    }
+    Ok(())
+}
+
 /// A pooled direct-to-Postgres client.
 #[derive(Debug, Clone)]
 pub struct DirectClient {
@@ -39,9 +73,10 @@ impl DirectClient {
     /// Queueing here would be measured as latency and charged, wrongly, to the
     /// database.
     pub async fn connect(url: &str, concurrency: u32) -> Result<Self, DirectError> {
+        let size = pool_size_for(concurrency);
         let pool = PgPoolOptions::new()
-            .max_connections(concurrency.max(1))
-            .min_connections(concurrency.max(1))
+            .max_connections(size)
+            .min_connections(size)
             .connect(url)
             .await?;
         Ok(DirectClient { pool })
@@ -83,17 +118,39 @@ impl DirectClient {
         // silently-empty result set — the same no-op trap guarded on the
         // gateway side.
         debug_assert!(touched > 0 || rows.is_empty());
-        if rows.is_empty() {
-            return Err(DirectError::EmptyResult {
-                shape: shape.name(),
-                iteration,
-            });
-        }
+        ensure_non_empty(rows.len(), shape.name(), iteration)?;
 
         Ok(elapsed)
     }
 
     pub async fn close(&self) {
         self.pool.close().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_pool_is_never_smaller_than_the_concurrency() {
+        assert_eq!(pool_size_for(8), 8);
+        assert_eq!(pool_size_for(1), 1);
+        // Zero concurrency would otherwise produce a zero-connection pool,
+        // which cannot serve a single request.
+        assert_eq!(pool_size_for(0), 1);
+    }
+
+    #[test]
+    fn an_empty_result_is_an_error_not_a_measurement() {
+        let err = ensure_non_empty(0, "point_lookup", 7).expect_err("empty result rejected");
+        assert!(matches!(err, DirectError::EmptyResult { .. }));
+        // The bracketed prefix survives so a log grep can classify it.
+        assert!(err.to_string().starts_with("[BENCH_DIRECT_EMPTY_RESULT]"));
+    }
+
+    #[test]
+    fn a_non_empty_result_passes() {
+        ensure_non_empty(1, "point_lookup", 7).expect("one row is fine");
     }
 }

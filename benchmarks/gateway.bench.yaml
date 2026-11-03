@@ -8,6 +8,11 @@
 # Constraints are set deliberately WIDE: the point is to measure the gateway's
 # own overhead, not to measure it hitting a row cap or a statement timeout. A
 # truncated response would make the gateway and direct paths incomparable.
+#
+# Both query targets live in this one file so a single config serves every
+# backend: `--backend postgres` measures the `target` server, `--backend mongo`
+# measures the `mongo` server. Adapters open lazily, so declaring both costs
+# nothing on a run that only uses one.
 
 servers:
   - name: target
@@ -20,6 +25,21 @@ servers:
       - name: app
         role: app
         password: app-dev-only
+        description: Benchmark target
+
+  - name: mongo
+    kind: mongo
+    description: Local dev target-mongo (docker-compose.dev.yml)
+    host: localhost
+    port: 27018
+    tls: insecure
+    databases:
+      - name: app
+        role: app
+        password: app-dev-only
+        # The container's bootstrap user lives in `admin` — see
+        # docker-compose.dev.yml `target-mongo`.
+        auth_database: admin
         description: Benchmark target
 
 permissions:
@@ -38,6 +58,16 @@ permissions:
           statement_timeout_ms: 30000
           # Off — a required reason adds a field to every request and would
           # measure our own test scaffolding.
+          require_reason: false
+
+      - server: mongo
+        database: app
+        action: query_read
+        constraints:
+          # Same reasoning as the postgres grant above: wide enough that the
+          # gateway never truncates, so the two paths stay comparable.
+          row_limit: 5000
+          statement_timeout_ms: 30000
           require_reason: false
 
 service_accounts:
