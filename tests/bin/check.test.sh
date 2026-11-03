@@ -48,7 +48,12 @@ case "$name $*" in
   'git grep '*)
     # rc=0 with a match line fails the gate; any rc other than 1 fails it
     # closed; only the default rc=1 (no match) reads as clean. The simulated
-    # token deliberately cannot match the real guard regex.
+    # token deliberately cannot match the real guard regex; the multi-token
+    # fixture's filename tokens can — exercising their redaction is the point.
+    if [[ -n ${TOKEN_HIT_MULTI:-} ]]; then
+      echo "config/${TOKEN_A}_and_${TOKEN_B}.yaml:3: dbmcp_svc_SIMULATED_TOKEN_FIXTURE_ONLY_NOT_HEX"
+      exit 0
+    fi
     if [[ -n ${TOKEN_HIT:-} ]]; then
       echo 'config/prod.yaml:9: dbmcp_svc_SIMULATED_TOKEN_FIXTURE_ONLY_NOT_HEX'
       exit 0
@@ -114,14 +119,17 @@ not_output() {
     exit 1
   fi
 }
-# The matched token must never reach the gate's output: the hit IS the
-# credential, and the gate's output is copied into PRs. The needle is not
+# A matched token must never reach the gate's output: the hit IS the
+# credential, and the gate's output is copied into PRs. The needles are not
 # echoed, so a failure never copies a token into the test log either.
 assert_no_token_in_output() {
-  if grep -qF -- 'dbmcp_svc_SIMULATED_TOKEN_FIXTURE_ONLY_NOT_HEX' "$work/output"; then
-    echo 'FAIL: the gate output contains the matched token'
-    exit 1
-  fi
+  local tok
+  for tok in "$@"; do
+    if grep -qF -- "$tok" "$work/output"; then
+      echo 'FAIL: the gate output contains the matched token'
+      exit 1
+    fi
+  done
 }
 # The final summary must repeat every skipped job's notice. Asserting over the
 # whole output would also pass on the initial notice alone, so the assertion is
@@ -147,6 +155,11 @@ assert_not_run() {
     exit 1
   fi
 }
+
+# Two DIFFERENT simulated 64-hex tokens for the multi-token filename fixture:
+# one repeated hex character each, so they cannot be mistaken for real ones.
+token_a="dbmcp_svc_$(printf 'a%.0s' {1..64})"
+token_b="dbmcp_svc_$(printf 'b%.0s' {1..64})"
 
 fixture
 run_gate 0
@@ -203,7 +216,16 @@ run_gate 1 TOKEN_HIT=1
 assert_output 'literal dbmcp_svc_ service token(s) in committed config'
 # The hit IS the credential: the gate reports where it is, never what it is.
 assert_output 'config/prod.yaml:9'
-assert_no_token_in_output
+assert_no_token_in_output 'dbmcp_svc_SIMULATED_TOKEN_FIXTURE_ONLY_NOT_HEX'
+assert_not_run "NOT RUN: pages typecheck/build/artifact guard - the gate stopped before this job"
+
+# A filename can carry the token itself — here two DIFFERENT tokens, and both
+# must be masked: a single match+replace left the second one in the output.
+fixture
+run_gate 1 TOKEN_HIT_MULTI=1 TOKEN_A="$token_a" TOKEN_B="$token_b"
+assert_output 'literal dbmcp_svc_ service token(s) in committed config'
+assert_output 'config/<redacted>_and_<redacted>.yaml:3'
+assert_no_token_in_output "$token_a" "$token_b" 'dbmcp_svc_SIMULATED_TOKEN_FIXTURE_ONLY_NOT_HEX'
 assert_not_run "NOT RUN: pages typecheck/build/artifact guard - the gate stopped before this job"
 
 fixture

@@ -132,7 +132,9 @@ never an empty result.
 
 A secret-scan hit is reported by LOCATION only (`path:line`), never by its
 matched line: the hit is the credential, and the gate's output is copied into
-PRs. A path that carries the token itself is masked as well.
+PRs. A path that carries tokens itself has every one of them masked — a
+filename holding two different tokens prints two `<redacted>` markers, never
+either token.
 
 Local website validation runs whenever the site toolchain is present, even for
 Rust-only changes. The independently configured Pages workflow keeps its existing

@@ -62,10 +62,14 @@ redact_token_hits() {
     if [[ $rest == *:* ]]; then
       location="$path:${rest%%:*}"
     fi
-    # A path that carries the token itself is masked as well.
-    if [[ $location =~ dbmcp_svc_[0-9a-f]{64} ]]; then
+    # A path that carries tokens itself is masked too — every one of them: a
+    # single match+replace only cleared the first match, so a filename holding
+    # two different tokens still printed the second. Each pass removes every
+    # occurrence of one distinct token and shortens the location, so the loop
+    # terminates once no token remains.
+    while [[ $location =~ dbmcp_svc_[0-9a-f]{64} ]]; do
       location=${location//${BASH_REMATCH[0]}/<redacted>}
-    fi
+    done
     printf '  %s\n' "$location"
   done
 }
