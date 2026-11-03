@@ -14,23 +14,38 @@ This project adheres to a [Code of Conduct](CODE_OF_CONDUCT.md). By participatin
 
 ### Prerequisites
 
-- **Rust** stable (pinned in `rust-toolchain.toml`)
-- **Docker** and **Docker Compose** (for local dev stack)
-- **PostgreSQL** client tools (psql)
+- **Debian/Ubuntu host** for `bin/setup`, with Bash, `dpkg` and `apt-get`. Install Git to clone the repo. If packages are missing, setup needs root or non-interactive `sudo`; alternatively, have an administrator install `build-essential`, `openssl` and `curl` first.
+- **Rust**, including Cargo and rustc, with the pinned toolchain and the `rustfmt` and `clippy` components from `rust-toolchain.toml`. Install through your trusted toolchain manager before setup; setup does not bootstrap Rust.
+- **Docker Engine or Docker Desktop** with **Docker Compose v2** (`docker compose`), including support for `up --wait`. Start the daemon and ensure your user can access it without sudo before setup; setup does not install Docker.
+- **Network access** to host package repositories, Rust dependency registries and container image registries; available local ports listed below.
+- **mise** is optional: setup runs `mise install` when available and otherwise uses host tools. A failed mise install stops setup.
+
+The check gate also requires a C compiler (`cc`), `make` and `grep`. The `bin/dev psql` helpers run psql inside the containers; a host PostgreSQL client is optional.
 
 ### Local Development
 
-Clone the repo and bring up the dev stack:
+From a fresh checkout with the host prerequisites installed:
 
 ```bash
 git clone https://github.com/developerz-ai/db-mcp-gateway.git
 cd db-mcp-gateway
-bin/dev up
+cp .env.example .env
+./bin/setup
+./bin/dev
+./bin/check
 ```
 
-This spins up:
-- A "state DB" (gateway metadata, sessions, audit log) on `localhost:5433`
-- A target PostgreSQL instance on `localhost:5434` (for testing gateway queries)
+`bin/setup` checks Cargo and Docker before installing missing host packages, fetches Rust dependencies with `cargo fetch --locked`, and starts all four dependency services, waiting for health. Failures stop at the named stage with an actionable diagnostic; subprocess output is suppressed to avoid exposing environment values. Review any detailed diagnostics locally, and never share credentials.
+
+`bin/dev` defaults to `up`. Running it after setup is safe: it ensures the same dependency services are up, not a second stack. Default loopback ports:
+- State PostgreSQL (gateway metadata, sessions, audit log): `localhost:5433`
+- Target PostgreSQL (testing gateway queries): `localhost:5434`
+- Target MongoDB: `localhost:27018`
+- MySQL permissions store: `localhost:3307`
+
+**Neither setup nor bin/dev starts the gateway.** Follow the [deployment quickstart's local walkthrough](website/docs/deployment/quickstart.md#run-it-locally) for separate gateway startup and the unauthenticated MCP smoke request, which should return HTTP `401`.
+
+`bin/check` first checks required tools and Docker daemon access, then runs `bin/ci` unchanged (format checks, Clippy and integration tests, plus cargo-audit when installed). Exit `75` means a required preflight resource is unavailable and the gate did not run; repair the named prerequisite and retry. Once CI starts, its exit status is preserved: lint, compilation and test failures are not reclassified as infrastructure failures. Exit `0` means the gate passed.
 
 **Check logs:** `bin/dev logs`  
 **Tear down:** `bin/dev down`  
