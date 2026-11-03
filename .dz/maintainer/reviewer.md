@@ -26,7 +26,7 @@ Rust + Cargo. The gate is `bin/check`, run from the repository root: `export PAT
 
 ## Gates that matter
 
-- `bin/check` is the gate: `cd` to the repo root, `export PATH="$HOME/.cargo/bin:$PATH"`, then `bin/ci`. CI and the pre-commit hook run the same thing.
+- `bin/check` is the gate: `cd` to the repo root, `export PATH="$HOME/.cargo/bin:$PATH"`, then `bin/ci`. The pre-commit hook runs `bin/check`; CI runs the equivalent jobs directly, not `bin/ci` — and its test invocation is wider: `cargo test --all-targets --all-features` where `bin/test` runs `cargo test --all-targets`.
 - `bin/ci` = `bin/lint` + `bin/test` + `cargo audit` (skipped with a `— SKIPPED` notice when `cargo-audit` is absent). `bin/test` boots the dev stack (state DB, target DB, MySQL, Mongo) and runs `cargo test --all-targets`; the target DB is never mocked.
 - `bin/lint` = `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo clippy --release --all-features -- -D warnings`, `bin/check-scrub-features`.
 - CI jobs: `fmt`, `clippy`, `test`, `audit`, `secret-scan`. The first four gate the image build; `secret-scan` is standalone today, so its green is not a required check. `cargo audit` ignores exactly one advisory, `RUSTSEC-2023-0071` — a new ignore is a finding.
