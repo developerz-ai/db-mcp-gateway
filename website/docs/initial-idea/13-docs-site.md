@@ -82,6 +82,67 @@ JS snippet, a CSS file) is fine — those extensions aren't in the denylist.
 Adding a config-like asset is not; either move it out of `website/static/`
 or extend the guard step with an explicit reason.
 
+## Local validation parity
+
+`bin/check` delegates to `bin/ci` and runs, in `website/`:
+
+1. `npm run typecheck` (the Pages PR build's TypeScript check).
+2. `npm run build` (the production Docusaurus build).
+3. The same post-build sensitive/config-asset denylist used before Pages upload:
+   case-insensitive `*.yaml`, `*.yml`, `*.env`, `.env.*`, `*.pem`, `*.key`,
+   `*.toml`, and `*.sql` files under `website/build/`.
+
+A failed typecheck, build, missing build directory, denylisted asset or scanner
+error blocks local success: a job that runs and fails keeps its own non-zero
+exit code and is never turned into a skip. Local diagnostics must not print
+sensitive asset contents.
+
+The Pages job has its own toolchain — Node 20+, npm and the installed website
+dependencies. When that toolchain is absent the gate does not treat it as an
+environment blocker: it reports a `NOT RUN:` notice naming the job, the reason
+and the command that enables it, and every other job is still graded, so the
+gate reaches a verdict on a box without Node dependencies:
+
+```bash
+NOT RUN: pages typecheck/build/artifact guard - website dependencies are absent (prepare: cd website && npm ci)
+```
+
+The skip is printed and repeated in the final summary; it is never silent.
+
+Only a REQUIRED resource returns exit 75 — the Rust toolchain (cargo, rustc,
+rustfmt, clippy), a C compiler (`cc`), `make`, GNU grep, the Docker CLI, the
+Docker daemon, Docker Compose, or a dev stack that never became healthy. Those
+make the gate unable to grade anything at all, so it refuses to grade instead
+of returning a verdict.
+A malformed compose file or any other compose command failure keeps its own
+exit status instead: 75 is reserved for an unreachable resource or a confirmed
+health failure, so the platform blames the change and not the box.
+
+The gate performs no installation: `bin/setup` does not install website
+dependencies or cargo-audit; prepare both separately. The artifact scanner must
+preserve its own failure status rather than hiding it behind process
+substitution or treating errors as an empty result. Diagnostics must not
+disclose sensitive file contents or token-scanner output.
+
+The SHA-pin scan checks each grep's status on its own, so its stages are not
+one pipeline: as a pipeline, a read error (grep exits 2) in the first stage
+was masked by the downstream filters (exit 1) and the scan read as clean. A
+scan that cannot read `.github/workflows` now fails closed — a read error is
+never an empty result.
+
+A secret-scan hit is reported by LOCATION only (`path:line`), never by its
+matched line: the hit is the credential, and the gate's output is copied into
+PRs. A path that carries tokens itself has every one of them masked — a
+filename holding two different tokens prints two `<redacted>` markers, never
+either token.
+
+Local website validation runs whenever the site toolchain is present, even for
+Rust-only changes. The independently configured Pages workflow keeps its existing
+path filters and job conditions: its PR job typechecks/builds, while the
+publishing job builds and checks the artifact before upload. Local validation
+combines these checks; it never uploads or deploys. Publishing remains CI-only
+and credentialed; passing local checks does not guarantee deployment success.
+
 ## `onBrokenLinks: 'throw'`
 
 `docusaurus.config.ts` sets `onBrokenLinks: 'throw'` and
