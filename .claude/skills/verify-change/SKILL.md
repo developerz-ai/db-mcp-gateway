@@ -21,7 +21,10 @@ verdicts exercised by it), CI's exact audit command, the token-regex
 regression from the same script CI runs
 (`tests/bin/secret-scan-regex.test.sh`), the all-feature
 test invocation and Pages parity — plus isolated shell orchestration
-regressions.
+regressions. Both scans fail closed: the SHA-pin scan checks each grep's
+status on its own, so a scan that cannot read `.github/workflows` is a
+tooling error rather than an empty result, and the tracked-token scan reports
+a hit by location (`path:line`) — never the credential it matched.
 
 The gate also runs the Pages-parity job — website typecheck, production build
 and the post-build sensitive-asset denylist from `.github/workflows/pages.yml` —

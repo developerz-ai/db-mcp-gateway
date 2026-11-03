@@ -43,6 +43,33 @@ not_run() {
   skipped_jobs+=("$notice")
 }
 
+# Report the LOCATION of a secret-scan hit, never the hit itself: the
+# matched line IS the credential, and gate output is copied into PRs
+# (spec 13 — diagnostics must not disclose token-scanner output).
+# `git grep -n` prints `path:line:content`; only `path:line` is emitted.
+redact_token_hits() {
+  local hit path rest location
+  while IFS= read -r hit; do
+    [[ -n $hit ]] || continue
+    if [[ $hit != *:* ]]; then
+      # Not the `path:line:content` shape: report nothing about the content.
+      printf '  <match at an unparsable location>\n'
+      continue
+    fi
+    path=${hit%%:*}
+    rest=${hit#*:}
+    location="$path"
+    if [[ $rest == *:* ]]; then
+      location="$path:${rest%%:*}"
+    fi
+    # A path that carries the token itself is masked as well.
+    if [[ $location =~ dbmcp_svc_[0-9a-f]{64} ]]; then
+      location=${location//${BASH_REMATCH[0]}/<redacted>}
+    fi
+    printf '  %s\n' "$location"
+  done
+}
+
 # The gate reached a job: it leaves the pending list whether it passed or
 # failed. The name is checked so a reordered script cannot silently rename a
 # job the trap still has to report.
@@ -97,16 +124,32 @@ echo '→ actions are SHA-pinned'
 # only worth anything if it stays that way, so a bare `@v3` merged later must
 # fail here too, not only in CI. Unlike the workflow's `|| true`, a grep that
 # cannot run fails closed — the gate never reads a broken scan as clean.
-# tests/bin/check.test.sh feeds this scan a pinned ref (must pass) and a
-# mutable tag (must fail); the greps here are the real grep, so no stub call
-# is recorded and the verdicts are the pin.
+# Each stage's status is checked on its own, so the stages are NOT one
+# pipeline: as a pipeline, a read error (rc=2) in the first grep was masked
+# by the downstream filters (rc=1) and pipefail reported the clean 1 — a
+# missing .github/workflows read as a clean scan.
+# tests/bin/check.test.sh feeds this scan a pinned ref (must pass), a mutable
+# tag (must fail) and a missing workflows directory (must fail closed); the
+# greps here are the real grep, so no stub call is recorded and the verdicts
+# are the pin.
+scan_stage='collect uses: lines'
 rc=0
-unpinned=$(grep -rhP --include='*.yml' --include='*.yaml' \
-  '^\s*-?\s*uses:\s*' .github/workflows \
-  | grep -vP '^\s*-?\s*uses:\s*\./' \
-  | grep -vP '^\s*-?\s*uses:\s*[^[:space:]#]+@[0-9a-f]{40}\s+#\s+\S+\s*$') || rc=$?
+uses_lines=$(grep -rhP --include='*.yml' --include='*.yaml' \
+  '^\s*-?\s*uses:\s*' .github/workflows) || rc=$?
+remote_uses=''
+if (( rc == 0 )); then
+  scan_stage='drop local actions'
+  remote_uses=$(printf '%s\n' "$uses_lines" \
+    | grep -vP '^\s*-?\s*uses:\s*\./') || rc=$?
+fi
+unpinned=''
+if (( rc == 0 )); then
+  scan_stage='drop pinned refs'
+  unpinned=$(printf '%s\n' "$remote_uses" \
+    | grep -vP '^\s*-?\s*uses:\s*[^[:space:]#]+@[0-9a-f]{40}\s+#\s+\S+\s*$') || rc=$?
+fi
 if (( rc > 1 )); then
-  echo "grep tooling failure (rc=$rc) — SHA-pin scan cannot read as clean (fail-closed)" >&2
+  echo "grep tooling failure (rc=$rc) — SHA-pin scan cannot read as clean (fail-closed): $scan_stage" >&2
   exit 1
 fi
 if [[ -n $unpinned ]]; then
@@ -139,6 +182,8 @@ job_reached 'secret-scan'
 # fails, and only rc=1 (no match) reads as clean. Regex and pathspec
 # exclusions are stated exactly as CI states them;
 # tests/bin/check.test.sh pins this command line against drift.
+# A hit is reported by LOCATION only — the matched line is the credential and
+# gate output is copied into PRs (spec 13).
 (
   set +e
   matches="$(git grep -nE "dbmcp_svc_[0-9a-f]{64}" \
@@ -148,7 +193,7 @@ job_reached 'secret-scan'
   set -e
   if [[ $rc -eq 0 && -n $matches ]]; then
     echo 'literal dbmcp_svc_ service token(s) in committed config — reference the secret via ENV: or FILE: (spec 14)' >&2
-    printf '%s\n' "$matches" >&2
+    redact_token_hits <<<"$matches" >&2
     exit 1
   fi
   if [[ $rc -ne 1 ]]; then

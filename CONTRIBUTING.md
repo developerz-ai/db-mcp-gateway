@@ -209,11 +209,11 @@ quality jobs in [ci.yml](.github/workflows/ci.yml) and validation in
 
 | Workflow job / validation | Local gate |
 |---|---|
-| `ci.yml` / `fmt` | `bin/lint`: `cargo fmt --all -- --check`, then the job's SHA-pin scan — same anchoring, 40-hex allow regex and local-action exemption as the workflow's step, failing closed on a broken grep |
+| `ci.yml` / `fmt` | `bin/lint`: `cargo fmt --all -- --check`, then the job's SHA-pin scan — same anchoring, 40-hex allow regex and local-action exemption as the workflow's step; each grep's status is checked on its own, so a scan that cannot read `.github/workflows` fails closed instead of reporting an empty result |
 | `ci.yml` / `clippy` | `bin/lint`: debug all-target/all-feature clippy and release all-feature clippy, both `-D warnings`; `bin/check-scrub-features` checks the non-dev regex feature graph |
 | `ci.yml` / `test` | `bin/test`: `cargo test --all-targets --all-features`, including bench-harness tests, real-DB setup and argument forwarding |
 | `ci.yml` / `audit` | `cargo audit --ignore RUSTSEC-2023-0071` — CI's exact command; the ignore set is unchanged (only `RUSTSEC-2023-0071`, justified in `.cargo/audit.toml` and `audit.toml`) |
-| `ci.yml` / `secret-scan` | The tracked-token scan — same `git grep` regex and pathspec exclusions as the workflow, fail-closed on any non-1 grep status — plus the regex regression run from the same script CI runs (`bash tests/bin/secret-scan-regex.test.sh`) |
+| `ci.yml` / `secret-scan` | The tracked-token scan — same `git grep` regex and pathspec exclusions as the workflow, fail-closed on any non-1 grep status, reporting a hit by location (`path:line`) and never by the matched credential — plus the regex regression run from the same script CI runs (`bash tests/bin/secret-scan-regex.test.sh`) |
 | `pages.yml` / `build` | In `website/`: `npm run typecheck` and `npm run build` |
 | `pages.yml` / pre-upload artifact guard | Post-build sensitive/config-asset denylist over `website/build/` |
 | Local orchestration regression | `bash tests/bin/check.test.sh`: temporary fixture checkouts and command stubs, no real DB mocks or recursive full-gate execution |
@@ -251,8 +251,9 @@ before the push. The regex regression is a single copy shared with the
 workflow (both run `tests/bin/secret-scan-regex.test.sh`); the two greps are
 ports of the workflow's steps, and `tests/bin/check.test.sh` pins the
 tracked-token scan's exact command line (git is stubbed in its fixture) and
-exercises both scans' verdicts (a pinned ref passes, a mutable tag fails; a
-token match and a grep failure both fail closed), so drift between the
+exercises both scans' verdicts (a pinned ref passes, a mutable tag fails, an
+unreadable workflows directory fails closed; a token match is reported by
+location only and a grep failure fails closed), so drift between the
 workflow and the gate turns red instead of passing silently.
 What the local gate adds beyond `bin/lint` (fmt, both clippy configurations and
 the scrub-feature guard) is the all-target/all-feature test invocation through

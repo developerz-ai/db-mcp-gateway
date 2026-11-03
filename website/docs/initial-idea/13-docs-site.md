@@ -124,6 +124,16 @@ preserve its own failure status rather than hiding it behind process
 substitution or treating errors as an empty result. Diagnostics must not
 disclose sensitive file contents or token-scanner output.
 
+The SHA-pin scan checks each grep's status on its own, so its stages are not
+one pipeline: as a pipeline, a read error (grep exits 2) in the first stage
+was masked by the downstream filters (exit 1) and the scan read as clean. A
+scan that cannot read `.github/workflows` now fails closed — a read error is
+never an empty result.
+
+A secret-scan hit is reported by LOCATION only (`path:line`), never by its
+matched line: the hit is the credential, and the gate's output is copied into
+PRs. A path that carries the token itself is masked as well.
+
 Local website validation runs whenever the site toolchain is present, even for
 Rust-only changes. The independently configured Pages workflow keeps its existing
 path filters and job conditions: its PR job typechecks/builds, while the

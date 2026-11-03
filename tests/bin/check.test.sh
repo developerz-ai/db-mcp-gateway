@@ -114,6 +114,15 @@ not_output() {
     exit 1
   fi
 }
+# The matched token must never reach the gate's output: the hit IS the
+# credential, and the gate's output is copied into PRs. The needle is not
+# echoed, so a failure never copies a token into the test log either.
+assert_no_token_in_output() {
+  if grep -qF -- 'dbmcp_svc_SIMULATED_TOKEN_FIXTURE_ONLY_NOT_HEX' "$work/output"; then
+    echo 'FAIL: the gate output contains the matched token'
+    exit 1
+  fi
+}
 # The final summary must repeat every skipped job's notice. Asserting over the
 # whole output would also pass on the initial notice alone, so the assertion is
 # scoped to the summary section.
@@ -179,9 +188,22 @@ run_gate 1
 assert_output 'unpinned action ref(s)'
 assert_not_run "NOT RUN: secret-scan - the gate stopped before this job"
 
+# A SHA-pin scan that cannot read its input fails closed. As one pipeline the
+# first grep exited 2 (no .github/workflows) while the downstream filters
+# exited 1, and pipefail reported the clean 1 — a missing workflows directory
+# read as a clean scan.
+fixture
+rm -rf "$work/repo/.github/workflows"
+run_gate 1
+assert_output 'grep tooling failure (rc=2) — SHA-pin scan cannot read as clean (fail-closed)'
+assert_not_run "NOT RUN: test - the gate stopped before this job"
+
 fixture
 run_gate 1 TOKEN_HIT=1
 assert_output 'literal dbmcp_svc_ service token(s) in committed config'
+# The hit IS the credential: the gate reports where it is, never what it is.
+assert_output 'config/prod.yaml:9'
+assert_no_token_in_output
 assert_not_run "NOT RUN: pages typecheck/build/artifact guard - the gate stopped before this job"
 
 fixture
