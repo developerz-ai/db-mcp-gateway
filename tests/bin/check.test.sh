@@ -19,6 +19,11 @@ fixture() {
   # The real token-regex regression, verbatim: the gate must run the same
   # script CI runs, so the fixture copies it instead of stubbing it.
   cp tests/bin/secret-scan-regex.test.sh "$work/repo/tests/bin/"
+  # The doc-anchor guard, verbatim, for the same reason: the gate invokes
+  # it, so the fixture must be able to resolve it. The fixture repo has no
+  # website/docs tree, and the guard passes on a missing tree — which is
+  # what lets the happy path below reach a verdict.
+  cp tests/bin/doc-anchors.test.sh "$work/repo/tests/bin/"
   # One pinned ref and one local action: both halves of the SHA-pin scan's
   # filtering must accept them, or the clean run below fails.
   cat > "$work/repo/.github/workflows/ci.yml" <<'WORKFLOW'
@@ -32,10 +37,13 @@ WORKFLOW
   chmod +x "$work/repo/website/node_modules/.bin/"*
   # Only what the gate still resolves on this PATH: the scripts' dirname, the
   # interpreter, grep (a bin/check REQUIRED probe, the SHA-pin scan's matcher
-  # and check-scrub-features'), find (the Pages guard) and tr (the token-regex
-  # regression's hex helper). mkdir/rm/touch are the external
-  # commands the stub itself runs.
-  for tool in bash dirname grep find mkdir rm touch tr; do
+  # and check-scrub-features'), find (the Pages guard and the anchor guard's
+  # doc walk), tr (the token-regex regression's hex helper), and the anchor
+  # guard's locale probe plus its sed/sort helpers (the sed is the guard's
+  # doc-discovery pipeline; the discovery-failure case below swaps in a
+  # failing stub). basename is the anchor guard's cross-file link resolver.
+  # mkdir/rm/touch are the external commands the stub itself runs.
+  for tool in bash dirname basename grep find mkdir rm touch tr locale sed sort; do
     ln -s "$(command -v "$tool")" "$work/tools/$tool"
   done
   cat > "$work/tools/stub" <<'STUB'
@@ -183,6 +191,9 @@ done
 assert_output 'no literal service tokens in committed config (git grep rc=1)'
 # The token-regex regression ran the real script copied into the fixture.
 assert_output 'passed, 0 failed'
+# The doc-anchor guard ran too: the gate invokes it, so the fixture must
+# prove the wiring, not just that the script was copied.
+assert_output 'no website/docs tree — nothing to check (pass)'
 # Every job ran: the summary must claim no skip.
 assert_output '✓ Local quality checks passed (no publishing or deployment)'
 not_called 'ps --status running'
@@ -286,7 +297,7 @@ done
 fixture
 run_gate 42 FAIL_AT='cargo fmt --all -- --check'
 assert_output 'Jobs not reached'
-for job in 'test' 'cargo audit' 'secret-scan' 'pages typecheck/build/artifact guard'; do
+for job in 'test' 'cargo audit' 'secret-scan' 'doc-anchor guard' 'pages typecheck/build/artifact guard'; do
   assert_not_run "NOT RUN: $job - the gate stopped before this job"
 done
 
@@ -375,7 +386,196 @@ fixture
 printf 'exit 44\n' > "$work/repo/tests/bin/check.test.sh"
 run_gate 44
 # Stopping at the FIRST job names every job the gate never reached.
-for job in 'fmt + clippy' 'test' 'cargo audit' 'secret-scan' 'pages typecheck/build/artifact guard'; do
+for job in 'fmt + clippy' 'test' 'cargo audit' 'secret-scan' 'doc-anchor guard' 'pages typecheck/build/artifact guard'; do
   assert_not_run "NOT RUN: $job - the gate stopped before this job"
 done
+# A VALID fragment resolves and the gate passes. The double-hyphen target is
+# the acceptance-critical one: "### MySQL / MSSQL — deferred" renders as
+# "mysql--mssql--deferred", because the slash and the em dash are DELETED
+# and each of the two spaces around them becomes its own hyphen — a
+# whitespace RUN is not collapsed into one. The all-ASCII "Two  spaces"
+# heading pins the same rule on the slugger's fast path, where the run is a
+# literal "  " rather than two spaces made adjacent by a deletion.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## Real heading\n\n### MySQL / MSSQL — deferred\n\n## Two  spaces\n\nSee [below](#real-heading), [deferred](#mysql--mssql--deferred) and [two](#two--spaces).\n' \
+  > "$work/repo/website/docs/valid.md"
+printf '# Title\n\n## Other heading\n' > "$work/repo/website/docs/other.md"
+printf '# Title\n\n## Cross-file heading\n\nSee [across](./other.md#other-heading).\n' \
+  > "$work/repo/website/docs/cross.md"
+run_gate 0
+assert_output 'every heading fragment link resolves to a rendered heading ID'
+# A broken heading FRAGMENT fails the gate. The Docusaurus build only
+# WARNS about a broken anchor (onBrokenAnchors defaults to 'warn'), so the
+# anchor guard is the thing that makes it fail — and the gate must fail on
+# it.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## Real heading\n\nSee [below](#no-such-heading).\n' \
+  > "$work/repo/website/docs/broken.md"
+run_gate 1
+assert_output 'resolves to no heading in'
+# A broken CROSS-FILE fragment fails the gate too. The guard resolves the
+# link's path against the doc tree, so a fragment that matches no heading
+# in the OTHER file is caught — and a guard that skipped cross-file
+# resolution would read this case as clean and let the gate pass.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## Other heading\n' > "$work/repo/website/docs/other.md"
+printf '# Title\n\n## Cross-file heading\n\nSee [across](./other.md#no-such-heading).\n' \
+  > "$work/repo/website/docs/cross-broken.md"
+run_gate 1
+assert_output 'resolves to no heading in'
+# The page TITLE is not an anchor: Docusaurus renders the level-1 heading
+# without an id, so the guard skips it — if that skip is deleted, `title`
+# becomes an ID, this link resolves and the gate wrongly passes. The real
+# heading in the same file shows the failure is about the h1, not an empty
+# inventory.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## Real heading\n\nSee [top](#title).\n' \
+  > "$work/repo/website/docs/h1.md"
+run_gate 1
+assert_output 'resolves to no heading in'
+# A heading inside a FENCED code block is not a heading either: the fence
+# skip keeps it out of the ID inventory. The fenced line is deliberately
+# level 2 — a level-1 line would also be dropped by the h1 skip above, so
+# deleting only the fence skip could never flip this verdict. With the
+# fence skip deleted, `fake-heading` is inventoried, the link resolves and
+# the gate wrongly passes.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n```sh\n## fake heading\n```\n\nSee [fake](#fake-heading).\n' \
+  > "$work/repo/website/docs/fenced.md"
+run_gate 1
+assert_output 'resolves to no heading in'
+# A fence is tracked by CHARACTER and LENGTH: inside a four-backtick block a
+# three-backtick example is CONTENT, not a closer, so the ## fake line stays
+# hidden and #fake must fail — while ## Real heading after the matching
+# four-backtick closer is still found. With length-blind toggling the inner
+# fence opened and closed the block, the fake heading was inventoried and
+# the dead #fake link passed.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n````md\n```sh\n## fake heading\n```\n````\n\n## Real heading\n\nSee [fake](#fake-heading) and [real](#real-heading).\n' \
+  > "$work/repo/website/docs/fence-nested.md"
+run_gate 1
+assert_output 'resolves to no heading in'
+# An HTML comment hides its whole contents: the commented-out heading is
+# not an anchor, so #hidden-heading fails…
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n<!--\n## Hidden heading\n-->\n\n## Real heading\n\nSee [hidden](#hidden-heading) and [real](#real-heading).\n' \
+  > "$work/repo/website/docs/commented-heading.md"
+run_gate 1
+assert_output 'resolves to no heading in'
+# …and a commented-out LINK is not a link either: the doc's only dead
+# fragment link sits inside the comment and must not fail the guard.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n<!-- [old](#no-such-heading) -->\n\n## Real heading\n\nSee [real](#real-heading).\n' \
+  > "$work/repo/website/docs/commented-link.md"
+run_gate 0
+assert_output 'every heading fragment link resolves to a rendered heading ID'
+# An explicit {#id} renders verbatim instead of a slug of the whole heading
+# text: #custom-id resolves…
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## Heading {#custom-id}\n\nSee [direct](#custom-id).\n' \
+  > "$work/repo/website/docs/explicit-id.md"
+run_gate 0
+assert_output 'every heading fragment link resolves to a rendered heading ID'
+# …and the invented whole-string slug no longer exists.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## Heading {#custom-id}\n\nSee [invented](#heading-custom-id).\n' \
+  > "$work/repo/website/docs/explicit-id-broken.md"
+run_gate 1
+assert_output 'resolves to no heading in'
+# github-slugger reserves every id it emits: A, A-1, A render a, a-1 and
+# a-2 — the second A climbs past the a-1 the literal heading emitted, so
+# the valid #a-2 link resolves. Counter-collision produced a, a-1, a-1 and
+# rejected the real #a-2.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## A\n\n## A-1\n\n## A\n\nSee [a](#a), [a1](#a-1) and [a2](#a-2).\n' \
+  > "$work/repo/website/docs/dedupe.md"
+run_gate 0
+assert_output 'every heading fragment link resolves to a rendered heading ID'
+# Lowercase is JavaScript's, not bash's: a final sigma (a capital Σ after a
+# cased character with none following) is ς, so ## ΟΣ renders ος and
+# ## ΟΣ ΑΣ renders ος-ας — both links resolve…
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## ΟΣ\n\n## ΟΣ ΑΣ\n\n## ΑΣ\n\nSee [x](#ος), [y](#ος-ας) and [z](#ας).\n' \
+  > "$work/repo/website/docs/sigma.md"
+run_gate 0
+assert_output 'every heading fragment link resolves to a rendered heading ID'
+# …and the plain-form σ the bash lowercasing would have produced is a dead
+# anchor and fails.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## ΟΣ\n\nSee [x](#οσ).\n' > "$work/repo/website/docs/sigma-broken.md"
+run_gate 1
+assert_output 'resolves to no heading in'
+# A backslash inside a heading's code span is deleted like any other
+# punctuation: `a\b` renders ab. The ASCII fast path must delete ONE
+# backslash — its '\\' list entry held two, so a single one survived and
+# the slug kept it.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## The `a\\b` switch\n\nSee [x](#the-ab-switch).\n' \
+  > "$work/repo/website/docs/backslash.md"
+run_gate 0
+assert_output 'every heading fragment link resolves to a rendered heading ID'
+# Link NODES are parsed, not raw ]( lines: a [x](#missing) inside an inline
+# code span is literal text, and an optional title is link syntax — the
+# titled, single-quoted and angle forms all resolve to #real-heading.
+fixture
+mkdir -p "$work/repo/website/docs"
+cat > "$work/repo/website/docs/link-nodes.md" <<'DOC'
+# Title
+
+## Real heading
+
+Code `[x](#missing)` is text. Titled [x](#real-heading "title"),
+single [y](#real-heading 'title') and angled [z](<#real-heading>).
+DOC
+run_gate 0
+assert_output 'every heading fragment link resolves to a rendered heading ID'
+# An EXTENSIONLESS page URL renders from its markdown source: ./other is
+# other.md, so a dead fragment behind the valid page URL fails instead of
+# being skipped as an unknown file (the old FILE_SEEN lookup dropped it
+# silently — and dropped the VALID extensionless link with it).
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## Other heading\n' > "$work/repo/website/docs/other.md"
+printf '# Title\n\n## Cross-file heading\n\nSee [ok](./other#other-heading) and [dead](./other#no-such-heading).\n' \
+  > "$work/repo/website/docs/cross-ext.md"
+run_gate 1
+assert_output 'resolves to no heading in'
+# The trailing-slash form renders the directory's index page, and a valid
+# fragment behind it resolves rather than being skipped or failing.
+fixture
+mkdir -p "$work/repo/website/docs/sub"
+printf '# Title\n\n## Sub heading\n' > "$work/repo/website/docs/sub/index.md"
+printf '# Title\n\n## Here\n\nSee [idx](./sub/#sub-heading).\n' \
+  > "$work/repo/website/docs/index-link.md"
+run_gate 0
+assert_output 'every heading fragment link resolves to a rendered heading ID'
+# Discovery failing must fail the guard, not grade a partial inventory: as
+# a process substitution the discovery pipeline's exit status was lost, so
+# a failing sed read as an empty doc list and every link passed. The docs
+# tree EXISTS here, so the guard actually reaches discovery.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## Real heading\n\nSee [x](#real-heading).\n' \
+  > "$work/repo/website/docs/valid.md"
+printf '#!/usr/bin/env bash\nexit 45\n' > "$work/tools/broken-sed"
+chmod +x "$work/tools/broken-sed"
+rm "$work/tools/sed"
+ln -s broken-sed "$work/tools/sed"
+run_gate 1
+assert_output 'website/docs discovery failed'
+assert_not_run "NOT RUN: pages typecheck/build/artifact guard - the gate stopped before this job"
 printf 'check orchestration regressions passed\n'

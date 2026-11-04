@@ -15,6 +15,10 @@
 # the two greps are ports of the workflow's steps: the orchestration
 # regression pins the token scan's exact command line and exercises both
 # scans' verdicts, so the copies cannot drift apart silently.
+# The doc-anchor guard resolves every heading FRAGMENT link in website/docs
+# against the heading IDs the build renders: a fragment pointing at no
+# heading is only a WARNING in the Docusaurus build (onBrokenAnchors
+# defaults to 'warn'), so without this the dead anchor would ship.
 # A missing GATE-SCOPED toolchain — cargo-audit (the
 # audit job) or Node 20+/npm plus the installed website dependencies (the
 # Pages job) — makes that one job report 'NOT RUN' while every other job is
@@ -34,6 +38,7 @@ pending_jobs=(
   'test'
   'cargo audit'
   'secret-scan'
+  'doc-anchor guard'
   'pages typecheck/build/artifact guard'
 )
 
@@ -208,6 +213,16 @@ job_reached 'secret-scan'
 )
 # The same regex regression CI runs: one script, one copy, both gates.
 bash tests/bin/secret-scan-regex.test.sh
+
+echo '→ doc-anchor guard'
+job_reached 'doc-anchor guard'
+# A heading ANCHOR fragment (`#some-heading`) is checked by Docusaurus
+# separately, and only warned about by default (onBrokenAnchors: 'warn'),
+# so a fragment pointing at no heading would still ship. The guard
+# resolves every fragment link in website/docs against the heading IDs the
+# build renders (spec 13) and fails when one matches nothing. Path links
+# stay with onBrokenLinks / onBrokenMarkdownLinks.
+bash tests/bin/doc-anchors.test.sh
 
 echo '→ website typecheck, build and Pages artifact guard'
 job_reached 'pages typecheck/build/artifact guard'
