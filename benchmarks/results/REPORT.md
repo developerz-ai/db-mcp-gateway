@@ -189,7 +189,7 @@ raw results → benchmarks/results/postgres.json
   working tree; baseline drift above 5% on **all three shapes** (30.3%,
   16.0%, 38.8%) → every delta row in this run is marked `Trustworthy: no`.
   The `mongo_aggregate` gateway deltas are *negative* (the gateway measured
-  faster than the second baseline); with a 38.8% drift between the two
+  faster than the first baseline); with a 38.8% drift between the two
   baselines that is the host moving, not a gateway speedup
 - Artifact: [mongo.json](mongo.json)
 

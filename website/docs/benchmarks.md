@@ -2,11 +2,13 @@
 
 db-mcp-gateway ships its own benchmark harness
 ([`benchmarks/gateway_overhead.sh`](https://github.com/developerz-ai/db-mcp-gateway/blob/main/benchmarks/gateway_overhead.sh)):
-it times the same query on the same host at the same moment down two paths —
-straight at the database, and through the gateway's `run_query` MCP tool with
-normal service-token authentication, normal authorization and the synchronous
-audit write intact. Nothing is skipped: a benchmark of a build we do not ship
-would be worth less than no benchmark.
+it times the same query on the same host down two paths in sequential phases:
+first straight at the database, then through the gateway's `run_query` MCP tool
+with normal service-token authentication, normal authorization and the
+synchronous audit write intact, then straight at the database again — the two
+baselines bracketing the gateway phase are how the harness detects host drift.
+Nothing is skipped: a benchmark of a build we do not ship would be worth less
+than no benchmark.
 
 This page publishes what the harness measured. Every figure below is quoted
 from a committed run artifact — the raw JSON with the full per-request
@@ -104,11 +106,11 @@ on this box it refused most of it:
   in these percentiles. Coefficients of variation ran 34% – 110% across
   distributions.
 - **Negative delta is the drift talking.** In the mongo run the aggregate
-  measured *faster* through the gateway than the second baseline
-  (`p50 533.57ms` vs `563.31ms`, deltas −29.73/−58.14/−61.12ms). With a
-  38.8% drift between the two baselines (`563.31ms` → `781.98ms`), that is
-  the host slowing down mid-run, not a gateway speedup. The row carries
-  `Trustworthy: no`.
+  measured *faster* through the gateway than the first baseline — the one the
+  deltas are computed against (`p50 533.57ms` vs `563.31ms`, deltas
+  −29.73/−58.14/−61.12ms). With a 38.8% drift between the two baselines
+  (`563.31ms` → `781.98ms`), that is the host slowing down mid-run, not a
+  gateway speedup. The row carries `Trustworthy: no`.
 - **Contention, not scaling.** The `--instances` run measures how the load
   generator, the gateway processes and the database divide one host's cores.
   It is labelled as contention everywhere it appears. A scaling result needs
