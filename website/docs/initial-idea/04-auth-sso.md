@@ -202,6 +202,8 @@ POST /register
 
 Do **not** add a second OAuth/SSO layer in front of `/mcp`. The gateway is the authorization server and brokers the IdP login internally.
 
+### State & persistence
+
 The split is by lifetime. State that only has to outlive one browser round-trip — pending IdP logins and one-time authorization codes — is **in-process**. A restart drops a login that is mid-flight (the client just retries), and under HA the login endpoints (`/authorize`, `/auth/callback`, `/token`) must run **single-replica** or behind **sticky routing** so every step of one login hits the same replica.
 
 State that is *meant* to outlive the process is in the state DB: **dynamic client registrations** (`oauth_clients`, migration 0008) and **refresh-token chains** (`oauth_refresh_tokens`, migration 0009). Both survive restarts and redeploys and are shared across replicas, so `/register` and `grant_type=refresh_token` need no sticky routing, a cached `client_id` doesn't break with `invalid_client` after a rollout, and a signed-in agent stays signed in across one. Persisting the chain is what makes `REFRESH_TTL_DAYS` mean what it says — in memory, the real ceiling was time-until-the-next-deploy. See [02-architecture §HA](02-architecture.md#ha). Already-authenticated `/mcp` traffic is unaffected either way — those sessions live in the state DB.
