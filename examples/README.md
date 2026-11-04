@@ -8,7 +8,7 @@ Starter templates for deploying and using the db-mcp-gateway.
 |---|---|
 | `.mcp.json` | Claude Code MCP server configuration — add to your repo for team-wide access |
 | `docker-compose.yml` | Production-like deployment with gateway + state DB (customize secrets per your env) |
-| `gateway.yaml` | Minimal gateway config — servers + permissions. Extend per [docs/deployment/config-reference.md](../docs/deployment/config-reference.md) |
+| `gateway.yaml` | Minimal gateway config — servers + permissions. Extend per [website/docs/deployment/config-reference.md](../website/docs/deployment/config-reference.md) |
 
 ## Quick start
 
@@ -24,7 +24,7 @@ git add .mcp.json && git commit -m "add: db-gateway MCP config"
 # In Claude Code, run /mcp to authenticate
 ```
 
-Full walkthrough: [`docs/usage/first-query.md`](../docs/usage/first-query.md)
+Full walkthrough: [`website/docs/usage/first-query.md`](../website/docs/usage/first-query.md)
 
 ### For operators (deploy the gateway)
 
@@ -44,10 +44,10 @@ docker compose up -d
 docker compose logs -f gateway
 ```
 
-Detailed guide: [`docs/deployment/quickstart.md`](../docs/deployment/quickstart.md)
+Detailed guide: [`website/docs/deployment/quickstart.md`](../website/docs/deployment/quickstart.md)
 
 ## Next steps
 
-- **Gateway admins:** [`docs/deployment/config-reference.md`](../docs/deployment/config-reference.md) for the full config schema, [`docs/deployment/logging.md`](../docs/deployment/logging.md) for audit retention and sinks.
-- **Developers:** [`docs/usage/claude-code.md`](../docs/usage/claude-code.md) for scope flags, troubleshooting, and multi-DB access patterns.
+- **Gateway admins:** [`website/docs/deployment/config-reference.md`](../website/docs/deployment/config-reference.md) for the full config schema, [`website/docs/deployment/logging.md`](../website/docs/deployment/logging.md) for audit retention and sinks.
+- **Developers:** [`website/docs/usage/claude-code.md`](../website/docs/usage/claude-code.md) for scope flags, troubleshooting, and multi-DB access patterns.
 - **Architecture:** [`website/docs/initial-idea/`](../website/docs/initial-idea/) for design docs.
