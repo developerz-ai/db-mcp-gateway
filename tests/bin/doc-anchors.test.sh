@@ -30,27 +30,40 @@
 #      "MySQL / MSSQL — deferred" renders as "mysql--mssql--deferred",
 #   3. each remaining SPACE (U+0020) replaced by exactly ONE hyphen.
 #
-# Three rules that are easy to get wrong and are pinned here:
+# Seven rules that are easy to get wrong and are pinned here:
 #   * a deleted character is deleted, not substituted — that is where the
 #     double hyphen comes from;
 #   * a whitespace RUN is not collapsed: the slugger replaces the space
 #     character one at a time, so "a  b" is "a--b", not "a-b";
 #   * a level-1 heading is the page TITLE. Docusaurus renders it as
 #     <header><h1>…</h1></header> with NO id, so it is not an anchor and a
-#     fragment may not point at it.
+#     fragment may not point at it;
+#   * lowercase is JavaScript's toLowerCase, not bash's ${var,,}: a final
+#     sigma — a capital Σ preceded by a cased character and followed by
+#     none — is ς (U+03C2), so "## ΟΣ" renders ος, not οσ;
+#   * fenced code is tracked by the fence's CHARACTER and LENGTH: inside a
+#     four-backtick block a three-backtick line is content, not a closer,
+#     and only a matching fence line closes the block;
+#   * an HTML comment hides its whole contents: a commented-out heading is
+#     not an anchor and a commented-out link is not a link;
+#   * a trailing {#id} is an EXPLICIT id, rendered verbatim instead of a
+#     slug of the whole heading text, and every emitted id — explicit or
+#     generated — is reserved: A, A-1, A render a, a-1, a-2.
 #
 # Run:
 #   bash tests/bin/doc-anchors.test.sh
 #
 # Exits 0 when every fragment resolves (or when there is no docs tree to
 # check), 1 on the first unresolved fragment. Self-contained: no network, no
-# DB, no cargo, no Node. Requires bash >= 4.
+# DB, no cargo, no Node. Requires bash >= 4.2 (the $'\u…' escapes in
+# js_lowercase).
 set -euo pipefail
 
 # Results of heading_text and slugify, returned in a global instead of on
 # stdout so the guard does not fork a subshell per heading.
 TEXT_OUT=''
 SLUG_OUT=''
+LOWER_OUT=''
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DOCS_ROOT="$REPO_ROOT/website/docs"
@@ -273,20 +286,62 @@ is_deleted_cp() {
 }
 
 # ---------------------------------------------------------------------------
+# JavaScript-compatible lowercase, in LOWER_OUT.
+#
+# github-slugger lowercases with str.toLowerCase(), and JavaScript's
+# toLowerCase is not bash's ${var,,}: it applies Unicode SpecialCasing, so
+# a capital sigma (Σ) preceded by a cased character and followed by none
+# becomes the FINAL form ς (U+03C2), while bash only ever produces the
+# plain form σ (U+03C3) — "## ΟΣ" renders ος, not οσ. The only other
+# unconditional multichar lowercase mapping is Turkish İ, which JavaScript
+# maps to i + U+0307 and bash to a bare i; it is replaced first so the
+# per-character pipeline never sees it. The sigma context is read on the
+# original string, and case-ignorable characters between the sigma and its
+# neighbour are not skipped, so such a heading degrades to the plain form,
+# never to a wrong final form. Every other mapping is one code point to one
+# code point, so ${var,,} already matches and the sigma pass only runs
+# when a Σ is present at all.
+# ---------------------------------------------------------------------------
+js_lowercase() {
+  local dotted=$'i\u0307'
+  local src=${1//İ/"$dotted"}
+  local out=${src,,}
+  if [[ $1 != *Σ* ]]; then
+    LOWER_OUT=$out
+    return 0
+  fi
+  local -i i n=${#src}
+  for (( i = 0; i < n; i++ )); do
+    [[ ${src:i:1} == Σ ]] || continue
+    # Final: a cased character precedes and none follows. [[:alpha:]]
+    # approximates "cased" — the scripts it wrongly calls cased (Han, kana)
+    # never sit next to a Greek sigma in these docs.
+    if (( i == 0 )); then continue; fi
+    if [[ ${src:i-1:1} != [[:alpha:]] ]]; then continue; fi
+    if (( i < n - 1 )) && [[ ${src:i+1:1} == [[:alpha:]] ]]; then continue; fi
+    # ${src,,} maps Σ to σ in place, so the sigma sits at the same index.
+    out=${out:0:i}ς${out:i+1}
+  done
+  LOWER_OUT=$out
+}
+
+# ---------------------------------------------------------------------------
 # slugify <text> -> the heading ID Docusaurus renders for that text.
 #
 # The result is returned in SLUG_OUT rather than on stdout: a command
 # substitution would fork a subshell per heading, and the guard runs over
 # every heading of every doc.
 #
-# Lowercase, delete the deleted set, then one hyphen per SPACE (U+0020) —
+# Lowercase (JavaScript rules — js_lowercase), delete the deleted set, then
+# one hyphen per SPACE (U+0020) —
 # one hyphen per space character, so a run of N spaces becomes N hyphens.
 # A deleted character is deleted, NOT replaced: "MySQL / MSSQL — deferred"
 # keeps the two spaces that surrounded the slash and the em dash, so it
 # renders as "mysql--mssql--deferred".
 # ---------------------------------------------------------------------------
 slugify() {
-  local text=${1,,}
+  js_lowercase "$1"
+  local text=$LOWER_OUT
   local out='' i ch cp
   local -i len=${#text}
   # Fast path: an all-ASCII heading needs no code-point scan. The ASCII
@@ -302,7 +357,7 @@ slugify() {
     # The list is written out so no globbing or word splitting can touch it.
     local p
     for p in '!' '"' '#' '$' '%' '&' "'" '(' ')' '*' '+' ',' '.' '/' ':' ';' \
-             '<' '=' '>' '?' '@' '[' '\\' ']' '^' '`' '{' '|' '}' '~'; do
+             '<' '=' '>' '?' '@' '[' '\' ']' '^' '`' '{' '|' '}' '~'; do
       text=${text//"$p"/}
     done
     text=${text// /-}
@@ -451,92 +506,228 @@ heading_text() {
 }
 
 # ---------------------------------------------------------------------------
+# One shared line scanner for heading_ids and fragment_links. One call per
+# line, in file order; it tracks the two constructs that hide markdown from
+# the renderer — fenced code blocks and HTML comments — and leaves the text
+# the renderer still sees for this line in CONTENT_OUT (empty for a line
+# inside a fence or comment).
+#
+# A fence is tracked by its CHARACTER and LENGTH: inside a four-backtick
+# block a three-backtick line is CONTENT (a fenced example), not a closer,
+# and a fence only closes on its own character, at least as many of them,
+# with nothing else on the line. A fence opens only at the start of a line.
+# ---------------------------------------------------------------------------
+
+scan_reset() {
+  SCAN_FENCE=0 SCAN_FENCE_CHAR='' SCAN_FENCE_LEN=0 SCAN_COMMENT=0
+}
+
+scan_step() {
+  local s=$1 out='' re
+  CONTENT_OUT=''
+  if (( SCAN_FENCE )); then
+    # A closing fence: the opening character, at least the opening length,
+    # then nothing but whitespace.
+    re='^[[:space:]]*('
+    re+=$SCAN_FENCE_CHAR
+    re+='{3,})[[:space:]]*$'
+    if [[ $s =~ $re ]] && (( ${#BASH_REMATCH[1]} >= SCAN_FENCE_LEN )); then
+      SCAN_FENCE=0
+    fi
+    return 0
+  fi
+  # A fence opens only at the start of the line: a ``` that follows text on
+  # the same line is an inline run of backticks, not a fence.
+  if [[ $s =~ ^[[:space:]]*(\`{3,}) ]]; then
+    SCAN_FENCE=1 SCAN_FENCE_CHAR='`' SCAN_FENCE_LEN=${#BASH_REMATCH[1]}
+    return 0
+  fi
+  if [[ $s =~ ^[[:space:]]*(\~{3,}) ]]; then
+    SCAN_FENCE=1 SCAN_FENCE_CHAR='~' SCAN_FENCE_LEN=${#BASH_REMATCH[1]}
+    return 0
+  fi
+  while [[ -n $s ]]; do
+    if (( SCAN_COMMENT )); then
+      if [[ $s != *'-->'* ]]; then
+        return 0                  # the rest of the line is commented out
+      fi
+      s=${s#*'-->'}
+      SCAN_COMMENT=0
+      continue
+    fi
+    if [[ $s == *'<!--'* ]]; then
+      out+=${s%%'<!--'*}
+      s=${s#*'<!--'}
+      SCAN_COMMENT=1
+      continue
+    fi
+    out+=$s
+    break
+  done
+  CONTENT_OUT=$out
+}
+
+# ---------------------------------------------------------------------------
 # Heading IDs of one markdown file, one per line.
 #
-# Fenced code blocks are skipped: a '#' line inside a shell snippet is not a
-# heading, and treating it as one would invent anchor IDs that do not exist.
-# Level-1 headings are skipped too: they are the page title, which the theme
-# renders without an id.
+# Fenced code and HTML comments are skipped (scan_step): a '#' line inside a
+# shell snippet is not a heading, and a commented-out heading is never
+# rendered. Level-1 headings are skipped too: they are the page title,
+# which the theme renders without an id.
 # ---------------------------------------------------------------------------
 heading_ids() {
-  local file=$1
-  local in_fence=0 fence='' line text level slug
+  local file=$1 line text level slug id base
   local -A seen=()
   local -i n
+  scan_reset
   while IFS= read -r line || [[ -n $line ]]; do
-    if (( in_fence )); then
-      if [[ $line =~ ^[[:space:]]*\`\`\` ]] || [[ $line =~ ^[[:space:]]*\~\~\~ ]]; then
-        in_fence=0
-      fi
-      continue
-    fi
-    if [[ $line =~ ^[[:space:]]*\`\`\` ]]; then
-      in_fence=1
-      continue
-    fi
-    if [[ $line =~ ^[[:space:]]*\~\~\~ ]]; then
-      in_fence=1
-      continue
-    fi
-    [[ $line =~ ^(#{1,6})(\ |$) ]] || continue
+    scan_step "$line"
+    [[ $CONTENT_OUT =~ ^(#{1,6})(\ |$) ]] || continue
     level=${BASH_REMATCH[1]}
-    text=${line#"$level"}
+    text=${CONTENT_OUT#"$level"}
     # Strip the space the ATX heading requires.
     text=${text# }
     # Level 1 is the page title: Docusaurus renders <h1> without an id.
     [[ $level == '#' ]] && continue
+    # An explicit id: Docusaurus strips a trailing {#id} from the heading
+    # BEFORE slugging and renders that id verbatim, so the braces never
+    # reach the slug step and the heading's anchor is the id, not a slug of
+    # the whole heading text.
+    id=''
+    if [[ $text =~ \{#([^}]+)\}[[:space:]]*$ ]]; then
+      id=${BASH_REMATCH[1]}
+      text=${text:0:$(( ${#text} - ${#BASH_REMATCH[0]} ))}
+    fi
     heading_text "$text"
     text=$TEXT_OUT
     # CommonMark strips trailing whitespace from an ATX heading's text.
     text=${text%"${text##*[![:space:]]}"}
     slugify "$text"
     slug=$SLUG_OUT
-    # github-slugger keeps the slugger state per FILE: a repeated heading
-    # gets "-1", "-2", … appended, so the second "### When to Use Each" is
-    # "when-to-use-each-1" and both are real anchors.
-    if [[ -n ${seen["$slug"]:-} ]]; then
-      n=${seen["$slug"]}
-      n=$((n + 1))
-      seen["$slug"]=$n
-      printf '%s-%s\n' "$slug" "$n"
-    else
+    [[ -n $id ]] && slug=$id
+    # github-slugger keeps per-FILE state and RESERVES every id it emits:
+    # A, A-1, A render a, a-1, a-2 — the second A climbs the counter PAST
+    # the a-1 the literal "A-1" heading already emitted, instead of
+    # colliding with it. An explicit {#id} enters the same map, so a later
+    # heading cannot re-emit it either.
+    if [[ -z ${seen["$slug"]+x} ]]; then
       seen["$slug"]=0
-      printf '%s\n' "$slug"
+    else
+      base=$slug
+      n=${seen["$base"]}
+      while :; do
+        n=$((n + 1))
+        seen["$base"]=$n
+        slug="$base-$n"
+        [[ -z ${seen["$slug"]+x} ]] && break
+      done
+      seen["$slug"]=0
     fi
+    printf '%s\n' "$slug"
   done < "$file"
 }
 
 # ---------------------------------------------------------------------------
-# Every markdown link target that carries a fragment, one per line.
+# Destinations of every markdown link node whose target carries a fragment,
+# one per line, accumulated into LINK_DESTS across the calls of one file.
 #
-# Only inline links and images are considered: anything without a '](…'
-# shape — reference-style links ([text][ref]), autolinks, link
-# definitions — is invisible to this scan. None of them are used in
-# website/docs; if one ever carries a heading fragment, fragment_links
-# must learn the form first, or the guard stays silent about it.
+# The scan runs on the scanner's visible text only (no fences, no HTML
+# comments) and parses link NODES instead of scanning raw lines: a
+# [x](#missing) inside an inline code span is literal documentation text,
+# and the optional title of [x](#real "title") is link syntax, not part of
+# the target — neither may reach the fragment check. Inline code is dropped
+# first (a backtick hides everything up to the next backtick), then every
+# [label](dest), [label](<dest>) and [label](dest "title") node contributes
+# its destination. Anything without a ]( … ) node shape — reference-style
+# links ([text][ref]), autolinks, link definitions — stays invisible, as
+# before: none are used in website/docs; if one ever carries a fragment,
+# this parser must learn the form first, or the guard stays silent about it.
 # ---------------------------------------------------------------------------
+
+# One link node's destination. $1 is the text after the `]( `. LINK_DEST
+# receives the destination, LINK_REST the text after the node's closing
+# ')', and LINK_OK says whether a well-formed node was found at all.
+LINK_DEST='' LINK_REST='' LINK_OK=0
+parse_link_node() {
+  local s=$1
+  LINK_DEST='' LINK_REST='' LINK_OK=0
+  # Whitespace just inside the parentheses is link syntax.
+  s=${s#"${s%%[![:space:]]*}"}
+  if [[ $s == '<'* ]]; then
+    # An angle destination: everything up to the closing '>'.
+    [[ $s == *'>'* ]] || return 0
+    LINK_DEST=${s:1}
+    LINK_DEST=${LINK_DEST%%'>'*}
+    s=${s#*'>'}
+  else
+    # A bare destination runs to the first whitespace or ')'.
+    LINK_DEST=${s%%[[:space:])]*}
+    s=${s#"$LINK_DEST"}
+  fi
+  # An optional title — "…", '…' or (…) — is link syntax: the destination
+  # already ended before it, and it never contains a bare closer.
+  s=${s#"${s%%[![:space:]]*}"}
+  case $s in
+    '"'* ) s=${s#'"'}; s=${s#*'"'} ;;
+    "'"* ) s=${s#"'"}; s=${s#*"'"} ;;
+    '('* ) s=${s#*'('}; s=${s#*')'} ;;
+  esac
+  # Whitespace between the node and its closing ')' is link syntax too.
+  s=${s%"${s##*[![:space:]]}"}
+  [[ $s == ')'* ]] || return 0
+  LINK_REST=${s#')'}
+  LINK_OK=1
+}
+
+collect_link_destinations() {
+  local s=$1 seg head out=''
+  local tick='`'
+  while [[ -n $s ]]; do
+    # An inline code span's content is literal — drop it whole.
+    if [[ $s == *"$tick"* ]]; then
+      seg=${s%%"$tick"*}
+      s=${s#*"$tick"}
+      if [[ $s == *"$tick"* ]]; then
+        s=${s#*"$tick"}
+      else
+        s=''                       # unpaired backtick: the rest is code text
+      fi
+    else
+      seg=$s
+      s=''
+    fi
+    while [[ $seg == *']('* ]]; do
+      head=${seg%%']('*}
+      parse_link_node "${seg#*']('}"
+      if (( ! LINK_OK )); then
+        # No well-formed node here: resume after this ]( so a later one on
+        # the same line is still found.
+        seg=${seg#*']('}
+        continue
+      fi
+      seg=$LINK_REST
+      # It is only a link if the label is bracketed text: the last '['
+      # before the ]( must carry no ']' after it.
+      if [[ $head != *'['* || ${head##*'['} == *']'* ]]; then
+        continue
+      fi
+      [[ $LINK_DEST == *'#'* ]] && out+="$LINK_DEST"$'\n'
+    done
+  done
+  LINK_DESTS+=$out
+}
+
 fragment_links() {
   local file=$1
-  local in_fence=0 line target rest
+  scan_reset
+  LINK_DESTS=''
   while IFS= read -r line || [[ -n $line ]]; do
-    if (( in_fence )); then
-      if [[ $line =~ ^[[:space:]]*\`\`\` ]] || [[ $line =~ ^[[:space:]]*\~\~\~ ]]; then
-        in_fence=0
-      fi
-      continue
-    fi
-    if [[ $line =~ ^[[:space:]]*\`\`\` ]] || [[ $line =~ ^[[:space:]]*\~\~\~ ]]; then
-      in_fence=1
-      continue
-    fi
-    while [[ $line == *']('* ]]; do
-      rest=${line#*']('}
-      target=${rest%%)*}
-      line=${rest#*')'}
-      [[ $target == *'#'* ]] || continue
-      printf '%s\n' "$target"
-    done
+    scan_step "$line"
+    collect_link_destinations "$CONTENT_OUT"
   done < "$file"
+  # One destination per line, already newline-terminated: stdout feeds the
+  # main loop's read, as the old printf-per-target scan did.
+  printf '%s' "$LINK_DESTS"
 }
 
 # ---------------------------------------------------------------------------
@@ -546,9 +737,20 @@ declare -A FILE_IDS=()
 declare -A FILE_SEEN=()
 
 DOC_FILES=()
+doc_list=''
+# The inventory must be COMPLETE before anything is graded. As a process
+# substitution the pipeline's exit status was lost, so a failing find, sed
+# or sort read as an empty — silently partial — list and every link passed.
+# Command substitution keeps the status under pipefail: a discovery error
+# fails the guard instead of shrinking the checked set.
+if ! doc_list=$(cd "$DOCS_ROOT" && find . -type f -name '*.md' | sed 's|^\./||' | sort); then
+  echo 'FAIL: website/docs discovery failed — the guard refuses to grade a partial inventory' >&2
+  exit 1
+fi
 while IFS= read -r rel; do
+  [[ -n $rel ]] || continue         # the herestring's trailing newline
   DOC_FILES+=("$rel")
-done < <(cd "$DOCS_ROOT" && find . -type f -name '*.md' | sed 's|^\./||' | sort)
+done <<< "$doc_list"
 
 for rel in "${DOC_FILES[@]}"; do
   FILE_SEEN["$rel"]=1
@@ -562,6 +764,10 @@ printf 'checked %d markdown file(s) under website/docs\n' "${#DOC_FILES[@]}"
 resolve_target() {
   local from_dir=$1 path=$2
   local base
+  # A leading '/' is site-root-relative: the docs root is the page root.
+  if [[ $path == /* ]]; then
+    from_dir=''
+  fi
   base=$(cd "$DOCS_ROOT/$from_dir" 2>/dev/null && cd "$(dirname "$path")" 2>/dev/null \
     && printf '%s/%s' "$(pwd)" "$(basename "$path")" || true)
   [[ -n $base ]] || return 1
@@ -587,9 +793,21 @@ for rel in "${DOC_FILES[@]}"; do
     else
       target_file=$(resolve_target "$dir" "$path") || continue
     fi
-    # The path itself is Docusaurus's job (onBrokenMarkdownLinks); the guard
-    # only resolves fragments against files it knows.
-    [[ -n ${FILE_SEEN["$target_file"]:-} ]] || continue
+    # An EXTENSIONLESS page URL renders from its markdown source: ./other
+    # serves other.md and ./sub/ serves sub/index.md. Resolve those before
+    # the fragment check — a URL with no source file behind it is a broken
+    # PATH (Docusaurus's onBrokenMarkdownLinks, not this guard), but one
+    # that resolves must have its fragment checked, not skipped as an
+    # unknown key.
+    if [[ -z ${FILE_SEEN["$target_file"]+x} ]]; then
+      if [[ -n ${FILE_SEEN["$target_file.md"]+x} ]]; then
+        target_file=$target_file.md
+      elif [[ -n ${FILE_SEEN["$target_file/index.md"]+x} ]]; then
+        target_file=$target_file/index.md
+      else
+        continue
+      fi
+    fi
     if ! grep -qxF -- "$fragment" <<<"${FILE_IDS["$target_file"]}"; then
       printf 'FAIL: %s: link to #%s resolves to no heading in %s\n' \
         "$rel" "$fragment" "$target_file" >&2

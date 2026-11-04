@@ -39,9 +39,10 @@ WORKFLOW
   # interpreter, grep (a bin/check REQUIRED probe, the SHA-pin scan's matcher
   # and check-scrub-features'), find (the Pages guard and the anchor guard's
   # doc walk), tr (the token-regex regression's hex helper), and the anchor
-  # guard's locale probe plus its sed/sort helpers. basename is the anchor
-  # guard's cross-file link resolver. mkdir/rm/touch are the
-  # external commands the stub itself runs.
+  # guard's locale probe plus its sed/sort helpers (the sed is the guard's
+  # doc-discovery pipeline; the discovery-failure case below swaps in a
+  # failing stub). basename is the anchor guard's cross-file link resolver.
+  # mkdir/rm/touch are the external commands the stub itself runs.
   for tool in bash dirname basename grep find mkdir rm touch tr locale sed sort; do
     ln -s "$(command -v "$tool")" "$work/tools/$tool"
   done
@@ -448,4 +449,133 @@ printf '# Title\n\n```sh\n## fake heading\n```\n\nSee [fake](#fake-heading).\n' 
   > "$work/repo/website/docs/fenced.md"
 run_gate 1
 assert_output 'resolves to no heading in'
+# A fence is tracked by CHARACTER and LENGTH: inside a four-backtick block a
+# three-backtick example is CONTENT, not a closer, so the ## fake line stays
+# hidden and #fake must fail — while ## Real heading after the matching
+# four-backtick closer is still found. With length-blind toggling the inner
+# fence opened and closed the block, the fake heading was inventoried and
+# the dead #fake link passed.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n````md\n```sh\n## fake heading\n```\n````\n\n## Real heading\n\nSee [fake](#fake-heading) and [real](#real-heading).\n' \
+  > "$work/repo/website/docs/fence-nested.md"
+run_gate 1
+assert_output 'resolves to no heading in'
+# An HTML comment hides its whole contents: the commented-out heading is
+# not an anchor, so #hidden-heading fails…
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n<!--\n## Hidden heading\n-->\n\n## Real heading\n\nSee [hidden](#hidden-heading) and [real](#real-heading).\n' \
+  > "$work/repo/website/docs/commented-heading.md"
+run_gate 1
+assert_output 'resolves to no heading in'
+# …and a commented-out LINK is not a link either: the doc's only dead
+# fragment link sits inside the comment and must not fail the guard.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n<!-- [old](#no-such-heading) -->\n\n## Real heading\n\nSee [real](#real-heading).\n' \
+  > "$work/repo/website/docs/commented-link.md"
+run_gate 0
+assert_output 'every heading fragment link resolves to a rendered heading ID'
+# An explicit {#id} renders verbatim instead of a slug of the whole heading
+# text: #custom-id resolves…
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## Heading {#custom-id}\n\nSee [direct](#custom-id).\n' \
+  > "$work/repo/website/docs/explicit-id.md"
+run_gate 0
+assert_output 'every heading fragment link resolves to a rendered heading ID'
+# …and the invented whole-string slug no longer exists.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## Heading {#custom-id}\n\nSee [invented](#heading-custom-id).\n' \
+  > "$work/repo/website/docs/explicit-id-broken.md"
+run_gate 1
+assert_output 'resolves to no heading in'
+# github-slugger reserves every id it emits: A, A-1, A render a, a-1 and
+# a-2 — the second A climbs past the a-1 the literal heading emitted, so
+# the valid #a-2 link resolves. Counter-collision produced a, a-1, a-1 and
+# rejected the real #a-2.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## A\n\n## A-1\n\n## A\n\nSee [a](#a), [a1](#a-1) and [a2](#a-2).\n' \
+  > "$work/repo/website/docs/dedupe.md"
+run_gate 0
+assert_output 'every heading fragment link resolves to a rendered heading ID'
+# Lowercase is JavaScript's, not bash's: a final sigma (a capital Σ after a
+# cased character with none following) is ς, so ## ΟΣ renders ος and
+# ## ΟΣ ΑΣ renders ος-ας — both links resolve…
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## ΟΣ\n\n## ΟΣ ΑΣ\n\n## ΑΣ\n\nSee [x](#ος), [y](#ος-ας) and [z](#ας).\n' \
+  > "$work/repo/website/docs/sigma.md"
+run_gate 0
+assert_output 'every heading fragment link resolves to a rendered heading ID'
+# …and the plain-form σ the bash lowercasing would have produced is a dead
+# anchor and fails.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## ΟΣ\n\nSee [x](#οσ).\n' > "$work/repo/website/docs/sigma-broken.md"
+run_gate 1
+assert_output 'resolves to no heading in'
+# A backslash inside a heading's code span is deleted like any other
+# punctuation: `a\b` renders ab. The ASCII fast path must delete ONE
+# backslash — its '\\' list entry held two, so a single one survived and
+# the slug kept it.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## The `a\\b` switch\n\nSee [x](#the-ab-switch).\n' \
+  > "$work/repo/website/docs/backslash.md"
+run_gate 0
+assert_output 'every heading fragment link resolves to a rendered heading ID'
+# Link NODES are parsed, not raw ]( lines: a [x](#missing) inside an inline
+# code span is literal text, and an optional title is link syntax — the
+# titled, single-quoted and angle forms all resolve to #real-heading.
+fixture
+mkdir -p "$work/repo/website/docs"
+cat > "$work/repo/website/docs/link-nodes.md" <<'DOC'
+# Title
+
+## Real heading
+
+Code `[x](#missing)` is text. Titled [x](#real-heading "title"),
+single [y](#real-heading 'title') and angled [z](<#real-heading>).
+DOC
+run_gate 0
+assert_output 'every heading fragment link resolves to a rendered heading ID'
+# An EXTENSIONLESS page URL renders from its markdown source: ./other is
+# other.md, so a dead fragment behind the valid page URL fails instead of
+# being skipped as an unknown file (the old FILE_SEEN lookup dropped it
+# silently — and dropped the VALID extensionless link with it).
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## Other heading\n' > "$work/repo/website/docs/other.md"
+printf '# Title\n\n## Cross-file heading\n\nSee [ok](./other#other-heading) and [dead](./other#no-such-heading).\n' \
+  > "$work/repo/website/docs/cross-ext.md"
+run_gate 1
+assert_output 'resolves to no heading in'
+# The trailing-slash form renders the directory's index page, and a valid
+# fragment behind it resolves rather than being skipped or failing.
+fixture
+mkdir -p "$work/repo/website/docs/sub"
+printf '# Title\n\n## Sub heading\n' > "$work/repo/website/docs/sub/index.md"
+printf '# Title\n\n## Here\n\nSee [idx](./sub/#sub-heading).\n' \
+  > "$work/repo/website/docs/index-link.md"
+run_gate 0
+assert_output 'every heading fragment link resolves to a rendered heading ID'
+# Discovery failing must fail the guard, not grade a partial inventory: as
+# a process substitution the discovery pipeline's exit status was lost, so
+# a failing sed read as an empty doc list and every link passed. The docs
+# tree EXISTS here, so the guard actually reaches discovery.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## Real heading\n\nSee [x](#real-heading).\n' \
+  > "$work/repo/website/docs/valid.md"
+printf '#!/usr/bin/env bash\nexit 45\n' > "$work/tools/broken-sed"
+chmod +x "$work/tools/broken-sed"
+rm "$work/tools/sed"
+ln -s broken-sed "$work/tools/sed"
+run_gate 1
+assert_output 'website/docs discovery failed'
+assert_not_run "NOT RUN: pages typecheck/build/artifact guard - the gate stopped before this job"
 printf 'check orchestration regressions passed\n'

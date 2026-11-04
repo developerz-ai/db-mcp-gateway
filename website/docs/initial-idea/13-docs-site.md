@@ -152,22 +152,23 @@ mdBook's `create-missing = false`, tighter — Docusaurus checks every
 markdown-to-markdown link PATH resolves too.
 
 Those two options cover link PATHS only. A same-page or cross-page
-heading ANCHOR fragment (`#some-heading`) is not a broken link and is
-never collected by Docusaurus, so a fragment that points at a heading
-that does not exist passes the build and ships a dead anchor.
+heading ANCHOR fragment (`#some-heading`) is a separate validation, not
+a broken link: Docusaurus collects anchors and reports broken ones under
+`onBrokenAnchors`, which defaults to 'warn'. A fragment that points at a
+heading that does not exist therefore only WARNS in the build and still
+ships a dead anchor — anchor validation never blocks the build the way
+path validation does.
 
-Anchor fragments are checked separately, by the anchor guard
+That separation is why the anchor guard exists
 (`tests/bin/doc-anchors.test.sh`): it resolves every heading fragment
 link in `website/docs` against the heading IDs the build renders
 (github-slugger rules — lowercased, the punctuation set and the control
 characters deleted, and each space (U+0020) replaced by one hyphen, so a
 run of N spaces becomes N hyphens) and fails when a fragment matches no
-heading. The build only WARNS: `onBrokenAnchors` defaults to 'warn' and
-`docusaurus.config.ts` never sets it, so a dead anchor ships. `bin/ci`
-runs the guard as its `doc-anchor guard` job — that gate is what fails
-on a broken anchor. The guard checks fragments only; path resolution
-stays with `onBrokenLinks` / `onBrokenMarkdownLinks`, and neither
-option is loosened.
+heading. `bin/ci` runs the guard as its `doc-anchor guard` job — that
+gate is what fails on a broken anchor. The guard checks fragments only;
+path resolution stays with `onBrokenLinks` / `onBrokenMarkdownLinks`,
+and neither option is loosened.
 
 ## Build-dir gitignore
 
