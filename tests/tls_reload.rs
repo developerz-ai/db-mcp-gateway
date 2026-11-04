@@ -184,14 +184,11 @@ async fn sighup_reloads_tls_cert_without_dropping_listener() {
 /// supplied roots. Returns true on a 2xx response, false on any TLS or HTTP
 /// error. Uses `resolve` to pin the SNI hostname to 127.0.0.1 without DNS.
 async fn request(roots: &[Certificate], host: &str, port: u16) -> bool {
-    let mut builder = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .resolve(host, format!("127.0.0.1:{port}").parse().expect("addr"))
         .timeout(Duration::from_secs(2))
         // Only the supplied roots are trusted — no OS trust store leakage.
-        .tls_built_in_root_certs(false);
-    for root in roots {
-        builder = builder.add_root_certificate(root.clone());
-    }
+        .tls_certs_only(roots.iter().cloned());
     let client = match builder.build() {
         Ok(c) => c,
         Err(_) => return false,
