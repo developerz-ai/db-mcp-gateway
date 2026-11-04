@@ -49,7 +49,7 @@ Phased plan from skeleton to a deployable gateway. Each phase is mergeable indep
 ## Phase 5 — Beyond Postgres (partial — see note)
 
 - MongoDB adapter ✅ done (v0.2.0) — `DbAdapter` trait implemented; schema describe, run_query, explain wired.
-- MySQL adapter — **deferred post-1.0**. Config parses and validates, but dispatch returns `UnsupportedAdapter` at boot. See [note below](#mysql--mssql-deferred).
+- MySQL adapter — **deferred post-1.0**. Config parses and validates, but dispatch returns `UnsupportedAdapter` at boot. See [note below](#mysql--mssql--deferred).
 - MSSQL adapter — **deferred post-1.0**. Same status as MySQL.
 - BigQuery adapter — not started.
 - Snowflake adapter — not started.
