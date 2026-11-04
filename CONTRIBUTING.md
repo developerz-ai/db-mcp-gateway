@@ -274,7 +274,7 @@ is evidence of validation, not a guarantee of deployment success.
 
 ## Release Process
 
-Cutting a release is documented in [`docs/deployment/releasing.md`](docs/deployment/releasing.md). TL;DR:
+Cutting a release is documented in [`website/docs/deployment/releasing.md`](website/docs/deployment/releasing.md). TL;DR:
 - Tag a commit with `v<major>.<minor>.<patch>`.
 - GitHub Actions auto-builds and pushes to GHCR (`ghcr.io/developerz-ai/db-mcp-gateway:X.Y.Z`).
 - Update `CHANGELOG.md` in the same PR.
