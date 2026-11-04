@@ -1,8 +1,9 @@
 # Benchmarks
 
-A harness for measuring what the gateway costs you. **No published numbers
-live here** — see `website/docs/benchmarks.md` for why. This directory exists
-so that anyone, including us, can produce their own.
+A harness for measuring what the gateway costs you. The published numbers
+live in `website/docs/benchmarks.md`, and the committed run evidence behind
+them lives in `results/` — see "Raw results" below. This directory exists so
+that anyone, including us, can produce their own.
 
 ## Run it
 
@@ -186,7 +187,7 @@ harness/
   stats.rs             exact percentiles, overhead deltas
   env.rs               machine + build provenance
   report.rs            JSON + Markdown output
-results/               raw JSON, gitignored
+results/               committed run evidence + local scratch (latest.json)
 ```
 
 Built only with `--features bench-harness`, so it never enters a release
@@ -194,11 +195,20 @@ build or the runtime image.
 
 ## Raw results
 
-Every run writes one JSON file under `benchmarks/results/` (gitignored). It
-carries the workload definition, the effective configuration, the software
-revision (commit hash plus a dirty-tree flag), the environment, and the raw
-measurement samples — enough to re-derive the published percentiles rather
-than take them on trust.
+Named result files are **committed** — `results/postgres.json`,
+`results/mongo.json`, `results/instances4.json` and `results/REPORT.md` are
+the run evidence behind the numbers in `website/docs/benchmarks.md`, which
+links each figure to its artifact. Every run also writes one JSON file under
+`benchmarks/results/`; it carries the workload definition, the effective
+configuration, the software revision (commit hash plus a dirty-tree flag),
+the environment, and the raw measurement samples — enough to re-derive the
+published percentiles rather than take them on trust. `REPORT.md` records
+every harness invocation: exact command, exit status, the Markdown report,
+warnings, retries and failures.
+
+The harness's default `--out` target, `results/latest.json`, stays
+gitignored: it is per-run scratch, overwritten on every run, and not part of
+the published evidence.
 
 No credential, connection string, service token or password appears in any
 result file, log line, error or Markdown report. The bench configs hold only

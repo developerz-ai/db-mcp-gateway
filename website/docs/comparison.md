@@ -106,7 +106,7 @@ groups:
 | **Security Features** | Basic (DIY) | Complete (SSO + audit) |
 | **Multi-Database** | Reinvent per DB type | Built-in (PG + Mongo) |
 | **Compliance Ready** | ❌ Build yourself | ✅ Built-in |
-| **Performance** | Yours to tune | [Not measured](benchmarks.md) |
+| **Performance** | Yours to tune | [Measured](benchmarks.md) |
 | **Error Handling** | Custom | Typed errors with stable codes |
 
 ### Total Cost of Ownership
@@ -343,7 +343,7 @@ from, so we are not going to invent one.
 | **MCP Protocol** | ❌ No | ✅ Yes | ❌ No | ❌ No | ✅ Yes |
 | **Configuration** | Ad-hoc | Custom code | SQL/Tables | INI files | ✅ YAML + Git |
 | **Maintenance** | Ongoing | High | Medium | Low | ✅ Low (upstream) |
-| **Performance** | Not measured | Not measured | Not measured | Not measured | [Not measured](benchmarks.md) |
+| **Performance** | Not measured | Not measured | Not measured | Not measured | [Measured](benchmarks.md) |
 | **Compliance** | ❌ DIY | ⚠️ DIY | ❌ Limited | ❌ Limited | ✅ Built-in |
 
 ---
@@ -360,8 +360,8 @@ from, so we are not going to invent one.
 - Pure performance optimization is the goal (use ProxySQL/PgBouncer)
 - Simple development environments without compliance needs (use direct access)
 - Enterprise-wide data governance beyond databases (use Immuta/Collibra)
-- Maximum performance is critical and you cannot accept an unquantified
-  proxy hop — we have not [measured ours](benchmarks.md) yet, so budget for
-  measuring it yourself before committing
+- Maximum performance is critical and a proxy hop sits on your critical path
+  — ours is [measured](benchmarks.md), but only on one shared host, so budget
+  for measuring it on your own hardware before committing
 
 **The sweet spot:** Production databases + AI agents + compliance requirements + operational simplicity.
