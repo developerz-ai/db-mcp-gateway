@@ -77,9 +77,11 @@ A `server.kind` of `mysql` or `mssql` refuses to start rather than booting
 clean and failing every query, so a wrong config is caught at deploy time and
 not by a user. MySQL and MSSQL query adapters are on the roadmap.
 
-**Performance:** we publish no benchmark numbers. We removed the ones we had
-because nobody had measured them — [here is what happened and how to measure
-it yourself](website/docs/benchmarks.md).
+**Performance:** measured numbers are published in
+[website/docs/benchmarks.md](website/docs/benchmarks.md), with the raw run
+evidence committed under [`benchmarks/results/`](benchmarks/results/) — and
+the harness to [measure it yourself](website/docs/benchmarks.md) on your own
+hardware.
 
 ---
 

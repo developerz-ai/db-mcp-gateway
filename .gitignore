@@ -54,9 +54,11 @@ goal.txt
 # `cargo chef prepare` would leave one in the working tree.
 recipe.json
 
-# Benchmark output. Raw results are environment-specific and only meaningful
-# next to the machine they came from — regenerate with benchmarks/gateway_overhead.sh.
-benchmarks/results/
+# Benchmark output. latest.json — the harness's default --out — is local
+# scratch, overwritten every run. The named evidence files (postgres.json,
+# mongo.json, instances4.json, REPORT.md) are committed as the evidence behind
+# the numbers published in website/docs/benchmarks.md.
+benchmarks/results/latest.json
 
 # developerz.ai maintainer agent — scratch it writes for itself while it works
 # (staged CI logs, run artifacts, run provenance). Written BY the agent FOR the
