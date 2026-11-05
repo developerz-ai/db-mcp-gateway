@@ -149,7 +149,23 @@ and credentialed; passing local checks does not guarantee deployment success.
 `onBrokenMarkdownLinks: 'throw'` so a rename that breaks an internal doc
 link fails the build instead of shipping a dead link. Same guarantee as
 mdBook's `create-missing = false`, tighter — Docusaurus checks every
-markdown-to-markdown link resolves too.
+markdown-to-markdown link PATH resolves too.
+
+Those two options cover link PATHS only. A same-page or cross-page
+heading ANCHOR fragment (`#some-heading`) is not a broken link and is
+never collected by Docusaurus, so a fragment that points at a heading
+that does not exist passes the build and ships a dead anchor.
+
+Anchor fragments are checked separately, by the anchor guard
+(`tests/bin/doc-anchors.test.sh`): it resolves every heading fragment
+link in `website/docs` against the heading IDs the build renders
+(github-slugger rules — lowercased, the punctuation set and the control
+characters deleted, and each space (U+0020) replaced by one hyphen, so a
+run of N spaces becomes N hyphens) and fails when a fragment matches no
+heading. `bin/ci` runs it, so a broken anchor fails the gate as well as
+the build. The guard checks fragments only; path resolution stays with
+`onBrokenLinks` / `onBrokenMarkdownLinks`, and neither option is
+loosened.
 
 ## Build-dir gitignore
 

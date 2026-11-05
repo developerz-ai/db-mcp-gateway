@@ -19,6 +19,11 @@ fixture() {
   # The real token-regex regression, verbatim: the gate must run the same
   # script CI runs, so the fixture copies it instead of stubbing it.
   cp tests/bin/secret-scan-regex.test.sh "$work/repo/tests/bin/"
+  # The doc-anchor guard, verbatim, for the same reason: the gate invokes
+  # it, so the fixture must be able to resolve it. The fixture repo has no
+  # website/docs tree, and the guard passes on a missing tree — which is
+  # what lets the happy path below reach a verdict.
+  cp tests/bin/doc-anchors.test.sh "$work/repo/tests/bin/"
   # One pinned ref and one local action: both halves of the SHA-pin scan's
   # filtering must accept them, or the clean run below fails.
   cat > "$work/repo/.github/workflows/ci.yml" <<'WORKFLOW'
@@ -32,10 +37,12 @@ WORKFLOW
   chmod +x "$work/repo/website/node_modules/.bin/"*
   # Only what the gate still resolves on this PATH: the scripts' dirname, the
   # interpreter, grep (a bin/check REQUIRED probe, the SHA-pin scan's matcher
-  # and check-scrub-features'), find (the Pages guard) and tr (the token-regex
-  # regression's hex helper). mkdir/rm/touch are the external
-  # commands the stub itself runs.
-  for tool in bash dirname grep find mkdir rm touch tr; do
+  # and check-scrub-features'), find (the Pages guard and the anchor guard's
+  # doc walk), tr (the token-regex regression's hex helper), and the anchor
+  # guard's locale probe plus its sed/sort helpers. basename is the anchor
+  # guard's cross-file link resolver. mkdir/rm/touch are the
+  # external commands the stub itself runs.
+  for tool in bash dirname basename grep find mkdir rm touch tr locale sed sort; do
     ln -s "$(command -v "$tool")" "$work/tools/$tool"
   done
   cat > "$work/tools/stub" <<'STUB'
@@ -183,6 +190,9 @@ done
 assert_output 'no literal service tokens in committed config (git grep rc=1)'
 # The token-regex regression ran the real script copied into the fixture.
 assert_output 'passed, 0 failed'
+# The doc-anchor guard ran too: the gate invokes it, so the fixture must
+# prove the wiring, not just that the script was copied.
+assert_output 'no website/docs tree — nothing to check (pass)'
 # Every job ran: the summary must claim no skip.
 assert_output '✓ Local quality checks passed (no publishing or deployment)'
 not_called 'ps --status running'
@@ -375,7 +385,44 @@ fixture
 printf 'exit 44\n' > "$work/repo/tests/bin/check.test.sh"
 run_gate 44
 # Stopping at the FIRST job names every job the gate never reached.
-for job in 'fmt + clippy' 'test' 'cargo audit' 'secret-scan' 'pages typecheck/build/artifact guard'; do
+for job in 'fmt + clippy' 'test' 'cargo audit' 'secret-scan' 'doc-anchor guard' 'pages typecheck/build/artifact guard'; do
   assert_not_run "NOT RUN: $job - the gate stopped before this job"
 done
+# A VALID fragment resolves and the gate passes. The double-hyphen target is
+# the acceptance-critical one: "### MySQL / MSSQL — deferred" renders as
+# "mysql--mssql--deferred", because the slash and the em dash are DELETED
+# and each of the two spaces around them becomes its own hyphen — a
+# whitespace RUN is not collapsed into one. The all-ASCII "Two  spaces"
+# heading pins the same rule on the slugger's fast path, where the run is a
+# literal "  " rather than two spaces made adjacent by a deletion.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## Real heading\n\n### MySQL / MSSQL — deferred\n\n## Two  spaces\n\nSee [below](#real-heading), [deferred](#mysql--mssql--deferred) and [two](#two--spaces).\n' \
+  > "$work/repo/website/docs/valid.md"
+printf '# Title\n\n## Other heading\n' > "$work/repo/website/docs/other.md"
+printf '# Title\n\n## Cross-file heading\n\nSee [across](./other.md#other-heading).\n' \
+  > "$work/repo/website/docs/cross.md"
+run_gate 0
+assert_output 'every heading fragment link resolves to a rendered heading ID'
+# A broken heading FRAGMENT fails the gate. The Docusaurus build only
+# WARNS about a broken anchor (onBrokenAnchors defaults to 'warn'), so the
+# anchor guard is the thing that makes it fail — and the gate must fail on
+# it.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## Real heading\n\nSee [below](#no-such-heading).\n' \
+  > "$work/repo/website/docs/broken.md"
+run_gate 1
+assert_output 'resolves to no heading in'
+# A broken CROSS-FILE fragment fails the gate too. The guard resolves the
+# link's path against the doc tree, so a fragment that matches no heading
+# in the OTHER file is caught — and a guard that skipped cross-file
+# resolution would read this case as clean and let the gate pass.
+fixture
+mkdir -p "$work/repo/website/docs"
+printf '# Title\n\n## Other heading\n' > "$work/repo/website/docs/other.md"
+printf '# Title\n\n## Cross-file heading\n\nSee [across](./other.md#no-such-heading).\n' \
+  > "$work/repo/website/docs/cross-broken.md"
+run_gate 1
+assert_output 'resolves to no heading in'
 printf 'check orchestration regressions passed\n'
