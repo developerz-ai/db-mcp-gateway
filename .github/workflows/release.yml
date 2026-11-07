@@ -229,5 +229,5 @@ jobs:
             ```
 
             GHCR is the public artifact; DOCR is the in-cluster source the
-            ArgoCD Image Updater tracks. See `docs/deployment/quickstart.md`
+            ArgoCD Image Updater tracks. See `website/docs/deployment/quickstart.md`
             for setup.
