@@ -64,7 +64,7 @@ async-trait = "0.1"
 mongodb = { version = "3.7", default-features = false, features = ["rustls-tls-aws-lc", "dns-resolver", "compat-3-3-0", "bson-3"] }
 
 # auth / crypto
-jsonwebtoken = "9"
+jsonwebtoken = "11"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form", "query"] }
 url = "2"
 # PKCE S256 for the MCP OAuth bridge: base64url-no-pad(sha256(verifier))
