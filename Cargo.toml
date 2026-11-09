@@ -80,7 +80,13 @@ clap = { version = "4", features = ["derive", "env"] }
 # `libsqlite3-sys` — sqlx-sqlite 0.8.6 requires `^0.30.1` and the fix landed
 # in 0.39.0 — so the driver is stood in for by a no-op stub; see
 # `[patch.crates-io]` below.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "macros", "migrate", "json", "postgres", "mysql", "uuid", "chrono", "bigdecimal"] }
+#
+# The version is pinned exactly, not to a range: the stub satisfies only
+# sqlx's `sqlx-sqlite = "=0.8.6"` requirement, so a `cargo update` that moved
+# sqlx to 0.8.7 would leave the patch unused — the real driver, and
+# `libsqlite3-sys` with it, would return to the lock and RUSTSEC-2026-0459
+# with them. Bump sqlx and the stub's version in the same commit.
+sqlx = { version = "=0.8.6", default-features = false, features = ["runtime-tokio-rustls", "macros", "migrate", "json", "postgres", "mysql", "uuid", "chrono", "bigdecimal"] }
 sqlparser = { version = "0.63", features = ["visitor"] }
 async-trait = "0.1"
 # Mongo target adapter (#57 scaffold + #58 exec). Disable default features so
@@ -187,6 +193,7 @@ strip = "symbols"
 # No sqlx release can carry a fixed `libsqlite3-sys`: sqlx-sqlite 0.8.6 requires
 # `^0.30.1`, sqlx-sqlite 0.9.0 still caps at `<0.38.0`, and the fix landed in
 # 0.39.0. The stub below stands in for the driver so the vulnerable crate
-# leaves the lock; it is never compiled, because the `sqlite` feature is off.
+# leaves the lock; no gate compiles it, because the `sqlite` feature is off and
+# the stub is not a default workspace member (CLAUDE.md §"Dependency graph").
 [patch.crates-io]
 sqlx-sqlite = { path = "third_party/sqlx-sqlite-noop" }

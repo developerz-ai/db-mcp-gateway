@@ -3,12 +3,14 @@
 # sqlx materialises `sqlx-sqlite` in `Cargo.lock` as soon as an enabled
 # feature references it (even weakly, via `dep?/feat`), which pulled in
 # `libsqlite3-sys` 0.30.1 (RUSTSEC-2026-0459) despite the `sqlite` feature
-# being off and the real driver never compiling. This crate is never built —
-# cargo only ever resolves its manifest — so an empty `lib.rs` is enough.
+# being off and the real driver never compiling. This crate is not a default
+# workspace member: plain `cargo build` never compiles it, and only a
+# workspace-wide selection (`cargo build --workspace`, or its `--all` alias)
+# does — then as an empty `lib.rs`, which is enough.
 #
 # `version` must satisfy sqlx's `sqlx-sqlite = "=0.8.6"` dependency
-# requirement exactly; bump it in lockstep with the sqlx version pinned in
-# the root `Cargo.toml`.
+# requirement exactly; bump it in lockstep with the exact `sqlx = "=0.8.6"`
+# pin in the root `Cargo.toml`.
 [package]
 name = "sqlx-sqlite"
 version = "0.8.6"
