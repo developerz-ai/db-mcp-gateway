@@ -1,0 +1,37 @@
+# No-op stand-in for sqlx's optional SQLite driver. See the root `Cargo.toml`
+# `[patch.crates-io]` and CLAUDE.md §"Dependency graph" for why this exists:
+# sqlx materialises `sqlx-sqlite` in `Cargo.lock` as soon as an enabled
+# feature references it (even weakly, via `dep?/feat`), which pulled in
+# `libsqlite3-sys` 0.30.1 (RUSTSEC-2026-0459) despite the `sqlite` feature
+# being off and the real driver never compiling. This crate is never built —
+# cargo only ever resolves its manifest — so an empty `lib.rs` is enough.
+#
+# `version` must satisfy sqlx's `sqlx-sqlite = "=0.8.6"` dependency
+# requirement exactly; bump it in lockstep with the sqlx version pinned in
+# the root `Cargo.toml`.
+[package]
+name = "sqlx-sqlite"
+version = "0.8.6"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# sqlx's own features reference `sqlx-sqlite` by name, including weakly
+# (`sqlx-sqlite?/chrono`) from features this workspace DOES enable (migrate,
+# json, chrono, uuid) — Cargo resolves those against this stub's feature set,
+# so every feature name the real sqlx-sqlite 0.8.6 crate declares must exist
+# here too, even though none of them wire up to anything.
+[features]
+any = []
+bundled = []
+chrono = []
+json = []
+migrate = []
+offline = []
+preupdate-hook = []
+regexp = []
+time = []
+unbundled = []
+uuid = []
