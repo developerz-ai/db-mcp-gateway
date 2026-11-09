@@ -1,3 +1,11 @@
+# The workspace exists for one extra member: `third_party/sqlx-sqlite-noop`, a
+# no-op stand-in for sqlx's optional SQLite driver (see `[patch.crates-io]`).
+# It has to be a workspace member because `cargo chef` — which the Dockerfile
+# uses to cache dependencies — restores only workspace members into its builder
+# stage, and the root manifest's patch has to resolve there.
+[workspace]
+members = ["third_party/sqlx-sqlite-noop"]
+
 [package]
 name = "db-mcp-gateway"
 version = "1.6.0"
@@ -54,7 +62,25 @@ serde-saphyr = "1"
 clap = { version = "4", features = ["derive", "env"] }
 
 # db
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "mysql", "uuid", "chrono", "json", "bigdecimal"] }
+# `default-features = false` drops sqlx's default `any` feature: the gateway
+# targets Postgres and MySQL (Mongo is a separate adapter) and no `sqlx::any`
+# API is used. Every feature the default set supplied — `macros`, `migrate`,
+# `json` — is named explicitly below, so `any` is the only thing lost.
+# `macros` and `migrate` are load-bearing: `sqlx::migrate!` and the
+# `#[derive(sqlx::FromRow)]` uses need them, and `sqlx::migrate!` expands to
+# `::sqlx::migrate::…`, so the umbrella's `migrate` feature cannot be dropped.
+#
+# The optional SQLite driver is a separate matter: sqlx keeps `sqlx-sqlite` as
+# an optional dependency, and Cargo.lock materialises an optional dependency as
+# soon as an enabled feature references it — even by a weak `dep?/feat`
+# reference. sqlx's `migrate`/`json`/`chrono`/`uuid` features each reference
+# `sqlx-sqlite?/…`, so the driver lands in the lock (with `libsqlite3-sys`
+# 0.30.1, flagged by RUSTSEC-2026-0459) even though the `sqlite` feature is
+# off and the driver is never compiled. No sqlx release can carry a fixed
+# `libsqlite3-sys` — sqlx-sqlite 0.8.6 requires `^0.30.1` and the fix landed
+# in 0.39.0 — so the driver is stood in for by a no-op stub; see
+# `[patch.crates-io]` below.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "macros", "migrate", "json", "postgres", "mysql", "uuid", "chrono", "bigdecimal"] }
 sqlparser = { version = "0.63", features = ["visitor"] }
 async-trait = "0.1"
 # Mongo target adapter (#57 scaffold + #58 exec). Disable default features so
@@ -152,3 +178,15 @@ debug = false
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Cargo.lock materialises optional dependencies that enabled features reference,
+# even weakly (`sqlx-sqlite?/…`). sqlx's `migrate`/`json`/`chrono`/`uuid`
+# features each reference the optional SQLite driver, so it lands in the lock
+# with `libsqlite3-sys` 0.30.1 and RUSTSEC-2026-0459 fires — even though the
+# `sqlite` feature is never enabled and the driver is never compiled.
+# No sqlx release can carry a fixed `libsqlite3-sys`: sqlx-sqlite 0.8.6 requires
+# `^0.30.1`, sqlx-sqlite 0.9.0 still caps at `<0.38.0`, and the fix landed in
+# 0.39.0. The stub below stands in for the driver so the vulnerable crate
+# leaves the lock; it is never compiled, because the `sqlite` feature is off.
+[patch.crates-io]
+sqlx-sqlite = { path = "third_party/sqlx-sqlite-noop" }
