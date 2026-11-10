@@ -213,10 +213,10 @@ jobs:
         with:
           tool: cargo-audit
       # RUSTSEC-2023-0071 (rsa via sqlx-mysql). NOT unreachable — MySQL is a
-      # supported permissions_store driver and CI exercises it. Suppressed only
-      # because no fixed upstream `rsa` release exists; the reachable path is
-      # a non-TLS caching_sha2_password handshake. Full justification and the
-      # mitigation plan are in .cargo/audit.toml.
+      # supported permissions_store driver and CI exercises it. rsa 0.10 is
+      # fixed upstream, but sqlx 0.9 requires Rust 1.94 and cannot preserve the
+      # project's Rust 1.88 MSRV. See .cargo/audit.toml for the MSRV-raise plus
+      # sqlx-upgrade removal trigger.
       - run: cargo audit --ignore RUSTSEC-2023-0071
 
   # Spec 14 invariant: no literal dbmcp_svc_ service tokens in committed YAML.
