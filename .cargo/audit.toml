@@ -15,9 +15,10 @@
 # `ssl-mode=REQUIRED` in PERMISSIONS_DB_DSN never reaches it. We do not yet
 # force that, so the path stays reachable under misconfiguration.
 #
-# Kept ignored because no fixed upstream `rsa` release exists — suppressing it
-# is what keeps `cargo audit` meaningful for every other advisory. Real
-# mitigation (force TLS on the permissions DSN) is tracked separately; revisit
-# at every dependency bump.
+# `rsa` 0.10 is published, but it requires the sqlx 0.9 upgrade path. sqlx 0.9
+# requires Rust 1.94 while this project declares MSRV 1.88, so the current
+# sqlx 0.8 dependency retains rsa 0.9.10. Keep this advisory ignored until the
+# project raises its MSRV to at least Rust 1.94 and upgrades sqlx; then remove
+# the ignore and re-resolve the dependency.
 [advisories]
 ignore = ["RUSTSEC-2023-0071"]
