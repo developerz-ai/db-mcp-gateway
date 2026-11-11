@@ -21,7 +21,10 @@ ignore = [
     # PERMISSIONS_DB_DSN with `ssl-mode=REQUIRED` avoids it; we do not yet force
     # that, so it stays reachable under operator misconfiguration.
     #
-    # No fixed upstream `rsa` release exists. Re-check when one ships, or when
-    # sqlx drops the dependency.
+    # `rsa` 0.10 is published, but it requires the sqlx 0.9 upgrade path. sqlx
+    # 0.9 requires Rust 1.94 while this project declares MSRV 1.88, so the
+    # current sqlx 0.8 dependency retains rsa 0.9.10. Keep this advisory ignored
+    # until the project raises its MSRV to at least Rust 1.94 and upgrades sqlx;
+    # then remove the ignore and re-resolve the dependency.
     "RUSTSEC-2023-0071",
 ]
