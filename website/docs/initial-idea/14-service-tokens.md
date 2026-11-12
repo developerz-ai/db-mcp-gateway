@@ -108,7 +108,7 @@ about tokens is callable over HTTP — the lifecycle is GitOps:
   only in programmatic test fixtures constructed via
   `ConfigFile::from_yaml_str` / `ServiceTokenStore::from_config` directly.
 - **Rotate** — overlap is mandatory, because each pod only loads one token at
-  boot, AND the YAML validator (`src/config/yaml.rs`) rejects duplicate
+  boot, AND the YAML validator (`src/config/yaml/validate.rs`) rejects duplicate
   service-account names — the new value cannot reuse the original `<name>`.
   Sequence: (1) mint a new value under a DISTINCT temporary name
   (`<name>-next` is the recommended convention); (2) add a *second*

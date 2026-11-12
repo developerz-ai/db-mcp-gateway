@@ -2,7 +2,7 @@
 # bin/check-scrub-features — assert the GlitchTip credential scrubber's regex
 # features are present in the graph that actually ships.
 #
-# `src/sentry_scrub.rs` compiles its patterns at runtime, so a missing `regex`
+# `src/sentry_scrub/scrubber.rs` compiles its patterns at runtime, so a missing `regex`
 # feature is invisible to fmt, clippy and `cargo test` alike. The shipping
 # binary is built WITHOUT dev-dependencies — and dev-dependencies were the only
 # thing pulling `unicode-case` into the graph. `(?i)` therefore failed to
@@ -26,7 +26,7 @@ for feature in unicode-case unicode-perl; do
 done
 
 if [ "$status" -ne 0 ]; then
-  echo "  src/sentry_scrub.rs needs it: 'unicode-case' for (?i), 'unicode-perl' for \\w/\\s/\\b."
+  echo "  src/sentry_scrub/scrubber.rs needs it: 'unicode-case' for (?i), 'unicode-perl' for \\w/\\s/\\b."
   echo "  Without it the gateway refuses to boot. Name it in the 'regex' dependency in Cargo.toml."
   exit 1
 fi

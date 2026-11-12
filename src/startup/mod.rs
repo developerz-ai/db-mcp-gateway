@@ -1,9 +1,17 @@
+//! Boot wiring and the detached background tasks the server runs alongside.
+
 use sqlx::PgPool;
 
 use db_mcp_gateway::audit;
+use db_mcp_gateway::auth::oauth::{AuthCodes, PendingFlows, RefreshTokens};
 use db_mcp_gateway::transport::probes::ShutdownFlag;
 use db_mcp_gateway::transport::tls;
-use db_mcp_gateway::transport::{AuthCodes, PendingFlows, RefreshTokens};
+
+mod boot;
+mod serve;
+
+pub(crate) use boot::{build_app_state, connect_state_db, init_tracing};
+pub(crate) use serve::serve;
 
 /// Background task: tick hourly and prune any audit row older than the
 /// configured TTL. The task is detached — `tokio::time::interval` survives

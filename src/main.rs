@@ -4,27 +4,16 @@ mod sentry_scrub;
 mod startup;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::Parser;
-use db_mcp_gateway::auth::{
-    AuthConfig, OidcClient, ServiceTokenStore, SessionCacheConfig, SessionStore,
-};
-use db_mcp_gateway::authz::PermissionsCache;
-use db_mcp_gateway::config::{ConfigFile, TlsConfig};
-use db_mcp_gateway::exec::AdapterRegistry;
-use db_mcp_gateway::state::permissions::pg::PgPermissionsRepo;
-use db_mcp_gateway::transport::probes::ShutdownFlag;
+use db_mcp_gateway::auth::{AuthConfig, ServiceTokenStore};
+use db_mcp_gateway::config::{Config, ConfigFile};
 use db_mcp_gateway::transport::tls;
-use db_mcp_gateway::transport::{
-    AppState, AuthCodes, AuthFacade, ClientRegistry, PendingFlows, RefreshTokens,
-};
-use db_mcp_gateway::{config::Config, state, transport};
 use metrics_exporter_prometheus::PrometheusBuilder;
-use tracing_subscriber::EnvFilter;
 
 use startup::{
-    install_shutdown_signal, spawn_audit_pruner, spawn_oauth_state_gc, spawn_reload_on_sighup,
+    build_app_state, connect_state_db, init_tracing, serve, spawn_audit_pruner,
+    spawn_oauth_state_gc,
 };
 
 #[derive(Debug, Parser)]
@@ -81,33 +70,9 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run() -> anyhow::Result<()> {
-    // JSON-per-line on stdout for Loki (see docs/deployment/logging.md for
-    // the field contract). `flatten_event` hoists `tracing::info!(k = v, …)`
-    // fields to the top level so Alloy doesn't need a nested-field stage;
-    // spans don't render because every per-request field is also emitted on
-    // the event itself. `with_target(true)` preserves the event's `target`
-    // — the module path by default, but explicitly set on `audit_stream`
-    // events (see `src/audit/stream.rs`) so operators can route the SIEM
-    // export separately from operational logs. Dropping it here would
-    // silently break the spec 07 §Stream contract.
-    //
-    // Writes go through `tracing_appender::non_blocking` so a slow stdout
-    // consumer (a paused terminal, a jammed log pipeline, a full pipe) never
-    // blocks the request path — every `tracing::info!` on the hot path,
-    // including the `audit_stream` fan-out in `src/audit/stream.rs`, is
-    // fire-and-forget. `_log_guard` MUST live for the lifetime of `run` so
-    // the queue drains on shutdown; drop it early and the appender thread
-    // exits mid-flight, silently dropping the tail of the audit stream.
-    let (non_blocking_stdout, _log_guard) = tracing_appender::non_blocking(std::io::stdout());
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .json()
-        .flatten_event(true)
-        .with_current_span(false)
-        .with_span_list(false)
-        .with_target(true)
-        .with_writer(non_blocking_stdout)
-        .init();
+    // Bound for the whole of `run` so the non-blocking log queue drains on
+    // shutdown — see `init_tracing`.
+    let _log_guard = init_tracing();
 
     // rustls 0.23 needs an explicit CryptoProvider; install before any TLS
     // path touches `RustlsConfig` (issue #12).
@@ -151,90 +116,16 @@ async fn run() -> anyhow::Result<()> {
         .install_recorder()
         .map_err(|err| anyhow::anyhow!("failed to install Prometheus recorder: {err}"))?;
 
-    let state_db = state::connect(&config.state_db.url, config.state_db.pool_size)
-        .await
-        .map_err(|err| boot_db_error("state DB", err))?;
-    tracing::info!(
-        pool_size = config.state_db.pool_size,
-        "state DB connected, migrations applied"
-    );
-
-    let shutdown = ShutdownFlag::new();
-    let sessions = SessionStore::with_cache_config(
-        state_db.clone(),
-        SessionCacheConfig {
-            ttl: std::time::Duration::from_secs(config.session_cache_ttl_seconds),
-            ..SessionCacheConfig::default()
-        },
-    );
-    let oidc = OidcClient::new(auth_config.clone())?;
-    // Spec 12 §"Storage backends" / #59: pick the permissions repo based on
-    // YAML config. Default (None) is the pg path — the permissions tables
-    // live in the same state DB as sessions / audit_calls. Mysql opens a
-    // separate pool keyed by `PERMISSIONS_DB_DSN`.
-    let permissions_repo: std::sync::Arc<dyn db_mcp_gateway::state::permissions::PermissionsRepo> =
-        match config_file
-            .permissions_store
-            .as_ref()
-            .map(|s| s.driver)
-            .unwrap_or(db_mcp_gateway::config::PermissionsStoreDriver::Pg)
-        {
-            db_mcp_gateway::config::PermissionsStoreDriver::Pg => {
-                Arc::new(PgPermissionsRepo::new(state_db.clone()))
-            }
-            db_mcp_gateway::config::PermissionsStoreDriver::Mysql => {
-                let dsn = std::env::var("PERMISSIONS_DB_DSN").map_err(|_| {
-                    anyhow::anyhow!(
-                        "permissions_store.driver = mysql requires PERMISSIONS_DB_DSN env"
-                    )
-                })?;
-                let pool = db_mcp_gateway::state::connect_permissions_mysql(
-                    &dsn,
-                    config.state_db.pool_size,
-                )
-                .await
-                .map_err(|err| boot_db_error("mysql permissions store", err))?;
-                tracing::info!(
-                    pool_size = config.state_db.pool_size,
-                    "mysql permissions store connected, migrations applied"
-                );
-                Arc::new(db_mcp_gateway::state::permissions::mysql::MysqlPermissionsRepo::new(pool))
-            }
-        };
-    let permissions_cache = PermissionsCache::new(
-        permissions_repo.clone(),
-        std::time::Duration::from_secs(config.permissions_cache_ttl_seconds),
-    );
-    // Captured before `auth_config` moves into the facade below.
-    let refresh_ttl = auth_config.refresh_ttl;
-    let app_state = AppState {
-        auth: Some(AuthFacade {
-            config: Arc::new(auth_config),
-            sessions,
-            oidc,
-            flows: PendingFlows::default(),
-            codes: AuthCodes::default(),
-            // Persist refresh chains in the shared state DB: a chain is meant to
-            // outlive the process (that is what `REFRESH_TTL_DAYS` buys), and an
-            // in-memory store silently capped the real "stay signed in" window at
-            // time-until-next-rollout.
-            refresh: RefreshTokens::with_db(state_db.clone(), refresh_ttl),
-            service_tokens,
-        }),
-        config: Arc::new(config_file),
-        adapter_registry: AdapterRegistry::new(),
-        state_db: Some(state_db.clone()),
-        shutdown: shutdown.clone(),
-        metrics: Some(metrics_handle),
-        permissions_cache: Some(permissions_cache),
-        permissions_repo: Some(permissions_repo),
-        mcp_path: Arc::from(config.mcp_path.as_str()),
-        // Persist DCR registrations in the shared state DB so a restart /
-        // redeploy no longer drops them (the `invalid_client` wedge for clients
-        // that cache their `client_id`). `default()` — in-memory — is the
-        // auth-less test bootstrap only.
-        client_registry: ClientRegistry::with_db(state_db.clone()),
-    };
+    let state_db = connect_state_db(&config).await?;
+    let app_state = build_app_state(
+        config_file,
+        &config,
+        auth_config,
+        service_tokens,
+        metrics_handle,
+        &state_db,
+    )
+    .await?;
 
     // Fail closed: a release binary must never serve with auth unwired.
     // `bearer_auth` deliberately passes through when `state.auth` is `None`
@@ -265,95 +156,7 @@ async fn run() -> anyhow::Result<()> {
         );
     }
 
-    let app = transport::router(&config, app_state)?;
-
-    let handle = axum_server::Handle::new();
-    let shutdown_for_signal = shutdown.clone();
-    let handle_for_signal = handle.clone();
-    // Install signal handlers synchronously so a registration failure aborts
-    // boot instead of leaving the server unable to drain on `docker stop`.
-    let signal_fut = install_shutdown_signal(shutdown_for_signal)?;
-    tokio::spawn(async move {
-        signal_fut.await;
-        // Drain in-flight requests, then close idle. The 30s window matches
-        // the upper bound on `statement_timeout` defaults; longer queries get
-        // SIGTERM-killed when the runtime tears down.
-        handle_for_signal.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
-    });
-
-    match config.tls.clone() {
-        TlsConfig::Enabled {
-            cert_path,
-            key_path,
-        } => {
-            let rustls = tls::load(&cert_path, &key_path).await?;
-            tracing::info!(
-                version = env!("CARGO_PKG_VERSION"),
-                addr = %config.bind,
-                path = %config.mcp_path,
-                cert_path = %cert_path.display(),
-                "db-mcp-gateway listening (TLS)"
-            );
-            // Install the SIGHUP cert hot-reload handler; a registration
-            // failure fails boot rather than silently disabling `kill -HUP`.
-            spawn_reload_on_sighup(rustls.clone(), cert_path, key_path)?;
-            axum_server::bind_rustls(config.bind, rustls)
-                .handle(handle)
-                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .await?;
-        }
-        TlsConfig::Disabled => {
-            tracing::warn!(
-                addr = %config.bind,
-                "TLS disabled — serving plain HTTP. This is dev-only; never deploy without TLS."
-            );
-            tracing::info!(
-                version = env!("CARGO_PKG_VERSION"),
-                addr = %config.bind,
-                path = %config.mcp_path,
-                "db-mcp-gateway listening (plain HTTP)"
-            );
-            axum_server::bind(config.bind)
-                .handle(handle)
-                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .await?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Collapse a boot-time database bring-up failure into a credential-free error.
-///
-/// `StateDbError::Connect` wraps a `sqlx::Error` whose `Display` can embed the
-/// DSN — and therefore the password — when the URL is malformed or auth is
-/// rejected. `main` returns `anyhow::Result`, and a returned error is rendered
-/// to stderr through its source chain on process exit, so propagating that
-/// `#[source]` would print the credential. We log the error *type* plus the
-/// credential-free class from [`state::connect_error_class`] (same discipline
-/// as the admin handlers in `transport/admin/`) and return a source-free error
-/// that names the class — `error_type` alone is the constant
-/// `sqlx_core::error::Error`, so it told the operator nothing and made every
-/// distinct boot failure one indistinguishable GlitchTip issue. The class
-/// travels in the returned message for exactly that reason. `Migrate` failures
-/// name only migration versions, never credentials, so they're surfaced in full
-/// for operator debugging. CLAUDE.md non-negotiable #1.
-fn boot_db_error(store: &'static str, err: state::StateDbError) -> anyhow::Error {
-    match err {
-        state::StateDbError::Connect(source) => {
-            let class = state::connect_error_class(&source);
-            tracing::error!(
-                store,
-                error_type = std::any::type_name_of_val(&source),
-                error_class = %class,
-                "boot database bring-up failed at connect"
-            );
-            anyhow::anyhow!("{store}: failed to connect ({class}; DSN withheld)")
-        }
-        state::StateDbError::Migrate(source) => {
-            anyhow::Error::new(source).context(format!("{store}: migrations failed"))
-        }
-    }
+    serve(&config, app_state).await
 }
 
 #[cfg(test)]
