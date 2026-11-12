@@ -6,30 +6,21 @@
 //! Exercises the production code path: real `audit_dispatch` call against a
 //! real state DB, tracing output captured for the call's duration.
 
+mod common;
+
 use std::sync::{Arc, Mutex};
 
-use db_mcp_gateway::audit;
+use common::audit::latest_audit;
+use common::cleanup::delete_audit_calls;
+use common::env::state_pool;
 use db_mcp_gateway::auth::{Identity, SessionId};
 use db_mcp_gateway::config::StreamSinkConfig;
-use db_mcp_gateway::state;
 use db_mcp_gateway::tools::audit_dispatch::{
     AuditHeader, RequestContext, audit_dispatch, success_outcome,
 };
 use serde_json::{Value, json};
 use tracing_subscriber::fmt::MakeWriter;
 use uuid::Uuid;
-
-fn state_db_url() -> String {
-    std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
-        "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
-    })
-}
-
-async fn pool() -> sqlx::PgPool {
-    state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)")
-}
 
 fn identity(user_sub: &str) -> Identity {
     Identity {
@@ -39,18 +30,6 @@ fn identity(user_sub: &str) -> Identity {
         groups: vec!["test".to_string()],
         issued_at: chrono::Utc::now(),
     }
-}
-
-/// Reruns of the real-DB tests must not leave rows behind — each test uses a
-/// per-run `user_sub`, but silent accumulation still bloats `audit_calls`
-/// over time and would break the `latest_for_user_tool` invariant if a `sub`
-/// is ever reused.
-async fn cleanup(pool: &sqlx::PgPool, user_sub: &str) {
-    sqlx::query("DELETE FROM audit_calls WHERE user_sub = $1")
-        .bind(user_sub)
-        .execute(pool)
-        .await
-        .expect("cleanup delete succeeds");
 }
 
 #[derive(Clone, Default)]
@@ -104,7 +83,7 @@ impl<'a> MakeWriter<'a> for FailingWriter {
 /// human-readable line, which any unrelated tracing line could satisfy.
 #[tokio::test]
 async fn configured_stdout_sink_streams_and_still_writes_the_durable_row() {
-    let p = pool().await;
+    let p = state_pool().await;
     let user = format!("stream-test-{}", Uuid::new_v4().simple());
     let request_id = Uuid::new_v4();
     let id: Value = json!(1);
@@ -178,15 +157,12 @@ async fn configured_stdout_sink_streams_and_still_writes_the_durable_row() {
         .unwrap_or_else(|| panic!("event missing audit_id: {event}"));
     Uuid::parse_str(audit_id_str).expect("audit_id is a UUID");
 
-    let row = audit::latest_for_user_tool(&p, &user, "run_query")
-        .await
-        .expect("audit query runs")
-        .expect("durable audit row was written");
+    let row = latest_audit(&p, &user, "run_query", "stdout-sink dispatch").await;
     assert_eq!(row.outcome, "success");
     assert_eq!(row.request_id, request_id.to_string());
     assert_eq!(row.id.to_string(), audit_id_str);
 
-    cleanup(&p, &user).await;
+    delete_audit_calls(&p, &user).await;
 }
 
 /// Sink outage is fire-and-forget: a stdout writer that fails on every write
@@ -196,7 +172,7 @@ async fn configured_stdout_sink_streams_and_still_writes_the_durable_row() {
 /// when a stream sink is broken.
 #[tokio::test]
 async fn failing_stdout_sink_does_not_block_response_or_durable_write() {
-    let p = pool().await;
+    let p = state_pool().await;
     let user = format!("stream-test-fail-{}", Uuid::new_v4().simple());
     let request_id = Uuid::new_v4();
     let id: Value = json!(1);
@@ -239,14 +215,11 @@ async fn failing_stdout_sink_does_not_block_response_or_durable_write() {
         "expected JSON-RPC result, got: {body}"
     );
 
-    let row = audit::latest_for_user_tool(&p, &user, "run_query")
-        .await
-        .expect("audit query runs")
-        .expect("durable audit row was written despite sink failure");
+    let row = latest_audit(&p, &user, "run_query", "failing-sink dispatch").await;
     assert_eq!(row.outcome, "success");
     assert_eq!(row.request_id, request_id.to_string());
 
-    cleanup(&p, &user).await;
+    delete_audit_calls(&p, &user).await;
 }
 
 /// No sinks configured (the default) → nothing streamed, only the durable
@@ -256,7 +229,7 @@ async fn failing_stdout_sink_does_not_block_response_or_durable_write() {
 /// short-circuit past it.
 #[tokio::test]
 async fn no_configured_sinks_streams_nothing() {
-    let p = pool().await;
+    let p = state_pool().await;
     let user = format!("stream-test-noop-{}", Uuid::new_v4().simple());
     let request_id = Uuid::new_v4();
     let id: Value = json!(1);
@@ -299,14 +272,11 @@ async fn no_configured_sinks_streams_nothing() {
     // Durable write still lands. The empty-sink path must NOT skip
     // `audit::log` — spec 07 makes the state-DB write mandatory whether or
     // not stream sinks are configured.
-    let row = audit::latest_for_user_tool(&p, &user, "list_servers")
-        .await
-        .expect("audit query runs")
-        .expect("durable audit row was written for empty-sink dispatch");
+    let row = latest_audit(&p, &user, "list_servers", "empty-sink dispatch").await;
     assert_eq!(row.outcome, "success");
     assert_eq!(row.request_id, request_id.to_string());
 
-    cleanup(&p, &user).await;
+    delete_audit_calls(&p, &user).await;
 }
 
 /// The same wiring proof as the `stdout` test above, for `syslog`: a
@@ -315,7 +285,7 @@ async fn no_configured_sinks_streams_nothing() {
 /// test is only about `audit_dispatch` actually reaching the sink.
 #[tokio::test]
 async fn configured_syslog_sink_delivers_udp_and_still_writes_the_durable_row() {
-    let p = pool().await;
+    let p = state_pool().await;
     let user = format!("stream-test-syslog-{}", Uuid::new_v4().simple());
     let request_id = Uuid::new_v4();
     let id: Value = json!(1);
@@ -366,12 +336,9 @@ async fn configured_syslog_sink_delivers_udp_and_still_writes_the_durable_row() 
     assert!(received.contains(&request_id.to_string()), "{received}");
     assert!(received.contains("run_query"), "{received}");
 
-    let row = audit::latest_for_user_tool(&p, &user, "run_query")
-        .await
-        .expect("audit query runs")
-        .expect("durable audit row was written");
+    let row = latest_audit(&p, &user, "run_query", "stdout-sink dispatch").await;
     assert_eq!(row.outcome, "success");
     assert_eq!(row.request_id, request_id.to_string());
 
-    cleanup(&p, &user).await;
+    delete_audit_calls(&p, &user).await;
 }

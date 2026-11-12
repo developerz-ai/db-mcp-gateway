@@ -6,7 +6,7 @@ use crate::exec::ExecError;
 use crate::transport::jsonrpc::Response;
 use crate::transport::protocol::{CallToolResult, TextContent};
 
-use super::Outcome;
+use super::{Outcome, OutcomeCode};
 
 /// Build a structured tool error response per spec 03 §Errors. `request_id`
 /// is duplicated inside the JSON body so agents that only read the tool
@@ -16,10 +16,10 @@ use super::Outcome;
 /// surface the spec-03 code (`"timeout"` / `"internal"`) instead of a bare
 /// JSON-RPC internal error. External tool callers keep using
 /// `error_outcome` / `outcome_from_exec_error`.
-pub(super) fn tool_error(id: Value, code: &'static str, message: &str) -> Response {
+pub(super) fn tool_error(id: Value, code: OutcomeCode, message: &str) -> Response {
     let body = serde_json::json!({
         "request_id": id.clone(),
-        "code": code,
+        "code": code.as_str(),
         "message": message,
     });
     Response::result(
@@ -48,7 +48,7 @@ pub fn tool_success(id: Value, text: String) -> Response {
 ///
 /// Scoped to `crate::tools`: the tools own their per-tool wording. Anything
 /// outside must route target-DB errors through [`outcome_from_exec_error`].
-pub(in crate::tools) fn error_outcome(id: Value, code: &'static str, message: &str) -> Outcome {
+pub(in crate::tools) fn error_outcome(id: Value, code: OutcomeCode, message: &str) -> Outcome {
     Outcome {
         response: tool_error(id, code, message),
         code,
@@ -95,22 +95,24 @@ pub fn outcome_from_exec_error(
     messages: &ToolErrorMessages,
 ) -> Outcome {
     let owned;
-    let (code, message): (&str, &str) = match err {
-        ExecError::Timeout => ("timeout", messages.timeout),
+    let (code, message): (OutcomeCode, &str) = match err {
+        ExecError::Timeout => (OutcomeCode::Timeout, messages.timeout),
         ExecError::Connection | ExecError::Unavailable => {
-            ("unavailable", "target database is unreachable")
+            (OutcomeCode::Unavailable, "target database is unreachable")
         }
-        ExecError::Sql => ("syntax_error", messages.sql_rejected),
+        ExecError::Sql => (OutcomeCode::SyntaxError, messages.sql_rejected),
         ExecError::Forbidden(reason) => {
             owned = format!(
                 "{prefix} rejected by gateway: {reason}",
                 prefix = messages.forbidden_prefix,
             );
-            ("forbidden_sql", owned.as_str())
+            (OutcomeCode::ForbiddenSql, owned.as_str())
         }
         ExecError::PasswordUnresolved { .. }
         | ExecError::UnsupportedAdapter(_)
-        | ExecError::NotImplemented { .. } => ("internal", "server-side configuration error"),
+        | ExecError::NotImplemented { .. } => {
+            (OutcomeCode::Internal, "server-side configuration error")
+        }
     };
     let mut outcome = error_outcome(id, code, message);
     outcome.elapsed_ms = Some(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
@@ -127,7 +129,7 @@ pub fn success_outcome(
 ) -> Outcome {
     Outcome {
         response: tool_success(id, text),
-        code: "success",
+        code: OutcomeCode::Success,
         elapsed_ms,
         row_count,
         truncated,
@@ -141,7 +143,7 @@ mod tests {
 
     #[test]
     fn tool_error_payload_shape() {
-        let response = tool_error(Value::from(7), "forbidden", "nope");
+        let response = tool_error(Value::from(7), OutcomeCode::Forbidden, "nope");
         let value = serde_json::to_value(&response).unwrap();
         assert_eq!(value["id"], 7);
         assert_eq!(value["result"]["isError"], true);
@@ -166,8 +168,8 @@ mod tests {
 
     #[test]
     fn error_outcome_mirrors_message_into_audit() {
-        let outcome = error_outcome(Value::from(1), "forbidden", "no grants");
-        assert_eq!(outcome.code, "forbidden");
+        let outcome = error_outcome(Value::from(1), OutcomeCode::Forbidden, "no grants");
+        assert_eq!(outcome.code, OutcomeCode::Forbidden);
         assert_eq!(outcome.error_message.as_deref(), Some("no grants"));
         assert!(outcome.row_count.is_none());
     }
@@ -192,7 +194,7 @@ mod tests {
             Instant::now(),
             &messages,
         );
-        assert_eq!(outcome.code, "internal");
+        assert_eq!(outcome.code, OutcomeCode::Internal);
         assert_eq!(
             outcome.error_message.as_deref(),
             Some("server-side configuration error")
@@ -211,7 +213,7 @@ mod tests {
             Some(100),
             Some(true),
         );
-        assert_eq!(outcome.code, "success");
+        assert_eq!(outcome.code, OutcomeCode::Success);
         assert_eq!(outcome.elapsed_ms, Some(42));
         assert_eq!(outcome.row_count, Some(100));
         assert_eq!(outcome.truncated, Some(true));

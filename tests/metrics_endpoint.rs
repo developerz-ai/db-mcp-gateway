@@ -5,11 +5,13 @@
 //! In its own test binary so the process-wide `install_recorder()` doesn't
 //! collide with any other test that might install one in the future.
 
+mod common;
+
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use axum::routing::get;
-use db_mcp_gateway::transport::AppState;
+use common::gateway::authless_state;
 use db_mcp_gateway::transport::probes;
 use metrics::counter;
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -29,30 +31,8 @@ async fn metrics_endpoint_renders_emitted_counters() {
     // Emit a probe metric so we have something deterministic to look for.
     counter!("tool_calls", "tool" => "list_servers", "outcome" => "success").increment(1);
 
-    use db_mcp_gateway::config::ConfigFile;
-    use db_mcp_gateway::exec::AdapterRegistry;
-    use db_mcp_gateway::transport::ClientRegistry;
-    use std::sync::Arc;
-
-    let state = AppState {
-        auth: None,
-        config: Arc::new(ConfigFile {
-            servers: Vec::new(),
-            permissions: Vec::new(),
-            admin: None,
-            permissions_store: None,
-            service_accounts: Vec::new(),
-            logging: Default::default(),
-        }),
-        adapter_registry: AdapterRegistry::new(),
-        state_db: None,
-        shutdown: Default::default(),
-        metrics: Some(handle),
-        permissions_cache: None,
-        permissions_repo: None,
-        mcp_path: Arc::from("/mcp"),
-        client_registry: ClientRegistry::default(),
-    };
+    let mut state = authless_state();
+    state.metrics = Some(handle);
     let app = Router::new()
         .route("/metrics", get(probes::metrics))
         .with_state(state);

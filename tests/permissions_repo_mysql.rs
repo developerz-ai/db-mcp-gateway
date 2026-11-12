@@ -5,9 +5,11 @@
 //! contract is what's tested — the same assertions pass on either
 //! backend, validating that callers don't need to know which is in use.
 
+mod common;
+
+use common::env::mysql_pool;
 use db_mcp_gateway::state::permissions::mysql::MysqlPermissionsRepo;
 use db_mcp_gateway::state::permissions::{DbType, GrantAction, GrantTarget, Page, PermissionsRepo};
-use db_mcp_gateway::state::{self};
 use serde_json::json;
 use sqlx::MySqlPool;
 use uuid::Uuid;
@@ -24,20 +26,8 @@ fn wide_page() -> Page {
     Page::new(Some(Page::MAX_LIMIT), None)
 }
 
-fn mysql_dsn() -> String {
-    std::env::var("PERMISSIONS_DB_DSN").unwrap_or_else(|_| {
-        "mysql://permissions:permissions-dev-only@localhost:3307/permissions".to_string()
-    })
-}
-
-async fn pool() -> MySqlPool {
-    state::connect_permissions_mysql(&mysql_dsn(), 5)
-        .await
-        .expect("mysql permissions store up (run `bin/dev up`)")
-}
-
 async fn repo() -> MysqlPermissionsRepo {
-    MysqlPermissionsRepo::new(pool().await)
+    MysqlPermissionsRepo::new(mysql_pool().await)
 }
 
 fn unique_sub(prefix: &str) -> String {
@@ -430,7 +420,7 @@ async fn database_crud_and_list_filters_soft_deleted() {
 /// can't make it flaky.
 #[tokio::test]
 async fn mysql_list_users_honours_limit_and_offset() {
-    let p = pool().await;
+    let p = mysql_pool().await;
     let r = MysqlPermissionsRepo::new(p.clone());
     // Retain the seeded subs for cleanup after assertions.
     let mut seeded_subs = Vec::with_capacity(3);
@@ -495,7 +485,7 @@ async fn mysql_list_users_honours_limit_and_offset() {
 async fn mysql_paging_covers_every_row_without_duplicates() {
     use sqlx::Connection;
 
-    let p = pool().await;
+    let p = mysql_pool().await;
     let r = MysqlPermissionsRepo::new(p.clone());
     let mut seeded = Vec::new();
     let mut seeded_subs = Vec::new();
@@ -599,7 +589,7 @@ async fn mysql_paging_covers_every_row_without_duplicates() {
 /// the `wide` snapshot and the offset read.
 #[tokio::test]
 async fn mysql_list_databases_honours_limit_and_offset() {
-    let p = pool().await;
+    let p = mysql_pool().await;
     let r = MysqlPermissionsRepo::new(p.clone());
     // Same server label for all three so a single `cleanup_server` sweeps them
     // (and any grant that happens to reference them).
@@ -680,7 +670,7 @@ async fn mysql_list_databases_honours_limit_and_offset() {
 /// `list_users`, since the filter path uses the same `ORDER BY`.
 #[tokio::test]
 async fn mysql_list_grants_pagination_covers_every_row_without_duplicates() {
-    let p = pool().await;
+    let p = mysql_pool().await;
     let r = MysqlPermissionsRepo::new(p.clone());
     let sub = unique_sub("mysql-grantpage");
     let user = r
@@ -746,7 +736,7 @@ async fn mysql_list_grants_pagination_covers_every_row_without_duplicates() {
 /// the typed `GrantTarget` — not just documentation — on this backend too.
 #[tokio::test]
 async fn raw_insert_with_both_specific_and_wildcard_is_rejected_by_check() {
-    let p = pool().await;
+    let p = mysql_pool().await;
     let r = MysqlPermissionsRepo::new(p.clone());
     let sub = unique_sub("mysql-xorcheck");
     let server = format!("mysql-xor-{}", Uuid::new_v4().simple());

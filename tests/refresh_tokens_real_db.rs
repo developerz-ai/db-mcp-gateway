@@ -9,24 +9,15 @@
 //! No mocking — these run against the real dev state DB (`bin/dev up`), same as
 //! the client-registry real-DB tests.
 
+mod common;
+
 use std::time::Duration;
 
-use db_mcp_gateway::transport::{GrantIdentity, RefreshTokens};
+use common::env::state_pool;
+use db_mcp_gateway::auth::oauth::{GrantIdentity, RefreshTokens};
 use sqlx::PgPool;
 
 const TTL: Duration = Duration::from_secs(60 * 24 * 3600);
-
-fn state_db_url() -> String {
-    std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
-        "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
-    })
-}
-
-async fn pool() -> PgPool {
-    db_mcp_gateway::state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)")
-}
 
 /// Namespaced per test so the whole file can run in parallel: every test owns a
 /// unique `sub` and cleans up by it.
@@ -54,7 +45,7 @@ async fn cleanup(pool: &PgPool, sub: &str) {
 /// renews after it, carrying the identity (groups included) it was minted with.
 #[tokio::test]
 async fn chain_survives_a_restart() {
-    let pool = pool().await;
+    let pool = state_pool().await;
     let sub = unique_sub("restart");
     let token = format!("tok-{}", uuid::Uuid::new_v4().simple());
 
@@ -81,7 +72,7 @@ async fn chain_survives_a_restart() {
 /// same value finds nothing (OAuth 2.1 §4.3.1 for public clients).
 #[tokio::test]
 async fn redemption_consumes_the_token() {
-    let pool = pool().await;
+    let pool = state_pool().await;
     let sub = unique_sub("replay");
     let token = format!("tok-{}", uuid::Uuid::new_v4().simple());
 
@@ -101,7 +92,7 @@ async fn redemption_consumes_the_token() {
 /// schedule (the group-staleness bound, O3b).
 #[tokio::test]
 async fn rotation_does_not_slide_the_deadline() {
-    let pool = pool().await;
+    let pool = state_pool().await;
     let sub = unique_sub("rotate");
     let first = format!("tok-{}", uuid::Uuid::new_v4().simple());
     let second = format!("tok-{}", uuid::Uuid::new_v4().simple());
@@ -126,7 +117,7 @@ async fn rotation_does_not_slide_the_deadline() {
 /// A chain past its absolute TTL does not renew, and GC reaps the row.
 #[tokio::test]
 async fn expired_chain_is_rejected_and_swept() {
-    let pool = pool().await;
+    let pool = state_pool().await;
     let sub = unique_sub("expired");
     let token = format!("tok-{}", uuid::Uuid::new_v4().simple());
 
@@ -159,7 +150,7 @@ async fn expired_chain_is_rejected_and_swept() {
 /// otherwise a signed-out user could silently mint a fresh session (O4).
 #[tokio::test]
 async fn purge_for_sub_drops_only_that_identitys_chains() {
-    let pool = pool().await;
+    let pool = state_pool().await;
     let mine = unique_sub("purge-mine");
     let theirs = unique_sub("purge-theirs");
     let a = format!("tok-{}", uuid::Uuid::new_v4().simple());
@@ -191,7 +182,7 @@ async fn purge_for_sub_drops_only_that_identitys_chains() {
 /// than honoring the deadline materialized at mint time.
 #[tokio::test]
 async fn shortening_the_configured_ttl_applies_to_existing_chains() {
-    let pool = pool().await;
+    let pool = state_pool().await;
     let sub = unique_sub("shrink");
     let token = format!("tok-{}", uuid::Uuid::new_v4().simple());
 

@@ -16,87 +16,30 @@
 //! (`system.profile` records the command document as the server received
 //! it), not from re-reading gateway state — the target DB is never mocked.
 
+mod common;
+
 use std::time::{Duration, Instant};
 
 use mongodb::bson::{Document, doc};
 use serde_json::Value;
 use uuid::Uuid;
 
-use db_mcp_gateway::audit;
+use common::audit::latest_audit;
+use common::cleanup::delete_audit_calls;
+use common::env::state_pool;
+use common::mongo_target::{
+    TARGET_DB, adapter, drop_collection, server, side_client, unique_collection,
+};
 use db_mcp_gateway::auth::{Identity, SessionId};
-use db_mcp_gateway::config::{
-    Action, ConfigFile, Constraints, Database, Grant, Password, Permission, Server, ServerKind, Tls,
-};
+use db_mcp_gateway::config::{Action, ConfigFile, Constraints, Grant, Permission};
 use db_mcp_gateway::exec::{
-    AdapterRegistry, DEFAULT_STATEMENT_TIMEOUT_MS, DbAdapter, ExecError, ExecQuery, MongoAdapter,
+    AdapterRegistry, DEFAULT_STATEMENT_TIMEOUT_MS, DbAdapter, ExecError, ExecQuery,
 };
-use db_mcp_gateway::state;
-use db_mcp_gateway::tools::RequestContext;
 use db_mcp_gateway::tools::run_query;
+use db_mcp_gateway::tools::{RequestContext, ToolCtx};
 
-const TARGET_HOST: &str = "localhost";
-const TARGET_PORT: u16 = 27018;
-const TARGET_USER: &str = "app";
-const TARGET_PASSWORD: &str = "app-dev-only";
-const TARGET_DB: &str = "app";
 const SERVER_NAME: &str = "mongo";
 const GROUP: &str = "mongo-timeout-test";
-
-fn server() -> Server {
-    Server {
-        name: SERVER_NAME.to_string(),
-        kind: ServerKind::Mongo,
-        description: String::new(),
-        host: TARGET_HOST.to_string(),
-        port: TARGET_PORT,
-        tls: Tls::Insecure,
-        databases: vec![database()],
-    }
-}
-
-fn database() -> Database {
-    Database {
-        name: TARGET_DB.to_string(),
-        role: TARGET_USER.to_string(),
-        password: Password::Literal(TARGET_PASSWORD.into()),
-        description: String::new(),
-        // The dev container's root user lives in `admin` — see
-        // docker-compose.dev.yml `target-mongo`.
-        auth_database: Some("admin".to_string()),
-    }
-}
-
-async fn adapter() -> MongoAdapter {
-    MongoAdapter::open(&server(), &database())
-        .await
-        .expect("target-mongo reachable; run `bin/dev up`")
-}
-
-/// Side-channel client for setup / teardown / inspection — bypasses the
-/// rejector so we can seed, drop, and read `system.profile`. NEVER a
-/// production path: it has root-equivalent access.
-fn side_client() -> mongodb::Client {
-    use mongodb::Client;
-    use mongodb::options::{ClientOptions, Credential, ServerAddress};
-    let credential = Credential::builder()
-        .username(TARGET_USER.to_string())
-        .password(TARGET_PASSWORD.to_string())
-        .source(Some("admin".to_string()))
-        .build();
-    let options = ClientOptions::builder()
-        .hosts(vec![ServerAddress::Tcp {
-            host: TARGET_HOST.to_string(),
-            port: Some(TARGET_PORT),
-        }])
-        .credential(credential)
-        .default_database(TARGET_DB.to_string())
-        .build();
-    Client::with_options(options).expect("side client builds")
-}
-
-fn unique_collection() -> String {
-    format!("mongotmo_{}", Uuid::new_v4().simple())
-}
 
 /// Bulk-insert `count` trivial documents. Chunked because a single
 /// `insert` command is capped at 100k documents (and 16MB of BSON).
@@ -112,13 +55,6 @@ async fn seed(collection: &str, count: usize) {
             .await
             .expect("seed insert");
     }
-}
-
-async fn drop_collection(collection: &str) {
-    let _ = side_client()
-        .database(TARGET_DB)
-        .run_command(doc! { "drop": collection })
-        .await;
 }
 
 /// `profile: 2` records every operation against `app` into
@@ -168,8 +104,8 @@ async fn profiled_max_time_ms(collection: &str) -> Option<i64> {
 /// splitting it would let two tests race on that global.
 #[tokio::test]
 async fn command_always_carries_the_clamped_max_time_ms() {
-    let a = adapter().await;
-    let coll = unique_collection();
+    let a = adapter(SERVER_NAME).await;
+    let coll = unique_collection("mongotmo");
     seed(&coll, 3).await;
     set_profiling(2).await;
 
@@ -198,7 +134,7 @@ async fn command_always_carries_the_clamped_max_time_ms() {
     }
 
     set_profiling(0).await;
-    drop_collection(&coll).await;
+    drop_collection(&side_client(), &coll).await;
 
     for ((grant, expected), got) in cases.into_iter().zip(observed) {
         assert_eq!(
@@ -224,8 +160,8 @@ async fn command_always_carries_the_clamped_max_time_ms() {
 /// server does not carry it. The contract under test is the bound itself.
 #[tokio::test]
 async fn expensive_cursor_read_is_bounded_by_the_budget() {
-    let a = adapter().await;
-    let coll = unique_collection();
+    let a = adapter(SERVER_NAME).await;
+    let coll = unique_collection("mongotmo");
     seed(&coll, 4_000).await;
 
     // Unindexed self-join: every input document triggers a full collection
@@ -246,7 +182,7 @@ async fn expensive_cursor_read_is_bounded_by_the_budget() {
         .await;
     let elapsed = started.elapsed();
 
-    drop_collection(&coll).await;
+    drop_collection(&side_client(), &coll).await;
 
     assert!(
         matches!(result, Err(ExecError::Timeout)),
@@ -256,18 +192,6 @@ async fn expensive_cursor_read_is_bounded_by_the_budget() {
         elapsed < Duration::from_secs(3),
         "call took {elapsed:?} — the budget did not bound it"
     );
-}
-
-fn state_db_url() -> String {
-    std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
-        "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
-    })
-}
-
-async fn state_pool() -> sqlx::PgPool {
-    state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)")
 }
 
 fn identity(user_sub: &str) -> Identity {
@@ -282,7 +206,7 @@ fn identity(user_sub: &str) -> Identity {
 
 fn config_with_timeout(statement_timeout_ms: Option<u32>) -> ConfigFile {
     ConfigFile {
-        servers: vec![server()],
+        servers: vec![server(SERVER_NAME)],
         permissions: vec![Permission {
             group: GROUP.to_string(),
             grants: vec![Grant {
@@ -318,7 +242,7 @@ fn tool_error_code(response: &db_mcp_gateway::transport::jsonrpc::Response) -> O
 #[tokio::test]
 async fn slow_operation_times_out_and_writes_timeout_audit_row() {
     let pool = state_pool().await;
-    let coll = unique_collection();
+    let coll = unique_collection("mongotmo");
     // Enough documents that an unindexed sort + group cannot finish inside
     // a 1ms budget.
     seed(&coll, 5_000).await;
@@ -337,14 +261,17 @@ async fn slow_operation_times_out_and_writes_timeout_audit_row() {
     // budget is not being enforced at all, which is the regression.
     let mut code = None;
     for _ in 0..5 {
+        let tool_ctx = ToolCtx {
+            identity: &identity,
+            config: &config,
+            registry: &registry,
+            permissions_cache: None,
+            state_db: Some(&pool),
+            request: &ctx,
+        };
         let response = run_query::run(
+            tool_ctx,
             Value::from(Uuid::new_v4().to_string()),
-            &identity,
-            &config,
-            &registry,
-            None,
-            Some(&pool),
-            &ctx,
             Some(serde_json::json!({
                 "server": SERVER_NAME,
                 "database": TARGET_DB,
@@ -358,7 +285,7 @@ async fn slow_operation_times_out_and_writes_timeout_audit_row() {
         }
     }
 
-    drop_collection(&coll).await;
+    drop_collection(&side_client(), &coll).await;
 
     assert_eq!(
         code.as_deref(),
@@ -366,18 +293,11 @@ async fn slow_operation_times_out_and_writes_timeout_audit_row() {
         "expected the `timeout` tool code within 5 attempts"
     );
 
-    let row = audit::latest_for_user_tool(&pool, &user, "run_query")
-        .await
-        .expect("audit query runs")
-        .expect("audit row was written");
+    let row = latest_audit(&pool, &user, "run_query", "run_query dispatch").await;
     assert_eq!(row.outcome, "timeout");
     assert_eq!(row.server.as_deref(), Some(SERVER_NAME));
     assert_eq!(row.database.as_deref(), Some(TARGET_DB));
     assert_eq!(row.db_type.as_deref(), Some("mongo"));
 
-    sqlx::query("DELETE FROM audit_calls WHERE user_sub = $1")
-        .bind(&user)
-        .execute(&pool)
-        .await
-        .expect("cleanup");
+    delete_audit_calls(&pool, &user).await;
 }

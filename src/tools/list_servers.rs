@@ -11,15 +11,15 @@
 
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::PgPool;
 
 use crate::auth::Identity;
-use crate::authz::{self, PermissionsCache, cache::load_or_empty};
+use crate::authz;
 use crate::config::{ConfigFile, Grant, ServerKind};
 use crate::transport::jsonrpc::Response;
 
+use super::ToolCtx;
 use super::audit_dispatch::{
-    AuditHeader, Outcome, RequestContext, audit_dispatch, error_outcome, success_outcome,
+    AuditHeader, Outcome, OutcomeCode, error_outcome, run_audited, success_outcome,
 };
 
 const TOOL_NAME: &str = "list_servers";
@@ -37,15 +37,8 @@ struct ListServersResult {
     servers: Vec<SafeServerView>,
 }
 
-pub async fn run(
-    id: Value,
-    identity: &Identity,
-    config: &ConfigFile,
-    permissions_cache: Option<&PermissionsCache>,
-    state_db: Option<&PgPool>,
-    request_ctx: &RequestContext,
-    _arguments: Option<Value>,
-) -> Response {
+/// Takes no arguments; any the caller sends are ignored.
+pub async fn run(ctx: ToolCtx<'_>, id: Value) -> Response {
     let header = AuditHeader {
         tool: TOOL_NAME,
         server: None,
@@ -54,35 +47,9 @@ pub async fn run(
         reason: None,
         db_type: None,
     };
-    let db_grants = match load_or_empty(permissions_cache, identity).await {
-        Ok(g) => g,
-        Err(err) => {
-            tracing::error!(%err, "permissions cache load failed");
-            let resp = error_outcome(id.clone(), "internal", "permissions_cache_load_failed");
-            let work = async move { resp };
-            return audit_dispatch(
-                id,
-                identity,
-                state_db,
-                request_ctx,
-                header,
-                &config.logging.stream,
-                work,
-            )
-            .await;
-        }
-    };
-    let work_id = id.clone();
-    let work = async move { compute_outcome(work_id, identity, config, &db_grants) };
-    audit_dispatch(
-        id,
-        identity,
-        state_db,
-        request_ctx,
-        header,
-        &config.logging.stream,
-        work,
-    )
+    run_audited(ctx, id, header, |id, grants| async move {
+        compute_outcome(id, ctx.identity, ctx.config, &grants)
+    })
     .await
 }
 
@@ -106,7 +73,11 @@ fn compute_outcome(
             // Serialization of our safe-view types is infallible in practice,
             // but `expect` on the request path is banned (CLAUDE.md): degrade
             // to a typed internal error instead of panicking.
-            return error_outcome(id, "internal", "tool.list_servers.serialization_failed");
+            return error_outcome(
+                id,
+                OutcomeCode::Internal,
+                "tool.list_servers.serialization_failed",
+            );
         }
     };
 
@@ -222,7 +193,7 @@ permissions:
             &load(),
             &[],
         );
-        assert_eq!(outcome.code, "success");
+        assert_eq!(outcome.code, OutcomeCode::Success);
         assert_eq!(outcome.row_count, Some(2));
         assert_eq!(outcome.truncated, Some(false));
     }

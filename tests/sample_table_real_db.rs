@@ -3,42 +3,10 @@
 //! tests in `src/tools/sample_table.rs` already cover the regex; this file
 //! proves the happy-path SQL works against a live Postgres.
 
-use db_mcp_gateway::config::{Database, Password, Server, ServerKind, Tls};
+mod common;
+
+use common::pg_target::adapter;
 use db_mcp_gateway::exec::{DbAdapter, ExecError, ExecQuery, ExecResult, PgAdapter};
-
-const TARGET_HOST: &str = "localhost";
-const TARGET_PORT: u16 = 5434;
-const TARGET_USER: &str = "app";
-const TARGET_PASSWORD: &str = "app-dev-only";
-const TARGET_DB: &str = "app";
-
-fn server() -> Server {
-    Server {
-        name: "target".to_string(),
-        kind: ServerKind::Postgres,
-        description: String::new(),
-        host: TARGET_HOST.to_string(),
-        port: TARGET_PORT,
-        tls: Tls::Insecure,
-        databases: vec![database()],
-    }
-}
-
-fn database() -> Database {
-    Database {
-        name: TARGET_DB.to_string(),
-        role: TARGET_USER.to_string(),
-        password: Password::Literal(TARGET_PASSWORD.into()),
-        description: String::new(),
-        auth_database: None,
-    }
-}
-
-async fn adapter() -> PgAdapter {
-    PgAdapter::open(&server(), &database())
-        .await
-        .expect("target-db reachable; run `bin/dev up`")
-}
 
 async fn run(a: &PgAdapter, sql: &str) -> Result<ExecResult, ExecError> {
     a.execute(ExecQuery {

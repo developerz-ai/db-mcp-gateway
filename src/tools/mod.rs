@@ -1,15 +1,15 @@
 //! MCP tool implementations.
 //!
-//! Each tool is a handler with shape
-//! `run(id, identity, config, [registry], args) -> jsonrpc::Response`. The
-//! transport routes `tools/call` to `dispatch_call`, which fans out by tool
-//! name.
+//! Each tool is a handler with shape `run(ctx, id, args) -> jsonrpc::Response`.
+//! The transport routes `tools/call` to `dispatch_call`, which fans out by
+//! tool name.
 //!
 //! Security-required (see CLAUDE.md). Every tool that returns config data
 //! MUST go through a credential-free view type (see `SafeServerView`); never
 //! serialize a `crate::config::Server` to the wire.
 
 pub mod audit_dispatch;
+mod context;
 pub mod describe_schema;
 pub mod explain;
 pub mod get_query_history;
@@ -17,17 +17,14 @@ pub mod list_databases;
 pub mod list_servers;
 pub mod run_query;
 pub mod sample_table;
+mod target;
 
 use serde::Deserialize;
 use serde_json::Value;
-use sqlx::PgPool;
 use tracing::Instrument;
 use tracing::info_span;
 
-use crate::auth::Identity;
-use crate::authz::PermissionsCache;
 use crate::config::{ConfigFile, ServerKind};
-use crate::exec::AdapterRegistry;
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
 /// Map a `ServerKind` to its audit-row string. Single source of truth so
@@ -72,6 +69,7 @@ pub(crate) fn db_type_for_server(config: &ConfigFile, server_name: &str) -> Opti
 pub(crate) const GATEWAY_ROW_LIMIT_CEILING: u32 = 100_000;
 
 pub use audit_dispatch::RequestContext;
+pub use context::ToolCtx;
 
 // Re-export canonical names so dispatch and the advertised capability can
 // never drift apart.
@@ -90,33 +88,15 @@ struct CallParams {
     arguments: Option<Value>,
 }
 
-/// Route a `tools/call` JSON-RPC request to its tool. Identity is the
-/// authenticated caller (the bearer-auth middleware guarantees presence on
-/// `/mcp` POST; the `Option` lets the caller surface "anonymous" as a defined
-/// internal-error rather than panicking).
+/// Route a `tools/call` JSON-RPC request to its tool. `ctx.identity` is the
+/// authenticated caller; the transport refuses before this point if there is
+/// none.
 ///
 /// Per CLAUDE.md, every tool dispatch is a tracing span with `request_id`,
 /// `user`, `server`, `database`. For tools that don't address a specific
 /// server/db (e.g. `list_servers`) those fields render empty; per-DB tools
 /// (`run_query`) fill them from the call arguments.
-// Per-request fan-out — every arg is a distinct slice of request state owned
-// by AppState. Bundling into a ToolContext would lengthen call sites without
-// reducing what each handler needs to know.
-#[allow(clippy::too_many_arguments)]
-pub async fn dispatch_call(
-    id: Value,
-    identity: Option<&Identity>,
-    config: &ConfigFile,
-    registry: &AdapterRegistry,
-    permissions_cache: Option<&PermissionsCache>,
-    state_db: Option<&PgPool>,
-    request_ctx: &RequestContext,
-    params: Option<Value>,
-) -> Response {
-    let Some(identity) = identity else {
-        return Response::error(id, ErrorObject::internal("missing identity"));
-    };
-
+pub async fn dispatch_call(id: Value, ctx: ToolCtx<'_>, params: Option<Value>) -> Response {
     let call: CallParams = match params.map(serde_json::from_value::<CallParams>) {
         Some(Ok(c)) => c,
         _ => {
@@ -133,7 +113,7 @@ pub async fn dispatch_call(
     // docs/deployment/logging.md (issue #14): `user_sub`, `db` — Alloy/Loki
     // parsers key off these directly. Renaming silently breaks consumers.
     //
-    // `request_id` is `request_ctx.request_id` (gateway-minted), NOT the
+    // `request_id` is `ctx.request.request_id` (gateway-minted), NOT the
     // client's JSON-RPC `id` — that value is caller-controlled (arbitrary
     // JSON, unbounded length, no uniqueness guarantee) and is only ever
     // echoed back in the response envelope. Using the gateway UUID here
@@ -141,12 +121,14 @@ pub async fn dispatch_call(
     // the same value, so a log line and its audit row always correlate.
     let span = info_span!(
         "tool_dispatch",
-        request_id = %request_ctx.request_id,
-        user_sub = %identity.user_sub,
+        request_id = %ctx.request.request_id,
+        user_sub = %ctx.identity.user_sub,
         tool = %call.name,
         server = span_server,
         db = span_database,
     );
+
+    let args = call.arguments;
 
     // `.instrument(span)`, not `span.enter()` held across the `.await`s
     // below. A sync `Entered` guard doesn't track task suspension on a
@@ -158,94 +140,13 @@ pub async fn dispatch_call(
     // interleaved tasks never see it as "current."
     async move {
         match call.name.as_str() {
-            LIST_SERVERS => {
-                list_servers::run(
-                    id,
-                    identity,
-                    config,
-                    permissions_cache,
-                    state_db,
-                    request_ctx,
-                    call.arguments,
-                )
-                .await
-            }
-            LIST_DATABASES => {
-                list_databases::run(
-                    id,
-                    identity,
-                    config,
-                    permissions_cache,
-                    state_db,
-                    request_ctx,
-                    call.arguments,
-                )
-                .await
-            }
-            DESCRIBE_SCHEMA => {
-                describe_schema::run(
-                    id,
-                    identity,
-                    config,
-                    registry,
-                    permissions_cache,
-                    state_db,
-                    request_ctx,
-                    call.arguments,
-                )
-                .await
-            }
-            SAMPLE_TABLE => {
-                sample_table::run(
-                    id,
-                    identity,
-                    config,
-                    registry,
-                    permissions_cache,
-                    state_db,
-                    request_ctx,
-                    call.arguments,
-                )
-                .await
-            }
-            EXPLAIN => {
-                explain::run(
-                    id,
-                    identity,
-                    config,
-                    registry,
-                    permissions_cache,
-                    state_db,
-                    request_ctx,
-                    call.arguments,
-                )
-                .await
-            }
-            RUN_QUERY => {
-                run_query::run(
-                    id,
-                    identity,
-                    config,
-                    registry,
-                    permissions_cache,
-                    state_db,
-                    request_ctx,
-                    call.arguments,
-                )
-                .await
-            }
-            GET_QUERY_HISTORY => {
-                get_query_history::run(
-                    id,
-                    identity,
-                    config,
-                    permissions_cache,
-                    state_db,
-                    request_ctx,
-                    call.arguments,
-                )
-                .await
-            }
+            LIST_SERVERS => list_servers::run(ctx, id).await,
+            LIST_DATABASES => list_databases::run(ctx, id, args).await,
+            DESCRIBE_SCHEMA => describe_schema::run(ctx, id, args).await,
+            SAMPLE_TABLE => sample_table::run(ctx, id, args).await,
+            EXPLAIN => explain::run(ctx, id, args).await,
+            RUN_QUERY => run_query::run(ctx, id, args).await,
+            GET_QUERY_HISTORY => get_query_history::run(ctx, id, args).await,
             other => Response::error(
                 id,
                 ErrorObject::invalid_params(format!("unknown tool: {other}")),

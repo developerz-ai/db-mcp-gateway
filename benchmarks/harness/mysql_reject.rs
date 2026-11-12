@@ -28,7 +28,9 @@ use std::path::Path;
 
 use db_mcp_gateway::config::{ConfigFile, ConfigFileError};
 use db_mcp_gateway::exec::ExecError;
-use db_mcp_gateway::tools::audit_dispatch::{ToolErrorMessages, outcome_from_exec_error};
+use db_mcp_gateway::tools::audit_dispatch::{
+    OutcomeCode, ToolErrorMessages, outcome_from_exec_error,
+};
 use serde::Serialize;
 
 /// The verdict of the MySQL rejection check.
@@ -214,7 +216,7 @@ fn check_runtime_backstop() -> bool {
         std::time::Instant::now(),
         &messages,
     );
-    if outcome.code != "internal" {
+    if outcome.code != OutcomeCode::Internal {
         return false;
     }
     let message = outcome.error_message.unwrap_or_default().to_lowercase();

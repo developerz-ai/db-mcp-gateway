@@ -1,8 +1,7 @@
 //! `describe_schema` — tables + columns + types for a database's schema.
 //!
-//! Action: `SchemaRead`. Reads from `information_schema.columns` via the
-//! per-DB pool. Schema/table args are passed as bound parameters (not
-//! interpolated), so no identifier-injection risk.
+//! Action: `SchemaRead`. The adapter runs the catalog lookup; schema/table
+//! reach it as bound values, never interpolated identifiers.
 //!
 //! Per the issue body, the response shape is tables + columns + types only;
 //! PK/FK/indexes (mentioned in spec doc 03 §describe_schema) are deferred to
@@ -12,18 +11,17 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::PgPool;
 
-use crate::auth::Identity;
-use crate::authz::{self, Decision, PermissionsCache, cache::load_or_empty};
-use crate::config::{Action, ConfigFile, Database, Grant, Server};
-use crate::exec::{AdapterRegistry, ExecQuery, ExecResult};
+use crate::config::{Action, Grant};
+use crate::exec::{ExecResult, SchemaQuery};
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
+use super::ToolCtx;
 use super::audit_dispatch::{
-    AuditHeader, Outcome, RequestContext, ToolErrorMessages, audit_dispatch, error_outcome,
-    outcome_from_exec_error, success_outcome,
+    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, error_outcome, outcome_from_exec_error,
+    run_audited, success_outcome,
 };
+use super::target::{forbidden, resolve_target};
 
 const TOOL_NAME: &str = "describe_schema";
 const ERROR_MESSAGES: ToolErrorMessages = ToolErrorMessages {
@@ -67,17 +65,7 @@ struct DescribeSchemaResult {
     tables: Vec<TableView>,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    id: Value,
-    identity: &Identity,
-    config: &ConfigFile,
-    registry: &AdapterRegistry,
-    permissions_cache: Option<&PermissionsCache>,
-    state_db: Option<&PgPool>,
-    request_ctx: &RequestContext,
-    arguments: Option<Value>,
-) -> Response {
+pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Response {
     let args: Arguments = match arguments.map(serde_json::from_value::<Arguments>) {
         Some(Ok(a)) => a,
         _ => {
@@ -94,82 +82,50 @@ pub async fn run(
         database: Some(&args.database),
         sql: None,
         reason: None,
-        db_type: super::db_type_for_server(config, &args.server),
+        db_type: super::db_type_for_server(ctx.config, &args.server),
     };
-    let db_grants = match load_or_empty(permissions_cache, identity).await {
-        Ok(g) => g,
-        Err(err) => {
-            tracing::error!(%err, "permissions cache load failed");
-            let resp = error_outcome(id.clone(), "internal", "permissions_cache_load_failed");
-            let work = async move { resp };
-            return audit_dispatch(
-                id,
-                identity,
-                state_db,
-                request_ctx,
-                header,
-                &config.logging.stream,
-                work,
-            )
-            .await;
-        }
-    };
-    let work = compute_outcome(id.clone(), identity, config, registry, &db_grants, &args);
-    audit_dispatch(
-        id,
-        identity,
-        state_db,
-        request_ctx,
-        header,
-        &config.logging.stream,
-        work,
-    )
+    let args = &args;
+    run_audited(ctx, id, header, |id, grants| async move {
+        compute_outcome(ctx, id, &grants, args).await
+    })
     .await
 }
 
 async fn compute_outcome(
+    ctx: ToolCtx<'_>,
     id: Value,
-    identity: &Identity,
-    config: &ConfigFile,
-    registry: &AdapterRegistry,
     db_grants: &[Grant],
     args: &Arguments,
 ) -> Outcome {
-    let Some((server, database)) = find_server_db(config, &args.server, &args.database) else {
+    let Some(target) = resolve_target(
+        ctx,
+        db_grants,
+        Action::SchemaRead,
+        &args.server,
+        &args.database,
+    ) else {
         return forbidden(id);
     };
-
-    let decision = authz::evaluate_effective(
-        identity,
-        Action::SchemaRead,
-        &server.name,
-        &database.name,
-        &config.permissions,
-        db_grants,
-    );
-    let constraints = match decision {
-        Decision::Allow { constraints } => constraints,
-        Decision::Deny => return forbidden(id),
-    };
-
-    let schema = args.schema.as_deref().unwrap_or(DEFAULT_SCHEMA);
-    let (sql, binds) = build_catalog_query(schema, args.table.as_deref());
 
     // Wall clock starts before pool open so error paths still carry
     // `duration_ms` into the audit row — spec 07 requires it on every call.
     let started = Instant::now();
-    let adapter = match registry.get_or_open(server, database).await {
+    let adapter = match ctx
+        .registry
+        .get_or_open(target.server, target.database)
+        .await
+    {
         Ok(a) => a,
         Err(err) => return outcome_from_exec_error(id, err, started, &ERROR_MESSAGES),
     };
 
-    let query = ExecQuery {
-        sql: &sql,
-        binds: &binds,
-        statement_timeout_ms: constraints.statement_timeout_ms,
+    let query = SchemaQuery {
+        schema: args.schema.as_deref().unwrap_or(DEFAULT_SCHEMA),
+        table: args.table.as_deref(),
+        statement_timeout_ms: target.constraints.statement_timeout_ms,
         row_limit: MAX_CATALOG_ROWS,
     };
-    let result = adapter.execute(query).await;
+    let result = adapter.describe_schema(query).await;
 
     match result {
         Ok(exec_result) => {
@@ -179,7 +135,7 @@ async fn compute_outcome(
                 Err(_) => {
                     return error_outcome(
                         id,
-                        "internal",
+                        OutcomeCode::Internal,
                         "catalog response shape changed unexpectedly",
                     );
                 }
@@ -187,7 +143,9 @@ async fn compute_outcome(
             let table_count = i64::try_from(payload.tables.len()).unwrap_or(i64::MAX);
             let text = match serde_json::to_string(&payload) {
                 Ok(t) => t,
-                Err(_) => return error_outcome(id, "internal", "failed to serialize result"),
+                Err(_) => {
+                    return error_outcome(id, OutcomeCode::Internal, "failed to serialize result");
+                }
             };
             // row_count = number of tables surfaced. The catalog scan IS
             // capped (`MAX_CATALOG_ROWS`), so persist the real truncation
@@ -202,37 +160,6 @@ async fn compute_outcome(
             )
         }
         Err(err) => outcome_from_exec_error(id, err, started, &ERROR_MESSAGES),
-    }
-}
-
-fn forbidden(id: Value) -> Outcome {
-    error_outcome(id, "forbidden", "no grants for this server/database")
-}
-
-fn find_server_db<'a>(
-    config: &'a ConfigFile,
-    server_name: &str,
-    database_name: &str,
-) -> Option<(&'a Server, &'a Database)> {
-    let server = config.servers.iter().find(|s| s.name == server_name)?;
-    let database = server.databases.iter().find(|d| d.name == database_name)?;
-    Some((server, database))
-}
-
-/// Build the catalog query + the bind values that go with it. Schema and
-/// table go through `$1` / `$2` — they're values, not identifiers, in this
-/// query, so the standard parameterised path is safe.
-fn build_catalog_query<'a>(schema: &'a str, table: Option<&'a str>) -> (String, Vec<&'a str>) {
-    let base = "SELECT table_schema, table_name, column_name, data_type, is_nullable \
-                FROM information_schema.columns \
-                WHERE table_schema = $1";
-    let order = " ORDER BY table_name, ordinal_position";
-    if let Some(_table) = table {
-        let sql = format!("{base} AND table_name = $2{order}");
-        (sql, vec![schema, table.unwrap_or("")])
-    } else {
-        let sql = format!("{base}{order}");
-        (sql, vec![schema])
     }
 }
 
@@ -275,19 +202,6 @@ fn assemble_tables(result: &ExecResult) -> Result<DescribeSchemaResult, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn catalog_query_uses_bind_params() {
-        let (sql, binds) = build_catalog_query("public", None);
-        assert!(sql.contains("table_schema = $1"), "{sql}");
-        assert!(!sql.contains("AND table_name"), "{sql}");
-        assert_eq!(binds, vec!["public"]);
-
-        let (sql, binds) = build_catalog_query("acme", Some("users"));
-        assert!(sql.contains("table_schema = $1"));
-        assert!(sql.contains("AND table_name = $2"));
-        assert_eq!(binds, vec!["acme", "users"]);
-    }
 
     /// Confirms `assemble_tables` correctly groups consecutive rows by
     /// (schema, table_name) and decodes is_nullable from the YES/NO text

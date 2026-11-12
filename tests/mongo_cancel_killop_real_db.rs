@@ -20,76 +20,18 @@
 //! cancellation lives in the tool-dispatch integration tests
 //! (see `tests/cancellation_real_db.rs`).
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use mongodb::Client;
 use mongodb::bson::{Document, doc};
-use mongodb::options::{ClientOptions, Credential, ServerAddress};
-use uuid::Uuid;
 
-use db_mcp_gateway::config::{Database, Password, Server, ServerKind, Tls};
-use db_mcp_gateway::exec::{DbAdapter, ExecQuery, MongoAdapter};
+use common::mongo_target::{TARGET_DB, adapter, drop_collection, side_client, unique_collection};
+use db_mcp_gateway::exec::{DbAdapter, ExecQuery};
 
-const TARGET_HOST: &str = "localhost";
-const TARGET_PORT: u16 = 27018;
-const TARGET_USER: &str = "app";
-const TARGET_PASSWORD: &str = "app-dev-only";
-const TARGET_DB: &str = "app";
 const SERVER_NAME: &str = "mongo-cancel-test";
-
-fn server() -> Server {
-    Server {
-        name: SERVER_NAME.to_string(),
-        kind: ServerKind::Mongo,
-        description: String::new(),
-        host: TARGET_HOST.to_string(),
-        port: TARGET_PORT,
-        tls: Tls::Insecure,
-        databases: vec![],
-    }
-}
-
-fn database() -> Database {
-    Database {
-        name: TARGET_DB.to_string(),
-        role: TARGET_USER.to_string(),
-        password: Password::Literal(TARGET_PASSWORD.into()),
-        description: String::new(),
-        auth_database: Some("admin".to_string()),
-    }
-}
-
-async fn adapter() -> MongoAdapter {
-    MongoAdapter::open(&server(), &database())
-        .await
-        .expect("target-mongo reachable; run `bin/dev up`")
-}
-
-/// Side-channel client for setup/teardown/monitoring — bypasses the
-/// rejector and the gateway's marker convention entirely. NEVER a
-/// production path: root-equivalent access, used only to observe
-/// `currentOp` and seed data.
-fn side_client() -> Client {
-    let credential = Credential::builder()
-        .username(TARGET_USER.to_string())
-        .password(TARGET_PASSWORD.to_string())
-        .source(Some("admin".to_string()))
-        .build();
-    let options = ClientOptions::builder()
-        .hosts(vec![ServerAddress::Tcp {
-            host: TARGET_HOST.to_string(),
-            port: Some(TARGET_PORT),
-        }])
-        .credential(credential)
-        .default_database(TARGET_DB.to_string())
-        .build();
-    Client::with_options(options).expect("side client builds")
-}
-
-fn unique_collection() -> String {
-    format!("mongocancel_{}", Uuid::new_v4().simple())
-}
 
 /// Bulk-insert `count` trivial documents, chunked under the 100k/16MB
 /// per-command cap.
@@ -104,13 +46,6 @@ async fn seed(client: &Client, collection: &str, count: usize) {
             .await
             .expect("seed insert");
     }
-}
-
-async fn drop_collection(client: &Client, collection: &str) {
-    let _ = client
-        .database(TARGET_DB)
-        .run_command(doc! { "drop": collection })
-        .await;
 }
 
 /// Whether `currentOp` on the admin side-channel shows an in-progress
@@ -172,7 +107,7 @@ async fn poll_until(client: &Client, collection: &str, want: bool, deadline: Dur
 #[tokio::test]
 async fn dropped_execute_future_kills_the_mongo_op() {
     let monitor = side_client();
-    let coll = unique_collection();
+    let coll = unique_collection("mongocancel");
     // Enough documents that an unindexed sort on a per-doc computed field
     // takes a comfortable few hundred ms to a couple of seconds — long enough
     // to observe in currentOp before the test aborts, short enough not to
@@ -182,7 +117,7 @@ async fn dropped_execute_future_kills_the_mongo_op() {
     // regardless of runner speed.
     seed(&monitor, &coll, 200_000).await;
 
-    let adapter = Arc::new(adapter().await);
+    let adapter = Arc::new(adapter(SERVER_NAME).await);
     // `$reduce` walks a 500-element `$range` per doc → ~100M cheap ops for
     // 200k docs, dominating the pipeline cost. Sort on the computed field
     // `h` prevents any index shortcut. Kept inline as a JSON string so the
@@ -263,10 +198,10 @@ async fn dropped_execute_future_kills_the_mongo_op() {
 #[tokio::test]
 async fn completed_command_leaves_nothing_in_current_op() {
     let monitor = side_client();
-    let coll = unique_collection();
+    let coll = unique_collection("mongocancel");
     seed(&monitor, &coll, 10).await;
 
-    let adapter = adapter().await;
+    let adapter = adapter(SERVER_NAME).await;
     let sql = format!(r#"{{"find":"{coll}","filter":{{}}}}"#);
 
     let result = adapter

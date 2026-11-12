@@ -5,15 +5,9 @@
 
 mod common;
 
-use std::sync::Arc;
-use std::time::Duration;
-
-use common::{MockTokenFlags, MockUser, spawn_mock_idp, spawn_mock_idp_with_flags};
-use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
-use db_mcp_gateway::config::{Config, ConfigFile};
-use db_mcp_gateway::exec::AdapterRegistry;
-use db_mcp_gateway::state;
-use db_mcp_gateway::transport::{self, AppState, AuthFacade, PendingFlows};
+use common::env::state_pool;
+use common::gateway::{GatewayBuilder, no_redirect_client};
+use common::idp::{MockTokenFlags, MockUser, spawn_mock_idp, spawn_mock_idp_with_flags};
 use serde_json::{Value, json};
 
 /// Config the e2e booted gateway sees. The user logs in with groups
@@ -51,17 +45,9 @@ permissions:
       - { server: staging, database: "*", action: query_read }
 "#;
 
-fn state_db_url() -> String {
-    std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
-        "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
-    })
-}
-
 #[tokio::test]
 async fn login_via_mock_idp_then_call_tool() {
-    let pool = state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)");
+    let pool = state_pool().await;
     // Don't TRUNCATE: tests must coexist with each other and any dev rows.
 
     let user = MockUser {
@@ -71,64 +57,12 @@ async fn login_via_mock_idp_then_call_tool() {
     };
     let idp = spawn_mock_idp("test-client", "test-secret", user.clone()).await;
 
-    // Bind the gateway first so we know our redirect URL.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let gateway_url = format!("http://{addr}");
-
-    let auth_config = AuthConfig {
-        issuer: idp.issuer.clone(),
-        client_id: idp.client_id.clone(),
-        client_secret: idp.client_secret.clone(),
-        audience: idp.client_id.clone(),
-        redirect_url: format!("{gateway_url}/auth/callback"),
-        ..AuthConfig::default()
-    };
-    let sessions = SessionStore::new(pool.clone());
-    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient http builder");
-
-    let config = Config {
-        bind: addr,
-        ..Config::default()
-    };
-    let config_file = ConfigFile::from_yaml_str(E2E_CONFIG_YAML).expect("e2e yaml is well-formed");
-    let app = transport::router(
-        &config,
-        AppState {
-            auth: Some(AuthFacade {
-                config: Arc::new(auth_config),
-                sessions,
-                oidc,
-                flows: PendingFlows::default(),
-                codes: db_mcp_gateway::transport::AuthCodes::default(),
-                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
-                service_tokens: Default::default(),
-            }),
-            config: Arc::new(config_file),
-            adapter_registry: AdapterRegistry::new(),
-            state_db: Some(pool),
-            shutdown: Default::default(),
-            metrics: None,
-            permissions_cache: None,
-            permissions_repo: None,
-            mcp_path: std::sync::Arc::from("/mcp"),
-            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
-        },
-    )
-    .expect("router builds");
-    tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await;
-    });
-
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let gateway_url = GatewayBuilder::new(E2E_CONFIG_YAML)
+        .idp(&idp)
+        .spawn(pool)
+        .await
+        .url;
+    let client = no_redirect_client();
 
     // 1. Start the flow: gateway hands back the IdP authorize URL.
     let login: Value = client
@@ -271,65 +205,14 @@ struct GatewayHandle {
     client: reqwest::Client,
 }
 
-async fn spawn_gateway(pool: sqlx::PgPool, idp: &common::MockIdpHandle) -> GatewayHandle {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let gateway_url = format!("http://{addr}");
-
-    let auth_config = AuthConfig {
-        issuer: idp.issuer.clone(),
-        client_id: idp.client_id.clone(),
-        client_secret: idp.client_secret.clone(),
-        audience: idp.client_id.clone(),
-        redirect_url: format!("{gateway_url}/auth/callback"),
-        ..AuthConfig::default()
-    };
-    let sessions = SessionStore::new(pool.clone());
-    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient http builder");
-    let config = Config {
-        bind: addr,
-        ..Config::default()
-    };
-    let config_file = ConfigFile::from_yaml_str(E2E_CONFIG_YAML).expect("e2e yaml is well-formed");
-    let app = transport::router(
-        &config,
-        AppState {
-            auth: Some(AuthFacade {
-                config: Arc::new(auth_config),
-                sessions,
-                oidc,
-                flows: PendingFlows::default(),
-                codes: db_mcp_gateway::transport::AuthCodes::default(),
-                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
-                service_tokens: Default::default(),
-            }),
-            config: Arc::new(config_file),
-            adapter_registry: AdapterRegistry::new(),
-            state_db: Some(pool),
-            shutdown: Default::default(),
-            metrics: None,
-            permissions_cache: None,
-            permissions_repo: None,
-            mcp_path: std::sync::Arc::from("/mcp"),
-            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
-        },
-    )
-    .expect("router builds");
-    tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
+async fn spawn_gateway(pool: sqlx::PgPool, idp: &common::idp::MockIdpHandle) -> GatewayHandle {
+    let gw = GatewayBuilder::new(E2E_CONFIG_YAML)
+        .idp(idp)
+        .spawn(pool)
         .await;
-    });
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
     GatewayHandle {
-        url: gateway_url,
-        client,
+        url: gw.url,
+        client: no_redirect_client(),
     }
 }
 
@@ -369,9 +252,7 @@ async fn drive_to_callback(gw: &GatewayHandle) -> reqwest::Response {
 /// with 502 Bad Gateway and error code `oidc_email_unverified`.
 #[tokio::test]
 async fn unverified_email_is_rejected() {
-    let pool = state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)");
+    let pool = state_pool().await;
 
     let user = MockUser {
         sub: format!("unverified-{}", uuid::Uuid::new_v4().simple()),
@@ -407,9 +288,7 @@ async fn unverified_email_is_rejected() {
 /// an identity even when `email_verified` is true.
 #[tokio::test]
 async fn empty_email_is_rejected() {
-    let pool = state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)");
+    let pool = state_pool().await;
 
     let user = MockUser {
         sub: format!("empty-email-{}", uuid::Uuid::new_v4().simple()),
@@ -442,9 +321,7 @@ async fn empty_email_is_rejected() {
 /// not-yet-valid token before any claim is trusted.
 #[tokio::test]
 async fn future_nbf_id_token_is_rejected() {
-    let pool = state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)");
+    let pool = state_pool().await;
 
     let user = MockUser {
         sub: format!("future-nbf-{}", uuid::Uuid::new_v4().simple()),
@@ -482,9 +359,7 @@ async fn future_nbf_id_token_is_rejected() {
 /// check — regardless of what key material the attacker holds.
 #[tokio::test]
 async fn hs256_id_token_is_rejected() {
-    let pool = state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)");
+    let pool = state_pool().await;
 
     let user = MockUser {
         sub: format!("hs256-attacker-{}", uuid::Uuid::new_v4().simple()),

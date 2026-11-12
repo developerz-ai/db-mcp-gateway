@@ -13,28 +13,18 @@
 //! with the admin endpoints — there's no caller to roll back here. What we
 //! prove now is that the writer's error is non-swallowed and typed.
 
+mod common;
+
+use common::env::state_pool;
 use db_mcp_gateway::audit::permissions::{
     self, PermissionsAuditAction, PermissionsAuditError, PermissionsAuditRow,
     PermissionsAuditTargetType,
 };
-use db_mcp_gateway::state;
 use serde_json::json;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
 use uuid::Uuid;
-
-fn state_db_url() -> String {
-    std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
-        "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
-    })
-}
-
-async fn pool() -> PgPool {
-    state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)")
-}
 
 async fn cleanup(pool: &PgPool, target_id: Uuid) {
     sqlx::query("DELETE FROM permissions_audit WHERE target_id = $1")
@@ -64,7 +54,7 @@ fn create_row(actor_id: Uuid, target_id: Uuid, request_id: &str) -> PermissionsA
 
 #[tokio::test]
 async fn create_row_round_trips_through_writer_and_reader() {
-    let p = pool().await;
+    let p = state_pool().await;
     let actor = Uuid::new_v4();
     let target = Uuid::new_v4();
     let row = create_row(actor, target, "req-create");
@@ -93,7 +83,7 @@ async fn create_row_round_trips_through_writer_and_reader() {
 
 #[tokio::test]
 async fn delete_row_omits_after_payload() {
-    let p = pool().await;
+    let p = state_pool().await;
     let actor = Uuid::new_v4();
     let target = Uuid::new_v4();
     let row = PermissionsAuditRow {
@@ -124,7 +114,7 @@ async fn delete_row_omits_after_payload() {
 async fn update_row_records_both_before_and_after() {
     // Mirrors the most common admin path: rename a database, change a grant's
     // constraints. Both halves of the diff must survive.
-    let p = pool().await;
+    let p = state_pool().await;
     let actor = Uuid::new_v4();
     let target = Uuid::new_v4();
     let row = PermissionsAuditRow {
@@ -152,7 +142,7 @@ async fn update_row_records_both_before_and_after() {
 
 #[tokio::test]
 async fn ts_defaults_to_server_time_and_is_recent() {
-    let p = pool().await;
+    let p = state_pool().await;
     let actor = Uuid::new_v4();
     let target = Uuid::new_v4();
     permissions::log(&p, &create_row(actor, target, "req-ts"))
@@ -201,7 +191,7 @@ async fn check_constraint_rejects_unknown_action_via_raw_insert() {
     // The typed `PermissionsAuditAction` is the in-process guard, but the DB
     // CHECK is what protects us from raw-SQL bypasses (manual migrations,
     // ad-hoc admin SQL). Confirm Postgres still blocks an out-of-set value.
-    let p = pool().await;
+    let p = state_pool().await;
     let target = Uuid::new_v4();
     let err = sqlx::query(
         "INSERT INTO permissions_audit \
@@ -223,7 +213,7 @@ async fn check_constraint_rejects_unknown_action_via_raw_insert() {
 async fn check_constraint_rejects_empty_actor_email() {
     // Empty actor_email bypasses the audit identity contract. The DB CHECK
     // prevents this even if the writer mistakenly passes an empty string.
-    let p = pool().await;
+    let p = state_pool().await;
     let target = Uuid::new_v4();
     let err = sqlx::query(
         "INSERT INTO permissions_audit \
@@ -245,7 +235,7 @@ async fn check_constraint_rejects_empty_actor_email() {
 async fn check_constraint_rejects_empty_request_id() {
     // Empty request_id breaks the per-request tracing contract. The DB CHECK
     // prevents this even if the writer mistakenly passes an empty string.
-    let p = pool().await;
+    let p = state_pool().await;
     let target = Uuid::new_v4();
     let err = sqlx::query(
         "INSERT INTO permissions_audit \
@@ -267,7 +257,7 @@ async fn check_constraint_rejects_empty_request_id() {
 async fn log_accepts_transaction_executor_and_respects_rollback() {
     // Verifies the new Executor trait bound allows transactions.
     // A rolled-back transaction must not persist the audit row.
-    let p = pool().await;
+    let p = state_pool().await;
     let actor = Uuid::new_v4();
     let target = Uuid::new_v4();
     let row = create_row(actor, target, "req-tx");

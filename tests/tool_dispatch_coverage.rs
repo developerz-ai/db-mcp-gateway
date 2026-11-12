@@ -13,7 +13,7 @@
 use db_mcp_gateway::auth::{Identity, SessionId};
 use db_mcp_gateway::config::ConfigFile;
 use db_mcp_gateway::exec::AdapterRegistry;
-use db_mcp_gateway::tools::{RequestContext, dispatch_call};
+use db_mcp_gateway::tools::{RequestContext, ToolCtx, dispatch_call};
 use db_mcp_gateway::transport::protocol::ToolsListResult;
 use serde_json::json;
 
@@ -42,14 +42,17 @@ async fn every_advertised_tool_has_a_dispatch_arm() {
     let request_ctx = RequestContext::default();
 
     for tool in ToolsListResult::current().tools {
+        let ctx = ToolCtx {
+            identity: &identity,
+            config: &config,
+            registry: &registry,
+            permissions_cache: None,
+            state_db: None,
+            request: &request_ctx,
+        };
         let response = dispatch_call(
             json!(1),
-            Some(&identity),
-            &config,
-            &registry,
-            None,
-            None,
-            &request_ctx,
+            ctx,
             Some(json!({ "name": tool.name, "arguments": {} })),
         )
         .await;

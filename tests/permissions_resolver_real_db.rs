@@ -8,32 +8,22 @@
 //!
 //! Boots against the dev state DB (`bin/dev up`); no mocking per CLAUDE.md.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::env::state_pool;
 use db_mcp_gateway::auth::{Identity, SessionId};
 use db_mcp_gateway::authz::{
     Decision, PermissionsCache, can_see_server_effective, evaluate_effective,
     loader::load_db_grants_for,
 };
 use db_mcp_gateway::config::{Action, ConfigFile};
-use db_mcp_gateway::state;
 use db_mcp_gateway::state::permissions::pg::PgPermissionsRepo;
 use db_mcp_gateway::state::permissions::{DbType, GrantAction, GrantTarget, PermissionsRepo};
 use sqlx::PgPool;
 use uuid::Uuid;
-
-fn state_db_url() -> String {
-    std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
-        "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
-    })
-}
-
-async fn pool() -> PgPool {
-    state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)")
-}
 
 fn fresh(tag: &str) -> String {
     format!("{tag}-{}", Uuid::new_v4().simple())
@@ -72,7 +62,7 @@ async fn cleanup(pool: &PgPool, user_sub: &str, server: &str) -> Result<(), sqlx
 
 #[tokio::test]
 async fn loader_projects_specific_grant_into_config_grant_shape() {
-    let p = pool().await;
+    let p = state_pool().await;
     let sub = fresh("loader-spec");
     let server = fresh("loader-server");
     let repo = PgPermissionsRepo::new(p.clone());
@@ -105,7 +95,7 @@ async fn loader_projects_specific_grant_into_config_grant_shape() {
 
 #[tokio::test]
 async fn loader_drops_grants_whose_database_was_soft_deleted() {
-    let p = pool().await;
+    let p = state_pool().await;
     let sub = fresh("loader-drop");
     let server = fresh("loader-drop-server");
     let repo = PgPermissionsRepo::new(p.clone());
@@ -142,7 +132,7 @@ async fn loader_drops_grants_whose_database_was_soft_deleted() {
 
 #[tokio::test]
 async fn loader_returns_empty_for_user_with_no_permissions_row() {
-    let p = pool().await;
+    let p = state_pool().await;
     let repo = PgPermissionsRepo::new(p.clone());
     // A user_sub that exists ONLY in the YAML world (e.g. brand-new SSO
     // user, no admin-API onboarding yet) gets an empty DB-grant set — NOT
@@ -154,7 +144,7 @@ async fn loader_returns_empty_for_user_with_no_permissions_row() {
 
 #[tokio::test]
 async fn evaluate_effective_grants_via_db_with_no_yaml_match() {
-    let p = pool().await;
+    let p = state_pool().await;
     let sub = fresh("evdb");
     let server = fresh("evdb-server");
     let repo = PgPermissionsRepo::new(p.clone());
@@ -190,7 +180,7 @@ async fn evaluate_effective_grants_via_db_with_no_yaml_match() {
 async fn evaluate_effective_merges_yaml_and_db_most_restrictive() {
     // YAML grants row_limit=10000; DB grant says row_limit=50. Symmetric
     // merge — the DB tightening must win without YAML being "primary".
-    let p = pool().await;
+    let p = state_pool().await;
     let sub = fresh("merge");
     let server = fresh("merge-server");
     let repo = PgPermissionsRepo::new(p.clone());
@@ -252,7 +242,7 @@ permissions:
 
 #[tokio::test]
 async fn can_see_server_effective_includes_db_grants() {
-    let p = pool().await;
+    let p = state_pool().await;
     let sub = fresh("see");
     let server_name = fresh("see-server");
     let repo = PgPermissionsRepo::new(p.clone());
@@ -299,7 +289,7 @@ servers:
 
 #[tokio::test]
 async fn cache_hits_avoid_db_round_trip_and_invalidate_busts_it() {
-    let p = pool().await;
+    let p = state_pool().await;
     let sub = fresh("cache");
     let server = fresh("cache-server");
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(p.clone()));
@@ -380,7 +370,7 @@ where
 
 #[tokio::test]
 async fn spawn_invalidate_drops_the_targeted_users_entry() {
-    let p = pool().await;
+    let p = state_pool().await;
     let sub = fresh("spawn-inv");
     let server = fresh("spawn-inv-server");
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(p.clone()));
@@ -444,7 +434,7 @@ async fn spawn_invalidate_is_a_noop_when_cache_is_none() {
     // must not spawn a task that would try to lock a missing cache.
     PermissionsCache::spawn_invalidate(&None, Some("any-sub"));
     // Also tolerate a missing user_sub even when the cache is wired.
-    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool().await));
+    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(state_pool().await));
     let cache = Some(PermissionsCache::new(repo, Duration::from_secs(60)));
     PermissionsCache::spawn_invalidate(&cache, None);
     // If we got here without panicking or hanging, the no-op contract holds.
@@ -452,7 +442,7 @@ async fn spawn_invalidate_is_a_noop_when_cache_is_none() {
 
 #[tokio::test]
 async fn spawn_invalidate_all_flushes_every_users_entry() {
-    let p = pool().await;
+    let p = state_pool().await;
     let sub_a = fresh("spawn-all-a");
     let sub_b = fresh("spawn-all-b");
     let server = fresh("spawn-all-server");

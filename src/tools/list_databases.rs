@@ -9,15 +9,15 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::PgPool;
 
 use crate::auth::Identity;
-use crate::authz::{self, Decision, PermissionsCache, cache::load_or_empty};
+use crate::authz::{self, Decision};
 use crate::config::{Action, ConfigFile, Database, Grant};
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
+use super::ToolCtx;
 use super::audit_dispatch::{
-    AuditHeader, Outcome, RequestContext, audit_dispatch, error_outcome, success_outcome,
+    AuditHeader, Outcome, OutcomeCode, error_outcome, run_audited, success_outcome,
 };
 
 const TOOL_NAME: &str = "list_databases";
@@ -40,15 +40,7 @@ struct ListDatabasesResult {
     databases: Vec<SafeDatabaseView>,
 }
 
-pub async fn run(
-    id: Value,
-    identity: &Identity,
-    config: &ConfigFile,
-    permissions_cache: Option<&PermissionsCache>,
-    state_db: Option<&PgPool>,
-    request_ctx: &RequestContext,
-    arguments: Option<Value>,
-) -> Response {
+pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Response {
     let args: Arguments = match arguments.map(serde_json::from_value::<Arguments>) {
         Some(Ok(a)) => a,
         _ => {
@@ -65,36 +57,12 @@ pub async fn run(
         database: None,
         sql: None,
         reason: None,
-        db_type: super::db_type_for_server(config, &args.server),
+        db_type: super::db_type_for_server(ctx.config, &args.server),
     };
-    let db_grants = match load_or_empty(permissions_cache, identity).await {
-        Ok(g) => g,
-        Err(err) => {
-            tracing::error!(%err, "permissions cache load failed");
-            let resp = error_outcome(id.clone(), "internal", "permissions_cache_load_failed");
-            let work = async move { resp };
-            return audit_dispatch(
-                id,
-                identity,
-                state_db,
-                request_ctx,
-                header,
-                &config.logging.stream,
-                work,
-            )
-            .await;
-        }
-    };
-    let work = compute_outcome(id.clone(), identity, config, &db_grants, &args);
-    audit_dispatch(
-        id,
-        identity,
-        state_db,
-        request_ctx,
-        header,
-        &config.logging.stream,
-        work,
-    )
+    let args = &args;
+    run_audited(ctx, id, header, |id, grants| async move {
+        compute_outcome(id, ctx.identity, ctx.config, &grants, args).await
+    })
     .await
 }
 
@@ -106,7 +74,7 @@ async fn compute_outcome(
     args: &Arguments,
 ) -> Outcome {
     let Some(server) = config.servers.iter().find(|s| s.name == args.server) else {
-        return error_outcome(id, "forbidden", "no grants for this server");
+        return error_outcome(id, OutcomeCode::Forbidden, "no grants for this server");
     };
 
     let visible: Vec<&Database> = server
@@ -128,7 +96,7 @@ async fn compute_outcome(
         .collect();
 
     if visible.is_empty() {
-        return error_outcome(id, "forbidden", "no grants for this server");
+        return error_outcome(id, OutcomeCode::Forbidden, "no grants for this server");
     }
 
     let row_count = i64::try_from(visible.len()).unwrap_or(i64::MAX);
@@ -142,7 +110,9 @@ async fn compute_outcome(
     let payload = ListDatabasesResult { databases: view };
     let text = match serde_json::to_string(&payload) {
         Ok(t) => t,
-        Err(_) => return error_outcome(id, "internal", "failed to serialize result"),
+        Err(_) => {
+            return error_outcome(id, OutcomeCode::Internal, "failed to serialize result");
+        }
     };
 
     success_outcome(id, text, None, Some(row_count), Some(false))
@@ -207,7 +177,7 @@ permissions:
     #[tokio::test]
     async fn engineer_sees_only_app() {
         let outcome = compute_for(&["engineers"], "prod").await;
-        assert_eq!(outcome.code, "success");
+        assert_eq!(outcome.code, OutcomeCode::Success);
         let body = payload(&outcome);
         let names: Vec<&str> = body["databases"]
             .as_array()
@@ -221,7 +191,7 @@ permissions:
     #[tokio::test]
     async fn analyst_sees_only_analytics() {
         let outcome = compute_for(&["analytics-team"], "prod").await;
-        assert_eq!(outcome.code, "success");
+        assert_eq!(outcome.code, OutcomeCode::Success);
         let body = payload(&outcome);
         let names: Vec<&str> = body["databases"]
             .as_array()
@@ -235,7 +205,7 @@ permissions:
     #[tokio::test]
     async fn ops_with_wildcard_sees_all() {
         let outcome = compute_for(&["ops"], "prod").await;
-        assert_eq!(outcome.code, "success");
+        assert_eq!(outcome.code, OutcomeCode::Success);
         let body = payload(&outcome);
         let names: Vec<&str> = body["databases"]
             .as_array()
@@ -251,7 +221,7 @@ permissions:
     #[tokio::test]
     async fn user_with_no_grants_gets_forbidden_not_empty() {
         let outcome = compute_for(&["finance"], "prod").await;
-        assert_eq!(outcome.code, "forbidden");
+        assert_eq!(outcome.code, OutcomeCode::Forbidden);
         let body = payload(&outcome);
         assert_eq!(body["code"], "forbidden");
     }
@@ -261,7 +231,7 @@ permissions:
     #[tokio::test]
     async fn unknown_server_is_forbidden_with_same_message() {
         let outcome = compute_for(&["engineers"], "nonexistent").await;
-        assert_eq!(outcome.code, "forbidden");
+        assert_eq!(outcome.code, OutcomeCode::Forbidden);
         let body = payload(&outcome);
         assert_eq!(body["code"], "forbidden");
         assert_eq!(body["message"], "no grants for this server");

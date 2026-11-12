@@ -19,20 +19,12 @@ use std::time::Duration;
 use axum::Router;
 use axum::middleware;
 use axum::routing::post;
-use common::{MockUser, spawn_mock_idp};
-use db_mcp_gateway::auth::{AuthConfig, Identity, OidcClient, SessionId, SessionStore};
-use db_mcp_gateway::config::{Config, ConfigFile};
-use db_mcp_gateway::exec::AdapterRegistry;
-use db_mcp_gateway::state;
+use common::audit::{assert_audit_outcome, find_audit, latest_audit};
+use common::gateway::{LoggedInGateway, spawn_logged_in};
+use common::idp::MockUser;
+use db_mcp_gateway::auth::{Identity, SessionId};
 use db_mcp_gateway::transport::limit;
-use db_mcp_gateway::transport::{self, AppState, AuthFacade, PendingFlows};
 use serde_json::{Value, json};
-
-fn state_db_url() -> String {
-    std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
-        "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
-    })
-}
 
 /// Config pointing the `target` server at the live `target-db` from
 /// `docker-compose.dev.yml`. The `engineers` group gets a fast 200ms
@@ -73,119 +65,17 @@ permissions:
           row_limit: 50
 "#;
 
-struct BootedGateway {
-    url: String,
-    bearer: String,
-    state_db: sqlx::PgPool,
-    user_sub: String,
-}
-
-async fn boot_gateway() -> BootedGateway {
+async fn boot_gateway() -> LoggedInGateway {
     boot_gateway_with(E2E_YAML, vec!["engineers".to_string()]).await
 }
 
-async fn boot_gateway_with(yaml: &str, groups: Vec<String>) -> BootedGateway {
-    let pool = state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)");
-
-    let user_sub = format!("test-user-{}", uuid::Uuid::new_v4().simple());
+async fn boot_gateway_with(yaml: &str, groups: Vec<String>) -> LoggedInGateway {
     let user = MockUser {
-        sub: user_sub.clone(),
+        sub: format!("test-user-{}", uuid::Uuid::new_v4().simple()),
         email: "rq-e2e@example.com".to_string(),
         groups,
     };
-    let idp = spawn_mock_idp("test-client", "test-secret", user).await;
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let gateway_url = format!("http://{addr}");
-
-    let auth_config = AuthConfig {
-        issuer: idp.issuer.clone(),
-        client_id: idp.client_id.clone(),
-        client_secret: idp.client_secret.clone(),
-        audience: idp.client_id.clone(),
-        redirect_url: format!("{gateway_url}/auth/callback"),
-        ..AuthConfig::default()
-    };
-    let sessions = SessionStore::new(pool.clone());
-    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient http builder");
-
-    let config = Config {
-        bind: addr,
-        ..Config::default()
-    };
-    let config_file = ConfigFile::from_yaml_str(yaml).expect("e2e yaml is well-formed");
-
-    let app = transport::router(
-        &config,
-        AppState {
-            auth: Some(AuthFacade {
-                config: Arc::new(auth_config),
-                sessions,
-                oidc,
-                flows: PendingFlows::default(),
-                codes: db_mcp_gateway::transport::AuthCodes::default(),
-                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
-                service_tokens: Default::default(),
-            }),
-            config: Arc::new(config_file),
-            state_db: Some(pool.clone()),
-            adapter_registry: AdapterRegistry::new(),
-            shutdown: Default::default(),
-            metrics: None,
-            permissions_cache: None,
-            permissions_repo: None,
-            mcp_path: std::sync::Arc::from("/mcp"),
-            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
-        },
-    )
-    .expect("router builds");
-    tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await;
-    });
-
-    // Walk login → return (gateway_url, bearer).
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-
-    let login: Value = client
-        .post(format!("{gateway_url}/auth/login"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let login_url = login["login_url"].as_str().unwrap();
-    let authorize = client.get(login_url).send().await.unwrap();
-    let callback = authorize.headers()["location"]
-        .to_str()
-        .unwrap()
-        .to_string();
-    let cb: Value = client
-        .get(&callback)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let bearer = cb["session_token"].as_str().unwrap().to_string();
-    BootedGateway {
-        url: gateway_url,
-        bearer,
-        state_db: pool,
-        user_sub,
-    }
+    spawn_logged_in(yaml, user).await
 }
 
 fn client() -> reqwest::Client {
@@ -231,27 +121,6 @@ fn payload(response: &Value) -> Value {
     serde_json::from_str(text).expect("payload is valid JSON")
 }
 
-/// Fetch and assert the most recent audit row for the caller's `run_query`
-/// matches the expected outcome. CLAUDE.md non-negotiable: every tool
-/// dispatch must produce an audited row.
-async fn assert_audit_outcome(
-    pool: &sqlx::PgPool,
-    user_sub: &str,
-    expected_outcome: &str,
-    label: &str,
-) {
-    use db_mcp_gateway::audit::latest_for_user_tool;
-    let row = latest_for_user_tool(pool, user_sub, "run_query")
-        .await
-        .expect("audit lookup query runs")
-        .unwrap_or_else(|| panic!("no audit row for `{label}` — request was unaudited"));
-    assert_eq!(
-        row.outcome, expected_outcome,
-        "`{label}` audit outcome (got {})",
-        row.outcome
-    );
-}
-
 #[tokio::test]
 async fn run_query_full_acceptance() {
     let booted = boot_gateway().await;
@@ -278,14 +147,14 @@ async fn run_query_full_acceptance() {
     assert_eq!(body["rows"][0][0], 1);
     assert_eq!(body["rows"][0][1], "hi");
     assert_eq!(body["truncated"], false);
-    assert_audit_outcome(pool, sub, "success", "quick SELECT").await;
+    assert_audit_outcome(pool, sub, "run_query", "success", "quick SELECT").await;
 
     // 2. Timeout: pg_sleep(2) under a 200ms grant. Audit row: outcome=timeout.
     let resp = call_run_query(url, bearer, "target", "app", "SELECT pg_sleep(2)", None).await;
     assert_eq!(resp["result"]["isError"], true, "{resp}");
     let body = payload(&resp);
     assert_eq!(body["code"], "timeout", "{body}");
-    assert_audit_outcome(pool, sub, "timeout", "pg_sleep timeout").await;
+    assert_audit_outcome(pool, sub, "run_query", "timeout", "pg_sleep timeout").await;
 
     // 3. Row cap: generate 1000 rows with caller limit=10 → grant cap 50 →
     //    effective 10 → truncated=true. Audit row: outcome=success (the
@@ -303,7 +172,7 @@ async fn run_query_full_acceptance() {
     let body = payload(&resp);
     assert_eq!(body["rows"].as_array().unwrap().len(), 10);
     assert_eq!(body["truncated"], true);
-    assert_audit_outcome(pool, sub, "success", "truncated query").await;
+    assert_audit_outcome(pool, sub, "run_query", "success", "truncated query").await;
 
     // 4. Forbidden: `hidden` server is configured but engineer has no grant.
     //    Tool must return `forbidden` — never reveal whether `hidden` exists.
@@ -313,14 +182,14 @@ async fn run_query_full_acceptance() {
     assert_eq!(resp["result"]["isError"], true, "{resp}");
     let body = payload(&resp);
     assert_eq!(body["code"], "forbidden", "{body}");
-    assert_audit_outcome(pool, sub, "forbidden", "hidden server").await;
+    assert_audit_outcome(pool, sub, "run_query", "forbidden", "hidden server").await;
 
     // 5. Forbidden also when the server name is bogus — same code, same
     //    message: no leakage of existence. Audit row: outcome=forbidden.
     let resp = call_run_query(url, bearer, "nonexistent", "app", "SELECT 1", None).await;
     assert_eq!(resp["result"]["isError"], true);
     assert_eq!(payload(&resp)["code"], "forbidden");
-    assert_audit_outcome(pool, sub, "forbidden", "bogus server").await;
+    assert_audit_outcome(pool, sub, "run_query", "forbidden", "bogus server").await;
 
     // 6. Unsupported backend is no longer reachable here: config validation now
     //    rejects an undispatchable `kind` (mysql/mssql) at boot, so a running
@@ -352,7 +221,7 @@ async fn run_query_full_acceptance() {
             body["request_id"], 1,
             "{label}: missing or wrong request_id in error payload: {body}"
         );
-        assert_audit_outcome(pool, sub, "forbidden_sql", label).await;
+        assert_audit_outcome(pool, sub, "run_query", "forbidden_sql", label).await;
     }
 
     // 8. Function denylist: `pg_read_file` and siblings are blocked by the
@@ -393,7 +262,7 @@ async fn run_query_full_acceptance() {
         assert_eq!(resp["result"]["isError"], true, "{label}: {resp}");
         let body = payload(&resp);
         assert_eq!(body["code"], "forbidden_sql", "{label}: {body}");
-        assert_audit_outcome(pool, sub, "forbidden_sql", label).await;
+        assert_audit_outcome(pool, sub, "run_query", "forbidden_sql", label).await;
     }
 }
 
@@ -459,7 +328,14 @@ async fn run_query_write_grant_commits_data_but_not_schema() {
     )
     .await;
     assert_eq!(resp["result"]["isError"], false, "insert: {resp}");
-    assert_audit_outcome(pool, sub, "success", "INSERT under write grant").await;
+    assert_audit_outcome(
+        pool,
+        sub,
+        "run_query",
+        "success",
+        "INSERT under write grant",
+    )
+    .await;
 
     // The row is really there — read it back through the gateway.
     let resp = call_run_query(
@@ -490,7 +366,14 @@ async fn run_query_write_grant_commits_data_but_not_schema() {
     .await;
     assert_eq!(resp["result"]["isError"], false, "update: {resp}");
     assert_eq!(payload(&resp)["rows"][0][0], "changed");
-    assert_audit_outcome(pool, sub, "success", "UPDATE under write grant").await;
+    assert_audit_outcome(
+        pool,
+        sub,
+        "run_query",
+        "success",
+        "UPDATE under write grant",
+    )
+    .await;
 
     // DELETE commits.
     let resp = call_run_query(
@@ -503,7 +386,14 @@ async fn run_query_write_grant_commits_data_but_not_schema() {
     )
     .await;
     assert_eq!(resp["result"]["isError"], false, "delete: {resp}");
-    assert_audit_outcome(pool, sub, "success", "DELETE under write grant").await;
+    assert_audit_outcome(
+        pool,
+        sub,
+        "run_query",
+        "success",
+        "DELETE under write grant",
+    )
+    .await;
 
     // Confirm the row is gone.
     let resp = call_run_query(
@@ -539,7 +429,7 @@ async fn run_query_write_grant_commits_data_but_not_schema() {
         let resp = call_run_query(url, bearer, "target", "app", &sql, None).await;
         assert_eq!(resp["result"]["isError"], true, "{label}: {resp}");
         assert_eq!(payload(&resp)["code"], "forbidden_sql", "{label}");
-        assert_audit_outcome(pool, sub, "forbidden_sql", label).await;
+        assert_audit_outcome(pool, sub, "run_query", "forbidden_sql", label).await;
     }
 
     // Cleanup.
@@ -575,7 +465,14 @@ async fn run_query_read_grant_cannot_write() {
         "forbidden_sql",
         "read grant must reject writes"
     );
-    assert_audit_outcome(pool, sub, "forbidden_sql", "INSERT under read grant").await;
+    assert_audit_outcome(
+        pool,
+        sub,
+        "run_query",
+        "forbidden_sql",
+        "INSERT under read grant",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -742,10 +639,7 @@ async fn run_query_preserves_client_id_but_audit_row_carries_gateway_uuid() {
 
     // Audit row's `request_id` must be a gateway-minted UUID, NOT derived
     // from the hostile client id.
-    let row = db_mcp_gateway::audit::latest_for_user_tool(pool, sub, "run_query")
-        .await
-        .expect("audit lookup query runs")
-        .expect("audit row exists for the request");
+    let row = latest_audit(pool, sub, "run_query", "run_query request").await;
     assert_eq!(row.outcome, "success");
     uuid::Uuid::parse_str(&row.request_id).unwrap_or_else(|_| {
         panic!(
@@ -803,9 +697,7 @@ async fn tools_call_as_notification_does_not_execute() {
     let body = resp.bytes().await.unwrap();
     assert!(body.is_empty(), "notification response must have no body");
 
-    let row = db_mcp_gateway::audit::latest_for_user_tool(pool, sub, "run_query")
-        .await
-        .expect("audit lookup query runs");
+    let row = find_audit(pool, sub, "run_query").await;
     assert!(
         row.is_none(),
         "tools/call as a notification must never execute the tool or write an audit row, got {row:?}"
@@ -861,9 +753,7 @@ async fn tools_call_with_null_id_is_invalid_request_and_does_not_execute() {
         "response id must be null when the request id was null"
     );
 
-    let row = db_mcp_gateway::audit::latest_for_user_tool(pool, sub, "run_query")
-        .await
-        .expect("audit lookup query runs");
+    let row = find_audit(pool, sub, "run_query").await;
     assert!(
         row.is_none(),
         "tools/call with a null id must never execute the tool or write an audit row, got {row:?}"
