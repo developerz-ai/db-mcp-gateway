@@ -4,56 +4,21 @@
 //! authorization-code + PKCE round-trip needs a live IdP and is covered by the
 //! auth e2e harness; here we lock down the discovery contract that was missing.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+mod common;
+
 use std::time::Duration;
 
+use common::gateway::spawn_authless;
 use db_mcp_gateway::config::Config;
-use db_mcp_gateway::transport::{self, AppState};
 use serde_json::{Value, json};
 
 /// Boot the gateway on an ephemeral port; return its base URL (no path).
 async fn spawn_gateway() -> String {
-    use db_mcp_gateway::config::ConfigFile;
-    use db_mcp_gateway::exec::AdapterRegistry;
-    use db_mcp_gateway::transport::ClientRegistry;
-    use std::sync::Arc;
-
-    let config = Config {
-        bind: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+    spawn_authless(Config {
         mcp_path: "/mcp".to_string(),
         ..Config::default()
-    };
-    let state = AppState {
-        auth: None,
-        config: Arc::new(ConfigFile {
-            servers: Vec::new(),
-            permissions: Vec::new(),
-            admin: None,
-            permissions_store: None,
-            service_accounts: Vec::new(),
-            logging: Default::default(),
-        }),
-        adapter_registry: AdapterRegistry::new(),
-        state_db: None,
-        shutdown: Default::default(),
-        metrics: None,
-        permissions_cache: None,
-        permissions_repo: None,
-        mcp_path: Arc::from("/mcp"),
-        client_registry: ClientRegistry::default(),
-    };
-    let app = transport::router(&config, state).expect("router builds");
-    let listener = tokio::net::TcpListener::bind(config.bind).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    });
-    format!("http://{addr}")
+    })
+    .await
 }
 
 fn client() -> reqwest::Client {

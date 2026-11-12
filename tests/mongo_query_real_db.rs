@@ -9,50 +9,14 @@
 //! `audit_dispatch_cancellation_real_db.rs` — it needs the state DB,
 //! not the target.
 
-use db_mcp_gateway::config::{Database, Password, Server, ServerKind, Tls};
+mod common;
+
+use common::mongo_target::{
+    TARGET_DB, adapter, database, drop_collection, server, side_client, unique_collection,
+};
 use db_mcp_gateway::exec::{DbAdapter, ExecError, ExecQuery, MongoAdapter};
 
-const TARGET_HOST: &str = "localhost";
-const TARGET_PORT: u16 = 27018;
-const TARGET_USER: &str = "app";
-const TARGET_PASSWORD: &str = "app-dev-only";
-const TARGET_DB: &str = "app";
-
-fn server() -> Server {
-    Server {
-        name: "mongo".to_string(),
-        kind: ServerKind::Mongo,
-        description: String::new(),
-        host: TARGET_HOST.to_string(),
-        port: TARGET_PORT,
-        tls: Tls::Insecure,
-        databases: vec![database()],
-    }
-}
-
-fn database() -> Database {
-    Database {
-        name: TARGET_DB.to_string(),
-        role: TARGET_USER.to_string(),
-        password: Password::Literal(TARGET_PASSWORD.into()),
-        description: String::new(),
-        // The dev container's root user lives in `admin` — see
-        // docker-compose.dev.yml `target-mongo`. Production deployments
-        // typically create a per-db least-privilege user and leave this
-        // `None` (defaults to `name`).
-        auth_database: Some("admin".to_string()),
-    }
-}
-
-async fn adapter() -> MongoAdapter {
-    MongoAdapter::open(&server(), &database())
-        .await
-        .expect("target-mongo reachable; run `bin/dev up`")
-}
-
-fn unique_collection() -> String {
-    format!("mongoexec_{}", uuid::Uuid::new_v4().simple())
-}
+const SERVER_NAME: &str = "mongo";
 
 async fn seed(a: &MongoAdapter, collection: &str, count: usize) {
     let docs: Vec<String> = (1..=count)
@@ -68,23 +32,8 @@ async fn seed(a: &MongoAdapter, collection: &str, count: usize) {
     // We can't go through the adapter — the rejector blocks `insert`.
     // Use the raw mongo client via a fresh side adapter for setup. The
     // production path NEVER seeds; this is test-only.
-    use mongodb::Client;
     use mongodb::bson::Document;
-    use mongodb::options::{ClientOptions, Credential, ServerAddress};
-    let credential = Credential::builder()
-        .username(TARGET_USER.to_string())
-        .password(TARGET_PASSWORD.to_string())
-        .source(Some("admin".to_string()))
-        .build();
-    let options = ClientOptions::builder()
-        .hosts(vec![ServerAddress::Tcp {
-            host: TARGET_HOST.to_string(),
-            port: Some(TARGET_PORT),
-        }])
-        .credential(credential)
-        .default_database(TARGET_DB.to_string())
-        .build();
-    let client = Client::with_options(options).expect("seed client");
+    let client = side_client();
     let doc: Document = serde_json::from_str(&insert).expect("seed doc parses");
     client
         .database(TARGET_DB)
@@ -93,14 +42,6 @@ async fn seed(a: &MongoAdapter, collection: &str, count: usize) {
         .expect("seed insert");
     // Hint: silence the unused-binding compile warning when count == 0
     let _ = a;
-}
-
-async fn drop_collection(collection: &str) {
-    let client = side_client();
-    let _ = client
-        .database(TARGET_DB)
-        .run_command(mongodb::bson::doc! { "drop": collection })
-        .await;
 }
 
 /// `listCollections` filtered by exact name — returns true iff mongo
@@ -123,35 +64,13 @@ async fn collection_exists(collection: &str) -> bool {
     cursor.next().await.is_some()
 }
 
-/// Side-channel client for test setup/teardown — bypasses the rejector
-/// so we can seed, drop, and inspect collections. NEVER use this path
-/// in production code: it has root-equivalent access.
-fn side_client() -> mongodb::Client {
-    use mongodb::Client;
-    use mongodb::options::{ClientOptions, Credential, ServerAddress};
-    let credential = Credential::builder()
-        .username(TARGET_USER.to_string())
-        .password(TARGET_PASSWORD.to_string())
-        .source(Some("admin".to_string()))
-        .build();
-    let options = ClientOptions::builder()
-        .hosts(vec![ServerAddress::Tcp {
-            host: TARGET_HOST.to_string(),
-            port: Some(TARGET_PORT),
-        }])
-        .credential(credential)
-        .default_database(TARGET_DB.to_string())
-        .build();
-    Client::with_options(options).expect("side client builds")
-}
-
 /// `find` returns documents row-by-row in the `[document]` shape the
 /// MCP layer expects. Each row carries the matched doc as a JSON value
 /// under the `"document"` column.
 #[tokio::test]
 async fn find_returns_documents_under_document_column() {
-    let a = adapter().await;
-    let coll = unique_collection();
+    let a = adapter(SERVER_NAME).await;
+    let coll = unique_collection("mongoexec");
     seed(&a, &coll, 5).await;
 
     let sql = format!(r#"{{"find":"{coll}","filter":{{"role":"admin"}}}}"#);
@@ -165,7 +84,7 @@ async fn find_returns_documents_under_document_column() {
         .await
         .expect("find runs");
 
-    drop_collection(&coll).await;
+    drop_collection(&side_client(), &coll).await;
 
     assert_eq!(result.columns, vec!["document".to_string()]);
     // 2 admins in the 1..=5 seed (i=2, i=4).
@@ -188,8 +107,8 @@ async fn find_returns_documents_under_document_column() {
 /// pulls the over-budget batch.
 #[tokio::test]
 async fn find_respects_row_limit_with_truncation_flag() {
-    let a = adapter().await;
-    let coll = unique_collection();
+    let a = adapter(SERVER_NAME).await;
+    let coll = unique_collection("mongoexec");
     seed(&a, &coll, 20).await;
 
     let sql = format!(r#"{{"find":"{coll}","filter":{{}}}}"#);
@@ -203,7 +122,7 @@ async fn find_respects_row_limit_with_truncation_flag() {
         .await
         .expect("find runs");
 
-    drop_collection(&coll).await;
+    drop_collection(&side_client(), &coll).await;
 
     assert_eq!(result.rows.len(), 5);
     assert!(result.truncated, "expected truncated=true beyond row_limit");
@@ -214,8 +133,8 @@ async fn find_respects_row_limit_with_truncation_flag() {
 /// runs server-side (not a pass-through of the input).
 #[tokio::test]
 async fn aggregate_runs_pipeline_and_returns_groups() {
-    let a = adapter().await;
-    let coll = unique_collection();
+    let a = adapter(SERVER_NAME).await;
+    let coll = unique_collection("mongoexec");
     seed(&a, &coll, 6).await; // 3 admin + 3 user
 
     let sql = format!(
@@ -231,7 +150,7 @@ async fn aggregate_runs_pipeline_and_returns_groups() {
         .await
         .expect("aggregate runs");
 
-    drop_collection(&coll).await;
+    drop_collection(&side_client(), &coll).await;
 
     assert_eq!(result.columns, vec!["document".to_string()]);
     assert_eq!(result.rows.len(), 2);
@@ -255,8 +174,8 @@ async fn aggregate_runs_pipeline_and_returns_groups() {
 /// `count` command's reply.
 #[tokio::test]
 async fn count_returns_scalar_under_count_column() {
-    let a = adapter().await;
-    let coll = unique_collection();
+    let a = adapter(SERVER_NAME).await;
+    let coll = unique_collection("mongoexec");
     seed(&a, &coll, 7).await;
 
     let sql = format!(r#"{{"count":"{coll}","query":{{}}}}"#);
@@ -270,7 +189,7 @@ async fn count_returns_scalar_under_count_column() {
         .await
         .expect("count runs");
 
-    drop_collection(&coll).await;
+    drop_collection(&side_client(), &coll).await;
 
     assert_eq!(result.columns, vec!["count".to_string()]);
     assert_eq!(result.rows.len(), 1);
@@ -282,8 +201,8 @@ async fn count_returns_scalar_under_count_column() {
 /// the seed → two rows.
 #[tokio::test]
 async fn distinct_returns_unique_values_one_per_row() {
-    let a = adapter().await;
-    let coll = unique_collection();
+    let a = adapter(SERVER_NAME).await;
+    let coll = unique_collection("mongoexec");
     seed(&a, &coll, 4).await; // 2 admin + 2 user → 2 distinct roles
 
     let sql = format!(r#"{{"distinct":"{coll}","key":"role"}}"#);
@@ -297,7 +216,7 @@ async fn distinct_returns_unique_values_one_per_row() {
         .await
         .expect("distinct runs");
 
-    drop_collection(&coll).await;
+    drop_collection(&side_client(), &coll).await;
 
     assert_eq!(result.columns, vec!["value".to_string()]);
     let values: std::collections::HashSet<&str> =
@@ -318,8 +237,8 @@ async fn distinct_returns_unique_values_one_per_row() {
 /// collection. Either way the test pins the typed mapping.
 #[tokio::test]
 async fn max_time_ms_surfaces_as_typed_timeout() {
-    let a = adapter().await;
-    let coll = unique_collection();
+    let a = adapter(SERVER_NAME).await;
+    let coll = unique_collection("mongoexec");
     // 5k docs so the aggregate has actual work to do under a microsecond
     // budget. We use $sortByCount + $sample which is cheap to set up but
     // takes more than 1ms on a fresh collection.
@@ -361,7 +280,7 @@ async fn max_time_ms_surfaces_as_typed_timeout() {
         }
     }
 
-    drop_collection(&coll).await;
+    drop_collection(&side_client(), &coll).await;
 
     if let Some(other) = last_other {
         panic!("expected Timeout or transient success, got {other:?}");
@@ -378,8 +297,8 @@ async fn max_time_ms_surfaces_as_typed_timeout() {
 /// follow-up commit.
 #[tokio::test]
 async fn rejected_write_command_does_not_reach_mongo() {
-    let a = adapter().await;
-    let coll = unique_collection();
+    let a = adapter(SERVER_NAME).await;
+    let coll = unique_collection("mongoexec");
     let sql = format!(r#"{{"insert":"{coll}","documents":[{{"x":1}}]}}"#);
     let err = a
         .execute(ExecQuery {
@@ -419,7 +338,7 @@ async fn rejected_write_command_does_not_reach_mongo() {
 async fn auth_database_none_falls_back_to_database_name() {
     let mut db = database();
     db.auth_database = None;
-    let s = server();
+    let s = server(SERVER_NAME);
     let a = MongoAdapter::open(&s, &db).await.expect("client builds");
 
     let sql = r#"{"count":"missing","query":{}}"#;

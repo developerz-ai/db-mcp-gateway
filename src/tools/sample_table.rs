@@ -1,28 +1,25 @@
-//! `sample_table` — `SELECT * FROM "<schema>"."<table>" LIMIT n` with the
-//! caller's grant row cap.
+//! `sample_table` — the first `n` rows of one table, under the caller's
+//! grant row cap.
 //!
-//! This is the first place we build SQL with an identifier from caller input.
-//! Postgres bind parameters can't bind identifiers (only values), so we
-//! validate-then-quote: each identifier must match
-//! `^[A-Za-z_][A-Za-z0-9_]*$` before it lands inside `"..."`. Anything else is
-//! rejected before SQL is built.
+//! Schema and table are caller input that the adapter interpolates as
+//! identifiers, so both must parse as [`Identifier`] here; anything else is
+//! rejected before the adapter sees it.
 
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::PgPool;
 
-use crate::auth::Identity;
-use crate::authz::{self, Decision, PermissionsCache, cache::load_or_empty};
-use crate::config::{Action, ConfigFile, Database, Grant, Server};
-use crate::exec::{AdapterRegistry, ExecQuery};
+use crate::config::{Action, Grant};
+use crate::exec::{IDENTIFIER_PATTERN, Identifier, SampleQuery};
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
+use super::ToolCtx;
 use super::audit_dispatch::{
-    AuditHeader, Outcome, RequestContext, ToolErrorMessages, audit_dispatch, error_outcome,
-    outcome_from_exec_error, success_outcome,
+    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, error_outcome, outcome_from_exec_error,
+    run_audited, success_outcome,
 };
+use super::target::{effective_row_limit, ensure_reason, forbidden, resolve_target};
 
 const TOOL_NAME: &str = "sample_table";
 const ERROR_MESSAGES: ToolErrorMessages = ToolErrorMessages {
@@ -57,17 +54,7 @@ struct SuccessPayload<'a> {
     elapsed_ms: u64,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    id: Value,
-    identity: &Identity,
-    config: &ConfigFile,
-    registry: &AdapterRegistry,
-    permissions_cache: Option<&PermissionsCache>,
-    state_db: Option<&PgPool>,
-    request_ctx: &RequestContext,
-    arguments: Option<Value>,
-) -> Response {
+pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Response {
     let args: Arguments = match arguments.map(serde_json::from_value::<Arguments>) {
         Some(Ok(a)) => a,
         _ => {
@@ -88,115 +75,70 @@ pub async fn run(
         // (tool + (schema, table)).
         sql: None,
         reason: args.reason.as_deref(),
-        db_type: super::db_type_for_server(config, &args.server),
+        db_type: super::db_type_for_server(ctx.config, &args.server),
     };
-    let db_grants = match load_or_empty(permissions_cache, identity).await {
-        Ok(g) => g,
-        Err(err) => {
-            tracing::error!(%err, "permissions cache load failed");
-            let resp = error_outcome(id.clone(), "internal", "permissions_cache_load_failed");
-            let work = async move { resp };
-            return audit_dispatch(
-                id,
-                identity,
-                state_db,
-                request_ctx,
-                header,
-                &config.logging.stream,
-                work,
-            )
-            .await;
-        }
-    };
-    let work = compute_outcome(id.clone(), identity, config, registry, &db_grants, &args);
-    audit_dispatch(
-        id,
-        identity,
-        state_db,
-        request_ctx,
-        header,
-        &config.logging.stream,
-        work,
-    )
+    let args = &args;
+    run_audited(ctx, id, header, |id, grants| async move {
+        compute_outcome(ctx, id, &grants, args).await
+    })
     .await
 }
 
 async fn compute_outcome(
+    ctx: ToolCtx<'_>,
     id: Value,
-    identity: &Identity,
-    config: &ConfigFile,
-    registry: &AdapterRegistry,
     db_grants: &[Grant],
     args: &Arguments,
 ) -> Outcome {
-    let Some((server, database)) = find_server_db(config, &args.server, &args.database) else {
-        return forbidden(id);
-    };
-
     // `query_read`, not `schema_read`: this tool returns *row data*. A
     // `schema_read` grant is metadata-only, and `Action::includes` would let a
     // bare `schema_read` satisfy a `SchemaRead` request — so gating on
     // `SchemaRead` here would hand table contents to a metadata-only grant.
     // Same action `run_query` and `explain` use.
-    let decision = authz::evaluate_effective(
-        identity,
-        Action::QueryRead,
-        &server.name,
-        &database.name,
-        &config.permissions,
+    let Some(target) = resolve_target(
+        ctx,
         db_grants,
-    );
-    let constraints = match decision {
-        Decision::Allow { constraints } => constraints,
-        Decision::Deny => return forbidden(id),
+        Action::QueryRead,
+        &args.server,
+        &args.database,
+    ) else {
+        return forbidden(id);
     };
+    let constraints = target.constraints;
 
     // Same guard as `run_query`: this tool returns rows, so a grant demanding
     // a reason must not be satisfiable by sampling instead of querying.
-    if constraints.require_reason && args.reason.as_deref().is_none_or(str::is_empty) {
-        return error_outcome(
-            id,
-            "reason_required",
-            "policy requires a `reason` for this server/database",
-        );
+    if let Err(rejected) = ensure_reason(&id, &constraints, args.reason.as_deref()) {
+        return *rejected;
     }
 
-    let schema = args.schema.as_deref().unwrap_or(DEFAULT_SCHEMA);
-    if !is_safe_identifier(schema) {
+    let Ok(schema) = Identifier::parse(args.schema.as_deref().unwrap_or(DEFAULT_SCHEMA)) else {
         return invalid_identifier(id, "schema");
-    }
-    if !is_safe_identifier(&args.table) {
+    };
+    let Ok(table) = Identifier::parse(&args.table) else {
         return invalid_identifier(id, "table");
-    }
-
-    let row_limit = effective_row_limit(args.limit, constraints.row_limit);
-    // Fetch one extra row so the gateway-side truncation flag can fire when
-    // the table has more rows than the requested sample. LIMIT is a u32
-    // produced by us — purely numeric, no injection risk. Identifier
-    // interpolation is safe because both identifiers passed
-    // `is_safe_identifier`.
-    let sql_limit = row_limit.saturating_add(1);
-    let sql = format!(
-        "SELECT * FROM \"{schema}\".\"{table}\" LIMIT {sql_limit}",
-        table = args.table,
-    );
-    let timeout_ms = constraints.statement_timeout_ms;
+    };
+    let row_limit = effective_row_limit(args.limit, constraints.row_limit, DEFAULT_SAMPLE_LIMIT);
 
     // Wall clock starts before pool open so error paths still carry
     // `duration_ms` into the audit row — spec 07 requires it on every call.
     let started = Instant::now();
-    let adapter = match registry.get_or_open(server, database).await {
+    let adapter = match ctx
+        .registry
+        .get_or_open(target.server, target.database)
+        .await
+    {
         Ok(a) => a,
         Err(err) => return outcome_from_exec_error(id, err, started, &ERROR_MESSAGES),
     };
 
-    let query = ExecQuery {
-        sql: &sql,
-        binds: &[],
-        statement_timeout_ms: timeout_ms,
+    let query = SampleQuery {
+        schema,
+        table,
+        statement_timeout_ms: constraints.statement_timeout_ms,
         row_limit,
     };
-    match adapter.execute(query).await {
+    match adapter.sample(query).await {
         Ok(result) => {
             let elapsed = i64::try_from(result.elapsed_ms).unwrap_or(i64::MAX);
             let row_count = i64::try_from(result.rows.len()).unwrap_or(i64::MAX);
@@ -209,7 +151,9 @@ async fn compute_outcome(
             };
             let text = match serde_json::to_string(&payload) {
                 Ok(t) => t,
-                Err(_) => return error_outcome(id, "internal", "failed to serialize result"),
+                Err(_) => {
+                    return error_outcome(id, OutcomeCode::Internal, "failed to serialize result");
+                }
             };
             success_outcome(id, text, Some(elapsed), Some(row_count), Some(truncated))
         }
@@ -217,126 +161,27 @@ async fn compute_outcome(
     }
 }
 
-/// Per spec 08 + the `validate_role` precedent: identifiers are exactly
-/// `^[A-Za-z_][A-Za-z0-9_]*$`. Anything else (spaces, quotes, semicolons,
-/// dashes, even valid-but-quoted-in-Postgres names like `My Table`) is
-/// rejected. Conservative — safer than trying to escape arbitrary input.
-fn is_safe_identifier(s: &str) -> bool {
-    let mut chars = s.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return false;
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
 fn invalid_identifier(id: Value, field: &'static str) -> Outcome {
     error_outcome(
         id,
-        "invalid_argument",
-        &format!("`{field}` must match ^[A-Za-z_][A-Za-z0-9_]*$"),
+        OutcomeCode::InvalidArguments,
+        &format!("`{field}` must match {IDENTIFIER_PATTERN}"),
     )
-}
-
-fn forbidden(id: Value) -> Outcome {
-    error_outcome(id, "forbidden", "no grants for this server/database")
-}
-
-fn find_server_db<'a>(
-    config: &'a ConfigFile,
-    server_name: &str,
-    database_name: &str,
-) -> Option<(&'a Server, &'a Database)> {
-    let server = config.servers.iter().find(|s| s.name == server_name)?;
-    let database = server.databases.iter().find(|d| d.name == database_name)?;
-    Some((server, database))
-}
-
-/// `effective = min(caller.unwrap_or(DEFAULT_SAMPLE_LIMIT), grant.unwrap_or(CEILING), CEILING)`.
-/// See `run_query::effective_row_limit` for the full rationale — same
-/// gateway-wide ceiling, same "absent grant is not unbounded" fix.
-fn effective_row_limit(caller: Option<u32>, grant: Option<u32>) -> u32 {
-    let grant_capped = grant
-        .unwrap_or(super::GATEWAY_ROW_LIMIT_CEILING)
-        .min(super::GATEWAY_ROW_LIMIT_CEILING);
-    caller.unwrap_or(DEFAULT_SAMPLE_LIMIT).min(grant_capped)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Spec 03 §Errors names the code `invalid_arguments`; this tool once
+    /// wrote the drifted `invalid_argument` into the audit row and payload.
     #[test]
-    fn is_safe_identifier_accepts_valid_names() {
-        for ok in [
-            "users",
-            "_private",
-            "public",
-            "USERS",
-            "user_accounts",
-            "t1",
-            "_t_2",
-            "X",
-        ] {
-            assert!(is_safe_identifier(ok), "should accept `{ok}`");
-        }
-    }
-
-    #[test]
-    fn is_safe_identifier_rejects_anything_else() {
-        for bad in [
-            "",                        // empty
-            "1users",                  // starts with digit
-            "user accounts",           // space
-            "users; DROP TABLE x; --", // injection attempt
-            "\"users\"",               // pre-quoted
-            "user-accounts",           // hyphen
-            "users.private",           // dot
-            "用户",                    // non-ASCII
-            "users\nDROP",             // newline
-            "users'",                  // quote
-        ] {
-            assert!(!is_safe_identifier(bad), "should reject `{bad}`");
-        }
-    }
-
-    #[test]
-    fn effective_row_limit_takes_smaller() {
-        assert_eq!(effective_row_limit(Some(20), Some(5)), 5);
-        assert_eq!(effective_row_limit(Some(5), Some(20)), 5);
-        assert_eq!(effective_row_limit(Some(50), None), 50);
-        assert_eq!(effective_row_limit(None, Some(3)), 3);
-        assert_eq!(effective_row_limit(None, None), DEFAULT_SAMPLE_LIMIT);
-    }
-
-    /// Regression for the #136 audit finding "caller `limit` unbounded when
-    /// the grant sets no `row_limit`" — see `run_query`'s identical test for
-    /// the full rationale.
-    #[test]
-    fn effective_row_limit_clamps_to_gateway_ceiling_when_grant_is_silent() {
-        assert_eq!(
-            effective_row_limit(Some(u32::MAX), None),
-            super::super::GATEWAY_ROW_LIMIT_CEILING
-        );
-    }
-
-    #[test]
-    fn effective_row_limit_grant_still_wins_under_hostile_caller_request() {
-        assert_eq!(effective_row_limit(Some(u32::MAX), Some(4)), 4);
-    }
-
-    /// A grant naming a `row_limit` above the ceiling must still be clamped
-    /// down — the ceiling is gateway-wide, so drift between `sample_table`'s
-    /// and `run_query`'s independent copies of `effective_row_limit` cannot
-    /// let a hostile grant + caller pair bypass it. Mirrors the identical
-    /// regression in `run_query`.
-    #[test]
-    fn effective_row_limit_clamps_grant_above_ceiling() {
-        assert_eq!(
-            effective_row_limit(Some(u32::MAX), Some(u32::MAX)),
-            super::super::GATEWAY_ROW_LIMIT_CEILING
-        );
+    fn invalid_identifier_uses_spec_code() {
+        let outcome = invalid_identifier(Value::from(1), "table");
+        assert_eq!(outcome.code, OutcomeCode::InvalidArguments);
+        let value = serde_json::to_value(&outcome.response).unwrap();
+        let text = value["result"]["content"][0]["text"].as_str().unwrap();
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["code"], "invalid_arguments");
     }
 }

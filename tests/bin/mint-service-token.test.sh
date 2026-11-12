@@ -187,7 +187,7 @@ assert_contains "rotation overlap names the <name>-next convention" '<name>-next
 # like "mint a new value with the same <name>" would be a foot-gun — the
 # round-2 finding. We check the exact wording pattern; harmless
 # references that name the rejection (e.g. "the same <name> is rejected
-# by src/config/yaml.rs as a duplicate") are fine and expected.
+# by src/config/yaml/validate.rs as a duplicate") are fine and expected.
 if grep -E -q 'mint .*same ?(<name>|name)' <<<"$OUT"; then
   FAIL=$((FAIL + 1))
   FAILED_ASSERTIONS+=("rotation overlap must NOT document same-name rotation as supported")

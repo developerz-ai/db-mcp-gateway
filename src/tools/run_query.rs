@@ -9,19 +9,18 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::PgPool;
 
-use crate::auth::Identity;
-use crate::authz::{self, Decision, PermissionsCache, cache::load_or_empty};
-use crate::config::{Action, ConfigFile, Database, Grant, Server};
+use crate::config::{Action, Grant, ServerKind};
+use crate::exec::ExecQuery;
 use crate::exec::sql_guard;
-use crate::exec::{AdapterRegistry, ExecQuery};
 use crate::transport::jsonrpc::{ErrorObject, Response};
 
+use super::ToolCtx;
 use super::audit_dispatch::{
-    AuditHeader, Outcome, RequestContext, ToolErrorMessages, audit_dispatch, error_outcome,
-    outcome_from_exec_error, success_outcome,
+    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, error_outcome, outcome_from_exec_error,
+    run_audited, success_outcome,
 };
+use super::target::{effective_row_limit, ensure_reason, forbidden, resolve_target};
 
 const TOOL_NAME: &str = "run_query";
 const ERROR_MESSAGES: ToolErrorMessages = ToolErrorMessages {
@@ -53,17 +52,7 @@ struct SuccessPayload<'a> {
     elapsed_ms: u64,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    id: Value,
-    identity: &Identity,
-    config: &ConfigFile,
-    registry: &AdapterRegistry,
-    permissions_cache: Option<&PermissionsCache>,
-    state_db: Option<&PgPool>,
-    request_ctx: &RequestContext,
-    arguments: Option<Value>,
-) -> Response {
+pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Response {
     let args: Arguments = match arguments.map(serde_json::from_value::<Arguments>) {
         Some(Ok(a)) => a,
         _ => {
@@ -82,105 +71,55 @@ pub async fn run(
         database: Some(&args.database),
         sql: Some(&args.sql),
         reason: args.reason.as_deref(),
-        db_type: super::db_type_for_server(config, &args.server),
+        db_type: super::db_type_for_server(ctx.config, &args.server),
     };
-    let db_grants = match load_or_empty(permissions_cache, identity).await {
-        Ok(g) => g,
-        Err(err) => {
-            tracing::error!(%err, "permissions cache load failed");
-            let resp = error_outcome(id.clone(), "internal", "permissions_cache_load_failed");
-            let work = async move { resp };
-            return audit_dispatch(
-                id,
-                identity,
-                state_db,
-                request_ctx,
-                header,
-                &config.logging.stream,
-                work,
-            )
-            .await;
-        }
-    };
-    let work = compute_outcome(
-        id.clone(),
-        identity,
-        config,
-        registry,
-        &db_grants,
-        request_ctx,
-        &args,
-    );
-    audit_dispatch(
-        id,
-        identity,
-        state_db,
-        request_ctx,
-        header,
-        &config.logging.stream,
-        work,
-    )
+    let args = &args;
+    run_audited(ctx, id, header, |id, grants| async move {
+        compute_outcome(ctx, id, &grants, args).await
+    })
     .await
 }
 
 async fn compute_outcome(
+    ctx: ToolCtx<'_>,
     id: Value,
-    identity: &Identity,
-    config: &ConfigFile,
-    registry: &AdapterRegistry,
     db_grants: &[Grant],
-    request_ctx: &RequestContext,
     args: &Arguments,
 ) -> Outcome {
-    let Some((server, database)) = find_server_db(config, &args.server, &args.database) else {
-        return error_outcome(id, "forbidden", "no grants for this server/database");
-    };
-
     // Constraints come from the read-level merge: it matches *every* grant that
     // applies to this (server, db) — `query_write` included, since it implies
     // `query_read` — so the most-restrictive value across all of them always
     // wins, and a write can never dodge a tighter read grant's caps.
-    let decision = authz::evaluate_effective(
-        identity,
-        Action::QueryRead,
-        &server.name,
-        &database.name,
-        &config.permissions,
+    let Some(target) = resolve_target(
+        ctx,
         db_grants,
-    );
-    let constraints = match decision {
-        Decision::Allow { constraints } => constraints,
-        Decision::Deny => {
-            return error_outcome(id, "forbidden", "no grants for this server/database");
-        }
+        Action::QueryRead,
+        &args.server,
+        &args.database,
+    ) else {
+        return forbidden(id);
     };
+    let (server, database, constraints) = (target.server, target.database, target.constraints);
 
     // A separate `query_write` check decides whether data writes are permitted.
     // Only `query_write` grants satisfy it (`query_read` does not imply write),
     // so read-only callers stay on the read-only guard.
-    let writes_allowed = matches!(
-        authz::evaluate_effective(
-            identity,
-            Action::QueryWrite,
-            &server.name,
-            &database.name,
-            &config.permissions,
-            db_grants,
-        ),
-        Decision::Allow { .. }
-    );
+    let writes_allowed = resolve_target(
+        ctx,
+        db_grants,
+        Action::QueryWrite,
+        &server.name,
+        &database.name,
+    )
+    .is_some();
     let access = if writes_allowed {
         sql_guard::Access::ReadWrite
     } else {
         sql_guard::Access::ReadOnly
     };
 
-    if constraints.require_reason && args.reason.as_deref().is_none_or(str::is_empty) {
-        return error_outcome(
-            id,
-            "reason_required",
-            "policy requires a `reason` for this server/database",
-        );
+    if let Err(rejected) = ensure_reason(&id, &constraints, args.reason.as_deref()) {
+        return *rejected;
     }
 
     // Defense-in-depth on top of the DB role: reject anything the grant doesn't
@@ -193,17 +132,17 @@ async fn compute_outcome(
     // rejector (`src/exec/mongo/rejector.rs`) as the equivalent guard. Mongo
     // writes are not offered here — a `query_write` grant on a mongo DB still
     // hits the read-only rejector.
-    if matches!(server.kind, crate::config::ServerKind::Postgres)
+    if matches!(server.kind, ServerKind::Postgres)
         && let Err(err) = sql_guard::check_sql(&args.sql, access)
     {
         return error_outcome(
             id,
-            "forbidden_sql",
+            OutcomeCode::ForbiddenSql,
             &format!("SQL rejected by gateway: {err}"),
         );
     }
 
-    let row_limit = effective_row_limit(args.limit, constraints.row_limit);
+    let row_limit = effective_row_limit(args.limit, constraints.row_limit, DEFAULT_ROW_LIMIT);
     let timeout_ms = constraints.statement_timeout_ms;
 
     // Emit `request_id` explicitly. The production formatter (main.rs) sets
@@ -213,8 +152,8 @@ async fn compute_outcome(
     // carry `request_id` on itself. The chokepoint's "tool dispatched"
     // line does; so must this one.
     tracing::info!(
-        request_id = %request_ctx.request_id,
-        user_sub = %identity.user_sub,
+        request_id = %ctx.request.request_id,
+        user_sub = %ctx.identity.user_sub,
         server = %server.name,
         db = %database.name,
         row_limit,
@@ -226,7 +165,7 @@ async fn compute_outcome(
     // unavailable, syntax_error) still surface `duration_ms` in the audit
     // row — spec 07 requires it for every tool invocation.
     let started = Instant::now();
-    let adapter = match registry.get_or_open(server, database).await {
+    let adapter = match ctx.registry.get_or_open(server, database).await {
         Ok(a) => a,
         Err(err) => return outcome_from_exec_error(id, err, started, &ERROR_MESSAGES),
     };
@@ -250,82 +189,12 @@ async fn compute_outcome(
             };
             let text = match serde_json::to_string(&payload) {
                 Ok(t) => t,
-                Err(_) => return error_outcome(id, "internal", "failed to serialize result"),
+                Err(_) => {
+                    return error_outcome(id, OutcomeCode::Internal, "failed to serialize result");
+                }
             };
             success_outcome(id, text, Some(elapsed), Some(row_count), Some(truncated))
         }
         Err(err) => outcome_from_exec_error(id, err, started, &ERROR_MESSAGES),
-    }
-}
-
-fn find_server_db<'a>(
-    config: &'a ConfigFile,
-    server_name: &str,
-    database_name: &str,
-) -> Option<(&'a Server, &'a Database)> {
-    let server = config.servers.iter().find(|s| s.name == server_name)?;
-    let database = server.databases.iter().find(|d| d.name == database_name)?;
-    Some((server, database))
-}
-
-/// `effective = min(caller.unwrap_or(DEFAULT_ROW_LIMIT), grant.unwrap_or(CEILING), CEILING)`.
-/// The grant is clamped to [`super::GATEWAY_ROW_LIMIT_CEILING`] first so a
-/// grant that declines to set `row_limit` (or one that names a value above
-/// the ceiling) still bounds the caller's request — an absent grant used to
-/// mean "whatever the caller asks for," including a hostile `limit` near
-/// `u32::MAX`.
-fn effective_row_limit(caller: Option<u32>, grant: Option<u32>) -> u32 {
-    let grant_capped = grant
-        .unwrap_or(super::GATEWAY_ROW_LIMIT_CEILING)
-        .min(super::GATEWAY_ROW_LIMIT_CEILING);
-    caller.unwrap_or(DEFAULT_ROW_LIMIT).min(grant_capped)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn effective_row_limit_takes_smaller() {
-        assert_eq!(effective_row_limit(Some(10), Some(5)), 5);
-        assert_eq!(effective_row_limit(Some(5), Some(10)), 5);
-        assert_eq!(effective_row_limit(Some(50), None), 50);
-        assert_eq!(effective_row_limit(None, Some(20)), 20);
-        assert_eq!(effective_row_limit(None, None), DEFAULT_ROW_LIMIT);
-    }
-
-    /// Regression for the #136 audit finding "caller `limit` unbounded when
-    /// the grant sets no `row_limit`": an absent grant must still clamp to
-    /// the gateway ceiling, not pass the caller's raw (potentially
-    /// near-`u32::MAX`) request straight through.
-    #[test]
-    fn effective_row_limit_clamps_to_gateway_ceiling_when_grant_is_silent() {
-        assert_eq!(
-            effective_row_limit(Some(u32::MAX), None),
-            super::super::GATEWAY_ROW_LIMIT_CEILING
-        );
-        assert_eq!(
-            effective_row_limit(Some(4_000_000_000), None),
-            super::super::GATEWAY_ROW_LIMIT_CEILING
-        );
-    }
-
-    /// A grant naming a `row_limit` above the ceiling must still be clamped
-    /// down — a grant can only tighten the ceiling, never loosen past it
-    /// (same most-restrictive-wins posture as `effective_timeout_ms`).
-    #[test]
-    fn effective_row_limit_clamps_grant_above_ceiling() {
-        assert_eq!(
-            effective_row_limit(Some(u32::MAX), Some(u32::MAX)),
-            super::super::GATEWAY_ROW_LIMIT_CEILING
-        );
-    }
-
-    /// A tight grant still wins even against a hostile caller request — the
-    /// pre-existing most-restrictive-wins behavior must survive the ceiling
-    /// clamp being added ahead of it.
-    #[test]
-    fn effective_row_limit_grant_still_wins_under_hostile_caller_request() {
-        assert_eq!(effective_row_limit(Some(u32::MAX), Some(7)), 7);
     }
 }

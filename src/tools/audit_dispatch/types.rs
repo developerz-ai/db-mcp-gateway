@@ -6,15 +6,15 @@ use uuid::Uuid;
 
 use crate::transport::jsonrpc::Response;
 
+use super::OutcomeCode;
+
 /// Result of a tool's compute step. Carries the response to send back AND
 /// the audit fields the helper will persist.
 #[derive(Debug)]
 pub struct Outcome {
     pub response: Response,
-    /// `"success"` or a spec 03 error code (`forbidden`, `forbidden_sql`,
-    /// `invalid_arguments`, `reason_required`, `timeout`, `syntax_error`,
-    /// `unavailable`, `internal`).
-    pub code: &'static str,
+    /// Stringified once, into the audit row, by the chokepoint.
+    pub code: OutcomeCode,
     pub elapsed_ms: Option<i64>,
     /// Rows returned to the agent (after any truncation). `None` for tools
     /// that don't return rows.

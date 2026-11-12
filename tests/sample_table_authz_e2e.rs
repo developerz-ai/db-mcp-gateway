@@ -12,30 +12,16 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use common::{MockUser, spawn_mock_idp};
-use db_mcp_gateway::audit::latest_for_user_tool;
-use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
-use db_mcp_gateway::config::{Config, ConfigFile, Database, Password, Server, ServerKind, Tls};
-use db_mcp_gateway::exec::{AdapterRegistry, DbAdapter, ExecQuery, PgAdapter};
-use db_mcp_gateway::state;
-use db_mcp_gateway::transport::{self, AppState, AuthFacade, PendingFlows};
+use common::gateway::{LoggedInGateway, spawn_logged_in};
+use common::idp::MockUser;
+use common::pg_target;
+use db_mcp_gateway::audit::AuditRow;
+use db_mcp_gateway::exec::{DbAdapter, ExecQuery, PgAdapter};
 use serde_json::{Value, json};
 
 const TOOL: &str = "sample_table";
-const TARGET_HOST: &str = "localhost";
-const TARGET_PORT: u16 = 5434;
-const TARGET_USER: &str = "app";
-const TARGET_PASSWORD: &str = "app-dev-only";
-const TARGET_DB: &str = "app";
-
-fn state_db_url() -> String {
-    std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
-        "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
-    })
-}
 
 /// One config, three groups: metadata-only, ordinary reader, and a reader
 /// whose grant demands a reason. Each test logs in as a user in exactly one
@@ -70,118 +56,16 @@ permissions:
           require_reason: true
 "#;
 
-struct BootedGateway {
-    url: String,
-    bearer: String,
-    state_db: sqlx::PgPool,
-    user_sub: String,
-}
-
-async fn boot_gateway(group: &str) -> BootedGateway {
-    let pool = state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)");
-
-    let user_sub = format!("test-user-{}", uuid::Uuid::new_v4().simple());
+async fn boot_gateway(group: &str) -> LoggedInGateway {
     let user = MockUser {
-        sub: user_sub.clone(),
+        sub: format!("test-user-{}", uuid::Uuid::new_v4().simple()),
         email: "sample-authz-e2e@example.com".to_string(),
         groups: vec![group.to_string()],
     };
-    let idp = spawn_mock_idp("test-client", "test-secret", user).await;
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let gateway_url = format!("http://{addr}");
-
-    let auth_config = AuthConfig {
-        issuer: idp.issuer.clone(),
-        client_id: idp.client_id.clone(),
-        client_secret: idp.client_secret.clone(),
-        audience: idp.client_id.clone(),
-        redirect_url: format!("{gateway_url}/auth/callback"),
-        ..AuthConfig::default()
-    };
-    let sessions = SessionStore::new(pool.clone());
-    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient http builder");
-
-    let config = Config {
-        bind: addr,
-        ..Config::default()
-    };
-    let config_file = ConfigFile::from_yaml_str(E2E_YAML).expect("e2e yaml is well-formed");
-
-    let app = transport::router(
-        &config,
-        AppState {
-            auth: Some(AuthFacade {
-                config: Arc::new(auth_config),
-                sessions,
-                oidc,
-                flows: PendingFlows::default(),
-                codes: db_mcp_gateway::transport::AuthCodes::default(),
-                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
-                service_tokens: Default::default(),
-            }),
-            config: Arc::new(config_file),
-            state_db: Some(pool.clone()),
-            adapter_registry: AdapterRegistry::new(),
-            shutdown: Default::default(),
-            metrics: None,
-            permissions_cache: None,
-            permissions_repo: None,
-            mcp_path: std::sync::Arc::from("/mcp"),
-            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
-        },
-    )
-    .expect("router builds");
-    tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await;
-    });
-
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-
-    let login: Value = client
-        .post(format!("{gateway_url}/auth/login"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let login_url = login["login_url"].as_str().unwrap();
-    let authorize = client.get(login_url).send().await.unwrap();
-    let callback = authorize.headers()["location"]
-        .to_str()
-        .unwrap()
-        .to_string();
-    let cb: Value = client
-        .get(&callback)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let bearer = cb["session_token"].as_str().unwrap().to_string();
-
-    BootedGateway {
-        url: gateway_url,
-        bearer,
-        state_db: pool,
-        user_sub,
-    }
+    spawn_logged_in(E2E_YAML, user).await
 }
 
-async fn call_sample_table(booted: &BootedGateway, mut args: Value) -> Value {
+async fn call_sample_table(booted: &LoggedInGateway, mut args: Value) -> Value {
     args["server"] = json!("target");
     args["database"] = json!("app");
     reqwest::Client::builder()
@@ -213,11 +97,8 @@ fn payload(response: &Value) -> Value {
 
 /// The audit row is non-negotiable on every dispatch — fetch the caller's
 /// latest `sample_table` row and return it for outcome/reason assertions.
-async fn latest_audit(booted: &BootedGateway, label: &str) -> db_mcp_gateway::audit::AuditRow {
-    latest_for_user_tool(&booted.state_db, &booted.user_sub, TOOL)
-        .await
-        .expect("audit lookup query runs")
-        .unwrap_or_else(|| panic!("no audit row for `{label}` — request was unaudited"))
+async fn latest_audit(booted: &LoggedInGateway, label: &str) -> AuditRow {
+    common::audit::latest_audit(&booted.state_db, &booted.user_sub, TOOL, label).await
 }
 
 /// A real table with real rows in a throwaway schema — never a mock: the
@@ -229,25 +110,7 @@ struct Fixture {
 
 impl Fixture {
     async fn create() -> Self {
-        let database = Database {
-            name: TARGET_DB.to_string(),
-            role: TARGET_USER.to_string(),
-            password: Password::Literal(TARGET_PASSWORD.into()),
-            description: String::new(),
-            auth_database: None,
-        };
-        let server = Server {
-            name: "target".to_string(),
-            kind: ServerKind::Postgres,
-            description: String::new(),
-            host: TARGET_HOST.to_string(),
-            port: TARGET_PORT,
-            tls: Tls::Insecure,
-            databases: Vec::new(),
-        };
-        let adapter = PgAdapter::open(&server, &database)
-            .await
-            .expect("target-db reachable; run `bin/dev up`");
+        let adapter = pg_target::adapter().await;
         let schema = format!("sampleauthz_{}", uuid::Uuid::new_v4().simple());
         let fixture = Self { adapter, schema };
         fixture

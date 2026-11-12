@@ -5,6 +5,7 @@
 //! `migrations/` and are applied at boot via `sqlx::migrate!` — failure to
 //! migrate refuses to start the process.
 
+pub mod audit;
 pub mod oauth;
 pub mod permissions;
 pub mod sessions;

@@ -298,17 +298,24 @@ async fn post_handler(
             connect_info.map(|ConnectInfo(addr)| addr),
             user_agent,
         );
-        let response = tools::dispatch_call(
-            id,
-            identity.as_deref(),
-            &state.config,
-            &state.adapter_registry,
-            state.permissions_cache.as_ref(),
-            state.state_db.as_ref(),
-            &request_ctx,
-            request.params,
-        )
-        .await;
+        // The bearer-auth middleware guarantees an identity on `/mcp` POST;
+        // a missing one is a defined internal error, never a panic.
+        let Some(identity) = identity.as_deref() else {
+            return Json(jsonrpc::Response::error(
+                id,
+                jsonrpc::ErrorObject::internal("missing identity"),
+            ))
+            .into_response();
+        };
+        let ctx = tools::ToolCtx {
+            identity,
+            config: &state.config,
+            registry: &state.adapter_registry,
+            permissions_cache: state.permissions_cache.as_ref(),
+            state_db: state.state_db.as_ref(),
+            request: &request_ctx,
+        };
+        let response = tools::dispatch_call(id, ctx, request.params).await;
         return Json(response).into_response();
     }
 

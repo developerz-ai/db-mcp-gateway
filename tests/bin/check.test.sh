@@ -179,7 +179,7 @@ for call in \
   'docker compose -f docker-compose.dev.yml up -d --wait' \
   'cargo test --all-targets --all-features' \
   'cargo audit --ignore RUSTSEC-2023-0071' \
-  'git grep -nE dbmcp_svc_[0-9a-f]{64} -- :!tests/** :!website/** :!config/example.yaml :!.github/** :!src/config/yaml.rs' \
+  'git grep -nE dbmcp_svc_[0-9a-f]{64} -- :!tests/** :!website/** :!config/example.yaml :!.github/** :!src/config/yaml/**' \
   'npm run typecheck' 'npm run build' 'orchestration'; do
   called "$call"
 done

@@ -11,24 +11,15 @@
 //!
 //! No mocking — these run against the real dev state DB (`bin/dev up`).
 
+mod common;
+
 use std::time::Duration;
 
+use common::env::state_pool;
 use db_mcp_gateway::auth::{AuthError, SessionCacheConfig, SessionStore};
 use sqlx::PgPool;
 use tokio::time::sleep;
 use uuid::Uuid;
-
-fn state_db_url() -> String {
-    std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
-        "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
-    })
-}
-
-async fn pool() -> PgPool {
-    db_mcp_gateway::state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)")
-}
 
 fn replica(pool: &PgPool, ttl: Duration) -> SessionStore {
     SessionStore::with_cache_config(
@@ -64,7 +55,7 @@ async fn cleanup(pool: &PgPool, user_sub: &str) {
 
 #[tokio::test]
 async fn revocation_on_one_replica_is_seen_by_another_after_cache_ttl() {
-    let pool = pool().await;
+    let pool = state_pool().await;
     let user_sub = format!("a3-cross-{}", Uuid::new_v4().simple());
 
     let replica_a = replica(&pool, Duration::from_secs(30));
@@ -91,7 +82,7 @@ async fn revocation_on_one_replica_is_seen_by_another_after_cache_ttl() {
 
 #[tokio::test]
 async fn revocation_is_stale_on_another_replica_within_cache_ttl() {
-    let pool = pool().await;
+    let pool = state_pool().await;
     let user_sub = format!("a3-stale-{}", Uuid::new_v4().simple());
 
     let replica_a = replica(&pool, Duration::from_secs(3600));
@@ -129,7 +120,7 @@ async fn revocation_is_stale_on_another_replica_within_cache_ttl() {
 /// time, not only in the degenerate TTL=0 case.
 #[tokio::test]
 async fn revocation_denied_after_real_ttl_elapses() {
-    let pool = pool().await;
+    let pool = state_pool().await;
     let user_sub = format!("a3-elapsed-{}", Uuid::new_v4().simple());
 
     // Short TTL so the test stays fast; long enough that the first lookup hits

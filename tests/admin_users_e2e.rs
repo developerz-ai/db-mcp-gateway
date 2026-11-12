@@ -16,6 +16,8 @@
 //! Tests use unique `user_sub` values and clean up after themselves so they
 //! coexist with each other and with dev rows.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,18 +25,17 @@ use axum::Router;
 use axum::extract::Request;
 use axum::middleware as axum_mw;
 use axum::middleware::Next;
-use db_mcp_gateway::auth::{AuthConfig, Identity, OidcClient, SessionId, SessionStore, jwt};
+use common::cleanup::{delete_permissions_audit, delete_permissions_user};
+use common::env::state_pool;
+use common::gateway::{EMPTY_YAML, GatewayBuilder};
+use db_mcp_gateway::auth::{AuthConfig, Identity, SessionId, SessionStore, jwt};
 use db_mcp_gateway::authz::PermissionsCache;
-use db_mcp_gateway::config::{AdminBlock, Config, ConfigFile};
-use db_mcp_gateway::exec::AdapterRegistry;
-use db_mcp_gateway::state;
 use db_mcp_gateway::state::permissions::{
     DbType, GrantAction, GrantTarget, PermissionsRepo, pg::PgPermissionsRepo,
 };
 use db_mcp_gateway::transport::admin;
 use db_mcp_gateway::transport::admin::middleware::AdminActor;
 use db_mcp_gateway::transport::admin::users::UsersState;
-use db_mcp_gateway::transport::{self, AppState, AuthFacade, PendingFlows};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -42,18 +43,6 @@ use sqlx::Row;
 use uuid::Uuid;
 
 const ADMIN_GROUP: &str = "db-mcp-gateway-admins";
-
-fn state_db_url() -> String {
-    std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
-        "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
-    })
-}
-
-async fn pool() -> PgPool {
-    state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)")
-}
 
 /// Insert a session row, mint a JWT for it, and return both.
 async fn mint_session(
@@ -100,15 +89,9 @@ impl Harness {
                     .flatten()
                     .and_then(|r| r.try_get::<Uuid, _>("id").ok());
             if let Some(uid) = id {
-                let _ = sqlx::query("DELETE FROM permissions_audit WHERE target_id = $1")
-                    .bind(uid)
-                    .execute(&self.pool)
-                    .await;
+                delete_permissions_audit(&self.pool, uid).await;
             }
-            let _ = sqlx::query("DELETE FROM permissions_users WHERE user_sub = $1")
-                .bind(sub)
-                .execute(&self.pool)
-                .await;
+            delete_permissions_user(&self.pool, sub).await;
             // Also clean up the admin actor's row (created by middleware).
             let _ = sqlx::query("DELETE FROM permissions_users WHERE user_sub LIKE 'admin-e2e-%'")
                 .execute(&self.pool)
@@ -117,83 +100,28 @@ impl Harness {
     }
 }
 
-/// Single gateway builder shared by both entry points. `cache = Some(_)` wires
-/// the resolver cache into `AppState`; `None` mirrors a YAML-only install and
-/// keeps the cache-free tests honest. Kept private so every AppState field
-/// addition lands in exactly one place.
+/// `cache = Some(_)` wires the resolver cache into `AppState`; `None`
+/// mirrors a YAML-only install and keeps the cache-free tests honest.
 async fn spawn_gateway_inner(
     cache: Option<PermissionsCache>,
 ) -> (Harness, AuthConfig, SessionStore) {
-    let pool = pool().await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let base_url = format!("http://{addr}");
-
-    let auth_config = AuthConfig {
-        // The OIDC fields don't matter — tests bypass the login flow.
-        issuer: "http://idp.invalid".to_string(),
-        client_id: "test".to_string(),
-        client_secret: "test".to_string(),
-        audience: "test".to_string(),
-        redirect_url: format!("{base_url}/auth/callback"),
-        ..AuthConfig::default()
-    };
-    let sessions = SessionStore::new(pool.clone());
-    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient builds");
-
-    let mut config_file = ConfigFile::from_yaml_str("servers: []\npermissions: []\n").unwrap();
-    config_file.admin = Some(AdminBlock {
-        enabled: true,
-        group: ADMIN_GROUP.to_string(),
-        session_max_age_secs: None,
-    });
-
+    let pool = state_pool().await;
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
-
-    let config = Config {
-        bind: addr,
-        ..Config::default()
-    };
-    let app = transport::router(
-        &config,
-        AppState {
-            auth: Some(AuthFacade {
-                config: Arc::new(auth_config.clone()),
-                sessions: sessions.clone(),
-                oidc,
-                flows: PendingFlows::default(),
-                codes: db_mcp_gateway::transport::AuthCodes::default(),
-                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
-                service_tokens: Default::default(),
-            }),
-            config: Arc::new(config_file),
-            adapter_registry: AdapterRegistry::new(),
-            state_db: Some(pool.clone()),
-            shutdown: Default::default(),
-            metrics: None,
-            permissions_cache: cache,
-            permissions_repo: Some(repo),
-            mcp_path: std::sync::Arc::from("/mcp"),
-            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
-        },
-    )
-    .expect("router builds");
-    tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await;
-    });
-
+    let mut builder = GatewayBuilder::new(EMPTY_YAML)
+        .admin(ADMIN_GROUP, true)
+        .repo(repo);
+    if let Some(cache) = cache {
+        builder = builder.cache(cache);
+    }
+    let gw = builder.spawn(pool).await;
     (
         Harness {
-            base_url,
-            pool,
+            base_url: gw.url,
+            pool: gw.state_db,
             cleanup_subs: Vec::new(),
         },
-        auth_config,
-        sessions,
+        gw.auth_config,
+        gw.sessions,
     )
 }
 
@@ -673,7 +601,7 @@ async fn get_does_not_write_user_row() {
 /// This is the integration test deferred from #51 (PR #65).
 #[tokio::test]
 async fn audit_write_failure_rolls_back_user_write() {
-    let pool = pool().await;
+    let pool = state_pool().await;
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
 
     let admin_email = format!("admin-rollback-{}@example.com", Uuid::new_v4().simple());
@@ -753,10 +681,7 @@ async fn audit_write_failure_rolls_back_user_write() {
     );
 
     // Cleanup admin seed.
-    let _ = sqlx::query("DELETE FROM permissions_users WHERE user_sub = $1")
-        .bind(&admin_sub)
-        .execute(&pool)
-        .await;
+    delete_permissions_user(&pool, &admin_sub).await;
 }
 
 /// Malformed JSON body must surface as the stable admin-error envelope
@@ -846,66 +771,15 @@ async fn invalid_path_id_returns_invalid_request_envelope() {
 /// §"Admin API"). Pairs with the enabled-path coverage above.
 #[tokio::test]
 async fn admin_disabled_returns_404_on_admin_routes() {
-    let pool = pool().await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let base_url = format!("http://{addr}");
-
-    let auth_config = AuthConfig {
-        issuer: "http://idp.invalid".to_string(),
-        client_id: "test".to_string(),
-        client_secret: "test".to_string(),
-        audience: "test".to_string(),
-        redirect_url: format!("{base_url}/auth/callback"),
-        ..AuthConfig::default()
-    };
-    let sessions = SessionStore::new(pool.clone());
-    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient builds");
-
+    let pool = state_pool().await;
     // Same YAML as the enabled tests but with admin block explicitly disabled.
-    let mut config_file = ConfigFile::from_yaml_str("servers: []\npermissions: []\n").unwrap();
-    config_file.admin = Some(AdminBlock {
-        enabled: false,
-        group: ADMIN_GROUP.to_string(),
-        session_max_age_secs: None,
-    });
-
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
-    let config = Config {
-        bind: addr,
-        ..Config::default()
-    };
-    let app = transport::router(
-        &config,
-        AppState {
-            auth: Some(AuthFacade {
-                config: Arc::new(auth_config.clone()),
-                sessions: sessions.clone(),
-                oidc,
-                flows: PendingFlows::default(),
-                codes: db_mcp_gateway::transport::AuthCodes::default(),
-                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
-                service_tokens: Default::default(),
-            }),
-            config: Arc::new(config_file),
-            adapter_registry: AdapterRegistry::new(),
-            state_db: Some(pool.clone()),
-            shutdown: Default::default(),
-            metrics: None,
-            permissions_cache: None,
-            permissions_repo: Some(repo),
-            mcp_path: std::sync::Arc::from("/mcp"),
-            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
-        },
-    )
-    .expect("router builds");
-    tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
+    let gw = GatewayBuilder::new(EMPTY_YAML)
+        .admin(ADMIN_GROUP, false)
+        .repo(repo)
+        .spawn(pool.clone())
         .await;
-    });
+    let (base_url, auth_config, sessions) = (gw.url, gw.auth_config, gw.sessions);
 
     // Mint an admin-group bearer so we can prove the 404 is from "unmounted
     // route", not "auth failed" — otherwise this test would also pass on a
@@ -940,10 +814,7 @@ async fn admin_disabled_returns_404_on_admin_routes() {
     // Cleanup any row the admin's bearer would have created (none, since
     // the admin upsert lives behind the middleware — but defensive cleanup
     // keeps the test independent of that contract).
-    let _ = sqlx::query("DELETE FROM permissions_users WHERE user_sub = $1")
-        .bind(&admin_sub)
-        .execute(&pool)
-        .await;
+    delete_permissions_user(&pool, &admin_sub).await;
 }
 
 /// Boot the gateway with the resolver cache wired up, so admin mutations
@@ -951,7 +822,7 @@ async fn admin_disabled_returns_404_on_admin_routes() {
 /// [`spawn_gateway_inner`] — the only real difference from [`spawn_gateway`]
 /// is the wired-in cache.
 async fn spawn_gateway_with_cache() -> (Harness, PermissionsCache, AuthConfig, SessionStore) {
-    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool().await));
+    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(state_pool().await));
     // 60s TTL keeps the "before" cache entry fresh for the whole test — we
     // rely on the invalidation, not TTL expiry, to prove the drop.
     let cache = PermissionsCache::new(repo, Duration::from_secs(60));

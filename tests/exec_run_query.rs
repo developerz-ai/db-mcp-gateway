@@ -6,47 +6,17 @@
 //! `ExecError::Timeout` classification path. Slice 3's auth_e2e covers the
 //! full agent → MCP → exec path.
 
+mod common;
+
 use std::time::{Duration, Instant};
 
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
-use db_mcp_gateway::config::{Database, Password, Server, ServerKind, Tls};
-use db_mcp_gateway::exec::{DbAdapter, ExecError, ExecQuery, PgAdapter};
-
-const TARGET_HOST: &str = "localhost";
-const TARGET_PORT: u16 = 5434;
-const TARGET_USER: &str = "app";
-const TARGET_PASSWORD: &str = "app-dev-only";
-const TARGET_DB: &str = "app";
-
-fn server() -> Server {
-    Server {
-        name: "target".to_string(),
-        kind: ServerKind::Postgres,
-        description: String::new(),
-        host: TARGET_HOST.to_string(),
-        port: TARGET_PORT,
-        tls: Tls::Insecure,
-        databases: vec![database()],
-    }
-}
-
-fn database() -> Database {
-    Database {
-        name: TARGET_DB.to_string(),
-        role: TARGET_USER.to_string(),
-        password: Password::Literal(TARGET_PASSWORD.into()),
-        description: String::new(),
-        auth_database: None,
-    }
-}
-
-async fn adapter() -> PgAdapter {
-    PgAdapter::open(&server(), &database())
-        .await
-        .expect("target-db reachable; run `bin/dev up`")
-}
+use common::pg_target::{
+    TARGET_DB, TARGET_HOST, TARGET_PASSWORD, TARGET_PORT, TARGET_USER, adapter,
+};
+use db_mcp_gateway::exec::{DbAdapter, ExecError, ExecQuery};
 
 fn query<'a>(sql: &'a str, timeout_ms: Option<u32>, row_limit: u32) -> ExecQuery<'a> {
     ExecQuery {

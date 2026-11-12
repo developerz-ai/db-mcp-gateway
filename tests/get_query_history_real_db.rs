@@ -9,24 +9,13 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use common::{MockUser, spawn_mock_idp};
+use common::gateway::{LoggedInGateway, spawn_logged_in};
+use common::idp::MockUser;
 use db_mcp_gateway::audit::{AuditRow, log};
-use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
-use db_mcp_gateway::config::{Config, ConfigFile};
-use db_mcp_gateway::exec::AdapterRegistry;
-use db_mcp_gateway::state;
-use db_mcp_gateway::transport::{self, AppState, AuthFacade, PendingFlows};
 use serde_json::{Value, json};
 use uuid::Uuid;
-
-fn state_db_url() -> String {
-    std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
-        "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
-    })
-}
 
 const E2E_YAML: &str = r#"
 servers:
@@ -48,124 +37,20 @@ permissions:
       - { server: target, database: app, action: query_read }
 "#;
 
-struct BootedGateway {
-    url: String,
-    bearer: String,
-    state_db: sqlx::PgPool,
-    user_sub: String,
-}
-
 /// The default gateway: a caller in `historians`, which holds `history_read`.
-async fn boot_gateway() -> BootedGateway {
+async fn boot_gateway() -> LoggedInGateway {
     boot_gateway_with("historians", "test-user", E2E_YAML).await
 }
 
 /// Boot a gateway whose caller belongs to `group`, against `yaml`.
-///
-/// Parameterized rather than copied: every field added to `AppState` would
-/// otherwise need the same edit in two places, and the copy silently rots
-/// when only one is updated.
-async fn boot_gateway_with(group: &str, sub_prefix: &str, yaml: &str) -> BootedGateway {
-    let pool = state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)");
-
+async fn boot_gateway_with(group: &str, sub_prefix: &str, yaml: &str) -> LoggedInGateway {
     let user_sub = format!("{sub_prefix}-{}", Uuid::new_v4().simple());
     let user = MockUser {
         sub: user_sub.clone(),
         email: format!("{user_sub}@example.com"),
         groups: vec![group.to_string()],
     };
-    let idp = spawn_mock_idp("test-client", "test-secret", user).await;
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let gateway_url = format!("http://{addr}");
-
-    let auth_config = AuthConfig {
-        issuer: idp.issuer.clone(),
-        client_id: idp.client_id.clone(),
-        client_secret: idp.client_secret.clone(),
-        audience: idp.client_id.clone(),
-        redirect_url: format!("{gateway_url}/auth/callback"),
-        ..AuthConfig::default()
-    };
-    let sessions = SessionStore::new(pool.clone());
-    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient http builder");
-
-    let config = Config {
-        bind: addr,
-        ..Config::default()
-    };
-    let config_file = ConfigFile::from_yaml_str(yaml).expect("e2e yaml is well-formed");
-
-    let app = transport::router(
-        &config,
-        AppState {
-            auth: Some(AuthFacade {
-                config: Arc::new(auth_config),
-                sessions,
-                oidc,
-                flows: PendingFlows::default(),
-                codes: db_mcp_gateway::transport::AuthCodes::default(),
-                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
-                service_tokens: Default::default(),
-            }),
-            config: Arc::new(config_file),
-            state_db: Some(pool.clone()),
-            adapter_registry: AdapterRegistry::new(),
-            shutdown: Default::default(),
-            metrics: None,
-            permissions_cache: None,
-            permissions_repo: None,
-            mcp_path: std::sync::Arc::from("/mcp"),
-            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
-        },
-    )
-    .expect("router builds");
-    tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await;
-    });
-
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-
-    let login: Value = client
-        .post(format!("{gateway_url}/auth/login"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let login_url = login["login_url"].as_str().unwrap();
-    let authorize = client.get(login_url).send().await.unwrap();
-    let callback = authorize.headers()["location"]
-        .to_str()
-        .unwrap()
-        .to_string();
-    let cb: Value = client
-        .get(&callback)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let bearer = cb["session_token"].as_str().unwrap().to_string();
-    BootedGateway {
-        url: gateway_url,
-        bearer,
-        state_db: pool,
-        user_sub,
-    }
+    spawn_logged_in(yaml, user).await
 }
 
 fn client() -> reqwest::Client {

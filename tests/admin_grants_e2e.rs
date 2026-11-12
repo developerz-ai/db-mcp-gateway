@@ -20,16 +20,20 @@
 //! audit_write_failure_rolls_back_user_write`); the same `tx_*` helpers are
 //! reused here unchanged, so the proof carries over without a duplicate test.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore, jwt};
+use common::cleanup::{
+    delete_permissions_audit, delete_permissions_database, delete_permissions_grant,
+    delete_permissions_user,
+};
+use common::env::state_pool;
+use common::gateway::{EMPTY_YAML, GatewayBuilder};
+use db_mcp_gateway::auth::{AuthConfig, SessionStore, jwt};
 use db_mcp_gateway::authz::PermissionsCache;
-use db_mcp_gateway::config::{AdminBlock, Config, ConfigFile};
-use db_mcp_gateway::exec::AdapterRegistry;
-use db_mcp_gateway::state;
 use db_mcp_gateway::state::permissions::{DbType, PermissionsRepo, pg::PgPermissionsRepo};
-use db_mcp_gateway::transport::{self, AppState, AuthFacade, PendingFlows};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -37,18 +41,6 @@ use sqlx::Row;
 use uuid::Uuid;
 
 const ADMIN_GROUP: &str = "db-mcp-gateway-admins";
-
-fn state_db_url() -> String {
-    std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
-        "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
-    })
-}
-
-async fn pool() -> PgPool {
-    state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)")
-}
 
 async fn mint_session(
     sessions: &SessionStore,
@@ -96,24 +88,12 @@ impl Harness {
 
     async fn cleanup(&self) {
         for id in &self.cleanup_grant_ids {
-            let _ = sqlx::query("DELETE FROM permissions_audit WHERE target_id = $1")
-                .bind(id)
-                .execute(&self.pool)
-                .await;
-            let _ = sqlx::query("DELETE FROM permissions_grants WHERE id = $1")
-                .bind(id)
-                .execute(&self.pool)
-                .await;
+            delete_permissions_audit(&self.pool, *id).await;
+            delete_permissions_grant(&self.pool, *id).await;
         }
         for id in &self.cleanup_database_ids {
-            let _ = sqlx::query("DELETE FROM permissions_audit WHERE target_id = $1")
-                .bind(id)
-                .execute(&self.pool)
-                .await;
-            let _ = sqlx::query("DELETE FROM permissions_databases WHERE id = $1")
-                .bind(id)
-                .execute(&self.pool)
-                .await;
+            delete_permissions_audit(&self.pool, *id).await;
+            delete_permissions_database(&self.pool, *id).await;
         }
         for sub in &self.cleanup_user_subs {
             let id_row = sqlx::query("SELECT id FROM permissions_users WHERE user_sub = $1")
@@ -124,98 +104,39 @@ impl Harness {
                 .flatten();
             if let Some(row) = id_row {
                 let id: Uuid = row.try_get("id").unwrap();
-                let _ = sqlx::query("DELETE FROM permissions_audit WHERE target_id = $1")
-                    .bind(id)
-                    .execute(&self.pool)
-                    .await;
+                delete_permissions_audit(&self.pool, id).await;
                 let _ = sqlx::query("DELETE FROM permissions_grants WHERE user_id = $1")
                     .bind(id)
                     .execute(&self.pool)
                     .await;
             }
-            let _ = sqlx::query("DELETE FROM permissions_users WHERE user_sub = $1")
-                .bind(sub)
-                .execute(&self.pool)
-                .await;
+            delete_permissions_user(&self.pool, sub).await;
         }
     }
 }
 
 async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
-    let pool = pool().await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let base_url = format!("http://{addr}");
-
-    let auth_config = AuthConfig {
-        issuer: "http://idp.invalid".to_string(),
-        client_id: "test".to_string(),
-        client_secret: "test".to_string(),
-        audience: "test".to_string(),
-        redirect_url: format!("{base_url}/auth/callback"),
-        ..AuthConfig::default()
-    };
-    let sessions = SessionStore::new(pool.clone());
-    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient builds");
-
-    let mut config_file = ConfigFile::from_yaml_str("servers: []\npermissions: []\n").unwrap();
-    config_file.admin = Some(AdminBlock {
-        enabled: true,
-        group: ADMIN_GROUP.to_string(),
-        session_max_age_secs: None,
-    });
-
+    let pool = state_pool().await;
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
     let cache = PermissionsCache::new(repo.clone(), Duration::from_secs(60));
-
-    let config = Config {
-        bind: addr,
-        ..Config::default()
-    };
-    let app = transport::router(
-        &config,
-        AppState {
-            auth: Some(AuthFacade {
-                config: Arc::new(auth_config.clone()),
-                sessions: sessions.clone(),
-                oidc,
-                flows: PendingFlows::default(),
-                codes: db_mcp_gateway::transport::AuthCodes::default(),
-                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
-                service_tokens: Default::default(),
-            }),
-            config: Arc::new(config_file),
-            adapter_registry: AdapterRegistry::new(),
-            state_db: Some(pool.clone()),
-            shutdown: Default::default(),
-            metrics: None,
-            permissions_cache: Some(cache.clone()),
-            permissions_repo: Some(repo.clone()),
-            mcp_path: std::sync::Arc::from("/mcp"),
-            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
-        },
-    )
-    .expect("router builds");
-    tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
+    let gw = GatewayBuilder::new(EMPTY_YAML)
+        .admin(ADMIN_GROUP, true)
+        .repo(repo.clone())
+        .cache(cache.clone())
+        .spawn(pool)
         .await;
-    });
-
     (
         Harness {
-            base_url,
-            pool,
+            base_url: gw.url,
+            pool: gw.state_db,
             repo,
             cache,
             cleanup_grant_ids: Vec::new(),
             cleanup_database_ids: Vec::new(),
             cleanup_user_subs: Vec::new(),
         },
-        auth_config,
-        sessions,
+        gw.auth_config,
+        gw.sessions,
     )
 }
 

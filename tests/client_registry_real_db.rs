@@ -15,7 +15,10 @@
 //! check and fail closed (`false`) — a nondeterministic flake where the victim
 //! changes per run. Serializing keeps the shared table consistent.
 
-use db_mcp_gateway::transport::ClientRegistry;
+mod common;
+
+use common::env::state_pool;
+use db_mcp_gateway::auth::oauth::ClientRegistry;
 use serial_test::serial;
 use sqlx::PgPool;
 
@@ -23,18 +26,6 @@ use sqlx::PgPool;
 /// `CLIENT_CAP` — a concurrent insert from any sibling test would be refused
 /// at the cap and flake. Serialize the whole file.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-fn state_db_url() -> String {
-    std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
-        "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
-    })
-}
-
-async fn pool() -> PgPool {
-    db_mcp_gateway::state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)")
-}
 
 async fn cleanup(pool: &PgPool, client_id: &str) {
     sqlx::query("DELETE FROM oauth_clients WHERE client_id = $1")
@@ -50,7 +41,7 @@ async fn cleanup(pool: &PgPool, client_id: &str) {
 #[serial]
 async fn registration_survives_a_restart() {
     let _serial = SERIAL.lock().await;
-    let pool = pool().await;
+    let pool = state_pool().await;
     let client_id = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
     cleanup(&pool, &client_id).await;
 
@@ -83,7 +74,7 @@ async fn registration_survives_a_restart() {
 #[serial]
 async fn re_register_updates_redirect_uris() {
     let _serial = SERIAL.lock().await;
-    let pool = pool().await;
+    let pool = state_pool().await;
     let client_id = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
     cleanup(&pool, &client_id).await;
 
@@ -112,7 +103,7 @@ async fn re_register_updates_redirect_uris() {
 #[serial]
 async fn expired_registration_is_swept_and_not_returned() {
     let _serial = SERIAL.lock().await;
-    let pool = pool().await;
+    let pool = state_pool().await;
     let stale = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
     cleanup(&pool, &stale).await;
 
@@ -162,7 +153,7 @@ async fn expired_registration_is_swept_and_not_returned() {
 #[serial]
 async fn at_cap_rejects_new_but_updates_existing_real_db() {
     let _serial = SERIAL.lock().await;
-    let pool = pool().await;
+    let pool = state_pool().await;
     let prefix = format!("capfill-{}-", uuid::Uuid::new_v4().simple());
 
     // Fill to the 10k cap in a single INSERT. Even if the table holds other

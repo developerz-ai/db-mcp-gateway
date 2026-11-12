@@ -27,19 +27,10 @@ fn effective_ttl_days(ttl: u32) -> u32 {
 /// the number of rows removed.
 pub async fn run_once(pool: &PgPool, ttl_days: u32) -> Result<u64, AuditError> {
     let days = effective_ttl_days(ttl_days);
-    // `interval '1 day' * $1` keeps the SQL portable to older Postgres
-    // versions (`make_interval` is 14+). The cast on the bind is needed so
-    // sqlx infers the parameter type — Postgres won't let `int * interval`
-    // happen with a freshly-bound untyped param.
-    let result = sqlx::query(
-        "DELETE FROM audit_calls \
-         WHERE occurred_at < now() - (interval '1 day' * $1::int)",
-    )
-    .bind(i32::try_from(days).unwrap_or(i32::MAX))
-    .execute(pool)
-    .await
-    .map_err(AuditError::Write)?;
-    Ok(result.rows_affected())
+    let days = i32::try_from(days).unwrap_or(i32::MAX);
+    crate::state::audit::delete_calls_older_than(pool, days)
+        .await
+        .map_err(AuditError::Write)
 }
 
 #[cfg(test)]

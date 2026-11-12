@@ -11,17 +11,13 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use common::{MockUser, spawn_mock_idp};
-use db_mcp_gateway::audit::latest_for_user_tool;
-use db_mcp_gateway::auth::{AuthConfig, OidcClient, ServiceTokenStore, SessionStore};
-use db_mcp_gateway::config::{Config, ConfigFile};
-use db_mcp_gateway::exec::AdapterRegistry;
-use db_mcp_gateway::state;
+use common::audit::latest_audit;
+use common::env::state_pool;
+use common::gateway::{GatewayBuilder, no_redirect_client};
+use common::idp::{MockUser, spawn_mock_idp};
 use db_mcp_gateway::state::permissions::PermissionsRepo;
 use db_mcp_gateway::state::permissions::pg::PgPermissionsRepo;
-use db_mcp_gateway::transport::{self, AppState, AuthFacade, PendingFlows};
 use serde_json::{Value, json};
 
 /// Well-formed (`dbmcp_svc_` + 64 body chars) but obviously synthetic fixture
@@ -78,12 +74,6 @@ admin:
   group: admins
 "#;
 
-fn state_db_url() -> String {
-    std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
-        "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
-    })
-}
-
 struct BootedGateway {
     url: String,
     client: reqwest::Client,
@@ -93,9 +83,7 @@ struct BootedGateway {
 /// One gateway with everything wired: mock IdP (human path), two service
 /// accounts (headless path), admin surface mounted (must stay human-only).
 async fn boot_gateway() -> BootedGateway {
-    let pool = state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)");
+    let pool = state_pool().await;
 
     // The human login flow needs an IdP even though the service-token tests
     // never drive it; same mock as auth_e2e.
@@ -105,71 +93,16 @@ async fn boot_gateway() -> BootedGateway {
         groups: vec!["engineers".into()],
     };
     let idp = spawn_mock_idp("test-client", "test-secret", user).await;
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let gateway_url = format!("http://{addr}");
-
-    let auth_config = AuthConfig {
-        issuer: idp.issuer.clone(),
-        client_id: idp.client_id.clone(),
-        client_secret: idp.client_secret.clone(),
-        audience: idp.client_id.clone(),
-        redirect_url: format!("{gateway_url}/auth/callback"),
-        ..AuthConfig::default()
-    };
-    let sessions = SessionStore::new(pool.clone());
-    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient http builder");
-    let config = Config {
-        bind: addr,
-        ..Config::default()
-    };
-    let config_file = ConfigFile::from_yaml_str(E2E_YAML).expect("e2e yaml is well-formed");
-    let service_tokens = ServiceTokenStore::from_config(&config_file.service_accounts)
-        .expect("fixture tokens satisfy the boot rules");
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
-
-    let app = transport::router(
-        &config,
-        AppState {
-            auth: Some(AuthFacade {
-                config: Arc::new(auth_config),
-                sessions,
-                oidc,
-                flows: PendingFlows::default(),
-                codes: db_mcp_gateway::transport::AuthCodes::default(),
-                refresh: db_mcp_gateway::transport::RefreshTokens::default(),
-                service_tokens,
-            }),
-            config: Arc::new(config_file),
-            adapter_registry: AdapterRegistry::new(),
-            state_db: Some(pool.clone()),
-            shutdown: Default::default(),
-            metrics: None,
-            permissions_cache: None,
-            permissions_repo: Some(repo),
-            mcp_path: std::sync::Arc::from("/mcp"),
-            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
-        },
-    )
-    .expect("router builds");
-    tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
+    let gw = GatewayBuilder::new(E2E_YAML)
+        .idp(&idp)
+        .repo(repo)
+        .spawn(pool)
         .await;
-    });
-
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
     BootedGateway {
-        url: gateway_url,
-        client,
-        state_db: pool,
+        url: gw.url,
+        client: no_redirect_client(),
+        state_db: gw.state_db,
     }
 }
 
@@ -222,10 +155,13 @@ async fn service_token_authenticates_scopes_and_audits() {
     );
 
     // Audit attribution: the row names the service identity, not a human.
-    let row = latest_for_user_tool(&gw.state_db, "service:ci-bot", "list_servers")
-        .await
-        .expect("audit lookup query runs")
-        .expect("service-token call wrote an audit row");
+    let row = latest_audit(
+        &gw.state_db,
+        "service:ci-bot",
+        "list_servers",
+        "service-token call",
+    )
+    .await;
     assert_eq!(row.outcome, "success");
     assert_eq!(row.user_email, "ci-bot@service-accounts.invalid");
     assert_eq!(row.groups, vec!["svc-ci".to_string()]);
@@ -250,10 +186,13 @@ async fn service_token_outside_group_scope_is_denied_and_audited() {
     let payload = tool_payload(resp).await;
     assert_eq!(payload["code"], "forbidden", "{payload}");
 
-    let row = latest_for_user_tool(&gw.state_db, "service:ci-bot", "describe_schema")
-        .await
-        .expect("audit lookup query runs")
-        .expect("denied call wrote an audit row");
+    let row = latest_audit(
+        &gw.state_db,
+        "service:ci-bot",
+        "describe_schema",
+        "denied call",
+    )
+    .await;
     assert_eq!(row.outcome, "forbidden");
     assert_eq!(row.server.as_deref(), Some("prod"));
 }
@@ -273,10 +212,13 @@ async fn service_token_with_empty_grants_sees_nothing() {
     // empty-grant group, and uses the synthesized .invalid email — this is
     // the only proof that a zero-grant service token still flows through
     // the synchronous audit write.
-    let row = latest_for_user_tool(&gw.state_db, "service:analytics-bot", "list_servers")
-        .await
-        .expect("audit lookup query runs")
-        .expect("zero-grant call wrote an audit row");
+    let row = latest_audit(
+        &gw.state_db,
+        "service:analytics-bot",
+        "list_servers",
+        "zero-grant call",
+    )
+    .await;
     assert_eq!(row.outcome, "success");
     assert_eq!(row.user_email, "analytics-bot@service-accounts.invalid");
     assert_eq!(row.groups, vec!["svc-analytics".to_string()]);
@@ -392,10 +334,13 @@ async fn logout_is_a_noop_for_service_tokens() {
     // service identity — proves logout did not damage the identity behind
     // the static token (there is no session row to revoke in the first
     // place, but the audit row is the receipt).
-    let row = latest_for_user_tool(&gw.state_db, "service:ci-bot", "list_servers")
-        .await
-        .expect("audit lookup query runs")
-        .expect("post-logout call wrote an audit row");
+    let row = latest_audit(
+        &gw.state_db,
+        "service:ci-bot",
+        "list_servers",
+        "post-logout call",
+    )
+    .await;
     assert_eq!(row.outcome, "success");
     assert_eq!(row.user_email, "ci-bot@service-accounts.invalid");
     assert_eq!(row.groups, vec!["svc-ci".to_string()]);

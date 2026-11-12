@@ -29,51 +29,24 @@
 //! `state != 'idle'`) so the assertion passes as soon as the cancel is
 //! delivered — the subsequent ROLLBACK is not required for the test.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use db_mcp_gateway::audit;
+use common::audit::latest_audit;
+use common::cleanup::delete_audit_calls;
+use common::env::{state_pool, target_db_url};
+use common::pg_target;
 use db_mcp_gateway::auth::{Identity, SessionId};
-use db_mcp_gateway::config::{Database, Password, Server, ServerKind, Tls};
 use db_mcp_gateway::exec::{DEFAULT_POOL_MAX_CONNECTIONS, DbAdapter, ExecQuery, PgAdapter};
-use db_mcp_gateway::state;
-use db_mcp_gateway::tools::audit_dispatch::{AuditHeader, Outcome, RequestContext, audit_dispatch};
+use db_mcp_gateway::tools::audit_dispatch::{
+    AuditHeader, Outcome, OutcomeCode, RequestContext, audit_dispatch,
+};
 use db_mcp_gateway::transport::jsonrpc::Response;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
-
-fn state_db_url() -> String {
-    std::env::var("STATE_DB_URL")
-        .unwrap_or_else(|_| "postgres://gateway:gateway-dev-only@localhost:5433/gateway".into())
-}
-
-fn target_db_url() -> String {
-    std::env::var("TARGET_DB_URL")
-        .unwrap_or_else(|_| "postgres://app:app-dev-only@localhost:5434/app".into())
-}
-
-fn test_server() -> Server {
-    Server {
-        name: "target".into(),
-        kind: ServerKind::Postgres,
-        description: String::new(),
-        host: "localhost".into(),
-        port: 5434,
-        tls: Tls::Insecure,
-        databases: vec![],
-    }
-}
-
-fn test_database() -> Database {
-    Database {
-        name: "app".into(),
-        role: "app".into(),
-        password: Password::Literal("app-dev-only".into()),
-        description: String::new(),
-        auth_database: None,
-    }
-}
 
 fn test_identity(user_sub: &str) -> Identity {
     Identity {
@@ -100,7 +73,7 @@ async fn pg_cancel_backend_fires_when_execute_future_dropped() {
         .expect("monitor connection to target DB (run `bin/dev up`)");
 
     let adapter = Arc::new(
-        PgAdapter::open(&test_server(), &test_database())
+        PgAdapter::open(&pg_target::server(), &pg_target::database())
             .await
             .expect("PgAdapter open"),
     );
@@ -179,9 +152,7 @@ async fn pg_cancel_backend_fires_when_execute_future_dropped() {
 /// `pg_sleep(31)`) to avoid concurrent-test cross-contamination.
 #[tokio::test]
 async fn cancelled_dispatch_cancels_pg_backend_and_writes_audit_row() {
-    let state_pool = state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB (run `bin/dev up`)");
+    let state_pool = state_pool().await;
 
     let monitor = PgPoolOptions::new()
         .max_connections(2)
@@ -190,7 +161,7 @@ async fn cancelled_dispatch_cancels_pg_backend_and_writes_audit_row() {
         .expect("monitor connection to target DB");
 
     let adapter = Arc::new(
-        PgAdapter::open(&test_server(), &test_database())
+        PgAdapter::open(&pg_target::server(), &pg_target::database())
             .await
             .expect("PgAdapter open"),
     );
@@ -236,7 +207,7 @@ async fn cancelled_dispatch_cancels_pg_backend_and_writes_audit_row() {
                 match result {
                     Ok(_) => Outcome {
                         response: Response::result(id_out, &serde_json::json!({"ok": true})),
-                        code: "success",
+                        code: OutcomeCode::Success,
                         elapsed_ms: Some(0),
                         row_count: Some(0),
                         truncated: Some(false),
@@ -244,7 +215,7 @@ async fn cancelled_dispatch_cancels_pg_backend_and_writes_audit_row() {
                     },
                     Err(_) => Outcome {
                         response: Response::result(id_out, &serde_json::json!({"ok": false})),
-                        code: "internal",
+                        code: OutcomeCode::Internal,
                         elapsed_ms: None,
                         row_count: None,
                         truncated: None,
@@ -305,12 +276,13 @@ async fn cancelled_dispatch_cancels_pg_backend_and_writes_audit_row() {
     );
 
     // 2. Audit row must be present with outcome = "cancelled".
-    let row = audit::latest_for_user_tool(&state_pool, &user, "run_query")
-        .await
-        .expect("audit query runs")
-        .unwrap_or_else(|| {
-            panic!("no audit row for user={user} — CancelledAuditGuard did not fire")
-        });
+    let row = latest_audit(
+        &state_pool,
+        &user,
+        "run_query",
+        &format!("user={user} — CancelledAuditGuard did not fire"),
+    )
+    .await;
 
     assert_eq!(row.outcome, "cancelled", "audit outcome mismatch");
     assert_eq!(row.server.as_deref(), Some("target"));
@@ -322,11 +294,7 @@ async fn cancelled_dispatch_cancels_pg_backend_and_writes_audit_row() {
     );
 
     // Cleanup so reruns don't accumulate rows for this user.
-    sqlx::query("DELETE FROM audit_calls WHERE user_sub = $1")
-        .bind(&user)
-        .execute(&state_pool)
-        .await
-        .expect("cleanup");
+    delete_audit_calls(&state_pool, &user).await;
 }
 
 /// Regression for the "cancel through the pool the stuck queries are pinning"
@@ -352,7 +320,7 @@ async fn concurrent_aborts_do_not_queue_on_query_pool() {
         .expect("monitor connection to target DB (run `bin/dev up`)");
 
     let adapter = Arc::new(
-        PgAdapter::open(&test_server(), &test_database())
+        PgAdapter::open(&pg_target::server(), &pg_target::database())
             .await
             .expect("PgAdapter open"),
     );

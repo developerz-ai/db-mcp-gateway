@@ -4,22 +4,13 @@
 //! Uses a per-test `user_sub` so concurrent runs (and any dev rows from
 //! other tests) don't interfere with the assertions.
 
+mod common;
+
+use common::cleanup::delete_audit_calls;
+use common::env::state_pool;
 use db_mcp_gateway::audit::{self, AuditRow};
-use db_mcp_gateway::state;
 use sqlx::Row;
 use uuid::Uuid;
-
-fn state_db_url() -> String {
-    std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
-        "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
-    })
-}
-
-async fn pool() -> sqlx::PgPool {
-    state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)")
-}
 
 fn audit_row(user_sub: &str, request_id: &str) -> AuditRow {
     AuditRow {
@@ -47,7 +38,7 @@ fn audit_row(user_sub: &str, request_id: &str) -> AuditRow {
 /// The acceptance test: an old row gets deleted; a fresh one stays.
 #[tokio::test]
 async fn pruner_deletes_only_rows_older_than_ttl() {
-    let p = pool().await;
+    let p = state_pool().await;
     let user = format!("pruner-test-{}", Uuid::new_v4().simple());
 
     // Write the fresh row through the real audit writer (occurred_at defaults
@@ -103,11 +94,7 @@ async fn pruner_deletes_only_rows_older_than_ttl() {
     assert_eq!(surviving_request_id, "fresh");
 
     // Cleanup so this test stays idempotent across reruns.
-    sqlx::query("DELETE FROM audit_calls WHERE user_sub = $1")
-        .bind(&user)
-        .execute(&p)
-        .await
-        .unwrap();
+    delete_audit_calls(&p, &user).await;
 }
 
 // Tempting to add a `ttl=0 deletes everything` sanity test, but

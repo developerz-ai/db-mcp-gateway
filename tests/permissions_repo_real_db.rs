@@ -8,7 +8,9 @@
 //! test asserts the database CHECK still blocks raw-SQL bypasses; the typed
 //! `GrantTarget` enum is the in-process guard rail above it.
 
-use db_mcp_gateway::state;
+mod common;
+
+use common::env::state_pool;
 use db_mcp_gateway::state::permissions::{
     DbType, GrantAction, GrantTarget, Page, PermissionsRepo, pg::PgPermissionsRepo,
 };
@@ -23,18 +25,6 @@ fn wide_page() -> Page {
     Page::new(Some(Page::MAX_LIMIT), None)
 }
 use uuid::Uuid;
-
-fn state_db_url() -> String {
-    std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
-        "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
-    })
-}
-
-async fn pool() -> PgPool {
-    state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)")
-}
 
 fn fresh_sub(tag: &str) -> String {
     format!("{tag}-{}", Uuid::new_v4().simple())
@@ -76,7 +66,7 @@ async fn cleanup_database(pool: &PgPool, server: &str) {
 
 #[tokio::test]
 async fn upsert_user_creates_and_then_refreshes_email_and_groups() {
-    let p = pool().await;
+    let p = state_pool().await;
     let sub = fresh_sub("upsert");
     let repo = PgPermissionsRepo::new(p.clone());
 
@@ -101,7 +91,7 @@ async fn upsert_user_creates_and_then_refreshes_email_and_groups() {
 
 #[tokio::test]
 async fn get_user_by_sub_skips_soft_deleted() {
-    let p = pool().await;
+    let p = state_pool().await;
     let sub = fresh_sub("getsoft");
     let repo = PgPermissionsRepo::new(p.clone());
 
@@ -146,7 +136,7 @@ async fn get_user_by_sub_skips_soft_deleted() {
 
 #[tokio::test]
 async fn database_crud_and_list_filters_soft_deleted() {
-    let p = pool().await;
+    let p = state_pool().await;
     let server = fresh_sub("dbcrud-server");
     let repo = PgPermissionsRepo::new(p.clone());
 
@@ -181,7 +171,7 @@ async fn database_crud_and_list_filters_soft_deleted() {
 
 #[tokio::test]
 async fn create_specific_grant_round_trips() {
-    let p = pool().await;
+    let p = state_pool().await;
     let sub = fresh_sub("specific");
     let server = fresh_sub("specific-server");
     let repo = PgPermissionsRepo::new(p.clone());
@@ -213,7 +203,7 @@ async fn create_specific_grant_round_trips() {
 
 #[tokio::test]
 async fn create_wildcard_grant_round_trips() {
-    let p = pool().await;
+    let p = state_pool().await;
     let sub = fresh_sub("wildcard");
     let server = fresh_sub("wc-server");
     let repo = PgPermissionsRepo::new(p.clone());
@@ -245,7 +235,7 @@ async fn create_wildcard_grant_round_trips() {
 
 #[tokio::test]
 async fn revoked_grants_drop_from_user_listing() {
-    let p = pool().await;
+    let p = state_pool().await;
     let sub = fresh_sub("revoke");
     let server = fresh_sub("revoke-server");
     let repo = PgPermissionsRepo::new(p.clone());
@@ -284,7 +274,7 @@ async fn revoked_grants_drop_from_user_listing() {
 /// admin SQL).
 #[tokio::test]
 async fn raw_insert_with_both_specific_and_wildcard_is_rejected_by_check() {
-    let p = pool().await;
+    let p = state_pool().await;
     let sub = fresh_sub("xorcheck");
     let server = fresh_sub("xor-server");
 
@@ -332,7 +322,7 @@ async fn raw_insert_with_both_specific_and_wildcard_is_rejected_by_check() {
 /// order), not the pool-vs-connection dispatch.
 #[tokio::test]
 async fn list_users_honours_limit_and_offset() {
-    let p = pool().await;
+    let p = state_pool().await;
     let repo = PgPermissionsRepo::new(p.clone());
     // Retain the seeded subs so we can hard-delete them after the assertions —
     // rows would otherwise pile up on the shared dev DB across test reruns.
@@ -421,7 +411,7 @@ async fn list_users_honours_limit_and_offset() {
 /// pool-vs-connection dispatch.
 #[tokio::test]
 async fn paging_covers_every_row_without_duplicates() {
-    let p = pool().await;
+    let p = state_pool().await;
     let repo = PgPermissionsRepo::new(p.clone());
     let mut seeded = Vec::new();
     let mut seeded_subs = Vec::new();

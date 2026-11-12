@@ -8,17 +8,11 @@
 
 mod common;
 
-use std::sync::Arc;
-use std::time::Duration;
-
-use common::{MockUser, spawn_mock_idp};
-use db_mcp_gateway::auth::{AuthConfig, OidcClient, SessionStore};
-use db_mcp_gateway::config::{Config, ConfigFile};
-use db_mcp_gateway::exec::AdapterRegistry;
-use db_mcp_gateway::state;
-use db_mcp_gateway::transport::{
-    self, AppState, AuthCodes, AuthFacade, GrantIdentity, PendingFlows, RefreshTokens,
-};
+use common::env::state_pool;
+use common::gateway::{GatewayBuilder, no_redirect_client, spawn_authless};
+use common::idp::{MockUser, spawn_mock_idp};
+use db_mcp_gateway::auth::oauth::{GrantIdentity, RefreshTokens};
+use db_mcp_gateway::config::Config;
 use serde_json::{Value, json};
 
 // RFC 7636 Appendix B test vector — lets the test exercise real PKCE S256
@@ -42,12 +36,6 @@ permissions:
     grants:
       - { server: prod, database: "*", action: schema_read }
 "#;
-
-fn state_db_url() -> String {
-    std::env::var("STATE_DB_URL").unwrap_or_else(|_| {
-        "postgres://gateway:gateway-dev-only@localhost:5433/gateway".to_string()
-    })
-}
 
 #[tokio::test]
 async fn mcp_oauth_bridge_full_flow() {
@@ -290,54 +278,12 @@ async fn spawn_authless_gateway() -> (String, reqwest::Client) {
 async fn spawn_authless_gateway_with_caps(
     max_concurrent_requests: usize,
 ) -> (String, reqwest::Client) {
-    use db_mcp_gateway::config::ConfigFile;
-    use db_mcp_gateway::exec::AdapterRegistry;
-    use db_mcp_gateway::transport::ClientRegistry;
-    use std::sync::Arc;
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind authless gateway");
-    let addr = listener.local_addr().unwrap();
-    let gateway_url = format!("http://{addr}");
-    let config = Config {
-        bind: addr,
+    let gateway_url = spawn_authless(Config {
         max_concurrent_requests,
         ..Config::default()
-    };
-    let state = AppState {
-        auth: None,
-        config: Arc::new(ConfigFile {
-            servers: Vec::new(),
-            permissions: Vec::new(),
-            admin: None,
-            permissions_store: None,
-            service_accounts: Vec::new(),
-            logging: Default::default(),
-        }),
-        adapter_registry: AdapterRegistry::new(),
-        state_db: None,
-        shutdown: Default::default(),
-        metrics: None,
-        permissions_cache: None,
-        permissions_repo: None,
-        mcp_path: Arc::from("/mcp"),
-        client_registry: ClientRegistry::default(),
-    };
-    let app = transport::router(&config, state).expect("router builds");
-    tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await;
-    });
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-    (gateway_url, client)
+    })
+    .await;
+    (gateway_url, no_redirect_client())
 }
 
 /// Register a public client with one redirect URI; return its `client_id`.
@@ -648,72 +594,17 @@ async fn code_bound_to_client_redirect_challenge() {
 /// shared handle to the refresh-token store so tests can directly manipulate
 /// chain state (e.g. backdate `issued_at` to simulate TTL expiry).
 async fn spawn_bridge_gateway(user: MockUser) -> (String, reqwest::Client, RefreshTokens) {
-    let pool = state::connect(&state_db_url(), 5)
-        .await
-        .expect("state DB up (run `bin/dev up`)");
+    let pool = state_pool().await;
     let idp = spawn_mock_idp("test-client", "test-secret", user).await;
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let gateway_url = format!("http://{addr}");
-
-    let auth_config = AuthConfig {
-        issuer: idp.issuer.clone(),
-        client_id: idp.client_id.clone(),
-        client_secret: idp.client_secret.clone(),
-        audience: idp.client_id.clone(),
-        redirect_url: format!("{gateway_url}/auth/callback"),
-        ..AuthConfig::default()
-    };
-    let sessions = SessionStore::new(pool.clone());
-    let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient http builder");
-    let config = Config {
-        bind: addr,
-        ..Config::default()
-    };
-    let config_file = ConfigFile::from_yaml_str(E2E_CONFIG_YAML).expect("e2e yaml is well-formed");
-    // Create the refresh-token store separately so we can hand a clone back to
-    // the test. `RefreshTokens` wraps an `Arc<Mutex<…>>`, so this clone shares
-    // the same storage as the one placed into `AppState`.
-    let refresh = db_mcp_gateway::transport::RefreshTokens::default();
-    let app = transport::router(
-        &config,
-        AppState {
-            auth: Some(AuthFacade {
-                config: Arc::new(auth_config),
-                sessions,
-                oidc,
-                flows: PendingFlows::default(),
-                codes: AuthCodes::default(),
-                refresh: refresh.clone(),
-                service_tokens: Default::default(),
-            }),
-            config: Arc::new(config_file),
-            adapter_registry: AdapterRegistry::new(),
-            state_db: Some(pool),
-            shutdown: Default::default(),
-            metrics: None,
-            permissions_cache: None,
-            permissions_repo: None,
-            mcp_path: std::sync::Arc::from("/mcp"),
-            client_registry: db_mcp_gateway::transport::ClientRegistry::default(),
-        },
-    )
-    .expect("router builds");
-    tokio::spawn(async move {
-        let _ = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
+    // `RefreshTokens` wraps an `Arc<Mutex<…>>`, so this clone shares the
+    // same storage as the one placed into `AppState`.
+    let refresh = RefreshTokens::default();
+    let gw = GatewayBuilder::new(E2E_CONFIG_YAML)
+        .idp(&idp)
+        .refresh(refresh.clone())
+        .spawn(pool)
         .await;
-    });
-
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-    (gateway_url, client, refresh)
+    (gw.url, no_redirect_client(), refresh)
 }
 
 /// Run register → authorize → callback → token to obtain an `(access, refresh)`

@@ -18,22 +18,12 @@
 //! the copy here stops matching the repo and the divergence is visible in
 //! review.
 
-use db_mcp_gateway::state::{self};
+mod common;
+
+use common::env::mysql_pool;
 use serde_json::Value as JsonValue;
 use sqlx::{MySqlPool, Row};
 use uuid::Uuid;
-
-fn mysql_dsn() -> String {
-    std::env::var("PERMISSIONS_DB_DSN").unwrap_or_else(|_| {
-        "mysql://permissions:permissions-dev-only@localhost:3307/permissions".to_string()
-    })
-}
-
-async fn pool() -> MySqlPool {
-    state::connect_permissions_mysql(&mysql_dsn(), 5)
-        .await
-        .expect("mysql permissions store up (run `bin/dev up`)")
-}
 
 /// The chosen plan for one table, reduced to the fields these tests assert on.
 #[derive(Debug)]
@@ -100,7 +90,7 @@ const SEED_ROWS: u32 = 900;
 
 #[tokio::test]
 async fn get_user_by_sub_uses_the_user_sub_index() {
-    let p = pool().await;
+    let p = mysql_pool().await;
     let tag = format!("planseed-{}", Uuid::new_v4().simple());
 
     sqlx::query(
@@ -149,7 +139,7 @@ async fn get_user_by_sub_uses_the_user_sub_index() {
 
 #[tokio::test]
 async fn list_databases_uses_the_live_index_and_avoids_filesort() {
-    let p = pool().await;
+    let p = mysql_pool().await;
     let tag = format!("planseed-{}", Uuid::new_v4().simple());
 
     sqlx::query(
@@ -202,7 +192,7 @@ async fn list_databases_uses_the_live_index_and_avoids_filesort() {
 /// third hot query can't regress the way the other two did.
 #[tokio::test]
 async fn list_grants_for_user_uses_the_user_index() {
-    let p = pool().await;
+    let p = mysql_pool().await;
     let plan = explain(
         &p,
         "SELECT id, user_id, server, database_id, db_name_wildcard, action, \
