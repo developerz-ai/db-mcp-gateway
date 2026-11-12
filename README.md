@@ -25,10 +25,10 @@ before any result goes back.
 
 ## Install
 
-**v2.0.0 — stable, in production use.** Upgrading from 1.x: [`website/docs/deployment/upgrading-to-2.md`](website/docs/deployment/upgrading-to-2.md). One image, one YAML file, and one Postgres for the gateway's own state:
+**v2.0.1 — stable, in production use.** Upgrading from 1.x: [`website/docs/deployment/upgrading-to-2.md`](website/docs/deployment/upgrading-to-2.md). One image, one YAML file, and one Postgres for the gateway's own state:
 
 ```bash
-docker pull ghcr.io/developerz-ai/db-mcp-gateway:2.0.0
+docker pull ghcr.io/developerz-ai/db-mcp-gateway:2.0.1
 ```
 
 Public on GHCR, no auth needed to pull. Multi-arch (`linux/amd64`,
