@@ -1,0 +1,62 @@
+name: weekly
+
+# Cheap checks off the PR path, against `main` (scheduled runs use the default
+# branch). A new advisory lands without any commit here, so the PR-time
+# `audit` job alone would only notice it on the next unrelated PR.
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weekly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    # GitHub-hosted runner (org rule: private repos on Ubicloud, public on GitHub-hosted).
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: stable
+      - name: install cargo-audit
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
+        with:
+          tool: cargo-audit
+      # Same ignore as ci.yml's `audit` job; .cargo/audit.toml holds its
+      # removal trigger.
+      - run: cargo audit --ignore RUSTSEC-2023-0071
+
+  # Report only: what `cargo update` would move. Applying it is a reviewed PR
+  # (Dependabot, or by hand narrowly — CLAUDE.md §Dependency graph; sqlx stays
+  # pinned with its sqlx-sqlite stub).
+  outdated:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: stable
+      - name: cargo update --dry-run
+        run: |
+          set -o pipefail
+          {
+            echo '## cargo update --dry-run'
+            echo '```'
+            cargo update --dry-run --color never 2>&1
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"

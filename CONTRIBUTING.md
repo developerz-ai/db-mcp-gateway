@@ -20,6 +20,7 @@ Host prerequisites — `bin/setup` checks these before it installs anything:
 - **Rust**, including Cargo and rustc, with the pinned toolchain and the `rustfmt` and `clippy` components from `rust-toolchain.toml`. Install through your trusted toolchain manager before setup; setup does not bootstrap Rust.
 - **Docker Engine or Docker Desktop** with **Docker Compose v2** (`docker compose`), including support for `up --wait`. Start the daemon and ensure your user can access it without sudo before setup; setup does not install Docker.
 - **Network access** to host package repositories, Rust dependency registries and container image registries; available local ports listed below.
+- **cargo-nextest** (`bin/setup` installs the pinned version) — `bin/test` falls back to `cargo test` without it.
 - **mise** is optional: setup runs `mise install` when available and otherwise uses host tools. A failed mise install stops setup.
 
 `bin/check` grades the same box, and a missing REQUIRED prerequisite returns

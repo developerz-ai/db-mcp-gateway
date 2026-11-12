@@ -77,7 +77,7 @@ case "$name $*" in
   'docker compose -f docker-compose.dev.yml up -d --wait')
     [[ "$name $*" != "${FAIL_AT:-}" ]] || exit 42
     touch "$CALLS.ready" ;;
-  'cargo test '*)
+  'cargo test '*|'cargo nextest '*)
     # A running state DB is deliberately insufficient in this fixture.
     [[ -f $CALLS.ready ]] || { echo 'FAIL: cargo before full-stack readiness'; exit 46; }
     if [[ -n ${EXPECT_FILTER:-} ]]; then
@@ -202,6 +202,13 @@ rm "$work/calls.ready"
 (cd "$work/repo" && PATH="$work/tools" CALLS="$work/calls" EXPECT_FILTER='filter with spaces' \
   bash bin/test --test smoke -- --nocapture 'filter with spaces')
 called 'cargo test --all-targets --all-features --test smoke -- --nocapture filter with spaces'
+# With cargo-nextest installed bin/test runs it instead, args intact.
+rm "$work/calls.ready"
+ln -s stub "$work/tools/cargo-nextest"
+(cd "$work/repo" && PATH="$work/tools" CALLS="$work/calls" EXPECT_FILTER='filter with spaces' \
+  bash bin/test --test smoke -- --nocapture 'filter with spaces')
+called 'cargo nextest run --all-targets --all-features --test smoke -- --nocapture filter with spaces'
+rm "$work/tools/cargo-nextest"
 # The restored ci.yml parity stages, exercised against the real scan code: a
 # mutable action ref fails the SHA-pin scan, a committed token fails the
 # tracked-token scan, and a git grep that cannot run fails closed (#190).

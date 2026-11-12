@@ -39,14 +39,15 @@ required-features = ["bench-harness"]
 
 [dependencies]
 # async runtime + http
-tokio = { version = "1", features = ["full"] }
+# Named features, not "full": the runtime, timers, sockets, signals, locks and
+# the one async file read (`config::secret`). Add a feature when code needs it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs"] }
 axum = { version = "0.7", features = ["macros"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 # rustls 0.23 requires explicit CryptoProvider selection — we pick aws-lc-rs
 # at boot in `transport::tls::install_crypto_provider`.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 tower = "0.5"
-tower-http = { version = "0.7", features = ["trace", "cors"] }
 futures = "0.3.32"            # Stream combinators for the SSE response
 
 # serialization + config
@@ -179,6 +180,14 @@ split-debuginfo = "unpacked"
 [profile.dev.package."*"]
 opt-level = 1
 debug = false
+
+# CI builds once per job and never rebuilds incrementally, so incremental state
+# is wasted disk and cache upload; without DWARF the ~40 test binaries link
+# faster and the rust-cache archive shrinks. Backtraces keep function names.
+[profile.ci]
+inherits = "dev"
+debug = false
+incremental = false
 
 [profile.release]
 lto = "thin"

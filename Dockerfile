@@ -1,16 +1,31 @@
 # syntax=docker/dockerfile:1.7
 
+# Base images are pinned by multi-arch index digest, not just tag: a tag is
+# mutable, so the same commit could build on different bases. Bump the tag and
+# digest together (`docker buildx imagetools inspect <image>:<tag>`).
+
+# ---- chef-bin ----
+# The prebuilt cargo-chef release binary, verified by checksum, instead of
+# `cargo install` compiling it from source on every builder-cache miss.
+# Both arches are fetched because `ADD --checksum` takes a literal; the
+# build's own arch is picked by TARGETARCH. busybox only unpacks the .tar.xz
+# (the rust slim image ships no xz).
+FROM busybox:1.37.0-musl@sha256:f6a95d611e0a8780fabdb2aec43e31275b2720dfefa3e41b16835bfc42454478 AS chef-bin
+ARG TARGETARCH
+ADD --checksum=sha256:ff390181459f53c787a496c4ee9a52d8c9c7975ab8d02c8dbd1a0fa1626171f4 \
+    https://github.com/LukeMathWalker/cargo-chef/releases/download/v0.1.77/cargo-chef-x86_64-unknown-linux-gnu.tar.xz \
+    /dl/amd64.tar.xz
+ADD --checksum=sha256:64cd1b405894f587a461a0dd0f60127330b1ebd204fd46b1a36fb0ff6da157e0 \
+    https://github.com/LukeMathWalker/cargo-chef/releases/download/v0.1.77/cargo-chef-aarch64-unknown-linux-gnu.tar.xz \
+    /dl/arm64.tar.xz
+RUN tar -xJf "/dl/${TARGETARCH}.tar.xz" -C /dl --strip-components=1
+
 # ---- chef ----
 # Matches rust-toolchain.toml exactly. When the two drift, the toolchain file
 # wins and rustup re-downloads inside the builder on every cache miss — bump
 # both together.
-#
-# cargo-chef is installed from crates.io on top of the official rust image
-# rather than pulled as `lukemathwalker/cargo-chef:*`, keeping the build's
-# supply chain to crates.io plus the official image. Version-pinned for the
-# same reason every GitHub Action is SHA-pinned.
-FROM rust:1.96.0-slim-bookworm AS chef
-RUN cargo install cargo-chef --locked --version 0.1.77
+FROM rust:1.96.0-slim-bookworm@sha256:4732ca96fd086cb9be682050c3f0176288eebaac2b80aa2bcefccfaf198e1950 AS chef
+COPY --from=chef-bin /dl/cargo-chef /usr/local/cargo/bin/cargo-chef
 WORKDIR /src
 
 # ---- planner ----
@@ -41,7 +56,7 @@ COPY . .
 RUN cargo build --release --locked
 
 # ---- runtime ----
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 WORKDIR /app
 
 COPY --from=builder /src/target/release/db-mcp-gateway /usr/local/bin/db-mcp-gateway
