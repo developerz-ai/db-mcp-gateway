@@ -9,6 +9,8 @@
 //! contract is enforced outside cargo test, by `bin/lint`.
 
 mod event_fields;
+mod patterns;
+mod protocol_fields;
 
 use super::*;
 
@@ -42,80 +44,6 @@ fn scrubs_postgres_dsn_in_event_message() {
     let json = extra.to_string();
     assert!(json.contains("***REDACTED***"), "nested extra redacted");
     assert!(!json.contains(secret), "secret in nested extra");
-}
-
-#[test]
-fn scrubs_password_assignment() {
-    let scrubber = scrubber();
-
-    // `key=value` form (the contract under test).
-    let out = scrubber.scrub_str("password=hunter2 ok");
-    assert!(out.contains("***REDACTED***"), "{out}");
-    assert!(!out.contains("hunter2"), "{out}");
-
-    // `key: value` form, mixed case.
-    let out = scrubber.scrub_str("OIDC_CLIENT_SECRET: s3cr3t-value");
-    assert!(out.contains("***REDACTED***"), "{out}");
-    assert!(!out.contains("s3cr3t-value"), "{out}");
-
-    // Allowlisted env names: value redacted even with no `user:pass@`
-    // userinfo and no secret keyword. The internal hostname must not leak.
-    // (CodeRabbit: SESSION_SIGNING_KEY / STATE_DB_URL bypassed the old
-    // scrubber.)
-    let out = scrubber.scrub_str("SESSION_SIGNING_KEY=jwt-hs256-base64-secret");
-    assert!(out.contains("***REDACTED***"), "{out}");
-    assert!(!out.contains("jwt-hs256-base64-secret"), "{out}");
-
-    let out = scrubber.scrub_str("STATE_DB_URL=postgres://db.internal/app");
-    assert!(out.contains("***REDACTED***"), "{out}");
-    assert!(
-        !out.contains("db.internal"),
-        "internal hostname leaked: {out}"
-    );
-
-    // A userinfo-bearing STATE_DB_URL is also fully redacted (allowlist
-    // whole-value pass, not just the URL userinfo strip).
-    let out = scrubber.scrub_str("STATE_DB_URL=postgres://app:s3cr3t@db.internal/app");
-    assert!(out.contains("***REDACTED***"), "{out}");
-    assert!(!out.contains("s3cr3t"), "{out}");
-    assert!(!out.contains("db.internal"), "{out}");
-
-    // `: value` separator, mixed case, and a sibling non-sensitive key
-    // left intact.
-    let out = scrubber.scrub_str("state_db_url: postgres://db.internal/app ok=1");
-    assert!(out.contains("***REDACTED***"), "{out}");
-    assert!(out.contains("ok=1"), "benign sibling key clobbered: {out}");
-
-    // `MY_STATE_DB_URL` is not the allowlisted key — left alone by this
-    // pass (its value carries no creds here).
-    let out = scrubber.scrub_str("MY_STATE_DB_URL=harmless");
-    assert!(!out.contains("***REDACTED***"), "false positive: {out}");
-
-    // Each DB scheme family loses its userinfo, host stays.
-    for raw in [
-        "postgres://u:p@h/db",
-        "postgresql://u:p@h:5432/db",
-        "mysql://u:p@h/db",
-        "mongodb://u:p@h/db",
-        "mongodb+srv://u:p@cluster.h/db",
-        "mariadb://u:p@h/db",
-        "redis://u:p@h:6379",
-    ] {
-        let out = scrubber.scrub_str(raw);
-        assert!(out.contains("***REDACTED***"), "{raw} -> {out}");
-        assert!(!out.contains(":p@"), "userinfo leaked: {raw} -> {out}");
-    }
-}
-
-#[test]
-fn does_not_redact_benign_text() {
-    let scrubber = scrubber();
-    // No creds, no secret keys → untouched.
-    let raw = "query returned 42 rows from table users in 3ms";
-    assert_eq!(scrubber.scrub_str(raw), raw);
-    // A URL without credentials is left intact.
-    let raw = "see https://example.com/docs for details";
-    assert_eq!(scrubber.scrub_str(raw), raw);
 }
 
 /// The production regression (GlitchTip issue DB-MCP-GATEWAY-2, 40 events,

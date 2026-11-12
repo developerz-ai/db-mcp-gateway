@@ -8,20 +8,20 @@
 //! populated it) and redacts anything that looks like a connection string or
 //! a secret assignment *before* it hits the wire.
 //!
-//! Env keys whose **values** must never reach GlitchTip: `STATE_DB_URL`,
+//! What is redacted, by value anywhere in the event: bare service tokens
+//! (`dbmcp_svc_…`), JWTs, `Bearer …` credentials, URL userinfo (including
+//! password-only and passwords containing `/` or `@`), `key=value` /
+//! `"key":"value"` assignments for credential keywords (quoted values with
+//! spaces included), and the whole value of the env keys `STATE_DB_URL`,
 //! `TARGET_DB_URL`, `PERMISSIONS_DB_DSN`, `OIDC_CLIENT_SECRET`,
-//! `SESSION_SIGNING_KEY`. These are matched by name against an explicit
-//! allowlist ([`scrubber::SENSITIVE_KEY_PATTERN`]) and their entire value redacted — so a
-//! userinfo-less `STATE_DB_URL=postgres://db.internal/app` (whose internal
-//! hostname the URL regex would leave intact) and a `SESSION_SIGNING_KEY=…`
-//! (which matches neither `key`/`url`) are both covered. Beyond that,
-//! URL-credential values are caught by the URL regex regardless of the key that
-//! carried them, and `…_SECRET` / `…_DSN`-style assignments are caught by the
-//! secret-keyword regex. This is defense in depth on top of the gateway's
-//! primary rule (credentials never travel in errors/logs) — the scrubber exists
-//! for the day something slips past that.
+//! `SESSION_SIGNING_KEY`. By key: every value under a JSON object key that
+//! names a credential (`password`, `token`, `authorization`, `cookie`, …),
+//! whatever its shape. The event is serialised, walked once and deserialised,
+//! so every protocol field is covered — not a hand-kept list. This is defense
+//! in depth on top of the gateway's primary rule (credentials never travel in
+//! errors/logs) — the scrubber exists for the day something slips past that.
 //!
-//! The three patterns are compiled **once, at boot**, by [`scrubber::Scrubber::new`]. A
+//! The patterns are compiled **once, at boot**, by [`scrubber::Scrubber::new`]. A
 //! pattern that does not compile aborts the process instead of degrading: the
 //! previous shape compiled them lazily and substituted the redaction sentinel
 //! for the whole string when compilation failed, which silently destroyed every
