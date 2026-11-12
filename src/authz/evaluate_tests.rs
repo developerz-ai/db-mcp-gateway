@@ -23,6 +23,8 @@ fn database(name: &str) -> Database {
         description: String::new(),
         auth_database: None,
         pool: None,
+        write_role: None,
+        write_password: None,
     }
 }
 

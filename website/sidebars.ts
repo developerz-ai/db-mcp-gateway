@@ -20,6 +20,7 @@ const sidebars: SidebarsConfig = {
         'usage/first-query',
         'usage/claude-code',
         'usage/other-agents',
+        'usage/headless-agents',
       ],
     },
     {

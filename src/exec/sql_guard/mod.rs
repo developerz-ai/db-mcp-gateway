@@ -92,20 +92,34 @@ pub fn is_read_only(sql: &str) -> Result<(), GuardError> {
     check_sql(sql, Access::ReadOnly)
 }
 
-/// SQL text that passed [`is_read_only`]. [`ReadOnlySql::parse`] is the only
-/// constructor, so holding one proves the read-only guard already ran — the
-/// exec layer's `explain` takes this instead of a bare `&str`.
+/// SQL text that passed the guard, plus the access the statement itself
+/// needs: [`Access::ReadOnly`] for a `SELECT`, [`Access::ReadWrite`] for a
+/// data write. [`GuardedSql::parse`] is the only constructor, so holding one
+/// proves the guard already ran — the exec layer's `explain` takes this
+/// instead of a bare `&str`, and picks the role and the `ANALYZE` rule from
+/// [`GuardedSql::required_access`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReadOnlySql<'a>(&'a str);
+pub struct GuardedSql<'a> {
+    sql: &'a str,
+    required: Access,
+}
 
-impl<'a> ReadOnlySql<'a> {
-    pub fn parse(sql: &'a str) -> Result<Self, GuardError> {
-        is_read_only(sql)?;
-        Ok(Self(sql))
+impl<'a> GuardedSql<'a> {
+    /// Guard `sql` at the caller's `access` (its grant). A `query_read`
+    /// caller can only ever obtain a read statement.
+    pub fn parse(sql: &'a str, access: Access) -> Result<Self, GuardError> {
+        let required = guard(sql, access)?;
+        Ok(Self { sql, required })
     }
 
     pub fn as_str(&self) -> &'a str {
-        self.0
+        self.sql
+    }
+
+    /// The least access the statement needs: never wider than the `access`
+    /// it was parsed under.
+    pub fn required_access(&self) -> Access {
+        self.required
     }
 }
 
@@ -113,6 +127,11 @@ impl<'a> ReadOnlySql<'a> {
 /// statement only — multiple statements are rejected in both modes so a write
 /// can never ride in behind a leading `SELECT`.
 pub fn check_sql(sql: &str, access: Access) -> Result<(), GuardError> {
+    guard(sql, access).map(|_| ())
+}
+
+/// [`check_sql`], returning the access the admitted statement needs.
+fn guard(sql: &str, access: Access) -> Result<Access, GuardError> {
     let dialect = PostgreSqlDialect {};
     let statements = Parser::parse_sql(&dialect, sql).map_err(|e| match e {
         ParserError::ParserError(_)
@@ -146,8 +165,16 @@ pub fn check_sql(sql: &str, access: Access) -> Result<(), GuardError> {
     check_statement_shape(stmt, access)?;
 
     match stmt.visit(&mut GuardVisitor::new()) {
-        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Continue(()) => Ok(required_access(stmt)),
         ControlFlow::Break(e) => Err(e),
+    }
+}
+
+/// Only a `Query` reads; every other admitted shape is a data write.
+fn required_access(stmt: &Statement) -> Access {
+    match stmt {
+        Statement::Query(_) => Access::ReadOnly,
+        _ => Access::ReadWrite,
     }
 }
 

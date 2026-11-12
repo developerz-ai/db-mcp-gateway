@@ -188,6 +188,42 @@ alter role mcp_gateway_prod_app_ro set idle_in_transaction_session_timeout = '60
 
 Store the password in your secret manager. Never paste it into config.
 
+### Optional: a write role for `query_write`
+
+Writes are opt-in, and the gateway never provisions them (MUST #3). For a
+database where some group should be able to `INSERT`/`UPDATE`/`DELETE`,
+create a **second** role and wire it as `write_role` — never widen the
+read-only role, which every read keeps using:
+
+```sql
+create role mcp_gateway_prod_app_rw with login password :'rw_pw';
+grant connect on database app to mcp_gateway_prod_app_rw;
+grant usage on schema public to mcp_gateway_prod_app_rw;
+-- data writes only: no CREATE, no TRUNCATE, no ownership
+grant select, insert, update, delete on all tables in schema public
+  to mcp_gateway_prod_app_rw;
+grant usage on all sequences in schema public to mcp_gateway_prod_app_rw;
+alter default privileges in schema public
+  grant select, insert, update, delete on tables to mcp_gateway_prod_app_rw;
+
+alter role mcp_gateway_prod_app_rw set statement_timeout = '30s';
+alter role mcp_gateway_prod_app_rw set idle_in_transaction_session_timeout = '60s';
+```
+
+```yaml
+      - name: app
+        role: mcp_gateway_prod_app_ro
+        password: ${ENV:PROD_APP_RO_PASSWORD}
+        write_role: mcp_gateway_prod_app_rw
+        write_password: ${ENV:PROD_APP_RW_PASSWORD}
+```
+
+Narrow the write role's table grants as far as the use case allows: table
+scoping is the role's job, not the gateway's. The introspection tools need
+nothing extra — `table_stats` only lists tables the read role can `SELECT`,
+and `db_activity` / `cancel_query` see and cancel only the gateway's own
+roles' backends, which a role may always do for itself.
+
 ## 2. Register an OIDC application
 
 In your IdP, create an OIDC app for the gateway:

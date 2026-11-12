@@ -19,7 +19,7 @@ mod session_store;
 pub use config::AuthConfig;
 pub use errors::AuthError;
 pub use oidc::{OidcClient, VerifiedIdentity};
-pub use service_token::{ServiceTokenError, ServiceTokenStore};
+pub use service_token::{ServicePolicy, ServiceTokenError, ServiceTokenStore};
 pub use session::{Identity, IdentityKind, Session, SessionId};
 pub use session_cache::SessionCacheConfig;
 pub use session_store::SessionStore;

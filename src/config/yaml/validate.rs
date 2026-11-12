@@ -4,10 +4,12 @@
 
 use std::collections::HashSet;
 
-use crate::config::schema::{Permission, Server, ServiceAccount, StreamSinkConfig};
+use crate::config::schema::{Permission, Server, StreamSinkConfig};
 
 use super::limits::{validate_constraint_values, validate_server_values};
 use super::roles::{reject_superuser_role, validate_role};
+use super::service_accounts::validate_service_accounts;
+use super::write_tier::{validate_write_grants, validate_write_role};
 use super::{
     AdminBlock, ConfigFile, ConfigFileError, PermissionsStoreBlock, PermissionsStoreDriver,
 };
@@ -19,6 +21,7 @@ impl ConfigFile {
         validate_permissions_store(self.permissions_store.as_ref(), admin)?;
         let server_names = validate_servers(&self.servers)?;
         let group_names = validate_permissions(&self.permissions, &self.servers, &server_names)?;
+        validate_write_grants(&self.permissions, &self.servers)?;
         validate_service_accounts(&self.service_accounts, &group_names, admin)?;
         validate_stream_sinks(&self.logging.stream)?;
         self.reject_production_literals()
@@ -98,6 +101,7 @@ fn validate_databases(server: &Server) -> Result<(), ConfigFileError> {
         }
         validate_role(&db.role).map_err(ConfigFileError::Invalid)?;
         reject_superuser_role(&db.role, server.kind, &db.name, &server.name)?;
+        validate_write_role(db, server)?;
         // `Some("")` would silently override the `None → name` fallback
         // and force mongo to authenticate against an empty `authSource`,
         // surfacing as a cryptic runtime auth failure instead of a boot
@@ -183,56 +187,6 @@ fn validate_grants(
     Ok(())
 }
 
-fn validate_service_accounts(
-    accounts: &[ServiceAccount],
-    group_names: &HashSet<&str>,
-    admin: Option<&AdminBlock>,
-) -> Result<(), ConfigFileError> {
-    let mut service_names: HashSet<&str> = HashSet::new();
-    for account in accounts {
-        validate_service_name(&account.name)?;
-        if !service_names.insert(account.name.as_str()) {
-            return Err(ConfigFileError::Invalid(format!(
-                "duplicate service account name `{}`",
-                account.name
-            )));
-        }
-        if account.group.trim().is_empty() {
-            return Err(ConfigFileError::Invalid(format!(
-                "service account `{}` must name a permissions group",
-                account.name
-            )));
-        }
-        // A token whose group has no `permissions:` block is almost always
-        // a typo'd group name; it would authenticate cleanly and then
-        // silently reach nothing. Same fail-fast rule as grants on unknown
-        // servers.
-        if !group_names.contains(account.group.as_str()) {
-            return Err(ConfigFileError::Invalid(format!(
-                "service account `{}` maps to group `{}`, which has no `permissions:` \
-                 block — declare the group there first (an empty `grants:` list \
-                 recognizes the group while granting nothing)",
-                account.name, account.group
-            )));
-        }
-        // The admin middleware gates on group membership alone, so this
-        // boot gate is what keeps a service token off `/admin/*` without
-        // widening that middleware. Rejected at boot, not trusted to review.
-        if let Some(admin) = admin
-            && admin.enabled
-            && account.group == admin.group
-        {
-            return Err(ConfigFileError::Invalid(format!(
-                "service account `{}` maps to group `{}`, which is the admin group — \
-                 a service token must never authorize `/admin/*`; give the service \
-                 its own group",
-                account.name, account.group
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// Stream sinks that touch the network need per-variant boot validation so a
 /// typo/omission fails at startup rather than as a silent drop inside the
 /// detached delivery task. `stdout` is a local `tracing` emission with no
@@ -256,30 +210,6 @@ fn validate_stream_sinks(sinks: &[StreamSinkConfig]) -> Result<(), ConfigFileErr
         }
     }
     Ok(())
-}
-
-/// Service-account names land in audit fields (`service:<name>` sub,
-/// `<name>@service-accounts.invalid` email), so keep them DNS-label-shaped:
-/// lowercase alphanumerics and dashes, starting with an alphanumeric, 63 max.
-/// Anything fancier buys nothing and makes audit queries/noising regexes
-/// messier.
-fn validate_service_name(name: &str) -> Result<(), ConfigFileError> {
-    let valid = !name.is_empty()
-        && name.len() <= 63
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphanumeric());
-    if valid {
-        return Ok(());
-    }
-    Err(ConfigFileError::Invalid(format!(
-        "service account name `{name}` must match ^[a-z0-9][a-z0-9-]{{0,62}}$ \
-         (lowercase; it becomes the audit identity `service:{name}`)"
-    )))
 }
 
 fn grant_database_exists(servers: &[Server], server_name: &str, db_name: &str) -> bool {

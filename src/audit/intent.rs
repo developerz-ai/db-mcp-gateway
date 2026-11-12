@@ -23,6 +23,10 @@ pub struct CallIntent<'a> {
     pub db_type: Option<&'static str>,
     /// Whether the call may write; an abandoned write may have committed.
     pub access: Access,
+    /// The caller's claimed upstream attribution, carried so an `abandoned`
+    /// row keeps it (see [`crate::audit::AuditRow::upstream_actor`]).
+    pub upstream_actor: Option<&'a str>,
+    pub upstream_run_id: Option<&'a str>,
 }
 
 /// Commit the intent row, under the same deadline as the completion write.

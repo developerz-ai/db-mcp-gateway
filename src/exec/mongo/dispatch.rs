@@ -10,8 +10,9 @@ use mongodb::bson::{Bson, Document, doc};
 use mongodb::error::{Error as MongoError, ErrorKind};
 use serde_json::Value;
 
-use super::super::adapter::{ExecError, ExecQuery, ExecResult};
+use super::super::adapter::{ExecError, ExecResult};
 use super::super::budget::ResultBudget;
+use super::super::query::ExecQuery;
 use super::MongoAdapter;
 use super::bson_json::{bson_to_json, doc_to_json};
 use super::cancel;
@@ -45,12 +46,12 @@ impl MongoAdapter {
         // `pg::run_query_inner`'s `CancelOnDrop`.
         let result = async {
             let (column, collected) = match command_name.as_str() {
-                "find" | "aggregate" => {
+                "find" | "aggregate" | "listCollections" | "listIndexes" => {
                     ("document", self.drain_cursor(cmd, query.row_limit).await?)
                 }
                 "count" => ("count", self.count(cmd, query.row_limit).await?),
                 "distinct" => ("value", self.distinct(cmd, query.row_limit).await?),
-                // Rejector already filters to find/aggregate/count/distinct.
+                // Rejector already filters to the commands above.
                 // This arm exists for type-system completeness — if the
                 // rejector's allow-list and dispatch table drift, fail loudly.
                 other => {

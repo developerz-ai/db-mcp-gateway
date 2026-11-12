@@ -136,6 +136,8 @@ async fn dropped_execute_future_kills_the_mongo_op() {
                 statement_timeout_ms: Some(30_000),
                 row_limit: 1,
                 access: Access::ReadOnly,
+                dry_run: false,
+                request_id: uuid::Uuid::new_v4(),
             })
             .await
     });
@@ -212,6 +214,8 @@ async fn completed_command_leaves_nothing_in_current_op() {
             statement_timeout_ms: Some(5_000),
             row_limit: 10,
             access: Access::ReadOnly,
+            dry_run: false,
+            request_id: uuid::Uuid::new_v4(),
         })
         .await;
 

@@ -271,6 +271,8 @@ async fn run_query_full_acceptance() {
 /// Config granting the `writers` group `query_write` on `target/app`. The dev
 /// `app` role owns the DB, so it has the real write privileges a write grant
 /// requires (CLAUDE.md #3: writes need the grant AND a write-capable DB role).
+/// Two tiers on one database: reads connect as the provisioned read-only
+/// role, `query_write` as `app` (`pg_target::writable_database`).
 const WRITE_YAML: &str = r#"
 servers:
   - name: target
@@ -281,8 +283,10 @@ servers:
     tls: insecure
     databases:
       - name: app
-        role: app
-        password: app-dev-only
+        role: dbmcp_test_ro
+        password: ro-dev-only
+        write_role: app
+        write_password: app-dev-only
         description: Local target-db
 
 permissions:
@@ -298,6 +302,7 @@ permissions:
 /// blocked even with the write grant, and every dispatch leaves an audit row.
 #[tokio::test]
 async fn run_query_write_grant_commits_data_but_not_schema() {
+    common::pg_target::ensure_read_role().await;
     let booted = boot_gateway_with(WRITE_YAML, vec!["writers".to_string()]).await;
     let (url, bearer, pool, sub) = (
         booted.url.as_str(),

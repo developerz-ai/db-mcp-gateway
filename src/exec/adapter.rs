@@ -22,12 +22,14 @@
 use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::config::ServerKind;
 
-use super::ident::Identifier;
+use super::query::{
+    ActivityQuery, ExecQuery, ExplainQuery, SampleQuery, SchemaQuery, TableStatsQuery,
+};
 use super::rejection::DbRejection;
-use super::sql_guard::{Access, ReadOnlySql};
 
 /// Gateway-wide ceiling on a single query's wall-clock budget. When a grant
 /// declines to set `statement_timeout_ms` (spec-06 "no constraint from this
@@ -77,58 +79,15 @@ pub enum AdapterKind {
     Mongo,
 }
 
-/// A single query against the adapter. `binds` are positional text values
-/// applied in order — `$1`, `$2`, … for pg; future adapters define their own
-/// placeholder convention. `binds = &[]` for queries with no parameters.
-///
-/// `access` is the caller's authz decision, and the adapter enforces it at
-/// the database: [`Access::ReadOnly`] runs inside a read-only transaction,
-/// so even a write-capable role cannot write through it. Only a `query_write`
-/// grant may pass [`Access::ReadWrite`].
-#[derive(Debug)]
-pub struct ExecQuery<'a> {
-    pub sql: &'a str,
-    pub binds: &'a [&'a str],
-    pub statement_timeout_ms: Option<u32>,
-    pub row_limit: u32,
-    pub access: Access,
-}
-
-/// Catalog lookup for one schema, optionally narrowed to one table. Schema
-/// and table are *values* to the catalog query (bound, not interpolated).
-#[derive(Debug)]
-pub struct SchemaQuery<'a> {
-    pub schema: &'a str,
-    pub table: Option<&'a str>,
-    pub statement_timeout_ms: Option<u32>,
-    pub row_limit: u32,
-}
-
-/// First `row_limit` rows of one table, every column. The names are
-/// [`Identifier`]s because they land in generated SQL as identifiers.
-#[derive(Debug)]
-pub struct SampleQuery<'a> {
-    pub schema: Identifier<'a>,
-    pub table: Identifier<'a>,
-    pub statement_timeout_ms: Option<u32>,
-    pub row_limit: u32,
-}
-
-/// Plan — never execute — one statement that already passed the read-only
-/// guard.
-#[derive(Debug)]
-pub struct ExplainQuery<'a> {
-    pub sql: ReadOnlySql<'a>,
-    pub statement_timeout_ms: Option<u32>,
-}
-
 /// Tabular result. `rows` is row-major; `columns` carries the names in their
 /// stable left-to-right order. `truncated` means more rows were available
 /// but the gateway stopped at `row_limit` or [`MAX_RESULT_BYTES`].
 ///
-/// `rows_affected` is `Some` only for an [`Access::ReadWrite`] query: the
-/// number of rows the statement changed, which can exceed `rows.len()` when a
-/// `RETURNING` list was truncated (the write itself is never cut short).
+/// `rows_affected` is `Some` only for an
+/// [`Access::ReadWrite`](super::sql_guard::Access::ReadWrite) query: the
+/// number of rows the statement changed (or, under `dry_run`, would have
+/// changed), which can exceed `rows.len()` when a `RETURNING` list was
+/// truncated (the write itself is never cut short).
 #[derive(Debug, Serialize)]
 pub struct ExecResult {
     pub columns: Vec<String>,
@@ -153,6 +112,19 @@ pub enum ExecError {
     #[error("query exceeded the configured statement_timeout")]
     Timeout,
 
+    /// The statement was cancelled before its budget ran out — by the
+    /// `cancel_query` tool (`DbAdapter::cancel_request`) or an operator's
+    /// `pg_cancel_backend`. Tools map it to the `cancelled` outcome.
+    #[error("query was cancelled")]
+    Cancelled,
+
+    /// A write was requested on a database with no `write_role`. Config
+    /// validation refuses a YAML `query_write` grant on such a database, so
+    /// this is reached only through a dynamic (admin API) grant. Tools map
+    /// it to `forbidden`. Names no role.
+    #[error("this database has no write role configured")]
+    WriteNotConfigured,
+
     /// The DB refused the statement and the reason is opaque (a protocol or
     /// decode failure, or a non-Postgres backend's command error).
     #[error("SQL rejected by the DB")]
@@ -171,17 +143,16 @@ pub enum ExecError {
     Decode,
 
     /// Gateway-side policy rejection — defense-in-depth on top of the
-    /// least-privilege DB role. Today this fires only from
-    /// `MongoAdapter::execute`, which runs the read-only rejector before
-    /// dispatching the command (#57). The pg path performs the same check
-    /// in the tool layer (`sql_guard::is_read_only` → `forbidden_sql`)
-    /// before ever calling `execute`, so this variant exists for adapters
-    /// whose policy check is intrinsic to dispatch. Tools map it to the
+    /// least-privilege DB role. Fires from `MongoAdapter::execute`, which
+    /// runs the read-only rejector before dispatching the command (#57), and
+    /// from the pg `explain` when `analyze` is asked of a write. The pg SQL
+    /// guard itself runs in the tool layer (`sql_guard` → `forbidden_sql`)
+    /// before `execute` is ever called. Tools map this variant to the
     /// `forbidden_sql` outcome code per spec 03 / 07.
     ///
-    /// The carried string is the operator-facing rejection reason — the
-    /// `RejectReason::Display` rendering — and is safe to surface (no
-    /// command values, no credentials). See `mongo::rejector::RejectReason`.
+    /// The carried string is the operator-facing rejection reason (for
+    /// Mongo, the `RejectReason::Display` rendering) and is safe to surface
+    /// (no command values, no credentials). See `mongo::rejector::RejectReason`.
     #[error("operation rejected by gateway policy: {0}")]
     Forbidden(String),
 
@@ -199,8 +170,8 @@ pub enum ExecError {
     UnsupportedAdapter(ServerKind),
 
     /// The adapter is registered but does not support the requested
-    /// operation. Today this fires on `MongoAdapter`'s `describe_schema`,
-    /// `sample` and `explain`. The error carries the responsible
+    /// operation. Today this fires on `MongoAdapter`'s `explain`,
+    /// `table_stats`, `db_activity` and `cancel_request`. The error carries the responsible
     /// `AdapterKind` and the operation name so operators see exactly which
     /// gap was hit.
     #[error("adapter `{adapter:?}` has not implemented `{op}` yet")]
@@ -231,20 +202,51 @@ pub trait DbAdapter: Send + Sync + std::fmt::Debug {
     /// See `ExecQuery` for the per-call inputs.
     async fn execute(&self, query: ExecQuery<'_>) -> Result<ExecResult, ExecError>;
 
-    /// Columns of every table in `query.schema` (or just `query.table`),
-    /// ordered by table then column position. Each row is exactly
-    /// `[schema, table, column, data_type, is_nullable]`, all strings;
-    /// `is_nullable` is `"YES"` / `"NO"`.
+    /// The schema, one row per column or per collection.
+    ///
+    /// - Postgres: every table in `query.schema` (or just `query.table`),
+    ///   ordered by table then column position. Each row is exactly
+    ///   `[schema, table, column, data_type, is_nullable]`, all strings;
+    ///   `is_nullable` is `"YES"` / `"NO"`.
+    /// - Mongo: every collection (or just `query.table`), ordered by name.
+    ///   Each row is exactly `[database, collection, type, indexes]`: three
+    ///   strings (`type` is `"collection"` / `"view"` / …) and a JSON array
+    ///   of `{name, key, unique}`, empty for a view.
     async fn describe_schema(&self, query: SchemaQuery<'_>) -> Result<ExecResult, ExecError>;
 
     /// Up to `query.row_limit` rows of the table, with `truncated` set when
-    /// the table holds more.
+    /// the table holds more. Mongo answers one `document` column.
     async fn sample(&self, query: SampleQuery<'_>) -> Result<ExecResult, ExecError>;
 
     /// The statement's plan without running it: one row, one cell holding
     /// the plan as JSON — either parsed (`Value::Array` / `Value::Object`) or
     /// as JSON text (`Value::String`).
     async fn explain(&self, query: ExplainQuery<'_>) -> Result<ExecResult, ExecError>;
+
+    /// Size, row estimate, dead tuples, last (auto)vacuum/analyze and
+    /// per-index size + scan count for each table the read role may
+    /// `SELECT`. Columns: `schema, table, total_bytes, table_bytes,
+    /// index_bytes, row_estimate, live_rows, dead_rows, seq_scans,
+    /// index_scans, last_vacuum, last_autovacuum, last_analyze,
+    /// last_autoanalyze, indexes` — `indexes` a JSON array of
+    /// `{name, bytes, scans}`.
+    async fn table_stats(&self, query: TableStatsQuery<'_>) -> Result<ExecResult, ExecError>;
+
+    /// The gateway's own non-idle backends on this database — read and
+    /// write role both. Columns: `pid, request_id, pool, state,
+    /// wait_event_type, wait_event, running_ms`; `request_id` is the gateway
+    /// request that backend is running (a UUID string, `null` for a backend
+    /// the gateway did not tag) and `pool` is `"read"` / `"write"`. No query
+    /// text: the caller's own statements are in its audit rows.
+    async fn db_activity(&self, query: ActivityQuery) -> Result<ExecResult, ExecError>;
+
+    /// Cancel whatever statement the gateway is running for `request_id` on
+    /// this database. `Ok(true)` when a backend was signalled, `Ok(false)`
+    /// when none was running. Authorization — that `request_id` is the
+    /// caller's own — is the tool's job; this only reaches backends of the
+    /// gateway's own roles. The victim's call fails with
+    /// [`ExecError::Cancelled`].
+    async fn cancel_request(&self, request_id: Uuid) -> Result<bool, ExecError>;
 
     /// Whether the adapter saw the target reject its credentials. The
     /// registry replaces a stale adapter on the next lookup, so the new one
@@ -273,5 +275,21 @@ mod tests {
     #[test]
     fn effective_timeout_never_zero() {
         assert_eq!(effective_timeout_ms(Some(0)), 1);
+    }
+
+    proptest::proptest! {
+        /// For any grant: never zero (Postgres' "no limit"), never above the
+        /// grant, never above the ceiling. The upper bound is floored at 1
+        /// because a zero grant still runs with the 1 ms floor.
+        #[test]
+        fn effective_timeout_stays_within_grant_and_ceiling(
+            grant in proptest::option::of(proptest::num::u32::ANY)
+        ) {
+            let effective = effective_timeout_ms(grant);
+            let bound = grant
+                .unwrap_or(u32::MAX)
+                .clamp(1, DEFAULT_STATEMENT_TIMEOUT_MS);
+            proptest::prop_assert!((1..=bound).contains(&effective));
+        }
     }
 }

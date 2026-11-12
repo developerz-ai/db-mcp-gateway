@@ -63,6 +63,37 @@ Boot-time validation (issue #16):
 | `description` | string | no | `""` | |
 | `pool` | [Pool](#pool) | no | server's `pool`, then built-in defaults | Per-field override of the server's `pool`. |
 | `auth_database` | string | no | `None` (falls back to `name`) | Mongo `authSource`. Set to `"admin"` when the role lives outside the target DB (container-bootstrapped users). Empty/whitespace is a boot error — omit to fall back. Ignored by pg. See [multi-db.md](../usage/multi-db.md). |
+| `write_role` | string | no | none | Postgres only. The role a `query_write` grant runs as; every read — under any grant — still connects as `role` in a read-only transaction. Same shape and stock-superuser checks as `role`, and must differ from it. Set together with `write_password` (one without the other aborts boot). Absent → the database is read-only through the gateway. See [Write tier](#write-tier). |
+| `write_password` | [secret ref](#secret-references) | with `write_role` | none | Password of `write_role`. Same forms and production-literal rule as `password`. |
+
+### Write tier
+
+A database with `write_role` gets a second pool, keyed by the same
+`(server, database)` and sized by the same `pool` settings, that connects as
+`write_role`. Only `run_query` under a `query_write` grant (including
+`dry_run`) and `explain` of an `INSERT`/`UPDATE`/`DELETE` use it; `explain`
+there runs in a read-only transaction, so the statement is planned, never
+executed. Everything else — reads, `describe_schema`, `sample_table`,
+`table_stats`, `explain` of a `SELECT` — runs as `role`. So a read-tier token
+cannot reach a write-capable role at all: the guarantee rests on the
+database's privileges, not on the SQL guard.
+
+Boot rules:
+
+- A `query_write` grant on a database without `write_role` aborts boot.
+  Wildcards expand against the configured databases, so
+  `{ server: "*", database: "*", action: query_write }` needs a `write_role`
+  on every database. A `query_write` grant added later through the admin API
+  on such a database fails each write with `forbidden`.
+- `write_role` on a non-postgres server aborts boot (Mongo stays read-only).
+- `write_role` equal to `role` aborts boot.
+
+Upgrading: a deployment that wired a write-capable role as `role` for a
+`query_write` grant now fails boot. Move that role to `write_role` +
+`write_password` and provision a read-only `role` (no compatibility shim).
+
+The gateway never creates or grants either role — see
+[quickstart §1](quickstart.md#1-provision-read-only-roles-on-each-target-db).
 
 > Spec also defines `sql_capture` on Database. It isn't enforced yet — it's
 > commented out in `config/example.yaml` because the parser rejects it.
@@ -133,6 +164,8 @@ Boot-time validation (issue #16):
 | `name` | string | **yes** | — | Stable service identity; becomes the audit identity `service:<name>`. Must match `^[a-z0-9][a-z0-9-]{0,62}$`, unique across the list. |
 | `group` | string | **yes** | — | The single permissions group the token acts as. Must be declared in `permissions:` (an empty `grants:` list recognizes a group that grants nothing) and must not equal `admin.group` when the admin surface is enabled — both abort boot. |
 | `token` | [secret ref](#secret-references) | **yes** | — | `${ENV:…}` or `${FILE:…}` (spec 14 — YAML carries the secret reference, never the bearer value). The loader accepts inline literal tokens (`Password::Literal`) for dev/test parity with `password:` and does not reject them at boot; credential-free committed config is guarded at CI by the `secret-scan` job — ADVISORY: it scans every tracked file (not just YAML) and fails the job on any literal `dbmcp_svc_<64hex>` (`tests/**` fixtures excluded), but does not block a merge until made a required check (#190 follow-up), not by the loader. Inline literals are therefore valid only in programmatic test fixtures constructed via `ConfigFile::from_yaml_str` / `ServiceTokenStore::from_config` directly. Resolved value must match `dbmcp_svc_` followed by exactly 64 lowercase hexadecimal characters (`0-9a-f`) — mint with `bin/mint-service-token <name>`. Short, overlong, non-hex, or mixed-case bodies abort boot with `ServiceTokenError::WeakToken`. Two accounts resolving to the same value abort boot (audit attribution would be ambiguous). |
+| `max_concurrent_requests` | u32 > 0 | no | `MAX_CONCURRENT_PER_IDENTITY` (16) | In-flight request cap for this token, replacing the per-identity cap so a fleet of agents behind one token is not throttled as one user. The global `MAX_CONCURRENT_REQUESTS` cap still applies. `0` aborts boot. |
+| `require_upstream` | bool | no | `false` | Reject calls that lack the `x-dbmcp-run-id` and `x-dbmcp-on-behalf-of` headers (`invalid_arguments`). The headers are **claimed** by the caller: stored on the audit row, never verified, never used for authorization. The audit identity stays `service:<name>`. |
 
 Minting the first production token is an operator action, not a deploy side effect: run `bin/mint-service-token <name>`, store the value in the secret store, deliver it as a SealedSecret env/file, PR the stanza, roll.
 
@@ -150,6 +183,8 @@ Minting the first production token is an operator action, not a deploy side effe
 ### Action hierarchy
 
 `query_write` ⊇ `query_read` ⊇ `schema_read`. `history_read` is its own track.
+A `query_write` grant needs a `write_role` on every database it matches —
+see [Write tier](#write-tier).
 
 ## Constraints
 

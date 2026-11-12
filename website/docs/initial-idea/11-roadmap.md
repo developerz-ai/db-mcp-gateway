@@ -48,7 +48,7 @@ Phased plan from skeleton to a deployable gateway. Each phase is mergeable indep
 
 ## Phase 5 — Beyond Postgres (partial — see note)
 
-- MongoDB adapter ✅ done (v0.2.0) — `DbAdapter` trait implemented; schema describe, run_query, explain wired.
+- MongoDB adapter ✅ done (v0.2.0) — `DbAdapter` trait implemented; run_query wired; describe_schema (collections + indexes) and sample_table added in plan 101. Mongo stays read-only.
 - MySQL adapter — **deferred post-1.0**. Config parses and validates, but dispatch returns `UnsupportedAdapter` at boot. See [note below](#mysql--mssql--deferred).
 - MSSQL adapter — **deferred post-1.0**. Same status as MySQL.
 - BigQuery adapter — not started.
@@ -63,7 +63,7 @@ Config schema accepts `kind: mysql` and `kind: mssql`, but as of v1.0.0 the disp
 ## Phase 6 — Reason capture + policy hooks ✅ done (v0.2.0)
 
 - `require_reason` enforcement end-to-end (tool returns `reason_required` error; agent prompts user; retries with reason).
-- Per-grant constraints fully wired (`row_limit`, `statement_timeout_ms`, `allowed_schemas`, `denied_tables`, `time_window`).
+- Per-grant constraints: `row_limit`, `statement_timeout_ms` and `require_reason` are wired; `time_window` (business hours only) is still to come. `allowed_schemas` / `denied_tables` are dropped — table scoping is the target-DB role's job ([06](06-permissions.md)).
 - Dynamic permissions admin API — SSO-gated `/admin/*` endpoints for grant CRUD; all mutations audited synchronously to `permissions_audit`. See [12-dynamic-permissions](12-dynamic-permissions.md).
 
 ## Phase 7 — HA + multi-replica
@@ -82,10 +82,17 @@ Config schema accepts `kind: mysql` and `kind: mssql`, but as of v1.0.0 the disp
 
 ## Phase 9 — Write mode
 
-- `query_write` action with explicit per-grant opt-in.
-- Mandatory reason capture.
-- Distinct audit log surfacing for writes.
-- Optional pre-write review step (queued + approved by another user) — *maybe*; revisit when a customer actually asks.
+- `query_write` action with explicit per-grant opt-in ✅ — runs as a separate `write_role` per database; reads of the same caller stay on the read role.
+- `rows_affected` in the response and `audit_calls.rows_affected` ✅; `dry_run` (execute, report, roll back; audited `dry_run`) ✅; `explain` of DML under `query_write` ✅; `tool_calls{access="write"}` ✅.
+- Mandatory reason capture — available per grant (`require_reason`), not forced for writes.
+- Optional pre-write review step — **not planned**: an in-band approval UI conflicts with MUST #5 ([10](10-non-goals.md)).
+
+## Phase 10 — Agent power (plan 101, slice 12) ✅
+
+- Upstream attribution for service tokens: `x-dbmcp-run-id` / `x-dbmcp-on-behalf-of` → `audit_calls.upstream_run_id` / `upstream_actor` (claimed, unverified); `require_upstream` per account ([14](14-service-tokens.md)).
+- Per-account `max_concurrent_requests`; `get_query_history` filtered by run id for service identities.
+- `explain` with `analyze: true` for reads; introspection tools `table_stats`, `db_activity`, `cancel_query` ([03](03-mcp-tools.md)).
+- Mongo `describe_schema` (collections + indexes) and `sample_table` (`find` + limit).
 
 ## Later, maybe never
 

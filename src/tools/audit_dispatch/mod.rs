@@ -19,7 +19,9 @@ pub use outcome::{ToolErrorMessages, outcome_from_exec_error, success_outcome, t
 // sanitized `outcome_from_exec_error` boundary instead.
 use outcome::tool_error;
 pub(in crate::tools) use outcome::{error_outcome, invalid_arguments};
-pub use types::{AuditHeader, AuditStore, Outcome, Reply, RequestContext};
+pub use types::{
+    AuditHeader, AuditStore, Outcome, Reply, RequestContext, Upstream, UpstreamClaim, WriteEffect,
+};
 
 use std::future::Future;
 use std::sync::Arc;
@@ -160,8 +162,8 @@ where
             identity,
             request_ctx,
             &header,
+            &outcome,
             OutcomeCode::AuditUnavailable,
-            duration_ms,
         );
         return tool_error(
             id,
@@ -171,7 +173,7 @@ where
         );
     }
 
-    record_dispatch(identity, request_ctx, &header, outcome.code, duration_ms);
+    record_dispatch(identity, request_ctx, &header, &outcome, outcome.code);
     // Streamed only now — a row that isn't the system of record yet must
     // not be streamed as if it were.
     store.sinks.send(&row, store.tasks);
@@ -188,15 +190,27 @@ where
 }
 
 /// The per-call counter and the single "tool dispatched" line (issue #14
-/// field contract), both carrying the outcome the client saw.
+/// field contract), both carrying `code` — the outcome the client saw.
+/// `upstream_*` are the caller's unverified claims, logged for correlation.
 fn record_dispatch(
     identity: &Identity,
     request_ctx: &RequestContext,
     header: &AuditHeader<'_>,
+    outcome: &Outcome,
     code: OutcomeCode,
-    duration_ms: i64,
 ) {
-    counter!(TOOL_CALLS, "tool" => header.tool, "outcome" => code.as_str()).increment(1);
+    let access = if outcome.write.is_some() {
+        "write"
+    } else {
+        "read"
+    };
+    counter!(
+        TOOL_CALLS,
+        "tool" => header.tool,
+        "outcome" => code.as_str(),
+        "access" => access,
+    )
+    .increment(1);
     tracing::info!(
         request_id = %request_ctx.request_id,
         user_sub = %identity.user_sub,
@@ -204,7 +218,10 @@ fn record_dispatch(
         server = header.server.unwrap_or(""),
         db = header.database.unwrap_or(""),
         outcome = code.as_str(),
-        duration_ms,
+        access,
+        duration_ms = outcome.elapsed_ms.unwrap_or(0),
+        upstream_run_id = request_ctx.upstream.run_id(),
+        upstream_actor = request_ctx.upstream.actor(),
         "tool dispatched"
     );
 }
@@ -219,6 +236,10 @@ fn pending_row(
     request_ctx: &RequestContext,
     header: &AuditHeader<'_>,
 ) -> AuditRow {
+    let (sql, sql_truncated) = match header.sql.map(audit::cap_stored_sql) {
+        Some((sql, truncated)) => (Some(sql), truncated),
+        None => (None, false),
+    };
     AuditRow {
         id: Uuid::new_v4(),
         request_id: request_ctx.request_id.to_string(),
@@ -228,7 +249,7 @@ fn pending_row(
         tool: header.tool.to_string(),
         server: header.server.map(str::to_string),
         database: header.database.map(str::to_string),
-        sql: header.sql.map(str::to_string),
+        sql,
         reason: header.reason.map(str::to_string),
         outcome: OutcomeCode::Cancelled,
         elapsed_ms: None,
@@ -238,5 +259,9 @@ fn pending_row(
         agent_client: request_ctx.agent_client.clone(),
         ip: request_ctx.ip.map(|i| i.to_string()),
         db_type: header.db_type.map(str::to_string),
+        upstream_actor: request_ctx.upstream.actor().map(str::to_string),
+        upstream_run_id: request_ctx.upstream.run_id().map(str::to_string),
+        rows_affected: None,
+        sql_truncated,
     }
 }

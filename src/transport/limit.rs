@@ -4,7 +4,8 @@
 //!   process-wide cap that sheds with `503 service_overloaded` and, after
 //!   authentication, a per-identity cap that returns `429 rate_limited` so one
 //!   noisy caller can't starve the rest (CLAUDE.md: "One noisy user must not
-//!   starve others.").
+//!   starve others."). A service account may set its own cap
+//!   (`service_accounts[].max_concurrent_requests`, plan 101 slice 12).
 //! - The unauthenticated OAuth routes get their own, smaller budget. They carry
 //!   no session identity, so sharing the gated budget would let anonymous
 //!   traffic (stalled bodies, an `/authorize` flood) take `/mcp` down.
@@ -26,7 +27,7 @@ use serde_json::json;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use super::request_id::GatewayRequestId;
-use crate::auth::Identity;
+use crate::auth::{Identity, ServicePolicy};
 
 /// Soft ceiling on tracked identities. `user_sub` values come from the SSO IdP,
 /// so real cardinality is the org's user count — but the map is still bounded so
@@ -58,12 +59,32 @@ impl ShedScope {
     }
 }
 
+/// One identity's permit pool and the cap it was sized for.
+#[derive(Debug)]
+struct IdentityPool {
+    permits: Arc<Semaphore>,
+    cap: usize,
+}
+
+impl IdentityPool {
+    fn new(cap: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(cap)),
+            cap,
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.permits.available_permits() >= self.cap
+    }
+}
+
 /// Holds the global and per-identity permit pools for one budget.
 #[derive(Debug)]
 pub struct ConcurrencyLimiter {
     global: Arc<Semaphore>,
     global_scope: ShedScope,
-    per_identity: Mutex<HashMap<String, Arc<Semaphore>>>,
+    per_identity: Mutex<HashMap<String, IdentityPool>>,
     per_identity_limit: usize,
     max_tracked: usize,
 }
@@ -101,25 +122,36 @@ impl ConcurrencyLimiter {
     }
 
     /// A permit from `user_sub`'s pool, or `None` when that one identity is at
-    /// its cap. Pools are created lazily and reclaimed once idle.
+    /// its cap — `account_cap` (a service account's own) or the per-identity
+    /// default. Pools are created lazily and reclaimed once idle.
     ///
     /// The permit is taken while the map lock is held: released first, a
     /// concurrent sweep could drop this identity's (still idle) semaphore and
     /// a later request would mint a second one — two pools, double the cap.
-    async fn try_identity(&self, user_sub: &str) -> Option<OwnedSemaphorePermit> {
+    async fn try_identity(
+        &self,
+        user_sub: &str,
+        account_cap: Option<usize>,
+    ) -> Option<OwnedSemaphorePermit> {
+        let cap = account_cap.unwrap_or(self.per_identity_limit);
         // tokio::sync::Mutex on the request path; no `.await` inside the
         // critical section, so it stays a map lookup plus a try-acquire.
         let mut map = self.per_identity.lock().await;
         if !map.contains_key(user_sub) && map.len() >= self.max_tracked {
             // Drop identities with nothing in flight before admitting a new
             // one, so the map tracks active callers rather than all-time.
-            map.retain(|_, sem| sem.available_permits() < self.per_identity_limit);
+            map.retain(|_, pool| !pool.is_idle());
         }
-        map.entry(user_sub.to_owned())
-            .or_insert_with(|| Arc::new(Semaphore::new(self.per_identity_limit)))
-            .clone()
-            .try_acquire_owned()
-            .ok()
+        let pool = map
+            .entry(user_sub.to_owned())
+            .or_insert_with(|| IdentityPool::new(cap));
+        if pool.cap != cap {
+            // The account's cap changed on a reload. Permits already out on
+            // the old pool finish there; new requests count against the new
+            // cap from now on.
+            *pool = IdentityPool::new(cap);
+        }
+        pool.permits.clone().try_acquire_owned().ok()
     }
 }
 
@@ -139,8 +171,12 @@ pub async fn enforce(
     };
 
     // `_per_identity` is held for the same lifetime as `_global`.
+    let account_cap = req
+        .extensions()
+        .get::<ServicePolicy>()
+        .and_then(|policy| policy.max_concurrent_requests);
     let _per_identity = match req.extensions().get::<Identity>() {
-        Some(identity) => match limiter.try_identity(&identity.user_sub).await {
+        Some(identity) => match limiter.try_identity(&identity.user_sub, account_cap).await {
             Some(permit) => Some(permit),
             None => return limited(&req, ShedScope::Identity),
         },

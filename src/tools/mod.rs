@@ -1,4 +1,4 @@
-//! MCP tool implementations.
+//! MCP tool implementations (spec 03).
 //!
 //! Each tool is a handler with shape `run(ctx, id, args) -> jsonrpc::Response`.
 //! The transport routes `tools/call` to `dispatch_call`, which fans out by
@@ -9,7 +9,9 @@
 //! serialize a `crate::config::Server` to the wire.
 
 pub mod audit_dispatch;
+pub mod cancel_query;
 mod context;
+pub mod db_activity;
 pub mod describe_schema;
 pub mod explain;
 pub mod get_query_history;
@@ -17,6 +19,8 @@ pub mod list_databases;
 pub mod list_servers;
 pub mod run_query;
 pub mod sample_table;
+pub mod table_stats;
+mod tabular;
 mod target;
 
 use serde::Deserialize;
@@ -69,11 +73,13 @@ pub(crate) fn db_type_for_server(config: &ConfigFile, server_name: &str) -> Opti
 /// connection* from being pinned by an oversized ask.
 pub(crate) const GATEWAY_ROW_LIMIT_CEILING: u32 = 100_000;
 
-pub use audit_dispatch::RequestContext;
+pub use audit_dispatch::{RequestContext, Upstream, UpstreamClaim};
 pub use context::ToolCtx;
 
 // Re-export canonical names so dispatch and the advertised capability can
 // never drift apart.
+pub use crate::mcp::protocol::CANCEL_QUERY_TOOL as CANCEL_QUERY;
+pub use crate::mcp::protocol::DB_ACTIVITY_TOOL as DB_ACTIVITY;
 pub use crate::mcp::protocol::DESCRIBE_SCHEMA_TOOL as DESCRIBE_SCHEMA;
 pub use crate::mcp::protocol::EXPLAIN_TOOL as EXPLAIN;
 pub use crate::mcp::protocol::GET_QUERY_HISTORY_TOOL as GET_QUERY_HISTORY;
@@ -81,6 +87,7 @@ pub use crate::mcp::protocol::LIST_DATABASES_TOOL as LIST_DATABASES;
 pub use crate::mcp::protocol::LIST_SERVERS_TOOL as LIST_SERVERS;
 pub use crate::mcp::protocol::RUN_QUERY_TOOL as RUN_QUERY;
 pub use crate::mcp::protocol::SAMPLE_TABLE_TOOL as SAMPLE_TABLE;
+pub use crate::mcp::protocol::TABLE_STATS_TOOL as TABLE_STATS;
 
 /// Audit-row and metric `tool` for a call that named no known tool. The
 /// caller's string is caller-controlled and unbounded, so it rides in
@@ -118,6 +125,13 @@ pub async fn dispatch_call(id: Value, ctx: ToolCtx<'_>, params: Option<Value>) -
         }
     };
 
+    // A malformed upstream claim, or a missing one the account requires, is
+    // refused before any tool runs — and audited like any bad argument.
+    if let Upstream::Rejected(message) = ctx.request.upstream {
+        return audit_dispatch::reject_arguments(ctx, id, audited_tool_name(&call.name), message)
+            .await;
+    }
+
     // Per-DB tools (`run_query`) carry `server`/`database` in their arguments;
     // surface them on the span so every dispatch trace ties to a target.
     // Other tools (`list_servers`) leave both empty by design.
@@ -140,6 +154,8 @@ pub async fn dispatch_call(id: Value, ctx: ToolCtx<'_>, params: Option<Value>) -
         tool = %call.name,
         server = span_server,
         db = span_database,
+        upstream_run_id = ctx.request.upstream.run_id(),
+        upstream_actor = ctx.request.upstream.actor(),
     );
 
     let args = call.arguments;
@@ -161,6 +177,9 @@ pub async fn dispatch_call(id: Value, ctx: ToolCtx<'_>, params: Option<Value>) -
             EXPLAIN => explain::run(ctx, id, args).await,
             RUN_QUERY => run_query::run(ctx, id, args).await,
             GET_QUERY_HISTORY => get_query_history::run(ctx, id, args).await,
+            TABLE_STATS => table_stats::run(ctx, id, args).await,
+            DB_ACTIVITY => db_activity::run(ctx, id, args).await,
+            CANCEL_QUERY => cancel_query::run(ctx, id, args).await,
             other => {
                 let name = prefix_at_char_boundary(other, UNKNOWN_TOOL_NAME_MAX_BYTES);
                 let message = format!("unknown tool: {name}");
@@ -171,6 +190,31 @@ pub async fn dispatch_call(id: Value, ctx: ToolCtx<'_>, params: Option<Value>) -
     .instrument(span)
     .await
 }
+
+/// The `&'static` audit/metric name for `name`: the tool's own when it is
+/// one, [`UNKNOWN_TOOL`] otherwise (a caller-controlled string never becomes
+/// a metric label).
+fn audited_tool_name(name: &str) -> &'static str {
+    ALL_TOOLS
+        .iter()
+        .find(|tool| **tool == name)
+        .copied()
+        .unwrap_or(UNKNOWN_TOOL)
+}
+
+/// Every tool `dispatch_call` routes.
+const ALL_TOOLS: [&str; 10] = [
+    LIST_SERVERS,
+    LIST_DATABASES,
+    DESCRIBE_SCHEMA,
+    SAMPLE_TABLE,
+    EXPLAIN,
+    RUN_QUERY,
+    GET_QUERY_HISTORY,
+    TABLE_STATS,
+    DB_ACTIVITY,
+    CANCEL_QUERY,
+];
 
 /// Pull `server`/`database` out of `tools/call` arguments for the dispatch
 /// span. Tools that don't address a specific target (`list_servers`) get

@@ -19,7 +19,7 @@ use db_mcp_gateway::audit::{self, CallIntent};
 use db_mcp_gateway::auth::{Identity, SessionId};
 use db_mcp_gateway::exec::Access;
 use db_mcp_gateway::tools::audit_dispatch::{
-    AuditHeader, Outcome, RequestContext, audit_dispatch, success_outcome,
+    AuditHeader, Outcome, RequestContext, Upstream, audit_dispatch, success_outcome,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -58,6 +58,8 @@ fn intent<'a>(request_id: Uuid, user_sub: &'a str, access: Access) -> CallIntent
         database: "app",
         db_type: Some("postgres"),
         access,
+        upstream_actor: None,
+        upstream_run_id: None,
     }
 }
 
@@ -92,6 +94,7 @@ async fn intent_without_completion_is_reaped_as_abandoned() {
         request_id: completed,
         ip: None,
         agent_client: None,
+        upstream: Upstream::default(),
     };
     let sinks = DispatchSinks::new(&[]);
     let outcome = success_outcome(json!(1), "{}".into(), Some(1), Some(1), Some(false));
@@ -157,6 +160,7 @@ async fn drain_completes_the_cancelled_row_of_an_aborted_dispatch() {
                 ip: None,
                 agent_client: None,
                 request_id: Uuid::new_v4(),
+                upstream: Upstream::default(),
             };
             audit_dispatch(
                 Value::from(1),
@@ -205,6 +209,7 @@ async fn failed_completion_write_records_the_code_the_client_saw() {
         request_id: Uuid::new_v4(),
         ip: None,
         agent_client: None,
+        upstream: Upstream::default(),
     };
     let outcome = success_outcome(json!(9), "{}".into(), Some(3), Some(1), Some(false));
 

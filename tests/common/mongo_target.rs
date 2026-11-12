@@ -38,6 +38,8 @@ pub fn database() -> Database {
         description: String::new(),
         auth_database: Some("admin".to_string()),
         pool: None,
+        write_role: None,
+        write_password: None,
     }
 }
 

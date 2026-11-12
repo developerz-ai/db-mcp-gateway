@@ -4,6 +4,8 @@
 //! Wire protocol only: nothing here dispatches a DB tool, so there are no
 //! audit rows to assert (tool audit coverage lives in the tool e2e suites).
 
+// audit-guard: exempt — every `tools/call` here is a notification or a bad id, refused before dispatch on an identity-less router
+
 mod common;
 
 use std::time::Duration;

@@ -14,8 +14,6 @@
 //! Audit-row assertions are intentionally skipped — this test runs the TLS
 //! layer in isolation (no auth, no tool dispatch, no audit integration).
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -24,6 +22,10 @@ use rcgen::{CertificateParams, KeyPair};
 use reqwest::Certificate;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+
+/// Bound on waiting for the server to come up and for SIGHUP to be drained.
+const READY_WITHIN: Duration = Duration::from_secs(5);
+const HAMMER_REQUESTS: usize = 10;
 
 /// Generate a self-signed cert+key for one SAN. Returns (cert_pem, key_pem)
 /// — both PEM-encoded.
@@ -83,13 +85,15 @@ async fn sighup_reloads_tls_cert_without_dropping_listener() {
             .expect("serve");
     });
 
-    // Spawn the same SIGHUP loop main.rs uses.
+    // Spawn the same SIGHUP loop main.rs uses. The handler is installed
+    // here, not inside the task: a SIGHUP raised before an unscheduled task
+    // registered it would hit the default action and kill the test binary.
     let reload_cert = cert_path.clone();
     let reload_key = key_path.clone();
     let rustls_for_reload = rustls.clone();
+    let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .expect("install SIGHUP");
     tokio::spawn(async move {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut hup = signal(SignalKind::hangup()).expect("install SIGHUP");
         while hup.recv().await.is_some() {
             // Same call shape as startup::spawn_reload_on_sighup; failures get
             // swallowed here because the test wants the loop to keep running.
@@ -102,14 +106,12 @@ async fn sighup_reloads_tls_cert_without_dropping_listener() {
         }
     });
 
-    // Give the server a moment to come up.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // ── Assertion 1: cert-A is served, cert-B doesn't validate.
+    // ── Assertion 1: cert-A is served (once the server is up), cert-B
+    //    doesn't validate.
     let a_root = Certificate::from_pem(a_cert.as_bytes()).expect("a root");
     let b_root = Certificate::from_pem(b_cert.as_bytes()).expect("b root");
     assert!(
-        request(std::slice::from_ref(&a_root), "a.localhost", addr.port()).await,
+        eventually_serves(&a_root, "a.localhost", addr.port()).await,
         "cert-A should serve a.localhost before swap"
     );
     assert!(
@@ -117,38 +119,22 @@ async fn sighup_reloads_tls_cert_without_dropping_listener() {
         "cert-B-trusted client must NOT validate the cert-A server"
     );
 
-    // ── Hammer loop in the background: zero requests may fail across the swap.
-    let keep_hitting = Arc::new(AtomicBool::new(true));
-    let stop = keep_hitting.clone();
-    let a_root_for_hammer = a_root.clone();
-    let port = addr.port();
-    let hammer_failures = Arc::new(AtomicBool::new(false));
-    let hammer_flag = hammer_failures.clone();
-    let hammer = tokio::spawn(async move {
-        while stop.load(Ordering::SeqCst) {
-            if !request(
-                std::slice::from_ref(&a_root_for_hammer),
-                "a.localhost",
-                port,
-            )
-            .await
-            {
-                // First miss before the swap — the listener didn't drop.
-                // After the swap cert-A naturally stops matching; the hammer
-                // is only run BEFORE we trigger SIGHUP.
-                hammer_flag.store(true, Ordering::SeqCst);
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    });
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    keep_hitting.store(false, Ordering::SeqCst);
-    hammer.await.expect("hammer join");
-    assert!(
-        !hammer_failures.load(Ordering::SeqCst),
-        "in-flight requests on cert-A failed before the swap"
-    );
+    // ── Hammer: a burst of concurrent cert-A requests must all succeed.
+    //    After the swap cert-A naturally stops matching, so the burst runs
+    //    BEFORE we trigger SIGHUP.
+    let burst: Vec<_> = (0..HAMMER_REQUESTS)
+        .map(|_| {
+            let root = a_root.clone();
+            let port = addr.port();
+            tokio::spawn(async move { request(&[root], "a.localhost", port).await })
+        })
+        .collect();
+    for request in burst {
+        assert!(
+            request.await.expect("hammer join"),
+            "in-flight requests on cert-A failed before the swap"
+        );
+    }
 
     // ── Swap the cert + key files, fire SIGHUP at ourselves.
     atomic_write(&cert_path, &b_cert);
@@ -160,15 +146,11 @@ async fn sighup_reloads_tls_cert_without_dropping_listener() {
         assert_eq!(libc::raise(libc::SIGHUP), 0, "raise SIGHUP");
     }
 
-    // Wait for the reload signal to be drained. 250ms is enough on every
-    // CI runner we use (Blacksmith 2vcpu); bumped to 1s if the test ever
-    // flakes here, never the other way.
-    tokio::time::sleep(Duration::from_millis(250)).await;
-
-    // ── Assertion 2: cert-B is now served. The previously-failing client
-    //    succeeds, and the previously-succeeding client now fails.
+    // ── Assertion 2: cert-B is now served (once the reload drained). The
+    //    previously-failing client succeeds, and the previously-succeeding
+    //    client now fails.
     assert!(
-        request(std::slice::from_ref(&b_root), "b.localhost", addr.port()).await,
+        eventually_serves(&b_root, "b.localhost", addr.port()).await,
         "cert-B must serve b.localhost AFTER swap"
     );
     assert!(
@@ -178,6 +160,20 @@ async fn sighup_reloads_tls_cert_without_dropping_listener() {
 
     handle.graceful_shutdown(Some(Duration::from_secs(1)));
     let _ = server.await;
+}
+
+/// Poll [`request`] until it succeeds or [`READY_WITHIN`] passes.
+async fn eventually_serves(root: &Certificate, host: &str, port: u16) -> bool {
+    let deadline = tokio::time::Instant::now() + READY_WITHIN;
+    loop {
+        if request(std::slice::from_ref(root), host, port).await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 /// One-shot HTTPS GET to `https://{host}:{port}/healthz`, trusting only the

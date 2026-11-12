@@ -19,7 +19,9 @@
 //! fast commit — could hit the *next* query that pooled backend runs. Each
 //! transaction therefore sets `application_name` to a fresh [`BackendTag`]
 //! (`SET LOCAL`, so it reverts at commit), and the cancel only fires while
-//! that backend still carries the tag.
+//! that backend still carries the tag. The tag also names the gateway
+//! request the transaction runs for, which is what `db_activity` reports and
+//! `cancel_request` matches on.
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -31,15 +33,32 @@ use crate::audit::drain::DetachedTasks;
 const CANCEL_SQL: &str = "SELECT pg_cancel_backend(pid) FROM pg_stat_activity \
                           WHERE pid = $1 AND application_name = $2";
 
-/// Per-transaction `application_name`. Built only from a UUID, so it is safe
-/// to interpolate into `SET LOCAL` (no quote can appear in it) and fits in
-/// Postgres' 63-byte `application_name`.
+/// Per-transaction `application_name`: `dbmcp-<request id>-<nonce>`, the
+/// request id and nonce in lowercase hex. Built only from UUIDs, so it is
+/// safe to interpolate into `SET LOCAL` (no quote can appear in it) and fits
+/// in Postgres' 63-byte `application_name` (47 bytes). The nonce keeps two
+/// transactions of one request apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct BackendTag(String);
 
 impl BackendTag {
-    pub(super) fn new() -> Self {
-        Self(format!("dbmcp-{}", Uuid::new_v4().simple()))
+    /// Captures the request id of a tag in `pg_stat_activity` (a POSIX regex,
+    /// no quote in it).
+    pub(super) const REQUEST_ID_PATTERN: &'static str = "^dbmcp-([0-9a-f]{32})-[0-9a-f]{8}$";
+
+    pub(super) fn for_request(request_id: Uuid) -> Self {
+        let nonce = Uuid::new_v4().simple().to_string();
+        Self(format!(
+            "{}{}",
+            Self::request_prefix(request_id),
+            &nonce[..8]
+        ))
+    }
+
+    /// Every tag of `request_id` starts with this; it contains no `LIKE`
+    /// wildcard.
+    pub(super) fn request_prefix(request_id: Uuid) -> String {
+        format!("dbmcp-{}-", request_id.simple())
     }
 
     pub(super) fn as_str(&self) -> &str {
@@ -114,8 +133,13 @@ mod tests {
 
     #[test]
     fn tag_is_unique_quote_free_and_fits_application_name() {
-        let (a, b) = (BackendTag::new(), BackendTag::new());
+        let request = Uuid::new_v4();
+        let (a, b) = (
+            BackendTag::for_request(request),
+            BackendTag::for_request(request),
+        );
         assert_ne!(a, b);
+        assert!(a.as_str().starts_with(&BackendTag::request_prefix(request)));
         assert!(a.as_str().len() <= 63, "{}", a.as_str());
         assert!(
             a.as_str()
@@ -124,5 +148,15 @@ mod tests {
             "{}",
             a.as_str()
         );
+    }
+
+    #[test]
+    fn request_id_pattern_matches_the_tag_shape() {
+        let request = Uuid::new_v4();
+        let tag = BackendTag::for_request(request);
+        let hex = request.simple().to_string();
+        assert_eq!(tag.as_str().len(), "dbmcp-".len() + 32 + 1 + 8);
+        assert_eq!(&tag.as_str()["dbmcp-".len().."dbmcp-".len() + 32], hex);
+        assert!(!BackendTag::REQUEST_ID_PATTERN.contains('\''));
     }
 }

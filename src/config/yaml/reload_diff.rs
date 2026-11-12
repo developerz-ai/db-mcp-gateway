@@ -60,13 +60,16 @@ impl ConfigFile {
     }
 }
 
-/// Everything a pool is opened from. `None` for a literal password.
+/// Everything a pool is opened from, write pool included. `None` for a
+/// literal password.
 fn fingerprint(server: &Server, db: &Database) -> Option<String> {
-    if matches!(db.password, Password::Literal(_)) {
+    if matches!(db.password, Password::Literal(_))
+        || matches!(db.write_password, Some(Password::Literal(_)))
+    {
         return None;
     }
     Some(format!(
-        "{}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:?}|{:?}",
+        "{}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}",
         server.host,
         server.port,
         server.tls,
@@ -76,5 +79,7 @@ fn fingerprint(server: &Server, db: &Database) -> Option<String> {
         db.auth_database,
         db.pool,
         db.password,
+        db.write_role,
+        db.write_password,
     ))
 }

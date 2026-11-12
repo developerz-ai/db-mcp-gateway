@@ -5,6 +5,8 @@
 
 mod common;
 
+use common::audit::assert_audit_outcome;
+use common::cleanup::delete_audit_calls;
 use common::env::state_pool;
 use common::gateway::{GatewayBuilder, no_redirect_client};
 use common::idp::{MockTokenFlags, MockUser, spawn_mock_idp, spawn_mock_idp_with_flags};
@@ -59,7 +61,7 @@ async fn login_via_mock_idp_then_call_tool() {
 
     let gateway_url = GatewayBuilder::new(E2E_CONFIG_YAML)
         .idp(&idp)
-        .spawn(pool)
+        .spawn(pool.clone())
         .await
         .url;
     let client = no_redirect_client();
@@ -144,6 +146,7 @@ async fn login_via_mock_idp_then_call_tool() {
             "leak: `{forbidden}` appeared in tool response: {full_response}"
         );
     }
+    assert_audit_outcome(&pool, &user.sub, "list_servers", "success", "list_servers").await;
 
     // 5. Without a bearer, the same call → 401 with the full unauth contract:
     //    structured error.category/code and a login_url for the agent.
@@ -190,6 +193,19 @@ async fn login_via_mock_idp_then_call_tool() {
     assert_eq!(after_body["error"]["category"], "unauthenticated");
     assert_eq!(after_body["error"]["code"], "revoked_session");
     assert_eq!(after_body["login_url"], "/auth/login");
+    // The two 401s never reached dispatch: still exactly the one audited call.
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_calls WHERE user_sub = $1 AND tool = 'list_servers'",
+    )
+    .bind(&user.sub)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows, 1,
+        "unauthenticated calls must not be attributed to the user"
+    );
+    delete_audit_calls(&pool, &user.sub).await;
 }
 
 // ---------------------------------------------------------------------------

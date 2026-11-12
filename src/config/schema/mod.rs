@@ -9,108 +9,13 @@
 //! sections and a richer validator. For #3 we only model what `list_servers`
 //! needs plus the authz inputs.
 
-use std::path::PathBuf;
-
 use serde::Deserialize;
 
-use super::pool::PoolConfig;
 use super::secret::Password;
 
-/// `deny_unknown_fields` turns a misspelled key (e.g. `databasses:` instead
-/// of `databases:`) into a boot-time error pointing at the line, instead of
-/// silently dropping the value — see issue #16. `ConfigFile` and every other
-/// section deny unknown keys too.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Server {
-    pub name: String,
-    pub kind: ServerKind,
-    /// Human-readable purpose. Surfaced to agents via `list_servers`.
-    #[serde(default)]
-    pub description: String,
-    pub host: String,
-    #[serde(default = "default_port")]
-    pub port: u16,
-    #[serde(default)]
-    pub tls: Tls,
-    /// CA bundle (PEM) for `tls: verify_full`; absent → system roots. Rejected
-    /// at boot unless `tls: verify_full`, and must be readable.
-    #[serde(default)]
-    pub tls_ca_file: Option<PathBuf>,
-    /// Pool sizing for every database on this server; a database's own
-    /// `pool:` wins per field.
-    #[serde(default)]
-    pub pool: Option<PoolConfig>,
-    #[serde(default)]
-    pub databases: Vec<Database>,
-}
+mod target;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ServerKind {
-    Postgres,
-    Mysql,
-    Mssql,
-    /// Document-store target — wired in #57. Permissions/storage backends
-    /// are still pg-or-mysql only (spec 12 §"Storage backends" excludes
-    /// mongo); `Mongo` here is exclusively a *query target* kind, dispatched
-    /// to `MongoAdapter` by [`crate::exec::AdapterRegistry`].
-    Mongo,
-}
-
-impl ServerKind {
-    /// Whether a query adapter is wired for this kind today. Mirrors the
-    /// dispatch in [`crate::exec::AdapterRegistry::get_or_open`]: config
-    /// validation rejects servers whose kind returns `false` at boot, so the
-    /// registry's `UnsupportedAdapter` arm is a defense-in-depth backstop a
-    /// validated config never reaches. Keep the two in sync — `mysql`/`mssql`
-    /// flip to `true` only when their adapters land (roadmap §"More adapters").
-    ///
-    /// Exhaustive on purpose: a new variant must declare its dispatchability
-    /// here rather than silently inheriting "supported".
-    pub fn has_adapter(self) -> bool {
-        match self {
-            ServerKind::Postgres | ServerKind::Mongo => true,
-            ServerKind::Mysql | ServerKind::Mssql => false,
-        }
-    }
-}
-
-/// Copy on purpose: callers match it by value. The CA path for
-/// `VerifyFull` lives beside it as `Server::tls_ca_file`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum Tls {
-    /// Encrypt. Postgres does not verify the server certificate
-    /// (`sslmode=require`) and boot warns per server; Mongo verifies.
-    #[default]
-    Required,
-    /// Encrypt and verify chain + hostname (Postgres `sslmode=verify-full`).
-    VerifyFull,
-    /// Plaintext. Boot logs a warning per server.
-    Insecure,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Database {
-    pub name: String,
-    pub role: String,
-    pub password: Password,
-    #[serde(default)]
-    pub description: String,
-    /// Optional authentication database for backends where the role lives
-    /// somewhere other than the target database (mongo's `authSource`).
-    /// `None` falls back to `name` — the least-privilege per-db user
-    /// pattern. Operators set this to `"admin"` when bootstrapping with
-    /// the container's root user. Ignored by pg (which authenticates
-    /// against the connected database).
-    #[serde(default)]
-    pub auth_database: Option<String>,
-    /// Pool sizing for this database; overrides the server's `pool:` per field.
-    #[serde(default)]
-    pub pool: Option<PoolConfig>,
-}
+pub use target::{Database, Server, ServerKind, Tls};
 
 /// A headless (non-interactive) caller: a named service identity carrying a
 /// static bearer token, one permissions group, and nothing else. Design:
@@ -136,6 +41,17 @@ pub struct ServiceAccount {
     /// `${ENV:…}` / `${FILE:…}` reference (inline literal tolerated for
     /// dev/test, same rule as `Database.password`).
     pub token: Password,
+    /// In-flight request cap for this identity, replacing the gateway-wide
+    /// per-identity cap (`MAX_CONCURRENT_PER_IDENTITY`, default 16) so a fleet
+    /// of agents behind one token is not throttled as one user. The global
+    /// cap still applies. Absent → the per-identity default.
+    #[serde(default)]
+    pub max_concurrent_requests: Option<u32>,
+    /// Reject calls that do not carry the upstream attribution headers
+    /// (`x-dbmcp-run-id`, `x-dbmcp-on-behalf-of`). The headers are claimed by
+    /// the caller, never verified, and never used for authz.
+    #[serde(default)]
+    pub require_upstream: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -234,10 +150,6 @@ pub enum StreamSinkConfig {
     Syslog { host: String, port: u16 },
 }
 
-fn default_port() -> u16 {
-    5432
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,34 +165,5 @@ mod tests {
         assert!(Action::HistoryRead.includes(Action::HistoryRead));
         assert!(!Action::QueryWrite.includes(Action::HistoryRead));
         assert!(!Action::HistoryRead.includes(Action::SchemaRead));
-    }
-
-    /// The dispatchable set must match `exec::AdapterRegistry::get_or_open`.
-    /// Pin it here so flipping a kind's support is a deliberate, reviewed edit.
-    #[test]
-    fn has_adapter_matches_wired_dispatch() {
-        assert!(ServerKind::Postgres.has_adapter());
-        assert!(ServerKind::Mongo.has_adapter());
-        assert!(!ServerKind::Mysql.has_adapter());
-        assert!(!ServerKind::Mssql.has_adapter());
-    }
-
-    #[test]
-    fn server_defaults_apply() {
-        let yaml = r#"
-            name: dev
-            kind: postgres
-            host: localhost
-        "#;
-        // Production options, not `from_str`'s defaults — a test that parses a
-        // config type should exercise the parser the gateway actually boots
-        // with, and this keeps `with_snippet: false` the only configuration
-        // any config YAML is ever parsed under.
-        let server: Server =
-            serde_saphyr::from_str_with_options(yaml, crate::config::yaml::non_leaking_options())
-                .unwrap();
-        assert_eq!(server.port, 5432);
-        assert_eq!(server.tls, Tls::Required);
-        assert!(server.databases.is_empty());
     }
 }

@@ -40,6 +40,12 @@ impl ConfigFile {
                         server.name, db.name
                     )));
                 }
+                if matches!(db.write_password, Some(Password::Literal(_))) {
+                    return Err(literal_error(format!(
+                        "servers[{}].databases[{}].write_password",
+                        server.name, db.name
+                    )));
+                }
             }
         }
         for account in &self.service_accounts {

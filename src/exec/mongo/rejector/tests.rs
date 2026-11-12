@@ -2,7 +2,7 @@ use super::*;
 
 /// Table-driven coverage of the allow / deny matrix. One row = one
 /// case; the assertion is the same shape for all so a future addition
-/// (e.g. listCollections in #58) is one line.
+/// is one line.
 fn field(command: &str, field: &str) -> RejectReason {
     RejectReason::DisallowedField {
         command: command.to_string(),
@@ -33,6 +33,26 @@ fn rejector_matrix() {
             "distinct allowed",
             r#"{"distinct":"users","key":"role"}"#,
             Ok(()),
+        ),
+        (
+            "listCollections allowed",
+            r#"{"listCollections":1,"filter":{"name":"users"},"nameOnly":false}"#,
+            Ok(()),
+        ),
+        (
+            "listIndexes allowed",
+            r#"{"listIndexes":"users","cursor":{}}"#,
+            Ok(()),
+        ),
+        (
+            "listCollections $where filter denied",
+            r#"{"listCollections":1,"filter":{"$where":"true"}}"#,
+            Err(RejectReason::DisallowedOperator("$where")),
+        ),
+        (
+            "listIndexes $db denied",
+            r#"{"listIndexes":"users","$db":"admin"}"#,
+            Err(field("listIndexes", "$db")),
         ),
         // --- writes denied by command allow-list ---------------------------
         (

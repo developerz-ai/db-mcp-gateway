@@ -2,15 +2,18 @@
 //! form exists only at the edges — the client error payload, the metric
 //! label, the log line and the `audit_calls.outcome` column.
 
-/// `"success"` or a spec 03 error code. Three variants are never returned by
-/// a tool: `Cancelled` (the drop guard stamps it on a row whose work never
-/// finished), `Abandoned` (the reaper stamps it on an intent that never got a
+/// `"success"`, `"dry_run"` (a write that ran and was rolled back) or a
+/// spec 03 error code. `Cancelled` is stamped by the drop guard on a row
+/// whose work never finished, and returned by a tool whose statement another
+/// call stopped (`cancel_query`). Two variants are never returned by a tool:
+/// `Abandoned` (the reaper stamps it on an intent that never got a
 /// completion row) and `AuditUnavailable` (the chokepoint answers it when the
 /// audit store refuses a write).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutcomeCode {
     Success,
+    DryRun,
     Forbidden,
     ForbiddenSql,
     PermissionDenied,
@@ -27,8 +30,9 @@ pub enum OutcomeCode {
 }
 
 impl OutcomeCode {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::Success,
+        Self::DryRun,
         Self::Forbidden,
         Self::ForbiddenSql,
         Self::PermissionDenied,
@@ -48,6 +52,7 @@ impl OutcomeCode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Success => "success",
+            Self::DryRun => "dry_run",
             Self::Forbidden => "forbidden",
             Self::ForbiddenSql => "forbidden_sql",
             Self::PermissionDenied => "permission_denied",
@@ -93,6 +98,7 @@ mod tests {
     fn spellings_match_spec_03() {
         let expected = [
             (OutcomeCode::Success, "success"),
+            (OutcomeCode::DryRun, "dry_run"),
             (OutcomeCode::Forbidden, "forbidden"),
             (OutcomeCode::ForbiddenSql, "forbidden_sql"),
             (OutcomeCode::PermissionDenied, "permission_denied"),

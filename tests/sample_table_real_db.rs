@@ -5,18 +5,15 @@
 
 mod common;
 
+use common::env::target_db_url;
 use common::pg_target::adapter;
-use db_mcp_gateway::exec::{Access, DbAdapter, ExecError, ExecQuery, ExecResult, PgAdapter};
+use db_mcp_gateway::exec::{Access, DbAdapter, ExecQuery};
 
-async fn run(a: &PgAdapter, sql: &str) -> Result<ExecResult, ExecError> {
-    a.execute(ExecQuery {
-        sql,
-        binds: &[],
-        statement_timeout_ms: None,
-        row_limit: 10,
-        access: Access::ReadWrite,
-    })
-    .await
+/// Fixture DDL/DML over a plain owner connection — never through the
+/// adapter, which only reads on a database without a `write_role`.
+async fn ddl(sql: &str) -> Result<(), sqlx::Error> {
+    let pool = sqlx::PgPool::connect(&target_db_url()).await?;
+    sqlx::query(sql).execute(&pool).await.map(|_| ())
 }
 
 fn fresh_schema_name() -> String {
@@ -32,22 +29,18 @@ async fn sample_returns_rows_with_truncation_flag() {
     let a = adapter().await;
     let schema = fresh_schema_name();
 
-    run(&a, &format!("CREATE SCHEMA \"{schema}\""))
+    ddl(&format!("CREATE SCHEMA \"{schema}\""))
         .await
         .expect("create schema");
-    run(
-        &a,
-        &format!("CREATE TABLE \"{schema}\".\"events\" (id int, name text)"),
-    )
+    ddl(&format!(
+        "CREATE TABLE \"{schema}\".\"events\" (id int, name text)"
+    ))
     .await
     .expect("create events");
-    run(
-        &a,
-        &format!(
-            "INSERT INTO \"{schema}\".\"events\" \
+    ddl(&format!(
+        "INSERT INTO \"{schema}\".\"events\" \
              SELECT g, 'event-' || g FROM generate_series(1, 100) g"
-        ),
-    )
+    ))
     .await
     .expect("seed events");
 
@@ -60,12 +53,14 @@ async fn sample_returns_rows_with_truncation_flag() {
             binds: &[],
             statement_timeout_ms: None,
             row_limit: 5,
-            access: Access::ReadWrite,
+            access: Access::ReadOnly,
+            dry_run: false,
+            request_id: uuid::Uuid::new_v4(),
         })
         .await
         .expect("sample SELECT runs");
 
-    let _ = run(&a, &format!("DROP SCHEMA \"{schema}\" CASCADE")).await;
+    let _ = ddl(&format!("DROP SCHEMA \"{schema}\" CASCADE")).await;
 
     assert_eq!(result.rows.len(), 5);
     assert!(
@@ -84,26 +79,33 @@ async fn quoted_identifiers_are_case_sensitive() {
     let a = adapter().await;
     let schema = fresh_schema_name();
 
-    run(&a, &format!("CREATE SCHEMA \"{schema}\""))
+    ddl(&format!("CREATE SCHEMA \"{schema}\""))
         .await
         .expect("create schema");
-    run(
-        &a,
-        &format!("CREATE TABLE \"{schema}\".\"MixedCase\" (x int)"),
-    )
-    .await
-    .expect("create MixedCase");
-    run(
-        &a,
-        &format!("INSERT INTO \"{schema}\".\"MixedCase\" VALUES (1), (2), (3)"),
-    )
+    ddl(&format!("CREATE TABLE \"{schema}\".\"MixedCase\" (x int)"))
+        .await
+        .expect("create MixedCase");
+    ddl(&format!(
+        "INSERT INTO \"{schema}\".\"MixedCase\" VALUES (1), (2), (3)"
+    ))
     .await
     .expect("seed");
 
     let sql = format!("SELECT * FROM \"{schema}\".\"MixedCase\" LIMIT 10");
-    let result = run(&a, &sql).await.expect("quoted identifier query runs");
+    let result = a
+        .execute(ExecQuery {
+            sql: &sql,
+            binds: &[],
+            statement_timeout_ms: None,
+            row_limit: 10,
+            access: Access::ReadOnly,
+            dry_run: false,
+            request_id: uuid::Uuid::new_v4(),
+        })
+        .await
+        .expect("quoted identifier query runs");
 
-    let _ = run(&a, &format!("DROP SCHEMA \"{schema}\" CASCADE")).await;
+    let _ = ddl(&format!("DROP SCHEMA \"{schema}\" CASCADE")).await;
 
     assert_eq!(result.rows.len(), 3);
 }

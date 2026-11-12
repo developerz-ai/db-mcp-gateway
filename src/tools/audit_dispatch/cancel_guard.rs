@@ -9,7 +9,7 @@ use crate::audit::stream::StreamSinks;
 use crate::audit::{self, AuditRow, OutcomeCode};
 
 use super::Outcome;
-use super::metric_names::{AUDIT_FALLBACK_FAILURES, TOOL_CALLS};
+use super::metric_names::{ACCESS_UNKNOWN, AUDIT_FALLBACK_FAILURES, TOOL_CALLS};
 
 const DISCONNECTED: &str = "client disconnected before completion";
 
@@ -81,6 +81,7 @@ impl CancelledAuditGuard {
         row.row_count = outcome.row_count;
         row.truncated = outcome.truncated;
         row.error_message = outcome.error_message.clone();
+        row.rows_affected = outcome.write.and_then(|w| w.rows_affected);
         self.completed = true;
         row.clone()
     }
@@ -110,6 +111,8 @@ impl Drop for CancelledAuditGuard {
                 TOOL_CALLS,
                 "tool" => self.tool,
                 "outcome" => OutcomeCode::Cancelled.as_str(),
+                // The access is decided inside the dropped work.
+                "access" => ACCESS_UNKNOWN,
             )
             .increment(1);
         }

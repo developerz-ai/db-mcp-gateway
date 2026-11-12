@@ -96,6 +96,13 @@ The agent figures out it needs to:
 
 Every step is logged on the gateway side with your identity.
 
+Beyond queries, ask for:
+
+- **Plans** — "explain this query" (`explain`; "with real timings" adds `analyze: true` for reads).
+- **Table health** — "how big is `orders` and when was it last vacuumed?" (`table_stats`).
+- **Your running queries** — "what am I running on prod right now?" (`db_activity`), and "cancel that one" (`cancel_query`). You only ever see and cancel your own.
+- **Writes** — only if your group holds `query_write` on that database. Ask for a dry run first ("how many rows would this update touch?"): the agent passes `dry_run: true`, the gateway runs the statement, reports `rows_affected` and rolls it back. See [Headless agents § Write semantics](headless-agents.md#write-semantics) — the rules are the same for humans.
+
 ## When something requires a reason
 
 Some grants require a reason string (typical for prod). When the gateway returns `reason_required`, Claude Code surfaces it and you type the reason in chat. The agent then retries the call with `reason: "..."` baked in. That reason ends up in the audit log.
@@ -145,5 +152,6 @@ claude mcp add --transport http \
 
 - [First-query walkthrough](first-query.md) — 5-minute happy path + the full gotchas list
 - [Other MCP-aware agents](other-agents.md) — Cursor, Continue, etc.
+- [Headless agents](headless-agents.md) — service tokens, run attribution, read/write tiers
 - [Permissions model](../initial-idea/06-permissions.md) — what `forbidden` actually means
 - [MCP tool surface](../initial-idea/03-mcp-tools.md) — every tool the gateway exposes

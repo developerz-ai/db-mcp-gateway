@@ -60,3 +60,49 @@ jobs:
             cargo update --dry-run --color never 2>&1
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Load gate (plan 101 slice 13 step 10): the benchmark harness against the
+  # dev stack it boots itself, compared with a baseline taken on this same
+  # runner class — absolute numbers from another host mean nothing here.
+  # Weekly, not per PR: a release build plus the full run is ~15 minutes and
+  # shared runners are noisy (load_gate.sh reports drifted shapes as
+  # inconclusive instead of gating on them).
+  load-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BASELINE: benchmarks/baselines/ci-ubuntu-latest-postgres.json
+      RESULT: benchmarks/results/ci-latest.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # rust-toolchain.toml pins the channel; rustup installs it on first use.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+      - name: run the benchmark harness
+        run: ./benchmarks/gateway_overhead.sh --out "$RESULT"
+      - name: gate against the stored baseline
+        run: |
+          set -o pipefail
+          if [[ ! -f "$BASELINE" ]]; then
+            {
+              echo '## load gate: baseline captured on this run'
+              echo "No \`$BASELINE\` yet. Commit the \`load-gate-result\` artifact"
+              echo "of this run as that file; later runs gate against it."
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo '## load gate'
+            ./benchmarks/load_gate.sh "$RESULT" "$BASELINE"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: keep the result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: load-gate-result
+          path: benchmarks/results/ci-latest.json
+          if-no-files-found: ignore

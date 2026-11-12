@@ -163,6 +163,7 @@ async fn compute_outcome(
         table: table.table,
         statement_timeout_ms: constraints.statement_timeout_ms,
         row_limit,
+        request_id: ctx.request.request_id,
     };
     match adapter.sample(query).await {
         Ok(result) => {

@@ -11,14 +11,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{Action, Grant, ServerKind};
-use crate::exec::ExecQuery;
-use crate::exec::sql_guard;
+use crate::exec::{Access, ExecQuery, ExecResult, GuardedSql};
 use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
 use super::audit_dispatch::{
-    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, error_outcome, outcome_from_exec_error,
-    reject_arguments, run_audited, success_outcome,
+    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, WriteEffect, error_outcome,
+    invalid_arguments, outcome_from_exec_error, reject_arguments, run_audited, success_outcome,
 };
 use super::target::{effective_row_limit, ensure_reason, forbidden, record_intent, resolve_target};
 
@@ -42,6 +41,9 @@ pub struct Arguments {
     pub limit: Option<u32>,
     #[serde(default)]
     pub reason: Option<String>,
+    /// Run a write, report `rows_affected`, roll it back.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -50,7 +52,16 @@ struct SuccessPayload<'a> {
     rows: &'a [Vec<Value>],
     truncated: bool,
     elapsed_ms: u64,
+    /// Rows the write changed; absent for a read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rows_affected: Option<u64>,
+    /// The write was rolled back.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    dry_run: bool,
 }
+
+const DRY_RUN_NEEDS_WRITE: &str =
+    "`dry_run` applies only to an INSERT/UPDATE/DELETE under a query_write grant";
 
 pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Response {
     let args: Arguments = match arguments.map(serde_json::from_value::<Arguments>) {
@@ -113,33 +124,25 @@ async fn compute_outcome(
         &database.name,
     )
     .is_some();
-    let access = if writes_allowed {
-        sql_guard::Access::ReadWrite
-    } else {
-        sql_guard::Access::ReadOnly
-    };
 
     if let Err(rejected) = ensure_reason(constraints, args.reason.as_deref()) {
         return *rejected;
     }
 
-    // Defense-in-depth on top of the DB role: reject anything the grant doesn't
-    // cover before it hits the pool. Read-only callers get `is_read_only`;
-    // `query_write` callers additionally get single-statement INSERT/UPDATE/
-    // DELETE — never schema mods. See exec::sql_guard.
-    //
-    // pg only: `sql_guard` is a SQL parser; mongo commands are JSON-shaped
-    // BSON, not SQL. `MongoAdapter::execute` runs its own read-only
-    // rejector (`src/exec/mongo/rejector.rs`) as the equivalent guard. Mongo
-    // writes are not offered here — a `query_write` grant on a mongo DB still
-    // hits the read-only rejector.
-    if matches!(server.kind, ServerKind::Postgres)
-        && let Err(err) = sql_guard::check_sql(&args.sql, access)
-    {
-        return error_outcome(
-            OutcomeCode::ForbiddenSql,
-            &format!("SQL rejected by gateway: {err}"),
-        );
+    // Defense-in-depth on top of the DB role: the guard refuses anything the
+    // grant doesn't cover before it hits the pool, and names the access the
+    // statement itself needs — so a write-tier caller's SELECT still runs as
+    // the read role. Mongo commands are not SQL: `MongoAdapter::execute` runs
+    // its own read-only rejector, and Mongo writes are not offered at all.
+    let access = match server.kind {
+        ServerKind::Postgres => match statement_access(&args.sql, writes_allowed) {
+            Ok(access) => access,
+            Err(rejected) => return *rejected,
+        },
+        ServerKind::Mysql | ServerKind::Mssql | ServerKind::Mongo => Access::ReadOnly,
+    };
+    if args.dry_run && access != Access::ReadWrite {
+        return invalid_arguments(id, DRY_RUN_NEEDS_WRITE);
     }
 
     let row_limit = effective_row_limit(args.limit, constraints.row_limit, DEFAULT_ROW_LIMIT);
@@ -180,26 +183,65 @@ async fn compute_outcome(
         statement_timeout_ms: timeout_ms,
         row_limit,
         access,
+        dry_run: args.dry_run,
+        request_id: ctx.request.request_id,
     };
-    match adapter.execute(query).await {
-        Ok(result) => {
-            let elapsed = i64::try_from(result.elapsed_ms).unwrap_or(i64::MAX);
-            let row_count = i64::try_from(result.rows.len()).unwrap_or(i64::MAX);
-            let truncated = result.truncated;
-            let payload = SuccessPayload {
-                columns: &result.columns,
-                rows: &result.rows,
-                truncated,
-                elapsed_ms: result.elapsed_ms,
-            };
-            let text = match serde_json::to_string(&payload) {
-                Ok(t) => t,
-                Err(_) => {
-                    return error_outcome(OutcomeCode::Internal, "failed to serialize result");
-                }
-            };
-            success_outcome(id, text, Some(elapsed), Some(row_count), Some(truncated))
-        }
-        Err(err) => outcome_from_exec_error(err, started, &ERROR_MESSAGES),
+    let (mut outcome, rows_affected) = match adapter.execute(query).await {
+        Ok(result) => (
+            result_outcome(id, &result, args.dry_run),
+            result.rows_affected,
+        ),
+        Err(err) => (outcome_from_exec_error(err, started, &ERROR_MESSAGES), None),
+    };
+    if access == Access::ReadWrite {
+        outcome.write = Some(WriteEffect {
+            rows_affected: rows_affected.map(|rows| i64::try_from(rows).unwrap_or(i64::MAX)),
+        });
     }
+    outcome
+}
+
+/// The access `sql` needs, after the guard at the caller's grant level:
+/// `ReadWrite` only for a data write under a `query_write` grant.
+fn statement_access(sql: &str, writes_allowed: bool) -> Result<Access, Box<Outcome>> {
+    let grant = if writes_allowed {
+        Access::ReadWrite
+    } else {
+        Access::ReadOnly
+    };
+    GuardedSql::parse(sql, grant)
+        .map(|guarded| guarded.required_access())
+        .map_err(|err| {
+            Box::new(error_outcome(
+                OutcomeCode::ForbiddenSql,
+                &format!("SQL rejected by gateway: {err}"),
+            ))
+        })
+}
+
+fn result_outcome(id: Value, result: &ExecResult, dry_run: bool) -> Outcome {
+    let elapsed = i64::try_from(result.elapsed_ms).unwrap_or(i64::MAX);
+    let row_count = i64::try_from(result.rows.len()).unwrap_or(i64::MAX);
+    let payload = SuccessPayload {
+        columns: &result.columns,
+        rows: &result.rows,
+        truncated: result.truncated,
+        elapsed_ms: result.elapsed_ms,
+        rows_affected: result.rows_affected,
+        dry_run,
+    };
+    let Ok(text) = serde_json::to_string(&payload) else {
+        return error_outcome(OutcomeCode::Internal, "failed to serialize result");
+    };
+    let mut outcome = success_outcome(
+        id,
+        text,
+        Some(elapsed),
+        Some(row_count),
+        Some(result.truncated),
+    );
+    if dry_run {
+        outcome.code = OutcomeCode::DryRun;
+    }
+    outcome
 }

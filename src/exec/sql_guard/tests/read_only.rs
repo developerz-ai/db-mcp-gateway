@@ -209,11 +209,18 @@ fn unparseable_rejected_as_parse_error() {
 }
 
 #[test]
-fn read_only_sql_mirrors_is_read_only() {
+fn guarded_sql_mirrors_the_guard_and_names_the_access_needed() {
     let sql = "SELECT id FROM users";
-    assert_eq!(ReadOnlySql::parse(sql).map(|s| s.as_str()), Ok(sql));
+    let read = GuardedSql::parse(sql, Access::ReadOnly).expect("read");
+    assert_eq!(read.as_str(), sql);
+    assert_eq!(read.required_access(), Access::ReadOnly);
     assert_eq!(
-        ReadOnlySql::parse("DELETE FROM users"),
+        GuardedSql::parse("DELETE FROM users", Access::ReadOnly),
         Err(GuardError::NotAllowed("DELETE"))
     );
+    // A write grant does not make a read need the write role.
+    let read = GuardedSql::parse(sql, Access::ReadWrite).expect("read");
+    assert_eq!(read.required_access(), Access::ReadOnly);
+    let write = GuardedSql::parse("DELETE FROM users", Access::ReadWrite).expect("write");
+    assert_eq!(write.required_access(), Access::ReadWrite);
 }

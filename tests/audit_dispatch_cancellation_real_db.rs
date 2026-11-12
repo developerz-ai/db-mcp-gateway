@@ -31,7 +31,7 @@ use db_mcp_gateway::audit;
 use db_mcp_gateway::auth::{Identity, SessionId};
 use db_mcp_gateway::config::StreamSinkConfig;
 use db_mcp_gateway::tools::audit_dispatch::{
-    AuditHeader, OutcomeCode, RequestContext, audit_dispatch,
+    AuditHeader, OutcomeCode, RequestContext, Upstream, audit_dispatch,
 };
 use serde_json::Value;
 use tokio::sync::Notify;
@@ -145,6 +145,7 @@ async fn dropped_dispatch_leaves_cancelled_audit_row() {
         ip: None,
         agent_client: None,
         request_id: Uuid::new_v4(),
+        upstream: Upstream::default(),
     };
 
     // `armed` signals the moment `work.await` is first polled — at that
@@ -233,6 +234,7 @@ async fn dropped_dispatch_streams_cancelled_row_when_stdout_configured() {
         request_id,
         ip: None,
         agent_client: None,
+        upstream: Upstream::default(),
     };
 
     let buf = BufWriter::default();
@@ -326,6 +328,7 @@ async fn completed_dispatch_does_not_leave_cancelled_row() {
         ip: None,
         agent_client: None,
         request_id: Uuid::new_v4(),
+        upstream: Upstream::default(),
     };
 
     let identity = identity(&user);
@@ -349,6 +352,7 @@ async fn completed_dispatch_does_not_leave_cancelled_row() {
             row_count: Some(1),
             truncated: Some(false),
             error_message: None,
+            write: None,
         }
     };
     let _ = audit_dispatch(
@@ -360,8 +364,8 @@ async fn completed_dispatch_does_not_leave_cancelled_row() {
         work,
     )
     .await;
-    // Give the detached write (audit::log) time to land.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // No wait: a completed dispatch commits its row before returning
+    // (MUST #4), so reading it straight away also asserts that.
 
     let row = latest_audit(&p, &user, "run_query", "run_query dispatch").await;
     assert_eq!(
@@ -396,6 +400,7 @@ async fn audit_row_request_id_is_gateway_uuid_not_client_id() {
         request_id: Uuid::new_v4(),
         ip: None,
         agent_client: None,
+        upstream: Upstream::default(),
     };
     let expected_request_id = ctx.request_id.to_string();
 
@@ -420,6 +425,7 @@ async fn audit_row_request_id_is_gateway_uuid_not_client_id() {
             row_count: Some(1),
             truncated: Some(false),
             error_message: None,
+            write: None,
         }
     };
     let _ = audit_dispatch(
@@ -431,7 +437,7 @@ async fn audit_row_request_id_is_gateway_uuid_not_client_id() {
         work,
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Synchronous audit: the row is committed by the time dispatch returns.
 
     let row = latest_audit(&p, &user, "run_query", "run_query dispatch").await;
 

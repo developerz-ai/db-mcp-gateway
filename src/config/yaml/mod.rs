@@ -18,7 +18,9 @@ mod gateway;
 mod limits;
 mod reload_diff;
 mod roles;
+mod service_accounts;
 mod validate;
+mod write_tier;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -212,6 +214,9 @@ impl ConfigFile {
                 // Resolved value is dropped right here — never stored,
                 // never logged.
                 let _ = db.password.resolve()?;
+                if let Some(write_password) = &db.write_password {
+                    let _ = write_password.resolve()?;
+                }
             }
         }
         for account in &self.service_accounts {

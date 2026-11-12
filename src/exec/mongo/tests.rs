@@ -25,6 +25,8 @@ fn database_for(name: &str, role: &str, password: &str) -> Database {
         description: String::new(),
         auth_database: None,
         pool: None,
+        write_role: None,
+        write_password: None,
     }
 }
 
@@ -70,6 +72,8 @@ async fn rejected_command_maps_to_forbidden_not_sql() {
         statement_timeout_ms: None,
         row_limit: 10,
         access: crate::exec::Access::ReadOnly,
+        dry_run: false,
+        request_id: uuid::Uuid::new_v4(),
     };
     let err = adapter
         .execute(query)
@@ -84,9 +88,10 @@ async fn rejected_command_maps_to_forbidden_not_sql() {
     }
 }
 
-/// Catalog, sample and explain are SQL-shaped; until the mongo
-/// implementations land they must fail with the typed "not implemented"
-/// error (→ `internal`), never by handing SQL text to the driver.
+/// `explain` and the Postgres statistics tools have no Mongo implementation;
+/// they fail with the typed "not implemented" error (→ `internal`), never by
+/// handing SQL text to the driver. No network is touched: each refuses
+/// before dispatch.
 #[tokio::test]
 async fn sql_shaped_operations_are_not_implemented() {
     let s = server_for("localhost", 27017, Tls::Insecure);
@@ -94,36 +99,50 @@ async fn sql_shaped_operations_are_not_implemented() {
     let adapter = MongoAdapter::open(&s, &d, PoolSizing::default(), DetachedTasks::new())
         .await
         .expect("client constructs");
+    let request_id = uuid::Uuid::new_v4();
 
-    let schema = adapter
-        .describe_schema(SchemaQuery {
+    let sql = crate::exec::GuardedSql::parse("SELECT 1", crate::exec::Access::ReadOnly)
+        .expect("read-only");
+    let explain = adapter
+        .explain(ExplainQuery {
+            sql,
+            analyze: false,
+            statement_timeout_ms: None,
+            request_id,
+        })
+        .await;
+    let stats = adapter
+        .table_stats(TableStatsQuery {
             schema: "public",
             table: None,
             statement_timeout_ms: None,
             row_limit: 10,
+            request_id,
         })
         .await;
-    let ident = |s| crate::exec::Identifier::parse(s).expect("valid identifier");
-    let sample = adapter
-        .sample(SampleQuery {
-            schema: ident("public"),
-            table: ident("users"),
+    let activity = adapter
+        .db_activity(ActivityQuery {
             statement_timeout_ms: None,
             row_limit: 10,
+            request_id,
         })
         .await;
-    let sql = crate::exec::sql_guard::ReadOnlySql::parse("SELECT 1").expect("read-only");
-    let explain = adapter
-        .explain(ExplainQuery {
-            sql,
-            statement_timeout_ms: None,
-        })
-        .await;
+    let cancel = adapter
+        .cancel_request(request_id)
+        .await
+        .map(|_| ExecResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            truncated: false,
+            elapsed_ms: 0,
+            rows_affected: None,
+        });
 
     for (result, want_op) in [
-        (schema, "describe_schema"),
-        (sample, "sample"),
         (explain, "explain"),
+        (stats, "table_stats"),
+        (activity, "db_activity"),
+        (cancel, "cancel_request"),
     ] {
         match result {
             Err(ExecError::NotImplemented {

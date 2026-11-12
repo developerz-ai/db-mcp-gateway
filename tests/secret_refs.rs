@@ -233,6 +233,8 @@ async fn rotated_password_file_is_picked_up_without_restart() {
         statement_timeout_ms: Some(5_000),
         row_limit: 1,
         access: Access::ReadOnly,
+        dry_run: false,
+        request_id: uuid::Uuid::new_v4(),
     };
     let run = |registry: AdapterRegistry| {
         let (server, database) = (server.clone(), database.clone());

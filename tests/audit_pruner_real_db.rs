@@ -32,6 +32,10 @@ fn audit_row(user_sub: &str, request_id: &str) -> AuditRow {
         agent_client: None,
         ip: None,
         db_type: None,
+        upstream_actor: None,
+        upstream_run_id: None,
+        rows_affected: None,
+        sql_truncated: false,
     }
 }
 

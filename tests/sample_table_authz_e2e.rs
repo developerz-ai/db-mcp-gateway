@@ -16,9 +16,7 @@ use std::time::Duration;
 
 use common::gateway::{LoggedInGateway, spawn_logged_in};
 use common::idp::MockUser;
-use common::pg_target;
 use db_mcp_gateway::audit::AuditRow;
-use db_mcp_gateway::exec::{Access, DbAdapter, ExecQuery, PgAdapter};
 use serde_json::{Value, json};
 
 const TOOL: &str = "sample_table";
@@ -104,15 +102,19 @@ async fn latest_audit(booted: &LoggedInGateway, label: &str) -> AuditRow {
 /// A real table with real rows in a throwaway schema — never a mock: the
 /// point is that `sample_table` either does or does not hand these rows back.
 struct Fixture {
-    adapter: PgAdapter,
+    owner: sqlx::PgPool,
     schema: String,
 }
 
 impl Fixture {
     async fn create() -> Self {
-        let adapter = pg_target::adapter().await;
+        // Fixture DDL runs over a plain owner connection — never through the
+        // adapter, which only reads on a database without a `write_role`.
+        let owner = sqlx::PgPool::connect(&common::env::target_db_url())
+            .await
+            .expect("target-db reachable; run `bin/dev up`");
         let schema = format!("sampleauthz_{}", uuid::Uuid::new_v4().simple());
-        let fixture = Self { adapter, schema };
+        let fixture = Self { owner, schema };
         fixture
             .exec(&format!("CREATE SCHEMA \"{}\"", fixture.schema))
             .await;
@@ -132,14 +134,8 @@ impl Fixture {
     }
 
     async fn exec(&self, sql: &str) {
-        self.adapter
-            .execute(ExecQuery {
-                sql,
-                binds: &[],
-                statement_timeout_ms: None,
-                row_limit: 10,
-                access: Access::ReadWrite,
-            })
+        sqlx::query(sql)
+            .execute(&self.owner)
             .await
             .unwrap_or_else(|e| panic!("fixture SQL failed ({sql}): {e}"));
     }

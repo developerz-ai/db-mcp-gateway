@@ -87,4 +87,6 @@ If your client runs unattended — a CI job, an agent runner, another service �
 - They never expire and cannot be revoked in-band; rotation and revocation are operator actions (config edit + rollout). Treat the value like any other long-lived credential: store it in your secret manager, never in a repo.
 - Service tokens are for tool calls only — they cannot reach the `/admin/*` surface and cannot mint login sessions.
 
+Send `x-dbmcp-run-id` and `x-dbmcp-on-behalf-of` with every call so the audit log can tell your runs apart — see [Headless agents](headless-agents.md) for the headers, the read/write tiers and write semantics.
+
 Operators: the mint/rotate/revoke runbook is [spec 14](../initial-idea/14-service-tokens.md) (`bin/mint-service-token`).

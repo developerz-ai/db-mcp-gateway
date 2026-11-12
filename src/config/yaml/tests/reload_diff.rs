@@ -37,6 +37,15 @@ fn each_connection_setting_evicts_only_its_database() {
             "auth_database",
             config("", ", auth_database: admin", "${ENV:D}", ""),
         ),
+        (
+            "write_role",
+            config(
+                "",
+                ", write_role: rw, write_password: \"${ENV:W}\"",
+                "${ENV:D}",
+                "",
+            ),
+        ),
         ("removed", base().without_d()),
     ] {
         assert_eq!(changed(&new), d, "{label}");

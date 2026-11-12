@@ -4,12 +4,14 @@
 //! `crate::tools` and everything else to the pure [`super::dispatch`]. The
 //! transport never evaluates a grant or runs SQL.
 
+use std::convert::Infallible;
 use std::net::SocketAddr;
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, FromRequestParts, State};
 use axum::http::header::{ALLOW, USER_AGENT};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -18,20 +20,40 @@ use serde_json::Value;
 use super::app_state::McpState;
 use super::dispatch;
 use super::request_id::{ClientRequestId, GatewayRequestId};
-use crate::auth::Identity;
+use super::upstream;
+use crate::auth::{Identity, ServicePolicy};
 use crate::mcp::jsonrpc::{self, ErrorObject, Request, RequestId};
 use crate::tools;
 
 const TOOLS_CALL: &str = "tools/call";
 const MCP_CLIENT_HEADER: HeaderName = HeaderName::from_static("x-mcp-client");
 
-/// Handle one JSON-RPC message. `Identity` is injected by `bearer_auth`
-/// (absent only on the auth-less `test_router`).
+/// Who `bearer_auth` authenticated: the `Identity` (absent only on the
+/// auth-less `test_router`) and, for a service token, its account policy.
+#[derive(Debug)]
+pub(super) struct Caller {
+    identity: Option<Identity>,
+    policy: Option<ServicePolicy>,
+}
+
+#[axum::async_trait]
+impl<S: Send + Sync> FromRequestParts<S> for Caller {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Infallible> {
+        Ok(Self {
+            identity: parts.extensions.get::<Identity>().cloned(),
+            policy: parts.extensions.get::<ServicePolicy>().copied(),
+        })
+    }
+}
+
+/// Handle one JSON-RPC message.
 pub(super) async fn post_handler(
     State(state): State<McpState>,
     Extension(request_id): Extension<GatewayRequestId>,
     client_request_id: Option<Extension<ClientRequestId>>,
-    identity: Option<Extension<Identity>>,
+    caller: Caller,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
@@ -55,6 +77,7 @@ pub(super) async fn post_handler(
         Err(response) => return Json(response).into_response(),
     };
 
+    let Caller { identity, policy } = caller;
     let user_sub = identity
         .as_ref()
         .map_or("anonymous", |i| i.user_sub.as_str());
@@ -90,7 +113,7 @@ pub(super) async fn post_handler(
 
     // `bearer_auth` guarantees an identity on the production router; a
     // missing one is a defined internal error, never a panic.
-    let Some(Extension(identity)) = identity else {
+    let Some(identity) = identity else {
         return Json(jsonrpc::Response::error(
             id,
             ErrorObject::internal("missing identity"),
@@ -106,6 +129,7 @@ pub(super) async fn post_handler(
         ip: connect_info.map(|ConnectInfo(addr)| addr.ip()),
         agent_client,
         request_id: request_id.as_uuid(),
+        upstream: upstream::from_headers(&headers, &identity, policy.as_ref()),
     };
     // One config / sink snapshot for the whole call, even across a reload.
     let config = state.config.load();

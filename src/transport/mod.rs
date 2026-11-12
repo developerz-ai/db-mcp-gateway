@@ -21,6 +21,7 @@ mod bounds;
 mod dispatch;
 mod mcp_handler;
 mod oauth;
+mod upstream;
 
 use std::sync::Arc;
 use std::time::Duration;
