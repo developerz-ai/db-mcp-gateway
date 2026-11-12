@@ -20,10 +20,40 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Docs-only PRs skip the Rust jobs. The skip is per job, not a workflow-level
+  # `paths-ignore`: `clippy` and `test` are required checks, and a workflow that
+  # never starts leaves them pending forever, while a job skipped by `if:`
+  # reports as passed. Pushes to `main` always run everything — `build` needs
+  # them. Docs guards (pages.yml) run on their own path filter.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # A PR checkout is the merge commit; its first parent is the base tip,
+          # so HEAD^1..HEAD is exactly what the PR changes.
+          fetch-depth: 2
+      - id: diff
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only HEAD^1 HEAD)
+          code=$(printf '%s\n' "$changed" \
+            | grep -vE '^(website/|docs/)|\.md$' \
+            | grep -q . && echo true || echo false)
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "code-affecting changes: $code"
+
   fmt:
     # GitHub-hosted runner (org rule: private repos on Ubicloud, public on GitHub-hosted).
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -57,14 +87,23 @@ jobs:
             exit 1
           fi
 
+  # Rust cache: the default rust-cache key is job id + rustc version +
+  # Cargo.lock/Cargo.toml hashes, so clippy (check artifacts) and test (full
+  # builds) each restore their own warm dependency cache. Saved from `main`
+  # only. A shared key made both jobs race to save one entry, and the loser
+  # restored the other job's artifacts — a cold build in disguise.
+  #
+  # No `cargo clean -p db-mcp-gateway`: restored local-crate artifacts can't go
+  # stale (rust-cache drops workspace crates before saving, and checkout mtimes
+  # are newer than any cached fingerprint). The E0063 failure it was added for
+  # (#188) was a real semantic merge conflict: a PR's checkout is the merge
+  # commit with `main`, which carried the test file the PR branch lacked.
   clippy:
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # A Cargo.lock change misses the cache, and a cold build of this graph
-    # (aws-lc-rs, mongodb, sqlx ×2 backends, sentry, axum) on 2 vCPU runs well
-    # past 15 min. release.yml already went to 60 for the same reason. After
-    # the rust-cache-clear added below, every PR run now pays the cold-build
-    # cost on the first clippy invocation, so we add 10 min of headroom.
-    timeout-minutes: 50
+    # ~2x the measured p95 (cold, Cargo.lock-changing run: 344 s; warm ~60 s).
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -75,15 +114,8 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
-          shared-key: build
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Wipe stale depfiles that Rust-cache restored from a main-branch build.
-      # Without this, `cargo clippy --all-targets` against a PR whose branch
-      # diverged before a test file was added (or removed) fails with
-      # `error[E0063]: missing field … in initializer` against depfiles that
-      # reference a `.rs` that no longer exists on the PR branch.
-      - run: cargo clean -p db-mcp-gateway
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --profile ci --all-targets --all-features -- -D warnings
       # --all-targets enables cfg(test), which makes imports used only by
       # #[cfg(any(test, debug_assertions))] helpers look live. The release
       # configuration compiles those helpers out, so the same code emitted
@@ -98,11 +130,11 @@ jobs:
       - run: bin/check-scrub-features
 
   test:
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # After the rust-cache-clear step below, this job pays the cold-build cost
-    # on every PR invocation; 50 min gives ~10 min of headroom over the
-    # observed 35-40 min peak.
-    timeout-minutes: 50
+    # ~2x the measured p95 (cold, Cargo.lock-changing run: 471 s).
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16
@@ -178,24 +210,28 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
-          shared-key: build
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Wipe stale depfiles that Rust-cache restored from a main-branch build —
-      # see the matching comment in the clippy job above for the cache-poisoning
-      # rationale. The `--all-targets` test invocation below hits the same
-      # pattern.
-      - run: cargo clean -p db-mcp-gateway
-      # No separate `cargo build` step — `cargo test --all-targets` builds the
-      # same targets, so the extra invocation was a wasted fingerprint pass.
-      # `--all-features` gates the bench-harness tests in `benchmarks/harness/*`
-      # which are otherwise skipped (matches the clippy job above; no runtime
-      # image is produced from this invocation, so the bench-harness bin never
-      # ships).
-      - run: cargo test --all-targets --all-features
+      - name: install cargo-nextest
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
+        with:
+          tool: cargo-nextest@0.9.151
+      # Same runner `bin/test` uses locally (.config/nextest.toml, `ci`
+      # profile: no retries, JUnit report). `--all-features` gates the
+      # bench-harness tests in `benchmarks/harness/*`, which are otherwise
+      # skipped; no runtime image is produced here, so that bin never ships.
+      # `--all-targets` excludes doctests, as `cargo test --all-targets` did.
+      - run: cargo nextest run --profile ci --cargo-profile ci --all-targets --all-features
+      - name: upload JUnit report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: junit
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
 
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:
@@ -366,7 +402,7 @@ jobs:
   merge:
     needs: [build]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     permissions:
       contents: read
       packages: write

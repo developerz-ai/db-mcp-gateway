@@ -36,6 +36,12 @@ if ! dpkg -s build-essential openssl curl >/dev/null 2>&1; then
   "${APT[@]}" install -y --no-install-recommends build-essential openssl curl >/dev/null 2>&1 || fail 'Host package installation failed. Ask an administrator to install build-essential, openssl and curl, then retry.'
 fi
 
+# bin/test runs nextest when present; same version as CI's test job.
+if ! command -v cargo-nextest >/dev/null 2>&1; then
+  echo '→ installing cargo-nextest (test runner)'
+  cargo install --locked cargo-nextest@0.9.151 >/dev/null 2>&1 || fail 'cargo-nextest install failed. Check registry access, then retry.'
+fi
+
 echo '→ fetching locked Rust dependencies'
 cargo fetch --locked >/dev/null 2>&1 || fail 'Locked dependency fetch failed. Check registry access and Cargo.lock consistency, then retry.'
 echo '→ starting dependency services and waiting for health'

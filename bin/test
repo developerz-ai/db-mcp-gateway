@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # bin/test — unit + integration tests. Brings up the dev stack if needed.
-# Pass-through args go to `cargo test` (e.g. bin/test --test smoke -- --nocapture).
+# Runs cargo-nextest when installed (.config/nextest.toml), else `cargo test`.
+# Pass-through args go to the runner (e.g. bin/test --test smoke -- --nocapture);
+# nextest accepts the libtest flags after `--`.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -78,4 +80,7 @@ if (( up_rc != 0 )); then
   exit "$up_rc"
 fi
 
+if command -v cargo-nextest >/dev/null 2>&1; then
+  exec cargo nextest run --all-targets --all-features "$@"
+fi
 exec cargo test --all-targets --all-features "$@"

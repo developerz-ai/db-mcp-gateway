@@ -42,7 +42,7 @@ Self-hosted MCP gateway. AI agents get audited, SSO-gated, read-only DB access. 
 | psql — state DB / target DB | `bin/dev psql state` / `bin/dev psql target` |
 | mongosh — target Mongo | `bin/dev mongosh` |
 | mysql — permissions store | `bin/dev mysql` |
-| Full test (unit + integration) | `bin/test` |
+| Full test (unit + integration; cargo-nextest when installed, else `cargo test`) | `bin/test` |
 | Single test by pattern | `bin/test --test <name>` or `cargo test <pattern>` |
 | Format | `bin/fmt` |
 | Lint (fmt-check + clippy -D warnings) | `bin/lint` |
@@ -112,13 +112,15 @@ GitHub Actions on GitHub-hosted runners — `ubuntu-latest` default (`ubuntu-24.
 | Job | Does |
 |---|---|
 | `fmt` | `cargo fmt --check`; every action pinned to a 40-hex SHA |
-| `clippy` | `clippy -D warnings` (all-targets + release cfg) + `bin/check-scrub-features` |
-| `test` | `cargo test --all-targets --all-features` against the service containers |
+| `changes` | path filter: docs-only PRs (`website/**`, `docs/**`, `*.md`) skip `clippy`/`test` via per-job `if:` (a skipped required job reads as passed) |
+| `clippy` | `clippy -D warnings` (all-targets + release cfg, `--profile ci`) + `bin/check-scrub-features` |
+| `test` | `cargo nextest run --profile ci --cargo-profile ci --all-targets --all-features` against the service containers; JUnit uploaded (`.config/nextest.toml`) |
 | `audit` | `cargo audit --ignore RUSTSEC-2023-0071` |
 | `secret-scan` | advisory — `git grep -nE` over every tracked file for `dbmcp_svc_[0-9a-f]{64}`; exempt paths: `tests/**`, `website/**`, `config/example.yaml`, `.github/**`, `src/config/yaml.rs` |
+| `weekly` (`weekly.yml`) | Mondays: `cargo audit` on `main` + `cargo update --dry-run` report |
 | `build` + `merge` | on `main`: per-arch image → multi-arch manifest, pushed to GHCR **and** DOCR |
 
-Every workflow declares a `concurrency` group with cancel-in-progress, and every job sets `timeout-minutes`. `ci.yml` cancels superseded **PR** runs only — pushes to `main` never cancel, because the Image Updater pins the short SHA, so cancelling the first of two closely-landed merges would leave that commit with no image at its tag (`main` is a moving convenience tag). The release workflow is hard `cancel-in-progress: false`. Public repo — org rule: private on Ubicloud, public on GitHub-hosted.
+Every workflow declares a `concurrency` group with cancel-in-progress, and every job sets `timeout-minutes` (~2× measured p95: clippy 15, test 20, small jobs 5, image build 30). Each Rust job keeps its own `Swatinem/rust-cache` key — never a shared key: it made `test` restore clippy's check-only artifacts and rebuild the graph. `ci.yml` cancels superseded **PR** runs only — pushes to `main` never cancel, because the Image Updater pins the short SHA, so cancelling the first of two closely-landed merges would leave that commit with no image at its tag (`main` is a moving convenience tag). The release workflow is hard `cancel-in-progress: false`. Public repo — org rule: private on Ubicloud, public on GitHub-hosted.
 
 ## Security review required
 
