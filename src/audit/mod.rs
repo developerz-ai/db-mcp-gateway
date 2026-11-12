@@ -93,6 +93,28 @@ pub struct AuditRow {
     /// 0007 (#58) so operator queries can split mongo activity from pg
     /// at the audit layer; spec 12 §"Mongo adapter" line 241.
     pub db_type: Option<String>,
+    /// `x-dbmcp-on-behalf-of` a service-token caller CLAIMED (unverified,
+    /// never used for authz). `None` for SSO sessions. Migration 0014.
+    pub upstream_actor: Option<String>,
+    /// `x-dbmcp-run-id` a service-token caller CLAIMED (unverified).
+    pub upstream_run_id: Option<String>,
+    /// Rows a write changed (or would have, for a rolled-back `dry_run`).
+    /// `None` for reads.
+    pub rows_affected: Option<i64>,
+    /// `sql` was cut at [`AUDIT_SQL_MAX_BYTES`] before it was stored.
+    pub sql_truncated: bool,
+}
+
+/// Bytes of `sql` one audit row stores. The SIEM export and the history read
+/// both carry this column; one multi-megabyte statement must not make a row
+/// that size. Past the cap the row keeps the prefix and sets `sql_truncated`.
+pub const AUDIT_SQL_MAX_BYTES: usize = 64 * 1024;
+
+/// `sql` capped at [`AUDIT_SQL_MAX_BYTES`] (on a char boundary), plus whether
+/// it was cut.
+pub fn cap_stored_sql(sql: &str) -> (String, bool) {
+    let kept = prefix_at_char_boundary(sql, AUDIT_SQL_MAX_BYTES);
+    (kept.to_owned(), kept.len() < sql.len())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -142,4 +164,22 @@ pub async fn latest_for_user_tool(
     crate::state::audit::latest_call_for_user_tool(pool, user_sub, tool)
         .await
         .map_err(AuditError::Write)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_sql_is_capped_on_a_char_boundary() {
+        let long = "é".repeat(AUDIT_SQL_MAX_BYTES);
+        let (kept, truncated) = cap_stored_sql(&long);
+        assert!(truncated);
+        assert!(kept.len() <= AUDIT_SQL_MAX_BYTES);
+        assert!(long.starts_with(&kept));
+
+        let exact = "x".repeat(AUDIT_SQL_MAX_BYTES);
+        assert_eq!(cap_stored_sql(&exact), (exact.clone(), false));
+        assert_eq!(cap_stored_sql("SELECT 1"), ("SELECT 1".to_owned(), false));
+    }
 }

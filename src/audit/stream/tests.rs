@@ -49,6 +49,10 @@ fn sample_row() -> AuditRow {
         agent_client: None,
         ip: None,
         db_type: Some("postgres".into()),
+        upstream_actor: None,
+        upstream_run_id: None,
+        rows_affected: None,
+        sql_truncated: false,
     }
 }
 

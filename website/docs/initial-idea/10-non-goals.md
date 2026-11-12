@@ -24,7 +24,15 @@ One install = one organization. Two organizations sharing one gateway is explici
 
 ## Not a write-heavy tool
 
-Writes are possible (see [06-permissions](06-permissions.md)) but the system is shaped around read-only debugging. Migrations, data corrections, bulk updates — those belong in your existing CI/CD or runbooks, not in an agent's tool call.
+Writes are possible (see [06-permissions](06-permissions.md)): a `query_write` grant runs single-statement `INSERT` / `UPDATE` / `DELETE` as a separate write role, with `rows_affected` and an optional `dry_run`. But the system is shaped around read-only debugging, and these stay out on purpose (plan 101, owner decision):
+
+- **DDL / migrations** — schema changes belong in your migration tool and CI/CD, reviewed and versioned.
+- **Multi-statement or explicit transactions** — one call is one statement; `BEGIN`/`COMMIT` across calls would pin a connection to an agent.
+- **Mongo writes** — Mongo targets are read-only whatever the grant.
+- **In-band approval UI** — no "queue this write for someone to approve" screen (MUST #5: permissions are YAML or the audited admin API).
+- **In-band token minting** — service tokens are config edits plus a rollout ([14](14-service-tokens.md)).
+
+Data corrections and bulk updates belong in your existing runbooks, not in an agent's tool call.
 
 ## Not a database
 

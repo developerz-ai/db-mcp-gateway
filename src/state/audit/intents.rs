@@ -16,8 +16,9 @@ use crate::exec::sql_guard::Access;
 pub async fn insert_intent(pool: &PgPool, intent: &CallIntent<'_>) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO audit_call_intents \
-         (request_id, user_sub, user_email, tool, server_name, database_name, db_type, access) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+         (request_id, user_sub, user_email, tool, server_name, database_name, db_type, access, \
+          upstream_actor, upstream_run_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(intent.request_id.to_string())
     .bind(intent.user_sub)
@@ -27,9 +28,35 @@ pub async fn insert_intent(pool: &PgPool, intent: &CallIntent<'_>) -> Result<(),
     .bind(intent.database)
     .bind(intent.db_type)
     .bind(access_label(intent.access))
+    .bind(intent.upstream_actor)
+    .bind(intent.upstream_run_id)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Of `request_ids`, the ones whose intent row belongs to `user_sub` on
+/// `(server, database)`. Every call that reaches a target commits an intent
+/// first, so this is the ownership check `db_activity` and `cancel_query`
+/// apply before showing or touching another request.
+pub async fn select_owned_request_ids(
+    pool: &PgPool,
+    user_sub: &str,
+    server: &str,
+    database: &str,
+    request_ids: &[String],
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT request_id FROM audit_call_intents \
+         WHERE user_sub = $1 AND server_name = $2 AND database_name = $3 \
+           AND request_id = ANY($4)",
+    )
+    .bind(user_sub)
+    .bind(server)
+    .bind(database)
+    .bind(request_ids)
+    .fetch_all(pool)
+    .await
 }
 
 fn access_label(access: Access) -> &'static str {
@@ -62,11 +89,11 @@ pub async fn reap_abandoned_intents(
     let reaped = sqlx::query(
         "INSERT INTO audit_calls \
          (id, request_id, user_sub, user_email, tool, server_name, database_name, db_type, \
-          outcome, error_message, occurred_at) \
+          outcome, error_message, occurred_at, upstream_actor, upstream_run_id) \
          SELECT gen_random_uuid(), i.request_id, i.user_sub, i.user_email, i.tool, \
                 i.server_name, i.database_name, i.db_type, $1, \
                 'no completion recorded before the gateway stopped (access: ' || i.access || ')', \
-                i.occurred_at \
+                i.occurred_at, i.upstream_actor, i.upstream_run_id \
          FROM audit_call_intents i \
          WHERE i.occurred_at < now() - make_interval(secs => $2) \
            AND NOT EXISTS (SELECT 1 FROM audit_calls c WHERE c.request_id = i.request_id)",

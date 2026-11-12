@@ -57,6 +57,18 @@ alter role mcp_gateway_prod_app_ro set idle_in_transaction_session_timeout = '60
 
 Operators run this with their own admin credentials. The gateway never gets superuser.
 
+**Write tier.** A database that should accept `query_write` gets a *second* role holding only the data privileges it needs, declared as `write_role` / `write_password` next to the read `role`. The gateway never creates or widens it (MUST #3); reads keep using the read-only role.
+
+```sql
+create role mcp_gateway_prod_app_rw with login password :'pw';
+grant connect on database app to mcp_gateway_prod_app_rw;
+grant usage on schema public to mcp_gateway_prod_app_rw;
+grant select, insert, update, delete on table orders, order_items to mcp_gateway_prod_app_rw;
+alter role mcp_gateway_prod_app_rw set statement_timeout = '30s';
+```
+
+Table scoping is these grants — the gateway has no table allow/deny list ([06-permissions](06-permissions.md)).
+
 ## State DB
 
 Co-deployed Postgres. Tiny — audit log is the bulky table and it's pruned (see [07-logging-retention](07-logging-retention.md)). One disk, hourly backups, nothing exotic. Can be the host's existing Postgres if there's a good reason; not recommended because mixing security-sensitive audit data with general app data is asking for trouble.
@@ -95,6 +107,10 @@ Rule: When fronting databases with a connection pool proxy (e.g. pgcat), route t
 | Via cloud-managed proxy (RDS Proxy) | `prod-proxy.proxy.us-east-1.rds.amazonaws.com` | `5432` | `required` | Encryption in-transit expected; network isolation managed by cloud provider. |
 
 Verify the proxy endpoint and port with your infrastructure team. Proxy unavailability will appear in the gateway's startup logs and connection-attempt logs, or the proxy's own health endpoint — not in the gateway's `/readyz` probe (which only checks state DB reachability and the shutdown flag).
+
+## Replicas
+
+Login state for the OAuth bridge (pending `/authorize` flows and authorization codes) lives in process memory. Run one replica, or route `/authorize`, `/auth/callback` and `/token` to the same replica with sticky sessions, so a login's `/authorize` and `/token` hit the same replica. Sessions, refresh tokens, audit and permissions live in the shared state DB and work on any replica.
 
 ## Upgrades
 

@@ -28,7 +28,7 @@ use db_mcp_gateway::exec::AdapterRegistry;
 use db_mcp_gateway::mcp::protocol::TOOLS_LIST;
 use db_mcp_gateway::state::permissions::PermissionsRepo;
 use db_mcp_gateway::state::permissions::pg::PgPermissionsRepo;
-use db_mcp_gateway::tools::{RequestContext, ToolCtx, dispatch_call};
+use db_mcp_gateway::tools::{RequestContext, ToolCtx, Upstream, dispatch_call};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -61,6 +61,7 @@ impl Fixture {
                 ip: None,
                 agent_client: None,
                 request_id: Uuid::new_v4(),
+                upstream: Upstream::Absent,
             },
         }
     }
@@ -167,6 +168,55 @@ async fn rejected_calls_leave_invalid_arguments_rows() {
         "{:?}",
         row.error_message
     );
+
+    delete_audit_calls(&fixture.pool, &user).await;
+}
+
+/// The new introspection tools reject malformed arguments like every other
+/// tool: JSON-RPC `invalid_params` plus an `invalid_arguments` row.
+#[tokio::test]
+async fn introspection_tools_audit_malformed_arguments() {
+    let fixture = Fixture::new().await;
+    let user = fixture.identity.user_sub.clone();
+    let cases = [
+        json!({ "name": "table_stats", "arguments": { "server": "s" } }),
+        json!({ "name": "db_activity", "arguments": { "database": "d" } }),
+        json!({ "name": "cancel_query", "arguments": { "server": "s", "database": "d" } }),
+    ];
+    for params in cases {
+        let tool = params["name"].as_str().unwrap();
+        let response = fixture.call(params.clone()).await;
+        assert_eq!(response["error"]["code"].as_i64(), Some(-32602), "{params}");
+        let row = latest_audit(&fixture.pool, &user, tool, &params.to_string()).await;
+        assert_eq!(row.outcome, "invalid_arguments", "{params}");
+    }
+    delete_audit_calls(&fixture.pool, &user).await;
+}
+
+/// A service call whose upstream claim the transport refused (malformed
+/// header, or `require_upstream` with a header missing) never reaches the
+/// tool: `invalid_params` on the wire, an `invalid_arguments` row naming the
+/// tool it asked for.
+#[tokio::test]
+async fn rejected_upstream_claim_leaves_an_invalid_arguments_row() {
+    let mut fixture = Fixture::new().await;
+    fixture.request.upstream = Upstream::Rejected("upstream headers required");
+    let user = fixture.identity.user_sub.clone();
+
+    let params = json!({ "name": "list_servers", "arguments": {} });
+    let response = fixture.call(params.clone()).await;
+    assert_eq!(
+        response["error"]["code"].as_i64(),
+        Some(-32602),
+        "{response}"
+    );
+    let row = latest_audit(&fixture.pool, &user, "list_servers", "rejected upstream").await;
+    assert_eq!(row.outcome, "invalid_arguments");
+    assert_eq!(
+        row.error_message.as_deref(),
+        Some("upstream headers required")
+    );
+    assert_eq!(row.upstream_run_id, None);
 
     delete_audit_calls(&fixture.pool, &user).await;
 }

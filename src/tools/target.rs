@@ -72,6 +72,8 @@ pub(super) async fn record_intent(
         database: &target.database.name,
         db_type: Some(super::db_type_label(target.server.kind)),
         access,
+        upstream_actor: ctx.request.upstream.actor(),
+        upstream_run_id: ctx.request.upstream.run_id(),
     };
     audit::intent::record(ctx.state_db, &intent)
         .await
@@ -162,6 +164,20 @@ mod tests {
     #[test]
     fn effective_row_limit_grant_still_wins_under_hostile_caller_request() {
         assert_eq!(effective_row_limit(Some(u32::MAX), Some(7), DEFAULT), 7);
+    }
+
+    proptest::proptest! {
+        /// Whatever the caller asks for, the effective limit never exceeds
+        /// the grant (when set) nor the gateway ceiling.
+        #[test]
+        fn effective_row_limit_never_exceeds_grant_or_ceiling(
+            caller in proptest::option::of(proptest::prelude::any::<u32>()),
+            grant in proptest::option::of(proptest::prelude::any::<u32>()),
+            default in 1u32..=CEILING,
+        ) {
+            let bound = grant.unwrap_or(CEILING).min(CEILING);
+            proptest::prop_assert!(effective_row_limit(caller, grant, default) <= bound);
+        }
     }
 
     #[test]

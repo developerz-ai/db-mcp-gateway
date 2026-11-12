@@ -12,9 +12,8 @@
 //!
 //! Contract:
 //!  1. The first key of the JSON object is the *command name*. Only
-//!     `find`, `aggregate`, `count`, `distinct` pass — matches issue #57
-//!     scope. Spec 12 §234 lists a broader allow set; the broader items
-//!     (`listCollections`, `listIndexes`, …) land with execution in #58.
+//!     `find`, `aggregate`, `count`, `distinct`, `listCollections` and
+//!     `listIndexes` pass.
 //!  2. Every other top-level key must be in that command's own allow-list
 //!     ([`allowed_fields`]). This is what stops a read command from carrying
 //!     session or routing state into the driver: `$db` (re-targeting the
@@ -36,7 +35,14 @@ use serde_json::Value;
 /// command name (mongo's wire convention). Anything outside this set is
 /// rejected — including writes (`insert`, `update`, `delete`, `drop`,
 /// `findAndModify`, `bulkWrite`, `createIndex`) and admin commands.
-const ALLOWED_COMMANDS: &[&str] = &["find", "aggregate", "count", "distinct"];
+const ALLOWED_COMMANDS: &[&str] = &[
+    "find",
+    "aggregate",
+    "count",
+    "distinct",
+    "listCollections",
+    "listIndexes",
+];
 
 /// Top-level keys each allowed command may carry besides its name. Shape and
 /// read options only: no session, transaction, write-concern or routing
@@ -86,6 +92,15 @@ fn allowed_fields(command: &str) -> &'static [&'static str] {
             "comment",
         ],
         "distinct" => &["key", "query", "collation", "comment", "hint", "maxTimeMS"],
+        "listCollections" => &[
+            "filter",
+            "nameOnly",
+            "authorizedCollections",
+            "cursor",
+            "comment",
+            "maxTimeMS",
+        ],
+        "listIndexes" => &["cursor", "comment", "maxTimeMS"],
         _ => &[],
     }
 }

@@ -8,6 +8,7 @@ mod parse_errors;
 mod reload_diff;
 mod service_accounts;
 mod structure;
+mod write_tier;
 
 const SAMPLE: &str = r#"
 servers:

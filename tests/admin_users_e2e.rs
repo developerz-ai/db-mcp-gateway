@@ -1600,8 +1600,15 @@ async fn admin_routes_are_concurrency_capped_per_identity() {
         &[ADMIN_GROUP.to_string()],
     )
     .await;
+    // The held requests stay blocked for the whole setup, which on a loaded
+    // runner outlasts `client()`'s 5 s timeout: a timed-out request frees
+    // its slot and the "shed" request is admitted instead. Outlive it.
+    let patient = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap();
     let post_db = || {
-        client()
+        patient
             .post(format!("{}/admin/v1/databases", gw.url))
             .bearer_auth(&jwt)
             .json(&json!({
@@ -1628,7 +1635,7 @@ async fn admin_routes_are_concurrency_capped_per_identity() {
         .unwrap();
 
     let held: Vec<_> = (0..CAP).map(|_| tokio::spawn(post_db())).collect();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let blocked: i64 = sqlx::query(
             // Row-lock waiters queue behind each other, so count every

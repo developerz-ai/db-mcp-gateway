@@ -54,7 +54,21 @@ pub const TOKEN_BODY_CHARS: usize = 64;
 struct ResolvedServiceToken {
     name: String,
     group: String,
+    policy: ServicePolicy,
     token: SecretString,
+}
+
+/// Per-account request policy from `service_accounts:`, attached to every
+/// request the account authenticates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServicePolicy {
+    /// Refuse calls that do not carry both `x-dbmcp-run-id` and
+    /// `x-dbmcp-on-behalf-of` (`invalid_arguments`, audited).
+    pub require_upstream: bool,
+    /// In-flight cap for this account, replacing the per-identity default —
+    /// a fleet of agents behind one token is not capped at one human's share.
+    /// `None` keeps the default.
+    pub max_concurrent_requests: Option<usize>,
 }
 
 impl std::fmt::Debug for ResolvedServiceToken {
@@ -62,6 +76,7 @@ impl std::fmt::Debug for ResolvedServiceToken {
         f.debug_struct("ResolvedServiceToken")
             .field("name", &self.name)
             .field("group", &self.group)
+            .field("policy", &self.policy)
             .field("token", &"<redacted>")
             .finish()
     }
@@ -131,6 +146,12 @@ impl ServiceTokenStore {
             tokens.push(ResolvedServiceToken {
                 name: account.name.clone(),
                 group: account.group.clone(),
+                policy: ServicePolicy {
+                    require_upstream: account.require_upstream,
+                    max_concurrent_requests: account
+                        .max_concurrent_requests
+                        .map(|cap| usize::try_from(cap).unwrap_or(usize::MAX)),
+                },
                 token,
             });
         }
@@ -143,11 +164,17 @@ impl ServiceTokenStore {
     /// exact, constant-time match; `None` defers to the session-JWT path —
     /// a non-match here is NOT an auth failure on its own.
     pub fn authenticate(&self, presented: &str) -> Option<Identity> {
+        self.authenticate_caller(presented)
+            .map(|(identity, _)| identity)
+    }
+
+    /// [`Self::authenticate`] plus the account's [`ServicePolicy`].
+    pub fn authenticate_caller(&self, presented: &str) -> Option<(Identity, ServicePolicy)> {
         let now = Utc::now();
         self.tokens
             .iter()
             .find(|entry| ct_eq(entry.token.expose_secret().as_bytes(), presented.as_bytes()))
-            .map(|entry| entry.identity(now))
+            .map(|entry| (entry.identity(now), entry.policy))
     }
 }
 

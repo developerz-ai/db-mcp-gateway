@@ -30,6 +30,10 @@ fn row() -> AuditRow {
         agent_client: None,
         ip: None,
         db_type: Some("postgres".into()),
+        upstream_actor: None,
+        upstream_run_id: None,
+        rows_affected: None,
+        sql_truncated: false,
     }
 }
 
@@ -54,6 +58,7 @@ fn outcome(code: OutcomeCode, error_message: Option<&str>) -> Outcome {
         row_count: Some(3),
         truncated: Some(false),
         error_message: error_message.map(str::to_string),
+        write: None,
     }
 }
 

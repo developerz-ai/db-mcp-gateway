@@ -114,8 +114,10 @@ async fn revocation_is_stale_on_another_replica_within_cache_ttl() {
     cleanup(&pool, &user_sub).await;
 }
 
-/// Real elapsed-time variant: use a genuine non-zero TTL and sleep past it so
-/// that the cache entry becomes stale by the clock rather than by TTL=0 proxy.
+/// Real elapsed-time variant: use a genuine non-zero TTL and poll until the
+/// cache entry goes stale by the clock rather than by TTL=0 proxy. The
+/// rejection must land no earlier than `ttl` after the warm-up and well
+/// before the deadline — measured, not slept.
 ///
 /// This proves the path that operators actually rely on in production: a session
 /// revoked on one replica is denied by another after at most `ttl` wall-clock
@@ -125,15 +127,17 @@ async fn revocation_denied_after_real_ttl_elapses() {
     let pool = state_pool().await;
     let user_sub = format!("a3-elapsed-{}", Uuid::new_v4().simple());
 
-    // Short TTL so the test stays fast; long enough that the first lookup hits
-    // the cache (not yet stale) and only the second (after sleep) re-validates.
-    let ttl = Duration::from_millis(120);
+    // Short enough to keep the test fast; long enough that a revoke on a
+    // loaded CI runner still lands well inside it.
+    let ttl = Duration::from_secs(1);
     let replica_a = replica(&pool, Duration::from_secs(3600));
     let replica_b = replica(&pool, ttl);
 
     let session = create_session(&replica_a, &user_sub).await;
 
-    // B caches the session as active (first lookup warms the cache).
+    // B caches the session as active (first lookup warms the cache). The
+    // entry is stamped no earlier than `warmed`.
+    let warmed = std::time::Instant::now();
     assert!(
         replica_b.lookup(session.id).await.is_ok(),
         "initial lookup ok"
@@ -148,15 +152,26 @@ async fn revocation_denied_after_real_ttl_elapses() {
         "still within TTL — B serves stale cached entry"
     );
 
-    // Let B's cache entry age past its TTL.
-    sleep(ttl + Duration::from_millis(50)).await;
-
-    // B's entry is now stale → re-reads the DB → sees revoked_at → rejects.
-    let err = replica_b
-        .lookup(session.id)
-        .await
-        .expect_err("revoked session must be denied after TTL elapses");
+    // Once B's entry ages past the TTL it re-reads the DB, sees revoked_at
+    // and rejects.
+    let deadline = warmed + ttl + Duration::from_secs(5);
+    let err = loop {
+        match replica_b.lookup(session.id).await {
+            Err(err) => break err,
+            Ok(_) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "revoked session still served long after the TTL"
+                );
+                sleep(Duration::from_millis(25)).await;
+            }
+        }
+    };
     assert!(matches!(err, AuthError::RevokedSession), "got {err:?}");
+    assert!(
+        warmed.elapsed() >= ttl,
+        "rejected before the cache TTL — the entry was never served from cache"
+    );
 
     cleanup(&pool, &user_sub).await;
 }

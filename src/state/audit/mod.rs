@@ -9,7 +9,7 @@ mod permissions;
 mod retention;
 
 pub use history::select_user_history;
-pub use intents::{insert_intent, reap_abandoned_intents};
+pub use intents::{insert_intent, reap_abandoned_intents, select_owned_request_ids};
 pub use permissions::insert_permissions_change;
 #[cfg(any(test, debug_assertions))]
 pub use permissions::latest_permissions_change;
@@ -35,8 +35,10 @@ pub async fn insert_call(pool: &PgPool, row: &AuditRow) -> Result<(), sqlx::Erro
         "INSERT INTO audit_calls \
          (id, request_id, user_sub, user_email, groups, tool, server_name, database_name, \
           sql, reason, outcome, elapsed_ms, row_count, truncated, error_message, \
-          agent_client, ip, db_type) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+          agent_client, ip, db_type, upstream_actor, upstream_run_id, rows_affected, \
+          sql_truncated) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
+                 $19, $20, $21, $22) \
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(row.id)
@@ -57,6 +59,10 @@ pub async fn insert_call(pool: &PgPool, row: &AuditRow) -> Result<(), sqlx::Erro
     .bind(&row.agent_client)
     .bind(&row.ip)
     .bind(&row.db_type)
+    .bind(&row.upstream_actor)
+    .bind(&row.upstream_run_id)
+    .bind(row.rows_affected)
+    .bind(row.sql_truncated)
     .execute(pool)
     .await?;
     Ok(())
@@ -72,7 +78,8 @@ pub async fn latest_call_for_user_tool(
     let row = sqlx::query(
         "SELECT id, request_id, user_sub, user_email, groups, tool, server_name, database_name, \
                 sql, reason, outcome, elapsed_ms, row_count, truncated, error_message, \
-                agent_client, ip, db_type, occurred_at \
+                agent_client, ip, db_type, upstream_actor, upstream_run_id, rows_affected, \
+                sql_truncated, occurred_at \
          FROM audit_calls WHERE user_sub = $1 AND tool = $2 \
          ORDER BY occurred_at DESC LIMIT 1",
     )
@@ -111,5 +118,9 @@ pub async fn latest_call_for_user_tool(
         agent_client: r.try_get("agent_client")?,
         ip: r.try_get("ip")?,
         db_type: r.try_get("db_type")?,
+        upstream_actor: r.try_get("upstream_actor")?,
+        upstream_run_id: r.try_get("upstream_run_id")?,
+        rows_affected: r.try_get("rows_affected")?,
+        sql_truncated: r.try_get("sql_truncated")?,
     }))
 }

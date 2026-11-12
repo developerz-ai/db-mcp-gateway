@@ -9,7 +9,8 @@
 //!    verified then resolved in the store (which honors revocation and expiry).
 //!
 //! On success, an `Identity` is attached to request extensions for downstream
-//! handlers and the audit layer to read.
+//! handlers and the audit layer to read; a service token also attaches its
+//! account's `ServicePolicy`.
 
 use axum::Json;
 use axum::extract::{Request, State};
@@ -41,8 +42,12 @@ pub async fn bearer_auth(
     // Service tokens first: an exact static match needs no DB round-trip, and
     // a non-match costs nothing (constant-time compare against a handful of
     // configured values) before the JWT path runs unchanged.
-    let identity = match auth.service_tokens.load().authenticate(&token) {
-        Some(identity) => identity,
+    let identity = match auth.service_tokens.load().authenticate_caller(&token) {
+        Some((identity, policy)) => {
+            // Read by the concurrency limiter and the upstream-header check.
+            req.extensions_mut().insert(policy);
+            identity
+        }
         None => match resolve_identity(auth, &token).await {
             Ok(id) => id,
             Err(err) if err.is_credential_failure() => return unauthorized(&state, &req, err),

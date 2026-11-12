@@ -21,6 +21,11 @@ fn min_option_naive(a: Option<u32>, b: Option<u32>) -> Option<u32> {
 
 proptest! {
     #[test]
+    fn merge_is_idempotent(a in any_constraints()) {
+        prop_assert_eq!(merge(&a, &a), a);
+    }
+
+    #[test]
     fn merge_is_commutative(a in any_constraints(), b in any_constraints()) {
         prop_assert_eq!(merge(&a, &b), merge(&b, &a));
     }

@@ -14,8 +14,8 @@ use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
 use common::pg_target::{
-    TARGET_DB, TARGET_HOST, TARGET_PASSWORD, TARGET_PORT, TARGET_USER, adapter,
-    single_connection_adapter,
+    READ_ROLE, TARGET_DB, TARGET_HOST, TARGET_PASSWORD, TARGET_PORT, TARGET_USER, adapter,
+    single_connection_adapter, writable_adapter,
 };
 use db_mcp_gateway::exec::{
     Access, DbAdapter, ExecError, ExecQuery, MAX_RESULT_BYTES, RejectionKind,
@@ -28,6 +28,8 @@ fn query<'a>(sql: &'a str, timeout_ms: Option<u32>, row_limit: u32) -> ExecQuery
         statement_timeout_ms: timeout_ms,
         row_limit,
         access: Access::ReadOnly,
+        dry_run: false,
+        request_id: Uuid::new_v4(),
     }
 }
 
@@ -266,6 +268,8 @@ async fn dropped_query_future_cancels_backend() {
             statement_timeout_ms: Some(30_000),
             row_limit: 10,
             access: Access::ReadOnly,
+            dry_run: false,
+            request_id: Uuid::new_v4(),
         };
         let _ = a.execute(q).await;
     });
@@ -479,6 +483,8 @@ async fn zero_row_bound_query_still_reports_column_names() {
             statement_timeout_ms: None,
             row_limit: 10,
             access: Access::ReadOnly,
+            dry_run: false,
+            request_id: Uuid::new_v4(),
         })
         .await
         .expect("bound empty SELECT runs");
@@ -571,7 +577,7 @@ async fn read_access_cannot_write_on_a_write_capable_role() {
 /// Rolling it back after reporting success was the bug.
 #[tokio::test]
 async fn truncated_write_commits_and_reports_rows_affected() {
-    let a = adapter().await;
+    let a = writable_adapter().await;
     let probe = probe_pool().await;
     let table = scratch_table(&probe).await;
 
@@ -612,7 +618,7 @@ async fn truncated_write_commits_and_reports_rows_affected() {
 /// with no rows.
 #[tokio::test]
 async fn rows_affected_is_reported_for_writes_only() {
-    let a = adapter().await;
+    let a = writable_adapter().await;
     let probe = probe_pool().await;
     let table = scratch_table(&probe).await;
 
@@ -823,4 +829,201 @@ async fn enum_values_decode_as_their_label() {
         .execute(&probe)
         .await;
     assert_eq!(r.expect("query runs").rows[0][0], "sad");
+}
+
+// ---------------------------------------------------------------------------
+// Agent power (plan 101 slice 12): write tier, dry run, explain, introspection
+// ---------------------------------------------------------------------------
+
+fn current_user(result: &db_mcp_gateway::exec::ExecResult) -> &str {
+    result.rows[0][0].as_str().expect("current_user is text")
+}
+
+/// Reads connect as the read role and writes as the write role — the read
+/// tier never reaches a write-capable role, whatever the SQL.
+#[tokio::test]
+async fn reads_run_as_role_and_writes_as_write_role() {
+    let a = writable_adapter().await;
+    let read = a
+        .execute(query("SELECT current_user::text", None, 1))
+        .await
+        .expect("read runs");
+    let write = a
+        .execute(write_query("SELECT current_user::text", 1))
+        .await
+        .expect("write-tier statement runs");
+    assert_eq!(current_user(&read), READ_ROLE);
+    assert_eq!(current_user(&write), TARGET_USER);
+}
+
+/// The read role holds SELECT only, so even a read-write transaction on the
+/// read tier could not write — but the adapter never offers one: a write on
+/// a database without `write_role` is refused before any connection.
+#[tokio::test]
+async fn write_without_write_role_is_refused() {
+    let a = adapter().await;
+    let err = a
+        .execute(write_query("SELECT 1", 1))
+        .await
+        .expect_err("no write tier");
+    assert!(matches!(err, ExecError::WriteNotConfigured), "{err:?}");
+}
+
+/// `dry_run` runs the write, reports `rows_affected`, and leaves no change.
+#[tokio::test]
+async fn dry_run_reports_rows_affected_and_rolls_back() {
+    let a = writable_adapter().await;
+    let probe = probe_pool().await;
+    let table = scratch_table(&probe).await;
+    let result = a
+        .execute(ExecQuery {
+            dry_run: true,
+            ..write_query(&format!("INSERT INTO \"{table}\" (id) VALUES (1), (2)"), 10)
+        })
+        .await
+        .expect("dry run executes");
+    let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{table}\""))
+        .fetch_one(&probe)
+        .await
+        .expect("count rows");
+    drop_table(&probe, &table).await;
+    assert_eq!(result.rows_affected, Some(2));
+    assert_eq!(rows, 0, "dry run left a change behind");
+}
+
+fn explain(sql: &str, access: Access, analyze: bool) -> db_mcp_gateway::exec::ExplainQuery<'_> {
+    db_mcp_gateway::exec::ExplainQuery {
+        sql: db_mcp_gateway::exec::GuardedSql::parse(sql, access).expect("guarded"),
+        analyze,
+        statement_timeout_ms: None,
+        request_id: Uuid::new_v4(),
+    }
+}
+
+/// `analyze` runs a read and reports actual timings; a write is planned
+/// (under the write role, in a read-only transaction) but never run.
+#[tokio::test]
+async fn explain_analyzes_reads_and_only_plans_writes() {
+    let a = writable_adapter().await;
+    let probe = probe_pool().await;
+    let table = scratch_table(&probe).await;
+
+    let analyzed = a
+        .explain(explain("SELECT 1 AS one", Access::ReadOnly, true))
+        .await
+        .expect("explain analyze of a read");
+    let plan = analyzed.rows[0][0].to_string();
+    assert!(plan.contains("Actual Total Time"), "{plan}");
+
+    let planned = a
+        .explain(explain(
+            &format!("INSERT INTO \"{table}\" (id) VALUES (1)"),
+            Access::ReadWrite,
+            false,
+        ))
+        .await
+        .expect("explain of a write");
+    assert!(planned.rows[0][0].to_string().contains("Insert"));
+
+    let refused = a
+        .explain(explain(
+            &format!("DELETE FROM \"{table}\""),
+            Access::ReadWrite,
+            true,
+        ))
+        .await
+        .expect_err("analyze of a write");
+    let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{table}\""))
+        .fetch_one(&probe)
+        .await
+        .expect("count rows");
+    drop_table(&probe, &table).await;
+    assert!(matches!(refused, ExecError::Forbidden(_)), "{refused:?}");
+    assert_eq!(rows, 0, "explain wrote");
+}
+
+/// `table_stats` covers the tables the read role can SELECT, indexes
+/// included.
+#[tokio::test]
+async fn table_stats_reports_size_and_indexes() {
+    let a = writable_adapter().await;
+    let probe = probe_pool().await;
+    let table = scratch_table(&probe).await;
+    let result = a
+        .table_stats(db_mcp_gateway::exec::TableStatsQuery {
+            schema: "public",
+            table: Some(&table),
+            statement_timeout_ms: None,
+            row_limit: 10,
+            request_id: Uuid::new_v4(),
+        })
+        .await
+        .expect("table stats");
+    drop_table(&probe, &table).await;
+    assert_eq!(result.rows.len(), 1, "{result:?}");
+    let column = |name: &str| {
+        let i = result
+            .columns
+            .iter()
+            .position(|c| c == name)
+            .unwrap_or_else(|| panic!("column {name} in {:?}", result.columns));
+        result.rows[0][i].clone()
+    };
+    assert_eq!(column("table"), serde_json::json!(table));
+    assert!(column("total_bytes").as_i64().is_some());
+    let indexes = column("indexes");
+    assert_eq!(indexes.as_array().map(Vec::len), Some(1), "{indexes}");
+}
+
+/// A running statement shows up in `db_activity` under its gateway request
+/// id, and `cancel_request` stops it: the victim fails as `Cancelled`, not
+/// `Timeout`.
+#[tokio::test]
+async fn activity_lists_and_cancel_stops_a_request() {
+    let a = std::sync::Arc::new(writable_adapter().await);
+    let victim_id = Uuid::new_v4();
+    let victim = {
+        let a = std::sync::Arc::clone(&a);
+        tokio::spawn(async move {
+            a.execute(ExecQuery {
+                request_id: victim_id,
+                ..query("SELECT pg_sleep(20)", Some(30_000), 1)
+            })
+            .await
+        })
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let listed = loop {
+        let activity = a
+            .db_activity(db_mcp_gateway::exec::ActivityQuery {
+                statement_timeout_ms: None,
+                row_limit: 100,
+                request_id: Uuid::new_v4(),
+            })
+            .await
+            .expect("activity");
+        let request_col = activity
+            .columns
+            .iter()
+            .position(|c| c == "request_id")
+            .expect("request_id column");
+        if activity
+            .rows
+            .iter()
+            .any(|row| row[request_col] == serde_json::json!(victim_id.to_string()))
+        {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(listed, "victim never listed in db_activity");
+
+    assert!(a.cancel_request(victim_id).await.expect("cancel runs"));
+    let outcome = victim.await.expect("victim task");
+    assert!(matches!(outcome, Err(ExecError::Cancelled)), "{outcome:?}");
+    assert!(!a.cancel_request(victim_id).await.expect("second cancel"));
 }

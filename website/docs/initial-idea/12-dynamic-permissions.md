@@ -276,6 +276,10 @@ pub enum DbKind {
 
 Existing pg execution moves behind `DbAdapter` with no behavior change. Read-only enforcement stays at the role level (per-DB `ro_*` roles in the target DB) + statement classification at the gateway. See [05-credentials](05-credentials.md).
 
+**One role per tier.** A database that accepts writes declares `write_role` + `write_password` beside its read `role`, and the adapter keeps two pools keyed `(server, database, read|write)`. Every read — a `query_write` caller's `SELECT` included — runs as `role` in a `READ ONLY` transaction; only a data write under `query_write` runs as `write_role`. A YAML `query_write` grant whose databases (wildcards expanded against the configured ones) lack a `write_role` fails boot ([08-config](08-config.md)); a DB-backed `query_write` grant on such a database is refused at request time with `forbidden`. The read tier never reaches a write-capable role.
+
+Introspection (`table_stats`, `db_activity`, `cancel_query` — [03](03-mcp-tools.md)) runs on the read pool. The adapter tags every backend with the gateway `request_id` through `application_name`, which is how `db_activity` names requests and `cancel_query` finds one; the tool, not the adapter, checks that the request is the caller's own.
+
 ### Mongo adapter
 
 Read-only enforcement is the interesting part. Mongo doesn't have a single "READ ONLY" role flag we can rely on the same way as a Postgres role; some "read" commands can write (`$out`, `$merge` in aggregation pipelines, `$function` server-side JS with side effects). The adapter rejects:
@@ -286,6 +290,8 @@ Read-only enforcement is the interesting part. Mongo doesn't have a single "READ
 - Any top-level key outside the command's own allow-list (`src/exec/mongo/rejector/mod.rs`, `allowed_fields`). The lists hold shape and read options only (`filter`, `sort`, `projection`, `pipeline`, `cursor`, `limit`, `collation`, …), so no `$`-prefixed key (`$db` would re-target the command at another database, `$readPreference` re-routes it), no session or transaction field (`lsid`, `txnNumber`, `autocommit`, `startTransaction`), no `writeConcern`, and no cursor-lifetime knob (`tailable`, `awaitData`, `noCursorTimeout`) reaches the driver. Before this, a `$db` key was forwarded and the server (8.0) refused the duplicate `$db` itself — safe by the server's grace, not the gateway's.
 
 The connection still uses a least-privilege mongo role (read-only on the target DB) — defense in depth, same posture as the pg `ro_*` roles.
+
+`describe_schema` and `sample_table` work on Mongo too: `describe_schema` is `listCollections` + `listIndexes` (collections with their indexes; `schema` is ignored, `table` names one collection) and `sample_table` is a `find` with the sample limit. Mongo writes stay out of scope ([10](10-non-goals.md)); `write_role` on a Mongo database fails boot.
 
 Timeouts via `maxTimeMS`. Row caps via a server-side limit of `row_limit + 1` (`find` `limit`/`batchSize`, a trailing `$limit` stage on `aggregate`) plus the gateway's row and byte budget at the adapter. A reply missing its documented field, or a document that cannot be rendered, is a typed error — never a fabricated `null`. Cancellation: `killOp` on client disconnect, best-effort and requires an opt-in privilege — see [config-reference.md §Mongo](../deployment/config-reference.md#mongo) for the full contract (`statement_timeout_ms` is the guaranteed bound either way, same as pg's belt-and-suspenders `tokio::time::timeout`).
 

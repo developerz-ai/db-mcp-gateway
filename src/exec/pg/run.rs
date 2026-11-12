@@ -1,8 +1,9 @@
 //! Per-query transaction orchestration: open the transaction in the caller's
 //! access mode, tag it, arm the cancel guard, apply the DB-side
-//! `statement_timeout`, stream rows up to the budget, then commit or cancel.
+//! `statement_timeout`, stream rows up to the budget, then commit, roll back
+//! (`dry_run`) or cancel.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use serde_json::Value;
@@ -10,8 +11,9 @@ use sqlx::{Column, Connection, Either, Executor, PgConnection, PgPool, Postgres,
 
 use crate::audit::drain::DetachedTasks;
 
-use super::super::adapter::{ExecError, ExecQuery, ExecResult, effective_timeout_ms};
+use super::super::adapter::{ExecError, ExecResult, effective_timeout_ms};
 use super::super::budget::ResultBudget;
+use super::super::query::ExecQuery;
 use super::super::sql_guard::Access;
 use super::cancel::{Backend, BackendTag, CancelOnDrop};
 use super::decode::{decode_row, decoders};
@@ -48,7 +50,7 @@ pub(super) async fn run_query_inner(
     // database's own enforcement of a read grant — the SQL guard is the
     // second layer, not the only one. Every interpolated value is a number
     // or a `BackendTag`, which contains no quote.
-    let tag = BackendTag::new();
+    let tag = BackendTag::for_request(query.request_id);
     let ms = effective_timeout_ms(query.statement_timeout_ms);
     let mode = match query.access {
         Access::ReadOnly => "READ ONLY",
@@ -90,24 +92,21 @@ pub(super) async fn run_query_inner(
         } else {
             collected.columns
         };
-        let rows_affected = match query.access {
-            Access::ReadOnly if collected.truncated => {
-                cancel_and_rollback(tx, ctx.cancel_pool, &backend).await;
-                None
-            }
-            Access::ReadOnly => {
-                tx.commit().await.map_err(|e| classify(e, role))?;
-                None
-            }
+        if query.access == Access::ReadOnly && collected.truncated {
+            cancel_and_rollback(tx, ctx.cancel_pool, &backend).await;
+        } else if query.dry_run {
+            // The statement ran to completion; its effect is discarded. A
+            // failed rollback is an error: the change must not be reported
+            // as undone unless it was.
+            tx.rollback().await.map_err(|e| classify(e, role))?;
+        } else {
             // A write is never cut short: the stream was drained, so the
             // statement completed, and it commits whether or not the
             // `RETURNING` rows were truncated. A failed commit is an error —
             // never success after a rollback.
-            Access::ReadWrite => {
-                tx.commit().await.map_err(|e| classify(e, role))?;
-                Some(collected.rows_affected)
-            }
-        };
+            tx.commit().await.map_err(|e| classify(e, role))?;
+        }
+        let rows_affected = (query.access == Access::ReadWrite).then_some(collected.rows_affected);
         Ok(ExecResult {
             columns,
             rows: collected.rows,
@@ -118,7 +117,19 @@ pub(super) async fn run_query_inner(
     }
     .await;
     cancel.disarm();
-    result
+    result.map_err(|err| cancelled_before_budget(err, started.elapsed(), ms))
+}
+
+/// `statement_timeout` and `pg_cancel_backend` both raise SQLSTATE `57014`.
+/// The timeout cannot fire before its budget, so a `57014` earlier than that
+/// is a cancel: the `cancel_query` tool, or an operator.
+fn cancelled_before_budget(err: ExecError, elapsed: Duration, budget_ms: u32) -> ExecError {
+    match err {
+        ExecError::Timeout if elapsed < Duration::from_millis(u64::from(budget_ms)) => {
+            ExecError::Cancelled
+        }
+        other => other,
+    }
 }
 
 /// Stream the statement, collecting rows until the budget runs out. A read
@@ -200,5 +211,20 @@ async fn describe_columns(tx: &mut Transaction<'_, Postgres>, sql: &str) -> Vec<
             .map(|c| c.name().to_string())
             .collect(),
         Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_early_query_canceled_is_a_cancel_not_a_timeout() {
+        let early = cancelled_before_budget(ExecError::Timeout, Duration::from_millis(10), 1_000);
+        assert!(matches!(early, ExecError::Cancelled), "{early:?}");
+        let late = cancelled_before_budget(ExecError::Timeout, Duration::from_millis(1_000), 1_000);
+        assert!(matches!(late, ExecError::Timeout), "{late:?}");
+        let other = cancelled_before_budget(ExecError::Sql, Duration::ZERO, 1_000);
+        assert!(matches!(other, ExecError::Sql), "{other:?}");
     }
 }

@@ -3,18 +3,19 @@
 //! Action: `SchemaRead`. The adapter runs the catalog lookup; schema/table
 //! reach it as bound values, never interpolated identifiers.
 //!
-//! Per the issue body, the response shape is tables + columns + types only;
-//! PK/FK/indexes (mentioned in spec doc 03 §describe_schema) are deferred to
-//! a follow-up.
+//! Postgres answers tables + columns + types (PK/FK/indexes from spec 03
+//! §describe_schema are deferred); Mongo answers collections + their indexes
+//! (see [`mongo`]).
+
+mod mongo;
 
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{Action, Grant};
-use crate::exec::sql_guard::Access;
-use crate::exec::{ExecResult, SchemaQuery};
+use crate::config::{Action, Grant, ServerKind};
+use crate::exec::{Access, ExecResult, SchemaQuery};
 use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
@@ -86,10 +87,14 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
 
     // The catalog read is scoped to a schema (and optionally one table);
     // that scope is what the audit row records as what was read.
+    // Mongo has no schemas: the database is the namespace.
+    let db_type = super::db_type_for_server(ctx.config, &args.server);
     let schema = args.schema.as_deref().unwrap_or(DEFAULT_SCHEMA);
-    let read = match args.table.as_deref() {
-        Some(table) => format!("{schema}.{table}"),
-        None => schema.to_string(),
+    let read = match (db_type, args.table.as_deref()) {
+        (Some("mongo"), Some(collection)) => format!("{}.{collection}", args.database),
+        (Some("mongo"), None) => args.database.clone(),
+        (_, Some(table)) => format!("{schema}.{table}"),
+        (_, None) => schema.to_string(),
     };
     let header = AuditHeader {
         tool: TOOL_NAME,
@@ -97,7 +102,7 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
         database: Some(&args.database),
         sql: Some(&read),
         reason: None,
-        db_type: super::db_type_for_server(ctx.config, &args.server),
+        db_type,
     };
     let args = &args;
     run_audited(ctx, id, header, |id, grants| async move {
@@ -143,40 +148,33 @@ async fn compute_outcome(
         table: args.table.as_deref(),
         statement_timeout_ms: target.constraints.statement_timeout_ms,
         row_limit: MAX_CATALOG_ROWS,
+        request_id: ctx.request.request_id,
     };
-    let result = adapter.describe_schema(query).await;
-
-    match result {
-        Ok(exec_result) => {
-            let elapsed = i64::try_from(exec_result.elapsed_ms).unwrap_or(i64::MAX);
-            let payload = match assemble_tables(&exec_result) {
-                Ok(p) => p,
-                Err(_) => {
-                    return error_outcome(
-                        OutcomeCode::Internal,
-                        "catalog response shape changed unexpectedly",
-                    );
-                }
-            };
-            let table_count = i64::try_from(payload.tables.len()).unwrap_or(i64::MAX);
-            let text = match serde_json::to_string(&payload) {
-                Ok(t) => t,
-                Err(_) => {
-                    return error_outcome(OutcomeCode::Internal, "failed to serialize result");
-                }
-            };
-            // row_count = number of tables surfaced; the truncation flag
-            // lets operators tell a clipped schema from a complete one.
-            success_outcome(
-                id,
-                text,
-                Some(elapsed),
-                Some(table_count),
-                Some(payload.truncated),
-            )
-        }
+    match adapter.describe_schema(query).await {
+        Ok(exec_result) => schema_outcome(id, target.server.kind, &exec_result),
         Err(err) => outcome_from_exec_error(err, started, &ERROR_MESSAGES),
     }
+}
+
+/// Render the catalog rows in the engine's shape. `row_count` = tables (or
+/// collections) surfaced; the truncation flag lets operators tell a clipped
+/// schema from a complete one.
+fn schema_outcome(id: Value, kind: ServerKind, result: &ExecResult) -> Outcome {
+    let elapsed = i64::try_from(result.elapsed_ms).unwrap_or(i64::MAX);
+    let rendered = match kind {
+        ServerKind::Mongo => mongo::assemble_collections(result)
+            .map(|payload| (payload.collections.len(), serde_json::to_string(&payload))),
+        ServerKind::Postgres | ServerKind::Mysql | ServerKind::Mssql => assemble_tables(result)
+            .map(|payload| (payload.tables.len(), serde_json::to_string(&payload))),
+    };
+    let Ok((count, Ok(text))) = rendered else {
+        return error_outcome(
+            OutcomeCode::Internal,
+            "catalog response shape changed unexpectedly",
+        );
+    };
+    let count = i64::try_from(count).unwrap_or(i64::MAX);
+    success_outcome(id, text, Some(elapsed), Some(count), Some(result.truncated))
 }
 
 /// Group `information_schema.columns` rows by `(schema, table_name)` into the
@@ -224,68 +222,5 @@ fn assemble_tables(result: &ExecResult) -> Result<DescribeSchemaResult, ()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Confirms `assemble_tables` correctly groups consecutive rows by
-    /// (schema, table_name) and decodes is_nullable from the YES/NO text
-    /// that information_schema returns.
-    #[test]
-    fn assemble_groups_by_table_and_decodes_nullable() {
-        let rows = vec![
-            vec![
-                Value::from("public"),
-                Value::from("users"),
-                Value::from("id"),
-                Value::from("bigint"),
-                Value::from("NO"),
-            ],
-            vec![
-                Value::from("public"),
-                Value::from("users"),
-                Value::from("email"),
-                Value::from("text"),
-                Value::from("YES"),
-            ],
-            vec![
-                Value::from("public"),
-                Value::from("orders"),
-                Value::from("id"),
-                Value::from("bigint"),
-                Value::from("NO"),
-            ],
-        ];
-        let exec_result = ExecResult {
-            columns: vec![
-                "table_schema".into(),
-                "table_name".into(),
-                "column_name".into(),
-                "data_type".into(),
-                "is_nullable".into(),
-            ],
-            rows,
-            truncated: false,
-            elapsed_ms: 0,
-            rows_affected: None,
-        };
-        let assembled = assemble_tables(&exec_result).unwrap();
-        assert_eq!(assembled.tables.len(), 2);
-        assert_eq!(assembled.tables[0].name, "users");
-        assert_eq!(assembled.tables[0].columns.len(), 2);
-        assert!(!assembled.tables[0].columns[0].nullable);
-        assert!(assembled.tables[0].columns[1].nullable);
-        assert_eq!(assembled.tables[1].name, "orders");
-        assert_eq!(assembled.tables[1].columns.len(), 1);
-        assert!(!assembled.truncated);
-
-        // Capped scan: the table the cut fell in may be partial, so it goes.
-        let capped = ExecResult {
-            truncated: true,
-            ..exec_result
-        };
-        let assembled = assemble_tables(&capped).unwrap();
-        assert!(assembled.truncated);
-        assert_eq!(assembled.tables.len(), 1);
-        assert_eq!(assembled.tables[0].name, "users");
-    }
-}
+#[path = "tests.rs"]
+mod tests;

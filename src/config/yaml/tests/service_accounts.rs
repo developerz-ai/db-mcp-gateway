@@ -34,6 +34,28 @@ fn parses_service_accounts() {
     // The token is a `Password` (Deserialize-only secret ref) — match the
     // variant rather than ever printing it.
     assert!(matches!(account.token, crate::config::Password::Literal(_)));
+    assert_eq!(account.max_concurrent_requests, None);
+    assert!(!account.require_upstream);
+}
+
+#[test]
+fn parses_per_account_limits() {
+    let yaml =
+        format!("{SERVICE_YAML}    max_concurrent_requests: 64\n    require_upstream: true\n");
+    let config = ConfigFile::from_yaml_str(&yaml).expect("limits parse");
+    let account = &config.service_accounts[0];
+    assert_eq!(account.max_concurrent_requests, Some(64));
+    assert!(account.require_upstream);
+}
+
+#[test]
+fn rejects_zero_max_concurrent_requests() {
+    let yaml = format!("{SERVICE_YAML}    max_concurrent_requests: 0\n");
+    let err = ConfigFile::from_yaml_str(&yaml).expect_err("zero cap must reject");
+    let ConfigFileError::Invalid(msg) = err else {
+        panic!("expected Invalid, got {err:?}");
+    };
+    assert!(msg.contains("max_concurrent_requests: 0"), "{msg}");
 }
 
 #[test]

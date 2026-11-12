@@ -19,7 +19,7 @@ Every `tools/call` gets one `audit_calls` row — including calls rejected befor
 
 A call that reaches a target database is written twice:
 
-1. **Intent** — after authz, before the gateway opens the target pool, it commits an `audit_call_intents` row: `request_id`, `occurred_at`, `user_sub`, `user_email`, `tool`, `server_name`, `database_name`, `db_type`, `access` (`read` or `write`). If that write fails, the call is refused with `audit_unavailable` and the target is never reached.
+1. **Intent** — after authz, before the gateway opens the target pool, it commits an `audit_call_intents` row: `request_id`, `occurred_at`, `user_sub`, `user_email`, `tool`, `server_name`, `database_name`, `db_type`, `access` (`read` or `write`), and the caller's claimed `upstream_actor` / `upstream_run_id` (migration 0014; the reaper copies them into the `abandoned` row). If that write fails, the call is refused with `audit_unavailable` and the target is never reached.
 2. **Completion** — after the tool's work, the `audit_calls` row with the outcome, under the same `request_id`. If that write fails, the client gets `audit_unavailable`; a drop guard retries the row with outcome `audit_unavailable` and the tool's own outcome in `error_message`.
 
 Every target call writes an intent — reads and writes alike (owner decision, plan 101). Revisit writes-only if the benchmark shows the extra insert matters; production volume today is tens of calls a day.
@@ -45,15 +45,18 @@ Every target call writes an intent — reads and writes alike (owner decision, p
 | `server_name`, `database_name` | Logical names; NULL for tools that address neither, or when the arguments never parsed |
 | `db_type` | `postgres` / `mongo`; NULL for tools that reach no target |
 | `tool` | `run_query`, `describe_schema`, …; `unknown` for an unknown or missing tool name |
-| `sql` | What the call read: the agent's SQL for `run_query` / `explain`; `schema.table` for `sample_table`; `schema` or `schema.table` for `describe_schema`; NULL for tools that read no table |
+| `sql` | What the call read: the agent's SQL for `run_query` / `explain`; `schema.table` for `sample_table` / `table_stats`; `schema` or `schema.table` for `describe_schema` (`database[.collection]` on Mongo); the target `request_id` for `cancel_query`; NULL for tools that read no table |
+| `sql_truncated` | `sql` was cut at the 64 KiB stored-SQL cap (on a character boundary) — one huge statement must not make a huge row in the store or the SIEM export |
 | `reason` | User-provided reason string, if any |
 | `row_count` | Final row count returned (after truncation) |
+| `rows_affected` | Rows a write changed (rolled back again under `dry_run`); NULL for reads |
+| `upstream_actor`, `upstream_run_id` | `x-dbmcp-on-behalf-of` / `x-dbmcp-run-id` a **service-token** caller claimed ([14-service-tokens](14-service-tokens.md)). Unverified — stored for attribution, never used for authz; `user_sub` stays `service:<name>`. NULL for SSO sessions |
 | `truncated` | Whether the row cap cut the result |
 | `elapsed_ms` | Wall-clock of the tool's work |
-| `outcome` | The spec [03](03-mcp-tools.md) code the client saw: `success`, `forbidden`, `forbidden_sql`, `invalid_arguments`, `reason_required`, `timeout`, `syntax_error`, `unavailable`, `audit_unavailable`, `internal`, …; plus `cancelled` and `abandoned`, which only the audit log carries |
+| `outcome` | The spec [03](03-mcp-tools.md) code the client saw: `success`, `dry_run`, `forbidden`, `forbidden_sql`, `invalid_arguments`, `reason_required`, `timeout`, `syntax_error`, `unavailable`, `audit_unavailable`, `internal`, …; plus `cancelled` and `abandoned`, which only the audit log carries |
 | `error_message` | The sanitized message the client got — no credentials or raw connection details |
 
-`sql` is stored verbatim. There is no per-database `sql_capture` (redacted / metadata-only) policy; a database whose literals must not be stored should not be reachable through `run_query`.
+`sql` is stored verbatim up to the cap. There is no per-database `sql_capture` (redacted / metadata-only) policy; a database whose literals must not be stored should not be reachable through `run_query`.
 
 ## Storage
 
@@ -128,6 +131,8 @@ The dispatch line (`message = "tool dispatched"`) carries additionally:
 | `db` | string | Logical database name from call args, empty for tools that aren't database-scoped |
 | `outcome` | string | The spec 03 code the client saw (`success` / `forbidden` / `forbidden_sql` / `invalid_arguments` / `timeout` / `syntax_error` / `unavailable` / `audit_unavailable` / `internal` / …). Emitted after the audit write, so an audit failure logs `audit_unavailable` |
 | `duration_ms` | integer | Wall-clock the tool itself took. `0` for outcomes where no tool work ran (e.g. `forbidden` before dispatch). |
+| `access` | string | `write` when the call ran with write access (a data write, or EXPLAIN of one, under `query_write`), else `read` |
+| `upstream_run_id`, `upstream_actor` | string | Only on a service-token call that claimed them; unverified |
 
 The audit-write-failure line adds:
 
@@ -137,7 +142,7 @@ The audit-write-failure line adds:
 | `class` | string | Credential-free cause (`pool_timed_out`, `database/<sqlstate>`, `timeout`, …) — never the driver error's text |
 | `tool_outcome` | string | The outcome the tool produced before the audit write failed |
 
-Audit metrics: `tool_calls{tool,outcome}` (outcome as above), `audit_write_duration_seconds`, `audit_fallback_failures_total` (a drop-guard retry that also failed — that call's row exists only if its intent is reaped), `audit_stream_dropped_total{sink}`.
+Audit metrics: `tool_calls{tool,outcome,access}` (outcome as above; `access` is `read`, `write`, or `unknown` for a call dropped before its tool decided), `audit_write_duration_seconds`, `audit_fallback_failures_total` (a drop-guard retry that also failed — that call's row exists only if its intent is reaped), `audit_stream_dropped_total{sink}`.
 
 Renames or removals of any field above are contract breaks. Additions are fine.
 

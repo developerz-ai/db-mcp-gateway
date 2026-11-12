@@ -87,6 +87,10 @@ async fn write_audit_row(
         agent_client: None,
         ip: None,
         db_type: Some("postgres".to_string()),
+        upstream_actor: None,
+        upstream_run_id: None,
+        rows_affected: None,
+        sql_truncated: false,
     };
     log(pool, &row).await.expect("audit insert");
     // Bump occurred_at backwards so the test is deterministic regardless of
@@ -556,4 +560,59 @@ async fn history_query_uses_the_history_index() {
         "index must serve the order: {plan}"
     );
     delete_audit_calls(pool, &booted.user_sub).await;
+}
+
+/// Agents sharing one service token do not read each other's history: a
+/// caller that claims a run id sees only that run's rows; one that claims
+/// none sees every row of the identity. A row stored with `sql_truncated`
+/// (cut at the audit cap, migration 0014) stays flagged in history.
+#[tokio::test]
+async fn history_filters_by_claimed_run_id() {
+    use db_mcp_gateway::audit::HistoryQuery;
+    use db_mcp_gateway::state::audit::select_user_history;
+
+    let pool = common::env::state_pool().await;
+    let user_sub = format!("service:history-{}", Uuid::new_v4().simple());
+    for (run, sql_truncated) in [("run-a", true), ("run-b", false)] {
+        sqlx::query(
+            "INSERT INTO audit_calls \
+             (id, request_id, user_sub, user_email, tool, server_name, database_name, sql, \
+              outcome, upstream_run_id, upstream_actor, rows_affected, sql_truncated) \
+             VALUES (gen_random_uuid(), gen_random_uuid()::text, $1, 'svc@x.invalid', \
+                     'run_query', 'target', 'app', $2, 'success', $2, 'alice', 3, $3)",
+        )
+        .bind(&user_sub)
+        .bind(run)
+        .bind(sql_truncated)
+        .execute(&pool)
+        .await
+        .expect("seed run row");
+    }
+    let query = |run: Option<&'static str>| HistoryQuery {
+        user_sub: &user_sub,
+        server: "target",
+        database: "app",
+        upstream_run_id: run,
+        since: None,
+        before: None,
+        limit: 10,
+    };
+
+    let run_a = select_user_history(&pool, &query(Some("run-a")))
+        .await
+        .unwrap();
+    assert_eq!(run_a.entries.len(), 1);
+    assert_eq!(run_a.entries[0].sql.as_deref(), Some("run-a"));
+    assert!(run_a.entries[0].sql_truncated, "stored flag survives");
+    assert_eq!(run_a.entries[0].rows_affected, Some(3));
+
+    let unknown = select_user_history(&pool, &query(Some("run-z")))
+        .await
+        .unwrap();
+    assert!(unknown.entries.is_empty());
+
+    let all = select_user_history(&pool, &query(None)).await.unwrap();
+    assert_eq!(all.entries.len(), 2);
+
+    delete_audit_calls(&pool, &user_sub).await;
 }

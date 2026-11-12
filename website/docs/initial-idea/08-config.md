@@ -44,6 +44,10 @@ servers:
       - name: app
         role: mcp_gateway_staging_app_ro
         password: ${FILE:/run/secrets/staging-app-ro-password}
+        # Optional write tier (postgres only). Present ⇒ `query_write` grants
+        # on this database run as this role; every read still runs as `role`.
+        write_role: mcp_gateway_staging_app_rw
+        write_password: ${FILE:/run/secrets/staging-app-rw-password}
 
 permissions:
   - group: backend-engineers
@@ -84,6 +88,8 @@ service_accounts:
   - name: ci-bot
     group: svc-ci-bot        # must exist in permissions:; never the admin group
     token: ${ENV:SERVICE_TOKEN_CI_BOT}
+    max_concurrent_requests: 64   # optional; replaces the per-identity cap (16) for this token
+    require_upstream: true        # optional; refuse calls without x-dbmcp-run-id + x-dbmcp-on-behalf-of
 
 logging:
   hot_retention_days: 90
@@ -114,6 +120,9 @@ logging:
 - `pool:` (on a server and/or a database: `max_connections` > 0, `min_connections` ≥ 0, `idle_timeout_s` > 0) — `min_connections` above `max_connections` at the same level fails boot. Each field resolves database → server → built-in default.
 - `tls_ca_file` is valid only with `tls: verify_full` and must be readable at boot.
 - Target TLS: on Postgres, `tls: required` (the default) encrypts but does **not** verify the server certificate (`sslmode=require`); on Mongo it verifies chain and hostname. `tls: verify_full` verifies chain and hostname on both (Postgres `sslmode=verify-full`), against `tls_ca_file` or the system roots — the setting to use for Postgres in production. `tls: insecure` is plaintext. Boot logs one warning per unverified or plaintext server, naming it.
+- `write_role` and `write_password` come as a pair, on `postgres` databases only; `write_role` follows the role-name and superuser rules below and must differ from `role` (the read role must not hold write privileges). In `gateway.env: production`, `write_password` must be a secret reference like `password`.
+- Every database a YAML `query_write` grant matches — wildcards expanded against the configured databases — must declare a `write_role`; otherwise boot fails naming the group, database and server. (A DB-backed `query_write` grant on such a database is refused at request time with `forbidden`.)
+- `service_accounts[].max_concurrent_requests`, when set, must be ≥ 1; `require_upstream` defaults to `false`.
 - Role names must match `^[a-zA-Z_][a-zA-Z0-9_]*$`. Catch typos before they become connection failures.
 - A database's `role` must not be the stock superuser account its backend ships with (`postgres` for Postgres, `root` for MySQL, `sa` for MSSQL, `root`/`admin` for Mongo). Matched case-insensitively on the name only — a superuser renamed to `app` still passes; the real least-privilege guarantee lives target-side. Rejected at boot so the "never run as DB superuser" rule (see [05-credentials.md](05-credentials.md)) can't be defeated by a config typo.
 - Every server's `kind` must have a query adapter wired (today `postgres` and `mongo`). A `mysql`/`mssql` target is rejected at boot rather than parsing clean and failing every query at runtime — these kinds are reserved for the roadmap adapters and only become valid when their adapters land.

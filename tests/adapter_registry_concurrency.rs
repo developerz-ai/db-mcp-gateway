@@ -255,6 +255,8 @@ async fn adapter_rejected_on_credentials_is_replaced() {
             statement_timeout_ms: Some(5_000),
             row_limit: 1,
             access: Access::ReadOnly,
+            dry_run: false,
+            request_id: uuid::Uuid::new_v4(),
         })
         .await
         .expect_err("wrong password must fail");

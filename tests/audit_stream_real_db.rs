@@ -16,7 +16,7 @@ use common::env::state_pool;
 use db_mcp_gateway::auth::{Identity, SessionId};
 use db_mcp_gateway::config::StreamSinkConfig;
 use db_mcp_gateway::tools::audit_dispatch::{
-    AuditHeader, RequestContext, audit_dispatch, success_outcome,
+    AuditHeader, RequestContext, Upstream, audit_dispatch, success_outcome,
 };
 use serde_json::{Value, json};
 use tracing_subscriber::fmt::MakeWriter;
@@ -92,6 +92,7 @@ async fn configured_stdout_sink_streams_and_still_writes_the_durable_row() {
         request_id,
         ip: None,
         agent_client: None,
+        upstream: Upstream::default(),
     };
     let identity = identity(&user);
     let header = AuditHeader {
@@ -181,6 +182,7 @@ async fn failing_stdout_sink_does_not_block_response_or_durable_write() {
         request_id,
         ip: None,
         agent_client: None,
+        upstream: Upstream::default(),
     };
     let identity = identity(&user);
     let header = AuditHeader {
@@ -238,6 +240,7 @@ async fn no_configured_sinks_streams_nothing() {
         request_id,
         ip: None,
         agent_client: None,
+        upstream: Upstream::default(),
     };
     let identity = identity(&user);
     let header = AuditHeader {
@@ -294,6 +297,7 @@ async fn configured_syslog_sink_delivers_udp_and_still_writes_the_durable_row() 
         request_id,
         ip: None,
         agent_client: None,
+        upstream: Upstream::default(),
     };
     let identity = identity(&user);
     let header = AuditHeader {

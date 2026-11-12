@@ -21,6 +21,8 @@ async fn explain_returns_parseable_json_plan() {
             statement_timeout_ms: None,
             row_limit: 10,
             access: Access::ReadWrite,
+            dry_run: false,
+            request_id: uuid::Uuid::new_v4(),
         })
         .await
         .expect("EXPLAIN runs");

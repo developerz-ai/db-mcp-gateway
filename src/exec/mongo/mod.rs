@@ -20,6 +20,7 @@
 
 mod bson_json;
 mod cancel;
+mod catalog;
 mod dispatch;
 pub mod rejector;
 #[cfg(test)]
@@ -36,12 +37,16 @@ use secrecy::ExposeSecret;
 use crate::audit::drain::DetachedTasks;
 use crate::config::{Database, Server, Tls};
 
+use uuid::Uuid;
+
 use super::adapter::{
-    AdapterKind, DbAdapter, ExecError, ExecQuery, ExecResult, ExplainQuery, SampleQuery,
-    SchemaQuery, TOKIO_TIMEOUT_SLACK_MS, effective_timeout_ms,
+    AdapterKind, DbAdapter, ExecError, ExecResult, TOKIO_TIMEOUT_SLACK_MS, effective_timeout_ms,
 };
 use super::pg::resolve_password;
 use super::pool_sizing::PoolSizing;
+use super::query::{
+    ActivityQuery, ExecQuery, ExplainQuery, SampleQuery, SchemaQuery, TableStatsQuery,
+};
 
 /// Bound on server selection and on opening one connection — the Mongo
 /// analogue of the pg pool's acquire timeout. Without it the driver waits
@@ -210,16 +215,28 @@ impl DbAdapter for MongoAdapter {
         }
     }
 
-    async fn describe_schema(&self, _query: SchemaQuery<'_>) -> Result<ExecResult, ExecError> {
-        Err(unsupported("describe_schema"))
+    async fn describe_schema(&self, query: SchemaQuery<'_>) -> Result<ExecResult, ExecError> {
+        self.describe(query).await
     }
 
-    async fn sample(&self, _query: SampleQuery<'_>) -> Result<ExecResult, ExecError> {
-        Err(unsupported("sample"))
+    async fn sample(&self, query: SampleQuery<'_>) -> Result<ExecResult, ExecError> {
+        self.sample_collection(query).await
     }
 
     async fn explain(&self, _query: ExplainQuery<'_>) -> Result<ExecResult, ExecError> {
         Err(unsupported("explain"))
+    }
+
+    async fn table_stats(&self, _query: TableStatsQuery<'_>) -> Result<ExecResult, ExecError> {
+        Err(unsupported("table_stats"))
+    }
+
+    async fn db_activity(&self, _query: ActivityQuery) -> Result<ExecResult, ExecError> {
+        Err(unsupported("db_activity"))
+    }
+
+    async fn cancel_request(&self, _request_id: Uuid) -> Result<bool, ExecError> {
+        Err(unsupported("cancel_request"))
     }
 
     fn is_stale(&self) -> bool {

@@ -36,44 +36,71 @@ fn unique_sub(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4().simple())
 }
 
+/// `id`s that `sql` selects for `key` — a plain consistent read, no locks.
+async fn ids(pool: &MySqlPool, sql: &str, key: &str) -> Vec<String> {
+    sqlx::query_scalar(sql)
+        .bind(key)
+        .fetch_all(pool)
+        .await
+        .expect("cleanup id lookup")
+}
+
+/// Delete `table` rows one primary key at a time. A predicate delete is the
+/// deadlock this avoids: no index leads with `server`, so `DELETE ... WHERE
+/// server = ?` scanned and X-locked every database row — sibling tests'
+/// included — while their concurrent grant INSERTs held the FK S-lock on
+/// one of those rows and waited on the delete's own FK gap lock.
+async fn delete_by_id(pool: &MySqlPool, table: &str, ids: &[String]) {
+    let sql = format!("DELETE FROM {table} WHERE id = ?");
+    for id in ids {
+        sqlx::query(&sql)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|err| panic!("cleanup {table} {id}: {err}"));
+    }
+}
+
+/// Grant ids pointing at any of `parents` through `column`.
+async fn grant_ids(pool: &MySqlPool, column: &str, parents: &[String]) -> Vec<String> {
+    let sql = format!("SELECT id FROM permissions_grants WHERE {column} = ?");
+    let mut found = Vec::new();
+    for parent in parents {
+        found.extend(ids(pool, &sql, parent).await);
+    }
+    found
+}
+
 /// Hard-delete a seeded user plus every grant that touches them. Same rationale
 /// as `cleanup_user` in the pg suite: the shared dev DB otherwise accumulates
 /// rows across reruns, and the partial-uniqueness emulation lets soft-deleted
-/// rows linger and inflate the table. `.expect(...)` so a cleanup failure fails
-/// the test loudly instead of silently leaking rows — pg does the same.
+/// rows linger and inflate the table. Panics on failure so a cleanup failure
+/// fails the test loudly instead of silently leaking rows — pg does the same.
 async fn cleanup_user(pool: &MySqlPool, user_sub: &str) {
-    sqlx::query(
-        "DELETE FROM permissions_grants \
-         WHERE user_id IN (SELECT id FROM permissions_users WHERE user_sub = ?)",
+    let users = ids(
+        pool,
+        "SELECT id FROM permissions_users WHERE user_sub = ?",
+        user_sub,
     )
-    .bind(user_sub)
-    .execute(pool)
-    .await
-    .expect("cleanup grants");
-    sqlx::query("DELETE FROM permissions_users WHERE user_sub = ?")
-        .bind(user_sub)
-        .execute(pool)
-        .await
-        .expect("cleanup users");
+    .await;
+    let grants = grant_ids(pool, "user_id", &users).await;
+    delete_by_id(pool, "permissions_grants", &grants).await;
+    delete_by_id(pool, "permissions_users", &users).await;
 }
 
 /// Companion for `cleanup_user` — deletes everything a test seeded on a
 /// per-test-unique `server` name (grants first for the FK, then the databases
-/// themselves). `.expect(...)` for the same fail-loud reason as `cleanup_user`.
+/// themselves).
 async fn cleanup_server(pool: &MySqlPool, server: &str) {
-    sqlx::query(
-        "DELETE FROM permissions_grants \
-         WHERE database_id IN (SELECT id FROM permissions_databases WHERE server = ?)",
+    let databases = ids(
+        pool,
+        "SELECT id FROM permissions_databases WHERE server = ?",
+        server,
     )
-    .bind(server)
-    .execute(pool)
-    .await
-    .expect("cleanup grants for server");
-    sqlx::query("DELETE FROM permissions_databases WHERE server = ?")
-        .bind(server)
-        .execute(pool)
-        .await
-        .expect("cleanup databases");
+    .await;
+    let grants = grant_ids(pool, "database_id", &databases).await;
+    delete_by_id(pool, "permissions_grants", &grants).await;
+    delete_by_id(pool, "permissions_databases", &databases).await;
 }
 
 /// Upsert + get-by-sub round-trip. Same contract as pg: the row exists

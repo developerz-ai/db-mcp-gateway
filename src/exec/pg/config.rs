@@ -15,15 +15,18 @@ use crate::config::{Database, Password, Server, Tls};
 
 use super::super::adapter::ExecError;
 
+/// Options for connecting to `database` as `role` — the database's read
+/// role or its write role; the two tiers differ in nothing else.
 pub(super) fn build_connect_options(
     server: &Server,
     database: &Database,
+    role: &str,
     password: &SecretString,
 ) -> PgConnectOptions {
     let opts = PgConnectOptions::new()
         .host(&server.host)
         .port(server.port)
-        .username(&database.role)
+        .username(role)
         // The sqlx boundary: the plaintext `&str` exists only for this builder
         // call, then lives inside `PgConnectOptions` (fed to the pool, dropped).
         .password(password.expose_secret())

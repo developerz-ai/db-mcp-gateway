@@ -17,6 +17,8 @@
 //! merging means being in two groups never *upgrades* your access.
 
 pub mod cache;
+#[cfg(test)]
+mod decision_proptests;
 pub mod effective;
 #[cfg(test)]
 mod effective_proptests;

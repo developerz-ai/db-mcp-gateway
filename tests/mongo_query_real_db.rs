@@ -82,6 +82,8 @@ async fn find_returns_documents_under_document_column() {
             statement_timeout_ms: None,
             row_limit: 100,
             access: Access::ReadOnly,
+            dry_run: false,
+            request_id: uuid::Uuid::new_v4(),
         })
         .await
         .expect("find runs");
@@ -121,6 +123,8 @@ async fn find_respects_row_limit_with_truncation_flag() {
             statement_timeout_ms: None,
             row_limit: 5,
             access: Access::ReadOnly,
+            dry_run: false,
+            request_id: uuid::Uuid::new_v4(),
         })
         .await
         .expect("find runs");
@@ -150,6 +154,8 @@ async fn aggregate_runs_pipeline_and_returns_groups() {
             statement_timeout_ms: None,
             row_limit: 100,
             access: Access::ReadOnly,
+            dry_run: false,
+            request_id: uuid::Uuid::new_v4(),
         })
         .await
         .expect("aggregate runs");
@@ -190,6 +196,8 @@ async fn count_returns_scalar_under_count_column() {
             statement_timeout_ms: None,
             row_limit: 100,
             access: Access::ReadOnly,
+            dry_run: false,
+            request_id: uuid::Uuid::new_v4(),
         })
         .await
         .expect("count runs");
@@ -218,6 +226,8 @@ async fn distinct_returns_unique_values_one_per_row() {
             statement_timeout_ms: None,
             row_limit: 100,
             access: Access::ReadOnly,
+            dry_run: false,
+            request_id: uuid::Uuid::new_v4(),
         })
         .await
         .expect("distinct runs");
@@ -272,6 +282,8 @@ async fn max_time_ms_surfaces_as_typed_timeout() {
                 statement_timeout_ms: Some(1),
                 row_limit: 10000,
                 access: Access::ReadOnly,
+                dry_run: false,
+                request_id: uuid::Uuid::new_v4(),
             })
             .await;
         match result {
@@ -322,6 +334,8 @@ async fn dollar_db_pointing_at_another_database_is_rejected() {
             statement_timeout_ms: None,
             row_limit: 10,
             access: Access::ReadOnly,
+            dry_run: false,
+            request_id: uuid::Uuid::new_v4(),
         })
         .await;
     let _ = side.database(&other).drop().await;
@@ -348,6 +362,8 @@ async fn rejected_write_command_does_not_reach_mongo() {
             statement_timeout_ms: None,
             row_limit: 10,
             access: Access::ReadOnly,
+            dry_run: false,
+            request_id: uuid::Uuid::new_v4(),
         })
         .await
         .expect_err("insert is denied by the rejector");
@@ -393,10 +409,122 @@ async fn auth_database_none_falls_back_to_database_name() {
             statement_timeout_ms: None,
             row_limit: 10,
             access: Access::ReadOnly,
+            dry_run: false,
+            request_id: uuid::Uuid::new_v4(),
         })
         .await;
     assert!(
         result.is_err(),
         "expected auth failure when fallback points at user-less `app`; got {result:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Mongo parity (plan 101 slice 12 step 7): catalog listing and sampling
+// ---------------------------------------------------------------------------
+
+/// `listCollections` and `listIndexes` pass the rejector and return one
+/// document per collection / index.
+#[tokio::test]
+async fn list_commands_return_documents() {
+    let a = adapter(SERVER_NAME).await;
+    let coll = unique_collection("mongolist");
+    seed(&a, &coll, 1).await;
+
+    let run = |sql: String| {
+        let a = &a;
+        async move {
+            a.execute(ExecQuery {
+                sql: &sql,
+                binds: &[],
+                statement_timeout_ms: None,
+                row_limit: 100,
+                access: Access::ReadOnly,
+                dry_run: false,
+                request_id: uuid::Uuid::new_v4(),
+            })
+            .await
+        }
+    };
+    let collections = run(format!(
+        r#"{{"listCollections":1,"filter":{{"name":"{coll}"}}}}"#
+    ))
+    .await
+    .expect("listCollections runs");
+    let indexes = run(format!(r#"{{"listIndexes":"{coll}"}}"#))
+        .await
+        .expect("listIndexes runs");
+    drop_collection(&side_client(), &coll).await;
+
+    assert_eq!(collections.rows.len(), 1);
+    assert_eq!(collections.rows[0][0]["name"].as_str(), Some(coll.as_str()));
+    // Every collection has the `_id_` index.
+    assert!(
+        indexes
+            .rows
+            .iter()
+            .any(|row| row[0]["name"].as_str() == Some("_id_")),
+        "{:?}",
+        indexes.rows
+    );
+}
+
+/// `describe_schema` answers one `[database, collection, type, indexes]` row
+/// per collection.
+#[tokio::test]
+async fn describe_schema_lists_collections_and_indexes() {
+    let a = adapter(SERVER_NAME).await;
+    let coll = unique_collection("mongoschema");
+    seed(&a, &coll, 1).await;
+
+    let result = a
+        .describe_schema(db_mcp_gateway::exec::SchemaQuery {
+            schema: "ignored",
+            table: Some(&coll),
+            statement_timeout_ms: None,
+            row_limit: 10,
+            request_id: uuid::Uuid::new_v4(),
+        })
+        .await
+        .expect("describe_schema runs");
+    drop_collection(&side_client(), &coll).await;
+
+    assert_eq!(
+        result.columns,
+        ["database", "collection", "type", "indexes"].map(String::from)
+    );
+    assert_eq!(result.rows.len(), 1);
+    let row = &result.rows[0];
+    assert_eq!(row[0].as_str(), Some(TARGET_DB));
+    assert_eq!(row[1].as_str(), Some(coll.as_str()));
+    assert_eq!(row[2].as_str(), Some("collection"));
+    let indexes = row[3].as_array().expect("indexes array");
+    assert!(indexes.iter().any(|i| i["name"] == "_id_"), "{indexes:?}");
+}
+
+/// `sample` is a `find` capped at the row limit, truncation flagged.
+#[tokio::test]
+async fn sample_returns_documents_up_to_the_limit() {
+    let a = adapter(SERVER_NAME).await;
+    let coll = unique_collection("mongosample");
+    seed(&a, &coll, 5).await;
+    fn ident(s: &str) -> db_mcp_gateway::exec::Identifier<'_> {
+        db_mcp_gateway::exec::Identifier::parse(s).expect("identifier")
+    }
+
+    let result = a
+        .sample(db_mcp_gateway::exec::SampleQuery {
+            schema: ident("ignored"),
+            table: ident(&coll),
+            statement_timeout_ms: None,
+            row_limit: 3,
+            request_id: uuid::Uuid::new_v4(),
+        })
+        .await
+        .expect("sample runs");
+    drop_collection(&side_client(), &coll).await;
+
+    assert_eq!(result.columns, vec!["document".to_string()]);
+    assert_eq!(result.rows.len(), 3);
+    assert!(result.truncated);
 }

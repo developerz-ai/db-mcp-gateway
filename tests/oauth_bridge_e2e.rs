@@ -8,6 +8,8 @@
 
 mod common;
 
+use common::audit::assert_audit_outcome;
+use common::cleanup::delete_audit_calls;
 use common::env::state_pool;
 use common::gateway::{GatewayBuilder, no_redirect_client, spawn_authless};
 use common::idp::{MockUser, spawn_mock_idp};
@@ -44,8 +46,10 @@ async fn mcp_oauth_bridge_full_flow() {
         email: "bridge@example.com".to_string(),
         groups: vec!["engineers".into()],
     };
+    let sub = user.sub.clone();
     // Don't auto-follow: we assert each hop of the OAuth dance explicitly.
     let (gateway_url, client, _refresh_store) = spawn_bridge_gateway(user).await;
+    let pool = state_pool().await;
 
     // 0. The regression itself: an unauthenticated /mcp call must carry a
     //    WWW-Authenticate header pointing at the protected-resource metadata,
@@ -192,6 +196,7 @@ async fn mcp_oauth_bridge_full_flow() {
         .as_str()
         .expect("list_servers JSON text");
     assert!(payload.contains("\"name\":\"prod\""), "{payload}");
+    assert_audit_outcome(&pool, &sub, "list_servers", "success", "bridge bearer").await;
 
     // 6. One-time use: replaying the same code → invalid_grant.
     let replay = client
@@ -243,6 +248,11 @@ async fn mcp_oauth_bridge_full_flow() {
         .await
         .unwrap();
     assert!(ok.status().is_success(), "refreshed bearer works");
+    assert_eq!(
+        list_servers_rows(&pool, &sub).await,
+        2,
+        "refreshed call audited"
+    );
 
     // 8. Rotation invalidates the old refresh token (OAuth 2.1 public client).
     let reused = client
@@ -259,6 +269,18 @@ async fn mcp_oauth_bridge_full_flow() {
         reused.json::<Value>().await.unwrap()["error"],
         "invalid_grant"
     );
+    delete_audit_calls(&pool, &sub).await;
+}
+
+/// `list_servers` rows attributed to `sub`.
+async fn list_servers_rows(pool: &sqlx::PgPool, sub: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_calls WHERE user_sub = $1 AND tool = 'list_servers'",
+    )
+    .bind(sub)
+    .fetch_one(pool)
+    .await
+    .expect("audit count")
 }
 
 // ---------------------------------------------------------------------------
@@ -698,7 +720,9 @@ async fn revoke_endpoint_invalidates_refresh_and_access_tokens() {
         email: "revoke@example.com".to_string(),
         groups: vec!["engineers".into()],
     };
+    let sub = user.sub.clone();
     let (gw, http, _refresh_store) = spawn_bridge_gateway(user).await;
+    let pool = state_pool().await;
 
     // --- Refresh-token revocation ---
     let (_access1, refresh1) = obtain_token_pair(&http, &gw).await;
@@ -739,6 +763,7 @@ async fn revoke_endpoint_invalidates_refresh_and_access_tokens() {
         .await
         .unwrap();
     assert!(before.status().is_success(), "bearer works before revoke");
+    assert_audit_outcome(&pool, &sub, "list_servers", "success", "pre-revoke call").await;
 
     let revoked_access = http
         .post(format!("{gw}/revoke"))
@@ -760,6 +785,12 @@ async fn revoke_endpoint_invalidates_refresh_and_access_tokens() {
         reqwest::StatusCode::UNAUTHORIZED,
         "session revoked → bearer rejected"
     );
+    assert_eq!(
+        list_servers_rows(&pool, &sub).await,
+        1,
+        "the rejected bearer must not reach dispatch"
+    );
+    delete_audit_calls(&pool, &sub).await;
 
     // --- RFC 7009 §2.2: unknown token still 200; missing token → 400 ---
     let unknown = http

@@ -164,6 +164,22 @@ Deliberately absent, because a single host cannot answer them honestly:
 - **Real MySQL query behaviour.** MySQL is not a query target; only the
   boot-time rejection is verified.
 
+## Load gate (weekly CI)
+
+The `load-gate` job in `.github/workflows/weekly.yml` runs the postgres
+harness on a GitHub-hosted runner and hands the result to `load_gate.sh`,
+which compares it per shape against `baselines/ci-ubuntu-latest-postgres.json`:
+p50 and p95 **overhead** (gateway minus direct) and gateway peak RSS may grow
+at most `TOLERANCE_PCT` (50%); any gateway error fails. A shape whose two
+direct baselines drift more than `MAX_DRIFT_PCT` (25%) is inconclusive rather
+than gated; a run with no conclusive shape fails.
+
+The baseline must come from the same runner class — the numbers in
+`results/` were taken elsewhere and are not comparable. Until the file exists
+the job records its run as the `load-gate-result` artifact and passes; commit
+that artifact as the baseline. Re-baseline the same way after an intended
+performance change, in the PR that makes it.
+
 ## Adding a query shape
 
 Add a variant to `Shape` in `harness/workload.rs` and fill in `sql()`,
@@ -175,6 +191,7 @@ or the gateway will truncate and the comparison becomes meaningless.
 
 ```text
 gateway_overhead.sh    runner: stack up, boot gateway, measure, tear down
+load_gate.sh           weekly CI regression gate: result vs stored baseline
 gateway.bench.yaml     gateway config (dev credentials only) — postgres + mongo targets
 gateway.bench.mysql.yaml
                        a `kind: mysql` target, used only to prove the boot-time rejection

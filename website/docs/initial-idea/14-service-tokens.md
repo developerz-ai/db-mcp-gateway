@@ -71,6 +71,42 @@ clean and greppable. There is no session row behind a service identity: no
 revocation bitmap, no expiry, no refresh chain — and the
 `sessions_created_total` / `sessions_revoked_total` counters are untouched.
 
+### Upstream attribution
+
+Many agents share one token — a fleet of coding agents, a devops runner
+working for many people — so the identity alone says *which token* acted,
+not *which run* or *for whom*. Two request headers carry that:
+
+| Header | Audit column | Meaning |
+|---|---|---|
+| `x-dbmcp-run-id` | `audit_calls.upstream_run_id` | The agent's task / run / job id |
+| `x-dbmcp-on-behalf-of` | `audit_calls.upstream_actor` | The person or system the run acts for |
+
+- **Claimed, never verified.** The gateway cannot check either value: it
+  stores them, logs them on the dispatch line and span, copies them onto the
+  intent row (so an `abandoned` row keeps them) — and never uses them for
+  authz. The audit subject stays `service:<name>`; the four properties of
+  the service-identity exception (CLAUDE.md) are untouched.
+- **Capped.** Each is one header value of 1–128 characters from
+  `[A-Za-z0-9._:@/+=-]`. A repeated, empty, overlong or out-of-charset value
+  refuses the call `invalid_arguments` (audited) rather than being dropped,
+  so a claim is never silently lost.
+- **Service tokens only.** On an SSO session both headers are ignored — the
+  identity is already verified — and nothing is stored.
+- **`require_upstream: true`** on the account refuses any call that lacks
+  either header with `invalid_arguments` (audited, nothing runs). Use it when
+  every call must be attributable to a run and a requester.
+- **History is per run.** `get_query_history` called with `x-dbmcp-run-id`
+  returns only rows recorded with that run id, so agents sharing a token do
+  not read each other's history by default ([03](03-mcp-tools.md)).
+
+### Per-account concurrency
+
+`max_concurrent_requests` (≥ 1) replaces the per-identity cap (default 16)
+for that token, so a fleet behind one token is not throttled as one user.
+The global cap still applies; a change takes effect on the next request after
+a reload.
+
 ### Scope
 
 Group-bounded. Per-database and per-action scope is expressed as grants on
@@ -183,7 +219,8 @@ requests are untouched.
 
 Downstream nothing changes: the resolved `Identity` flows into authz, the
 per-identity concurrency limiter (a service gets its own bucket keyed by
-`service:<name>`), and the synchronous audit write — failure of which still
+`service:<name>`, sized by its `max_concurrent_requests` when set), and the
+synchronous audit write — failure of which still
 fails the request.
 
 ## What this is not

@@ -5,7 +5,7 @@
 use std::sync::LazyLock;
 
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 /// MCP protocol revision this gateway speaks.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -23,6 +23,9 @@ pub const SAMPLE_TABLE_TOOL: &str = "sample_table";
 pub const EXPLAIN_TOOL: &str = "explain";
 pub const RUN_QUERY_TOOL: &str = "run_query";
 pub const GET_QUERY_HISTORY_TOOL: &str = "get_query_history";
+pub const TABLE_STATS_TOOL: &str = "table_stats";
+pub const DB_ACTIVITY_TOOL: &str = "db_activity";
+pub const CANCEL_QUERY_TOOL: &str = "cancel_query";
 
 /// Response to `initialize` — the MCP handshake greeting.
 #[derive(Debug, Serialize)]
@@ -87,144 +90,9 @@ pub struct ToolsListResult {
     pub tools: Vec<Tool>,
 }
 
-/// The `tools/list` payload. Static, so its JSON schemas are built once per
-/// process rather than on every call.
+/// The `tools/list` payload (built in `super::tool_list`). Static, so its JSON
+/// schemas are built once per process rather than on every call.
 pub static TOOLS_LIST: LazyLock<ToolsListResult> = LazyLock::new(ToolsListResult::build);
-
-impl ToolsListResult {
-    fn build() -> Self {
-        Self {
-            tools: vec![
-                Tool {
-                    name: LIST_SERVERS_TOOL,
-                    description: "List the database servers the caller is permitted to see. \
-                                  Returns logical name, kind, and description — no connection info.",
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": false
-                    }),
-                },
-                Tool {
-                    name: LIST_DATABASES_TOOL,
-                    description: "List databases on a configured server that the caller is \
-                                  permitted to see. Returns logical name + description — \
-                                  no connection info.",
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "server": { "type": "string" }
-                        },
-                        "required": ["server"],
-                        "additionalProperties": false
-                    }),
-                },
-                Tool {
-                    name: DESCRIBE_SCHEMA_TOOL,
-                    description: "Return tables + columns + types for a given database. \
-                                  Optional `schema` (default `public`) and `table` narrow \
-                                  the result. No row data is returned.",
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "server":   { "type": "string" },
-                            "database": { "type": "string" },
-                            "schema":   { "type": "string" },
-                            "table":    { "type": "string" }
-                        },
-                        "required": ["server", "database"],
-                        "additionalProperties": false
-                    }),
-                },
-                Tool {
-                    name: SAMPLE_TABLE_TOOL,
-                    description: "Return a small sample of rows from a table — `SELECT * \
-                                  FROM \"<schema>\".\"<table>\" LIMIT n`. Useful for \"what \
-                                  does this data look like\" without writing SQL. Schema and \
-                                  table identifiers must be plain alphanumerics.",
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "server":   { "type": "string" },
-                            "database": { "type": "string" },
-                            "table":    { "type": "string" },
-                            "schema":   { "type": "string" },
-                            "limit":    { "type": "integer", "minimum": 1 },
-                            "reason":   { "type": "string" }
-                        },
-                        "required": ["server", "database", "table"],
-                        "additionalProperties": false
-                    }),
-                },
-                Tool {
-                    name: EXPLAIN_TOOL,
-                    description: "Return the query plan for a SELECT/CTE via \
-                                  `EXPLAIN (FORMAT JSON)`. SQL is AST-validated read-only \
-                                  before wrapping; the query itself is not executed.",
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "server":   { "type": "string" },
-                            "database": { "type": "string" },
-                            "sql":      { "type": "string" },
-                            "reason":   { "type": "string" }
-                        },
-                        "required": ["server", "database", "sql"],
-                        "additionalProperties": false
-                    }),
-                },
-                Tool {
-                    name: RUN_QUERY_TOOL,
-                    description: "Execute SQL against a configured (server, database) under the \
-                                  caller's grants. Returns columns, rows, truncation flag, and \
-                                  elapsed_ms. Statement timeout + row cap enforced by policy.",
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "server":   { "type": "string" },
-                            "database": { "type": "string" },
-                            "sql":      { "type": "string" },
-                            "limit":    { "type": "integer", "minimum": 1 },
-                            "reason":   { "type": "string" }
-                        },
-                        "required": ["server", "database", "sql"],
-                        "additionalProperties": false
-                    }),
-                },
-                Tool {
-                    name: GET_QUERY_HISTORY_TOOL,
-                    description: "Return the caller's recent queries against a configured \
-                                  (server, database): SQL, timestamp, duration, row count, and \
-                                  outcome. Lets the agent recover context across sessions. \
-                                  Scoping is on the SSO-verified identity, NEVER on a \
-                                  client-supplied user field.",
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "server":   { "type": "string" },
-                            "database": { "type": "string" },
-                            "since":    { "type": "string", "format": "date-time",
-                                           "description": "RFC 3339 timestamp; only entries \
-                                                            occurred at or after this instant are \
-                                                            returned." },
-                            "limit":    { "type": "integer", "minimum": 1, "maximum": 1000,
-                                           "description": "Max entries to return; clamped to \
-                                                            the gateway ceiling." },
-                            "cursor":   { "type": "string",
-                                           "description": "Opaque `next_cursor` from a previous \
-                                                            page; returns the entries after it." },
-                            "reason":   { "type": "string",
-                                           "description": "Why you are reading history; required \
-                                                            when the grant sets require_reason." }
-                        },
-                        "required": ["server", "database"],
-                        "additionalProperties": false
-                    }),
-                },
-            ],
-        }
-    }
-}
 
 #[derive(Debug, Serialize)]
 pub struct CallToolResult {

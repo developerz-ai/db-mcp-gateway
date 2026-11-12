@@ -22,11 +22,6 @@ use db_mcp_gateway::auth::oauth::{ClientRegistry, StoreError};
 use serial_test::serial;
 use sqlx::PgPool;
 
-/// These tests share one `oauth_clients` table, and the cap test fills it to
-/// `CLIENT_CAP` — a concurrent insert from any sibling test would be refused
-/// at the cap and flake. Serialize the whole file.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 async fn cleanup(pool: &PgPool, client_id: &str) {
     sqlx::query("DELETE FROM oauth_clients WHERE client_id = $1")
         .bind(client_id)
@@ -40,7 +35,6 @@ async fn cleanup(pool: &PgPool, client_id: &str) {
 #[tokio::test]
 #[serial]
 async fn registration_survives_a_restart() {
-    let _serial = SERIAL.lock().await;
     let pool = state_pool().await;
     let client_id = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
     cleanup(&pool, &client_id).await;
@@ -72,7 +66,6 @@ async fn registration_survives_a_restart() {
 #[tokio::test]
 #[serial]
 async fn re_register_updates_redirect_uris() {
-    let _serial = SERIAL.lock().await;
     let pool = state_pool().await;
     let client_id = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
     cleanup(&pool, &client_id).await;
@@ -98,7 +91,6 @@ async fn re_register_updates_redirect_uris() {
 #[tokio::test]
 #[serial]
 async fn expired_registration_is_swept_and_not_returned() {
-    let _serial = SERIAL.lock().await;
     let pool = state_pool().await;
     let stale = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
     cleanup(&pool, &stale).await;
@@ -172,7 +164,6 @@ async fn delete_prefixed(pool: &PgPool, prefix: &str) {
 #[tokio::test]
 #[serial]
 async fn at_cap_evicts_the_oldest_never_authorised_client_real_db() {
-    let _serial = SERIAL.lock().await;
     let pool = state_pool().await;
     let prefix = format!("capjunk-{}-", uuid::Uuid::new_v4().simple());
     // Still within the 1 h never-authorised window, so not expired — only
@@ -199,7 +190,6 @@ async fn at_cap_evicts_the_oldest_never_authorised_client_real_db() {
 #[tokio::test]
 #[serial]
 async fn at_cap_of_authorised_clients_is_store_full_real_db() {
-    let _serial = SERIAL.lock().await;
     let pool = state_pool().await;
     let prefix = format!("capauth-{}-", uuid::Uuid::new_v4().simple());
     // An expiry past created_at + 1 h marks a client that has authorized.

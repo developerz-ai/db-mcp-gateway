@@ -40,7 +40,7 @@ use db_mcp_gateway::exec::{
 use db_mcp_gateway::state::permissions::PermissionsRepo;
 use db_mcp_gateway::state::permissions::pg::PgPermissionsRepo;
 use db_mcp_gateway::tools::run_query;
-use db_mcp_gateway::tools::{RequestContext, ToolCtx};
+use db_mcp_gateway::tools::{RequestContext, ToolCtx, Upstream};
 
 const SERVER_NAME: &str = "mongo";
 const GROUP: &str = "mongo-timeout-test";
@@ -132,6 +132,8 @@ async fn command_always_carries_the_clamped_max_time_ms() {
             statement_timeout_ms: grant,
             row_limit: 100,
             access: Access::ReadOnly,
+            dry_run: false,
+            request_id: uuid::Uuid::new_v4(),
         })
         .await
         .expect("find runs");
@@ -184,6 +186,8 @@ async fn expensive_cursor_read_is_bounded_by_the_budget() {
             // High enough that the row cap can't be what stops the drain.
             row_limit: 1_000_000,
             access: Access::ReadOnly,
+            dry_run: false,
+            request_id: uuid::Uuid::new_v4(),
         })
         .await;
     let elapsed = started.elapsed();
@@ -278,6 +282,7 @@ async fn slow_operation_times_out_and_writes_timeout_audit_row() {
             request_id: Uuid::new_v4(),
             ip: None,
             agent_client: None,
+            upstream: Upstream::Absent,
         };
         let tool_ctx = ToolCtx {
             identity: &identity,

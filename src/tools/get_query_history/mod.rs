@@ -181,6 +181,7 @@ async fn compute_outcome(
         user_sub: &ctx.identity.user_sub,
         server: &args.server,
         database: &args.database,
+        upstream_run_id: ctx.request.upstream.run_id(),
         since: window.since,
         before: window.before,
         limit: window.limit,

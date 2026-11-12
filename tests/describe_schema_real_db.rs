@@ -20,6 +20,8 @@ async fn run(a: &PgAdapter, sql: &str) -> Result<ExecResult, ExecError> {
         statement_timeout_ms: None,
         row_limit: 10,
         access: Access::ReadWrite,
+        dry_run: false,
+        request_id: uuid::Uuid::new_v4(),
     })
     .await
 }
@@ -63,6 +65,8 @@ async fn catalog_query_returns_expected_columns_and_types() {
             statement_timeout_ms: None,
             row_limit: 500,
             access: Access::ReadWrite,
+            dry_run: false,
+            request_id: uuid::Uuid::new_v4(),
         })
         .await
         .expect("catalog query runs");
@@ -122,6 +126,8 @@ async fn table_filter_narrows_results() {
             statement_timeout_ms: None,
             row_limit: 500,
             access: Access::ReadWrite,
+            dry_run: false,
+            request_id: uuid::Uuid::new_v4(),
         })
         .await
         .expect("filtered catalog query runs");

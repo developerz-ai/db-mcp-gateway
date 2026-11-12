@@ -3,17 +3,36 @@
 //! there with its buckets), so the public router must not serve it — and no
 //! series emitted on the request path may carry an identity or SQL label.
 //!
-//! Own test binary: the recorder install is process-global.
+//! Own test binary: the recorder install is process-global. The dispatch
+//! case writes an audit row to the real state DB; run under the shared DB
+//! lock.
 
 mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use common::gateway::{SERVICE_TOKEN, SERVICE_YAML, offline_state};
+use common::audit::assert_audit_outcome;
+use common::cleanup::delete_audit_calls;
+use common::env::state_pool;
+use common::gateway::{GatewayBuilder, SERVICE_TOKEN, SERVICE_YAML, offline_state};
 use db_mcp_gateway::config::Config;
 use db_mcp_gateway::transport;
 use metrics_exporter_prometheus::PrometheusBuilder;
+use serde_json::json;
 use tower::ServiceExt;
+
+const DISPATCH_TOKEN: &str =
+    "dbmcp_svc_8888888888888888888888888888888888888888888888888888888888888888";
+const DISPATCH_SUB: &str = "service:metrics-bot";
+const DISPATCH_YAML: &str = "servers: []
+permissions:
+  - group: svc-metrics
+    grants: []
+service_accounts:
+  - name: metrics-bot
+    group: svc-metrics
+    token: dbmcp_svc_8888888888888888888888888888888888888888888888888888888888888888
+";
 
 /// Label names that would put a user, a query or a request into a series.
 const FORBIDDEN_LABELS: &[&str] = &[
@@ -78,8 +97,35 @@ async fn request_path_series_carry_no_identity_or_sql_labels() {
     for call in calls {
         send(call.expect("request")).await;
     }
+    // A real audited tool dispatch, so the per-call series exist to inspect.
+    let pool = state_pool().await;
+    let gw = GatewayBuilder::new(DISPATCH_YAML).spawn(pool.clone()).await;
+    let dispatched = reqwest::Client::new()
+        .post(format!("{}/mcp", gw.url))
+        .bearer_auth(DISPATCH_TOKEN)
+        .json(&json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                      "params": {"name": "list_servers"}}))
+        .send()
+        .await
+        .expect("gateway reachable");
+    assert_eq!(dispatched.status(), 200);
+    assert_audit_outcome(
+        &pool,
+        DISPATCH_SUB,
+        "list_servers",
+        "success",
+        "list_servers",
+    )
+    .await;
+    delete_audit_calls(&pool, DISPATCH_SUB).await;
 
     let body = handle.render();
+    assert!(
+        body.lines().any(|line| line.starts_with("tool_calls")
+            && line.contains(r#"tool="list_servers""#)
+            && line.contains(r#"outcome="success""#)),
+        "the dispatch left no `tool_calls` series:\n{body}"
+    );
     for line in body.lines().filter(|l| !l.starts_with('#')) {
         let Some(labels) = line
             .split_once('{')
@@ -95,8 +141,11 @@ async fn request_path_series_carry_no_identity_or_sql_labels() {
             );
         }
     }
+    for token in [SERVICE_TOKEN, DISPATCH_TOKEN] {
+        assert!(!body.contains(token), "bearer leaked into metrics:\n{body}");
+    }
     assert!(
-        !body.contains(SERVICE_TOKEN),
-        "bearer leaked into metrics:\n{body}"
+        !body.contains(DISPATCH_SUB),
+        "identity leaked into a label value:\n{body}"
     );
 }

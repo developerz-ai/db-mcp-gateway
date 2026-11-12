@@ -139,6 +139,8 @@ impl Fixture {
                 statement_timeout_ms: None,
                 row_limit: 10,
                 access: Access::ReadWrite,
+                dry_run: false,
+                request_id: uuid::Uuid::new_v4(),
             })
             .await
             .unwrap_or_else(|e| panic!("fixture SQL failed ({sql}): {e}"));

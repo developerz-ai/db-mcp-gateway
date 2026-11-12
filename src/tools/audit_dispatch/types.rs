@@ -40,6 +40,18 @@ pub struct Outcome {
     /// `None` on success. MUST be the typed string we sent, never a raw
     /// DB error.
     pub error_message: Option<String>,
+    /// `Some` when the call reached the target with write access (a
+    /// `query_write` grant running DML); `None` for reads. Drives the
+    /// `access` metric label and `audit_calls.rows_affected`.
+    pub write: Option<WriteEffect>,
+}
+
+/// What a write-access call did to the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteEffect {
+    /// Rows the statement changed (rolled back again under `dry_run`).
+    /// `None` when the statement never completed.
+    pub rows_affected: Option<i64>,
 }
 
 /// Audit context known up-front from the tool's arguments — before any work
@@ -103,4 +115,47 @@ pub struct RequestContext {
     /// `Default`: a shared nil id would collide on `audit_call_intents`'
     /// primary key, so every caller supplies a fresh one.
     pub request_id: Uuid,
+    /// Upstream attribution claimed by a service-token caller.
+    pub upstream: Upstream,
+}
+
+/// Attribution a service-token caller CLAIMED for one call through the
+/// `x-dbmcp-run-id` / `x-dbmcp-on-behalf-of` headers (spec 14). Unverified:
+/// stored in the audit row and logged, never used for authz — the audit
+/// subject stays `service:<name>`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpstreamClaim {
+    pub run_id: Option<String>,
+    pub actor: Option<String>,
+}
+
+/// The transport's verdict on the upstream headers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Upstream {
+    /// Nothing claimed: an SSO session (headers ignored — its identity is
+    /// verified), or a service token that sent neither header.
+    #[default]
+    Absent,
+    Claimed(UpstreamClaim),
+    /// A header is malformed, or the account sets `require_upstream` and a
+    /// header is missing. The call is refused `invalid_arguments`, audited.
+    Rejected(&'static str),
+}
+
+impl Upstream {
+    /// The claim to record, if any.
+    pub fn claim(&self) -> Option<&UpstreamClaim> {
+        match self {
+            Self::Claimed(claim) => Some(claim),
+            Self::Absent | Self::Rejected(_) => None,
+        }
+    }
+
+    pub fn run_id(&self) -> Option<&str> {
+        self.claim().and_then(|c| c.run_id.as_deref())
+    }
+
+    pub fn actor(&self) -> Option<&str> {
+        self.claim().and_then(|c| c.actor.as_deref())
+    }
 }

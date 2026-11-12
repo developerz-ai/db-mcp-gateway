@@ -59,6 +59,7 @@ pub(in crate::tools) fn error_outcome(code: OutcomeCode, message: &str) -> Outco
         row_count: None,
         truncated: None,
         error_message: Some(message.to_string()),
+        write: None,
     }
 }
 
@@ -77,6 +78,7 @@ pub(in crate::tools) fn invalid_arguments(id: Value, message: &str) -> Outcome {
         row_count: None,
         truncated: None,
         error_message: Some(message.to_string()),
+        write: None,
     }
 }
 
@@ -117,6 +119,11 @@ pub fn outcome_from_exec_error(
     let owned;
     let (code, message): (OutcomeCode, &str) = match err {
         ExecError::Timeout => (OutcomeCode::Timeout, messages.timeout),
+        // Another call of the same identity cancelled this one (`cancel_query`).
+        ExecError::Cancelled => (
+            OutcomeCode::Cancelled,
+            "query was cancelled by cancel_query",
+        ),
         ExecError::Connection | ExecError::Unavailable => {
             (OutcomeCode::Unavailable, "target database is unreachable")
         }
@@ -149,6 +156,12 @@ pub fn outcome_from_exec_error(
             );
             (OutcomeCode::ForbiddenSql, owned.as_str())
         }
+        // Boot validation refuses a `query_write` grant without a write role,
+        // so this is a write the configuration does not allow.
+        ExecError::WriteNotConfigured => (
+            OutcomeCode::Forbidden,
+            "this database accepts no writes through the gateway",
+        ),
         ExecError::PasswordUnresolved { .. }
         | ExecError::UnsupportedAdapter(_)
         | ExecError::NotImplemented { .. } => {
@@ -175,6 +188,7 @@ pub fn success_outcome(
         row_count,
         truncated,
         error_message: None,
+        write: None,
     }
 }
 

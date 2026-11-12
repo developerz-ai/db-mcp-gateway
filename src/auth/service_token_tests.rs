@@ -7,6 +7,8 @@ fn account(name: &str, group: &str, token: &str) -> ServiceAccount {
         name: name.to_string(),
         group: group.to_string(),
         token: Password::Literal(SecretString::from(token)),
+        max_concurrent_requests: None,
+        require_upstream: false,
     }
 }
 
@@ -150,6 +152,8 @@ fn unresolved_reference_is_a_boot_error_without_material() {
         name: "ci-bot".to_string(),
         group: "svc-ci".to_string(),
         token: Password::EnvVar(missing.clone()),
+        max_concurrent_requests: None,
+        require_upstream: false,
     }];
     let err =
         ServiceTokenStore::from_config(&accounts).expect_err("unset env ref must fail the build");
@@ -198,4 +202,24 @@ fn auth_errors_carry_no_token_material() {
     for err in [AuthError::MissingBearer, AuthError::InvalidSession] {
         assert!(!format!("{err}").contains(&token));
     }
+}
+
+/// The account's policy rides with the identity it authenticates; the
+/// identity itself is unchanged (audit subject `service:<name>`).
+#[test]
+fn authenticate_caller_carries_the_account_policy() {
+    let mut fleet = account("fleet", "svc-agents", &good_token("f"));
+    fleet.max_concurrent_requests = Some(64);
+    fleet.require_upstream = true;
+    let store = ServiceTokenStore::from_config(&[fleet]).expect("valid account builds a store");
+    let (identity, policy) = store.authenticate_caller(&good_token("f")).expect("match");
+    assert_eq!(identity.user_sub, "service:fleet");
+    assert_eq!(identity.groups, vec!["svc-agents".to_string()]);
+    assert_eq!(
+        policy,
+        ServicePolicy {
+            require_upstream: true,
+            max_concurrent_requests: Some(64),
+        }
+    );
 }

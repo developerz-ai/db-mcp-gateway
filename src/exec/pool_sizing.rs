@@ -107,6 +107,8 @@ mod tests {
             description: String::new(),
             auth_database: None,
             pool: database,
+            write_role: None,
+            write_password: None,
         };
         let server = Server {
             name: "s".into(),

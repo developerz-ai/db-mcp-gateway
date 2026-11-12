@@ -19,13 +19,13 @@ pub mod ident;
 pub mod mongo;
 pub mod pg;
 mod pool_sizing;
+mod query;
 mod registry;
 mod rejection;
 pub mod sql_guard;
 
 pub use adapter::{
-    AdapterKind, DEFAULT_STATEMENT_TIMEOUT_MS, DbAdapter, ExecError, ExecQuery, ExecResult,
-    ExplainQuery, MAX_RESULT_BYTES, SampleQuery, SchemaQuery,
+    AdapterKind, DEFAULT_STATEMENT_TIMEOUT_MS, DbAdapter, ExecError, ExecResult, MAX_RESULT_BYTES,
 };
 pub use ident::{IDENTIFIER_PATTERN, Identifier, InvalidIdentifier};
 pub use mongo::MongoAdapter;
@@ -33,6 +33,9 @@ pub use pg::PgAdapter;
 pub use pool_sizing::{
     DEFAULT_POOL_IDLE_TIMEOUT, DEFAULT_POOL_MAX_CONNECTIONS, InvalidPoolSizing, PoolSizing,
 };
+pub use query::{
+    ActivityQuery, ExecQuery, ExplainQuery, SampleQuery, SchemaQuery, TableStatsQuery,
+};
 pub use registry::AdapterRegistry;
 pub use rejection::{DbRejection, RejectionKind};
-pub use sql_guard::Access;
+pub use sql_guard::{Access, GuardedSql};

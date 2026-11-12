@@ -32,6 +32,55 @@ pub(super) fn any_constraints() -> impl Strategy<Value = Constraints> {
         )
 }
 
+/// Small alphabet — the resolver doesn't care about the string values
+/// themselves, only that wildcards (`*`) match anything and non-wildcards
+/// must match exactly. Keeping the alphabet tiny lets proptest actually
+/// explore the (yaml ∩ db) overlap case rather than getting lost in unique
+/// random strings.
+fn any_server() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("prod".to_string()),
+        Just("staging".to_string()),
+        Just("*".to_string()),
+    ]
+}
+
+fn any_database() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("app".to_string()),
+        Just("billing".to_string()),
+        Just("*".to_string()),
+    ]
+}
+
+pub(super) fn any_grant() -> impl Strategy<Value = Grant> {
+    (
+        any_server(),
+        any_database(),
+        any_action(),
+        any_constraints(),
+    )
+        .prop_map(|(server, database, action, constraints)| Grant {
+            server,
+            database,
+            action,
+            constraints,
+        })
+}
+
+pub(super) fn any_grants() -> impl Strategy<Value = Vec<Grant>> {
+    proptest::collection::vec(any_grant(), 0..6)
+}
+
+/// Concrete `(server, database, action)` request — uses the non-wildcard
+/// alphabet, since wildcards on the *request* side never appear in real
+/// dispatch.
+pub(super) fn any_request() -> impl Strategy<Value = (String, String, Action)> {
+    let req_server = prop_oneof![Just("prod".to_string()), Just("staging".to_string())];
+    let req_db = prop_oneof![Just("app".to_string()), Just("billing".to_string())];
+    (req_server, req_db, any_action())
+}
+
 pub(super) fn identity_in(group: &str) -> Identity {
     Identity {
         session_id: SessionId::new(),

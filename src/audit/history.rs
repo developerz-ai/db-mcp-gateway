@@ -15,12 +15,15 @@ pub const HISTORY_SQL_MAX_BYTES: usize = 4096;
 pub struct HistoryEntry {
     pub request_id: String,
     pub sql: Option<String>,
-    /// `sql` was cut at [`HISTORY_SQL_MAX_BYTES`].
+    /// `sql` was cut — at [`HISTORY_SQL_MAX_BYTES`] here, or at
+    /// [`super::AUDIT_SQL_MAX_BYTES`] when the row was stored.
     pub sql_truncated: bool,
     pub reason: Option<String>,
     pub occurred_at: String,
     pub elapsed_ms: Option<i64>,
     pub row_count: Option<i64>,
+    /// Rows a write changed; `None` for reads.
+    pub rows_affected: Option<i64>,
     pub outcome: String,
 }
 
@@ -65,6 +68,10 @@ pub struct HistoryQuery<'a> {
     pub user_sub: &'a str,
     pub server: &'a str,
     pub database: &'a str,
+    /// The run a service-token caller claims (`x-dbmcp-run-id`). When set,
+    /// only that run's rows come back, so agents sharing one token do not
+    /// read each other's history by default. `None` for SSO sessions.
+    pub upstream_run_id: Option<&'a str>,
     pub since: Option<DateTime<Utc>>,
     pub before: Option<HistoryCursor>,
     pub limit: u32,

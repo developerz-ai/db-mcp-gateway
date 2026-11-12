@@ -1,11 +1,12 @@
-//! `explain` — `EXPLAIN (FORMAT JSON)` wrapper. Returns the query plan
-//! without executing the user's query.
+//! `explain` — `EXPLAIN (FORMAT JSON)` wrapper. Returns the query plan;
+//! plain EXPLAIN never executes the user's statement.
 //!
-//! Same authz / audit / AST-guard path as `run_query`. The inner SQL is gated
-//! through `sql_guard::ReadOnlySql::parse` before the adapter wraps it — so `EXPLAIN
-//! DELETE FROM users` is rejected even though EXPLAIN without ANALYZE
-//! doesn't execute (we stay conservative; an operator could enable ANALYZE
-//! later thinking EXPLAIN is always safe).
+//! Same authz / audit / AST-guard path as `run_query`: the inner SQL is gated
+//! through `GuardedSql::parse` at the caller's grant level, so a data write
+//! can be explained only under a `query_write` grant (it is planned as the
+//! write role). `analyze: true` does execute the statement, so it is refused
+//! for anything but a read; the read runs inside the read-only transaction
+//! and the statement timeout.
 
 use std::time::Instant;
 
@@ -13,14 +14,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{Action, Grant};
-use crate::exec::ExplainQuery;
-use crate::exec::sql_guard::{Access, ReadOnlySql};
+use crate::exec::{Access, ExplainQuery, GuardedSql};
 use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
 use super::audit_dispatch::{
-    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, error_outcome, outcome_from_exec_error,
-    reject_arguments, run_audited, success_outcome,
+    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, WriteEffect, error_outcome,
+    outcome_from_exec_error, reject_arguments, run_audited, success_outcome,
 };
 use super::target::{ensure_reason, forbidden, record_intent, resolve_target};
 
@@ -35,9 +35,15 @@ pub struct Arguments {
     pub server: String,
     pub database: String,
     pub sql: String,
+    /// Execute the statement for real timings — read statements only.
+    #[serde(default)]
+    pub analyze: bool,
     #[serde(default)]
     pub reason: Option<String>,
 }
+
+const ANALYZE_NEEDS_READ: &str =
+    "SQL rejected by gateway: `analyze` executes the statement; only a read may be analyzed";
 
 #[derive(Debug, Serialize)]
 struct SuccessPayload {
@@ -100,7 +106,21 @@ async fn compute_outcome(
         return *rejected;
     }
 
-    let sql = match ReadOnlySql::parse(&args.sql) {
+    // A data write may be planned only under a `query_write` grant.
+    let writes_allowed = resolve_target(
+        ctx,
+        db_grants,
+        Action::QueryWrite,
+        &args.server,
+        &args.database,
+    )
+    .is_some();
+    let grant_access = if writes_allowed {
+        Access::ReadWrite
+    } else {
+        Access::ReadOnly
+    };
+    let sql = match GuardedSql::parse(&args.sql, grant_access) {
         Ok(sql) => sql,
         Err(err) => {
             return error_outcome(
@@ -109,8 +129,12 @@ async fn compute_outcome(
             );
         }
     };
+    let access = sql.required_access();
+    if args.analyze && access != Access::ReadOnly {
+        return error_outcome(OutcomeCode::ForbiddenSql, ANALYZE_NEEDS_READ);
+    }
 
-    if let Err(refused) = record_intent(ctx, TOOL_NAME, &target, Access::ReadOnly).await {
+    if let Err(refused) = record_intent(ctx, TOOL_NAME, &target, access).await {
         return *refused;
     }
 
@@ -128,9 +152,26 @@ async fn compute_outcome(
 
     let query = ExplainQuery {
         sql,
+        analyze: args.analyze,
         statement_timeout_ms: target.constraints.statement_timeout_ms,
+        request_id: ctx.request.request_id,
     };
-    match adapter.explain(query).await {
+    let mut outcome = plan_outcome(id, adapter.explain(query).await, started);
+    if access == Access::ReadWrite {
+        // Planned as the write role; plain EXPLAIN changes nothing.
+        outcome.write = Some(WriteEffect {
+            rows_affected: None,
+        });
+    }
+    outcome
+}
+
+fn plan_outcome(
+    id: Value,
+    explained: Result<crate::exec::ExecResult, crate::exec::ExecError>,
+    started: Instant,
+) -> Outcome {
+    match explained {
         Ok(result) => {
             let elapsed = i64::try_from(result.elapsed_ms).unwrap_or(i64::MAX);
 
