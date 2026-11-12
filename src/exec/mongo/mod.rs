@@ -18,25 +18,25 @@
 //! (not concatenated into a URI), so no encoding bug can turn a
 //! `:`-bearing password into URI structure. See [`MongoAdapter::open`].
 
+mod bson_json;
 mod cancel;
+mod dispatch;
 pub mod rejector;
+#[cfg(test)]
+mod tests;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use mongodb::Client;
-use mongodb::bson::{Bson, Document};
-use mongodb::error::{Error as MongoError, ErrorKind};
 use mongodb::options::{ClientOptions, Credential, ServerAddress, Tls as MongoTls, TlsOptions};
 use secrecy::ExposeSecret;
-use serde_json::Value;
 
 use crate::config::{Database, Server, Tls};
 
 use super::adapter::{
-    AdapterKind, DbAdapter, ExecError, ExecQuery, ExecResult, TOKIO_TIMEOUT_SLACK_MS,
-    effective_timeout_ms,
+    AdapterKind, DbAdapter, ExecError, ExecQuery, ExecResult, ExplainQuery, SampleQuery,
+    SchemaQuery, TOKIO_TIMEOUT_SLACK_MS, effective_timeout_ms,
 };
 use super::pg::resolve_password;
 
@@ -180,6 +180,18 @@ impl DbAdapter for MongoAdapter {
         }
     }
 
+    async fn describe_schema(&self, _query: SchemaQuery<'_>) -> Result<ExecResult, ExecError> {
+        Err(unsupported("describe_schema"))
+    }
+
+    async fn sample(&self, _query: SampleQuery<'_>) -> Result<ExecResult, ExecError> {
+        Err(unsupported("sample"))
+    }
+
+    async fn explain(&self, _query: ExplainQuery<'_>) -> Result<ExecResult, ExecError> {
+        Err(unsupported("explain"))
+    }
+
     /// Cheap liveness probe — ping the admin database. Same role as pg's
     /// `SELECT 1`: confirms the client can hand out a working connection
     /// and the server is responding. Costs one round-trip.
@@ -194,252 +206,9 @@ impl DbAdapter for MongoAdapter {
     }
 }
 
-impl MongoAdapter {
-    /// Parse, stamp the DB-side budget, and run one already-accepted command.
-    /// Split out of [`DbAdapter::execute`] so the `tokio::time::timeout`
-    /// there covers the cursor drain as well as the initial dispatch.
-    async fn dispatch(
-        &self,
-        query: &ExecQuery<'_>,
-        effective_ms: u32,
-    ) -> Result<ExecResult, ExecError> {
-        let mut cmd: Document = serde_json::from_str(query.sql).map_err(|_| ExecError::Sql)?;
-        let command_name = first_command_name(&cmd).ok_or(ExecError::Sql)?;
-
-        // Unconditional: `insert` overwrites, so a caller-supplied
-        // `maxTimeMS` in the raw command can only ever be replaced by the
-        // gateway's clamped value — it can't be used to buy more budget.
-        cmd.insert("maxTimeMS", i64::from(effective_ms));
-        // Marker for the cancel guard's `currentOp` lookup — see
-        // `cancel::stamp_marker` and this method's own doc comment above.
-        let marker = cancel::stamp_marker(&mut cmd);
-        let mut kill_guard = cancel::KillOpOnDrop::armed(self.client.clone(), marker);
-
-        let started = Instant::now();
-        let db = self.client.database(&self.database_name);
-
-        // Wrapped in a block so `?` inside each arm exits the block (captured
-        // into `result`) rather than this function — an early function return
-        // would skip `kill_guard.disarm()` below. Harmless either way (the
-        // guard is best-effort: a currentOp lookup against an already-errored
-        // operation just finds nothing), but disarming on every normal
-        // completion — success or typed error — is the correct target, same
-        // posture as `pg::run_query_inner`'s `CancelOnDrop`.
-        let result: Result<ExecResult, ExecError> = async {
-            match command_name.as_str() {
-                // Cursor-returning commands. `run_cursor_command` handles the
-                // initial response *and* follow-up `getMore` calls so we can
-                // drain past the first batch when the user asks for more rows.
-                "find" | "aggregate" => {
-                    let mut cursor = db.run_cursor_command(cmd).await.map_err(classify)?;
-                    let limit = query.row_limit as usize;
-                    let mut rows: Vec<Vec<Value>> = Vec::new();
-                    let mut truncated = false;
-                    while let Some(doc_result) = cursor.next().await {
-                        if rows.len() >= limit {
-                            truncated = true;
-                            break;
-                        }
-                        let doc = doc_result.map_err(classify)?;
-                        rows.push(vec![doc_to_json(doc)]);
-                    }
-                    Ok(ExecResult {
-                        columns: vec!["document".to_string()],
-                        rows,
-                        truncated,
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                    })
-                }
-                // Scalar commands. The response shape carries the answer in
-                // a single field that's documented per command name.
-                "count" => {
-                    let response = db.run_command(cmd).await.map_err(classify)?;
-                    let n = response
-                        .get_i64("n")
-                        .or_else(|_| response.get_i32("n").map(i64::from));
-                    // `row_limit == 0` is a valid grant constraint (authz
-                    // proptests generate it) and the exec invariant is
-                    // "never emit more rows than configured" — the cursor
-                    // arms above honor it implicitly via `rows.len() >= limit`
-                    // / `.take(limit)`; the scalar arm has to do it explicitly
-                    // because its result shape is fixed at one row.
-                    let (rows, truncated) = if query.row_limit == 0 {
-                        (Vec::new(), true)
-                    } else {
-                        let value = match n {
-                            Ok(v) => Value::from(v),
-                            Err(_) => Value::Null,
-                        };
-                        (vec![vec![value]], false)
-                    };
-                    Ok(ExecResult {
-                        columns: vec!["count".to_string()],
-                        rows,
-                        truncated,
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                    })
-                }
-                "distinct" => {
-                    let response = db.run_command(cmd).await.map_err(classify)?;
-                    let values: Vec<Bson> =
-                        response.get_array("values").cloned().unwrap_or_default();
-                    let limit = query.row_limit as usize;
-                    let truncated = values.len() > limit;
-                    let rows: Vec<Vec<Value>> = values
-                        .into_iter()
-                        .take(limit)
-                        .map(|b| vec![bson_to_json(b)])
-                        .collect();
-                    Ok(ExecResult {
-                        columns: vec!["value".to_string()],
-                        rows,
-                        truncated,
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                    })
-                }
-                // Rejector already filters to find/aggregate/count/distinct.
-                // This arm exists for type-system completeness — if the
-                // rejector's allow-list and dispatch table drift, fail loudly.
-                other => Err(ExecError::Forbidden(format!(
-                    "command `{other}` is rejector-allowed but not dispatch-wired"
-                ))),
-            }
-        }
-        .await;
-        // Command finished (success or typed error) — no orphaned operation
-        // to kill. Guard stays armed ONLY if this future is dropped while
-        // awaiting above (agent disconnect / outer `tokio::time::timeout`).
-        kill_guard.disarm();
-        result
-    }
-}
-
-/// Pluck the wire-order first key (the command name) out of an already-
-/// parsed `Document`. Mongo's wire convention is "first key is the
-/// command name" — bson 3's `Document` preserves insertion order so
-/// `keys().next()` returns it.
-fn first_command_name(doc: &Document) -> Option<String> {
-    doc.keys().next().map(|k| k.to_string())
-}
-
-/// Convert a `bson::Document` to a `serde_json::Value` using mongo's
-/// relaxed extended JSON format. Plain scalars / arrays / docs map 1:1;
-/// mongo-specific types (`ObjectId`, `Date`, `Decimal128`) render as the
-/// standard `{ "$oid": ... }` / `{ "$date": ... }` shapes operators
-/// expect — same rendering `mongosh` produces. Falls back to `Value::Null`
-/// if serialization fails (should be impossible for a `Document` we just
-/// received from the driver).
-fn doc_to_json(doc: Document) -> Value {
-    bson_to_json(Bson::Document(doc))
-}
-
-fn bson_to_json(b: Bson) -> Value {
-    // bson 3 routes through serde. The default Serialize impl produces the
-    // relaxed extended JSON shape (`ObjectId` → `{ "$oid": "..." }`, etc.)
-    // which matches what `mongosh` prints — operators reading the audit
-    // row or the tool response see the same renderings they'd see at the
-    // shell, with no ad-hoc translation in between.
-    serde_json::to_value(&b).unwrap_or(Value::Null)
-}
-
-/// Map a `mongodb::error::Error` to our typed `ExecError`. The mapping
-/// preserves the same semantics as `pg::classify`:
-///
-/// - `maxTimeMS` exhaustion → `Timeout`. Mongo's wire-protocol code is
-///   `50` (`MaxTimeMSExpired`), surfaced via `ErrorKind::Command`.
-/// - Connection / IO failures → `Unavailable`.
-/// - Anything else (including a `Command` error for malformed BSON or a
-///   non-existent collection) → `Sql`.
-///
-/// `Display` MUST NOT carry credentials. The driver's error renderings
-/// don't include the connection URI in practice, but we map to typed
-/// variants whose `Display` we control just in case.
-fn classify(err: MongoError) -> ExecError {
-    match err.kind.as_ref() {
-        ErrorKind::Command(cmd_err) if cmd_err.code == 50 => ExecError::Timeout,
-        ErrorKind::Io(_)
-        | ErrorKind::ConnectionPoolCleared { .. }
-        | ErrorKind::DnsResolve { .. }
-        | ErrorKind::ServerSelection { .. } => ExecError::Unavailable,
-        _ => ExecError::Sql,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{Password, ServerKind};
-
-    fn server_for(host: &str, port: u16, tls: Tls) -> Server {
-        Server {
-            name: "mongo".to_string(),
-            kind: ServerKind::Mongo,
-            description: String::new(),
-            host: host.to_string(),
-            port,
-            tls,
-            databases: vec![],
-        }
-    }
-
-    fn database_for(name: &str, role: &str, password: &str) -> Database {
-        Database {
-            name: name.to_string(),
-            role: role.to_string(),
-            password: Password::Literal(password.into()),
-            description: String::new(),
-            auth_database: None,
-        }
-    }
-
-    /// `MongoAdapter::Debug` must NEVER include the client (which renders
-    /// the parsed `ClientOptions` including credentials). Mirrors the
-    /// `PgAdapter` redaction test in `pg.rs`.
-    #[tokio::test]
-    async fn debug_does_not_leak_credentials() {
-        let s = server_for("localhost", 27017, Tls::Required);
-        let d = database_for("app", "the_user", "super_secret_pw");
-        let adapter = MongoAdapter::open(&s, &d).await.expect("client constructs");
-        let rendered = format!("{adapter:?}");
-        assert!(rendered.contains("mongo/app"));
-        assert!(
-            !rendered.contains("super_secret_pw"),
-            "leaked password: {rendered}"
-        );
-        assert!(!rendered.contains("the_user"), "leaked role: {rendered}");
-    }
-
-    /// A command the rejector blocks must surface as
-    /// [`ExecError::Forbidden`] (→ tool code `forbidden_sql`), not
-    /// [`ExecError::Sql`] (→ `syntax_error`). The distinction matters per
-    /// spec 03 — `syntax_error` is "DB rejected the SQL", whereas this is
-    /// gateway-side policy denial. The carried message must include the
-    /// reason so the tool layer can surface the operator-facing reason
-    /// without leaking command values.
-    #[tokio::test]
-    async fn rejected_command_maps_to_forbidden_not_sql() {
-        let s = server_for("localhost", 27017, Tls::Insecure);
-        let d = database_for("app", "the_user", "pw");
-        let adapter = MongoAdapter::open(&s, &d).await.expect("client constructs");
-
-        // `$where` is a denied operator at any depth; the rejector returns
-        // `DisallowedOperator("$where")`.
-        let query = ExecQuery {
-            sql: r#"{"find":"users","filter":{"$where":"true"}}"#,
-            binds: &[],
-            statement_timeout_ms: None,
-            row_limit: 10,
-        };
-        let err = adapter
-            .execute(query)
-            .await
-            .expect_err("denied command must error");
-        match err {
-            ExecError::Forbidden(reason) => assert!(
-                reason.contains("$where"),
-                "reason must name the denied operator, got: {reason}"
-            ),
-            other => panic!("expected Forbidden, got {other:?}"),
-        }
+fn unsupported(op: &'static str) -> ExecError {
+    ExecError::NotImplemented {
+        adapter: AdapterKind::Mongo,
+        op,
     }
 }
