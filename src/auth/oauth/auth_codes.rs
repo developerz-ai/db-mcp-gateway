@@ -93,11 +93,14 @@ impl AuthCodes {
         }
     }
 
-    /// Remove all expired codes. Called periodically by a background task.
-    pub async fn gc_expired(&self) {
+    /// Remove all expired codes; returns how many. Called periodically by a
+    /// background task.
+    pub async fn gc_expired(&self) -> u64 {
         let mut map = self.inner.lock().await;
         let now = Instant::now();
+        let before = map.len();
         map.retain(|_, code| code.expires_at > now);
+        (before - map.len()) as u64
     }
 }
 

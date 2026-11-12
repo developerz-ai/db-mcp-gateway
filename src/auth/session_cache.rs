@@ -1,32 +1,36 @@
 //! Bounded, TTL-fresh cache fronting the session store (A3).
 //!
 //! Two clocks, on purpose:
-//! - [`Session::is_active`] reads wall-clock (`expires_at` / `revoked_at` are
-//!   DB timestamps).
+//! - session expiry reads wall-clock (`expires_at` is a DB timestamp).
 //! - cache *freshness* uses a monotonic [`Instant`], so a wall-clock step can't
 //!   silently stretch the re-validation window.
 //!
-//! Why a freshness TTL: [`super::SessionStore::revoke`] only evicts the entry
-//! on the replica that handled the logout. Under HA (multiple replicas behind a
-//! load balancer — see `website/docs/initial-idea/02-architecture.md#ha`) a session
-//! revoked on replica B stays cached on replica A until A's entry ages out. The
-//! TTL caps that window: after `ttl`, A's next lookup re-reads the state DB and
-//! honors `revoked_at`. Single-replica deployments still observe revocation on
-//! the very next request (revoke evicts locally); the TTL is the multi-replica
-//! safety net, not the primary mechanism.
+//! Why a freshness TTL: [`super::SessionStore::revoke`] only tombstones the
+//! entry on the replica that handled the logout. Under HA (multiple replicas
+//! behind a load balancer — see `website/docs/initial-idea/02-architecture.md#ha`)
+//! a session revoked on replica B stays cached on replica A until A's entry ages
+//! out. The TTL caps that window: after `ttl`, A's next lookup re-reads the
+//! state DB and honors `revoked_at`.
 //!
-//! Bounded growth: legitimate login churn keeps inserting fresh ids (DB misses
-//! never get cached — `lookup` removes them). `max_entries` is a hard ceiling;
-//! a full cache first drops entries already past their freshness TTL (re-reading
-//! those is free), then evicts the oldest if the sweep freed nothing.
+//! Tombstones: a revoke (or a DB read that finds the session inactive) leaves a
+//! negative entry that [`SessionCache::insert`] refuses to overwrite. That
+//! closes the race where a lookup reads the row just before a concurrent revoke
+//! commits and would otherwise re-cache the now-revoked session for a full TTL.
+//! A revoked/expired/missing session never becomes valid again, so a tombstone
+//! can't wrongly reject anyone.
+//!
+//! Bounded growth: a full cache stops admitting new live entries (the lookup
+//! still succeeds from the DB) instead of scanning the map under the write
+//! lock; the GC task's [`SessionCache::sweep`] reclaims stale entries.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
-use super::session::{Session, SessionId};
+use super::session::{Identity, SessionId};
 
 /// Freshness window default. Short — revocation is security-critical
 /// (off-boarding, leaked bearer), so re-validate more eagerly than the 60s
@@ -34,10 +38,14 @@ use super::session::{Session, SessionId};
 /// bound while the request path stays off the state DB the rest of the time.
 pub const DEFAULT_SESSION_CACHE_TTL_SECONDS: u64 = 30;
 
-/// Hard ceiling on cached sessions. ~100k entries at a few hundred bytes each
-/// caps the cache in the tens of MB even under pathological login churn. Not an
-/// operator knob — a memory backstop, not a policy.
+/// Hard ceiling on cached live sessions. ~100k entries at a few hundred bytes
+/// each caps the cache in the tens of MB even under pathological login churn.
+/// Not an operator knob — a memory backstop, not a policy.
 const DEFAULT_SESSION_CACHE_MAX_ENTRIES: usize = 100_000;
+
+/// Floor on a tombstone's lifetime. Covers a lookup whose DB read is still in
+/// flight when the revoke lands, even when the freshness TTL is zero.
+const MIN_TOMBSTONE_LIFETIME: Duration = Duration::from_secs(60);
 
 /// Tuning for [`SessionCache`]. `Default` is production-safe; the test-facing
 /// `SessionStore::new` uses it as-is, production overrides `ttl` from config.
@@ -46,8 +54,7 @@ pub struct SessionCacheConfig {
     /// A cache hit older than this re-reads the state DB. `0` re-validates
     /// every request (no effective caching).
     pub ttl: Duration,
-    /// Hard cap on cached entries; a full cache evicts before admitting a new
-    /// one.
+    /// Hard cap on cached live entries; a full cache stops admitting new ones.
     pub max_entries: usize,
 }
 
@@ -60,60 +67,139 @@ impl Default for SessionCacheConfig {
     }
 }
 
-struct CacheEntry {
-    session: Session,
-    /// Monotonic stamp of when this entry was last validated against the DB.
-    cached_at: Instant,
+#[derive(Debug)]
+enum Entry {
+    Live {
+        identity: Arc<Identity>,
+        expires_at: DateTime<Utc>,
+        /// Monotonic stamp of when this entry was last validated against the DB.
+        cached_at: Instant,
+    },
+    Tombstone {
+        until: Instant,
+        reason: Inactive,
+    },
 }
 
-/// In-memory session cache with a freshness TTL and a hard size cap.
+/// Why a session can no longer authenticate. None of these ever reverts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inactive {
+    Revoked,
+    Expired,
+    /// No row: never issued here, or already garbage-collected.
+    Unknown,
+}
+
+/// What the cache knows about a session id.
+#[derive(Debug)]
+pub enum Cached {
+    /// Fresh and active: serve without touching the DB.
+    Live(Arc<Identity>),
+    /// Known inactive — reject without touching the DB.
+    Gone(Inactive),
+    /// Absent or stale: re-read the DB.
+    Miss,
+}
+
+/// In-memory session cache with a freshness TTL, revocation tombstones and a
+/// hard size cap on live entries.
+#[derive(Debug)]
 pub struct SessionCache {
     ttl: Duration,
+    tombstone_lifetime: Duration,
     max_entries: usize,
-    inner: RwLock<HashMap<SessionId, CacheEntry>>,
+    inner: RwLock<HashMap<SessionId, Entry>>,
+    /// One DB read per session id at a time; see [`SessionCache::flight`].
+    flights: Mutex<HashMap<SessionId, Arc<Mutex<()>>>>,
 }
 
 impl SessionCache {
     pub fn new(config: SessionCacheConfig) -> Self {
         Self {
             ttl: config.ttl,
-            // 0 would make every insert evict-then-insert; clamp to a sane floor.
+            tombstone_lifetime: config.ttl.max(MIN_TOMBSTONE_LIFETIME),
+            // 0 would refuse every entry; clamp to a sane floor.
             max_entries: config.max_entries.max(1),
             inner: RwLock::new(HashMap::new()),
+            flights: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Return the cached session only if it is both *fresh* (validated within
-    /// `ttl`) and *active* at `now`. A stale or absent entry returns `None`,
-    /// forcing the caller to re-read the state DB — that re-read is what makes a
-    /// revoke on another replica take effect within `ttl`.
-    pub async fn get(&self, id: SessionId, now: DateTime<Utc>) -> Option<Session> {
+    pub async fn get(&self, id: SessionId, now: DateTime<Utc>) -> Cached {
         let map = self.inner.read().await;
-        let entry = map.get(&id)?;
-        // Stale → miss (re-validate); inactive can't normally be cached, but a
-        // wall-clock-expired entry is rejected here belt-and-suspenders.
-        if entry.cached_at.elapsed() >= self.ttl || !entry.session.is_active(now) {
-            return None;
+        match map.get(&id) {
+            None => Cached::Miss,
+            Some(Entry::Tombstone { until, reason }) if Instant::now() < *until => {
+                Cached::Gone(*reason)
+            }
+            Some(Entry::Tombstone { .. }) => Cached::Miss,
+            Some(Entry::Live { expires_at, .. }) if *expires_at <= now => {
+                Cached::Gone(Inactive::Expired)
+            }
+            Some(Entry::Live {
+                identity,
+                cached_at,
+                ..
+            }) if cached_at.elapsed() < self.ttl => Cached::Live(Arc::clone(identity)),
+            Some(Entry::Live { .. }) => Cached::Miss,
         }
-        Some(entry.session.clone())
     }
 
-    /// Insert (or refresh) an entry, enforcing the size cap first.
-    pub async fn insert(&self, id: SessionId, session: Session) {
-        let entry = CacheEntry {
-            session,
-            cached_at: Instant::now(),
-        };
+    /// Cache an active session. Refused when a live tombstone holds the id (a
+    /// revoke raced this lookup) or when the cache is full of other entries.
+    pub async fn insert(&self, identity: Identity, expires_at: DateTime<Utc>) {
+        let id = identity.session_id;
         let mut map = self.inner.write().await;
-        if map.len() >= self.max_entries && !map.contains_key(&id) {
-            evict_one(&mut map, self.ttl);
+        match map.get(&id) {
+            Some(Entry::Tombstone { until, .. }) if Instant::now() < *until => return,
+            Some(_) => {}
+            None if map.len() >= self.max_entries => {
+                tracing::debug!("session cache at capacity; serving uncached");
+                return;
+            }
+            None => {}
         }
-        map.insert(id, entry);
+        map.insert(
+            id,
+            Entry::Live {
+                identity: Arc::new(identity),
+                expires_at,
+                cached_at: Instant::now(),
+            },
+        );
     }
 
-    /// Drop an entry. Idempotent; a missing id is a no-op.
-    pub async fn remove(&self, id: SessionId) {
-        self.inner.write().await.remove(&id);
+    /// Remember that `id` is inactive. Ignores the size cap: tombstones are
+    /// bounded by the revoke rate, and dropping one would reopen the race.
+    pub async fn tombstone(&self, id: SessionId, reason: Inactive) {
+        let until = Instant::now() + self.tombstone_lifetime;
+        self.inner
+            .write()
+            .await
+            .insert(id, Entry::Tombstone { until, reason });
+    }
+
+    /// Drop stale live entries and lapsed tombstones. Called by the GC task.
+    pub async fn sweep(&self) {
+        let now = Instant::now();
+        let ttl = self.ttl;
+        self.inner.write().await.retain(|_, entry| match entry {
+            Entry::Live { cached_at, .. } => cached_at.elapsed() < ttl,
+            Entry::Tombstone { until, .. } => now < *until,
+        });
+    }
+
+    /// The per-id lock a DB read holds, so concurrent misses for one session
+    /// issue one query: followers wait, then re-check the cache. Pair with
+    /// [`SessionCache::end_flight`].
+    pub async fn flight(&self, id: SessionId) -> Arc<Mutex<()>> {
+        Arc::clone(self.flights.lock().await.entry(id).or_default())
+    }
+
+    /// Forget the flight lock for `id`. Waiters still holding a clone proceed
+    /// and find the cache filled; a newcomer starts a fresh flight.
+    pub async fn end_flight(&self, id: SessionId) {
+        self.flights.lock().await.remove(&id);
     }
 
     #[cfg(test)]
@@ -122,124 +208,6 @@ impl SessionCache {
     }
 }
 
-/// Free one slot in a full map. Drops every entry already past `ttl` first —
-/// those force a DB re-read on next lookup anyway, so eviction is free — and
-/// falls back to evicting the single oldest entry if nothing was stale.
-fn evict_one(map: &mut HashMap<SessionId, CacheEntry>, ttl: Duration) {
-    let before = map.len();
-    map.retain(|_, e| e.cached_at.elapsed() < ttl);
-    if map.len() < before {
-        return;
-    }
-    if let Some(oldest) = map
-        .iter()
-        .min_by_key(|(_, e)| e.cached_at)
-        .map(|(id, _)| *id)
-    {
-        // All entries fresh and the cache is full: capacity is undersized for
-        // the live-session count. Evict the oldest (closest to re-validation).
-        tracing::debug!("session cache at capacity; evicting oldest entry");
-        map.remove(&oldest);
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::Duration as ChronoDuration;
-
-    fn session(active_for_secs: i64) -> Session {
-        let now = Utc::now();
-        Session {
-            id: SessionId::new(),
-            user_sub: "sub".into(),
-            user_email: "e@example.com".into(),
-            groups: vec!["g".into()],
-            agent_client: None,
-            issued_at: now,
-            expires_at: now + ChronoDuration::seconds(active_for_secs),
-            revoked_at: None,
-        }
-    }
-
-    fn cache(ttl_secs: u64, max_entries: usize) -> SessionCache {
-        SessionCache::new(SessionCacheConfig {
-            ttl: Duration::from_secs(ttl_secs),
-            max_entries,
-        })
-    }
-
-    #[tokio::test]
-    async fn fresh_active_session_is_returned() {
-        let cache = cache(3600, 16);
-        let s = session(3600);
-        cache.insert(s.id, s.clone()).await;
-        assert!(cache.get(s.id, Utc::now()).await.is_some());
-    }
-
-    #[tokio::test]
-    async fn absent_session_is_a_miss() {
-        let cache = cache(3600, 16);
-        assert!(cache.get(SessionId::new(), Utc::now()).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn stale_entry_forces_revalidation() {
-        // ttl = 0 → every entry is instantly stale, so `get` always misses and
-        // the caller is forced back to the DB. This is the cross-replica
-        // revocation safety net at its extreme.
-        let cache = cache(0, 16);
-        let s = session(3600);
-        cache.insert(s.id, s.clone()).await;
-        assert!(cache.get(s.id, Utc::now()).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn expired_session_is_not_returned() {
-        // Fresh in the cache, but wall-clock-expired → `is_active` rejects it.
-        let cache = cache(3600, 16);
-        let s = session(-1);
-        cache.insert(s.id, s.clone()).await;
-        assert!(cache.get(s.id, Utc::now()).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn eviction_keeps_cache_within_capacity() {
-        let cache = cache(3600, 2);
-        let (a, b, c) = (session(3600), session(3600), session(3600));
-        cache.insert(a.id, a.clone()).await;
-        cache.insert(b.id, b.clone()).await;
-        cache.insert(c.id, c.clone()).await;
-
-        assert_eq!(cache.len().await, 2, "size cap is hard");
-        // All entries were fresh, so the oldest (a) is evicted; the newest stays.
-        assert!(
-            cache.get(a.id, Utc::now()).await.is_none(),
-            "oldest evicted"
-        );
-        assert!(
-            cache.get(c.id, Utc::now()).await.is_some(),
-            "newest retained"
-        );
-    }
-
-    #[tokio::test]
-    async fn stale_sweep_reclaims_capacity_before_eviction() {
-        // ttl = 0 → on the over-capacity insert, the stale sweep clears the map
-        // for free, so no oldest-eviction min-scan is needed.
-        let cache = cache(0, 2);
-        let (a, b, c) = (session(3600), session(3600), session(3600));
-        cache.insert(a.id, a.clone()).await;
-        cache.insert(b.id, b.clone()).await;
-        cache.insert(c.id, c.clone()).await;
-        assert_eq!(cache.len().await, 1, "stale sweep cleared room");
-    }
-
-    #[tokio::test]
-    async fn zero_capacity_is_clamped_to_one() {
-        let cache = cache(3600, 0);
-        let s = session(3600);
-        cache.insert(s.id, s.clone()).await;
-        assert_eq!(cache.len().await, 1);
-    }
-}
+#[path = "session_cache_tests.rs"]
+mod tests;

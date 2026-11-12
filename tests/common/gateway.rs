@@ -1,22 +1,22 @@
 //! Boot a real gateway router on an ephemeral port. Every `AppState` and
-//! `AuthConfig` literal in the test tree lives here.
+//! `AuthConfig` construction in the test tree lives here.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use axum::Router;
-use db_mcp_gateway::auth::oauth::{
-    AuthCodes, AuthFacade, ClientRegistry, PendingFlows, RefreshTokens,
-};
+use db_mcp_gateway::auth::jwt::SessionJwt;
+use db_mcp_gateway::auth::oauth::{AuthCodes, AuthFacade, PendingFlows, RefreshTokens};
 use db_mcp_gateway::auth::{AuthConfig, OidcClient, ServiceTokenStore, SessionStore};
 use db_mcp_gateway::authz::PermissionsCache;
 use db_mcp_gateway::config::{AdminBlock, Config, ConfigFile};
-use db_mcp_gateway::exec::AdapterRegistry;
 use db_mcp_gateway::state::permissions::PermissionsRepo;
 use db_mcp_gateway::transport::{self, AppState};
 use serde_json::Value;
 use sqlx::PgPool;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::net::TcpListener;
 
 use super::env::state_pool;
@@ -25,34 +25,77 @@ use super::idp::{MockIdpHandle, MockUser, spawn_mock_idp};
 /// No servers, no grants: for tests that never dispatch a DB tool.
 pub const EMPTY_YAML: &str = "servers: []\npermissions: []\n";
 
+/// Static bearer of the one service account in [`SERVICE_YAML`]: it
+/// authenticates with no state DB, so offline gateways can reach `/mcp`.
+pub const SERVICE_TOKEN: &str =
+    "dbmcp_svc_3333333333333333333333333333333333333333333333333333333333333333";
+pub const SERVICE_YAML: &str = "servers: []
+permissions:
+  - group: svc-transport
+    grants: []
+service_accounts:
+  - name: transport-bot
+    group: svc-transport
+    token: dbmcp_svc_3333333333333333333333333333333333333333333333333333333333333333
+";
+
 pub fn config_file(yaml: &str) -> ConfigFile {
     ConfigFile::from_yaml_str(yaml).expect("e2e yaml is well-formed")
 }
 
-/// The single `AppState` literal. Optional parts (cache, repo, metrics) are
-/// `None`; callers set the public fields they need.
-pub fn app_state(
-    config: ConfigFile,
-    state_db: Option<PgPool>,
-    auth: Option<AuthFacade>,
-) -> AppState {
-    AppState {
-        auth,
-        config: Arc::new(config),
-        adapter_registry: AdapterRegistry::new(),
-        state_db,
-        shutdown: Default::default(),
-        metrics: None,
-        permissions_cache: None,
-        permissions_repo: None,
-        mcp_path: Arc::from("/mcp"),
-        client_registry: ClientRegistry::default(),
+/// Auth facade over `pool` with in-memory login stores.
+fn auth_facade(
+    pool: &PgPool,
+    auth_config: &AuthConfig,
+    refresh: RefreshTokens,
+    service_tokens: ServiceTokenStore,
+) -> AuthFacade {
+    AuthFacade {
+        jwt: SessionJwt::new(&auth_config.session_signing_key),
+        config: Arc::new(auth_config.clone()),
+        sessions: SessionStore::new(pool.clone()),
+        oidc: OidcClient::new(auth_config.clone()).expect("OidcClient http builder"),
+        flows: PendingFlows::default(),
+        codes: AuthCodes::default(),
+        refresh,
+        service_tokens: Arc::new(ArcSwap::from_pointee(service_tokens)),
     }
 }
 
-/// No auth, no state DB, empty config: wire-protocol and discovery tests.
+/// A state pool that points nowhere: anything touching it fails like an
+/// outage, after a short acquire timeout.
+fn offline_pool() -> PgPool {
+    PgPoolOptions::new()
+        .acquire_timeout(Duration::from_millis(200))
+        .connect_lazy_with(PgConnectOptions::new().host("offline.invalid"))
+}
+
+/// No reachable IdP or state DB, empty config: wire-protocol and discovery
+/// tests. The OAuth metadata advertises `base_url` (the configured
+/// `OIDC_REDIRECT_URL` origin is the gateway's public base).
+pub fn offline_state(base_url: &str, yaml: &str) -> AppState {
+    let auth_config = AuthConfig {
+        issuer: "http://idp.invalid".to_string(),
+        redirect_url: format!("{base_url}/auth/callback"),
+        ..AuthConfig::default()
+    };
+    let config = config_file(yaml);
+    let service_tokens = ServiceTokenStore::from_config(&config.service_accounts)
+        .expect("fixture tokens satisfy the boot rules");
+    let pool = offline_pool();
+    let auth = auth_facade(
+        &pool,
+        &auth_config,
+        RefreshTokens::default(),
+        service_tokens,
+    );
+    AppState::for_tests(config, pool, auth)
+}
+
+/// [`offline_state`] with an empty config, for tests that never read the
+/// advertised base URL.
 pub fn authless_state() -> AppState {
-    app_state(config_file(EMPTY_YAML), None, None)
+    offline_state("http://localhost:8443", EMPTY_YAML)
 }
 
 /// Bind `127.0.0.1:0`; returns the listener and its resolved address.
@@ -75,17 +118,24 @@ pub fn serve(listener: TcpListener, app: Router) {
     });
 }
 
-/// Authless gateway with `config` (whose `bind` is overwritten with the real
+/// Offline gateway with `config` (whose `bind` is overwritten with the real
 /// address); returns the base URL.
 pub async fn spawn_authless(config: Config) -> String {
+    spawn_offline(config, EMPTY_YAML).await
+}
+
+/// [`spawn_authless`] serving `yaml` — e.g. `service_accounts:`, whose static
+/// bearers authenticate with no state DB.
+pub async fn spawn_offline(config: Config, yaml: &str) -> String {
     let (listener, addr) = bind().await;
+    let url = format!("http://{addr}");
     let config = Config {
         bind: addr,
         ..config
     };
-    let app = transport::router(&config, authless_state()).expect("router builds");
+    let app = transport::router(&config, offline_state(&url, yaml)).expect("router builds");
     serve(listener, app);
-    format!("http://{addr}")
+    url
 }
 
 /// HTTP client that never follows redirects, so each OAuth hop is assertable.
@@ -185,27 +235,24 @@ impl GatewayBuilder {
             redirect_url: format!("{url}/auth/callback"),
             ..AuthConfig::default()
         };
-        let sessions = SessionStore::new(pool.clone());
-        let oidc = OidcClient::new(auth_config.clone()).expect("OidcClient http builder");
-
         let mut config_file = config_file(&self.yaml);
         if self.admin.is_some() {
             config_file.admin = self.admin;
         }
         let service_tokens = ServiceTokenStore::from_config(&config_file.service_accounts)
             .expect("fixture tokens satisfy the boot rules");
-        let auth = AuthFacade {
-            config: Arc::new(auth_config.clone()),
-            sessions: sessions.clone(),
-            oidc,
-            flows: PendingFlows::default(),
-            codes: AuthCodes::default(),
-            refresh: self.refresh,
-            service_tokens,
-        };
-        let mut state = app_state(config_file, Some(pool.clone()), Some(auth));
-        state.permissions_cache = self.cache;
-        state.permissions_repo = self.repo;
+        let auth = auth_facade(&pool, &auth_config, self.refresh, service_tokens);
+        let sessions = auth.sessions.clone();
+        let mut state = AppState::for_tests(config_file, pool.clone(), auth);
+        if let Some(repo) = self.repo {
+            // Keep the cache reading the same store the admin API writes.
+            let ttl = Duration::from_secs(Config::default().permissions_cache_ttl_seconds);
+            state.mcp.permissions_cache = PermissionsCache::new(repo.clone(), ttl);
+            state.mcp.permissions_repo = repo;
+        }
+        if let Some(cache) = self.cache {
+            state.mcp.permissions_cache = cache;
+        }
 
         let config = Config {
             bind: addr,

@@ -12,14 +12,18 @@
 //!     handlers so it runs inside the same transaction as the audit row.
 //!
 //! Every write commits a `permissions_audit` row in the same transaction as
-//! the data write. Audit failure rolls back. CLAUDE.md non-negotiable #4.
+//! the data write ([`audited_tx`]). Audit failure rolls back. CLAUDE.md
+//! non-negotiable #4.
 
+mod audited_tx;
 pub mod databases;
 pub mod error;
 pub mod grants;
 pub mod middleware;
 pub mod page_query;
+mod payload;
 pub mod users;
+mod validation;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +33,7 @@ use axum::middleware as axum_mw;
 use axum::routing::{get, post};
 use sqlx::PgPool;
 
+use crate::auth::SessionStore;
 use crate::authz::PermissionsCache;
 use crate::state::permissions::PermissionsRepo;
 
@@ -37,31 +42,43 @@ use self::grants::GrantsState;
 use self::middleware::{AdminMiddlewareState, require_admin_group};
 use self::users::UsersState;
 
+/// Everything the admin API needs from the gateway.
+#[derive(Debug, Clone)]
+pub struct AdminDeps {
+    /// SSO group the caller must carry.
+    pub group: String,
+    pub repo: Arc<dyn PermissionsRepo>,
+    pub state_db: PgPool,
+    /// A committed change drops the affected cached grant sets on this
+    /// replica (other replicas hear it over `NOTIFY`) — spec 12 §"Cache
+    /// invalidation".
+    pub cache: PermissionsCache,
+    /// For `POST /admin/v1/users/:id/revoke-sessions`.
+    pub sessions: SessionStore,
+    /// `admin.session_max_age_secs`: older sessions get `session_too_old`
+    /// (403) to bound admin-group staleness. `None` = no cap.
+    pub max_session_age: Option<Duration>,
+    /// Server names the gateway config declares — the only legal targets of
+    /// a wildcard grant.
+    pub known_servers: Arc<[String]>,
+}
+
 /// Build the `/admin/v1/*` router. Returned router is unmounted; the caller
 /// (`transport::router`) merges it into the top-level app and stacks
-/// `bearer_auth` over it.
-///
-/// Each entity family is its own `Router<EntityState>` `.with_state(...)`-ed
-/// to its handlers, then merged. They share the single `require_admin_group`
-/// layer applied at the top.
-///
-/// `cache` threads through to the grants handlers so a grant change fires a
-/// per-user cache invalidation post-commit — spec 12 §"Cache invalidation"
-/// and #54's acceptance criterion. `None` when the gateway runs without a
-/// resolver cache (YAML-only installs); invalidation then is a no-op.
-///
-/// `max_session_age` maps to `admin.session_max_age_secs` in YAML: sessions
-/// older than this are rejected with `session_too_old` (403) to bound admin
-/// group staleness. `None` = no cap (rely on `session_ttl_hours` alone).
-pub fn router(
-    admin_group: String,
-    repo: Arc<dyn PermissionsRepo>,
-    state_db: PgPool,
-    cache: Option<PermissionsCache>,
-    max_session_age: Option<Duration>,
-) -> Router {
+/// `bearer_auth` over it. Each entity family is its own `Router` with its own
+/// state; they share the single `require_admin_group` layer.
+pub fn router(deps: AdminDeps) -> Router {
+    let AdminDeps {
+        group,
+        repo,
+        state_db,
+        cache,
+        sessions,
+        max_session_age,
+        known_servers,
+    } = deps;
     let mw_state = AdminMiddlewareState {
-        admin_group,
+        admin_group: group,
         max_session_age,
     };
     let users_routes = Router::new()
@@ -72,10 +89,15 @@ pub fn router(
                 .patch(users::patch)
                 .delete(users::delete),
         )
+        .route(
+            "/admin/v1/users/:id/revoke-sessions",
+            post(users::revoke_sessions),
+        )
         .with_state(UsersState {
             repo: repo.clone(),
             state_db: state_db.clone(),
             cache: cache.clone(),
+            sessions,
         });
     let databases_routes = Router::new()
         .route(
@@ -105,6 +127,7 @@ pub fn router(
             repo,
             state_db,
             cache,
+            known_servers,
         });
 
     Router::new()

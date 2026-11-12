@@ -1,13 +1,8 @@
-use std::time::Duration;
-
 use url::{Host, Url};
 
 use super::super::errors::AuthError;
 
 pub(super) const SCOPES: &str = "openid email profile groups";
-
-/// JWKS cache lifetime. Keeps the IdP load low while bounding rotation lag.
-pub(super) const JWKS_TTL: Duration = Duration::from_secs(3600);
 
 /// Require an OIDC URL to use `https`, permitting `http` only for loopback
 /// hosts (localhost / 127.0.0.0/8 / ::1) so dev and mock IdPs keep working.
@@ -33,7 +28,7 @@ pub(super) fn claim_is_true(value: Option<&serde_json::Value>) -> bool {
     }
 }
 
-pub(super) fn is_loopback(url: &Url) -> bool {
+pub(crate) fn is_loopback(url: &Url) -> bool {
     match url.host() {
         Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
         Some(Host::Ipv4(ip)) => ip.is_loopback(),

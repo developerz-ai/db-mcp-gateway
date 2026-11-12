@@ -34,7 +34,17 @@ The gateway speaks **MCP over Streamable HTTP** (the 2025-03+ MCP transport), no
 
 - A single configurable endpoint (default `/mcp`).
 - `POST` carries client→server JSON-RPC 2.0 messages; the gateway replies with a JSON-RPC response (`application/json`), or `202 Accepted` for notifications.
-- `GET` opens the server→client SSE stream for server-initiated messages. On connect it emits a non-normative `greeting` event (protocol version + server identity) so a plain `curl` confirms liveness, then holds open with keep-alives.
+- `GET` returns `405 Method Not Allowed` (`Allow: POST`), before authentication. The gateway never initiates server→client messages, so it offers no SSE stream; MCP 2025-06-18 lets a server answer `GET` with `405` instead. (An idle stream also pinned a socket per unauthenticated caller.)
+- One JSON-RPC message per `POST`. A batch array is refused with `invalid_request` (`-32600`, message `batch requests are not supported`) — MCP 2025-06-18 removed batching.
+
+**Framing errors.** The body is parsed to JSON first, then to a request, so every failure has a JSON-RPC shape (HTTP 200 unless noted):
+
+| Body | Response |
+|---|---|
+| Not JSON | `-32700` `Parse error`, `"id": null` |
+| JSON array (batch) | `-32600` `batch requests are not supported`, `"id": null` |
+| JSON, but not a request object (`42`, `{}`, missing `method`, `jsonrpc` ≠ `"2.0"`) | `-32600` `Invalid request`, echoing `id` when it can be read from the object, else `null` |
+| Unreadable or over the size limit (1 MiB) | the HTTP status of the failure (e.g. `413`) with a `-32600` body |
 
 **Request `id` semantics.** The JSON-RPC `id` member is treated as a three-way distinction rather than a `null`/non-`null` flag, because JSON-RPC 2.0 and MCP disagree about what an explicit `"id": null` means and the gateway must not silently reinterpret one as the other:
 
@@ -45,9 +55,11 @@ The gateway speaks **MCP over Streamable HTTP** (the 2025-03+ MCP transport), no
 | **Present, string or integer number** | A real request with a well-typed MCP `RequestId` | Normal request/response, id echoed back on the reply. |
 | **Present, unsupported type** (boolean, array, object, fractional number) | MCP defines `RequestId` as `string \| number`; JSON-RPC 2.0 also says numbers `SHOULD NOT` be fractional. Neither a valid request id nor a notification. | `invalid_request` JSON-RPC error with the sender's id echoed verbatim. `tools/call` is rejected before any authz/query/audit work — same reasoning as the null case. |
 
-The distinction lives in `RequestId` (`Absent` / `Null` / `Present`, with `Present` validated by `is_invalid_type`) so the same rule can be enforced identically in stateless dispatch and in the `tools/call` fast path.
+The distinction lives in `RequestId` (`Absent` / `Null` / `Present`, with `Present` validated by `is_invalid_type`) and is applied once, in `transport/mcp_handler.rs`, before the request is routed to stateless dispatch or to `tools/call`.
 
-Protocol version: `2025-06-18`. The framing is hand-rolled JSON-RPC; it gets swapped for an official MCP server SDK when one stabilizes (see [11-roadmap](11-roadmap.md)). Transport owns framing only — auth, tool dispatch, and audit are separate layers below.
+**Request ids.** The JSON-RPC `id` above is the client's correlation value and is only ever echoed in the envelope. Separately, the outermost middleware mints a gateway UUID per HTTP request and returns it as the `x-request-id` header on every response — success, `401`, `404`, `405`, `429`, `503`. Error bodies, the `tool_dispatch` span, `audit_calls.request_id` and admin errors all use that same value. A client-supplied `x-request-id` (≤128 chars of `[A-Za-z0-9._:-]`) is logged as `client_request_id` for correlation only — never the audit key.
+
+Protocol version: `2025-06-18`. The protocol vocabulary (JSON-RPC envelope, MCP payload types, tool names) lives in `src/mcp/`, which both the transport and the tools import. The framing is hand-rolled JSON-RPC; it gets swapped for an official MCP server SDK when one stabilizes (see [11-roadmap](11-roadmap.md)). Transport owns framing only — auth, tool dispatch, and audit are separate layers below.
 
 ## Layers inside the gateway
 
@@ -55,20 +67,21 @@ One reason to change per layer. Don't blur these.
 
 | Layer | Owns | Why it's its own thing |
 |---|---|---|
-| **Transport** | MCP over HTTP+SSE, JSON-RPC framing, capability negotiation | Protocol churns; isolate it |
+| **Transport** | MCP over Streamable HTTP, JSON-RPC framing, capability negotiation | Protocol churns; isolate it |
 | **Auth** | OIDC flow, JWT verification, session cache, group resolution | Security boundary; must be auditable in isolation |
 | **Authz** | Map (user, groups) × (server, database, action) → allow/deny + constraints | Pure function over config; testable without a DB |
 | **Tool dispatch** | The MCP tool surface: `list_databases`, `describe_schema`, `sample_table`, `run_query`, `explain` | Stable contract to agents |
 | **Query exec** | Connection pool per DB, statement timeout, row cap, cancellation | Where most of the safety lives |
-| **Audit** | Append-only writes to state DB, structured logs, retention pruner | Append-only, never read by hot path |
+| **Audit** | Two-phase append-only writes to state DB (intent before the target call, completion after), reaper, shutdown drain, stream sinks, retention pruner | Append-only, never read by hot path |
 | **Config** | Load + validate YAML, hot reload on SIGHUP, secrets resolution | Decoupled so config errors fail at boot, not at query time |
 
 ## Process model
 
 - Single binary, single process, async runtime (tokio).
-- Connection pool per *target database*, sized in config.
+- Connection pool per *target database*, sized in config (default 4 connections, sized from the 2026-11-12 baseline; min 0, idle connections closed after 5 min — an idle gateway holds no target connection). Opened on first use; replaced when the target rejects its credentials (password rotation) or on config reload; a failed open is remembered for 5 s so a dead target answers `unavailable` at once.
 - One Postgres pool for the state DB.
-- A background task per pool for health checks; one for audit retention pruning; one for SSO key rotation.
+- No target-DB health checks: `/readyz` never depends on a target database, so one dead target cannot take the gateway out of rotation. One background task for audit retention pruning; one for the audit intent reaper; one for SSO key rotation.
+- Detached work that must outlive a request but not the process (the audit drop guard's retry, stream-sink deliveries, target-side cancels) runs on one tracked task set that `main` drains, bounded, at shutdown.
 
 ## Concurrency
 
@@ -86,14 +99,15 @@ The gateway is the shared substrate for an *entire engineering org* hammering aw
 | Scenario | Behavior |
 |---|---|
 | 50 agents call `list_databases` simultaneously | All return in parallel; no target DB hit at all — served from cached metadata |
-| 10 agents `run_query` against `prod/app` (pool max 5) | First 5 execute; next 5 queue up to `acquire_timeout`; queue beyond that returns `unavailable` |
+| 10 agents `run_query` against `prod/app` (pool max 4) | First 4 execute; next 6 queue up to `acquire_timeout`; queue beyond that returns `unavailable` |
 | One agent runs a slow 25s query | Other agents' queries against the same DB execute in parallel on other pool connections; that agent's own *next* query waits or fails fast |
 | Agent disconnects mid-query | `pg_cancel_backend` fires, the connection returns to the pool within seconds, audit log records `outcome: cancelled` |
-| 1000 audit writes in 10s | Audit pool absorbs the burst; if it can't, the *request* fails (synchronous audit invariant — see [01-overview](01-overview.md)) rather than queueing audit and lying about durability |
+| 1000 audit writes in 10s | Audit pool absorbs the burst; if it can't, the *request* fails with `audit_unavailable` (synchronous audit invariant — see [01-overview](01-overview.md)) rather than queueing audit and lying about durability |
+| Gateway killed between the target commit and the audit row | The intent row committed before the target call survives; the reaper records the call as `outcome: abandoned` ([07](07-logging-retention.md) §"Intent and completion") |
 
 ### HA
 
-For organizations that need to survive a single gateway instance going down: run two replicas behind a load balancer. Session state is in the state DB, not in-process, so an **established** session (a Bearer JWT on `/mcp`) follows the request to whichever replica picks it up — sticky sessions are *not* required for the steady-state request path. The only singleton background task — audit retention pruning — uses an advisory lock in the state DB so only one replica runs it at a time.
+For organizations that need to survive a single gateway instance going down: run two replicas behind a load balancer. Session state is in the state DB, not in-process, so an **established** session (a Bearer JWT on `/mcp`) follows the request to whichever replica picks it up — sticky sessions are *not* required for the steady-state request path. Audit retention pruning and the audit intent reaper run on every replica, each under its own transaction-scoped advisory lock in the state DB, so only one replica deletes a batch or sweeps at a time.
 
 **Session revocation is eventually consistent across replicas.** Each replica fronts the state DB with a small in-process session cache that has a freshness TTL (`SESSION_CACHE_TTL_SECONDS`, default 30s) and a hard size bound. A logout/revoke evicts the entry on the replica that handled it (immediate there), but other replicas keep serving their cached copy until it ages past the TTL and re-validates against `revoked_at`. The cross-replica revocation window is therefore ≤ the TTL — tune it down for faster propagation, up to spend fewer state-DB reads (see [04-auth-sso §Session tokens](04-auth-sso.md#session-tokens)).
 

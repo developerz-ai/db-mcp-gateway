@@ -1,6 +1,7 @@
 //! Typed errors for the auth layer.
 //!
-//! Mapped to HTTP responses by `auth::middleware`. Never embeds a token, code,
+//! Mapped to HTTP responses by `transport::auth_middleware` and
+//! `transport::auth_routes`. Never embeds a token, code,
 //! client secret, or DB credential in the `Display` impl — those would leak
 //! through logs and error responses.
 
@@ -36,6 +37,11 @@ pub enum AuthError {
     #[error("session has been revoked")]
     RevokedSession,
 
+    /// The session outlived its TTL — distinct from a revocation so a client
+    /// (and ops) can tell "sign in again, routinely" from "you were signed out".
+    #[error("session has expired")]
+    ExpiredSession,
+
     #[error("no session token presented")]
     MissingBearer,
 
@@ -47,4 +53,37 @@ pub enum AuthError {
 
     #[error("gateway overloaded; auth store full")]
     StoreFull,
+}
+
+impl AuthError {
+    /// The caller's credential is missing or no longer good: answer 401 with a
+    /// `WWW-Authenticate` challenge so the client re-runs login. Every other
+    /// variant is the gateway's or the IdP's failure — a 5xx with no challenge,
+    /// because re-login would not fix it and would sign a working user out.
+    pub fn is_credential_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingBearer
+                | Self::InvalidSession
+                | Self::RevokedSession
+                | Self::ExpiredSession
+                | Self::Jwt(_)
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_credential_variants_challenge() {
+        assert!(AuthError::MissingBearer.is_credential_failure());
+        assert!(AuthError::InvalidSession.is_credential_failure());
+        assert!(AuthError::RevokedSession.is_credential_failure());
+        assert!(AuthError::ExpiredSession.is_credential_failure());
+        assert!(!AuthError::State(sqlx::Error::PoolClosed).is_credential_failure());
+        assert!(!AuthError::StoreFull.is_credential_failure());
+        assert!(!AuthError::Discovery.is_credential_failure());
+    }
 }

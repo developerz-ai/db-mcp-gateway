@@ -4,13 +4,29 @@
 //! non-negotiable: every tool dispatch traces to an SSO-verified identity →
 //! audit row, and audit-write failures **fail the request**. No best-effort.
 //!
-//! Retention pruner lives in `audit::pruner`. Stream sinks live in
-//! `audit::stream` — `stdout` and `syslog` ship (#218); `otlp` and the
-//! archive tier (S3/GCS/Azure) remain out of scope, tracked in #218.
+//! Two-phase: [`intent`] commits a row before a call reaches a target DB,
+//! [`log`] writes the completion row after it, and [`reaper`] turns an intent
+//! that never got a completion into an `abandoned` row. Retention lives in
+//! [`pruner`], stream sinks in [`stream`] (`stdout` and `syslog`; `otlp` and
+//! the archive tier remain out of scope, #218), and the shutdown drain for
+//! detached writes in [`drain`].
 
+pub mod drain;
+mod history;
+pub mod intent;
+mod outcome;
 pub mod permissions;
 pub mod pruner;
+pub mod reaper;
 pub mod stream;
+
+pub(crate) use history::prefix_at_char_boundary;
+pub use history::{
+    HISTORY_SQL_MAX_BYTES, HistoryCursor, HistoryEntry, HistoryPage, HistoryQuery, InvalidCursor,
+    cap_history_sql,
+};
+pub use intent::CallIntent;
+pub use outcome::OutcomeCode;
 
 use sqlx::PgPool;
 use std::time::Duration;
@@ -52,15 +68,13 @@ pub struct AuditRow {
     pub tool: String,
     pub server: Option<String>,
     pub database: Option<String>,
-    /// The SQL the agent submitted, if any. `list_servers` etc. leave this
-    /// `None`. Spec 08's `sql_capture: full | redacted | metadata_only`
-    /// policy lands in a follow-up.
+    /// What the call read or ran: the agent's SQL for `run_query`/`explain`,
+    /// the target `schema.table` for `sample_table`/`describe_schema`.
+    /// `None` for tools that touch no table (`list_servers`, …).
     pub sql: Option<String>,
     pub reason: Option<String>,
-    /// `"success"` or one of the spec 03 error codes (`forbidden`, `timeout`,
-    /// `syntax_error`, `unavailable`, `reason_required`, `internal`,
-    /// `forbidden_sql`).
-    pub outcome: String,
+    /// `success` or the spec 03 error code the client saw.
+    pub outcome: OutcomeCode,
     pub elapsed_ms: Option<i64>,
     pub row_count: Option<i64>,
     pub truncated: Option<bool>,
@@ -87,6 +101,17 @@ pub enum AuditError {
     Write(#[source] sqlx::Error),
     #[error("audit write timed out after {0:?}")]
     Timeout(Duration),
+}
+
+impl AuditError {
+    /// Credential-free cause for logs: the sqlx error's `Display` can carry
+    /// connection details, its class cannot.
+    pub fn class(&self) -> String {
+        match self {
+            Self::Write(source) => crate::state::connect_error_class(source),
+            Self::Timeout(_) => "timeout".to_owned(),
+        }
+    }
 }
 
 /// Persist one audit row. Synchronous on the request path: callers MUST
@@ -117,18 +142,4 @@ pub async fn latest_for_user_tool(
     crate::state::audit::latest_call_for_user_tool(pool, user_sub, tool)
         .await
         .map_err(AuditError::Write)
-}
-
-/// One row in the `get_query_history` response. Field names match the wire
-/// contract documented at `website/docs/initial-idea/03-mcp-tools.md`
-/// §get_query_history.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct HistoryEntry {
-    pub request_id: String,
-    pub sql: Option<String>,
-    pub reason: Option<String>,
-    pub occurred_at: String,
-    pub elapsed_ms: Option<i64>,
-    pub row_count: Option<i64>,
-    pub outcome: String,
 }

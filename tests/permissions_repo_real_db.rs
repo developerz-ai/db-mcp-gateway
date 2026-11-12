@@ -12,7 +12,7 @@ mod common;
 
 use common::env::state_pool;
 use db_mcp_gateway::state::permissions::{
-    DbType, GrantAction, GrantTarget, Page, PermissionsRepo, pg::PgPermissionsRepo,
+    DbType, GrantAction, GrantTarget, Page, PermissionsRepo, PermissionsSeed, pg::PgPermissionsRepo,
 };
 use sqlx::PgPool;
 

@@ -12,42 +12,39 @@
 //!   caches its `client_id` (most do) replayed a now-forgotten id after every
 //!   deploy and got a hard error instead of silently re-registering. Persisting
 //!   matches how `sessions` already survive restarts.
-//! - **Memory** (`default`) — the auth-less test bootstrap (`AppState::for_tests`)
-//!   and unit tests, which have no state DB.
+//! - **Memory** (`default`) — unit tests and test harnesses without a state DB.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 
+use super::StoreError;
 use crate::state::oauth as db;
 
-/// TTL for a Dynamic-Client-Registration entry, refreshed on every successful
-/// `/authorize` lookup so an actively-used client never lapses.
+/// Lifetime of a client that has completed a successful `/authorize`, sliding
+/// on every later one so an actively-used client never lapses.
 ///
-/// Was 24 h, on the assumption that a client registers and immediately walks
-/// `/authorize` → `/token`. It does — but it then *caches* the `client_id`
-/// indefinitely and only re-authorizes days later, when the refresh chain runs
-/// out or the user signs out. By then the registration had been GC'd and the
-/// browser landed on a bare `invalid_client` JSON page: a dead end, because
-/// nothing in the OAuth redirect leg tells the client to re-register.
-///
-/// So the window has to cover the whole "stay signed in" horizon, not one
-/// login: 90 days, sliding. `/authorize` self-heals the residual case (see
-/// `oauth::authorize`), and the cap plus GC still bound an unauthenticated
-/// `/register` flood.
-const CLIENT_TTL: Duration = Duration::from_secs(90 * 24 * 3600);
+/// 90 days because a client caches its `client_id` indefinitely and only
+/// re-authorizes when its refresh chain runs out or the user signs out; a
+/// shorter window GC'd the registration first and the browser landed on a bare
+/// `invalid_client` page. `/authorize` self-heals the residual case (see
+/// `oauth::authorize`).
+const CLIENT_TTL: ChronoDuration = ChronoDuration::days(90);
+
+/// Lifetime of a registration no `/authorize` has used yet. A real client
+/// registers and authorizes within seconds; an unauthenticated `/register`
+/// flood only ever produces rows like these, so they expire fast and are the
+/// ones evicted at the cap.
+const UNAUTHORISED_CLIENT_TTL: ChronoDuration = ChronoDuration::hours(1);
 
 /// Hard cap on registered clients. `/register` is unauthenticated (open DCR per
-/// RFC 7591), so the store needs a ceiling or a flood could exhaust it. At the
-/// cap (after GC drops expired entries) a new registration is *rejected* rather
-/// than evicting a live client: evicting the soonest-to-expire entry would let
-/// an unauthenticated flood knock legitimate clients out of their in-flight
-/// `/authorize` (`invalid_client`). Bounded storage that still self-heals as
-/// TTLs lapse.
+/// RFC 7591), so the store needs a ceiling. At the cap a registration evicts
+/// the oldest expired or never-authorised row; a client that has authorized is
+/// never evicted, so a flood can't knock a legitimate client out. Only a store
+/// full of authorised clients refuses ([`StoreError::StoreFull`]).
 const CLIENT_CAP: i64 = 10_000;
 
 /// Bounded registry of Dynamic-Client-Registration clients: `client_id` → its
@@ -92,7 +89,14 @@ impl Default for ClientRegistry {
 #[derive(Debug, Clone)]
 struct RegisteredClient {
     redirect_uris: Vec<String>,
-    expires_at: Instant,
+    created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+}
+
+impl RegisteredClient {
+    fn evictable(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at <= now || self.expires_at <= self.created_at + UNAUTHORISED_CLIENT_TTL
+    }
 }
 
 impl ClientRegistry {
@@ -104,114 +108,128 @@ impl ClientRegistry {
         }
     }
 
-    /// Record a freshly registered client's redirect URIs (validated by the
-    /// caller). Drops expired entries first; if still at the cap, rejects the
-    /// new registration (`false`) rather than evicting a live client — an
-    /// unauthenticated `/register` must never be able to knock out a legitimate
-    /// client mid-flow. Returns `true` once recorded; updating an existing
-    /// `client_id` always succeeds (it doesn't grow the store).
-    ///
-    /// A DB error fails **closed** (`false`, surfaced to the client as
-    /// `temporarily_unavailable`): better to make the client retry than to
-    /// pretend a registration `/authorize` can't then find was stored. Only a
-    /// static message is logged, never the error — a `sqlx::Error` can embed the
-    /// DSN (password) in its `Display` (see `state::connect`).
-    pub async fn insert(&self, client_id: String, redirect_uris: Vec<String>) -> bool {
-        match &self.backend {
-            Backend::Db(pool) => Self::insert_db(pool, &client_id, &redirect_uris)
-                .await
-                .unwrap_or_else(|_| {
-                    // Deliberately no error source: a `sqlx::Error` can render
-                    // the DSN (password) in its `Display` (see `state::connect`).
-                    tracing::warn!("client registration insert failed (state DB)");
-                    false
-                }),
-            Backend::Memory(map) => {
-                let mut map = map.lock().await;
-                Self::gc_mem(&mut map);
-                if map.len() >= CLIENT_CAP as usize && !map.contains_key(&client_id) {
-                    return false;
-                }
-                map.insert(
-                    client_id,
-                    RegisteredClient {
-                        redirect_uris,
-                        expires_at: Instant::now() + CLIENT_TTL,
-                    },
-                );
-                true
-            }
+    /// Record a client's redirect URIs (validated by the caller) with the
+    /// short never-authorised TTL. At the cap, evicts the oldest expired or
+    /// never-authorised client first; `StoreFull` only when every row belongs
+    /// to an authorised client. A DB error is `Backend` — fail closed, the
+    /// client retries. Re-registering an existing `client_id` replaces its URIs
+    /// and needs the same room as a new one.
+    pub async fn insert(
+        &self,
+        client_id: String,
+        redirect_uris: Vec<String>,
+    ) -> Result<(), StoreError> {
+        let stored = match &self.backend {
+            Backend::Db(pool) => db::insert_client_capped(
+                pool,
+                &client_id,
+                &redirect_uris,
+                CLIENT_CAP,
+                UNAUTHORISED_CLIENT_TTL,
+            )
+            .await
+            .map_err(|_| {
+                // Deliberately no error source: a `sqlx::Error` can render the
+                // DSN (password) in its `Display` (see `state::connect`).
+                tracing::warn!("client registration insert failed (state DB)");
+                StoreError::Backend
+            })?,
+            Backend::Memory(map) => insert_mem(&mut *map.lock().await, client_id, redirect_uris),
+        };
+        if stored {
+            Ok(())
+        } else {
+            Err(StoreError::StoreFull)
+        }
+    }
+
+    /// Register a client `/authorize` adopted (unknown `client_id`, loopback
+    /// redirect) — the authorize itself is its first use, so it is promoted
+    /// to [`CLIENT_TTL`] at once instead of expiring as never-authorised.
+    pub async fn adopt(&self, client_id: String, redirect_uri: String) -> Result<(), StoreError> {
+        self.insert(client_id.clone(), vec![redirect_uri]).await?;
+        match self.redirect_uris(&client_id).await {
+            Some(_) => Ok(()),
+            None => Err(StoreError::Backend),
         }
     }
 
     /// The registered redirect URIs for `client_id`, if the registration is
-    /// still live. `None` means "unknown client". A DB error also yields `None`
-    /// (fail closed: an unresolvable client is treated as unknown rather than
-    /// waved through).
-    ///
-    /// A hit slides `expires_at` forward by a full [`CLIENT_TTL`], so a client
-    /// that keeps authorizing keeps its registration indefinitely and only an
-    /// abandoned one ages out.
+    /// still live; `None` means "unknown client". A DB error also yields `None`
+    /// (fail closed). A hit slides `expires_at` to a full [`CLIENT_TTL`] — the
+    /// first one promotes a never-authorised client out of eviction range.
     pub async fn redirect_uris(&self, client_id: &str) -> Option<Vec<String>> {
         match &self.backend {
-            Backend::Db(pool) => Self::touch_db(pool, client_id).await.unwrap_or_else(|_| {
-                // No error source — see the DSN-leak note on `insert`.
-                tracing::warn!("client registration lookup failed (state DB)");
-                None
-            }),
+            Backend::Db(pool) => db::touch_client(pool, client_id, CLIENT_TTL)
+                .await
+                .unwrap_or_else(|_| {
+                    // No error source — see the DSN-leak note on `insert`.
+                    tracing::warn!("client registration lookup failed (state DB)");
+                    None
+                }),
             Backend::Memory(map) => {
                 let mut map = map.lock().await;
-                Self::gc_mem(&mut map);
-                let client = map.get_mut(client_id)?;
-                client.expires_at = Instant::now() + CLIENT_TTL;
+                let now = Utc::now();
+                let client = map.get_mut(client_id).filter(|c| c.expires_at > now)?;
+                client.expires_at = now + CLIENT_TTL;
                 Some(client.redirect_uris.clone())
             }
         }
     }
 
-    /// DB insert: GC lapsed rows, enforce the cap against live rows (rejecting a
-    /// *new* client at the cap while still letting an existing one update), then
-    /// upsert with a fresh TTL. The count/insert pair isn't one atomic step, but
-    /// the cap is a best-effort ceiling on an unauthenticated endpoint, not an
-    /// invariant — a transient one-over under a registration storm is harmless.
-    async fn insert_db(
-        pool: &PgPool,
-        client_id: &str,
-        redirect_uris: &[String],
-    ) -> Result<bool, sqlx::Error> {
-        db::delete_expired_clients(pool).await?;
-
-        // Only enforce the cap for a brand-new client; an existing `client_id`
-        // updating its URIs doesn't grow the table, so let it through at cap.
-        if !db::client_exists(pool, client_id).await?
-            && db::count_clients(pool).await? >= CLIENT_CAP
-        {
-            return Ok(false);
+    /// Delete lapsed registrations; returns how many. Background GC task only
+    /// — the request path never sweeps. A DB failure is logged and counts 0.
+    pub async fn gc_expired(&self) -> u64 {
+        match &self.backend {
+            Backend::Db(pool) => db::delete_expired_clients(pool).await.unwrap_or_else(|_| {
+                // No error source — see the DSN-leak note on `insert`.
+                tracing::warn!("client registration GC failed (state DB)");
+                0
+            }),
+            Backend::Memory(map) => {
+                let now = Utc::now();
+                let mut map = map.lock().await;
+                let before = map.len();
+                map.retain(|_, c| c.expires_at > now);
+                (before - map.len()) as u64
+            }
         }
-
-        let uris = serde_json::to_value(redirect_uris).unwrap_or(serde_json::Value::Array(vec![]));
-        // Infallible in practice (CLIENT_TTL is 90 days), but avoid a hot-path
-        // panic — fall back to a literal, mirroring `SessionStore::create`.
-        let ttl =
-            ChronoDuration::from_std(CLIENT_TTL).unwrap_or_else(|_| ChronoDuration::hours(24));
-        db::upsert_client(pool, client_id, &uris, Utc::now() + ttl).await?;
-        Ok(true)
     }
+}
 
-    /// DB lookup: the live registration's URIs, or `None` if absent/expired.
-    /// Slides `expires_at` in the same statement, so the read and the renewal
-    /// can't disagree and no extra round-trip lands on the `/authorize` path.
-    async fn touch_db(pool: &PgPool, client_id: &str) -> Result<Option<Vec<String>>, sqlx::Error> {
-        // Infallible for the const TTL; clamp rather than panic (CLAUDE.md).
-        let ttl = ChronoDuration::from_std(CLIENT_TTL).unwrap_or_else(|_| ChronoDuration::days(90));
-        let row = db::touch_client(pool, client_id, Utc::now() + ttl).await?;
-        Ok(row.map(|v| serde_json::from_value(v).unwrap_or_default()))
+/// Memory twin of `db::insert_client_capped`. `false` when the map is full of
+/// authorised clients.
+fn insert_mem(
+    map: &mut HashMap<String, RegisteredClient>,
+    client_id: String,
+    redirect_uris: Vec<String>,
+) -> bool {
+    let now = Utc::now();
+    if map.len() >= CLIENT_CAP as usize {
+        let oldest = map
+            .iter()
+            .filter(|(_, c)| c.evictable(now))
+            .min_by_key(|(_, c)| c.created_at)
+            .map(|(id, _)| id.clone());
+        let Some(oldest) = oldest else {
+            return false;
+        };
+        map.remove(&oldest);
     }
-
-    fn gc_mem(map: &mut HashMap<String, RegisteredClient>) {
-        let now = Instant::now();
-        map.retain(|_, c| c.expires_at > now);
+    match map.get_mut(&client_id) {
+        Some(existing) => existing.redirect_uris = redirect_uris,
+        None => {
+            map.insert(
+                client_id,
+                RegisteredClient {
+                    redirect_uris,
+                    created_at: now,
+                    expires_at: now + UNAUTHORISED_CLIENT_TTL,
+                },
+            );
+        }
     }
+    true
 }
 
 #[cfg(test)]

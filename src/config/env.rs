@@ -1,14 +1,23 @@
 //! Env-driven runtime knobs: bind address, MCP path, state DB, TLS, cache TTLs.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
+pub use error::ConfigError;
 use mcp_path::validate_mcp_path;
 
+mod error;
 mod mcp_path;
 
 const DEFAULT_STATE_DB_URL: &str = "postgres://gateway:gateway-dev-only@localhost:5433/gateway";
-const DEFAULT_STATE_DB_POOL_SIZE: u32 = 10;
+// Evaluated at compile time: a zero literal fails the build, never the process.
+const DEFAULT_STATE_DB_POOL_SIZE: NonZeroU32 = NonZeroU32::new(10).expect("non-zero literal");
+/// Loopback by default: `/metrics` is not part of the public surface. A
+/// cluster scrape sets `METRICS_BIND=0.0.0.0:9090` and fences the port with a
+/// NetworkPolicy.
+const DEFAULT_METRICS_BIND: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9090));
 /// Spec 07 §Storage: "Hot — Gateway's state Postgres — 90 days (configurable)".
 const DEFAULT_AUDIT_RETENTION_DAYS: u32 = 90;
 /// Spec 12 §Cache: per-user DB-grant cache TTL. 60s keeps the request path off
@@ -17,22 +26,25 @@ const DEFAULT_AUDIT_RETENTION_DAYS: u32 = 90;
 /// `PermissionsCache::invalidate` directly so the practical staleness is the
 /// in-flight request, not the TTL.
 const DEFAULT_PERMISSIONS_CACHE_TTL_SECONDS: u64 = 60;
+const MAX_PERMISSIONS_CACHE_TTL_SECONDS: u64 = 300;
 /// A3: freshness TTL for the in-memory session cache. A cache hit older than
 /// this re-reads the state DB, so a session revoked on another replica stops
 /// being honored within this window. Short — revocation is security-critical.
 /// `0` re-validates every request. Kept in sync with the test-facing default
 /// in `auth::session_cache`; this value is the operator override.
 const DEFAULT_SESSION_CACHE_TTL_SECONDS: u64 = 30;
-/// Matches `transport::limit::MAX_CONCURRENT_REQUESTS`. Exposed via `Config`
-/// so integration tests can boot with tight limits without touching the static.
+/// Default `MAX_CONCURRENT_REQUESTS`: process-wide in-flight ceiling.
 pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 512;
-/// Matches `transport::limit::MAX_CONCURRENT_PER_IDENTITY`.
+/// Default `MAX_CONCURRENT_PER_IDENTITY`: one caller's in-flight ceiling.
 pub const DEFAULT_MAX_CONCURRENT_PER_IDENTITY: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Address the HTTP server binds to.
     pub bind: SocketAddr,
+    /// Address the Prometheus `/metrics` listener binds to — a separate
+    /// listener so the scrape endpoint never rides the public one.
+    pub metrics_bind: SocketAddr,
     /// Path the MCP endpoint is mounted at (e.g. `/mcp`).
     pub mcp_path: String,
     /// The gateway's own Postgres (sessions, audit, denylist).
@@ -50,13 +62,11 @@ pub struct Config {
     /// Freshness TTL (seconds) for the session cache (A3). Bounds cross-replica
     /// revocation staleness; `0` re-validates every request.
     pub session_cache_ttl_seconds: u64,
-    /// Process-wide ceiling on concurrent in-flight gated requests. Exposed so
-    /// tests can boot with a tight global cap to exercise the 503 path without
-    /// flooding the gateway; production code uses `DEFAULT_MAX_CONCURRENT_REQUESTS`.
+    /// Process-wide ceiling on concurrent in-flight gated requests
+    /// (`MAX_CONCURRENT_REQUESTS`; past it, 503).
     pub max_concurrent_requests: usize,
-    /// Per-identity ceiling on concurrent in-flight gated requests. Exposed so
-    /// tests can set this to 1 to exercise the 429 path with a single slow
-    /// in-flight request; production code uses `DEFAULT_MAX_CONCURRENT_PER_IDENTITY`.
+    /// Per-identity ceiling on concurrent in-flight gated requests
+    /// (`MAX_CONCURRENT_PER_IDENTITY`; past it, 429).
     pub max_concurrent_per_identity: usize,
 }
 
@@ -70,7 +80,7 @@ pub enum TlsConfig {
         cert_path: PathBuf,
         key_path: PathBuf,
     },
-    /// Dev-only. Boot emits a loud warning every minute.
+    /// Dev-only. Boot emits a loud warning once.
     Disabled,
 }
 
@@ -84,7 +94,9 @@ impl TlsConfig {
 #[derive(Clone)]
 pub struct StateDbConfig {
     pub url: String,
-    pub pool_size: u32,
+    /// Request-path pool size. Zero is unrepresentable: a zero-connection
+    /// pool times out every acquire.
+    pub pool_size: NonZeroU32,
 }
 
 impl std::fmt::Debug for StateDbConfig {
@@ -100,6 +112,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             bind: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8443)),
+            metrics_bind: DEFAULT_METRICS_BIND,
             mcp_path: "/mcp".to_string(),
             state_db: StateDbConfig {
                 url: DEFAULT_STATE_DB_URL.to_string(),
@@ -119,67 +132,12 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum ConfigError {
-    #[error("invalid GATEWAY_BIND `{value}`: {source}")]
-    Bind {
-        value: String,
-        source: std::net::AddrParseError,
-    },
-    #[error("invalid MCP_PATH `{0}`: must be a non-empty absolute path (e.g. `/mcp`)")]
-    McpPath(String),
-    #[error(
-        "invalid MCP_PATH `{0}`: that path is already served by the gateway \
-         (probes, OAuth, discovery metadata, or the admin API). Pick another, e.g. `/mcp`"
-    )]
-    McpPathReserved(String),
-    #[error("invalid STATE_DB_POOL_SIZE `{value}`: {source}")]
-    StateDbPoolSize {
-        value: String,
-        source: std::num::ParseIntError,
-    },
-    #[error("invalid AUDIT_RETENTION_DAYS `{value}`: {source}")]
-    AuditRetentionDays {
-        value: String,
-        source: std::num::ParseIntError,
-    },
-    #[error("invalid AUDIT_RETENTION_DAYS `{0}`: must be greater than zero")]
-    AuditRetentionZero(String),
-    #[error("invalid PERMISSIONS_CACHE_TTL_SECONDS `{value}`: {source}")]
-    PermissionsCacheTtl {
-        value: String,
-        source: std::num::ParseIntError,
-    },
-    #[error("invalid SESSION_CACHE_TTL_SECONDS `{value}`: {source}")]
-    SessionCacheTtl {
-        value: String,
-        source: std::num::ParseIntError,
-    },
-    #[error(
-        "TLS is required but not configured: set TLS_CERT_PATH and TLS_KEY_PATH, \
-         or TLS_DISABLED=true for local dev (never in production)"
-    )]
-    TlsMissing,
-    #[error("TLS_CERT_PATH `{path}` is not readable: {source}")]
-    TlsCertUnreadable {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[error("TLS_KEY_PATH `{path}` is not readable: {source}")]
-    TlsKeyUnreadable {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[error("invalid TLS_DISABLED `{0}`: expected `true` or `false`")]
-    TlsDisabledFlag(String),
-}
-
 impl Config {
     /// Build config from environment, falling back to defaults.
     ///
-    /// `GATEWAY_BIND`, `MCP_PATH`, `STATE_DB_URL`, and `STATE_DB_POOL_SIZE`
-    /// override the defaults. Malformed values are startup errors — config
-    /// mistakes should fail at boot, not silently.
+    /// `GATEWAY_BIND`, `METRICS_BIND`, `MCP_PATH`, `STATE_DB_URL`, and
+    /// `STATE_DB_POOL_SIZE` override the defaults. Malformed values are startup
+    /// errors — config mistakes should fail at boot, not silently.
     pub fn from_env() -> Result<Self, ConfigError> {
         let mut config = Config::default();
 
@@ -188,16 +146,29 @@ impl Config {
                 .parse()
                 .map_err(|source| ConfigError::Bind { value, source })?;
         }
+        if let Ok(value) = std::env::var("METRICS_BIND") {
+            config.metrics_bind = value
+                .parse()
+                .map_err(|source| ConfigError::MetricsBind { value, source })?;
+        }
+        if config.metrics_bind == config.bind {
+            return Err(ConfigError::MetricsBindCollides(config.bind));
+        }
         if let Ok(path) = std::env::var("MCP_PATH") {
             config.mcp_path = validate_mcp_path(path)?;
         }
         if let Ok(url) = std::env::var("STATE_DB_URL") {
             config.state_db.url = url;
         }
+        // Read before STATE_DB_POOL_SIZE, which is bounded by the global cap.
+        if let Ok(value) = std::env::var("MAX_CONCURRENT_REQUESTS") {
+            config.max_concurrent_requests = parse_cap("MAX_CONCURRENT_REQUESTS", value)?;
+        }
+        if let Ok(value) = std::env::var("MAX_CONCURRENT_PER_IDENTITY") {
+            config.max_concurrent_per_identity = parse_cap("MAX_CONCURRENT_PER_IDENTITY", value)?;
+        }
         if let Ok(value) = std::env::var("STATE_DB_POOL_SIZE") {
-            config.state_db.pool_size = value
-                .parse()
-                .map_err(|source| ConfigError::StateDbPoolSize { value, source })?;
+            config.state_db.pool_size = parse_pool_size(value, config.max_concurrent_requests)?;
         }
         if let Ok(value) = std::env::var("AUDIT_RETENTION_DAYS") {
             let parsed: u32 = value
@@ -214,13 +185,7 @@ impl Config {
             config.audit_retention_days = parsed;
         }
         if let Ok(value) = std::env::var("PERMISSIONS_CACHE_TTL_SECONDS") {
-            config.permissions_cache_ttl_seconds =
-                value
-                    .parse()
-                    .map_err(|source| ConfigError::PermissionsCacheTtl {
-                        value: value.clone(),
-                        source,
-                    })?;
+            config.permissions_cache_ttl_seconds = parse_cache_ttl(value)?;
         }
         // 0 is valid here — it means "re-validate every request" (no caching).
         if let Ok(value) = std::env::var("SESSION_CACHE_TTL_SECONDS") {
@@ -237,6 +202,56 @@ impl Config {
 
         Ok(config)
     }
+}
+
+/// The grant cache bounds how long a revoked grant can still be honoured on a
+/// replica that missed the invalidation; past five minutes that window is an
+/// outage of revocation, so a larger value fails boot rather than being
+/// silently clamped.
+fn parse_cache_ttl(value: String) -> Result<u64, ConfigError> {
+    let ttl: u64 = value
+        .parse()
+        .map_err(|source| ConfigError::PermissionsCacheTtl {
+            value: value.clone(),
+            source,
+        })?;
+    if ttl > MAX_PERMISSIONS_CACHE_TTL_SECONDS {
+        return Err(ConfigError::PermissionsCacheTtlTooLong(ttl));
+    }
+    Ok(ttl)
+}
+
+/// A concurrency ceiling: a positive integer. Zero would shed every request.
+fn parse_cap(name: &'static str, value: String) -> Result<usize, ConfigError> {
+    match value.trim().parse::<usize>() {
+        Ok(0) | Err(_) => Err(ConfigError::ConcurrencyCap { name, value }),
+        Ok(cap) => Ok(cap),
+    }
+}
+
+/// `STATE_DB_POOL_SIZE`: non-zero, and no larger than the request ceiling —
+/// connections past `max_concurrent_requests` can never be checked out at
+/// once, they only hold server slots.
+fn parse_pool_size(
+    value: String,
+    max_concurrent_requests: usize,
+) -> Result<NonZeroU32, ConfigError> {
+    let parsed: u32 = value
+        .parse()
+        .map_err(|source| ConfigError::StateDbPoolSize {
+            value: value.clone(),
+            source,
+        })?;
+    let Some(size) = NonZeroU32::new(parsed) else {
+        return Err(ConfigError::StateDbPoolSizeZero);
+    };
+    if usize::try_from(parsed).is_ok_and(|n| n > max_concurrent_requests) {
+        return Err(ConfigError::StateDbPoolSizeAboveConcurrency {
+            size: parsed,
+            max_concurrent_requests,
+        });
+    }
+    Ok(size)
 }
 
 /// Resolve `TlsConfig` from `TLS_DISABLED` / `TLS_CERT_PATH` / `TLS_KEY_PATH`.

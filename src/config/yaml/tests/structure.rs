@@ -45,8 +45,8 @@ permissions:
 }
 
 /// Parsing the committed example file catches breaking schema drift
-/// before it ships. Sections we don't yet model (`gateway:`, `auth:`,
-/// `logging:`) are silently ignored — that's intentional until #16.
+/// before it ships — every key in it must be modeled, since the top level
+/// denies unknown keys.
 #[test]
 fn parses_the_committed_example_file() {
     let src = include_str!("../../../../config/example.yaml");

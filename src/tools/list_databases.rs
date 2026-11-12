@@ -13,11 +13,12 @@ use serde_json::Value;
 use crate::auth::Identity;
 use crate::authz::{self, Decision};
 use crate::config::{Action, ConfigFile, Database, Grant};
-use crate::transport::jsonrpc::{ErrorObject, Response};
+use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
 use super::audit_dispatch::{
-    AuditHeader, Outcome, OutcomeCode, error_outcome, run_audited, success_outcome,
+    AuditHeader, Outcome, OutcomeCode, error_outcome, reject_arguments, run_audited,
+    success_outcome,
 };
 
 const TOOL_NAME: &str = "list_databases";
@@ -44,10 +45,7 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
     let args: Arguments = match arguments.map(serde_json::from_value::<Arguments>) {
         Some(Ok(a)) => a,
         _ => {
-            return Response::error(
-                id,
-                ErrorObject::invalid_params("list_databases requires `server`"),
-            );
+            return reject_arguments(ctx, id, TOOL_NAME, "list_databases requires `server`").await;
         }
     };
 
@@ -74,7 +72,7 @@ async fn compute_outcome(
     args: &Arguments,
 ) -> Outcome {
     let Some(server) = config.servers.iter().find(|s| s.name == args.server) else {
-        return error_outcome(id, OutcomeCode::Forbidden, "no grants for this server");
+        return error_outcome(OutcomeCode::Forbidden, "no grants for this server");
     };
 
     let visible: Vec<&Database> = server
@@ -96,7 +94,7 @@ async fn compute_outcome(
         .collect();
 
     if visible.is_empty() {
-        return error_outcome(id, OutcomeCode::Forbidden, "no grants for this server");
+        return error_outcome(OutcomeCode::Forbidden, "no grants for this server");
     }
 
     let row_count = i64::try_from(visible.len()).unwrap_or(i64::MAX);
@@ -111,7 +109,7 @@ async fn compute_outcome(
     let text = match serde_json::to_string(&payload) {
         Ok(t) => t,
         Err(_) => {
-            return error_outcome(id, OutcomeCode::Internal, "failed to serialize result");
+            return error_outcome(OutcomeCode::Internal, "failed to serialize result");
         }
     };
 
@@ -123,6 +121,7 @@ mod tests {
     use super::*;
     use crate::auth::SessionId;
     use crate::config::ConfigFile;
+    use crate::tools::audit_dispatch::Reply;
 
     fn identity(groups: &[&str]) -> Identity {
         Identity {
@@ -131,6 +130,7 @@ mod tests {
             user_email: "u@example.com".to_string(),
             groups: groups.iter().map(|g| g.to_string()).collect(),
             issued_at: chrono::Utc::now(),
+            kind: crate::auth::IdentityKind::Sso,
         }
     }
 
@@ -169,7 +169,10 @@ permissions:
     }
 
     fn payload(outcome: &Outcome) -> Value {
-        let value = serde_json::to_value(&outcome.response).unwrap();
+        let Reply::Response(response) = &outcome.reply else {
+            panic!("expected a rendered response, got {:?}", outcome.reply);
+        };
+        let value = serde_json::to_value(response).unwrap();
         let text = value["result"]["content"][0]["text"].as_str().unwrap();
         serde_json::from_str(text).unwrap()
     }
@@ -222,8 +225,7 @@ permissions:
     async fn user_with_no_grants_gets_forbidden_not_empty() {
         let outcome = compute_for(&["finance"], "prod").await;
         assert_eq!(outcome.code, OutcomeCode::Forbidden);
-        let body = payload(&outcome);
-        assert_eq!(body["code"], "forbidden");
+        assert!(matches!(outcome.reply, Reply::ToolError));
     }
 
     /// Server doesn't exist → same `forbidden` as no-grants, identical
@@ -232,9 +234,11 @@ permissions:
     async fn unknown_server_is_forbidden_with_same_message() {
         let outcome = compute_for(&["engineers"], "nonexistent").await;
         assert_eq!(outcome.code, OutcomeCode::Forbidden);
-        let body = payload(&outcome);
-        assert_eq!(body["code"], "forbidden");
-        assert_eq!(body["message"], "no grants for this server");
+        assert!(matches!(outcome.reply, Reply::ToolError));
+        assert_eq!(
+            outcome.error_message.as_deref(),
+            Some("no grants for this server")
+        );
     }
 
     /// No password substring ever appears in the tool output, regardless of

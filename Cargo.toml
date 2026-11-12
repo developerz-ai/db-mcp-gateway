@@ -56,7 +56,7 @@ serde = { version = "1", features = ["derive"] }
 # order via `indexmap`. The mongo rejector (`src/exec/mongo/rejector.rs`)
 # relies on this — mongo's wire convention is "the first key of the
 # command document is the command name."
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 # Not `serde_yaml` — rationale in website/docs/initial-idea/08-config.md
 # §"YAML parser". Must be parsed via `config::yaml::non_leaking_options`.
 serde-saphyr = "1"
@@ -127,6 +127,7 @@ tracing-appender = "0.2"
 # metrics — facade + Prometheus exporter for /metrics
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
+metrics-util = { version = "0.20.4", default-features = false }  # MetricKindMask for the recorder idle timeout
 
 # ids + time
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -153,6 +154,9 @@ regex = { version = "1", default-features = false, features = [
   "unicode-case",
   "unicode-perl",
 ] }
+tower-http = { version = "0.7.1", features = ["timeout"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+arc-swap = "1.9.1"
 
 [dev-dependencies]
 # Self dev-dependency: enables `test-support` for this crate's own integration
@@ -192,7 +196,8 @@ incremental = false
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = "symbols"
+# Drop DWARF, keep the symbol table: GlitchTip backtraces need function names.
+strip = "debuginfo"
 
 # Cargo.lock materialises optional dependencies that enabled features reference,
 # even weakly (`sqlx-sqlite?/…`). sqlx's `migrate`/`json`/`chrono`/`uuid`

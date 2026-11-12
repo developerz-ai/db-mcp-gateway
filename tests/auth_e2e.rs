@@ -388,3 +388,113 @@ async fn hs256_id_token_is_rejected() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "oidc_id_token_invalid", "{body}");
 }
+
+// ---------------------------------------------------------------------------
+// Slice 08 steps 1-3: a state-DB failure is the gateway's 5xx, never a 401
+// that signs a working user out; logout ends every session of the subject.
+// ---------------------------------------------------------------------------
+
+const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// A session the gateway has never seen (its own cache stays cold), so the
+/// bearer check must reach the state DB.
+async fn cold_bearer(gw: &common::gateway::TestGateway, sub: &str) -> String {
+    let store = db_mcp_gateway::auth::SessionStore::new(gw.state_db.clone());
+    let session = store
+        .create(sub, "cold@example.com", &[], HOUR, None, None)
+        .await
+        .expect("session row");
+    db_mcp_gateway::auth::jwt::issue(&gw.auth_config.session_signing_key, session.id, sub, HOUR)
+        .expect("jwt")
+}
+
+fn ping() -> Value {
+    json!({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+}
+
+#[tokio::test]
+async fn state_db_outage_on_bearer_check_is_5xx_without_challenge() {
+    let gw = GatewayBuilder::new(E2E_CONFIG_YAML)
+        .spawn(state_pool().await)
+        .await;
+    let sub = format!("outage-{}", uuid::Uuid::new_v4().simple());
+    let bearer = cold_bearer(&gw, &sub).await;
+    gw.state_db.close().await;
+
+    let resp = no_redirect_client()
+        .post(format!("{}/mcp", gw.url))
+        .bearer_auth(&bearer)
+        .json(&ping())
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_server_error(), "{}", resp.status());
+    assert!(
+        resp.headers().get("www-authenticate").is_none(),
+        "a state-DB blip must not send the client back through login"
+    );
+}
+
+#[tokio::test]
+async fn logout_ends_every_session_of_the_subject() {
+    let gw = GatewayBuilder::new(E2E_CONFIG_YAML)
+        .spawn(state_pool().await)
+        .await;
+    let sub = format!("logout-all-{}", uuid::Uuid::new_v4().simple());
+    let device_a = cold_bearer(&gw, &sub).await;
+    let device_b = cold_bearer(&gw, &sub).await;
+    let http = no_redirect_client();
+
+    let logout = http
+        .post(format!("{}/auth/logout", gw.url))
+        .bearer_auth(&device_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), 204);
+
+    let other_device = http
+        .post(format!("{}/mcp", gw.url))
+        .bearer_auth(&device_b)
+        .json(&ping())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        other_device.status(),
+        401,
+        "device B must be signed out too"
+    );
+}
+
+#[tokio::test]
+async fn logout_during_state_db_outage_is_5xx_not_204() {
+    let gw = GatewayBuilder::new(E2E_CONFIG_YAML)
+        .spawn(state_pool().await)
+        .await;
+    let sub = format!("logout-outage-{}", uuid::Uuid::new_v4().simple());
+    // Through the gateway's own store, so its cache is warm and the bearer
+    // check passes with the pool closed — only the revoke hits the DB.
+    let session = gw
+        .sessions
+        .create(&sub, "warm@example.com", &[], HOUR, None, None)
+        .await
+        .expect("session row");
+    let bearer = db_mcp_gateway::auth::jwt::issue(
+        &gw.auth_config.session_signing_key,
+        session.id,
+        &sub,
+        HOUR,
+    )
+    .expect("jwt");
+    gw.state_db.close().await;
+
+    let resp = no_redirect_client()
+        .post(format!("{}/auth/logout", gw.url))
+        .bearer_auth(&bearer)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_server_error(), "{}", resp.status());
+    assert!(resp.headers().get("www-authenticate").is_none());
+}

@@ -14,16 +14,20 @@
 //! that accepts and then never speaks Postgres. That is a genuine socket
 //! behaviour, just cheaper to arrange than a wedged Postgres.
 //!
-//! Audit assertion intentionally skipped in both tests: they exercise the
+//! Audit assertion intentionally skipped in every test here: they exercise the
 //! exec layer's `AdapterRegistry` in isolation via `get_or_open`, never
 //! entering the tool-dispatch path where audit rows are written. Audit
 //! coverage for the tool path lives in the integration tests (see
 //! `tests/run_query_e2e.rs` and `tests/cancellation_real_db.rs`).
 
+mod common;
+
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use db_mcp_gateway::config::{ConfigFile, Database, Server};
-use db_mcp_gateway::exec::AdapterRegistry;
+use common::mongo_target;
+use db_mcp_gateway::config::{ConfigFile, Database, Password, Server};
+use db_mcp_gateway::exec::{Access, AdapterRegistry, ExecError, ExecQuery};
 
 /// `PgAdapter`'s pool acquire timeout — how long a connect to an unresponsive
 /// host takes to give up. Not exported, so it is restated here.
@@ -35,6 +39,9 @@ use db_mcp_gateway::exec::AdapterRegistry;
 /// real value above 1.5x and correct code fails; below 0.75x and serialized
 /// code slips through.
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the registry remembers a failed open. Not exported either.
+const FAILED_OPEN_TTL: Duration = Duration::from_secs(5);
 
 /// A listener that completes the TCP handshake and then goes silent, so a
 /// Postgres client blocks waiting for a startup response that never comes.
@@ -148,20 +155,121 @@ async fn opens_for_different_databases_do_not_serialize() {
     );
 }
 
-/// A failed open must leave the slot reusable. The map now keeps a `OnceCell`
-/// per key whether or not the open succeeded, so this pins that an errored
-/// attempt leaves the cell uninitialized rather than caching the failure or
-/// wedging every later caller.
+/// A failed open is remembered briefly — the next caller gets `unavailable`
+/// at once instead of spending another acquire timeout (and a request
+/// permit) on a target that just failed — and then retried. The slot is
+/// never wedged.
 #[tokio::test]
-async fn a_failed_open_is_retried_not_cached() {
+async fn a_failed_open_is_cached_briefly_then_retried() {
     let config = config_for(spawn_blackhole().await, spawn_blackhole().await);
     let registry = AdapterRegistry::new();
     let (server, database) = target(&config, "first");
 
-    for attempt in 1..=2 {
-        assert!(
-            registry.get_or_open(server, database).await.is_err(),
-            "attempt {attempt} against an unreachable database must error"
-        );
-    }
+    assert!(registry.get_or_open(server, database).await.is_err());
+
+    let started = Instant::now();
+    let cached = registry.get_or_open(server, database).await;
+    assert!(
+        matches!(cached, Err(ExecError::Unavailable)),
+        "a just-failed target answers unavailable"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "the cached failure must not wait out another connect: {:?}",
+        started.elapsed()
+    );
+
+    tokio::time::sleep(FAILED_OPEN_TTL).await;
+    let started = Instant::now();
+    assert!(registry.get_or_open(server, database).await.is_err());
+    assert!(
+        started.elapsed() >= POOL_ACQUIRE_TIMEOUT / 2,
+        "after the TTL the open is attempted again: {:?}",
+        started.elapsed()
+    );
+}
+
+/// `evict` drops the adapter; concurrent callers after it converge on one
+/// fresh adapter. Mongo opens without a round trip, so this needs no
+/// reachable target.
+#[tokio::test]
+async fn evict_then_concurrent_reopen_converges_on_one_adapter() {
+    let server = mongo_target::server("evict");
+    let database = mongo_target::database();
+    let registry = AdapterRegistry::new();
+
+    let before = registry
+        .get_or_open(&server, &database)
+        .await
+        .expect("opens");
+    let again = registry
+        .get_or_open(&server, &database)
+        .await
+        .expect("cached");
+    assert!(
+        Arc::ptr_eq(&before, &again),
+        "steady state reuses the adapter"
+    );
+
+    registry.evict(&server.name, &database.name).await;
+    let reopened = futures::future::join_all((0..8).map(|_| {
+        let (registry, server, database) = (registry.clone(), server.clone(), database.clone());
+        async move {
+            registry
+                .get_or_open(&server, &database)
+                .await
+                .expect("reopens")
+        }
+    }))
+    .await;
+    assert!(
+        !Arc::ptr_eq(&before, &reopened[0]),
+        "evict forces a new adapter"
+    );
+    assert!(
+        reopened.iter().all(|a| Arc::ptr_eq(a, &reopened[0])),
+        "concurrent callers share one reopened adapter"
+    );
+}
+
+/// An adapter whose credentials the target rejects goes stale, and the
+/// registry replaces it on the next lookup — the hook that lets a rotated
+/// password take effect. Runs against the dev Mongo (:27018).
+#[tokio::test]
+async fn adapter_rejected_on_credentials_is_replaced() {
+    let server = mongo_target::server("stale");
+    let database = Database {
+        password: Password::Literal("not-the-password".into()),
+        ..mongo_target::database()
+    };
+    let registry = AdapterRegistry::new();
+
+    let first = registry
+        .get_or_open(&server, &database)
+        .await
+        .expect("opens");
+    let err = first
+        .execute(ExecQuery {
+            sql: r#"{"count":"anything"}"#,
+            binds: &[],
+            statement_timeout_ms: Some(5_000),
+            row_limit: 1,
+            access: Access::ReadOnly,
+        })
+        .await
+        .expect_err("wrong password must fail");
+    assert!(matches!(err, ExecError::Connection), "got {err:?}");
+    assert!(
+        first.is_stale(),
+        "a credential rejection marks the adapter stale"
+    );
+
+    let second = registry
+        .get_or_open(&server, &database)
+        .await
+        .expect("reopens");
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "the stale adapter was replaced"
+    );
 }

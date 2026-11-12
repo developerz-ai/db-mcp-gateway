@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_json::value::RawValue;
 
 /// The only JSON-RPC version we accept or emit.
 pub const JSONRPC_VERSION: &str = "2.0";
@@ -119,8 +120,10 @@ impl Request {
 pub struct Response {
     pub jsonrpc: &'static str,
     pub id: Value,
+    /// Already-serialised JSON: a tool result is rendered once, here, not
+    /// first into a `Value` tree and then again into the body.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
+    pub result: Option<Box<RawValue>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorObject>,
 }
@@ -130,7 +133,7 @@ impl Response {
     /// payloads can't realistically fail; if it ever did we degrade to an internal
     /// error rather than `unwrap`-ing and panicking the worker.
     pub fn result<T: Serialize>(id: Value, value: &T) -> Self {
-        match serde_json::to_value(value) {
+        match serde_json::value::to_raw_value(value) {
             Ok(value) => Self {
                 jsonrpc: JSONRPC_VERSION,
                 id,
@@ -168,6 +171,11 @@ impl ErrorObject {
         Self::new(INVALID_REQUEST, "Invalid request")
     }
 
+    /// `invalid_request` with a reason the client can act on.
+    pub fn invalid_request_with(message: impl Into<String>) -> Self {
+        Self::new(INVALID_REQUEST, message)
+    }
+
     pub fn method_not_found(method: &str) -> Self {
         Self::new(METHOD_NOT_FOUND, format!("Method not found: {method}"))
     }
@@ -190,94 +198,5 @@ impl ErrorObject {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn detects_notification_by_missing_id() {
-        let notification: Request =
-            serde_json::from_value(json!({"jsonrpc": "2.0", "method": "x"})).unwrap();
-        assert!(notification.is_notification());
-        assert!(matches!(notification.id, RequestId::Absent));
-
-        let request: Request =
-            serde_json::from_value(json!({"jsonrpc": "2.0", "id": 1, "method": "x"})).unwrap();
-        assert!(!request.is_notification());
-        assert!(matches!(request.id, RequestId::Present(_)));
-    }
-
-    /// `"id": null` is *not* a notification — the member is present,
-    /// just explicitly null, which MCP forbids for requests. Preserving
-    /// presence lets the transport reject it as `invalid_request`
-    /// instead of silently accepting it as a notification.
-    #[test]
-    fn distinguishes_explicit_null_id_from_absent_id() {
-        let with_null: Request =
-            serde_json::from_value(json!({"jsonrpc": "2.0", "id": null, "method": "x"})).unwrap();
-        assert!(!with_null.is_notification());
-        assert!(with_null.id.is_null());
-        assert_eq!(with_null.id.response_id(), Value::Null);
-
-        let absent: Request =
-            serde_json::from_value(json!({"jsonrpc": "2.0", "method": "x"})).unwrap();
-        assert!(absent.is_notification());
-        assert!(!absent.id.is_null());
-    }
-
-    /// MCP `RequestId` is `string | number` (integer). The parser accepts
-    /// any JSON value into `Present` so the transport can echo the value
-    /// back in the error response, but `is_invalid_type` flags the
-    /// non-conforming cases the transport must reject.
-    #[test]
-    fn flags_unsupported_id_types_as_invalid() {
-        for id in [json!(true), json!(false), json!([]), json!({}), json!(1.5)] {
-            let request: Request =
-                serde_json::from_value(json!({"jsonrpc": "2.0", "id": id, "method": "x"})).unwrap();
-            assert!(
-                request.id.is_invalid_type(),
-                "expected {id} to be flagged as invalid MCP RequestId type",
-            );
-            // Round-tripped verbatim so error responses echo the sender's id.
-            assert_eq!(request.id.response_id(), id);
-            // Invalid-type is disjoint from notification and null.
-            assert!(!request.id.is_notification());
-            assert!(!request.id.is_null());
-        }
-    }
-
-    #[test]
-    fn accepts_string_and_integer_ids() {
-        for id in [
-            json!("req-1"),
-            json!(1),
-            json!(0),
-            json!(-1),
-            json!(u64::MAX),
-        ] {
-            let request: Request =
-                serde_json::from_value(json!({"jsonrpc": "2.0", "id": id, "method": "x"})).unwrap();
-            assert!(
-                !request.id.is_invalid_type(),
-                "expected {id} to be accepted as a valid MCP RequestId",
-            );
-        }
-    }
-
-    #[test]
-    fn error_response_has_no_result() {
-        let response = Response::error(json!(1), ErrorObject::method_not_found("foo"));
-        let value = serde_json::to_value(&response).unwrap();
-        assert_eq!(value["jsonrpc"], "2.0");
-        assert_eq!(value["error"]["code"], METHOD_NOT_FOUND);
-        assert!(value.get("result").is_none());
-    }
-
-    #[test]
-    fn success_response_has_no_error() {
-        let response = Response::result(json!(1), &json!({ "ok": true }));
-        let value = serde_json::to_value(&response).unwrap();
-        assert_eq!(value["result"]["ok"], true);
-        assert!(value.get("error").is_none());
-    }
-}
+#[path = "jsonrpc_tests.rs"]
+mod tests;

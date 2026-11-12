@@ -3,14 +3,15 @@
 use sqlx::MySqlPool;
 use uuid::Uuid;
 
-use super::super::{DbType, Page, PermissionsDatabase, RepoError};
+use super::super::{Page, PermissionsDatabase, RepoError};
 use super::rows::database_from_row;
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) async fn create_database(
     pool: &MySqlPool,
     server: &str,
     db_name: &str,
-    db_type: DbType,
+    db_type: super::super::DbType,
 ) -> Result<PermissionsDatabase, RepoError> {
     let new_id = Uuid::new_v4();
     sqlx::query(
@@ -64,28 +65,13 @@ pub(super) async fn list_databases(
     rows.iter().map(database_from_row).collect()
 }
 
-/// See [`super::super::PermissionsRepo::all_live_databases`] — deliberately
-/// unpaginated; the authz resolver needs the complete set.
-pub(super) async fn all_live_databases(
-    pool: &MySqlPool,
-) -> Result<Vec<PermissionsDatabase>, RepoError> {
-    let rows = sqlx::query(
-        "SELECT id, server, db_name, db_type, created_at, updated_at, deleted_at \
-         FROM permissions_databases \
-         WHERE deleted_at IS NULL \
-         ORDER BY server, db_name",
-    )
-    .fetch_all(pool)
-    .await?;
-    rows.iter().map(database_from_row).collect()
-}
-
+#[cfg(any(test, feature = "test-support"))]
 pub(super) async fn update_database(
     pool: &MySqlPool,
     id: Uuid,
     server: Option<&str>,
     db_name: Option<&str>,
-    db_type: Option<DbType>,
+    db_type: Option<super::super::DbType>,
 ) -> Result<Option<PermissionsDatabase>, RepoError> {
     // One transaction so the reread returns exactly the row this UPDATE wrote —
     // a concurrent patch or soft-delete can't slip in between (PATCH contract in
@@ -120,6 +106,7 @@ pub(super) async fn update_database(
     row.map(|r| database_from_row(&r)).transpose()
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) async fn soft_delete_database(pool: &MySqlPool, id: Uuid) -> Result<bool, RepoError> {
     let res = sqlx::query(
         "UPDATE permissions_databases SET deleted_at = NOW(6) \

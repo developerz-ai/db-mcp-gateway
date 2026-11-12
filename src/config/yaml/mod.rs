@@ -1,8 +1,7 @@
-//! Load + validate the gateway's `servers:` and `permissions:` from YAML.
-//!
-//! For #3 this is a strict subset of the spec doc 08 schema. The remaining
-//! sections (`gateway:`, `auth:`, `logging:`) come from env/AuthConfig today
-//! and land in YAML with issue #16.
+//! Load + validate the gateway's YAML config (spec 08). Every section, and
+//! the top level itself, denies unknown keys: a misspelled section name fails
+//! boot instead of being silently ignored. OIDC and listener settings are
+//! env-driven (`AuthConfig`, `Config`), not YAML.
 
 use std::path::{Path, PathBuf};
 
@@ -12,13 +11,21 @@ use super::schema::{LoggingBlock, Permission, Server, ServiceAccount};
 use super::secret::SecretError;
 
 pub use error::ConfigFileError;
+pub use gateway::{Environment, GatewayBlock};
 
 mod error;
+mod gateway;
+mod limits;
+mod reload_diff;
 mod roles;
 mod validate;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigFile {
+    /// `env: production` rejects inline literal secrets. Absent → development.
+    #[serde(default)]
+    pub gateway: GatewayBlock,
     #[serde(default)]
     pub servers: Vec<Server>,
     #[serde(default)]
@@ -173,8 +180,14 @@ impl ConfigFile {
     /// through [`non_leaking_options`] too — `serde_saphyr::from_str` defaults
     /// to attaching source snippets, which on this file means credentials.
     pub fn from_yaml_str(raw: &str) -> Result<Self, ConfigFileError> {
-        let parsed: ConfigFile = serde_saphyr::from_str_with_options(raw, non_leaking_options())
-            .map_err(|source| ConfigFileError::parse_from(PathBuf::from("<inline>"), source))?;
+        let mut parsed: ConfigFile =
+            serde_saphyr::from_str_with_options(raw, non_leaking_options())
+                .map_err(|source| ConfigFileError::parse_from(PathBuf::from("<inline>"), source))?;
+        // Group names are compared to IdP claims verbatim; stray YAML
+        // whitespace would make a block silently match nobody.
+        for permission in &mut parsed.permissions {
+            permission.group = permission.group.trim().to_string();
+        }
         parsed.validate()?;
         Ok(parsed)
     }

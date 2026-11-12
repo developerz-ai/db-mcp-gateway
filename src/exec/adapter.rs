@@ -13,8 +13,11 @@
 //! most-restrictive-wins.
 //!
 //! Security note: `ExecError`'s `Display` never carries connection strings,
-//! hostnames, passwords, or SQLSTATE codes. The pg-side mapping is in
-//! `pg::decode::classify`; new adapters must preserve this discipline.
+//! hostnames, passwords, or role names. The one variant that carries
+//! server text, [`ExecError::Rejected`], is built only from a statement-level
+//! database error (never a connect error) with the role name redacted. The
+//! pg-side mapping is in `pg::error`; new adapters must preserve this
+//! discipline.
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -23,7 +26,8 @@ use serde_json::Value;
 use crate::config::ServerKind;
 
 use super::ident::Identifier;
-use super::sql_guard::ReadOnlySql;
+use super::rejection::DbRejection;
+use super::sql_guard::{Access, ReadOnlySql};
 
 /// Gateway-wide ceiling on a single query's wall-clock budget. When a grant
 /// declines to set `statement_timeout_ms` (spec-06 "no constraint from this
@@ -38,6 +42,14 @@ use super::sql_guard::ReadOnlySql;
 /// backend's, so it lives next to the trait rather than in one impl.
 pub const DEFAULT_STATEMENT_TIMEOUT_MS: u32 = 30_000;
 
+/// Gateway-wide ceiling on the decoded size of one result — the byte
+/// analogue of the row cap. A handful of wide `text`/`jsonb` rows can be
+/// hundreds of MiB while staying under any row limit; past this budget the
+/// adapter stops collecting and flags `truncated`, exactly as for the row
+/// cap. Measured over the decoded JSON values (see `result_size`), not wire
+/// bytes, because the decoded form is what the gateway holds in memory.
+pub const MAX_RESULT_BYTES: usize = 32 * 1024 * 1024;
+
 /// Extra slack on top of the DB-side timeout so the Tokio guard doesn't
 /// preempt before the backend has a chance to surface its own cancel (which
 /// carries the precise, typed error).
@@ -46,15 +58,18 @@ pub(super) const TOKIO_TIMEOUT_SLACK_MS: u64 = 500;
 /// Effective per-query timeout in milliseconds. The grant value wins when
 /// present (it may be more restrictive) but is clamped to the gateway
 /// ceiling so it can only tighten, never loosen:
-/// `effective = min(grant.unwrap_or(CEILING), CEILING)`.
+/// `effective = clamp(grant.unwrap_or(CEILING), 1, CEILING)`.
+///
+/// The floor of 1 is belt and braces: config and the admin API reject a zero
+/// timeout, but Postgres reads `statement_timeout = 0` as *no limit*, so a
+/// zero that slipped through would silently disable the DB-side cap.
 pub(super) fn effective_timeout_ms(grant: Option<u32>) -> u32 {
     grant
         .unwrap_or(DEFAULT_STATEMENT_TIMEOUT_MS)
-        .min(DEFAULT_STATEMENT_TIMEOUT_MS)
+        .clamp(1, DEFAULT_STATEMENT_TIMEOUT_MS)
 }
 
-/// Backend identifier — used for metrics tagging and per-adapter dispatch.
-/// More variants land as `PgAdapter`'s siblings arrive.
+/// Backend identifier — names the adapter in [`ExecError::NotImplemented`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AdapterKind {
@@ -65,12 +80,18 @@ pub enum AdapterKind {
 /// A single query against the adapter. `binds` are positional text values
 /// applied in order — `$1`, `$2`, … for pg; future adapters define their own
 /// placeholder convention. `binds = &[]` for queries with no parameters.
+///
+/// `access` is the caller's authz decision, and the adapter enforces it at
+/// the database: [`Access::ReadOnly`] runs inside a read-only transaction,
+/// so even a write-capable role cannot write through it. Only a `query_write`
+/// grant may pass [`Access::ReadWrite`].
 #[derive(Debug)]
 pub struct ExecQuery<'a> {
     pub sql: &'a str,
     pub binds: &'a [&'a str],
     pub statement_timeout_ms: Option<u32>,
     pub row_limit: u32,
+    pub access: Access,
 }
 
 /// Catalog lookup for one schema, optionally narrowed to one table. Schema
@@ -103,13 +124,18 @@ pub struct ExplainQuery<'a> {
 
 /// Tabular result. `rows` is row-major; `columns` carries the names in their
 /// stable left-to-right order. `truncated` means more rows were available
-/// but the gateway stopped at `row_limit`.
+/// but the gateway stopped at `row_limit` or [`MAX_RESULT_BYTES`].
+///
+/// `rows_affected` is `Some` only for an [`Access::ReadWrite`] query: the
+/// number of rows the statement changed, which can exceed `rows.len()` when a
+/// `RETURNING` list was truncated (the write itself is never cut short).
 #[derive(Debug, Serialize)]
 pub struct ExecResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
     pub truncated: bool,
     pub elapsed_ms: u64,
+    pub rows_affected: Option<u64>,
 }
 
 /// Typed execution errors. `Display` carries no secrets, hostnames, or
@@ -127,8 +153,22 @@ pub enum ExecError {
     #[error("query exceeded the configured statement_timeout")]
     Timeout,
 
+    /// The DB refused the statement and the reason is opaque (a protocol or
+    /// decode failure, or a non-Postgres backend's command error).
     #[error("SQL rejected by the DB")]
     Sql,
+
+    /// The DB refused the statement with a SQLSTATE the agent can act on:
+    /// the code plus the server's primary message, role name redacted.
+    /// Tools map it by [`DbRejection::kind`].
+    #[error("SQL rejected by the DB: {0}")]
+    Rejected(DbRejection),
+
+    /// The target answered, but with a value the gateway could not decode
+    /// (a Mongo reply missing its documented field, an undecodable BSON
+    /// document). Never papered over with a fabricated `null`.
+    #[error("target DB returned a response the gateway could not decode")]
+    Decode,
 
     /// Gateway-side policy rejection — defense-in-depth on top of the
     /// least-privilege DB role. Today this fires only from
@@ -187,10 +227,6 @@ pub enum ExecError {
 ///    more than `row_limit` rows.
 #[async_trait]
 pub trait DbAdapter: Send + Sync + std::fmt::Debug {
-    /// Backend identifier — used for `metrics!` tagging and per-adapter
-    /// dispatch from generic tool code.
-    fn kind(&self) -> AdapterKind;
-
     /// Run a single query under the gateway-enforced timeout + row cap.
     /// See `ExecQuery` for the per-call inputs.
     async fn execute(&self, query: ExecQuery<'_>) -> Result<ExecResult, ExecError>;
@@ -210,10 +246,10 @@ pub trait DbAdapter: Send + Sync + std::fmt::Debug {
     /// as JSON text (`Value::String`).
     async fn explain(&self, query: ExplainQuery<'_>) -> Result<ExecResult, ExecError>;
 
-    /// Cheap liveness probe — `SELECT 1` (or backend equivalent). Used by
-    /// `/readyz` to confirm the adapter's pool can still acquire a connection
-    /// without consulting the underlying DB's query planner.
-    async fn health(&self) -> Result<(), ExecError>;
+    /// Whether the adapter saw the target reject its credentials. The
+    /// registry replaces a stale adapter on the next lookup, so the new one
+    /// re-resolves the password reference — rotation without a restart.
+    fn is_stale(&self) -> bool;
 }
 
 #[cfg(test)]
@@ -230,5 +266,12 @@ mod tests {
         // A looser grant is clamped down to the ceiling — it can only tighten.
         assert_eq!(effective_timeout_ms(Some(60_000)), 30_000);
         assert_eq!(effective_timeout_ms(Some(3_600_000)), 30_000);
+    }
+
+    /// Postgres reads `statement_timeout = 0` as "no limit", so a zero grant
+    /// must never reach the DB as zero.
+    #[test]
+    fn effective_timeout_never_zero() {
+        assert_eq!(effective_timeout_ms(Some(0)), 1);
     }
 }

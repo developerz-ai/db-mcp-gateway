@@ -13,57 +13,63 @@
 //!    the gateway allows) is resolved by
 //!    [`super::adapter::effective_timeout_ms`], so no query can pin a pool
 //!    connection indefinitely and no grant can loosen past the ceiling.
+//! 3. A read runs in a `READ ONLY` transaction, and no session state
+//!    survives a connection's return to the pool (see [`reset_on_release`]).
 //!
-//! Split by responsibility: `cancel` owns the drop-guard cancellation,
-//! `truncate` owns the row-cap cleanup, `decode` owns row → JSON and
-//! `sqlx::Error` → `ExecError`, `config` owns password resolution and
-//! `PgConnectOptions` construction, `run` owns the per-query transaction
-//! orchestration. `catalog`, `sample` and `explain` build the Postgres SQL
-//! behind the matching `DbAdapter` methods. This file keeps only the adapter
-//! shape.
+//! Split by responsibility: `cancel` owns the identity-checked cancel and
+//! its drop guard, `truncate` owns read-truncation cleanup, `decode` owns
+//! row → JSON, `error` owns `sqlx::Error` → `ExecError`, `config` owns
+//! password resolution and `PgConnectOptions` construction, `run` owns the
+//! per-query transaction. `catalog`, `sample` and `explain` build the
+//! Postgres SQL behind the matching `DbAdapter` methods.
 
 mod cancel;
 mod catalog;
 mod config;
 mod decode;
+mod error;
 mod explain;
 mod run;
 mod sample;
 mod truncate;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use metrics::gauge;
-use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::pool::{PoolConnection, PoolConnectionMetadata};
+use sqlx::postgres::{PgPoolOptions, Postgres};
+use sqlx::{Executor, PgConnection, PgPool};
 
+use crate::audit::drain::DetachedTasks;
 use crate::config::{Database, Server};
 
 use super::adapter::{
-    AdapterKind, DbAdapter, ExecError, ExecQuery, ExecResult, ExplainQuery, SampleQuery,
-    SchemaQuery, TOKIO_TIMEOUT_SLACK_MS, effective_timeout_ms,
+    DbAdapter, ExecError, ExecQuery, ExecResult, ExplainQuery, SampleQuery, SchemaQuery,
+    TOKIO_TIMEOUT_SLACK_MS, effective_timeout_ms,
 };
+use super::pool_sizing::PoolSizing;
+use super::sql_guard::Access;
 
 use config::build_connect_options;
-use decode::classify;
-use run::run_query_inner;
+use error::{AcquireFailure, log_discarded};
+use run::{RunCtx, run_query_inner};
 
 // Re-exported so `super::pg::resolve_password` keeps working for sibling
 // adapters (mongo::MongoAdapter::open) without exposing the config submodule.
 pub(crate) use config::resolve_password;
 
-/// Public so integration tests (e.g. `cancellation_real_db`) can size the
-/// saturation workload to match the pool exactly rather than duplicating the
-/// literal — a stale copy would silently stop exercising full saturation if
-/// this constant changed.
-pub const DEFAULT_POOL_MAX_CONNECTIONS: u32 = 5;
-const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Dedicated pool for `pg_cancel_backend(pid)` writes. Must stay separate
+/// Bound on waiting for a pooled connection (or opening one). Spent *before*
+/// the statement budget starts: a saturated pool is `unavailable`, not a
+/// `timeout` of the caller's query.
+pub(super) const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Dedicated pool for `pg_cancel_backend(pid)`. Must stay separate
 /// from the main pool — if `CancelOnDrop::drop` fired through the main
 /// pool, its `execute` would queue on `acquire()` behind the very
-/// connections the cancels are trying to free (five hung queries + five
-/// drops with `max_connections = 5` deadlocks every cancel until
+/// connections the cancels are trying to free (N hung queries + N drops
+/// with `max_connections = N` deadlocks every cancel until
 /// `statement_timeout` expires). Sized to 2 so a burst of concurrent
 /// disconnects gets two round-trips in parallel; cancels are single-round
 /// and cheap, no need for more.
@@ -76,6 +82,13 @@ pub struct PgAdapter {
     /// Dedicated pool for `pg_cancel_backend(pid)`. Never shares connections
     /// with `pool` — see [`CANCEL_POOL_MAX_CONNECTIONS`] for the reason.
     cancel_pool: PgPool,
+    /// Redacted from server messages before they reach the agent.
+    role: String,
+    /// Set when the target rejected the credentials; the registry then
+    /// replaces this adapter so the password is resolved again.
+    stale: AtomicBool,
+    /// Tracks drop-guard cancels so a shutdown drain waits for them.
+    detached: DetachedTasks,
     /// Composite label for metrics tagging — bounded cardinality, supplied
     /// from YAML config rather than user input.
     db_label: String,
@@ -92,69 +105,110 @@ impl std::fmt::Debug for PgAdapter {
 }
 
 impl PgAdapter {
-    /// Open a fresh pool for `(server, database)`. Lazy: a misconfigured DB
-    /// only errors here (the registry calls this on first request to that
-    /// DB), not at boot.
-    pub async fn open(server: &Server, database: &Database) -> Result<Self, ExecError> {
+    /// Open the pools for `(server, database)`. The query pool connects once
+    /// so a misconfigured DB errors here (the registry calls this on first
+    /// request to that DB, not at boot); that connection then idles out like
+    /// any other. The cancel pool connects on first use. Drop-guard cancels
+    /// run on `detached`.
+    pub async fn open(
+        server: &Server,
+        database: &Database,
+        sizing: PoolSizing,
+        detached: DetachedTasks,
+    ) -> Result<Self, ExecError> {
         let password = resolve_password(&database.password).await?;
         let opts = build_connect_options(server, database, &password);
-        // Same DSN for both pools — the cancel pool is a Postgres client like
-        // any other, it just never runs anything but `pg_cancel_backend(...)`.
         let pool = PgPoolOptions::new()
-            .max_connections(DEFAULT_POOL_MAX_CONNECTIONS)
+            .max_connections(sizing.max_connections)
+            .min_connections(sizing.min_connections)
+            .idle_timeout(sizing.idle_timeout)
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+            .after_release(reset_on_release)
             .connect_with(opts.clone())
             .await
-            .map_err(|_| ExecError::Connection)?;
+            .map_err(|err| {
+                log_discarded(&err, "target pool open failed");
+                ExecError::Connection
+            })?;
         let cancel_pool = PgPoolOptions::new()
             .max_connections(CANCEL_POOL_MAX_CONNECTIONS)
+            .min_connections(0)
+            .idle_timeout(sizing.idle_timeout)
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-            .connect_with(opts)
-            .await
-            .map_err(|_| ExecError::Connection)?;
+            .connect_lazy_with(opts);
 
         let db_label = format!("{}/{}", server.name, database.name);
-        // Single label `db = "<server>/<database>"` — bounded cardinality.
-        // Live connection count would need a polling task; reporting the
-        // configured max is the cheap first signal for "pool exists for this
-        // db". A separate `pool_kind` label distinguishes the query pool from
-        // the cancel pool so operator dashboards see both without stat name
-        // proliferation.
+        // Configured maxima, one gauge per pool kind — cheap first signal for
+        // "pool exists for this db" with bounded label cardinality.
         gauge!("pool_size", "db" => db_label.clone(), "pool_kind" => "query")
-            .set(DEFAULT_POOL_MAX_CONNECTIONS as f64);
+            .set(f64::from(sizing.max_connections));
         gauge!("pool_size", "db" => db_label.clone(), "pool_kind" => "cancel")
-            .set(CANCEL_POOL_MAX_CONNECTIONS as f64);
+            .set(f64::from(CANCEL_POOL_MAX_CONNECTIONS));
 
         Ok(Self {
             pool,
             cancel_pool,
+            role: database.role.clone(),
+            stale: AtomicBool::new(false),
+            detached,
             db_label,
         })
     }
+
+    /// A connection for one query, bounded by [`POOL_ACQUIRE_TIMEOUT`]. A
+    /// credential rejection marks the adapter stale.
+    async fn acquire(&self) -> Result<PoolConnection<Postgres>, ExecError> {
+        self.pool
+            .acquire()
+            .await
+            .map_err(|err| match AcquireFailure::of(&err) {
+                AcquireFailure::Auth => {
+                    self.stale.store(true, Ordering::Relaxed);
+                    ExecError::Connection
+                }
+                AcquireFailure::Other => ExecError::Unavailable,
+            })
+    }
+}
+
+/// `after_release` hook: wipe session state before a connection serves the
+/// next caller. `RESET ALL` undoes session `SET`s / `set_config(…, false)`;
+/// `pg_advisory_unlock_all()` drops session advisory locks. Not `DISCARD
+/// ALL`: it would also drop the prepared statements sqlx's cache still
+/// believes exist. A failed reset discards the connection.
+fn reset_on_release(
+    conn: &mut PgConnection,
+    _meta: PoolConnectionMetadata,
+) -> BoxFuture<'_, Result<bool, sqlx::Error>> {
+    Box::pin(async move {
+        match conn
+            .execute("RESET ALL; SELECT pg_advisory_unlock_all()")
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                log_discarded(&err, "connection reset failed; discarding");
+                Ok(false)
+            }
+        }
+    })
 }
 
 #[async_trait]
 impl DbAdapter for PgAdapter {
-    fn kind(&self) -> AdapterKind {
-        AdapterKind::Postgres
-    }
-
     async fn execute(&self, query: ExecQuery<'_>) -> Result<ExecResult, ExecError> {
-        // A timeout is ALWAYS applied: the grant value when present (it may be
-        // tighter), else the gateway ceiling. `None` would otherwise leave the
-        // query unbounded and pin a pool connection — see S4. Both the
-        // DB-side `SET LOCAL` and this Tokio guard use the same effective
-        // value (computed again inside `run_query_inner`).
-        let effective_ms = effective_timeout_ms(query.statement_timeout_ms);
+        let mut conn = self.acquire().await?;
         // Belt-and-suspenders: a Tokio-side deadline so even a misapplied
-        // SET LOCAL (or a DB that ignores it) still bounds the call.
+        // SET LOCAL (or a DB that ignores it) still bounds the call. Same
+        // effective value as the DB-side cap set inside `run_query_inner`.
+        let effective_ms = effective_timeout_ms(query.statement_timeout_ms);
         let budget = Duration::from_millis(u64::from(effective_ms) + TOKIO_TIMEOUT_SLACK_MS);
-        match tokio::time::timeout(
-            budget,
-            run_query_inner(&self.pool, &self.cancel_pool, &query),
-        )
-        .await
-        {
+        let ctx = RunCtx {
+            cancel_pool: &self.cancel_pool,
+            role: &self.role,
+            detached: &self.detached,
+        };
+        match tokio::time::timeout(budget, run_query_inner(&mut conn, &ctx, &query)).await {
             Ok(result) => result,
             Err(_elapsed) => Err(ExecError::Timeout),
         }
@@ -167,6 +221,7 @@ impl DbAdapter for PgAdapter {
             binds: &binds,
             statement_timeout_ms: query.statement_timeout_ms,
             row_limit: query.row_limit,
+            access: Access::ReadOnly,
         })
         .await
     }
@@ -178,6 +233,7 @@ impl DbAdapter for PgAdapter {
             binds: &[],
             statement_timeout_ms: query.statement_timeout_ms,
             row_limit: query.row_limit,
+            access: Access::ReadOnly,
         })
         .await
     }
@@ -189,19 +245,13 @@ impl DbAdapter for PgAdapter {
             binds: &[],
             statement_timeout_ms: query.statement_timeout_ms,
             row_limit: explain::EXPLAIN_RESULT_CAP,
+            access: Access::ReadOnly,
         })
         .await
     }
 
-    async fn health(&self) -> Result<(), ExecError> {
-        // `SELECT 1` proves the pool can hand out a working connection and
-        // the DB is accepting queries. Cheaper than a no-op acquire because
-        // the round-trip catches half-open connections too.
-        sqlx::query("SELECT 1")
-            .fetch_optional(&self.pool)
-            .await
-            .map(|_| ())
-            .map_err(classify)
+    fn is_stale(&self) -> bool {
+        self.stale.load(Ordering::Relaxed)
     }
 }
 

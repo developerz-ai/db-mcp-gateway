@@ -9,21 +9,12 @@
 #   gcp-sm:projects/...       secret backend — recognised, not implemented (boot aborts)
 # Anything else is taken as an inline literal (dev/test only).
 
+# Listener, state DB, TLS and OIDC settings are environment variables, not YAML
+# (GATEWAY_BIND, METRICS_BIND, STATE_DB_URL, STATE_DB_POOL_SIZE, TLS_*, OIDC_*) —
+# see website/docs/deployment/. Every key in this file is checked at boot: an
+# unknown or misspelled key aborts startup.
 gateway:
-  bind: 0.0.0.0:8443
-  external_url: https://db.internal.example.com
   env: production              # 'production' rejects inline literal secrets
-  state_db:
-    url: ${ENV:STATE_DB_URL}
-    pool_size: 10
-
-auth:
-  oidc:
-    issuer: https://example.okta.com
-    client_id: ${ENV:OIDC_CLIENT_ID}
-    client_secret: ${ENV:OIDC_CLIENT_SECRET}
-    groups_claim: groups
-    session_ttl_hours: 8
 
 servers:
   - name: prod
@@ -36,19 +27,20 @@ servers:
         role: mcp_gateway_prod_app_ro
         password: vault:secret/prod/db/app_ro_password
         description: "Main customer-facing app DB"
-        # `sql_capture` and `pool:` are in the spec but not yet enforced.
-        # Parser rejects them until the features ship. See website/docs/initial-idea/08-config.md.
+        # `sql_capture` is in the spec but not yet enforced; the parser rejects it.
         # sql_capture: redacted          # planned: full | redacted | metadata_only
-        # pool:
-        #   max_connections: 5
-        #   idle_timeout_seconds: 300
-        #   acquire_timeout_seconds: 10
+        # Optional per-database pool sizing; overrides the server's `pool:` per
+        # field. min <= max; max_connections and idle_timeout_s are non-zero.
+        pool:
+          max_connections: 5
+          min_connections: 0
+          idle_timeout_s: 300
 
       - name: billing
         role: mcp_gateway_prod_billing_ro
         password: vault:secret/prod/db/billing_ro_password
         # sql_capture: metadata_only      # planned — see comment above
-        # pool: { max_connections: 3 }
+        pool: { max_connections: 3 }
 
   - name: staging
     kind: postgres
@@ -61,7 +53,7 @@ servers:
         # File mount: pair with a Kubernetes Secret + volumeMount or a
         # sealed-secret. Refer to deployment docs for the helm/kustomize bit.
         password: ${FILE:/run/secrets/staging-app-ro-password}
-        # pool: { max_connections: 5 }    # planned — see comment above
+        pool: { max_connections: 5 }
 
   # Analytics server with a write-capable sandbox DB. The role below actually
   # holds INSERT/UPDATE/DELETE on `sandbox` — writes need BOTH a `query_write`
@@ -88,7 +80,7 @@ servers:
 #   re-authentication. Caps the window where a user removed from the admin
 #   group in the IdP can still reach `/admin/*`. Group membership is frozen at
 #   login time, so without this cap a removed admin retains access until their
-#   full session expires (auth.oidc.session_ttl_hours, default 8 h). Example:
+#   full session expires (SESSION_TTL_HOURS env, default 8 h). Example:
 #   3600 = admin access expires 1 h after login regardless of session TTL.
 #   Absent / omitted = no cap (rely on session_ttl_hours + explicit revocation).
 # admin:

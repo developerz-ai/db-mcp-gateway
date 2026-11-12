@@ -26,12 +26,12 @@
 //! [`absence_is_silent_even_with_wildcards`]: a user whose groups don't
 //! match cannot be allowed by a wildcard that exists for another group.
 
+use super::proptest_support::{
+    TEST_GROUP, any_action, any_constraints, as_yaml_for, identity_in, no_more_permissive_than,
+};
 use super::{Decision, evaluate_effective};
-use crate::auth::{Identity, SessionId};
-use crate::config::{Action, Constraints, Grant, Permission};
+use crate::config::Grant;
 use proptest::prelude::*;
-
-const TEST_GROUP: &str = "g";
 
 /// Small alphabet — see the matching helper in [`super::effective_proptests`]
 /// for the rationale. The point of a tiny universe is forcing proptest into
@@ -42,68 +42,6 @@ fn any_concrete_server() -> impl Strategy<Value = String> {
 
 fn any_concrete_db() -> impl Strategy<Value = String> {
     prop_oneof![Just("app".to_string()), Just("billing".to_string())]
-}
-
-fn any_action() -> impl Strategy<Value = Action> {
-    prop_oneof![
-        Just(Action::SchemaRead),
-        Just(Action::QueryRead),
-        Just(Action::QueryWrite),
-        Just(Action::HistoryRead),
-    ]
-}
-
-fn any_constraints() -> impl Strategy<Value = Constraints> {
-    (
-        any::<bool>(),
-        proptest::option::of(0u32..=1_000_000),
-        proptest::option::of(0u32..=600_000),
-    )
-        .prop_map(
-            |(require_reason, row_limit, statement_timeout_ms)| Constraints {
-                require_reason,
-                row_limit,
-                statement_timeout_ms,
-            },
-        )
-}
-
-fn identity_in(group: &str) -> Identity {
-    Identity {
-        session_id: SessionId::new(),
-        user_sub: "test-sub".to_string(),
-        user_email: "test@example.com".to_string(),
-        groups: vec![group.to_string()],
-        issued_at: chrono::Utc::now(),
-    }
-}
-
-/// Wrap a flat `Vec<Grant>` into a `Permission` keyed on `group`.
-fn as_yaml_for(group: &str, grants: Vec<Grant>) -> Vec<Permission> {
-    vec![Permission {
-        group: group.to_string(),
-        grants,
-    }]
-}
-
-/// Field-wise "no more permissive than" predicate. Lifted from
-/// [`super::effective_proptests`]; the wildcard properties depend on the
-/// same ordering on `Constraints`.
-fn no_more_permissive_than(a: &Constraints, b: &Constraints) -> bool {
-    let reason_ok = a.require_reason || !b.require_reason;
-    let rl_ok = match (a.row_limit, b.row_limit) {
-        (Some(av), Some(bv)) => av <= bv,
-        (Some(_), None) => true,
-        (None, Some(_)) => false,
-        (None, None) => true,
-    };
-    let to_ok = match (a.statement_timeout_ms, b.statement_timeout_ms) {
-        (Some(av), Some(bv)) => av <= bv,
-        (Some(_), None) => true,
-        (None, Some(_)) => false,
-        (None, None) => true,
-    };
-    reason_ok && rl_ok && to_ok
 }
 
 proptest! {

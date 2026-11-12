@@ -211,7 +211,6 @@ fn check_runtime_backstop() -> bool {
         forbidden_prefix: "query",
     };
     let outcome = outcome_from_exec_error(
-        serde_json::Value::from(1),
         ExecError::UnsupportedAdapter(db_mcp_gateway::config::ServerKind::Mysql),
         std::time::Instant::now(),
         &messages,

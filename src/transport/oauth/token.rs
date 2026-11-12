@@ -1,19 +1,18 @@
 use axum::Json;
-use axum::extract::State;
+use axum::extract::rejection::FormRejection;
+use axum::extract::{Form, State};
 use axum::http::StatusCode;
 use axum::http::header::{CACHE_CONTROL, PRAGMA};
 use axum::response::{IntoResponse, Response};
-use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::auth::{jwt, pkce};
+use crate::auth::{AuthError, pkce};
 
-use super::super::app_state::AppState;
-use super::helpers::{oauth_error, random_token};
+use super::super::app_state::OAuthState;
+use super::helpers::{form_rejected, oauth_error, random_token};
 use super::urls::MCP_SCOPE;
-use crate::auth::oauth::AuthFacade;
-use crate::auth::oauth::GrantIdentity;
+use crate::auth::oauth::{AuthFacade, IssuedTokens};
 
 #[derive(Debug, Deserialize)]
 pub struct TokenForm {
@@ -36,11 +35,13 @@ pub struct TokenForm {
 /// the token. Both mint a fresh gateway session and return the session JWT as
 /// the bearer access token plus a new refresh token.
 pub async fn token(
-    State(state): State<AppState>,
-    axum::Form(form): axum::Form<TokenForm>,
+    State(state): State<OAuthState>,
+    form: Result<Form<TokenForm>, FormRejection>,
 ) -> Response {
-    // Validate the grant before touching auth state so a malformed request is a
-    // clean 400 regardless of wiring.
+    let Form(form) = match form {
+        Ok(form) => form,
+        Err(rejection) => return form_rejected(&rejection),
+    };
     let grant = form.grant_type.as_deref();
     if grant != Some("authorization_code") && grant != Some("refresh_token") {
         return oauth_error(
@@ -49,13 +50,7 @@ pub async fn token(
             "supported grant types: authorization_code, refresh_token",
         );
     }
-    let Some(auth) = state.auth.as_ref() else {
-        return oauth_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            "auth not configured",
-        );
-    };
+    let auth = &state.auth;
     if grant == Some("refresh_token") {
         token_refresh(auth, form).await
     } else {
@@ -120,8 +115,8 @@ async fn token_authorization_code(auth: &AuthFacade, form: TokenForm) -> Respons
         );
     }
 
-    // Fresh authorization → fresh refresh-token chain (no carried birth time).
-    issue_token_response(auth, entry.identity, None).await
+    // Fresh authorization → fresh session + refresh-token chain.
+    token_response(auth.issue_tokens(entry.identity, random_token()).await)
 }
 
 async fn token_refresh(auth: &AuthFacade, form: TokenForm) -> Response {
@@ -132,102 +127,47 @@ async fn token_refresh(auth: &AuthFacade, form: TokenForm) -> Response {
             "refresh_token is required",
         );
     };
-    // Rotation: take() consumes the presented token; `issue_token_response`
-    // mints a fresh one. A replayed (already-rotated) token finds nothing.
-    let Some(entry) = auth.refresh.take(token).await else {
-        return oauth_error(
+    // Rotation in one state-DB transaction: the presented token is consumed,
+    // its paired session revoked, a fresh pair minted. A replayed (already
+    // rotated) token finds nothing.
+    match auth.rotate_tokens(token, random_token()).await {
+        Ok(Some(issued)) => token_response(Ok(issued)),
+        Ok(None) => oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
             "refresh token is invalid or expired",
-        );
-    };
-    // Carry the chain's original birth time so rotation renews the token value
-    // but never extends the absolute TTL. `entry.identity` (groups included) is
-    // the one frozen at the original browser login, so this same cap also bounds
-    // how long a since-revoked group keeps minting sessions (O3b): the chain dies
-    // REFRESH_TTL after the first mint, forcing a fresh `/authorize` that
-    // re-reads groups from the IdP.
-    let issued_at = entry.issued_at;
-    issue_token_response(auth, entry.identity, Some(issued_at)).await
+        ),
+        Err(err) => token_response(Err(err)),
+    }
 }
 
-/// Mint a fresh session for `identity`, issue the session JWT as the access
-/// token, mint+store a rotating refresh token, and render the OAuth token
-/// response (with `Cache-Control: no-store`).
-///
-/// `chain_issued_at` is `None` for a fresh authorization (the new refresh token
-/// starts its own chain) and `Some(birth)` for a rotation (the new token
-/// inherits the chain's original mint time so the absolute TTL doesn't slide).
-async fn issue_token_response(
-    auth: &AuthFacade,
-    identity: GrantIdentity,
-    chain_issued_at: Option<DateTime<Utc>>,
-) -> Response {
-    // Preserve the original `/authorize` login time so `admin.session_max_age_secs`
-    // counts from the first login, not from this rotation. The chain birth is
-    // already wall-clock (it round-trips through the state DB), so it carries
-    // straight through. `None` on fresh authorizations: stamp `issued_at` as now
-    // (handled inside `SessionStore::create`).
-    let original_issued_at = chain_issued_at;
-
-    let session = match auth
-        .sessions
-        .create(
-            &identity.sub,
-            &identity.email,
-            &identity.groups,
-            auth.config.session_ttl,
-            None,
-            original_issued_at,
-        )
-        .await
-    {
-        Ok(s) => s,
-        Err(_) => {
+/// Render the OAuth token response (`Cache-Control: no-store`), or a 503 when
+/// the state DB could not mint — never a token the store does not hold.
+fn token_response(issued: Result<IssuedTokens, AuthError>) -> Response {
+    let issued = match issued {
+        Ok(issued) => issued,
+        Err(AuthError::StoreFull) => {
             return oauth_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::SERVICE_UNAVAILABLE,
                 "server_error",
-                "could not create session",
+                "gateway temporarily overloaded; try again",
+            );
+        }
+        Err(_) => {
+            // No error source: `AuthError::State` can carry the DSN.
+            tracing::warn!("token issuance failed (state DB)");
+            return oauth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "could not issue tokens; try again",
             );
         }
     };
-    let access_token = match jwt::issue(
-        &auth.config.session_signing_key,
-        session.id,
-        &identity.sub,
-        auth.config.session_ttl,
-    ) {
-        Ok(t) => t,
-        Err(_) => {
-            return oauth_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "could not issue token",
-            );
-        }
-    };
-    let refresh_token = random_token();
-    let refresh_result = match chain_issued_at {
-        Some(issued_at) => {
-            auth.refresh
-                .insert_rotated(&refresh_token, identity, issued_at)
-                .await
-        }
-        None => auth.refresh.insert(&refresh_token, identity).await,
-    };
-    if refresh_result.is_err() {
-        return oauth_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server_error",
-            "gateway temporarily overloaded; try again",
-        );
-    }
-
     let body = json!({
-        "access_token": access_token,
+        "access_token": issued.access_token,
         "token_type": "Bearer",
-        "expires_in": auth.config.session_ttl.as_secs(),
-        "refresh_token": refresh_token,
+        "expires_in": issued.expires_in_secs,
+        "refresh_token": issued.refresh_token,
         "scope": MCP_SCOPE,
     });
     // OAuth 2.1 §Token Response: token responses must not be cached.

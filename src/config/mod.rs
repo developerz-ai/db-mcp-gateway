@@ -1,14 +1,13 @@
-//! Bootstrap configuration for the gateway.
-//!
-//! Two-layered today:
-//! - `Config` (`env`) carries env-driven runtime knobs: bind address,
-//!   MCP path, state DB pool — what we needed for #1 and #2.
-//! - `ConfigFile` (`yaml`) carries the operator's YAML: `servers:` +
-//!   `permissions:` — what we need for #3.
-//!
-//! Unification of both into a single YAML lands with issue #16.
+//! Bootstrap configuration for the gateway, in two layers:
+//! - `Config` (`env`) carries env-driven runtime knobs: listeners, MCP path,
+//!   state DB pool, TLS, cache TTLs.
+//! - `ConfigFile` (`yaml`) carries the operator's YAML: `gateway:`,
+//!   `servers:`, `permissions:`, `service_accounts:`, `admin:`,
+//!   `permissions_store:`, `logging:` (spec 08).
 
 mod env;
+mod pool;
+pub mod reload;
 pub mod schema;
 pub mod secret;
 pub mod yaml;
@@ -17,6 +16,7 @@ pub use env::{
     Config, ConfigError, DEFAULT_MAX_CONCURRENT_PER_IDENTITY, DEFAULT_MAX_CONCURRENT_REQUESTS,
     StateDbConfig, TlsConfig,
 };
+pub use pool::PoolConfig;
 pub use schema::ServiceAccount;
 pub use schema::{
     Action, Constraints, Database, Grant, LoggingBlock, Permission, Server, ServerKind,
@@ -24,6 +24,6 @@ pub use schema::{
 };
 pub use secret::{Password, SecretError};
 pub use yaml::{
-    AdminBlock, ConfigFile, ConfigFileError, ConfigLoadError, PermissionsStoreBlock,
-    PermissionsStoreDriver,
+    AdminBlock, ConfigFile, ConfigFileError, ConfigLoadError, Environment, GatewayBlock,
+    PermissionsStoreBlock, PermissionsStoreDriver,
 };

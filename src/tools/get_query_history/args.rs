@@ -3,17 +3,16 @@
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use serde_json::Value;
-
-use crate::tools::GATEWAY_ROW_LIMIT_CEILING;
-use crate::tools::audit_dispatch::{Outcome, OutcomeCode};
-use crate::transport::jsonrpc::{ErrorObject, Response};
 
 /// Hard floor on entries returned when no caller `limit` is supplied.
 /// History is "recover context across sessions", not "bulk export" — small
 /// by default keeps the response bounded and the agent's recovery loop
 /// cheap.
 const DEFAULT_HISTORY_LIMIT: u32 = 100;
+
+/// Most entries one page returns. Older entries are reached through
+/// `cursor`, never through a bigger page.
+pub(super) const HISTORY_LIMIT_CEILING: u32 = 1000;
 
 /// Caller-supplied arguments. `deny_unknown_fields` is the security
 /// guarantee behind the scoping promise in the module doc: an agent cannot
@@ -32,18 +31,23 @@ pub struct Arguments {
     pub since: Option<String>,
     #[serde(default)]
     pub limit: Option<u32>,
+    /// `next_cursor` from the previous page; absent for the newest page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Required when the grant sets `require_reason`; recorded in the audit
+    /// row either way.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
-/// `effective = min(caller.unwrap_or(DEFAULT), GATEWAY_ROW_LIMIT_CEILING)`.
-/// Same most-restrictive-wins posture as `target::effective_row_limit`,
-/// minus the grant column: history is read-only against audit data, no
-/// `row_limit` constraint applies. The ceiling is what bounds a hostile
-/// caller from asking for `u32::MAX` rows and getting back the entire audit
-/// table slice they happen to be entitled to.
+/// `effective = min(caller.unwrap_or(DEFAULT), HISTORY_LIMIT_CEILING)`.
+/// History is read-only against audit data, so no grant `row_limit`
+/// applies; the ceiling is what bounds a hostile caller asking for
+/// `u32::MAX` rows of the audit table slice they are entitled to.
 pub(super) fn effective_limit(caller: Option<u32>) -> u32 {
     caller
         .unwrap_or(DEFAULT_HISTORY_LIMIT)
-        .min(GATEWAY_ROW_LIMIT_CEILING)
+        .min(HISTORY_LIMIT_CEILING)
 }
 
 /// Whether `effective_limit` lowered what the caller asked for.
@@ -54,27 +58,6 @@ pub(super) fn effective_limit(caller: Option<u32>) -> u32 {
 /// keep raising `limit` against a ceiling that will never yield more.
 pub(super) fn limit_was_clamped(caller: Option<u32>, effective: u32) -> bool {
     caller.is_some_and(|asked| asked > effective)
-}
-
-/// Build an `Outcome` for a post-deserialisation argument rejection.
-///
-/// The wire response keeps the JSON-RPC `invalid_params` envelope (-32602)
-/// — this is a structural, transport-layer error, not a tool result — while
-/// the audit row records `outcome = "invalid_arguments"` so a caller
-/// probing the boundary with `limit: 0` or a malformed `since` still leaves
-/// a trail. `error_outcome` is the wrong shape here: it wraps the response
-/// as a `tool_error` (`isError: true` inside the tool result), which would
-/// change the wire contract for callers already relying on the JSON-RPC
-/// error envelope (see `history_rejects_smuggled_user_field`).
-pub(super) fn invalid_arguments_outcome(id: Value, message: &str) -> Outcome {
-    Outcome {
-        response: Response::error(id, ErrorObject::invalid_params(message)),
-        code: OutcomeCode::InvalidArguments,
-        elapsed_ms: None,
-        row_count: None,
-        truncated: None,
-        error_message: Some(message.to_string()),
-    }
 }
 
 /// Parse an RFC 3339 timestamp at the edge. Any failure becomes a typed

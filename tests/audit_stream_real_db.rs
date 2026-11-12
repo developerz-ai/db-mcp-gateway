@@ -10,7 +10,7 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
-use common::audit::latest_audit;
+use common::audit::{DispatchSinks, latest_audit};
 use common::cleanup::delete_audit_calls;
 use common::env::state_pool;
 use db_mcp_gateway::auth::{Identity, SessionId};
@@ -29,6 +29,7 @@ fn identity(user_sub: &str) -> Identity {
         user_email: "stream-test@example.com".to_string(),
         groups: vec!["test".to_string()],
         issued_at: chrono::Utc::now(),
+        kind: db_mcp_gateway::auth::IdentityKind::Sso,
     }
 }
 
@@ -89,7 +90,8 @@ async fn configured_stdout_sink_streams_and_still_writes_the_durable_row() {
     let id: Value = json!(1);
     let ctx = RequestContext {
         request_id,
-        ..RequestContext::default()
+        ip: None,
+        agent_client: None,
     };
     let identity = identity(&user);
     let header = AuditHeader {
@@ -122,10 +124,9 @@ async fn configured_stdout_sink_streams_and_still_writes_the_durable_row() {
     let _response = audit_dispatch(
         id,
         &identity,
-        Some(&p),
         &ctx,
         header,
-        &[StreamSinkConfig::Stdout],
+        DispatchSinks::new(&[StreamSinkConfig::Stdout]).store(&p),
         std::future::ready(outcome),
     )
     .await;
@@ -178,7 +179,8 @@ async fn failing_stdout_sink_does_not_block_response_or_durable_write() {
     let id: Value = json!(1);
     let ctx = RequestContext {
         request_id,
-        ..RequestContext::default()
+        ip: None,
+        agent_client: None,
     };
     let identity = identity(&user);
     let header = AuditHeader {
@@ -200,10 +202,9 @@ async fn failing_stdout_sink_does_not_block_response_or_durable_write() {
     let response = audit_dispatch(
         id,
         &identity,
-        Some(&p),
         &ctx,
         header,
-        &[StreamSinkConfig::Stdout],
+        DispatchSinks::new(&[StreamSinkConfig::Stdout]).store(&p),
         std::future::ready(outcome),
     )
     .await;
@@ -235,7 +236,8 @@ async fn no_configured_sinks_streams_nothing() {
     let id: Value = json!(1);
     let ctx = RequestContext {
         request_id,
-        ..RequestContext::default()
+        ip: None,
+        agent_client: None,
     };
     let identity = identity(&user);
     let header = AuditHeader {
@@ -258,10 +260,9 @@ async fn no_configured_sinks_streams_nothing() {
     let _response = audit_dispatch(
         id,
         &identity,
-        Some(&p),
         &ctx,
         header,
-        &[],
+        DispatchSinks::new(&[]).store(&p),
         std::future::ready(outcome),
     )
     .await;
@@ -291,7 +292,8 @@ async fn configured_syslog_sink_delivers_udp_and_still_writes_the_durable_row() 
     let id: Value = json!(1);
     let ctx = RequestContext {
         request_id,
-        ..RequestContext::default()
+        ip: None,
+        agent_client: None,
     };
     let identity = identity(&user);
     let header = AuditHeader {
@@ -312,13 +314,13 @@ async fn configured_syslog_sink_delivers_udp_and_still_writes_the_durable_row() 
     let _response = audit_dispatch(
         id,
         &identity,
-        Some(&p),
         &ctx,
         header,
-        &[StreamSinkConfig::Syslog {
+        DispatchSinks::new(&[StreamSinkConfig::Syslog {
             host: "127.0.0.1".to_string(),
             port,
-        }],
+        }])
+        .store(&p),
         std::future::ready(outcome),
     )
     .await;

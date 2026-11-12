@@ -101,3 +101,55 @@ fn tls_missing_error_names_the_envs_and_dev_escape() {
     assert!(rendered.contains("TLS_KEY_PATH"), "{rendered}");
     assert!(rendered.contains("TLS_DISABLED"), "{rendered}");
 }
+
+#[test]
+fn state_db_pool_size_rejects_zero_and_unusable_sizes() {
+    assert!(matches!(
+        parse_pool_size("0".into(), 512),
+        Err(ConfigError::StateDbPoolSizeZero)
+    ));
+    assert!(matches!(
+        parse_pool_size("513".into(), 512),
+        Err(ConfigError::StateDbPoolSizeAboveConcurrency { size: 513, .. })
+    ));
+    assert!(matches!(
+        parse_pool_size("ten".into(), 512),
+        Err(ConfigError::StateDbPoolSize { .. })
+    ));
+    assert_eq!(
+        parse_pool_size("512".into(), 512)
+            .map(std::num::NonZeroU32::get)
+            .ok(),
+        Some(512)
+    );
+}
+
+#[test]
+fn metrics_listener_defaults_off_the_public_one() {
+    let config = Config::default();
+    assert!(config.metrics_bind.ip().is_loopback());
+    assert_ne!(config.metrics_bind, config.bind);
+}
+
+#[test]
+fn concurrency_caps_reject_zero_and_garbage() {
+    for bad in ["0", "", "-1", "many"] {
+        assert!(matches!(
+            parse_cap("MAX_CONCURRENT_REQUESTS", bad.into()),
+            Err(ConfigError::ConcurrencyCap { .. })
+        ));
+    }
+    assert_eq!(
+        parse_cap("MAX_CONCURRENT_PER_IDENTITY", "4".into()).ok(),
+        Some(4)
+    );
+}
+
+#[test]
+fn permissions_cache_ttl_is_capped_at_five_minutes() {
+    assert_eq!(parse_cache_ttl("300".into()).ok(), Some(300));
+    assert!(matches!(
+        parse_cache_ttl("301".into()),
+        Err(ConfigError::PermissionsCacheTtlTooLong(301))
+    ));
+}

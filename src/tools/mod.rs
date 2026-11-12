@@ -24,8 +24,9 @@ use serde_json::Value;
 use tracing::Instrument;
 use tracing::info_span;
 
+use crate::audit::prefix_at_char_boundary;
 use crate::config::{ConfigFile, ServerKind};
-use crate::transport::jsonrpc::{ErrorObject, Response};
+use crate::mcp::jsonrpc::Response;
 
 /// Map a `ServerKind` to its audit-row string. Single source of truth so
 /// audit rows + the [`list_servers`] tool view never disagree about the
@@ -73,13 +74,20 @@ pub use context::ToolCtx;
 
 // Re-export canonical names so dispatch and the advertised capability can
 // never drift apart.
-pub use crate::transport::protocol::DESCRIBE_SCHEMA_TOOL as DESCRIBE_SCHEMA;
-pub use crate::transport::protocol::EXPLAIN_TOOL as EXPLAIN;
-pub use crate::transport::protocol::GET_QUERY_HISTORY_TOOL as GET_QUERY_HISTORY;
-pub use crate::transport::protocol::LIST_DATABASES_TOOL as LIST_DATABASES;
-pub use crate::transport::protocol::LIST_SERVERS_TOOL as LIST_SERVERS;
-pub use crate::transport::protocol::RUN_QUERY_TOOL as RUN_QUERY;
-pub use crate::transport::protocol::SAMPLE_TABLE_TOOL as SAMPLE_TABLE;
+pub use crate::mcp::protocol::DESCRIBE_SCHEMA_TOOL as DESCRIBE_SCHEMA;
+pub use crate::mcp::protocol::EXPLAIN_TOOL as EXPLAIN;
+pub use crate::mcp::protocol::GET_QUERY_HISTORY_TOOL as GET_QUERY_HISTORY;
+pub use crate::mcp::protocol::LIST_DATABASES_TOOL as LIST_DATABASES;
+pub use crate::mcp::protocol::LIST_SERVERS_TOOL as LIST_SERVERS;
+pub use crate::mcp::protocol::RUN_QUERY_TOOL as RUN_QUERY;
+pub use crate::mcp::protocol::SAMPLE_TABLE_TOOL as SAMPLE_TABLE;
+
+/// Audit-row and metric `tool` for a call that named no known tool. The
+/// caller's string is caller-controlled and unbounded, so it rides in
+/// `error_message` (capped), never in a metric label.
+const UNKNOWN_TOOL: &str = "unknown";
+/// Bytes of an unknown tool name kept in the audit row.
+const UNKNOWN_TOOL_NAME_MAX_BYTES: usize = 64;
 
 #[derive(Debug, Deserialize)]
 struct CallParams {
@@ -100,7 +108,13 @@ pub async fn dispatch_call(id: Value, ctx: ToolCtx<'_>, params: Option<Value>) -
     let call: CallParams = match params.map(serde_json::from_value::<CallParams>) {
         Some(Ok(c)) => c,
         _ => {
-            return Response::error(id, ErrorObject::invalid_params("missing or invalid `name`"));
+            return audit_dispatch::reject_arguments(
+                ctx,
+                id,
+                UNKNOWN_TOOL,
+                "missing or invalid `name`",
+            )
+            .await;
         }
     };
 
@@ -147,10 +161,11 @@ pub async fn dispatch_call(id: Value, ctx: ToolCtx<'_>, params: Option<Value>) -
             EXPLAIN => explain::run(ctx, id, args).await,
             RUN_QUERY => run_query::run(ctx, id, args).await,
             GET_QUERY_HISTORY => get_query_history::run(ctx, id, args).await,
-            other => Response::error(
-                id,
-                ErrorObject::invalid_params(format!("unknown tool: {other}")),
-            ),
+            other => {
+                let name = prefix_at_char_boundary(other, UNKNOWN_TOOL_NAME_MAX_BYTES);
+                let message = format!("unknown tool: {name}");
+                audit_dispatch::reject_arguments(ctx, id, UNKNOWN_TOOL, &message).await
+            }
         }
     }
     .instrument(span)

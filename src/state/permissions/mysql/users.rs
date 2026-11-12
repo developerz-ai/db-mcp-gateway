@@ -6,6 +6,7 @@ use uuid::Uuid;
 use super::super::{Page, PermissionsUser, RepoError};
 use super::rows::user_from_row;
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) async fn upsert_user(
     pool: &MySqlPool,
     user_sub: &str,
@@ -41,6 +42,7 @@ pub(super) async fn upsert_user(
         .ok_or(RepoError::Sqlx(sqlx::Error::RowNotFound))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) async fn get_user_by_sub(
     pool: &MySqlPool,
     user_sub: &str,
@@ -71,48 +73,6 @@ pub(super) async fn get_user(
     row.map(|r| user_from_row(&r)).transpose()
 }
 
-pub(super) async fn update_user(
-    pool: &MySqlPool,
-    id: Uuid,
-    user_email: Option<&str>,
-    groups: Option<&[String]>,
-) -> Result<Option<PermissionsUser>, RepoError> {
-    let groups_json = match groups {
-        Some(g) => Some(serde_json::to_value(g).map_err(RepoError::EncodeGroups)?),
-        None => None,
-    };
-    // One transaction so the reread returns exactly the row this UPDATE wrote —
-    // a concurrent login sync or delete can't slip in between (PATCH contract in
-    // `PermissionsRepo::update_user`).
-    let mut tx = pool.begin().await?;
-    let res = sqlx::query(
-        "UPDATE permissions_users \
-         SET user_email = COALESCE(?, user_email), \
-             groups_json = COALESCE(?, groups_json), \
-             updated_at = NOW(6) \
-         WHERE id = ? AND deleted_at IS NULL",
-    )
-    .bind(user_email)
-    .bind(groups_json)
-    .bind(id.to_string())
-    .execute(&mut *tx)
-    .await?;
-    if res.rows_affected() == 0 {
-        return Ok(None);
-    }
-    // Re-read so callers (admin API audit) see the post-update row.
-    let row = sqlx::query(
-        "SELECT id, user_sub, user_email, groups_json, created_at, updated_at, deleted_at \
-         FROM permissions_users \
-         WHERE id = ? AND deleted_at IS NULL",
-    )
-    .bind(id.to_string())
-    .fetch_optional(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    row.map(|r| user_from_row(&r)).transpose()
-}
-
 pub(super) async fn list_users(
     pool: &MySqlPool,
     page: Page,
@@ -133,6 +93,7 @@ pub(super) async fn list_users(
     rows.iter().map(user_from_row).collect()
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) async fn soft_delete_user(pool: &MySqlPool, id: Uuid) -> Result<bool, RepoError> {
     let res = sqlx::query(
         "UPDATE permissions_users SET deleted_at = NOW(6) \

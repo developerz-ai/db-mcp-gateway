@@ -1,13 +1,12 @@
-use axum::extract::State;
+use axum::extract::rejection::FormRejection;
+use axum::extract::{Form, State};
 use axum::http::StatusCode;
 use axum::http::header::{CACHE_CONTROL, PRAGMA};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
-use crate::auth::{SessionId, jwt};
-
-use super::super::app_state::AppState;
-use super::helpers::oauth_error;
+use super::super::app_state::OAuthState;
+use super::helpers::{form_rejected, oauth_error};
 
 #[derive(Debug, Deserialize)]
 pub struct RevokeForm {
@@ -30,11 +29,17 @@ pub struct RevokeForm {
 /// Per RFC 7009 §2.2 the response is `200` for any well-formed request — an
 /// unknown, expired, forged, or already-revoked token included — so a caller
 /// can't probe token validity here. A missing `token` is the lone malformed case
-/// → `invalid_request` (400).
+/// → `invalid_request` (400). A refresh token also revokes its paired access
+/// session. `503` when the state DB fails: never claim a revoke that did not
+/// happen.
 pub async fn revoke(
-    State(state): State<AppState>,
-    axum::Form(form): axum::Form<RevokeForm>,
+    State(state): State<OAuthState>,
+    form: Result<Form<RevokeForm>, FormRejection>,
 ) -> Response {
+    let Form(form) = match form {
+        Ok(form) => form,
+        Err(rejection) => return form_rejected(&rejection),
+    };
     let Some(token) = form.token.as_deref().filter(|t| !t.is_empty()) else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -42,31 +47,18 @@ pub async fn revoke(
             "token is required",
         );
     };
-    let Some(auth) = state.auth.as_ref() else {
+    let auth = &state.auth;
+
+    if auth.revoke_token(token).await.is_err() {
+        // No error source: `AuthError::State` wraps a sqlx::Error that can
+        // carry the DSN.
+        tracing::warn!("token revocation failed (state DB)");
         return oauth_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
             "server_error",
-            "auth not configured",
+            "token revocation is temporarily unavailable; retry",
         );
-    };
-
-    // Refresh token: removing the presented token ends the chain (only the
-    // latest token in a rotated chain is ever live).
-    let refresh_revoked = auth.refresh.take(token).await.is_some();
-
-    // Access token: a verifiable session JWT → revoke its session row. A forged
-    // or expired JWT fails verification and is silently ignored.
-    let session_revoked = match jwt::verify(&auth.config.session_signing_key, token) {
-        Ok(claims) => auth
-            .sessions
-            .revoke(SessionId::from(claims.sid))
-            .await
-            .is_ok(),
-        Err(_) => false,
-    };
-
-    // Outcome flags only — never the token itself (it would leak a live secret).
-    tracing::debug!(refresh_revoked, session_revoked, "token revocation");
+    }
 
     // RFC 7009 §2.2: always 200 for a well-formed request. `no-store` mirrors the
     // token endpoint so an intermediary can't cache the response.

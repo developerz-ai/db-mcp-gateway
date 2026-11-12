@@ -35,6 +35,7 @@ fn identity_in(group: &str) -> Identity {
         user_email: format!("{group}@developerz.ai"),
         groups: vec![group.to_string()],
         issued_at: chrono::Utc::now(),
+        kind: db_mcp_gateway::auth::IdentityKind::Sso,
     }
 }
 

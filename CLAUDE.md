@@ -26,7 +26,7 @@ Self-hosted MCP gateway. AI agents get audited, SSO-gated, read-only DB access. 
 | Lang | Rust 2024 — toolchain channel `1.96.0` (`rust-toolchain.toml`: rustfmt + clippy), MSRV `1.88` (`Cargo.toml`); deps pinned to latest stable at implementation time |
 | Runtime / HTTP | tokio; axum (+ axum-server, rustls) |
 | DB driver | sqlx 0.8 — Postgres + MySQL; mongodb 3.7 for the Mongo target |
-| MCP | hand-rolled JSON-RPC over HTTP+SSE → swap for SDK when one stabilizes |
+| MCP | hand-rolled JSON-RPC over Streamable HTTP (POST; `GET /mcp` → 405) → swap for SDK when one stabilizes |
 | Config | serde + serde-saphyr (not serde_yaml), validated at boot |
 | State store | Postgres (co-deployed): sessions, audit log, denylist. Permissions store `pg` (`src/state/permissions/pg.rs`) or `mysql` (`src/state/permissions/mysql/`) |
 | Error tracking | GlitchTip (Sentry protocol), credential-scrubbed by `src/sentry_scrub/` |
@@ -60,9 +60,9 @@ One reason to change per layer. Don't blur.
 
 | Layer | Owns | Module |
 |---|---|---|
-| Transport | MCP framing, JSON-RPC, HTTP+SSE, admin API | `src/transport/` |
-| Auth | OIDC, JWT, session cache, service tokens | `src/auth/` |
-| Authz | (user, groups, server, db, action) → allow + constraints | `src/authz/` |
+| Transport | HTTP routes, request id, budgets/timeouts, OAuth handlers, admin API (MCP framing types in `src/mcp/`) | `src/transport/`, `src/mcp/` |
+| Auth | OIDC, JWT, session cache, service tokens, OAuth state (`src/auth/oauth/`) | `src/auth/` |
+| Authz | (user, groups, server, db, action) → allow + constraints; per-replica cache, admin commits reach other replicas via LISTEN/NOTIFY, SIGHUP reloads YAML | `src/authz/` |
 | Tools | MCP tool dispatch | `src/tools/` |
 | Exec | Per-DB pool, statement timeout, row cap, cancellation | `src/exec/` |
 | Audit | Append-only writes, retention, archive, sinks | `src/audit/` |
@@ -82,8 +82,8 @@ The bar: idiomatic, boring, readable Rust. No spaghetti, no premature abstractio
 | Borrow by default | `&str` over `String`, `&[T]` over `Vec<T>`. `.clone()` only when ownership must move — a non-obvious clone gets a one-line `// why`. `Arc<T>` for shared read-only; add a lock only when you mutate shared state, keep the critical section tiny. |
 | One thing per function | Need "and" to describe it → split it. No premature abstraction: concrete first, introduce a trait when the **second** impl arrives (e.g. `DbAdapter`). Iterator chains over manual index loops where they read clearer. |
 | Tracing | `tracing`, not `println`. Every tool dispatch is a span with `request_id`, `user`, `server`, `database`. |
-| Audit before response | Audit write commits **before** the success response goes out. Two-phase commit with the state DB. |
-| Per-DB pools | Sized by config. Never one global pool. Never share a pool across `(server, database)`. |
+| Audit before response | Two-phase: an intent row commits before any target call; the completion row commits **before** the response goes out; a missing completion is reaped as `abandoned`. Audit write fails → `audit_unavailable`, never a silent success. |
+| Per-DB pools | Sized by config (`pool:` on server/database). Lazy (min 0, idle 5 min), replaced on credential rejection or reload. Never one global pool. Never share a pool across `(server, database)`. |
 | Async end-to-end | No `std::sync::Mutex` on the request path — use `tokio::sync`. No `block_on`, no blocking I/O in async fns (offload with `spawn_blocking`). Never hold a `std::sync` guard across `.await`. A slow query on DB A must never block DB B. One noisy user must not starve others. |
 | Cancellation safety | Agent disconnect → tokio task dropped → `pg_cancel_backend` → audit row `outcome: cancelled`. Test it; easy to write code that holds the conn until the query finishes anyway. |
 | Size | Files ≤300 LOC. Split by responsibility. No backwards-compat shims pre-v1. |
@@ -135,7 +135,8 @@ src/
   startup/          # boot helpers (tracing, state DB, app state, serve) + background tasks
   sentry_scrub/     # credential scrubbing for GlitchTip
   config/           # YAML schema, validation, secrets, hot reload
-  transport/        # MCP over HTTP+SSE, admin API
+  mcp/              # JSON-RPC envelope, MCP payloads + tool names (shared by transport and tools)
+  transport/        # MCP over Streamable HTTP, OAuth routes, admin API
   auth/             # OIDC, JWT, sessions, service tokens
   authz/            # grant evaluation, constraint merge
   tools/            # MCP tool impls

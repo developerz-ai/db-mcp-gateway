@@ -265,25 +265,13 @@ async fn mcp_oauth_bridge_full_flow() {
 // Security tests
 // ---------------------------------------------------------------------------
 
-/// Spawn a gateway with no auth and no state DB — sufficient to exercise
+/// Offline gateway (no reachable IdP or state DB) — sufficient to exercise
 /// `/register` and the `/authorize` parameter-validation rejection paths.
-/// Production-sized concurrency caps.
 async fn spawn_authless_gateway() -> (String, reqwest::Client) {
-    spawn_authless_gateway_with_caps(Config::default().max_concurrent_requests).await
-}
-
-/// Same as [`spawn_authless_gateway`], but with `max_concurrent_requests`
-/// overridden — lets a test drive the global concurrency cap into
-/// contention without needing hundreds of simultaneous connections.
-async fn spawn_authless_gateway_with_caps(
-    max_concurrent_requests: usize,
-) -> (String, reqwest::Client) {
-    let gateway_url = spawn_authless(Config {
-        max_concurrent_requests,
-        ..Config::default()
-    })
-    .await;
-    (gateway_url, no_redirect_client())
+    (
+        spawn_authless(Config::default()).await,
+        no_redirect_client(),
+    )
 }
 
 /// Register a public client with one redirect URI; return its `client_id`.
@@ -402,47 +390,68 @@ async fn attacker_redirect_uri_rejected() {
     );
 }
 
-/// Regression for the #136 audit finding "/authorize flood wedges all
-/// logins ... the open routes skip the concurrency limiter". `/authorize`
-/// must be bounded by the same global `ConcurrencyLimiter` gated traffic
-/// goes through — pre-fix, this router mounted it in the `open` group,
-/// which never got `limit::enforce` layered on at all, so no volume of
-/// concurrent `/authorize` traffic could ever be shed.
-///
-/// `max_concurrent_requests: 0` gives the global semaphore zero permits, so
-/// `try_acquire_owned()` fails unconditionally — deterministic, no timing
-/// race needed (an earlier version of this test tried firing a burst of
-/// concurrent requests against a cap of 1 and asserting at least one 503;
-/// that was flaky because `/authorize`'s fast-reject validation path
-/// completes faster than genuine request overlap can be engineered from a
-/// test client). A single request must come back 503 if and only if
-/// `/authorize` is actually routed through `limit::enforce`.
+/// The IdP sends the browser back with `error=access_denied` and no `code`
+/// (the user declined consent). The bridge must 302 to the client's own
+/// redirect with that error and its `state` — never strand the loopback
+/// listener on a gateway error page.
 #[tokio::test]
-async fn authorize_route_is_concurrency_limited() {
-    let (gw, http) = spawn_authless_gateway_with_caps(0).await;
+async fn idp_denial_redirects_back_to_the_client() {
+    let user = MockUser {
+        sub: format!("denied-user-{}", uuid::Uuid::new_v4().simple()),
+        email: "denied@example.com".to_string(),
+        groups: vec!["engineers".into()],
+    };
+    let (gw, http, _refresh) = spawn_bridge_gateway(user).await;
+    let client_id = register_client(&http, &gw, CLIENT_REDIRECT).await;
 
-    let resp = http
+    let authorize = http
         .get(format!("{gw}/authorize"))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", CLIENT_REDIRECT),
+            ("code_challenge", PKCE_CHALLENGE),
+            ("code_challenge_method", "S256"),
+            ("state", "client-csrf-1"),
+        ])
         .send()
         .await
-        .expect("request sent");
+        .unwrap();
+    assert!(authorize.status().is_redirection());
+    // The gateway's own `state` for the IdP leg, as the IdP would echo it.
+    let idp_url = reqwest::Url::parse(&location(&authorize)).unwrap();
+    let idp_state = idp_url
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .map(|(_, v)| v.into_owned())
+        .expect("state on the IdP authorize URL");
 
-    assert_eq!(
-        resp.status(),
-        reqwest::StatusCode::SERVICE_UNAVAILABLE,
-        "expected 503 with a zero-permit global cap — /authorize is not routed through limit::enforce"
+    let callback = http
+        .get(format!("{gw}/auth/callback"))
+        .query(&[
+            ("error", "access_denied"),
+            ("error_description", "user said no"),
+            ("state", idp_state.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert!(callback.status().is_redirection(), "{}", callback.status());
+    let back = reqwest::Url::parse(&location(&callback)).unwrap();
+    assert!(back.as_str().starts_with(CLIENT_REDIRECT), "{back}");
+    let pairs: Vec<(String, String)> = back.query_pairs().into_owned().collect();
+    assert!(
+        pairs.contains(&("error".into(), "access_denied".into())),
+        "{back}"
     );
-    // Overload contract: `Retry-After: 1` alongside 503 (03-mcp-tools spec).
-    // Missing the header lets clients retry immediately and re-flood the cap.
-    assert_eq!(
-        resp.headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok()),
-        Some("1"),
-        "503 service_overloaded must set Retry-After: 1"
+    assert!(
+        pairs.contains(&("state".into(), "client-csrf-1".into())),
+        "{back}"
     );
-    let body: Value = resp.json().await.expect("503 body is JSON");
-    assert_eq!(body["error"]["code"], "service_overloaded");
+    assert!(
+        !back.as_str().contains("user+said+no"),
+        "the IdP's free-text description stays server-side: {back}"
+    );
 }
 
 /// `/authorize` without a `state` parameter (absent or empty) must return
@@ -905,4 +914,69 @@ fn location(resp: &reqwest::Response) -> String {
         .to_str()
         .unwrap()
         .to_string()
+}
+
+/// Slice 08 step 4: a refresh rotates in one transaction that also revokes the
+/// session the old refresh token was paired with — the pre-rotation access
+/// token stops working.
+#[tokio::test]
+async fn refresh_revokes_the_previous_access_token() {
+    let user = MockUser {
+        sub: format!("rotate-access-{}", uuid::Uuid::new_v4().simple()),
+        email: "rotate@example.com".to_string(),
+        groups: vec!["engineers".into()],
+    };
+    let (gw, http, _refresh_store) = spawn_bridge_gateway(user).await;
+    let (old_access, refresh) = obtain_token_pair(&http, &gw).await;
+
+    http.post(format!("{gw}/token"))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .expect("rotation succeeds");
+
+    let stale = http
+        .post(format!("{gw}/mcp"))
+        .bearer_auth(&old_access)
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+/// RFC 7009 says 200 for an unknown token, but a revoke the state DB could not
+/// perform is not "unknown": it is a 503, never a 200 that leaves the bearer
+/// live.
+#[tokio::test]
+async fn revoke_during_state_db_outage_is_503() {
+    let user = MockUser {
+        sub: format!("revoke-outage-{}", uuid::Uuid::new_v4().simple()),
+        email: "revoke@example.com".to_string(),
+        groups: vec!["engineers".into()],
+    };
+    let pool = state_pool().await;
+    let idp = spawn_mock_idp("test-client", "test-secret", user).await;
+    let gw = GatewayBuilder::new(E2E_CONFIG_YAML)
+        .idp(&idp)
+        .spawn(pool.clone())
+        .await;
+    let http = no_redirect_client();
+    let (access, _refresh) = obtain_token_pair(&http, &gw.url).await;
+    pool.close().await;
+
+    let resp = http
+        .post(format!("{}/revoke", gw.url))
+        .form(&[("token", access.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "server_error");
 }

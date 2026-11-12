@@ -1,6 +1,9 @@
-//! AST-level guard for SQL sent to a target DB. Defense in depth on top of the
-//! Postgres role's privileges — if a DBA accidentally grants a role more than
-//! its grant's action warrants, the gateway still refuses to send the query.
+//! AST-level guard for SQL sent to a target DB — the third layer of read-only
+//! enforcement. The DB role's privileges are the first; the read-only
+//! transaction every read runs in (`exec::pg::run`) is the second, and holds
+//! even if a DBA grants the role more than its grant's action warrants. The
+//! guard refuses what neither of those stops (session-state and filesystem
+//! functions, dynamic SQL) and gives a typed error before the query is sent.
 //!
 //! Two access levels, selected by the caller's authz decision:
 //!

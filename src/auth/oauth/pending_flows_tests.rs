@@ -1,10 +1,17 @@
 use super::*;
 
+async fn insert(store: &PendingFlows, state: &str) {
+    store
+        .insert(state.into(), "nonce".into(), "verifier".into())
+        .await;
+}
+
 /// Insert a flow with an explicit expiry, bypassing the real `FLOW_TTL`
 /// (15 min) so tests can manufacture already-expired entries without sleeping.
 async fn insert_with_expiry(store: &PendingFlows, state: String, expires_at: Instant) {
-    let mut map = store.inner.lock().await;
-    map.insert(
+    let mut flows = store.inner.lock().await;
+    flows.order.push_back(state.clone());
+    flows.by_state.insert(
         state,
         PendingFlow {
             nonce: "nonce".into(),
@@ -16,92 +23,63 @@ async fn insert_with_expiry(store: &PendingFlows, state: String, expires_at: Ins
 }
 
 #[tokio::test]
-async fn pending_flows_gc_removes_expired_entries() {
+async fn take_is_one_time() {
     let store = PendingFlows::default();
-    store
-        .insert("flow1".into(), "nonce1".into(), "verifier1".into())
-        .await
-        .unwrap();
-    store
-        .insert("flow2".into(), "nonce2".into(), "verifier2".into())
-        .await
-        .unwrap();
-
-    // Both flows should exist.
+    insert(&store, "flow1").await;
     assert!(store.take("flow1").await.is_some());
-    assert!(store.take("flow2").await.is_some());
+    assert!(store.take("flow1").await.is_none());
+}
 
-    // Re-insert and then run gc_expired.
-    store
-        .insert("flow3".into(), "nonce3".into(), "verifier3".into())
-        .await
-        .unwrap();
+#[tokio::test]
+async fn expired_flow_is_not_returned_and_gc_removes_it() {
+    let store = PendingFlows::default();
+    insert_with_expiry(
+        &store,
+        "stale".into(),
+        Instant::now() - Duration::from_secs(1),
+    )
+    .await;
+    insert(&store, "live").await;
     store.gc_expired().await;
-    // Flow3 is still within TTL, should exist after GC.
-    assert!(store.take("flow3").await.is_some());
+    {
+        let flows = store.inner.lock().await;
+        assert_eq!(flows.by_state.len(), 1);
+        assert_eq!(flows.order.len(), 1, "order compacted with the map");
+    }
+    assert!(store.take("stale").await.is_none());
+    assert!(store.take("live").await.is_some());
 }
 
+/// `/authorize` is unauthenticated: a flood that fills the map must not block
+/// a real login. The oldest flow is evicted instead of refusing the new one.
 #[tokio::test]
-async fn pending_flows_rejects_when_full() {
+async fn at_cap_evicts_the_oldest_flow() {
     let store = PendingFlows::default();
-    // Fill to the limit.
     for i in 0..PENDING_FLOWS_MAX_SIZE {
-        let state = format!("flow-{i}");
-        store
-            .insert(state, format!("nonce-{i}"), format!("verifier-{i}"))
-            .await
-            .unwrap();
+        insert(&store, &format!("flood-{i}")).await;
     }
+    insert(&store, "real-login").await;
 
-    // Next insert should fail.
-    let result = store
-        .insert("overflow".into(), "nonce".into(), "verifier".into())
-        .await;
-    assert_eq!(result, Err(StoreError::StoreFull));
-}
-
-/// Regression for the #136 audit finding "/authorize flood wedges all
-/// logins ... cap hit without GC'ing expired flows first". Filling the
-/// map with entries that have ALREADY expired (simulating a burst that
-/// aged out before the periodic 30s sweep ran) must not permanently
-/// block a real login — `insert_flow`'s opportunistic GC-on-full must
-/// reclaim the room inline, without waiting for `gc_expired` to be
-/// called externally.
-#[tokio::test]
-async fn pending_flows_opportunistic_gc_reclaims_room_at_cap() {
-    let store = PendingFlows::default();
-    let already_expired = Instant::now() - Duration::from_secs(1);
-    for i in 0..PENDING_FLOWS_MAX_SIZE {
-        insert_with_expiry(&store, format!("expired-{i}"), already_expired).await;
-    }
-
-    let result = store
-        .insert("real-login".into(), "nonce".into(), "verifier".into())
-        .await;
-    assert!(
-        result.is_ok(),
-        "opportunistic GC must free room for a legitimate login at cap"
+    assert_eq!(
+        store.inner.lock().await.by_state.len(),
+        PENDING_FLOWS_MAX_SIZE
     );
+    assert!(store.take("flood-0").await.is_none(), "oldest evicted");
+    assert!(store.take("flood-1").await.is_some());
     assert!(store.take("real-login").await.is_some());
 }
 
-/// A map genuinely full of LIVE (non-expired) flows must still reject —
-/// the opportunistic GC only reclaims what's actually stale; it must not
-/// evict live entries just to make room.
+/// Eviction skips states already taken (still queued in the order log).
 #[tokio::test]
-async fn pending_flows_opportunistic_gc_does_not_evict_live_entries() {
+async fn eviction_skips_taken_flows() {
     let store = PendingFlows::default();
     for i in 0..PENDING_FLOWS_MAX_SIZE {
-        store
-            .insert(format!("live-{i}"), "nonce".into(), "verifier".into())
-            .await
-            .unwrap();
+        insert(&store, &format!("f-{i}")).await;
     }
-
-    let result = store
-        .insert("overflow".into(), "nonce".into(), "verifier".into())
-        .await;
-    assert_eq!(result, Err(StoreError::StoreFull));
-    // All the original live flows must still be there.
-    assert!(store.take("live-0").await.is_some());
+    assert!(store.take("f-0").await.is_some());
+    insert(&store, "a").await; // room freed by the take: no eviction
+    insert(&store, "b").await; // at cap: evicts f-1, skipping taken f-0
+    assert!(store.take("f-1").await.is_none());
+    assert!(store.take("f-2").await.is_some());
+    assert!(store.take("a").await.is_some() && store.take("b").await.is_some());
 }

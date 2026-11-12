@@ -1,47 +1,56 @@
-//! Operational endpoints: `/healthz`, `/readyz`, `/metrics`.
+//! Operational endpoints: `/healthz`, `/readyz`.
 //!
-//! Mounted on the open router — k8s probes and Prometheus scrapers don't carry
-//! a bearer. None of these return DB credentials, role names, or session data.
-//! See spec 09-deployment.md.
+//! Mounted on the open router — k8s probes don't carry a bearer. Neither
+//! returns DB credentials, role names, or session data. `/metrics` is served
+//! on its own listener (`METRICS_BIND`), not here. See spec 09-deployment.md.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwapOption;
 use axum::extract::State;
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::PgPool;
+use sqlx::pool::PoolConnection;
+use sqlx::postgres::Postgres;
+use tokio::sync::Mutex;
 
 use super::app_state::AppState;
-
-/// Prometheus text exposition content type. Version 0.0.4 is what every
-/// scraper since prom 0.x understands; OpenMetrics is a superset they accept
-/// when sent as text/plain.
-const PROM_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// Cap how long a `SELECT 1` is allowed to take before /readyz gives up and
 /// returns 503. Probes fire on a fast cadence; a slow DB shouldn't wedge them.
 const READYZ_DB_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Shared shutdown flag. Flipped by the graceful-shutdown handler so that
-/// probes return 503 while axum drains in-flight requests — k8s removes the
-/// pod from the Service endpoint set before the pod actually exits.
+/// How long one state-DB probe answers `/readyz`. Probes are unauthenticated
+/// and uncapped, so without this every probe (or a flood posing as one) would
+/// take a state-DB connection.
+const READYZ_CACHE_TTL: Duration = Duration::from_secs(1);
+
+/// The last state-DB probe result and when it ran, plus a gate so at most one
+/// probe runs at a time.
 #[derive(Clone, Debug, Default)]
-pub struct ShutdownFlag(Arc<AtomicBool>);
+pub struct ReadinessCache {
+    last: Arc<ArcSwapOption<(Instant, bool)>>,
+    probing: Arc<Mutex<()>>,
+}
 
-impl ShutdownFlag {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn trigger(&self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-
-    pub fn is_set(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+impl ReadinessCache {
+    /// Never queues: while one probe runs, concurrent callers get the last
+    /// result (not ready if there is none yet) instead of waiting on it.
+    async fn state_db_ready(&self, pool: &PgPool) -> bool {
+        let cached = self.last.load_full();
+        if let Some((at, ready)) = cached.as_deref().copied()
+            && at.elapsed() < READYZ_CACHE_TTL
+        {
+            return ready;
+        }
+        let Ok(_probing) = self.probing.try_lock() else {
+            return cached.is_some_and(|last| last.1);
+        };
+        let ready = probe_state_db(pool).await.is_ok();
+        self.last.store(Some(Arc::new((Instant::now(), ready))));
+        ready
     }
 }
 
@@ -49,7 +58,7 @@ impl ShutdownFlag {
 /// the container on a non-200, so this stays 200 even when the DB is down —
 /// flapping liveness on transient DB outages would just thrash the pod.
 pub async fn healthz(State(state): State<AppState>) -> Response {
-    if state.shutdown.is_set() {
+    if state.shutdown.is_cancelled() {
         return (StatusCode::SERVICE_UNAVAILABLE, "shutting down").into_response();
     }
     (StatusCode::OK, "ok").into_response()
@@ -59,24 +68,30 @@ pub async fn healthz(State(state): State<AppState>) -> Response {
 /// state DB is unreachable — k8s yanks the pod out of the Service endpoint set
 /// on a 503 without restarting it.
 pub async fn readyz(State(state): State<AppState>) -> Response {
-    if state.shutdown.is_set() {
+    if state.shutdown.is_cancelled() {
         return (StatusCode::SERVICE_UNAVAILABLE, "shutting down").into_response();
     }
-    let Some(pool) = state.state_db.as_ref() else {
-        // No state DB wired = test bootstrap. Anything talking to /readyz in
-        // that mode is a test asserting the not-ready path.
-        return (StatusCode::SERVICE_UNAVAILABLE, "state db not configured").into_response();
-    };
-    match probe_state_db(pool).await {
-        Ok(()) => (StatusCode::OK, "ok").into_response(),
-        Err(()) => (StatusCode::SERVICE_UNAVAILABLE, "state db unreachable").into_response(),
+    if state.readiness.state_db_ready(&state.mcp.state_db).await {
+        (StatusCode::OK, "ok").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "state db unreachable").into_response()
     }
 }
 
+/// `SELECT 1` on a connection taken without queueing behind request traffic.
+/// A pool at its size limit with no idle connection is busy serving queries,
+/// which proves the database is up — that counts as ready, not as a failure.
 async fn probe_state_db(pool: &PgPool) -> Result<(), ()> {
-    let probe = sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(pool);
+    let probe = async {
+        let mut conn: PoolConnection<Postgres> = match pool.try_acquire() {
+            Some(conn) => conn,
+            None if pool.size() >= pool.options().get_max_connections() => return Ok(()),
+            None => pool.acquire().await?,
+        };
+        crate::state::ping(&mut conn).await
+    };
     match tokio::time::timeout(READYZ_DB_TIMEOUT, probe).await {
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => {
             // Body stays generic on purpose — the error may contain a host
             // or role name; spec 05 forbids leaking either via HTTP.
@@ -93,25 +108,6 @@ async fn probe_state_db(pool: &PgPool) -> Result<(), ()> {
     }
 }
 
-/// Prometheus scrape endpoint. Renders the global recorder.
-///
-/// Test bootstraps don't install the recorder (it's a process-wide singleton),
-/// so a missing handle returns an empty body rather than 500 — there's
-/// genuinely nothing to render.
-pub async fn metrics(State(state): State<AppState>) -> Response {
-    let body = state
-        .metrics
-        .as_ref()
-        .map(PrometheusHandle::render)
-        .unwrap_or_default();
-    let mut response = body.into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(PROM_CONTENT_TYPE),
-    );
-    response
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +116,8 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use axum::routing::get;
     use tower::ServiceExt;
+
+    use crate::transport::app_state::offline_for_tests;
 
     /// Bodies in these tests are short fixed strings; an 8KiB cap is more than
     /// the real responses ever produce.
@@ -145,7 +143,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_returns_ok_when_live() {
-        let app = router_with_state(AppState::for_tests());
+        let app = router_with_state(offline_for_tests());
         let response = app.oneshot(get_request("/healthz")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_text(response).await, "ok");
@@ -153,20 +151,34 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_returns_503_during_shutdown() {
-        let state = AppState::for_tests();
-        state.shutdown.trigger();
+        let state = offline_for_tests();
+        state.shutdown.cancel();
         let app = router_with_state(state);
         let response = app.oneshot(get_request("/healthz")).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    /// No state DB → not ready. Mirrors the boot-window state where the pod is
-    /// up but hasn't connected to Postgres yet.
+    /// Unreachable state DB → not ready. Mirrors the boot-window state where
+    /// the pod is up but hasn't connected to Postgres yet.
     #[tokio::test]
     async fn readyz_returns_503_without_state_db() {
-        let app = router_with_state(AppState::for_tests());
+        let app = router_with_state(offline_for_tests());
         let response = app.oneshot(get_request("/readyz")).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A fresh cached result answers `/readyz` without touching the (here
+    /// unreachable) state DB.
+    #[tokio::test]
+    async fn readyz_answers_from_a_fresh_cached_probe() {
+        let state = offline_for_tests();
+        state
+            .readiness
+            .last
+            .store(Some(Arc::new((Instant::now(), true))));
+        let app = router_with_state(state);
+        let response = app.oneshot(get_request("/readyz")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// The probe path must not leak DB internals on failure. Cover the
@@ -174,7 +186,7 @@ mod tests {
     /// no role name, no host.
     #[tokio::test]
     async fn readyz_error_body_does_not_leak_internals() {
-        let app = router_with_state(AppState::for_tests());
+        let app = router_with_state(offline_for_tests());
         let response = app.oneshot(get_request("/readyz")).await.unwrap();
         let body = body_text(response).await;
         assert!(

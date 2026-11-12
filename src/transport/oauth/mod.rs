@@ -38,6 +38,7 @@ mod urls;
 // Re-export everything the parent module (transport) accesses via `oauth::*`
 pub(super) use authorize::{authorize, complete_bridge_login};
 pub(super) use discovery::{authorization_server_metadata, protected_resource_metadata};
+pub(super) use helpers::{query_rejected, random_token, redirect_with_error};
 pub(super) use register::register;
 pub(super) use revoke::revoke;
 pub(super) use token::token;

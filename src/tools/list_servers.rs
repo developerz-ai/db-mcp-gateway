@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::auth::Identity;
 use crate::authz;
 use crate::config::{ConfigFile, Grant, ServerKind};
-use crate::transport::jsonrpc::Response;
+use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
 use super::audit_dispatch::{
@@ -74,7 +74,6 @@ fn compute_outcome(
             // but `expect` on the request path is banned (CLAUDE.md): degrade
             // to a typed internal error instead of panicking.
             return error_outcome(
-                id,
                 OutcomeCode::Internal,
                 "tool.list_servers.serialization_failed",
             );
@@ -111,6 +110,7 @@ mod tests {
             user_email: "u@example.com".to_string(),
             groups: groups.iter().map(|g| g.to_string()).collect(),
             issued_at: chrono::Utc::now(),
+            kind: crate::auth::IdentityKind::Sso,
         }
     }
 
@@ -154,7 +154,10 @@ permissions:
     /// tests against a real state DB).
     fn body_for(groups: &[&str]) -> String {
         let outcome = compute_outcome(Value::from(1), &identity(groups), &load(), &[]);
-        let json = serde_json::to_value(&outcome.response).unwrap();
+        let crate::tools::audit_dispatch::Reply::Response(response) = &outcome.reply else {
+            panic!("expected a rendered response, got {:?}", outcome.reply);
+        };
+        let json = serde_json::to_value(response).unwrap();
         json["result"]["content"][0]["text"]
             .as_str()
             .expect("content[0].text is the JSON-stringified payload")

@@ -8,7 +8,7 @@ mod common;
 
 use common::cleanup::delete_audit_calls;
 use common::env::state_pool;
-use db_mcp_gateway::audit::{self, AuditRow};
+use db_mcp_gateway::audit::{self, AuditRow, OutcomeCode};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -24,7 +24,7 @@ fn audit_row(user_sub: &str, request_id: &str) -> AuditRow {
         database: None,
         sql: None,
         reason: None,
-        outcome: "success".to_string(),
+        outcome: OutcomeCode::Success,
         elapsed_ms: None,
         row_count: None,
         truncated: None,
@@ -101,3 +101,58 @@ async fn pruner_deletes_only_rows_older_than_ttl() {
 // `pruner::run_once` doesn't scope by user — a parallel run would
 // indiscriminately wipe any audit rows another test was depending on.
 // The acceptance above already proves the SQL is shaped correctly.
+
+/// A backlog larger than one batch is drained in one run, intents included,
+/// while rows inside the TTL survive.
+#[tokio::test]
+async fn pruner_drains_a_backlog_larger_than_one_batch() {
+    let p = state_pool().await;
+    let user = format!("pruner-batch-{}", Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO audit_calls \
+         (id, request_id, user_sub, user_email, tool, outcome, occurred_at) \
+         SELECT gen_random_uuid(), gen_random_uuid()::text, $1, 'p@example.com', \
+                'list_servers', 'success', now() - interval '200 days' \
+         FROM generate_series(1, 5003)",
+    )
+    .bind(&user)
+    .execute(&p)
+    .await
+    .expect("seed old calls");
+    sqlx::query(
+        "INSERT INTO audit_call_intents \
+         (request_id, occurred_at, user_sub, user_email, tool, server_name, database_name, access) \
+         VALUES (gen_random_uuid()::text, now() - interval '200 days', $1, 'p@example.com', \
+                 'run_query', 'prod', 'app', 'read'), \
+                (gen_random_uuid()::text, now(), $1, 'p@example.com', \
+                 'run_query', 'prod', 'app', 'read')",
+    )
+    .bind(&user)
+    .execute(&p)
+    .await
+    .expect("seed intents");
+
+    let deleted = audit::pruner::run_once(&p, 90).await.expect("pruner runs");
+    assert!(deleted >= 5004, "expected the whole backlog, got {deleted}");
+
+    let calls_left: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_calls WHERE user_sub = $1")
+            .bind(&user)
+            .fetch_one(&p)
+            .await
+            .unwrap();
+    let intents_left: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_call_intents WHERE user_sub = $1")
+            .bind(&user)
+            .fetch_one(&p)
+            .await
+            .unwrap();
+    assert_eq!(calls_left, 0);
+    assert_eq!(intents_left, 1, "the fresh intent survives");
+
+    sqlx::query("DELETE FROM audit_call_intents WHERE user_sub = $1")
+        .bind(&user)
+        .execute(&p)
+        .await
+        .unwrap();
+}

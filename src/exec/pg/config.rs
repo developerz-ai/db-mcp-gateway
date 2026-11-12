@@ -8,6 +8,7 @@
 //! keeps working from outside without leaking this submodule.
 
 use secrecy::{ExposeSecret, SecretString};
+use sqlx::ConnectOptions;
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
 
 use crate::config::{Database, Password, Server, Tls};
@@ -19,7 +20,7 @@ pub(super) fn build_connect_options(
     database: &Database,
     password: &SecretString,
 ) -> PgConnectOptions {
-    PgConnectOptions::new()
+    let opts = PgConnectOptions::new()
         .host(&server.host)
         .port(server.port)
         .username(&database.role)
@@ -27,10 +28,26 @@ pub(super) fn build_connect_options(
         // call, then lives inside `PgConnectOptions` (fed to the pool, dropped).
         .password(password.expose_secret())
         .database(&database.name)
-        .ssl_mode(match server.tls {
-            Tls::Required => PgSslMode::Require,
-            Tls::Insecure => PgSslMode::Disable,
-        })
+        .ssl_mode(ssl_mode(server.tls))
+        // sqlx logs every statement it runs at `info` by default; on the
+        // target path that is the caller's SQL — audit-row material, never a
+        // log line.
+        .disable_statement_logging();
+    // Absent → the system roots verify the chain.
+    match &server.tls_ca_file {
+        Some(ca) => opts.ssl_root_cert(ca),
+        None => opts,
+    }
+}
+
+/// `required` encrypts without verifying (`sslmode=require`); only
+/// `verify_full` checks the chain and the hostname.
+fn ssl_mode(tls: Tls) -> PgSslMode {
+    match tls {
+        Tls::Required => PgSslMode::Require,
+        Tls::VerifyFull => PgSslMode::VerifyFull,
+        Tls::Insecure => PgSslMode::Disable,
+    }
 }
 
 /// Adapt `Password::resolve` into `ExecError`. The boot-time walk in
@@ -76,6 +93,13 @@ pub(crate) async fn resolve_password(password: &Password) -> Result<SecretString
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tls_maps_to_ssl_mode() {
+        assert!(matches!(ssl_mode(Tls::Required), PgSslMode::Require));
+        assert!(matches!(ssl_mode(Tls::VerifyFull), PgSslMode::VerifyFull));
+        assert!(matches!(ssl_mode(Tls::Insecure), PgSslMode::Disable));
+    }
 
     #[tokio::test]
     async fn resolve_password_handles_each_form() {

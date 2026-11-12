@@ -23,15 +23,17 @@ Boot-time validation (issue #16):
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
+| `gateway` | `{ env: production \| development }` | no (defaults `development`) | `production` rejects inline literal secrets (DB passwords, service tokens) at boot. |
 | `servers` | list of [Server](#server) | no (defaults `[]`) | Target DBs the gateway can dispatch to. |
 | `permissions` | list of [Permission](#permission) | no (defaults `[]`) | Group→grant mapping. Empty list means no caller can reach anything. |
 | `admin` | [Admin](#admin) | no | `/admin/v1/*` surface gating — see [admin-api.md](admin-api.md). |
 | `permissions_store` | [PermissionsStore](#permissionsstore) | no | Storage backend for users/databases/grants. Absent → state DB (pg). |
 | `service_accounts` | list of [ServiceAccount](#serviceaccount) | no (defaults `[]`) | Static bearer tokens for headless clients — see [spec 14](../initial-idea/14-service-tokens.md). |
 
-> Other top-level keys (`gateway:`, `auth:`, `logging:`) are accepted for
-> forward-compat with the full spec but not parsed. Their settings come from
-> environment variables today — see [`.env.example`](https://github.com/developerz-ai/db-mcp-gateway/blob/main/.env.example).
+> The top level denies unknown keys: `auth:`, `gateway.bind` or a misspelled
+> section name abort boot. Listener, state DB, TLS and OIDC settings come from
+> environment variables — see [`.env.example`](https://github.com/developerz-ai/db-mcp-gateway/blob/main/.env.example)
+> and the [quickstart env table](quickstart.md#the-environment-variables-the-gateway-reads).
 
 ## Server
 
@@ -43,7 +45,9 @@ Boot-time validation (issue #16):
 | `kind` | `postgres` \| `mongo` \| `mysql` \| `mssql` | **yes** | — | `postgres` and `mongo` work today (#56–#58); `mysql` / `mssql` parse but are **rejected by boot validation** — the process refuses to start (`ServerKind::has_adapter`). Unrelated to `permissions_store.driver: mysql`, which is supported. |
 | `host` | string | **yes** | — | DNS or IP of the target DB. |
 | `port` | u16 | no | `5432` | |
-| `tls` | `required` \| `insecure` | no | `required` | `insecure` logs a warning every minute when used in prod. |
+| `tls` | `required` \| `verify_full` \| `insecure` | no | `required` | `required` encrypts; on Postgres it does **not** verify the certificate (boot warns), on Mongo it does. `verify_full` verifies chain + hostname. `insecure` is plaintext (boot warns). |
+| `tls_ca_file` | path | no | system roots | CA bundle (PEM) for `verify_full`. Boot error when set without `verify_full` or when unreadable. |
+| `pool` | [Pool](#pool) | no | built-in defaults | Applies to every database on the server; a database's own `pool` wins per field. |
 | `description` | string | no | `""` | Human-readable purpose; surfaced by `list_servers`. |
 | `databases` | list of [Database](#database) | no | `[]` | Per-DB definitions. |
 
@@ -57,11 +61,21 @@ Boot-time validation (issue #16):
 | `role` | string | **yes** | — | Postgres role / mongo username (`^[A-Za-z_][A-Za-z0-9_]*$`). Typo here is caught at boot. |
 | `password` | [secret ref](#secret-references) | **yes** | — | `${ENV:…}` / `${FILE:…}` / `vault:…` / `aws-sm:…` / `gcp-sm:…` / inline literal. |
 | `description` | string | no | `""` | |
+| `pool` | [Pool](#pool) | no | server's `pool`, then built-in defaults | Per-field override of the server's `pool`. |
 | `auth_database` | string | no | `None` (falls back to `name`) | Mongo `authSource`. Set to `"admin"` when the role lives outside the target DB (container-bootstrapped users). Empty/whitespace is a boot error — omit to fall back. Ignored by pg. See [multi-db.md](../usage/multi-db.md). |
 
-> Spec also defines `sql_capture` and `pool:` on Database. Those aren't
-> enforced yet — they're commented out in `config/example.yaml` so the parser
-> doesn't reject them. Will land when the relevant features ship.
+> Spec also defines `sql_capture` on Database. It isn't enforced yet — it's
+> commented out in `config/example.yaml` because the parser rejects it.
+
+## Pool
+
+`#[serde(deny_unknown_fields)]`, on [Server](#server) and [Database](#database). Each field resolves database → server → built-in default independently.
+
+| Key | Type | Required | Notes |
+|---|---|---|---|
+| `max_connections` | u32 > 0 | no | `0` is a boot error. |
+| `min_connections` | u32 | no | Connections kept while idle; `0` = fully lazy. Above `max_connections` at the same level is a boot error. |
+| `idle_timeout_s` | u64 > 0 | no | Seconds an idle connection above the minimum lives. |
 
 ### Mongo
 
@@ -146,8 +160,8 @@ now they abort boot.
 | Key | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `require_reason` | bool | no | `false` | Caller must pass a non-empty `reason` arg. |
-| `row_limit` | u32 | no | none | Truncate cap. Combined with caller's `limit`, most-restrictive wins. |
-| `statement_timeout_ms` | u32 | no | none | Postgres-side `SET LOCAL statement_timeout` for queries under this grant. |
+| `row_limit` | u32 | no | none | Truncate cap. Combined with caller's `limit`, most-restrictive wins. `0` aborts boot. |
+| `statement_timeout_ms` | u32 | no | none | Postgres-side `SET LOCAL statement_timeout` for queries under this grant. `0` aborts boot (Postgres reads it as no timeout). |
 
 ## Secret references
 
@@ -171,12 +185,6 @@ Boot-time guarantees (issue #15):
 
 ## What the parser does NOT validate (yet)
 
-- Top-level `gateway:` / `auth:` / `logging:` sections are silently ignored.
-  Their values come from env vars today.
-- Pool sizing (`pool: { max_connections, idle_timeout_seconds, … }`) on
-  databases — gateway uses fixed defaults until per-DB pool sizing ships.
-- `env: production` strictness (rejecting inline literal passwords) is in
-  the spec but not enforced today.
 - Network reachability — boot doesn't try to connect to listed servers;
   pools open lazily on first use.
 

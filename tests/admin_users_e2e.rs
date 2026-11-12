@@ -31,7 +31,7 @@ use common::gateway::{EMPTY_YAML, GatewayBuilder};
 use db_mcp_gateway::auth::{AuthConfig, Identity, SessionId, SessionStore, jwt};
 use db_mcp_gateway::authz::PermissionsCache;
 use db_mcp_gateway::state::permissions::{
-    DbType, GrantAction, GrantTarget, PermissionsRepo, pg::PgPermissionsRepo,
+    DbType, GrantAction, GrantTarget, PermissionsRepo, PermissionsSeed, pg::PgPermissionsRepo,
 };
 use db_mcp_gateway::transport::admin;
 use db_mcp_gateway::transport::admin::middleware::AdminActor;
@@ -612,9 +612,10 @@ async fn audit_write_failure_rolls_back_user_write() {
     let users_state = UsersState {
         repo: repo.clone(),
         state_db: pool.clone(),
-        cache: None,
+        cache: PermissionsCache::new(repo.clone(), Duration::from_secs(60)),
+        sessions: SessionStore::new(pool.clone()),
     };
-    // The handler calls tx_upsert_actor inside the transaction, so the actor
+    // The handler upserts the actor inside the transaction, so the actor
     // row is not pre-seeded here. The empty request_id trips the CHECK on
     // permissions_audit.request_id (migration 0005), causing the transaction
     // — including the upserted actor row and the target user write — to roll back.
@@ -907,6 +908,7 @@ async fn patch_invalidates_cached_authz_for_user() {
         user_email: "cache@example.com".to_string(),
         groups: vec!["engineers".to_string()],
         issued_at: chrono::Utc::now(),
+        kind: db_mcp_gateway::auth::IdentityKind::Sso,
     };
 
     // Warm the cache with the pre-patch state: no grants.
@@ -916,7 +918,7 @@ async fn patch_invalidates_cached_authz_for_user() {
     // Add a database + grant directly via the repo. This intentionally
     // bypasses the admin endpoint's cache invalidation so we can prove
     // the PATCH below is what drops the stale entry.
-    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(h.pool.clone()));
+    let repo = PgPermissionsRepo::new(h.pool.clone());
     let db_row = repo
         .create_database(
             "prod",
@@ -1031,7 +1033,7 @@ async fn delete_invalidates_cached_authz_for_user() {
         .unwrap();
     let target_id: Uuid = create["id"].as_str().unwrap().parse().unwrap();
 
-    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(h.pool.clone()));
+    let repo = PgPermissionsRepo::new(h.pool.clone());
     let db_row = repo
         .create_database(
             "prod",
@@ -1057,6 +1059,7 @@ async fn delete_invalidates_cached_authz_for_user() {
         user_email: "doomed@example.com".to_string(),
         groups: vec!["engineers".to_string()],
         issued_at: chrono::Utc::now(),
+        kind: db_mcp_gateway::auth::IdentityKind::Sso,
     };
 
     // Warm cache — we should see the seeded grant.
@@ -1195,6 +1198,7 @@ async fn database_mutations_flush_all_cached_authz_for_all_users() {
         user_email: "a@example.com".to_string(),
         groups: vec!["engineers".to_string()],
         issued_at: chrono::Utc::now(),
+        kind: db_mcp_gateway::auth::IdentityKind::Sso,
     };
     let identity_b = Identity {
         session_id: SessionId::new(),
@@ -1202,6 +1206,7 @@ async fn database_mutations_flush_all_cached_authz_for_all_users() {
         user_email: "b@example.com".to_string(),
         groups: vec!["engineers".to_string()],
         issued_at: chrono::Utc::now(),
+        kind: db_mcp_gateway::auth::IdentityKind::Sso,
     };
 
     // Warm both users' cache entries with the pre-mutation state (0 grants).
@@ -1210,7 +1215,7 @@ async fn database_mutations_flush_all_cached_authz_for_all_users() {
 
     // Add a grant per user directly via the repo — bypasses admin API
     // invalidation so the DB-endpoint flush is what drops the stale entries.
-    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(h.pool.clone()));
+    let repo = PgPermissionsRepo::new(h.pool.clone());
     let grant_a = repo
         .create_grant(
             user_a_id,
@@ -1383,6 +1388,378 @@ async fn list_honours_limit_query_param() {
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     let err: Value = bad.json().await.unwrap();
     assert_eq!(err["error"]["code"], "invalid_request", "{err}");
+
+    h.cleanup().await;
+}
+
+/// A YAML service identity's authority is exactly its YAML group, so the
+/// admin API refuses to register one as a DB-grant-bearing user.
+#[tokio::test]
+async fn create_rejects_service_subject() {
+    let (h, auth_cfg, sessions) = spawn_gateway().await;
+    let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    let jwt = mint_session(
+        &sessions,
+        &auth_cfg.session_signing_key,
+        &admin_sub,
+        "admin@example.com",
+        &[ADMIN_GROUP.to_string()],
+    )
+    .await;
+    let sub = format!("service:bot-{}", Uuid::new_v4().simple());
+    let resp = client()
+        .post(format!("{}/admin/v1/users", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&json!({ "user_sub": sub, "user_email": "bot@example.com" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let exists: bool =
+        sqlx::query("SELECT EXISTS (SELECT 1 FROM permissions_users WHERE user_sub = $1)")
+            .bind(&sub)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap()
+            .get(0);
+    assert!(!exists, "a refused service subject writes no row");
+    delete_permissions_user(&h.pool, &admin_sub).await;
+}
+
+/// A re-POST of an existing subject is an upsert and must drop that
+/// subject's cached grant set like any other user mutation.
+#[tokio::test]
+async fn repeat_create_invalidates_cached_authz_for_user() {
+    let (mut h, cache, auth_cfg, sessions) = spawn_gateway_with_cache().await;
+    let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    let target_sub = format!("target-e2e-recreate-{}", Uuid::new_v4().simple());
+    h.track(target_sub.clone());
+    let jwt = mint_session(
+        &sessions,
+        &auth_cfg.session_signing_key,
+        &admin_sub,
+        "admin@example.com",
+        &[ADMIN_GROUP.to_string()],
+    )
+    .await;
+    let post = || {
+        client()
+            .post(format!("{}/admin/v1/users", h.base_url))
+            .bearer_auth(&jwt)
+            .json(&json!({ "user_sub": target_sub, "user_email": "re@example.com" }))
+            .send()
+    };
+    let created: Value = post().await.unwrap().json().await.unwrap();
+    let target_id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    let identity = identity_for(&target_sub);
+    assert!(cache.get_for(&identity).await.unwrap().is_empty());
+
+    let repo = PgPermissionsRepo::new(h.pool.clone());
+    let (db_id, grant_id) = seed_grant(&repo, target_id, "recreate").await;
+    assert!(
+        cache.get_for(&identity).await.unwrap().is_empty(),
+        "still cached"
+    );
+
+    assert_eq!(post().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(poll_cache_len(&cache, &identity, 1).await.len(), 1);
+
+    drop_seeded(&h.pool, db_id, grant_id).await;
+    h.cleanup().await;
+}
+
+/// Deleting a user revokes every grant it holds in the same transaction,
+/// with a `delete` audit row per grant.
+#[tokio::test]
+async fn delete_cascades_grant_revocation_with_audit_rows() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    let target_sub = format!("target-e2e-cascade-{}", Uuid::new_v4().simple());
+    h.track(target_sub.clone());
+    let jwt = mint_session(
+        &sessions,
+        &auth_cfg.session_signing_key,
+        &admin_sub,
+        "admin@example.com",
+        &[ADMIN_GROUP.to_string()],
+    )
+    .await;
+    let repo = PgPermissionsRepo::new(h.pool.clone());
+    let user = repo
+        .upsert_user(&target_sub, "cascade@example.com", &[])
+        .await
+        .unwrap();
+    let (db_id, grant_id) = seed_grant(&repo, user.id, "cascade").await;
+
+    let resp = client()
+        .delete(format!("{}/admin/v1/users/{}", h.base_url, user.id))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let revoked: bool =
+        sqlx::query("SELECT revoked_at IS NOT NULL FROM permissions_grants WHERE id = $1")
+            .bind(grant_id)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap()
+            .get(0);
+    assert!(revoked, "user delete must revoke its grants");
+    let audit: (String, Option<Value>, Option<Value>) = sqlx::query(
+        "SELECT action, before, after FROM permissions_audit \
+         WHERE target_id = $1 AND target_type = 'grant'",
+    )
+    .bind(grant_id)
+    .fetch_one(&h.pool)
+    .await
+    .map(|r| (r.get("action"), r.get("before"), r.get("after")))
+    .unwrap();
+    assert_eq!(audit.0, "delete");
+    assert_eq!(audit.1.unwrap()["id"], grant_id.to_string());
+    assert!(audit.2.is_none());
+
+    drop_seeded(&h.pool, db_id, grant_id).await;
+    h.cleanup().await;
+}
+
+fn identity_for(sub: &str) -> Identity {
+    Identity {
+        session_id: SessionId::new(),
+        user_sub: sub.to_string(),
+        user_email: "e2e@example.com".to_string(),
+        groups: vec!["engineers".to_string()],
+        issued_at: chrono::Utc::now(),
+        kind: db_mcp_gateway::auth::IdentityKind::Sso,
+    }
+}
+
+/// Seed a database + specific grant out of band (no admin invalidation).
+async fn seed_grant(repo: &PgPermissionsRepo, user_id: Uuid, tag: &str) -> (Uuid, Uuid) {
+    let db = repo
+        .create_database(
+            "prod",
+            &format!("{tag}-app-{}", Uuid::new_v4().simple()),
+            DbType::Postgres,
+        )
+        .await
+        .expect("seed database");
+    let grant = repo
+        .create_grant(
+            user_id,
+            GrantTarget::Specific { database_id: db.id },
+            GrantAction::QueryRead,
+            json!({}),
+        )
+        .await
+        .expect("seed grant");
+    (db.id, grant.id)
+}
+
+async fn drop_seeded(pool: &PgPool, db_id: Uuid, grant_id: Uuid) {
+    for id in [grant_id, db_id] {
+        delete_permissions_audit(pool, id).await;
+    }
+    let _ = sqlx::query("DELETE FROM permissions_grants WHERE id = $1")
+        .bind(grant_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM permissions_databases WHERE id = $1")
+        .bind(db_id)
+        .execute(pool)
+        .await;
+}
+
+/// Plan 101 slice 09 step 1: admin routes share the bearer-gated per-identity
+/// concurrency cap. Hold `DEFAULT_MAX_CONCURRENT_PER_IDENTITY` admin writes
+/// in flight (blocked on the admin's own row lock) and the next one is shed
+/// with `429 concurrency_limit_exceeded`, never queued.
+#[tokio::test]
+async fn admin_routes_are_concurrency_capped_per_identity() {
+    use db_mcp_gateway::config::DEFAULT_MAX_CONCURRENT_PER_IDENTITY as CAP;
+
+    // One connection per blocked request, plus headroom: the requests must
+    // wait on the row lock, not on pool checkout.
+    let size = std::num::NonZeroU32::new(u32::try_from(CAP).unwrap() + 4).unwrap();
+    let pool = db_mcp_gateway::state::connect(&common::env::state_db_url(), size)
+        .await
+        .expect("state DB up");
+    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
+    let gw = GatewayBuilder::new(EMPTY_YAML)
+        .admin(ADMIN_GROUP, true)
+        .repo(repo)
+        .spawn(pool.clone())
+        .await;
+    let admin_sub = format!("admin-e2e-cap-{}", Uuid::new_v4().simple());
+    let jwt = mint_session(
+        &gw.sessions,
+        &gw.auth_config.session_signing_key,
+        &admin_sub,
+        "cap@example.com",
+        &[ADMIN_GROUP.to_string()],
+    )
+    .await;
+    let post_db = || {
+        client()
+            .post(format!("{}/admin/v1/databases", gw.url))
+            .bearer_auth(&jwt)
+            .json(&json!({
+                "server": "cap",
+                "db_name": format!("cap-{}", Uuid::new_v4().simple()),
+                "db_type": "postgres",
+            }))
+            .send()
+    };
+    // First write creates the admin's row so there is a row to lock.
+    let first: Value = post_db().await.unwrap().json().await.unwrap();
+    let mut db_ids = vec![first["id"].as_str().unwrap().parse::<Uuid>().unwrap()];
+
+    let mut lock = pool.begin().await.unwrap();
+    let locker: i32 = sqlx::query("SELECT pg_backend_pid()")
+        .fetch_one(&mut *lock)
+        .await
+        .unwrap()
+        .get(0);
+    sqlx::query("SELECT id FROM permissions_users WHERE user_sub = $1 FOR UPDATE")
+        .bind(&admin_sub)
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+
+    let held: Vec<_> = (0..CAP).map(|_| tokio::spawn(post_db())).collect();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let blocked: i64 = sqlx::query(
+            // Row-lock waiters queue behind each other, so count every
+            // backend whose wait chain reaches our lock, not only direct waiters.
+            "WITH RECURSIVE w(pid) AS ( \
+                 SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) \
+                 UNION \
+                 SELECT a.pid FROM pg_stat_activity a, w WHERE w.pid = ANY(pg_blocking_pids(a.pid)) \
+             ) SELECT count(*) FROM w",
+        )
+        .bind(locker)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
+        if blocked >= i64::try_from(CAP).unwrap() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let activity: Vec<String> = sqlx::query(
+                "SELECT pid::text || ' ' || coalesce(wait_event_type, '-') || ' ' || \
+                        coalesce(state, '-') || ' ' || left(query, 70) || ' blk=' || \
+                        pg_blocking_pids(pid)::text \
+                 FROM pg_stat_activity WHERE datname = current_database()",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+            panic!("only {blocked} blocked (locker {locker}): {activity:#?}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let shed = post_db().await.unwrap();
+    assert_eq!(shed.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body: Value = shed.json().await.unwrap();
+    assert_eq!(
+        body["error"]["code"], "concurrency_limit_exceeded",
+        "{body}"
+    );
+
+    lock.rollback().await.unwrap();
+    for h in held {
+        let resp = h.await.unwrap().unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let v: Value = resp.json().await.unwrap();
+        db_ids.push(v["id"].as_str().unwrap().parse().unwrap());
+    }
+    for id in db_ids {
+        delete_permissions_audit(&pool, id).await;
+        let _ = sqlx::query("DELETE FROM permissions_databases WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await;
+    }
+    delete_permissions_user(&pool, &admin_sub).await;
+}
+
+/// Slice 08 step 2 (admin revoke): `POST /admin/v1/users/:id/revoke-sessions`
+/// kills every live session of the subject — its bearer is 401 on the next
+/// call — and writes exactly one audit row, in the revoke's transaction.
+#[tokio::test]
+async fn revoke_sessions_logs_the_subject_out_and_audits_once() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    let target_sub = format!("target-e2e-revoke-{}", Uuid::new_v4().simple());
+    h.track(admin_sub.clone());
+    h.track(target_sub.clone());
+    let admin_jwt = mint_session(
+        &sessions,
+        &auth_cfg.session_signing_key,
+        &admin_sub,
+        "admin@example.com",
+        &[ADMIN_GROUP.to_string()],
+    )
+    .await;
+    let target_jwt = mint_session(
+        &sessions,
+        &auth_cfg.session_signing_key,
+        &target_sub,
+        "victim@example.com",
+        &["engineers".to_string()],
+    )
+    .await;
+    let target = PgPermissionsRepo::new(h.pool.clone())
+        .upsert_user(&target_sub, "victim@example.com", &[])
+        .await
+        .unwrap();
+    let tools_list = || {
+        client()
+            .post(format!("{}/mcp", h.base_url))
+            .bearer_auth(&target_jwt)
+            .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .send()
+    };
+    assert_eq!(tools_list().await.unwrap().status(), StatusCode::OK);
+
+    let resp = client()
+        .post(format!(
+            "{}/admin/v1/users/{}/revoke-sessions",
+            h.base_url, target.id
+        ))
+        .bearer_auth(&admin_jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["revoked_sessions"], 1);
+
+    assert_eq!(
+        tools_list().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let audit_rows: i64 =
+        sqlx::query("SELECT COUNT(*) FROM permissions_audit WHERE target_id = $1")
+            .bind(target.id)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap()
+            .get(0);
+    assert_eq!(audit_rows, 1);
+    let (action, before, after, _, _) = latest_audit_for_target(&h.pool, target.id)
+        .await
+        .expect("audit");
+    assert_eq!(action, "update");
+    assert_eq!(before.unwrap()["live_sessions"], 1);
+    assert_eq!(after.unwrap()["live_sessions"], 0);
 
     h.cleanup().await;
 }

@@ -6,7 +6,7 @@
 mod common;
 
 use common::pg_target::adapter;
-use db_mcp_gateway::exec::{DbAdapter, ExecError, ExecQuery, ExecResult, PgAdapter};
+use db_mcp_gateway::exec::{Access, DbAdapter, ExecError, ExecQuery, ExecResult, PgAdapter};
 
 async fn run(a: &PgAdapter, sql: &str) -> Result<ExecResult, ExecError> {
     a.execute(ExecQuery {
@@ -14,6 +14,7 @@ async fn run(a: &PgAdapter, sql: &str) -> Result<ExecResult, ExecError> {
         binds: &[],
         statement_timeout_ms: None,
         row_limit: 10,
+        access: Access::ReadWrite,
     })
     .await
 }
@@ -59,6 +60,7 @@ async fn sample_returns_rows_with_truncation_flag() {
             binds: &[],
             statement_timeout_ms: None,
             row_limit: 5,
+            access: Access::ReadWrite,
         })
         .await
         .expect("sample SELECT runs");

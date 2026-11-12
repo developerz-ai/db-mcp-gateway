@@ -18,15 +18,18 @@
 mod auth_codes;
 mod client_registry;
 mod facade;
+mod grants;
 mod pending_flows;
 mod refresh_chain;
+mod refresh_db;
 mod refresh_tokens;
 
 use sha2::{Digest, Sha256};
 
 pub use auth_codes::{AuthCode, AuthCodes};
 pub use client_registry::ClientRegistry;
-pub use facade::AuthFacade;
+pub use facade::{AuthFacade, IssuedTokens};
+pub use grants::Minted;
 pub use pending_flows::{OAuthBridge, PendingFlow, PendingFlows};
 pub use refresh_chain::DEFAULT_REFRESH_TTL;
 pub use refresh_tokens::{RefreshToken, RefreshTokens};

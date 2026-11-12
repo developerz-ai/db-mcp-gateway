@@ -4,8 +4,8 @@ use sqlx::{Row, mysql::MySqlRow};
 use uuid::Uuid;
 
 use super::super::{
-    DbType, GrantAction, GrantTarget, PermissionsDatabase, PermissionsGrant, PermissionsUser,
-    RepoError,
+    DbType, GrantAction, GrantTarget, LiveGrant, PermissionsDatabase, PermissionsGrant,
+    PermissionsUser, RepoError,
 };
 
 /// Decode a CHAR(36) UUID column. The pg impl reads `UUID` natively;
@@ -62,28 +62,30 @@ pub(super) fn database_from_row(row: &MySqlRow) -> Result<PermissionsDatabase, R
 
 pub(super) fn grant_from_row(row: &MySqlRow) -> Result<PermissionsGrant, RepoError> {
     let action_str: String = row.try_get("action")?;
-    let server: Option<String> = row.try_get("server")?;
-    let database_id: Option<Uuid> = parse_optional_uuid(row, "database_id")?;
-    let wildcard: bool = row.try_get("db_name_wildcard")?;
-    let target = match (server.clone(), database_id, wildcard) {
-        (None, Some(db_id), false) => GrantTarget::Specific { database_id: db_id },
-        (Some(srv), None, true) => GrantTarget::Wildcard { server: srv },
-        _ => {
-            return Err(RepoError::InvalidGrantTarget {
-                server,
-                database_id,
-                wildcard,
-            });
-        }
-    };
     Ok(PermissionsGrant {
         id: parse_uuid(row, "id")?,
         user_id: parse_uuid(row, "user_id")?,
-        target,
+        target: GrantTarget::from_columns(
+            row.try_get("server")?,
+            parse_optional_uuid(row, "database_id")?,
+            row.try_get("db_name_wildcard")?,
+        )?,
         action: GrantAction::parse(&action_str)?,
         constraints: row.try_get("constraints_json")?,
         created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
         updated_at: row.try_get::<DateTime<Utc>, _>("updated_at")?,
         revoked_at: row.try_get::<Option<DateTime<Utc>>, _>("revoked_at")?,
+    })
+}
+
+/// Decode the resolver join (see `grants::live_grants_for_sub`).
+pub(super) fn live_grant_from_row(row: &MySqlRow) -> Result<LiveGrant, RepoError> {
+    let action_str: String = row.try_get("action")?;
+    Ok(LiveGrant {
+        id: parse_uuid(row, "id")?,
+        server: row.try_get("server")?,
+        db_name: row.try_get("db_name")?,
+        action: GrantAction::parse(&action_str)?,
+        constraints: row.try_get("constraints_json")?,
     })
 }

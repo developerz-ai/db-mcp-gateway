@@ -10,7 +10,10 @@
 //! also defends the strict parse: legacy `${VAR}` (no scheme) is rejected at
 //! parse time, not silently turned into a literal password.
 
+mod common;
+
 use db_mcp_gateway::config::{ConfigFile, ConfigFileError, Password, SecretError};
+use db_mcp_gateway::exec::{Access, AdapterRegistry, ExecError, ExecQuery};
 use db_mcp_gateway::state;
 use std::io::Write;
 
@@ -160,7 +163,7 @@ async fn malformed_state_db_url_leaks_no_dsn() {
     // "sentinelpassword" is the canary: if it appears in any formatted error
     // output the test fails.
     let url = "postgres://gateway:sentinelpassword@127.0.0.1:59999/gateway";
-    let err = state::connect(url, 1)
+    let err = state::connect(url, std::num::NonZeroU32::MIN)
         .await
         .expect_err("connection to port 59999 must fail");
 
@@ -185,4 +188,85 @@ async fn malformed_state_db_url_leaks_no_dsn() {
             "DSN leaked in Debug — `{forbidden}` found: {debug}"
         );
     }
+}
+
+/// Password rotation without a restart (plan 101 slice 06): the password
+/// file is rewritten after the pool opened, the old sessions are killed, and
+/// the gateway picks up the new password — the adapter that saw the
+/// credential rejection goes stale and the registry re-opens it, resolving
+/// the file again. A dedicated role keeps the shared `app` role untouched.
+#[tokio::test]
+async fn rotated_password_file_is_picked_up_without_restart() {
+    use common::pg_target;
+
+    let probe = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&format!(
+            "postgres://{}:{}@{}:{}/{}",
+            pg_target::TARGET_USER,
+            pg_target::TARGET_PASSWORD,
+            pg_target::TARGET_HOST,
+            pg_target::TARGET_PORT,
+            pg_target::TARGET_DB
+        ))
+        .await
+        .expect("target-db reachable; run `bin/dev up`");
+    let role = format!("rot_{}", uuid::Uuid::new_v4().simple());
+    let set_password = |pw: &str| format!("ALTER ROLE \"{role}\" PASSWORD '{pw}'");
+    sqlx::query(&format!("CREATE ROLE \"{role}\" LOGIN PASSWORD 'first-pw'"))
+        .execute(&probe)
+        .await
+        .expect("create rotation role");
+
+    let mut file = tempfile::NamedTempFile::new().expect("tempfile");
+    write!(file, "first-pw").expect("write first password");
+    let server = pg_target::server();
+    let database = db_mcp_gateway::config::Database {
+        role: role.clone(),
+        password: Password::File(file.path().to_path_buf()),
+        ..pg_target::database()
+    };
+    let registry = AdapterRegistry::new();
+    let select_one = || ExecQuery {
+        sql: "SELECT 1::int8 AS n",
+        binds: &[],
+        statement_timeout_ms: Some(5_000),
+        row_limit: 1,
+        access: Access::ReadOnly,
+    };
+    let run = |registry: AdapterRegistry| {
+        let (server, database) = (server.clone(), database.clone());
+        async move {
+            let adapter = registry.get_or_open(&server, &database).await?;
+            adapter.execute(select_one()).await
+        }
+    };
+
+    run(registry.clone()).await.expect("first password works");
+
+    sqlx::query(&set_password("second-pw"))
+        .execute(&probe)
+        .await
+        .expect("rotate password");
+    std::fs::write(file.path(), "second-pw").expect("rewrite password file");
+    sqlx::query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = $1")
+        .bind(&role)
+        .execute(&probe)
+        .await
+        .expect("kill the old sessions");
+
+    // The first call after rotation may still try the old password on a new
+    // connection; it marks the adapter stale. The next one must succeed.
+    let first = run(registry.clone()).await;
+    let second = run(registry.clone()).await;
+    let _ = sqlx::query(&format!("DROP ROLE IF EXISTS \"{role}\""))
+        .execute(&probe)
+        .await;
+    if let Err(err) = &first {
+        assert!(
+            matches!(err, ExecError::Connection | ExecError::Unavailable),
+            "a failed first call is a credential/connection error, got {err:?}"
+        );
+    }
+    second.expect("rotated password picked up without a restart");
 }

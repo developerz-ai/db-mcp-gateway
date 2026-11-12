@@ -15,8 +15,11 @@ use uuid::Uuid;
 
 use common::pg_target::{
     TARGET_DB, TARGET_HOST, TARGET_PASSWORD, TARGET_PORT, TARGET_USER, adapter,
+    single_connection_adapter,
 };
-use db_mcp_gateway::exec::{DbAdapter, ExecError, ExecQuery};
+use db_mcp_gateway::exec::{
+    Access, DbAdapter, ExecError, ExecQuery, MAX_RESULT_BYTES, RejectionKind,
+};
 
 fn query<'a>(sql: &'a str, timeout_ms: Option<u32>, row_limit: u32) -> ExecQuery<'a> {
     ExecQuery {
@@ -24,6 +27,15 @@ fn query<'a>(sql: &'a str, timeout_ms: Option<u32>, row_limit: u32) -> ExecQuery
         binds: &[],
         statement_timeout_ms: timeout_ms,
         row_limit,
+        access: Access::ReadOnly,
+    }
+}
+
+/// A `query_write` caller's query.
+fn write_query(sql: &str, row_limit: u32) -> ExecQuery<'_> {
+    ExecQuery {
+        access: Access::ReadWrite,
+        ..query(sql, None, row_limit)
     }
 }
 
@@ -153,27 +165,34 @@ async fn statement_timeout_kills_slow_query() {
     assert!(!rendered.contains("57014"), "leaked SQLSTATE: {rendered}");
 }
 
-/// SQL the DB rejects (e.g. unknown column) must surface as `ExecError::Sql`,
-/// not as `Timeout` or `Unavailable`. Keeps the error-mapping correct so the
-/// MCP layer can return the right error code to the agent.
+/// A statement the DB refuses comes back with its SQLSTATE and the server's
+/// message, so the agent can fix the query; the kind picks the stable code.
 #[tokio::test]
-async fn syntax_error_classifies_as_sql() {
+async fn db_rejection_carries_sqlstate_and_message() {
     let a = adapter().await;
     let err = a
         .execute(query("SELECT not_a_real_function()", None, 10))
         .await
         .expect_err("undefined function must fail");
-    assert!(matches!(err, ExecError::Sql), "got {err:?}");
-}
+    let ExecError::Rejected(rejection) = err else {
+        panic!("expected Rejected, got {err:?}");
+    };
+    assert_eq!(rejection.sqlstate(), "42883");
+    assert!(
+        rejection.message().contains("not_a_real_function"),
+        "{rejection}"
+    );
+    assert_eq!(rejection.kind(), RejectionKind::Other);
 
-/// Adapter's `kind()` reports `Postgres` and `health()` round-trips a
-/// `SELECT 1`. Cheap but worth pinning so a future refactor doesn't quietly
-/// regress the trait surface.
-#[tokio::test]
-async fn pg_adapter_reports_kind_and_health() {
-    let a = adapter().await;
-    assert_eq!(a.kind(), db_mcp_gateway::exec::AdapterKind::Postgres);
-    a.health().await.expect("health check round-trips");
+    let err = a
+        .execute(query("SELECT nope FROM (SELECT 1 AS n) t", None, 10))
+        .await
+        .expect_err("undefined column must fail");
+    let ExecError::Rejected(rejection) = err else {
+        panic!("expected Rejected, got {err:?}");
+    };
+    assert_eq!(rejection.sqlstate(), "42703");
+    assert_eq!(rejection.kind(), RejectionKind::UndefinedObject);
 }
 
 /// Separate pool to the SAME target DB, used to observe `pg_stat_activity`
@@ -246,6 +265,7 @@ async fn dropped_query_future_cancels_backend() {
             binds: &[],
             statement_timeout_ms: Some(30_000),
             row_limit: 10,
+            access: Access::ReadOnly,
         };
         let _ = a.execute(q).await;
     });
@@ -383,7 +403,7 @@ async fn sql_null_decodes_to_null_for_every_type() {
 async fn unrenderable_type_is_marked_not_nulled() {
     let adapter = adapter().await;
     let result = adapter
-        .execute(query("SELECT ARRAY[1,2,3] AS arr", None, 10))
+        .execute(query("SELECT '[1,3)'::int4range AS r", None, 10))
         .await
         .expect("query runs");
 
@@ -400,10 +420,10 @@ async fn unrenderable_type_is_marked_not_nulled() {
 
     // And the caller's documented workaround actually works.
     let cast = adapter
-        .execute(query("SELECT ARRAY[1,2,3]::text AS arr", None, 10))
+        .execute(query("SELECT '[1,3)'::int4range::text AS r", None, 10))
         .await
         .expect("query runs");
-    assert_eq!(cast.rows[0][0], "{1,2,3}");
+    assert_eq!(cast.rows[0][0], "[1,3)");
 }
 
 /// A query that matches no rows must still report the column names it
@@ -458,6 +478,7 @@ async fn zero_row_bound_query_still_reports_column_names() {
             binds: &["a", "b"],
             statement_timeout_ms: None,
             row_limit: 10,
+            access: Access::ReadOnly,
         })
         .await
         .expect("bound empty SELECT runs");
@@ -469,4 +490,337 @@ async fn zero_row_bound_query_still_reports_column_names() {
         "column name from a bound zero-row query must survive"
     );
     assert!(!result.truncated);
+}
+
+// ---------------------------------------------------------------------------
+// Exec safety (plan 101 slice 05)
+// ---------------------------------------------------------------------------
+
+/// A fresh table owned by this test, created and dropped through the probe
+/// pool (the adapter under test never runs DDL).
+async fn scratch_table(probe: &sqlx::PgPool) -> String {
+    let table = format!("exec_safety_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "CREATE TABLE \"{table}\" (id int PRIMARY KEY, v int NOT NULL DEFAULT 0)"
+    ))
+    .execute(probe)
+    .await
+    .expect("create scratch table");
+    table
+}
+
+async fn drop_table(probe: &sqlx::PgPool, table: &str) {
+    let _ = sqlx::query(&format!("DROP TABLE IF EXISTS \"{table}\""))
+        .execute(probe)
+        .await;
+}
+
+/// The dev role can write, so only the read-only transaction stands between
+/// a read grant and a write here. `nextval` and `lo_from_bytea` are writes
+/// the SQL guard would also stop — at this layer they must fail at the DB,
+/// with no side effect.
+#[tokio::test]
+async fn read_access_cannot_write_on_a_write_capable_role() {
+    let a = adapter().await;
+    let probe = probe_pool().await;
+    let seq = format!("exec_safety_seq_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SEQUENCE \"{seq}\""))
+        .execute(&probe)
+        .await
+        .expect("create sequence");
+    let objects_before: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_largeobject_metadata")
+        .fetch_one(&probe)
+        .await
+        .expect("count large objects");
+
+    for sql in [
+        format!("SELECT nextval('\"{seq}\"')"),
+        "SELECT lo_from_bytea(0, 'x')".to_string(),
+    ] {
+        let err = a
+            .execute(query(&sql, None, 10))
+            .await
+            .expect_err("a write under read access must fail");
+        let ExecError::Rejected(rejection) = err else {
+            panic!("expected Rejected for `{sql}`, got {err:?}");
+        };
+        assert_eq!(
+            rejection.sqlstate(),
+            "25006",
+            "read_only_sql_transaction for `{sql}`"
+        );
+    }
+
+    let called: bool = sqlx::query_scalar(&format!("SELECT is_called FROM \"{seq}\""))
+        .fetch_one(&probe)
+        .await
+        .expect("read sequence");
+    let objects_after: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_largeobject_metadata")
+        .fetch_one(&probe)
+        .await
+        .expect("count large objects");
+    let _ = sqlx::query(&format!("DROP SEQUENCE \"{seq}\""))
+        .execute(&probe)
+        .await;
+    assert!(!called, "nextval advanced the sequence under read access");
+    assert_eq!(objects_before, objects_after, "a large object was created");
+}
+
+/// A `RETURNING` write past the row limit is drained and committed: the
+/// response's `truncated` and `rows_affected` match what is in the table.
+/// Rolling it back after reporting success was the bug.
+#[tokio::test]
+async fn truncated_write_commits_and_reports_rows_affected() {
+    let a = adapter().await;
+    let probe = probe_pool().await;
+    let table = scratch_table(&probe).await;
+
+    let inserted = a
+        .execute(write_query(
+            &format!(
+                "INSERT INTO \"{table}\" (id) SELECT g FROM generate_series(1, 50) g RETURNING id"
+            ),
+            5,
+        ))
+        .await
+        .expect("insert runs");
+    let updated = a
+        .execute(write_query(
+            &format!("UPDATE \"{table}\" SET v = 1 RETURNING id, v"),
+            5,
+        ))
+        .await
+        .expect("update runs");
+    let (rows, ones): (i64, i64) = sqlx::query_as(&format!(
+        "SELECT count(*), count(*) FILTER (WHERE v = 1) FROM \"{table}\""
+    ))
+    .fetch_one(&probe)
+    .await
+    .expect("count rows");
+    drop_table(&probe, &table).await;
+
+    for (label, result) in [("insert", &inserted), ("update", &updated)] {
+        assert_eq!(result.rows.len(), 5, "{label}: returned rows capped");
+        assert!(result.truncated, "{label}: truncated flagged");
+        assert_eq!(result.rows_affected, Some(50), "{label}: every row written");
+    }
+    assert_eq!(rows, 50, "insert committed");
+    assert_eq!(ones, 50, "update committed");
+}
+
+/// A read reports no `rows_affected`; a write without `RETURNING` reports it
+/// with no rows.
+#[tokio::test]
+async fn rows_affected_is_reported_for_writes_only() {
+    let a = adapter().await;
+    let probe = probe_pool().await;
+    let table = scratch_table(&probe).await;
+
+    let write = a
+        .execute(write_query(
+            &format!("INSERT INTO \"{table}\" (id) VALUES (1), (2)"),
+            10,
+        ))
+        .await
+        .expect("insert runs");
+    let read = a
+        .execute(query(&format!("SELECT id FROM \"{table}\""), None, 10))
+        .await
+        .expect("select runs");
+    drop_table(&probe, &table).await;
+
+    assert_eq!(write.rows_affected, Some(2));
+    assert!(write.rows.is_empty() && !write.truncated);
+    assert_eq!(read.rows_affected, None);
+    assert_eq!(read.rows.len(), 2);
+}
+
+/// Session state set by one caller is gone for the next caller on the same
+/// backend: a session `set_config`, a session advisory lock, the tag. The
+/// pool has one connection, and the backend PID proves it was reused (reset,
+/// not discarded).
+#[tokio::test]
+async fn no_session_state_survives_release() {
+    let a = single_connection_adapter().await;
+    let probe = probe_pool().await;
+    let lock_key: i64 = rand_key();
+
+    let first = a
+        .execute(query(
+            &format!(
+                "SELECT pg_backend_pid() AS pid, \
+                        set_config('search_path', 'pg_catalog', false) AS sp, \
+                        pg_advisory_lock({lock_key}) AS lock, \
+                        current_setting('application_name') AS app"
+            ),
+            None,
+            10,
+        ))
+        .await
+        .expect("first call runs");
+    let second = a
+        .execute(query(
+            "SELECT pg_backend_pid() AS pid, current_setting('search_path') AS sp, \
+                    current_setting('application_name') AS app",
+            None,
+            10,
+        ))
+        .await
+        .expect("second call runs");
+
+    let lock_free: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(lock_key)
+        .fetch_one(&probe)
+        .await
+        .expect("probe takes the lock");
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(lock_key)
+        .execute(&probe)
+        .await;
+
+    assert_eq!(first.rows[0][0], second.rows[0][0], "same backend reused");
+    assert_ne!(
+        second.rows[0][1], "pg_catalog",
+        "search_path leaked across callers"
+    );
+    assert!(lock_free, "session advisory lock survived release");
+    let (app1, app2) = (&first.rows[0][3], &second.rows[0][2]);
+    assert!(
+        app1.as_str().is_some_and(|s| s.starts_with("dbmcp-")),
+        "transaction carries its tag: {app1}"
+    );
+    assert_ne!(app1, app2, "each transaction gets a fresh tag");
+}
+
+/// Wide rows stop at the byte budget well before the row limit, and the
+/// connection is reusable afterwards.
+#[tokio::test]
+async fn wide_rows_truncate_at_the_byte_budget() {
+    let a = single_connection_adapter().await;
+    let one_mib = 1024 * 1024;
+    let result = a
+        .execute(query(
+            &format!("SELECT repeat('x', {one_mib}) AS blob FROM generate_series(1, 64)"),
+            None,
+            1_000,
+        ))
+        .await
+        .expect("wide query runs");
+    assert!(result.truncated, "byte budget flags truncation");
+    let bytes: usize = result
+        .rows
+        .iter()
+        .map(|r| r[0].as_str().map_or(0, str::len))
+        .sum();
+    assert!(bytes <= MAX_RESULT_BYTES, "{bytes} bytes returned");
+    assert!(result.rows.len() < 64, "stopped before the row limit");
+
+    let next = a
+        .execute(query("SELECT 1::int8 AS n", None, 10))
+        .await
+        .expect("connection reusable after a byte-capped read");
+    assert_eq!(next.rows[0][0], 1);
+}
+
+/// A zero timeout must not reach Postgres as zero (= no limit).
+#[tokio::test]
+async fn zero_timeout_is_not_unlimited() {
+    let a = adapter().await;
+    let err = a
+        .execute(query("SELECT pg_sleep(2)", Some(0), 10))
+        .await
+        .expect_err("a zero budget cannot run a 2 s sleep");
+    assert!(matches!(err, ExecError::Timeout), "got {err:?}");
+}
+
+/// Waiting for a pooled connection is not the caller's query budget: with
+/// the only connection pinned, a 100 ms query is `unavailable` after the
+/// acquire timeout, not a `timeout`.
+#[tokio::test]
+async fn saturated_pool_is_unavailable_not_timeout() {
+    let a = std::sync::Arc::new(single_connection_adapter().await);
+    let holder = {
+        let a = a.clone();
+        tokio::spawn(async move {
+            a.execute(query("SELECT pg_sleep(8)", Some(10_000), 1))
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let err = a
+        .execute(query("SELECT 1", Some(100), 1))
+        .await
+        .expect_err("no connection is free");
+    assert!(matches!(err, ExecError::Unavailable), "got {err:?}");
+    holder.abort();
+}
+
+fn rand_key() -> i64 {
+    i64::from_le_bytes(Uuid::new_v4().as_bytes()[..8].try_into().expect("8 bytes"))
+}
+
+// ---------------------------------------------------------------------------
+// Decoder coverage (plan 101 slice 06)
+// ---------------------------------------------------------------------------
+
+/// JSON has no NaN or infinity; they must not collapse into SQL-NULL `null`.
+#[tokio::test]
+async fn non_finite_floats_render_as_strings() {
+    let a = adapter().await;
+    let r = a
+        .execute(query(
+            "SELECT 'NaN'::float8, 'Infinity'::float4, '-Infinity'::float8",
+            None,
+            10,
+        ))
+        .await
+        .expect("query runs");
+    assert_eq!(r.rows[0], vec!["NaN", "Infinity", "-Infinity"]);
+}
+
+#[tokio::test]
+async fn arrays_intervals_and_inet_decode() {
+    let a = adapter().await;
+    let r = a
+        .execute(query(
+            "SELECT ARRAY['a', NULL]::text[], ARRAY[1, 2]::int4[], ARRAY[3]::int8[], \
+                    ARRAY['11111111-2222-3333-4444-555555555555']::uuid[], \
+                    '1 year 2 mons 3 days 04:05:06.5'::interval, \
+                    '10.0.0.1'::inet, '10.0.0.0/8'::cidr, '::1/128'::inet",
+            None,
+            10,
+        ))
+        .await
+        .expect("query runs");
+    let row = &r.rows[0];
+    assert_eq!(row[0], serde_json::json!(["a", null]));
+    assert_eq!(row[1], serde_json::json!([1, 2]));
+    assert_eq!(row[2], serde_json::json!([3]));
+    assert_eq!(
+        row[3],
+        serde_json::json!(["11111111-2222-3333-4444-555555555555"])
+    );
+    assert_eq!(row[4], "P1Y2M3DT4H5M6.5S");
+    assert_eq!(row[5], "10.0.0.1");
+    assert_eq!(row[6], "10.0.0.0/8");
+    assert_eq!(row[7], "::1");
+}
+
+#[tokio::test]
+async fn enum_values_decode_as_their_label() {
+    let a = adapter().await;
+    let probe = probe_pool().await;
+    let ty = format!("exec_mood_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE TYPE \"{ty}\" AS ENUM ('happy', 'sad')"))
+        .execute(&probe)
+        .await
+        .expect("create enum");
+    let r = a
+        .execute(query(&format!("SELECT 'sad'::\"{ty}\" AS mood"), None, 10))
+        .await;
+    let _ = sqlx::query(&format!("DROP TYPE \"{ty}\""))
+        .execute(&probe)
+        .await;
+    assert_eq!(r.expect("query runs").rows[0][0], "sad");
 }

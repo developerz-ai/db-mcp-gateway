@@ -6,14 +6,17 @@ mod startup;
 use std::path::PathBuf;
 
 use clap::Parser;
+use db_mcp_gateway::audit::drain::DRAIN_TIMEOUT;
 use db_mcp_gateway::auth::{AuthConfig, ServiceTokenStore};
-use db_mcp_gateway::config::{Config, ConfigFile};
+use db_mcp_gateway::config::{Config, ConfigFile, ServerKind, Tls};
+use db_mcp_gateway::state;
 use db_mcp_gateway::transport::tls;
-use metrics_exporter_prometheus::PrometheusBuilder;
+use tokio_util::sync::CancellationToken;
 
 use startup::{
-    build_app_state, connect_state_db, init_tracing, serve, spawn_audit_pruner,
-    spawn_oauth_state_gc,
+    AuthGcTargets, build_app_state, connect_state_db, init_logging, install_recorder, serve,
+    spawn_audit_pruner, spawn_audit_reaper, spawn_auth_state_gc, spawn_dropped_lines_exporter,
+    spawn_metrics_listener,
 };
 
 #[derive(Debug, Parser)]
@@ -71,8 +74,8 @@ fn main() -> anyhow::Result<()> {
 
 async fn run() -> anyhow::Result<()> {
     // Bound for the whole of `run` so the non-blocking log queue drains on
-    // shutdown — see `init_tracing`.
-    let _log_guard = init_tracing();
+    // shutdown — see `init_logging`.
+    let (_log_guard, dropped_log_lines) = init_logging()?;
 
     // rustls 0.23 needs an explicit CryptoProvider; install before any TLS
     // path touches `RustlsConfig` (issue #12).
@@ -82,9 +85,7 @@ async fn run() -> anyhow::Result<()> {
 
     // Spec 05 §"resolved at config load": `load` parses, validates, AND
     // resolves every ${ENV:…} / ${FILE:…} ref in one shot. A boot abort is a
-    // clearer operator signal than the user's first query failing on connect,
-    // and folding resolve into the load helper makes it impossible to ship a
-    // SIGHUP path that forgets to re-resolve.
+    // clearer operator signal than the user's first query failing on connect.
     let config_file = ConfigFile::load(&cli.config)?;
     tracing::info!(
         path = %cli.config.display(),
@@ -92,11 +93,11 @@ async fn run() -> anyhow::Result<()> {
         permissions = config_file.permissions.len(),
         "config loaded; all secret refs resolved"
     );
+    warn_unverified_target_tls(&config_file);
 
     // Service tokens (spec 14): resolve every `service_accounts:` ref now so a
     // weak/unresolvable token aborts boot instead of silently rejecting that
-    // client's every call. Empty config → empty store → JWT-only auth, the
-    // pre-#185 behavior.
+    // client's every call. Empty config → empty store → JWT-only auth.
     let service_tokens = ServiceTokenStore::from_config(&config_file.service_accounts)?;
     if !config_file.service_accounts.is_empty() {
         tracing::info!(
@@ -108,55 +109,105 @@ async fn run() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     let auth_config = AuthConfig::from_env()?;
 
+    // One token stops everything that is not the request path: background
+    // loops, metrics upkeep and listener, the SIGHUP loop. Cancelled by the
+    // signal handler, and again below in case `serve` returns on an error.
+    let stop = CancellationToken::new();
+
     // Install the Prometheus recorder before anything starts emitting metrics.
-    // `install_recorder` registers a process-wide global — any later install
-    // (e.g. from a test harness sharing the binary) would fail, which is why
-    // tests bootstrap with `AppState::for_tests()` (no recorder).
-    let metrics_handle = PrometheusBuilder::new()
-        .install_recorder()
-        .map_err(|err| anyhow::anyhow!("failed to install Prometheus recorder: {err}"))?;
+    // `install_recorder` registers a process-wide global — tests bootstrap
+    // with no recorder for that reason.
+    let metrics_handle = install_recorder(stop.clone())?;
+    spawn_metrics_listener(config.metrics_bind, metrics_handle, stop.clone()).await?;
+    spawn_dropped_lines_exporter(dropped_log_lines, stop.clone());
 
     let state_db = connect_state_db(&config).await?;
+    // Pruner and GC get their own two connections so a long prune never holds
+    // a connection a request is waiting on.
+    let background_db = state::connect_background(&config.state_db.url)
+        .await
+        .map_err(|err| match err {
+            // The source can embed the DSN; only its credential-free class escapes.
+            state::StateDbError::Connect(source) => anyhow::anyhow!(
+                "state DB background pool: failed to connect ({}; DSN withheld)",
+                state::connect_error_class(&source)
+            ),
+            other => anyhow::Error::new(other),
+        })?;
     let app_state = build_app_state(
         config_file,
         &config,
         auth_config,
         service_tokens,
-        metrics_handle,
+        stop.clone(),
         &state_db,
     )
     .await?;
 
-    // Fail closed: a release binary must never serve with auth unwired.
-    // `bearer_auth` deliberately passes through when `state.auth` is `None`
-    // (the test bootstrap relies on it), so the only thing standing between a
-    // wiring regression and an unauthenticated DB-query surface is this guard
-    // on the production serve path. Integration tests build the router via
-    // `transport::router(...)` directly and never reach `main`, so this never
-    // trips them (sec qa 2026-06-29 A2).
-    if app_state.auth.is_none() {
-        anyhow::bail!("refusing to start: AppState.auth is None — auth facade not wired");
+    spawn_audit_pruner(
+        background_db.clone(),
+        config.audit_retention_days,
+        stop.clone(),
+    );
+    spawn_audit_reaper(background_db.clone(), stop.clone());
+    let auth = &app_state.oauth.auth;
+    spawn_auth_state_gc(
+        AuthGcTargets {
+            sessions: auth.sessions.clone(),
+            flows: auth.flows.clone(),
+            codes: auth.codes.clone(),
+            refresh: auth.refresh.clone(),
+            client_registry: app_state.oauth.client_registry.clone(),
+        },
+        stop.clone(),
+    );
+    // Cloned before `serve` takes the state: the detached audit work must be
+    // drained after the listener stops, and the request pool closed after that.
+    let detached = app_state.mcp.detached.clone();
+
+    let served = serve(&config, app_state, cli.config.clone(), stop.clone()).await;
+
+    // `serve` returns once the drain window closes. Stop the background loops,
+    // let detached audit writes finish (bounded), then close the pools so
+    // in-flight state-DB statements complete instead of being cut at exit.
+    stop.cancel();
+    if let Err(error) = detached.drain(DRAIN_TIMEOUT).await {
+        tracing::error!(%error, "detached audit work still running at shutdown; the reaper will mark it abandoned");
     }
+    close_pool("background", background_db).await;
+    close_pool("request", state_db).await;
+    served
+}
 
-    // Spawn the audit retention pruner. Ticks hourly, deletes rows older
-    // than `audit_retention_days`. The tokio runtime drops the task on
-    // graceful shutdown — DELETE is the only DB call, so cancelling
-    // mid-flight just rolls back; no half-state.
-    spawn_audit_pruner(state_db, config.audit_retention_days);
-
-    // Spawn the OAuth state garbage collector. Ticks every 30 seconds to
-    // remove expired authorization codes, pending flows, and refresh tokens.
-    // This prevents unbounded memory growth from abandoned logins or leaked
-    // tokens.
-    if let Some(auth_facade) = app_state.auth.as_ref() {
-        spawn_oauth_state_gc(
-            auth_facade.flows.clone(),
-            auth_facade.codes.clone(),
-            auth_facade.refresh.clone(),
-        );
+/// Close a state-DB pool, bounded so a wedged connection cannot hold the pod
+/// past its termination grace period.
+async fn close_pool(name: &'static str, pool: sqlx::PgPool) {
+    const CLOSE_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+    if tokio::time::timeout(CLOSE_BOUND, pool.close())
+        .await
+        .is_err()
+    {
+        tracing::warn!(pool = name, "state DB pool did not close within bound");
     }
+}
 
-    serve(&config, app_state).await
+/// Postgres `tls: required` encrypts without verifying the server certificate
+/// (`sslmode=require`; Mongo's `required` does verify), and `tls: insecure` is
+/// plaintext. Neither should go unnoticed in a deploy log.
+fn warn_unverified_target_tls(config_file: &ConfigFile) {
+    for server in &config_file.servers {
+        match (server.kind, server.tls) {
+            (ServerKind::Postgres, Tls::Required) => tracing::warn!(
+                server = %server.name,
+                "target TLS is encrypted but the server certificate is NOT verified"
+            ),
+            (_, Tls::Insecure) => tracing::warn!(
+                server = %server.name,
+                "target TLS is disabled: credentials and results cross the network in plaintext"
+            ),
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]

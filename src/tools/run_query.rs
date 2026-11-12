@@ -13,14 +13,14 @@ use serde_json::Value;
 use crate::config::{Action, Grant, ServerKind};
 use crate::exec::ExecQuery;
 use crate::exec::sql_guard;
-use crate::transport::jsonrpc::{ErrorObject, Response};
+use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
 use super::audit_dispatch::{
     AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, error_outcome, outcome_from_exec_error,
-    run_audited, success_outcome,
+    reject_arguments, run_audited, success_outcome,
 };
-use super::target::{effective_row_limit, ensure_reason, forbidden, resolve_target};
+use super::target::{effective_row_limit, ensure_reason, forbidden, record_intent, resolve_target};
 
 const TOOL_NAME: &str = "run_query";
 const ERROR_MESSAGES: ToolErrorMessages = ToolErrorMessages {
@@ -56,12 +56,13 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
     let args: Arguments = match arguments.map(serde_json::from_value::<Arguments>) {
         Some(Ok(a)) => a,
         _ => {
-            return Response::error(
+            return reject_arguments(
+                ctx,
                 id,
-                ErrorObject::invalid_params(
-                    "run_query requires `server`, `database`, `sql` arguments",
-                ),
-            );
+                TOOL_NAME,
+                "run_query requires `server`, `database`, `sql` arguments",
+            )
+            .await;
         }
     };
 
@@ -97,9 +98,9 @@ async fn compute_outcome(
         &args.server,
         &args.database,
     ) else {
-        return forbidden(id);
+        return forbidden();
     };
-    let (server, database, constraints) = (target.server, target.database, target.constraints);
+    let (server, database, constraints) = (target.server, target.database, &target.constraints);
 
     // A separate `query_write` check decides whether data writes are permitted.
     // Only `query_write` grants satisfy it (`query_read` does not imply write),
@@ -118,7 +119,7 @@ async fn compute_outcome(
         sql_guard::Access::ReadOnly
     };
 
-    if let Err(rejected) = ensure_reason(&id, &constraints, args.reason.as_deref()) {
+    if let Err(rejected) = ensure_reason(constraints, args.reason.as_deref()) {
         return *rejected;
     }
 
@@ -136,7 +137,6 @@ async fn compute_outcome(
         && let Err(err) = sql_guard::check_sql(&args.sql, access)
     {
         return error_outcome(
-            id,
             OutcomeCode::ForbiddenSql,
             &format!("SQL rejected by gateway: {err}"),
         );
@@ -161,13 +161,17 @@ async fn compute_outcome(
         "tool.run_query.dispatch"
     );
 
+    if let Err(refused) = record_intent(ctx, TOOL_NAME, &target, access).await {
+        return *refused;
+    }
+
     // Start the wall clock BEFORE pool open so error paths (timeout,
     // unavailable, syntax_error) still surface `duration_ms` in the audit
     // row — spec 07 requires it for every tool invocation.
     let started = Instant::now();
     let adapter = match ctx.registry.get_or_open(server, database).await {
         Ok(a) => a,
-        Err(err) => return outcome_from_exec_error(id, err, started, &ERROR_MESSAGES),
+        Err(err) => return outcome_from_exec_error(err, started, &ERROR_MESSAGES),
     };
 
     let query = ExecQuery {
@@ -175,6 +179,7 @@ async fn compute_outcome(
         binds: &[],
         statement_timeout_ms: timeout_ms,
         row_limit,
+        access,
     };
     match adapter.execute(query).await {
         Ok(result) => {
@@ -190,11 +195,11 @@ async fn compute_outcome(
             let text = match serde_json::to_string(&payload) {
                 Ok(t) => t,
                 Err(_) => {
-                    return error_outcome(id, OutcomeCode::Internal, "failed to serialize result");
+                    return error_outcome(OutcomeCode::Internal, "failed to serialize result");
                 }
             };
             success_outcome(id, text, Some(elapsed), Some(row_count), Some(truncated))
         }
-        Err(err) => outcome_from_exec_error(id, err, started, &ERROR_MESSAGES),
+        Err(err) => outcome_from_exec_error(err, started, &ERROR_MESSAGES),
     }
 }

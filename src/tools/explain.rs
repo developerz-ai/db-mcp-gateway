@@ -14,15 +14,15 @@ use serde_json::Value;
 
 use crate::config::{Action, Grant};
 use crate::exec::ExplainQuery;
-use crate::exec::sql_guard::ReadOnlySql;
-use crate::transport::jsonrpc::{ErrorObject, Response};
+use crate::exec::sql_guard::{Access, ReadOnlySql};
+use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
 use super::audit_dispatch::{
     AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, error_outcome, outcome_from_exec_error,
-    run_audited, success_outcome,
+    reject_arguments, run_audited, success_outcome,
 };
-use super::target::{ensure_reason, forbidden, resolve_target};
+use super::target::{ensure_reason, forbidden, record_intent, resolve_target};
 
 const TOOL_NAME: &str = "explain";
 const ERROR_MESSAGES: ToolErrorMessages = ToolErrorMessages {
@@ -51,12 +51,13 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
     let args: Arguments = match arguments.map(serde_json::from_value::<Arguments>) {
         Some(Ok(a)) => a,
         _ => {
-            return Response::error(
+            return reject_arguments(
+                ctx,
                 id,
-                ErrorObject::invalid_params(
-                    "explain requires `server`, `database`, `sql` arguments",
-                ),
-            );
+                TOOL_NAME,
+                "explain requires `server`, `database`, `sql` arguments",
+            )
+            .await;
         }
     };
 
@@ -90,12 +91,12 @@ async fn compute_outcome(
         &args.server,
         &args.database,
     ) else {
-        return forbidden(id);
+        return forbidden();
     };
 
     // Same guard as `run_query`: a grant demanding a reason applies to every
     // way the caller reaches the target DB, plan-only included.
-    if let Err(rejected) = ensure_reason(&id, &target.constraints, args.reason.as_deref()) {
+    if let Err(rejected) = ensure_reason(&target.constraints, args.reason.as_deref()) {
         return *rejected;
     }
 
@@ -103,12 +104,15 @@ async fn compute_outcome(
         Ok(sql) => sql,
         Err(err) => {
             return error_outcome(
-                id,
                 OutcomeCode::ForbiddenSql,
                 &format!("SQL rejected by gateway: {err}"),
             );
         }
     };
+
+    if let Err(refused) = record_intent(ctx, TOOL_NAME, &target, Access::ReadOnly).await {
+        return *refused;
+    }
 
     // Wall clock starts before pool open so error paths still carry
     // `duration_ms` into the audit row — spec 07 requires it on every call.
@@ -119,7 +123,7 @@ async fn compute_outcome(
         .await
     {
         Ok(a) => a,
-        Err(err) => return outcome_from_exec_error(id, err, started, &ERROR_MESSAGES),
+        Err(err) => return outcome_from_exec_error(err, started, &ERROR_MESSAGES),
     };
 
     let query = ExplainQuery {
@@ -136,7 +140,6 @@ async fn compute_outcome(
                 Ok(p) => p,
                 Err(()) => {
                     return error_outcome(
-                        id,
                         OutcomeCode::Internal,
                         "EXPLAIN returned an unexpected row shape",
                     );
@@ -150,13 +153,13 @@ async fn compute_outcome(
             let text = match serde_json::to_string(&payload) {
                 Ok(t) => t,
                 Err(_) => {
-                    return error_outcome(id, OutcomeCode::Internal, "failed to serialize result");
+                    return error_outcome(OutcomeCode::Internal, "failed to serialize result");
                 }
             };
             // EXPLAIN always returns one row (the plan); never truncated.
             success_outcome(id, text, Some(elapsed), Some(1), Some(false))
         }
-        Err(err) => outcome_from_exec_error(id, err, started, &ERROR_MESSAGES),
+        Err(err) => outcome_from_exec_error(err, started, &ERROR_MESSAGES),
     }
 }
 
@@ -186,6 +189,7 @@ mod tests {
             rows: vec![vec![Value::from(r#"[{"Plan":{"Node Type":"Seq Scan"}}]"#)]],
             truncated: false,
             elapsed_ms: 0,
+            rows_affected: None,
         };
         let plan = extract_plan(&result).expect("decodes");
         assert_eq!(plan[0]["Plan"]["Node Type"], "Seq Scan");
@@ -200,6 +204,7 @@ mod tests {
             rows: vec![vec![serde_json::json!([{"Plan": {"Node Type": "Result"}}])]],
             truncated: false,
             elapsed_ms: 0,
+            rows_affected: None,
         };
         let plan = extract_plan(&result).expect("passes through");
         assert_eq!(plan[0]["Plan"]["Node Type"], "Result");
@@ -212,6 +217,7 @@ mod tests {
             rows: vec![],
             truncated: false,
             elapsed_ms: 0,
+            rows_affected: None,
         };
         assert!(extract_plan(&empty).is_err());
 
@@ -221,6 +227,7 @@ mod tests {
             rows: vec![vec![Value::from(42)]],
             truncated: false,
             elapsed_ms: 0,
+            rows_affected: None,
         };
         assert!(extract_plan(&wrong).is_err());
     }
