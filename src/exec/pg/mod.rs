@@ -56,7 +56,7 @@ use super::pool_sizing::PoolSizing;
 use super::query::{ActivityQuery, ExecQuery};
 use super::sql_guard::Access;
 
-use error::{AcquireFailure, log_discarded};
+use error::{AcquireFailure, is_feature_not_supported, log_discarded};
 use run::{RunCtx, run_query_inner};
 use tier::Tier;
 
@@ -228,15 +228,25 @@ impl PgAdapter {
 /// `pg_advisory_unlock_all()` drops session advisory locks. Not `DISCARD
 /// ALL`: it would also drop the prepared statements sqlx's cache still
 /// believes exist. A failed reset discards the connection.
+///
+/// A server without advisory locks (YugabyteDB with the preview flag off)
+/// rejects the unlock as `feature_not_supported`; it can hold no advisory
+/// lock, so the connection is kept. The rejected statement aborted the
+/// implicit transaction the pair ran in, taking `RESET ALL` with it, so the
+/// reset is repeated alone.
 fn reset_on_release(
     conn: &mut PgConnection,
     _meta: PoolConnectionMetadata,
 ) -> BoxFuture<'_, Result<bool, sqlx::Error>> {
     Box::pin(async move {
-        match conn
+        let reset = match conn
             .execute("RESET ALL; SELECT pg_advisory_unlock_all()")
             .await
         {
+            Err(err) if is_feature_not_supported(&err) => conn.execute("RESET ALL").await,
+            other => other,
+        };
+        match reset {
             Ok(_) => Ok(true),
             Err(err) => {
                 log_discarded(&err, "connection reset failed; discarding");
