@@ -1,10 +1,10 @@
 //! Execution layer: per-`(server, database)` adapters that enforce
 //! `statement_timeout`, row caps, and cancellation.
 //!
-//! The trait surface lives in [`adapter`]; the Postgres impl in [`pg`].
-//! Tools consume an `Arc<dyn DbAdapter>` from [`AdapterRegistry`] and never
-//! see backend-specific types — that's the whole point of #56's refactor:
-//! mongo (#57) and mysql (#59) slot in here without touching `src/tools/`.
+//! The trait surface lives in [`adapter`]; the Postgres impl in [`pg`], the
+//! Mongo impl in [`mongo`]. Tools consume an `Arc<dyn DbAdapter>` from
+//! [`AdapterRegistry`] and never see backend-specific types or SQL — mysql
+//! (#59) slots in here without touching `src/tools/`.
 //!
 //! Security-required (see CLAUDE.md). The non-negotiables — no credentials
 //! in errors/logs, DB-side `statement_timeout` set per-tx — are documented
@@ -14,6 +14,7 @@
 //! [`adapter`], and every impl applies it identically.
 
 pub mod adapter;
+pub mod ident;
 pub mod mongo;
 pub mod pg;
 pub mod sql_guard;
@@ -27,7 +28,9 @@ use crate::config::{Database, Server, ServerKind};
 
 pub use adapter::{
     AdapterKind, DEFAULT_STATEMENT_TIMEOUT_MS, DbAdapter, ExecError, ExecQuery, ExecResult,
+    ExplainQuery, SampleQuery, SchemaQuery,
 };
+pub use ident::{IDENTIFIER_PATTERN, Identifier, InvalidIdentifier};
 pub use mongo::MongoAdapter;
 pub use pg::{DEFAULT_POOL_MAX_CONNECTIONS, PgAdapter};
 

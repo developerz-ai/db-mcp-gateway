@@ -4,7 +4,8 @@
 //! [`super::pg::PgAdapter`] and [`super::mongo::MongoAdapter`] implement this
 //! today; mysql (#59) slots in here without touching the tools layer: every
 //! per-DB tool drives the registry and the registry returns the right
-//! adapter.
+//! adapter. Engine-specific SQL (catalog lookups, sampling, `EXPLAIN`) lives
+//! behind the trait, never in a tool.
 //!
 //! [`effective_timeout_ms`] lives here rather than in one impl because the
 //! ceiling is a *gateway* policy, not a backend detail — an adapter that
@@ -13,13 +14,16 @@
 //!
 //! Security note: `ExecError`'s `Display` never carries connection strings,
 //! hostnames, passwords, or SQLSTATE codes. The pg-side mapping is in
-//! [`super::pg::classify`]; new adapters must preserve this discipline.
+//! `pg::decode::classify`; new adapters must preserve this discipline.
 
 use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::ServerKind;
+
+use super::ident::Identifier;
+use super::sql_guard::ReadOnlySql;
 
 /// Gateway-wide ceiling on a single query's wall-clock budget. When a grant
 /// declines to set `statement_timeout_ms` (spec-06 "no constraint from this
@@ -67,6 +71,34 @@ pub struct ExecQuery<'a> {
     pub binds: &'a [&'a str],
     pub statement_timeout_ms: Option<u32>,
     pub row_limit: u32,
+}
+
+/// Catalog lookup for one schema, optionally narrowed to one table. Schema
+/// and table are *values* to the catalog query (bound, not interpolated).
+#[derive(Debug)]
+pub struct SchemaQuery<'a> {
+    pub schema: &'a str,
+    pub table: Option<&'a str>,
+    pub statement_timeout_ms: Option<u32>,
+    pub row_limit: u32,
+}
+
+/// First `row_limit` rows of one table, every column. The names are
+/// [`Identifier`]s because they land in generated SQL as identifiers.
+#[derive(Debug)]
+pub struct SampleQuery<'a> {
+    pub schema: Identifier<'a>,
+    pub table: Identifier<'a>,
+    pub statement_timeout_ms: Option<u32>,
+    pub row_limit: u32,
+}
+
+/// Plan — never execute — one statement that already passed the read-only
+/// guard.
+#[derive(Debug)]
+pub struct ExplainQuery<'a> {
+    pub sql: ReadOnlySql<'a>,
+    pub statement_timeout_ms: Option<u32>,
 }
 
 /// Tabular result. `rows` is row-major; `columns` carries the names in their
@@ -126,10 +158,9 @@ pub enum ExecError {
     #[error("no adapter is registered for server kind `{0:?}`")]
     UnsupportedAdapter(ServerKind),
 
-    /// The adapter is registered but the requested operation is not yet
-    /// implemented. Today this fires only on `MongoAdapter::execute` — the
-    /// scaffold from #57 runs the read-only rejector but defers actual
-    /// query execution to #58. The error carries the responsible
+    /// The adapter is registered but does not support the requested
+    /// operation. Today this fires on `MongoAdapter`'s `describe_schema`,
+    /// `sample` and `explain`. The error carries the responsible
     /// `AdapterKind` and the operation name so operators see exactly which
     /// gap was hit.
     #[error("adapter `{adapter:?}` has not implemented `{op}` yet")]
@@ -163,6 +194,21 @@ pub trait DbAdapter: Send + Sync + std::fmt::Debug {
     /// Run a single query under the gateway-enforced timeout + row cap.
     /// See `ExecQuery` for the per-call inputs.
     async fn execute(&self, query: ExecQuery<'_>) -> Result<ExecResult, ExecError>;
+
+    /// Columns of every table in `query.schema` (or just `query.table`),
+    /// ordered by table then column position. Each row is exactly
+    /// `[schema, table, column, data_type, is_nullable]`, all strings;
+    /// `is_nullable` is `"YES"` / `"NO"`.
+    async fn describe_schema(&self, query: SchemaQuery<'_>) -> Result<ExecResult, ExecError>;
+
+    /// Up to `query.row_limit` rows of the table, with `truncated` set when
+    /// the table holds more.
+    async fn sample(&self, query: SampleQuery<'_>) -> Result<ExecResult, ExecError>;
+
+    /// The statement's plan without running it: one row, one cell holding
+    /// the plan as JSON — either parsed (`Value::Array` / `Value::Object`) or
+    /// as JSON text (`Value::String`).
+    async fn explain(&self, query: ExplainQuery<'_>) -> Result<ExecResult, ExecError>;
 
     /// Cheap liveness probe — `SELECT 1` (or backend equivalent). Used by
     /// `/readyz` to confirm the adapter's pool can still acquire a connection
