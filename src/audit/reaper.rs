@@ -19,6 +19,10 @@ use super::{AUDIT_WRITE_TIMEOUT, AuditError};
 /// Advisory-lock key for the sweep — arbitrary, fixed, unique to the reaper.
 const REAPER_LOCK_KEY: i64 = 0x6462_6d63_7072_6170; // "dbmcprap"
 
+/// Calls the reaper recorded as `abandoned`: each one reached the target with
+/// no recorded outcome, so an alert on any increase is warranted.
+const ABANDONED_TOTAL: &str = "audit_abandoned_total";
+
 /// How often a replica attempts a sweep.
 pub const REAP_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -56,7 +60,12 @@ pub async fn run(pool: PgPool) {
         ticker.tick().await;
         match run_once(&pool, REAPER_GRACE).await {
             Ok(Some(0) | None) => {}
-            Ok(Some(n)) => tracing::warn!(rows = n, "audit reaper: recorded abandoned calls"),
+            Ok(Some(n)) => {
+                // Only the lock holder writes rows, so summing across replicas
+                // counts each abandoned call once.
+                metrics::counter!(ABANDONED_TOTAL).increment(n);
+                tracing::warn!(rows = n, "audit reaper: recorded abandoned calls");
+            }
             Err(err) => tracing::error!(
                 %err,
                 class = %err.class(),

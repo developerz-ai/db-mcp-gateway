@@ -379,20 +379,19 @@ Names are fixed — dashboards and alerts are written against them. No label car
 
 | Series | Type | Labels |
 |---|---|---|
-| `tool_calls` | counter | `tool`, `outcome`, `access` (`read`/`write`), `identity_kind` (`sso`/`service`) |
+| `tool_calls` | counter | `tool`, `outcome` (the spec 03 code the client saw — an intent or completion write that failed shows as `audit_unavailable`), `access` (`read`/`write`/`unknown` for a call dropped before it decided) |
 | `query_duration_seconds` | histogram (fixed buckets 5 ms – 60 s) | `tool` |
 | `audit_write_duration_seconds` | histogram (fixed buckets 1 ms – 5 s) | — |
-| `audit_write_failures_total` | counter | `phase` (`intent`/`completion`/`fallback`) |
-| `audit_abandoned_total` | counter | — |
+| `audit_fallback_failures_total` | counter | — (a disconnect-path audit write failed; the row exists only once the reaper records it) |
+| `audit_abandoned_total` | counter | — (intents the reaper recorded as `abandoned`; only the lock-holding replica increments it, so `sum()` across replicas is exact) |
 | `audit_pruner_runs_total` | counter | `result` (`ok`/`error`) |
 | `audit_pruner_last_success_timestamp` | gauge (unix seconds) | — |
 | `requests_shed_total` | counter | `scope` (`global`/`identity`/`oauth`) |
-| `target_pool_connections` | gauge | `db`, `state` (`idle`/`in_use`) |
-| `state_pool_acquire_seconds` | histogram | `pool` |
+| `pool_size` | gauge (configured max connections) | `db`, `pool_kind` (`query`/`cancel`, plus `write_query`/`write_cancel` when `write_role` is set) |
 | `sessions_created_total` / `sessions_revoked_total` | counter | — |
-| `config_reloads_total` | counter | `result` |
+| `config_reloads_total` | counter | `result` (`ok`/`error`) |
 | `log_lines_dropped_total` | counter | — |
-| `audit_stream_dropped_total` | counter | — |
+| `audit_stream_dropped_total` | counter | `sink` (`syslog`) |
 
 Histograms use fixed buckets so they aggregate across replicas. Gauges and histograms untouched for an hour leave the output (an evicted database's labels do not linger); counters never expire.
 
