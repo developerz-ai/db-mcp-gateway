@@ -4,51 +4,51 @@ status: in_progress        # not_started | in_progress | blocked | complete | su
 created_by: sebi
 worked_by: "sebi"              # executor fills with their git user.name
 owner: sebi
-percent: 0
-current_focus: ""
+percent: 78
+current_focus: "v2.0.0 release; then 14 (D1 roles/secrets/service accounts), 15 (tesote), 16 (developerz.ai)"
 slices:
   - file: 01-live-baseline.md
-    status: not_started
-    percent: 0
+    status: in_progress
+    percent: 50
   - file: 02-refactor-foundations.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 03-state-migrations.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 04-audit-integrity.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 05-exec-safety.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 06-exec-efficiency.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 07-authz-permissions.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 08-auth-sessions.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 09-transport.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 10-config-reload-shutdown.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 11-observability-scrubber.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 12-agent-power.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 13-tests.md
-    status: not_started
-    percent: 0
+    status: complete
+    percent: 100
   - file: 14-infra-developerz.md
-    status: not_started
-    percent: 0
+    status: in_progress
+    percent: 15
   - file: 15-infra-tesote.md
     status: not_started
     percent: 0
@@ -56,8 +56,10 @@ slices:
     status: not_started
     percent: 0
   - file: 17-devex-build-ci.md
-    status: not_started
-    percent: 0
-evidence: []
+    status: complete
+    percent: 100
+evidence:
+  - "PRs #279-#293 merged (02-13, 17); #291 TTL hotfix; infra developerz-ai/infrastructure#2282 (14 step 1) live-tested: Prometheus up=1 on :9090"
+  - "01 step 2 benchmark baseline deferred: target Postgres unavailable on the dev box; weekly load gate captures it on first run"
 notes: "Production measurements in 01 were taken 2026-11-12 (read-only); the benchmark baseline in 01 step 2 is still to be captured. Owner decisions are listed in overview.md Risks."
 last_updated: 2026-11-12

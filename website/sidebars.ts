@@ -31,6 +31,7 @@ const sidebars: SidebarsConfig = {
         'deployment/admin-api',
         'deployment/logging',
         'deployment/releasing',
+        'deployment/upgrading-to-2',
       ],
     },
     {
