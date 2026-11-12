@@ -61,6 +61,13 @@ First time you call a gateway tool, Claude Code will hit a `401` and Claude will
 
 Tokens are stored in your system keychain (macOS) or credentials file, refreshed automatically until they expire. To start over: `/mcp` → *Clear authentication*.
 
+Signing out (`POST /auth/logout`) ends **every** session for your identity — every machine and every Claude Code instance signed in as you has to run `/mcp` again.
+
+### `401` vs `5xx`
+
+- **`401`** (with a `WWW-Authenticate` header) means your credential is missing, expired or revoked. Claude Code re-runs the sign-in; that is the fix.
+- **`5xx`** (`500`/`503`, no `WWW-Authenticate`) means the gateway itself could not check your credential — typically its state database is briefly unavailable. Signing in again will not help; retry in a moment. Your session is still valid.
+
 ## Verify it works
 
 In a Claude Code session, ask the agent to list databases:
@@ -113,6 +120,7 @@ Quick reference. The deeper explanations + corporate-proxy / popup-blocker / `re
 | [`timeout` on `run_query`](first-query.md#timeout-on-run_query) | Query was slow. Ask the agent to `explain` first, or narrow it. Operator-set; not bypassable. |
 | [`row_limit_exceeded` (or `truncated: true`)](first-query.md#row_limit_exceeded-or-truncated-true-in-the-response) | Result was clipped. Add a tighter `WHERE`/`LIMIT`, or aggregate. |
 | Gateway tools missing from `/mcp` | Either the gateway URL is wrong, the gateway is down, or your token expired silently. `/mcp` → *Reconnect*. |
+| `500`/`503` instead of `401` | Gateway-side failure (often its state DB). Not a sign-in problem — retry; tell the operator if it persists. |
 | TLS / cert error instead of `401` | Corporate proxy is intercepting. See [first-query.md → Corporate proxy / VPN](first-query.md#corporate-proxy--vpn). |
 
 ## Removing the server

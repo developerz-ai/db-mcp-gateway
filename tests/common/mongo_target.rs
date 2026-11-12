@@ -1,8 +1,9 @@
 //! Fixtures for the target Mongo (`target-mongo`, :27018). The dev
 //! container's `app` user is the root user and authenticates against `admin`.
 
+use db_mcp_gateway::audit::drain::DetachedTasks;
 use db_mcp_gateway::config::{Database, Password, Server, ServerKind, Tls};
-use db_mcp_gateway::exec::MongoAdapter;
+use db_mcp_gateway::exec::{MongoAdapter, PoolSizing};
 use mongodb::Client;
 use mongodb::bson::doc;
 use mongodb::options::{ClientOptions, Credential, ServerAddress};
@@ -23,6 +24,8 @@ pub fn server(name: &str) -> Server {
         host: TARGET_HOST.to_string(),
         port: TARGET_PORT,
         tls: Tls::Insecure,
+        tls_ca_file: None,
+        pool: None,
         databases: vec![database()],
     }
 }
@@ -34,13 +37,19 @@ pub fn database() -> Database {
         password: Password::Literal(TARGET_PASSWORD.into()),
         description: String::new(),
         auth_database: Some("admin".to_string()),
+        pool: None,
     }
 }
 
 pub async fn adapter(server_name: &str) -> MongoAdapter {
-    MongoAdapter::open(&server(server_name), &database())
-        .await
-        .expect("target-mongo reachable; run `bin/dev up`")
+    MongoAdapter::open(
+        &server(server_name),
+        &database(),
+        PoolSizing::default(),
+        DetachedTasks::new(),
+    )
+    .await
+    .expect("target-mongo reachable; run `bin/dev up`")
 }
 
 /// Side-channel client for setup / teardown / inspection — bypasses the

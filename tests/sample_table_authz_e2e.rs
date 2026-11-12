@@ -18,7 +18,7 @@ use common::gateway::{LoggedInGateway, spawn_logged_in};
 use common::idp::MockUser;
 use common::pg_target;
 use db_mcp_gateway::audit::AuditRow;
-use db_mcp_gateway::exec::{DbAdapter, ExecQuery, PgAdapter};
+use db_mcp_gateway::exec::{Access, DbAdapter, ExecQuery, PgAdapter};
 use serde_json::{Value, json};
 
 const TOOL: &str = "sample_table";
@@ -138,6 +138,7 @@ impl Fixture {
                 binds: &[],
                 statement_timeout_ms: None,
                 row_limit: 10,
+                access: Access::ReadWrite,
             })
             .await
             .unwrap_or_else(|e| panic!("fixture SQL failed ({sql}): {e}"));
@@ -170,9 +171,12 @@ async fn schema_read_grant_cannot_sample_rows() {
         !resp.to_string().contains("111-11-1111"),
         "row data leaked to a schema_read-only caller: {resp}"
     );
+    let row = latest_audit(&booted, "schema_read sample").await;
+    assert_eq!(row.outcome, "forbidden");
+    // Denied before the target: no intent row, nothing to reap.
     assert_eq!(
-        latest_audit(&booted, "schema_read sample").await.outcome,
-        "forbidden"
+        common::audit::find_intent(&booted.state_db, &row.request_id).await,
+        None
     );
 }
 
@@ -195,10 +199,34 @@ async fn query_read_grant_can_sample_rows() {
     assert_eq!(body["columns"], json!(["id", "ssn"]));
     assert_eq!(body["rows"][0][0], 1);
     assert_eq!(body["rows"][0][1], "111-11-1111");
+    let row = latest_audit(&booted, "query_read sample").await;
+    assert_eq!(row.outcome, "success");
+    // The audit row names what was read, and the intent preceded the read.
     assert_eq!(
-        latest_audit(&booted, "query_read sample").await.outcome,
-        "success"
+        row.sql.as_deref(),
+        Some(format!("{}.customers", fixture.schema).as_str())
     );
+    assert_eq!(
+        common::audit::find_intent(&booted.state_db, &row.request_id)
+            .await
+            .as_deref(),
+        Some("read")
+    );
+}
+
+/// A table name that is not an identifier never reaches authz or the
+/// target: JSON-RPC `invalid_params` (spec 03 `invalid_arguments`), audited.
+#[tokio::test]
+async fn non_identifier_table_is_an_audited_invalid_argument() {
+    let booted = boot_gateway("engineers").await;
+
+    let resp = call_sample_table(&booted, json!({ "table": "customers; drop" })).await;
+
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+    let row = latest_audit(&booted, "invalid table").await;
+    assert_eq!(row.outcome, "invalid_arguments");
+    assert_eq!(row.server.as_deref(), Some("target"));
+    assert_eq!(row.sql, None);
 }
 
 /// `require_reason` must not be dodgeable by sampling instead of querying:

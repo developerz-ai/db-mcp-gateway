@@ -34,16 +34,19 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::audit::latest_audit;
+use common::audit::{DispatchSinks, latest_audit};
 use common::cleanup::delete_audit_calls;
 use common::env::{state_pool, target_db_url};
 use common::pg_target;
+use db_mcp_gateway::audit::drain::DetachedTasks;
 use db_mcp_gateway::auth::{Identity, SessionId};
-use db_mcp_gateway::exec::{DEFAULT_POOL_MAX_CONNECTIONS, DbAdapter, ExecQuery, PgAdapter};
-use db_mcp_gateway::tools::audit_dispatch::{
-    AuditHeader, Outcome, OutcomeCode, RequestContext, audit_dispatch,
+use db_mcp_gateway::exec::{
+    Access, DEFAULT_POOL_MAX_CONNECTIONS, DbAdapter, ExecQuery, PgAdapter, PoolSizing,
 };
-use db_mcp_gateway::transport::jsonrpc::Response;
+use db_mcp_gateway::mcp::jsonrpc::Response;
+use db_mcp_gateway::tools::audit_dispatch::{
+    AuditHeader, Outcome, OutcomeCode, Reply, RequestContext, audit_dispatch,
+};
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
@@ -55,6 +58,7 @@ fn test_identity(user_sub: &str) -> Identity {
         user_email: "cancel-real-db@example.com".to_string(),
         groups: vec!["test".to_string()],
         issued_at: chrono::Utc::now(),
+        kind: db_mcp_gateway::auth::IdentityKind::Sso,
     }
 }
 
@@ -73,9 +77,14 @@ async fn pg_cancel_backend_fires_when_execute_future_dropped() {
         .expect("monitor connection to target DB (run `bin/dev up`)");
 
     let adapter = Arc::new(
-        PgAdapter::open(&pg_target::server(), &pg_target::database())
-            .await
-            .expect("PgAdapter open"),
+        PgAdapter::open(
+            &pg_target::server(),
+            &pg_target::database(),
+            PoolSizing::default(),
+            DetachedTasks::new(),
+        )
+        .await
+        .expect("PgAdapter open"),
     );
 
     // Spawn a long-running query with a 30 s timeout so it outlives any
@@ -89,6 +98,7 @@ async fn pg_cancel_backend_fires_when_execute_future_dropped() {
                 binds: &[],
                 statement_timeout_ms: Some(30_000),
                 row_limit: 1,
+                access: Access::ReadOnly,
             })
             .await
     });
@@ -161,14 +171,24 @@ async fn cancelled_dispatch_cancels_pg_backend_and_writes_audit_row() {
         .expect("monitor connection to target DB");
 
     let adapter = Arc::new(
-        PgAdapter::open(&pg_target::server(), &pg_target::database())
-            .await
-            .expect("PgAdapter open"),
+        PgAdapter::open(
+            &pg_target::server(),
+            &pg_target::database(),
+            PoolSizing::default(),
+            DetachedTasks::new(),
+        )
+        .await
+        .expect("PgAdapter open"),
     );
 
     let user = format!("cancel-rdb-{}", Uuid::new_v4().simple());
     let request_id = Value::from(Uuid::new_v4().to_string());
-    let ctx = RequestContext::default();
+    // Unique per test: the intent row is keyed on the gateway request id.
+    let ctx = RequestContext {
+        request_id: Uuid::new_v4(),
+        ip: None,
+        agent_client: None,
+    };
 
     let adapter_task = adapter.clone();
     let state_pool_task = state_pool.clone();
@@ -202,11 +222,15 @@ async fn cancelled_dispatch_cancels_pg_backend_and_writes_audit_row() {
                         binds: &[],
                         statement_timeout_ms: Some(30_000),
                         row_limit: 1,
+                        access: Access::ReadOnly,
                     })
                     .await;
                 match result {
                     Ok(_) => Outcome {
-                        response: Response::result(id_out, &serde_json::json!({"ok": true})),
+                        reply: Reply::Response(Box::new(Response::result(
+                            id_out,
+                            &serde_json::json!({"ok": true}),
+                        ))),
                         code: OutcomeCode::Success,
                         elapsed_ms: Some(0),
                         row_count: Some(0),
@@ -214,7 +238,7 @@ async fn cancelled_dispatch_cancels_pg_backend_and_writes_audit_row() {
                         error_message: None,
                     },
                     Err(_) => Outcome {
-                        response: Response::result(id_out, &serde_json::json!({"ok": false})),
+                        reply: Reply::ToolError,
                         code: OutcomeCode::Internal,
                         elapsed_ms: None,
                         row_count: None,
@@ -224,13 +248,13 @@ async fn cancelled_dispatch_cancels_pg_backend_and_writes_audit_row() {
                 }
             }
         };
+        let sinks = DispatchSinks::new(&[]);
         audit_dispatch(
             id_task,
             &identity,
-            Some(&state_pool_task),
             &ctx,
             header,
-            &[],
+            sinks.store(&state_pool_task),
             work,
         )
         .await
@@ -320,9 +344,14 @@ async fn concurrent_aborts_do_not_queue_on_query_pool() {
         .expect("monitor connection to target DB (run `bin/dev up`)");
 
     let adapter = Arc::new(
-        PgAdapter::open(&pg_target::server(), &pg_target::database())
-            .await
-            .expect("PgAdapter open"),
+        PgAdapter::open(
+            &pg_target::server(),
+            &pg_target::database(),
+            PoolSizing::default(),
+            DetachedTasks::new(),
+        )
+        .await
+        .expect("PgAdapter open"),
     );
 
     // Saturate the query pool so every slot is held by a pg_sleep. If cancels
@@ -340,6 +369,7 @@ async fn concurrent_aborts_do_not_queue_on_query_pool() {
                     binds: &[],
                     statement_timeout_ms: Some(30_000),
                     row_limit: 1,
+                    access: Access::ReadOnly,
                 })
                 .await
         }));
@@ -404,4 +434,18 @@ async fn concurrent_aborts_do_not_queue_on_query_pool() {
         1500,
         still_active,
     );
+
+    // Every slot was released mid-query and went back through the reset
+    // hook; the pool must still serve the next caller on a clean connection.
+    let next = adapter
+        .execute(ExecQuery {
+            sql: "SELECT current_setting('application_name') AS app",
+            binds: &[],
+            statement_timeout_ms: Some(5_000),
+            row_limit: 1,
+            access: Access::ReadOnly,
+        })
+        .await
+        .expect("query pool serves the next caller after N aborted queries");
+    assert_eq!(next.rows.len(), 1);
 }

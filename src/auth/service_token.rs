@@ -32,7 +32,7 @@ fn is_well_formed_token(token: &str) -> bool {
 }
 
 use super::pkce::ct_eq;
-use super::session::{Identity, SessionId};
+use super::session::{Identity, IdentityKind, SessionId};
 use crate::config::ServiceAccount;
 use crate::config::secret::SecretError;
 
@@ -169,6 +169,7 @@ impl ResolvedServiceToken {
             // token, and the admin session-age gate never sees these (the
             // boot-time group check keeps service groups off `/admin/*`).
             issued_at: now,
+            kind: IdentityKind::Service,
         }
     }
 }

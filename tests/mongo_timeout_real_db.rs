@@ -18,23 +18,27 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mongodb::bson::{Document, doc};
 use serde_json::Value;
 use uuid::Uuid;
 
-use common::audit::latest_audit;
+use common::audit::{DispatchSinks, latest_audit};
 use common::cleanup::delete_audit_calls;
 use common::env::state_pool;
 use common::mongo_target::{
     TARGET_DB, adapter, drop_collection, server, side_client, unique_collection,
 };
 use db_mcp_gateway::auth::{Identity, SessionId};
+use db_mcp_gateway::authz::PermissionsCache;
 use db_mcp_gateway::config::{Action, ConfigFile, Constraints, Grant, Permission};
 use db_mcp_gateway::exec::{
-    AdapterRegistry, DEFAULT_STATEMENT_TIMEOUT_MS, DbAdapter, ExecError, ExecQuery,
+    Access, AdapterRegistry, DEFAULT_STATEMENT_TIMEOUT_MS, DbAdapter, ExecError, ExecQuery,
 };
+use db_mcp_gateway::state::permissions::PermissionsRepo;
+use db_mcp_gateway::state::permissions::pg::PgPermissionsRepo;
 use db_mcp_gateway::tools::run_query;
 use db_mcp_gateway::tools::{RequestContext, ToolCtx};
 
@@ -127,6 +131,7 @@ async fn command_always_carries_the_clamped_max_time_ms() {
             binds: &[],
             statement_timeout_ms: grant,
             row_limit: 100,
+            access: Access::ReadOnly,
         })
         .await
         .expect("find runs");
@@ -178,6 +183,7 @@ async fn expensive_cursor_read_is_bounded_by_the_budget() {
             statement_timeout_ms: Some(200),
             // High enough that the row cap can't be what stops the drain.
             row_limit: 1_000_000,
+            access: Access::ReadOnly,
         })
         .await;
     let elapsed = started.elapsed();
@@ -201,11 +207,13 @@ fn identity(user_sub: &str) -> Identity {
         user_email: "mongo-timeout-test@example.com".to_string(),
         groups: vec![GROUP.to_string()],
         issued_at: chrono::Utc::now(),
+        kind: db_mcp_gateway::auth::IdentityKind::Sso,
     }
 }
 
 fn config_with_timeout(statement_timeout_ms: Option<u32>) -> ConfigFile {
     ConfigFile {
+        gateway: Default::default(),
         servers: vec![server(SERVER_NAME)],
         permissions: vec![Permission {
             group: GROUP.to_string(),
@@ -228,7 +236,7 @@ fn config_with_timeout(statement_timeout_ms: Option<u32>) -> ConfigFile {
 }
 
 /// The tool-level error code carried inside a `tools/call` response body.
-fn tool_error_code(response: &db_mcp_gateway::transport::jsonrpc::Response) -> Option<String> {
+fn tool_error_code(response: &db_mcp_gateway::mcp::jsonrpc::Response) -> Option<String> {
     let value = serde_json::to_value(response).ok()?;
     let text = value["result"]["content"][0]["text"].as_str()?;
     let body: Value = serde_json::from_str(text).ok()?;
@@ -251,7 +259,8 @@ async fn slow_operation_times_out_and_writes_timeout_audit_row() {
     let identity = identity(&user);
     let config = config_with_timeout(Some(1));
     let registry = AdapterRegistry::new();
-    let ctx = RequestContext::default();
+    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
+    let permissions_cache = PermissionsCache::new(repo, Duration::from_secs(30));
     let sql = format!(
         r#"{{"aggregate":"{coll}","pipeline":[{{"$sort":{{"i":-1}}}},{{"$group":{{"_id":null,"ns":{{"$push":"$i"}}}}}}],"cursor":{{}}}}"#
     );
@@ -259,14 +268,25 @@ async fn slow_operation_times_out_and_writes_timeout_audit_row() {
     // Bounded retry: a very fast box can occasionally squeak a 5k-doc sort
     // past a 1ms budget. Five attempts that all beat it would mean the
     // budget is not being enforced at all, which is the regression.
+    let sinks = DispatchSinks::new(&[]);
     let mut code = None;
     for _ in 0..5 {
+        // A fresh gateway request id per attempt, as the transport mints one:
+        // the intent row is keyed on it, so reusing one (e.g. the nil UUID
+        // from `Default`) collides with an earlier attempt's row.
+        let ctx = RequestContext {
+            request_id: Uuid::new_v4(),
+            ip: None,
+            agent_client: None,
+        };
         let tool_ctx = ToolCtx {
             identity: &identity,
             config: &config,
             registry: &registry,
-            permissions_cache: None,
-            state_db: Some(&pool),
+            permissions_cache: &permissions_cache,
+            state_db: &pool,
+            audit_sinks: &sinks.sinks,
+            detached: &sinks.tasks,
             request: &ctx,
         };
         let response = run_query::run(

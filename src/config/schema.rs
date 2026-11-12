@@ -9,15 +9,17 @@
 //! sections and a richer validator. For #3 we only model what `list_servers`
 //! needs plus the authz inputs.
 
+use std::path::PathBuf;
+
 use serde::Deserialize;
 
+use super::pool::PoolConfig;
 use super::secret::Password;
 
 /// `deny_unknown_fields` turns a misspelled key (e.g. `databasses:` instead
 /// of `databases:`) into a boot-time error pointing at the line, instead of
-/// silently dropping the value — see issue #16. Top-level `ConfigFile` stays
-/// lenient because it carries un-modeled `gateway:` / `auth:` / `logging:`
-/// sections; strictness there waits for the env→YAML unification.
+/// silently dropping the value — see issue #16. `ConfigFile` and every other
+/// section deny unknown keys too.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Server {
@@ -31,6 +33,14 @@ pub struct Server {
     pub port: u16,
     #[serde(default)]
     pub tls: Tls,
+    /// CA bundle (PEM) for `tls: verify_full`; absent → system roots. Rejected
+    /// at boot unless `tls: verify_full`, and must be readable.
+    #[serde(default)]
+    pub tls_ca_file: Option<PathBuf>,
+    /// Pool sizing for every database on this server; a database's own
+    /// `pool:` wins per field.
+    #[serde(default)]
+    pub pool: Option<PoolConfig>,
     #[serde(default)]
     pub databases: Vec<Database>,
 }
@@ -66,12 +76,18 @@ impl ServerKind {
     }
 }
 
+/// Copy on purpose: callers match it by value. The CA path for
+/// `VerifyFull` lives beside it as `Server::tls_ca_file`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Tls {
+    /// Encrypt. Postgres does not verify the server certificate
+    /// (`sslmode=require`) and boot warns per server; Mongo verifies.
     #[default]
     Required,
-    /// Logs a warning every minute when used in prod — see spec 08.
+    /// Encrypt and verify chain + hostname (Postgres `sslmode=verify-full`).
+    VerifyFull,
+    /// Plaintext. Boot logs a warning per server.
     Insecure,
 }
 
@@ -91,6 +107,9 @@ pub struct Database {
     /// against the connected database).
     #[serde(default)]
     pub auth_database: Option<String>,
+    /// Pool sizing for this database; overrides the server's `pool:` per field.
+    #[serde(default)]
+    pub pool: Option<PoolConfig>,
 }
 
 /// A headless (non-interactive) caller: a named service identity carrying a

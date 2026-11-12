@@ -66,6 +66,10 @@ permissions:
 
 If `store` is absent, the gateway runs YAML-only and the admin API is disabled. This is the path the dogfood install keeps using.
 
+**The MySQL store is read-only-provisioned.** The gateway only reads it; the operator fills it with their own tooling. Boot rejects `driver: mysql` together with `admin.enabled: true`, so there is no audited write path to MySQL and none is planned — the `permissions_audit` table its `0002` migration created stays unwritten. With no admin commit there is no cross-replica notification either: a change made in MySQL is honoured within `PERMISSIONS_CACHE_TTL_SECONDS` (clamped to ≤ 300 s). Identity and routing columns (`user_sub`, `server`, `db_name`) use the case- and accent-sensitive `utf8mb4_0900_as_cs` collation (`migrations-mysql/0004`), so `Alice` and `alice` are two subjects, as they are in Postgres.
+
+**`db_type` names the target engine** a `permissions_databases` row registers — `postgres`, `mysql` or `mongo` (`migrations/0013`, `migrations-mysql/0005`) — not the store the row lives in.
+
 ## `permissions_audit` table
 
 Mirrors the query audit invariant from non-negotiable #4: synchronous, write fails → request fails. No best-effort audit, ever, including for permissions changes.
@@ -74,7 +78,7 @@ Mirrors the query audit invariant from non-negotiable #4: synchronous, write fai
 |---|---|---|
 | `id` | bigserial PK | |
 | `ts` | timestamptz | server time |
-| `actor_id` | uuid | the admin who made the change (SSO subject) |
+| `actor_id` | uuid | the acting admin's `permissions_users.id`; deliberately not a foreign key, so an append-only audit row outlives any cleanup of the row it names |
 | `actor_email` | text | denormalized for forensics; mirrors query audit |
 | `action` | text | `create` \| `update` \| `delete` |
 | `target_type` | text | `user` \| `database` \| `grant` |
@@ -107,24 +111,25 @@ All endpoints require a valid SSO JWT with the admin group claim. Every write co
 
 **List endpoints are paginated.** `GET /admin/v1/{users,databases,grants}` accept `?limit=` and `?offset=`. `limit` defaults to **100** and is clamped to a maximum of **1000** — an oversized ask is clamped, not rejected, matching how the gateway treats every other caller-supplied bound. A non-numeric value is a client mistake and returns `invalid_request` (400). Ordering is stable and total (`created_at, id` for users and grants; `(server, db_name)` for databases), so a walk over a *stable* dataset returns rows in deterministic order and visits each one exactly once. Concurrent inserts, deletes, or updates between page requests can shift rows in or out of a later `offset` window — this is offset-pagination semantics, not a snapshot. Callers that need snapshot guarantees should either walk the pages inside a single admin batch (no writes in-flight) or fall back to a full re-read on the tail. Without pagination an install's entire permissions table loaded into memory and serialized into one response.
 
-Pagination deliberately does *not* apply to the resolver's internal read of all live databases: `authz::loader` indexes the complete set to resolve `Specific` grant targets, and a windowed read would silently drop grants whose database fell outside it.
+Pagination deliberately does *not* apply to the resolver's read: `authz::loader` loads a subject's complete live grant set in **one query** (live user ⋈ live grants ⟕ live databases, keyed on `user_sub`), and a windowed read would silently drop authority. A specific grant whose database is soft-deleted drops inside that query.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/admin/v1/users` | Register a user (SSO subject + email + cached groups) |
+| `POST` | `/admin/v1/users` | Register a user (SSO subject + email + cached groups). A `service:*` subject is rejected (400) — a service token's authority is its YAML group only ([14](14-service-tokens.md)) |
 | `GET` | `/admin/v1/users` | List users |
 | `GET` | `/admin/v1/users/:id` | Fetch one user |
 | `PATCH` | `/admin/v1/users/:id` | Update (e.g. refresh group cache) |
-| `DELETE` | `/admin/v1/users/:id` | Soft-delete; existing grants cascade to revoked |
+| `DELETE` | `/admin/v1/users/:id` | Soft-delete; its live grants are revoked in the same transaction, one `delete` audit row per grant |
+| `POST` | `/admin/v1/users/:id/revoke-sessions` | Revoke every live session and delete every refresh chain of the user's `user_sub`; their bearers are `401` on the next call. One `permissions_audit` row (`update` on the user, payload `{user_sub, live_sessions, refresh_tokens}` before → zeros after) in the revoke's transaction; session-cache tombstones only after commit. Returns `{revoked_sessions, revoked_refresh_tokens}` |
 | `POST` | `/admin/v1/databases` | Register a logical `(server, db_name, db_type)` |
 | `GET` | `/admin/v1/databases` | List |
 | `GET` | `/admin/v1/databases/:id` | Fetch one |
 | `PATCH` | `/admin/v1/databases/:id` | Update (rename, change type — both audited) |
-| `DELETE` | `/admin/v1/databases/:id` | Remove; grants on it cascade-revoke |
+| `DELETE` | `/admin/v1/databases/:id` | Soft-delete; its specific grants are revoked in the same transaction, one `delete` audit row per grant (wildcards name the server and stay) |
 | `POST` | `/admin/v1/grants` | Create a grant |
 | `GET` | `/admin/v1/grants` | List, filterable by user / database |
 | `GET` | `/admin/v1/grants/:id` | Fetch one |
-| `PATCH` | `/admin/v1/grants/:id` | Update constraints, action set |
+| `PATCH` | `/admin/v1/grants/:id` | Update action and/or constraints — constraints merge per key (see §PATCH merges per key) |
 | `DELETE` | `/admin/v1/grants/:id` | Revoke |
 
 ### What the API never returns
@@ -154,7 +159,7 @@ The `databases` endpoints register a *logical* db reference; the connection stri
 }
 ```
 
-`db_name_wildcard: true` + `database_id: null` is the `db_name = "*"` form (see §Wildcard).
+`db_name_wildcard: true` + `database_id: null` + `server` is the `db_name = "*"` form (see §Wildcard). `server` must name a server the gateway config declares; `"*"` or an undeclared name is `invalid_request` (400).
 
 ### Validation + error semantics
 
@@ -164,41 +169,53 @@ The grants handlers validate at the API layer **before** the DB CHECKs would cat
 |---|---|---|
 | XOR target | both, neither, or mismatched `database_id` / `(server, db_name_wildcard: true)` | `invalid_request` (400) at handler, never reaches DB CHECK |
 | Action parse | unknown action string | `invalid_request` (400) before any SQL runs |
-| FK violation (`23503`) | `user_id` or `database_id` missing / soft-deleted | `invalid_request` (400), stable `invalid grant reference` message; DB error text never echoed (non-negotiable #1) |
+| Dead reference | `user_id` or `database_id` missing or soft-deleted — checked by the insert itself (`INSERT … SELECT … WHERE deleted_at IS NULL`, both rows held `FOR SHARE` until commit) | `invalid_request` (400), stable `invalid grant reference` message; DB error text never echoed (non-negotiable #1) |
+| Wildcard server | `server` is `"*"` or not declared in config | `invalid_request` (400) |
+| Zero bound | `constraints.row_limit` or `constraints.statement_timeout_ms` is `0` on POST, or set to `0` by PATCH (a zero would disable the bound, not tighten it) | `invalid_request` (400); nothing written |
+| Stale precondition | PATCH `expected_updated_at` differs from the locked row's `updated_at` | `conflict` (409); nothing written |
+| Deadlock / serialization abort (`40P01` / `40001`) | concurrent admin writes Postgres had to abort | `conflict` (409); safe to retry |
 | CHECK violation (`23514`) | belt-and-suspenders for a future migration adding a CHECK the handler doesn't pre-validate | `invalid_request` (400) |
 | UNIQUE violation (`23505`) | on `/databases`: registering a `(server, db_name)` pair that already exists, or PATCHing one onto another | `invalid_request` (400), message names the pair from the caller's own input; DB error text never echoed |
 | Anything else | pool exhaustion, encoder bug, audit failure | `internal` (500), body carries `request_id` only; underlying error stays in gateway logs |
 
 The `(server, db_name)` UNIQUE index is partial (`WHERE deleted_at IS NULL`), so a soft-deleted pair does not occupy it — the same pair can be registered again after a DELETE.
 
+### Locked writes
+
+Every admin mutation runs one shape (`src/transport/admin/audited_tx.rs`): begin → upsert the acting admin's `permissions_users` row → lock the target row (`SELECT … FOR UPDATE`) → mutate → write `permissions_audit` → queue `NOTIFY` → commit → invalidate this replica's cache. Locking the actor row first gives every admin write one lock order; a mutation of the actor's own user row skips the actor upsert (that row plays both parts). Because the target is locked before `before` is read, concurrent writes serialise and the audit chain is continuous: `after[n] == before[n+1]`. PATCH bodies may carry `expected_updated_at` (the value last read); a mismatch is 409.
+
+### PATCH merges per key
+
+`constraints` on `PATCH /admin/v1/grants/:id` is a per-key patch onto the stored object, never a replacement: an absent key keeps its value, `null` clears it (`require_reason` clears to `false`), a value sets it. A PATCH naming only `row_limit` therefore keeps `require_reason` and `statement_timeout_ms` — no admin call can loosen a constraint it did not name. Proven by `src/authz/patch_proptests.rs`.
+
 ### PATCH cannot change the target
 
-`PATCH /admin/v1/grants/:id` accepts `action` and `constraints` only. The XOR target (`Specific` vs `Wildcard`) is the grant's identity — re-targeting is DELETE + POST. Bodies carrying `database_id` / `server` / `db_name_wildcard` are rejected at the parse layer (`deny_unknown_fields` → 400).
+`PATCH /admin/v1/grants/:id` accepts `action`, `constraints` and `expected_updated_at` only. The XOR target (`Specific` vs `Wildcard`) is the grant's identity — re-targeting is DELETE + POST. Bodies carrying `database_id` / `server` / `db_name_wildcard` are rejected at the parse layer (`deny_unknown_fields` → 400).
 
 ### Cache invalidation
 
-The resolver caches `(user, server, db) → grants` per session. Admin API writes call `PermissionsCache::spawn_invalidate` (per-user) or `PermissionsCache::spawn_invalidate_all` (full flush) after the data + audit tx commits. Both launch a detached `tokio::spawn`ed task that runs the invalidation off the request future, so a client disconnect between commit and invalidate can't leave a stale entry live until TTL. The next tool call recomputes. No restart needed. Cache TTL is also short (default 60s) so a missed invalidation self-heals.
+The resolver caches each subject's DB grant set (`PermissionsCache`, keyed on `user_sub`). A cold miss is one store query; concurrent misses for one subject share it (single flight); a load overtaken by an invalidation of that subject is not cached (per-subject revision) and is retried at most three times; expired idle entries are swept on insert.
 
-Every admin surface that can change a grant's meaning invalidates on a successful commit — not just `/admin/v1/grants`:
+An admin commit both drops this replica's affected entries and, inside the same transaction, `NOTIFY`s channel `dbmcp_permissions`; every replica's listener applies it on commit and never on rollback. A listener that loses its connection reconnects with backoff and flushes everything on reconnect, since notifications sent meanwhile are lost. The bound on a revoke reaching every replica is therefore the notification latency, or the reconnect delay after a dropped listener — the TTL (`PERMISSIONS_CACHE_TTL_SECONDS`, default 60 s, clamped ≤ 300 s) bounds only what nothing announces, such as a MySQL store edited outside the gateway.
 
 | Surface | Scope | Why |
 |---|---|---|
-| `/admin/v1/grants` (POST/PATCH/DELETE) | Per-user (`PermissionsCache::spawn_invalidate`) | A grant only ever affects the one user it targets. |
-| `/admin/v1/users` (PATCH/DELETE) | Per-user, keyed on the mutated row's `user_sub` | A group change flips constraint-merge results; a soft-delete must stop landing decisions for the deleted principal immediately, not after TTL. `create` skips invalidation — a fresh row has no existing cache entry. |
-| `/admin/v1/databases` (POST/PATCH/DELETE) | Full flush (`PermissionsCache::spawn_invalidate_all`) | A `permissions_databases` row change can shift what a `(server, db_name)` wildcard grant resolves to for *any* user — narrower per-user invalidation is not sufficient. |
-
-Implementation notes every handler honors:
+| `/admin/v1/grants` (POST/PATCH/DELETE) | The grant's user | A grant only ever affects the one user it targets. |
+| `/admin/v1/users` (POST/PATCH/DELETE) | The mutated row's `user_sub` | A group change flips constraint-merge results; a re-POST of an existing subject is an upsert and changes it too; a soft-delete (and its grant cascade) must stop landing decisions immediately. |
+| `/admin/v1/databases` (PATCH/DELETE) | Every subject | A rename or soft-delete changes what every specific grant on the row resolves to. |
+| `/admin/v1/databases` (POST) | None | A new row has no grants, and wildcards resolve against config databases, never these rows. |
 
 | Rule | Behavior |
 |---|---|
-| Post-commit, fire-and-forget | Hook fires **after** the data + audit tx commits. Pre-commit lets a concurrent reader re-warm with the still-stale grant; post-commit guarantees the next re-warm sees the new state. |
-| Detached from the request | `spawn_invalidate` / `spawn_invalidate_all` run the invalidation on a `tokio::spawn`ed task, not awaited inline on the request future. A client disconnect between the tx commit and the invalidate call must not leave a stale entry live until TTL — the detached task owns its inputs and runs to completion regardless of what happens to the request. |
-| `user_sub`-keyed (user/grant paths) | Cache key is the SSO subject; grants reference users by row id. Handler resolves `user_sub` through the same tx (lookup sees the same DB state the audit row records) before spawning the invalidation. |
-| YAML-only installs | No state DB → resolver cache absent → invalidation is a no-op. TTL is the safety net. |
+| Post-commit | Local invalidation runs **after** commit, so a concurrent reader cannot re-warm with the pre-commit state; the `NOTIFY` is transactional for the same reason. |
+| Detached from the request | Local invalidation runs on a `tokio::spawn`ed task (`PermissionsCache::spawn_apply`), so a client disconnect between commit and invalidate cannot strand a stale entry. |
+| `user_sub`-keyed | Grants reference users by row id; the handler resolves `user_sub` inside the transaction. |
+| Service identities | A `service:<name>` identity never reads the store — its authority is exactly its YAML group, so a DB grant seeded for it is inert. |
+| YAML-only installs | No resolver cache → invalidation is a no-op. |
 
 ## Wildcard grants
 
-`db_name = "*"` is a per-grant flag for "applies to every database registered for `server`". Intended for dev/superuser grants; the audience Sebby flagged as "us devs and other like us".
+`db_name = "*"` is a per-grant flag for "applies to every database the gateway **config** declares on `server`" — not every `permissions_databases` row registered for it. Registering or deleting a database row never changes what a wildcard covers; changing the config's databases does. Intended for dev/superuser grants; the audience Sebby flagged as "us devs and other like us".
 
 ### Rules
 
@@ -266,10 +283,11 @@ Read-only enforcement is the interesting part. Mongo doesn't have a single "READ
 - Any aggregation pipeline containing `$out`, `$merge`, `$function`, or `$where` with non-pure JS.
 - Any command outside the allowed set: `find`, `aggregate`, `count`, `countDocuments`, `distinct`, `estimatedDocumentCount`, `listCollections`, `listIndexes`.
 - Write commands explicitly: `insert`, `update`, `delete`, `findAndModify`, `bulkWrite`, `createIndex`, `drop`.
+- Any top-level key outside the command's own allow-list (`src/exec/mongo/rejector/mod.rs`, `allowed_fields`). The lists hold shape and read options only (`filter`, `sort`, `projection`, `pipeline`, `cursor`, `limit`, `collation`, …), so no `$`-prefixed key (`$db` would re-target the command at another database, `$readPreference` re-routes it), no session or transaction field (`lsid`, `txnNumber`, `autocommit`, `startTransaction`), no `writeConcern`, and no cursor-lifetime knob (`tailable`, `awaitData`, `noCursorTimeout`) reaches the driver. Before this, a `$db` key was forwarded and the server (8.0) refused the duplicate `$db` itself — safe by the server's grace, not the gateway's.
 
 The connection still uses a least-privilege mongo role (read-only on the target DB) — defense in depth, same posture as the pg `ro_*` roles.
 
-Timeouts via `maxTimeMS`. Row caps via cursor batch limit + total-rows enforcement at the adapter. Cancellation: `killOp` on client disconnect, best-effort and requires an opt-in privilege — see [config-reference.md §Mongo](../deployment/config-reference.md#mongo) for the full contract (`statement_timeout_ms` is the guaranteed bound either way, same as pg's belt-and-suspenders `tokio::time::timeout`).
+Timeouts via `maxTimeMS`. Row caps via a server-side limit of `row_limit + 1` (`find` `limit`/`batchSize`, a trailing `$limit` stage on `aggregate`) plus the gateway's row and byte budget at the adapter. A reply missing its documented field, or a document that cannot be rendered, is a typed error — never a fabricated `null`. Cancellation: `killOp` on client disconnect, best-effort and requires an opt-in privilege — see [config-reference.md §Mongo](../deployment/config-reference.md#mongo) for the full contract (`statement_timeout_ms` is the guaranteed bound either way, same as pg's belt-and-suspenders `tokio::time::timeout`).
 
 Audit row shape matches pg's: same envelope (`request_id`, `user`, `server`, `database`, `outcome`, `duration_ms`), payload carries `db_kind: "mongo"` and the BSON command with sensitive values redacted by the same rules as SQL parameter redaction in [07-logging-retention](07-logging-retention.md).
 

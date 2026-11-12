@@ -1,10 +1,9 @@
 use axum::Json;
 use axum::extract::State;
-use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
-use super::super::app_state::AppState;
+use super::super::app_state::OAuthState;
 
 use super::urls::{MCP_SCOPE, base_url};
 
@@ -12,11 +11,8 @@ use super::urls::{MCP_SCOPE, base_url};
 /// own authorization server. Mounted at both the bare path and the
 /// `mcp_path`-suffixed path so clients that key the well-known by resource path
 /// (RFC 9728 §3.1) find it either way.
-pub async fn protected_resource_metadata(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
-    let base = match base_url(&state, &headers) {
+pub async fn protected_resource_metadata(State(state): State<OAuthState>) -> Response {
+    let base = match base_url(&state) {
         Ok(b) => b,
         Err(e) => return *e,
     };
@@ -32,11 +28,8 @@ pub async fn protected_resource_metadata(
 
 /// `GET /.well-known/oauth-authorization-server` (and an `openid-configuration`
 /// alias) — RFC 8414 metadata pointing at this gateway's bridge endpoints.
-pub async fn authorization_server_metadata(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
-    let base = match base_url(&state, &headers) {
+pub async fn authorization_server_metadata(State(state): State<OAuthState>) -> Response {
+    let base = match base_url(&state) {
         Ok(b) => b,
         Err(e) => return *e,
     };

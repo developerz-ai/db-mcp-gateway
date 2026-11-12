@@ -1,9 +1,14 @@
-//! Boot-time construction: logging, the state DB, the permissions store and
-//! the `AppState` the router serves.
+//! Boot-time construction: the state DB, the permissions store and the
+//! `AppState` the router serves.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
+
+use db_mcp_gateway::audit::drain::DetachedTasks;
+use db_mcp_gateway::audit::stream::StreamSinks;
+use db_mcp_gateway::auth::jwt::SessionJwt;
 use db_mcp_gateway::auth::oauth::{
     AuthCodes, AuthFacade, ClientRegistry, PendingFlows, RefreshTokens,
 };
@@ -16,44 +21,10 @@ use db_mcp_gateway::exec::AdapterRegistry;
 use db_mcp_gateway::state;
 use db_mcp_gateway::state::permissions::PermissionsRepo;
 use db_mcp_gateway::state::permissions::mysql::MysqlPermissionsRepo;
-use db_mcp_gateway::state::permissions::pg::PgPermissionsRepo;
-use db_mcp_gateway::transport::AppState;
-use db_mcp_gateway::transport::probes::ShutdownFlag;
-use metrics_exporter_prometheus::PrometheusHandle;
+use db_mcp_gateway::state::permissions::pg::{PgPermissionsRepo, notify};
+use db_mcp_gateway::transport::{AppState, McpState, OAuthState};
 use sqlx::PgPool;
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::EnvFilter;
-
-/// Install the global JSON-per-line stdout subscriber for Loki (see
-/// docs/deployment/logging.md for the field contract). `flatten_event` hoists
-/// `tracing::info!(k = v, …)` fields to the top level so Alloy doesn't need a
-/// nested-field stage; spans don't render because every per-request field is
-/// also emitted on the event itself. `with_target(true)` preserves the event's
-/// `target` — the module path by default, but explicitly set on `audit_stream`
-/// events (see `src/audit/stream.rs`) so operators can route the SIEM export
-/// separately from operational logs. Dropping it here would silently break the
-/// spec 07 §Stream contract.
-///
-/// Writes go through `tracing_appender::non_blocking` so a slow stdout consumer
-/// (a paused terminal, a jammed log pipeline, a full pipe) never blocks the
-/// request path — every `tracing::info!` on the hot path, including the
-/// `audit_stream` fan-out in `src/audit/stream.rs`, is fire-and-forget. The
-/// returned guard MUST live for the lifetime of `run` so the queue drains on
-/// shutdown; drop it early and the appender thread exits mid-flight, silently
-/// dropping the tail of the audit stream.
-pub(crate) fn init_tracing() -> WorkerGuard {
-    let (non_blocking_stdout, log_guard) = tracing_appender::non_blocking(std::io::stdout());
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .json()
-        .flatten_event(true)
-        .with_current_span(false)
-        .with_span_list(false)
-        .with_target(true)
-        .with_writer(non_blocking_stdout)
-        .init();
-    log_guard
-}
+use tokio_util::sync::CancellationToken;
 
 pub(crate) async fn connect_state_db(config: &Config) -> anyhow::Result<PgPool> {
     let state_db = state::connect(&config.state_db.url, config.state_db.pool_size)
@@ -67,12 +38,13 @@ pub(crate) async fn connect_state_db(config: &Config) -> anyhow::Result<PgPool> 
 }
 
 /// Wire every `AppState` dependency. Moves `config_file` and `auth_config` in.
+/// `stop` is the process shutdown token; probes go 503 once it is cancelled.
 pub(crate) async fn build_app_state(
     config_file: ConfigFile,
     config: &Config,
     auth_config: AuthConfig,
     service_tokens: ServiceTokenStore,
-    metrics_handle: PrometheusHandle,
+    stop: CancellationToken,
     state_db: &PgPool,
 ) -> anyhow::Result<AppState> {
     let sessions = SessionStore::with_cache_config(
@@ -84,14 +56,33 @@ pub(crate) async fn build_app_state(
     );
     let oidc = OidcClient::new(auth_config.clone())?;
     let permissions_repo = build_permissions_repo(&config_file, config, state_db).await?;
+    // Captured before `auth_config` moves into the facade below.
+    let refresh_ttl = auth_config.refresh_ttl;
+    // One drain set: detached audit writes and target-side cancels both
+    // finish (bounded) before shutdown closes the pools.
+    let detached = DetachedTasks::new();
     let permissions_cache = PermissionsCache::new(
         permissions_repo.clone(),
         Duration::from_secs(config.permissions_cache_ttl_seconds),
-    );
-    // Captured before `auth_config` moves into the facade below.
-    let refresh_ttl = auth_config.refresh_ttl;
-    Ok(AppState {
-        auth: Some(AuthFacade {
+    )
+    .with_detached(detached.clone());
+    if permissions_driver(&config_file) == PermissionsStoreDriver::Pg {
+        spawn_permissions_listener(state_db.clone(), permissions_cache.clone(), stop.clone());
+    }
+    let mcp = McpState {
+        audit_sinks: Arc::new(ArcSwap::from_pointee(StreamSinks::from_config(
+            &config_file.logging.stream,
+        ))),
+        config: Arc::new(ArcSwap::from_pointee(config_file)),
+        adapter_registry: AdapterRegistry::with_detached(detached.clone()),
+        state_db: state_db.clone(),
+        permissions_cache,
+        permissions_repo,
+        detached,
+    };
+    let oauth = OAuthState {
+        auth: AuthFacade {
+            jwt: SessionJwt::new(&auth_config.session_signing_key),
             config: Arc::new(auth_config),
             sessions,
             oidc,
@@ -102,22 +93,39 @@ pub(crate) async fn build_app_state(
             // in-memory store silently capped the real "stay signed in" window at
             // time-until-next-rollout.
             refresh: RefreshTokens::with_db(state_db.clone(), refresh_ttl),
-            service_tokens,
-        }),
-        config: Arc::new(config_file),
-        adapter_registry: AdapterRegistry::new(),
-        state_db: Some(state_db.clone()),
-        shutdown: ShutdownFlag::new(),
-        metrics: Some(metrics_handle),
-        permissions_cache: Some(permissions_cache),
-        permissions_repo: Some(permissions_repo),
-        mcp_path: Arc::from(config.mcp_path.as_str()),
+            service_tokens: Arc::new(ArcSwap::from_pointee(service_tokens)),
+        },
         // Persist DCR registrations in the shared state DB so a restart /
         // redeploy no longer drops them (the `invalid_client` wedge for clients
-        // that cache their `client_id`). `default()` — in-memory — is the
-        // auth-less test bootstrap only.
+        // that cache their `client_id`).
         client_registry: ClientRegistry::with_db(state_db.clone()),
-    })
+        mcp_path: Arc::from(config.mcp_path.as_str()),
+    };
+    Ok(AppState::new(mcp, oauth, stop))
+}
+
+fn permissions_driver(config_file: &ConfigFile) -> PermissionsStoreDriver {
+    config_file
+        .permissions_store
+        .as_ref()
+        .map_or(PermissionsStoreDriver::Pg, |store| store.driver)
+}
+
+/// Cross-replica cache invalidation: apply every committed permissions change
+/// another replica announces over `LISTEN/NOTIFY`, until shutdown. Postgres
+/// store only — the MySQL store has no such channel and relies on the TTL.
+/// The listener holds one dedicated connection taken from `pool`.
+fn spawn_permissions_listener(pool: PgPool, cache: PermissionsCache, stop: CancellationToken) {
+    tokio::spawn(async move {
+        let listen = notify::listen(pool, move |change| {
+            let cache = cache.clone();
+            async move { cache.apply(&change).await }
+        });
+        tokio::select! {
+            () = listen => {}
+            () = stop.cancelled() => {}
+        }
+    });
 }
 
 /// Spec 12 §"Storage backends" / #59: pick the permissions repo based on YAML
@@ -129,12 +137,7 @@ async fn build_permissions_repo(
     config: &Config,
     state_db: &PgPool,
 ) -> anyhow::Result<Arc<dyn PermissionsRepo>> {
-    let driver = config_file
-        .permissions_store
-        .as_ref()
-        .map(|s| s.driver)
-        .unwrap_or(PermissionsStoreDriver::Pg);
-    match driver {
+    match permissions_driver(config_file) {
         PermissionsStoreDriver::Pg => Ok(Arc::new(PgPermissionsRepo::new(state_db.clone()))),
         PermissionsStoreDriver::Mysql => {
             let dsn = std::env::var("PERMISSIONS_DB_DSN").map_err(|_| {

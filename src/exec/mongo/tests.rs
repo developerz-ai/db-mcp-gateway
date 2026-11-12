@@ -1,5 +1,7 @@
 use super::*;
+use crate::audit::drain::DetachedTasks;
 use crate::config::{Password, ServerKind};
+use crate::exec::PoolSizing;
 
 fn server_for(host: &str, port: u16, tls: Tls) -> Server {
     Server {
@@ -9,6 +11,8 @@ fn server_for(host: &str, port: u16, tls: Tls) -> Server {
         host: host.to_string(),
         port,
         tls,
+        tls_ca_file: None,
+        pool: None,
         databases: vec![],
     }
 }
@@ -20,6 +24,7 @@ fn database_for(name: &str, role: &str, password: &str) -> Database {
         password: Password::Literal(password.into()),
         description: String::new(),
         auth_database: None,
+        pool: None,
     }
 }
 
@@ -30,7 +35,9 @@ fn database_for(name: &str, role: &str, password: &str) -> Database {
 async fn debug_does_not_leak_credentials() {
     let s = server_for("localhost", 27017, Tls::Required);
     let d = database_for("app", "the_user", "super_secret_pw");
-    let adapter = MongoAdapter::open(&s, &d).await.expect("client constructs");
+    let adapter = MongoAdapter::open(&s, &d, PoolSizing::default(), DetachedTasks::new())
+        .await
+        .expect("client constructs");
     let rendered = format!("{adapter:?}");
     assert!(rendered.contains("mongo/app"));
     assert!(
@@ -51,7 +58,9 @@ async fn debug_does_not_leak_credentials() {
 async fn rejected_command_maps_to_forbidden_not_sql() {
     let s = server_for("localhost", 27017, Tls::Insecure);
     let d = database_for("app", "the_user", "pw");
-    let adapter = MongoAdapter::open(&s, &d).await.expect("client constructs");
+    let adapter = MongoAdapter::open(&s, &d, PoolSizing::default(), DetachedTasks::new())
+        .await
+        .expect("client constructs");
 
     // `$where` is a denied operator at any depth; the rejector returns
     // `DisallowedOperator("$where")`.
@@ -60,6 +69,7 @@ async fn rejected_command_maps_to_forbidden_not_sql() {
         binds: &[],
         statement_timeout_ms: None,
         row_limit: 10,
+        access: crate::exec::Access::ReadOnly,
     };
     let err = adapter
         .execute(query)
@@ -81,7 +91,9 @@ async fn rejected_command_maps_to_forbidden_not_sql() {
 async fn sql_shaped_operations_are_not_implemented() {
     let s = server_for("localhost", 27017, Tls::Insecure);
     let d = database_for("app", "the_user", "pw");
-    let adapter = MongoAdapter::open(&s, &d).await.expect("client constructs");
+    let adapter = MongoAdapter::open(&s, &d, PoolSizing::default(), DetachedTasks::new())
+        .await
+        .expect("client constructs");
 
     let schema = adapter
         .describe_schema(SchemaQuery {

@@ -7,7 +7,7 @@
 //! Acceptance from #53:
 //!  - CRUD endpoints work for admin
 //!  - DSN-shaped fields in POST/PATCH are rejected (the headline criterion)
-//!  - unknown `db_type` rejected
+//!  - unknown `db_type` rejected; `mongo` accepted
 //!  - non-admin → 403, no data row, no audit row
 //!  - every write produces an audit row
 //!
@@ -300,21 +300,43 @@ async fn patch_with_dsn_field_is_rejected() {
     h.cleanup().await;
 }
 
+/// Mongo targets register like any other (migration 0013).
+#[tokio::test]
+async fn mongo_db_type_is_accepted() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
+    let resp = client()
+        .post(format!("{}/admin/v1/databases", h.base_url))
+        .bearer_auth(&jwt)
+        .json(&json!({
+            "server": "docs",
+            "db_name": format!("events-{}", Uuid::new_v4().simple()),
+            "db_type": "mongo",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["db_type"], "mongo");
+    h.track_db(body["id"].as_str().unwrap().parse().unwrap());
+    h.cleanup().await;
+}
+
 #[tokio::test]
 async fn unknown_db_type_is_rejected() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
 
-    // `mongo` is intentionally excluded from the permissions-store db_type per
-    // spec 12 §"Storage backends" — mongo lands as a query target, not as a
-    // permissions backend.
+    // `db_type` names the target engine: postgres, mysql or mongo. Anything
+    // else is a client error.
     let resp = client()
         .post(format!("{}/admin/v1/databases", h.base_url))
         .bearer_auth(&jwt)
         .json(&json!({
             "server": "prod",
             "db_name": format!("app-{}", Uuid::new_v4().simple()),
-            "db_type": "mongo",
+            "db_type": "sqlite",
         }))
         .send()
         .await

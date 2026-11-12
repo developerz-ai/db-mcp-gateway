@@ -16,8 +16,10 @@ use common::audit::latest_audit;
 use common::env::state_pool;
 use common::gateway::{GatewayBuilder, no_redirect_client};
 use common::idp::{MockUser, spawn_mock_idp};
-use db_mcp_gateway::state::permissions::PermissionsRepo;
 use db_mcp_gateway::state::permissions::pg::PgPermissionsRepo;
+use db_mcp_gateway::state::permissions::{
+    DbType, GrantAction, GrantTarget, PermissionsRepo, PermissionsSeed,
+};
 use serde_json::{Value, json};
 
 /// Well-formed (`dbmcp_svc_` + 64 body chars) but obviously synthetic fixture
@@ -344,4 +346,58 @@ async fn logout_is_a_noop_for_service_tokens() {
     assert_eq!(row.outcome, "success");
     assert_eq!(row.user_email, "ci-bot@service-accounts.invalid");
     assert_eq!(row.groups, vec!["svc-ci".to_string()]);
+}
+
+/// AC (spec 14, plan 101 slice 07): a service token's authority is exactly
+/// its YAML group. A DB grant seeded for `service:<name>` — which the admin
+/// API refuses to create, so only direct DB access can plant one — is
+/// inert: the call is still `forbidden` and audited as such.
+#[tokio::test]
+async fn db_grant_seeded_for_service_identity_is_ignored() {
+    let gw = boot_gateway().await;
+    let repo = PgPermissionsRepo::new(gw.state_db.clone());
+    let user = repo
+        .upsert_user("service:ci-bot", "ci-bot@service-accounts.invalid", &[])
+        .await
+        .expect("seed service row");
+    let db = repo
+        .create_database("prod", "app", DbType::Postgres)
+        .await
+        .expect("seed database");
+    let grant = repo
+        .create_grant(
+            user.id,
+            GrantTarget::Specific { database_id: db.id },
+            GrantAction::QueryRead,
+            json!({}),
+        )
+        .await
+        .expect("seed grant");
+
+    let resp = call_tool(
+        &gw,
+        Some(CI_BOT_TOKEN),
+        9,
+        "describe_schema",
+        json!({ "server": "prod", "database": "app" }),
+    )
+    .await;
+    let payload = tool_payload(resp).await;
+    assert_eq!(payload["code"], "forbidden", "{payload}");
+    let row = latest_audit(
+        &gw.state_db,
+        "service:ci-bot",
+        "describe_schema",
+        "seeded grant",
+    )
+    .await;
+    assert_eq!(row.outcome, "forbidden");
+
+    for (sql, id) in [
+        ("DELETE FROM permissions_grants WHERE id = $1", grant.id),
+        ("DELETE FROM permissions_databases WHERE id = $1", db.id),
+        ("DELETE FROM permissions_users WHERE id = $1", user.id),
+    ] {
+        let _ = sqlx::query(sql).bind(id).execute(&gw.state_db).await;
+    }
 }

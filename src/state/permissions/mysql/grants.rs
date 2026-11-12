@@ -1,23 +1,20 @@
 //! Grant CRUD operations for the MySQL permissions store.
 
-use serde_json::Value as JsonValue;
 use sqlx::MySqlPool;
 use uuid::Uuid;
 
-use super::super::{GrantAction, GrantTarget, Page, PermissionsGrant, RepoError};
-use super::rows::grant_from_row;
+use super::super::{LiveGrant, Page, PermissionsGrant, RepoError};
+use super::rows::{grant_from_row, live_grant_from_row};
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) async fn create_grant(
     pool: &MySqlPool,
     user_id: Uuid,
-    target: GrantTarget,
-    action: GrantAction,
-    constraints: JsonValue,
+    target: super::super::GrantTarget,
+    action: super::super::GrantAction,
+    constraints: serde_json::Value,
 ) -> Result<PermissionsGrant, RepoError> {
-    let (server, database_id, wildcard) = match &target {
-        GrantTarget::Specific { database_id } => (None, Some(*database_id), false),
-        GrantTarget::Wildcard { server } => (Some(server.clone()), None, true),
-    };
+    let (server, database_id, wildcard) = target.columns();
     let new_id = Uuid::new_v4();
     // INSERT + reread in one transaction: the caller always gets back the row it
     // just wrote. A post-insert read failure on the pool would otherwise surface
@@ -65,6 +62,7 @@ where
     row.map(|r| grant_from_row(&r)).transpose()
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) async fn list_grants_for_user(
     pool: &MySqlPool,
     user_id: Uuid,
@@ -121,35 +119,7 @@ pub(super) async fn list_grants(
     rows.iter().map(grant_from_row).collect()
 }
 
-pub(super) async fn update_grant(
-    pool: &MySqlPool,
-    id: Uuid,
-    action: Option<GrantAction>,
-    constraints: Option<JsonValue>,
-) -> Result<Option<PermissionsGrant>, RepoError> {
-    // One transaction so the reread returns exactly the row this UPDATE wrote
-    // (matches the atomic create path and the PATCH contract).
-    let mut tx = pool.begin().await?;
-    let res = sqlx::query(
-        "UPDATE permissions_grants \
-         SET action = COALESCE(?, action), \
-             constraints_json = COALESCE(?, constraints_json), \
-             updated_at = NOW(6) \
-         WHERE id = ? AND revoked_at IS NULL",
-    )
-    .bind(action.map(|a| a.as_db_str()))
-    .bind(constraints)
-    .bind(id.to_string())
-    .execute(&mut *tx)
-    .await?;
-    if res.rows_affected() == 0 {
-        return Ok(None);
-    }
-    let row = grant_by_id(&mut *tx, id).await?;
-    tx.commit().await?;
-    Ok(row)
-}
-
+#[cfg(any(test, feature = "test-support"))]
 pub(super) async fn revoke_grant(pool: &MySqlPool, id: Uuid) -> Result<bool, RepoError> {
     let res = sqlx::query(
         "UPDATE permissions_grants SET revoked_at = NOW(6) \
@@ -159,4 +129,26 @@ pub(super) async fn revoke_grant(pool: &MySqlPool, id: Uuid) -> Result<bool, Rep
     .execute(pool)
     .await?;
     Ok(res.rows_affected() > 0)
+}
+
+/// Same one-round-trip join as the pg store: live user ⋈ live grants ⟕ live
+/// databases; a specific grant on a soft-deleted database drops here.
+pub(super) async fn live_grants_for_sub(
+    pool: &MySqlPool,
+    user_sub: &str,
+) -> Result<Vec<LiveGrant>, RepoError> {
+    let rows = sqlx::query(
+        "SELECT g.id, COALESCE(g.server, d.server) AS server, d.db_name, g.action, \
+                g.constraints_json \
+         FROM permissions_grants g \
+         JOIN permissions_users u ON u.id = g.user_id \
+         LEFT JOIN permissions_databases d ON d.id = g.database_id AND d.deleted_at IS NULL \
+         WHERE u.user_sub = ? AND u.deleted_at IS NULL AND g.revoked_at IS NULL \
+           AND (g.db_name_wildcard OR d.id IS NOT NULL) \
+         ORDER BY g.created_at, g.id",
+    )
+    .bind(user_sub)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(live_grant_from_row).collect()
 }

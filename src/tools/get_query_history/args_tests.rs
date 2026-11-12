@@ -8,11 +8,8 @@ use super::*;
 /// slice. Pin both branches of the clamp here.
 #[test]
 fn effective_limit_clamps_to_ceiling() {
-    assert_eq!(effective_limit(Some(u32::MAX)), GATEWAY_ROW_LIMIT_CEILING);
-    assert_eq!(
-        effective_limit(Some(4_000_000_000)),
-        GATEWAY_ROW_LIMIT_CEILING
-    );
+    assert_eq!(effective_limit(Some(u32::MAX)), HISTORY_LIMIT_CEILING);
+    assert_eq!(effective_limit(Some(4_000_000_000)), HISTORY_LIMIT_CEILING);
 }
 
 #[test]
@@ -32,7 +29,7 @@ fn effective_limit_uses_default_when_absent() {
 /// `since`. Pin every branch of that distinction.
 #[test]
 fn truncated_reports_the_ceiling_clamp_only() {
-    let ceiling = GATEWAY_ROW_LIMIT_CEILING;
+    let ceiling = HISTORY_LIMIT_CEILING;
 
     // Above the ceiling: clamped, so flagged.
     assert!(limit_was_clamped(
@@ -122,6 +119,8 @@ fn arguments_accepts_canonical_shape() {
     assert_eq!(args.database, "app");
     assert!(args.since.is_none());
     assert!(args.limit.is_none());
+    assert!(args.cursor.is_none());
+    assert!(args.reason.is_none());
 }
 
 #[test]

@@ -1,16 +1,16 @@
 //! Pending IdP logins: `state → nonce` from `/auth/login` (or a bridged
 //! `/authorize`) lives here until `/auth/callback` consumes it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
-use super::StoreError;
-
 /// Size cap on the pending flows map. A login produces one pending flow;
 /// this cap bounds resource exhaustion from abandoning many browser logins.
+/// At the cap the oldest flow is evicted — `/authorize` is unauthenticated, so
+/// refusing would let a flood block every real login.
 const PENDING_FLOWS_MAX_SIZE: usize = 10_000;
 
 /// TTL-bounded so a wedged login can't accumulate.
@@ -44,7 +44,27 @@ pub struct OAuthBridge {
 
 #[derive(Clone, Default, Debug)]
 pub struct PendingFlows {
-    inner: Arc<Mutex<HashMap<String, PendingFlow>>>,
+    inner: Arc<Mutex<Flows>>,
+}
+
+#[derive(Default, Debug)]
+struct Flows {
+    by_state: HashMap<String, PendingFlow>,
+    /// Insertion order. Every flow has the same TTL, so the front is both the
+    /// oldest and the first to expire. May hold states already taken; those
+    /// are skipped on eviction and dropped by `gc_expired`.
+    order: VecDeque<String>,
+}
+
+impl Flows {
+    /// Drop the oldest still-present flow, skipping taken ones. O(1) amortized.
+    fn evict_oldest(&mut self) {
+        while let Some(state) = self.order.pop_front() {
+            if self.by_state.remove(&state).is_some() {
+                return;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -61,13 +81,8 @@ pub struct PendingFlow {
 }
 
 impl PendingFlows {
-    pub async fn insert(
-        &self,
-        state: String,
-        nonce: String,
-        idp_verifier: String,
-    ) -> Result<(), StoreError> {
-        self.insert_flow(state, nonce, idp_verifier, None).await
+    pub async fn insert(&self, state: String, nonce: String, idp_verifier: String) {
+        self.insert_flow(state, nonce, idp_verifier, None).await;
     }
 
     /// Insert a flow carrying MCP OAuth-bridge context (the client redirect /
@@ -78,9 +93,9 @@ impl PendingFlows {
         nonce: String,
         idp_verifier: String,
         bridge: OAuthBridge,
-    ) -> Result<(), StoreError> {
+    ) {
         self.insert_flow(state, nonce, idp_verifier, Some(bridge))
-            .await
+            .await;
     }
 
     async fn insert_flow(
@@ -89,26 +104,13 @@ impl PendingFlows {
         nonce: String,
         idp_verifier: String,
         bridge: Option<OAuthBridge>,
-    ) -> Result<(), StoreError> {
-        let mut map = self.inner.lock().await;
-        // Reclaim expired flows before rejecting at cap. The periodic sweep
-        // (`spawn_oauth_state_gc`, every 30s) only reaps entries that have
-        // crossed `FLOW_TTL` (15 min) — it does nothing against a sustained
-        // `/authorize` flood that keeps the map packed with *fresh* junk
-        // faster than entries naturally expire. This is unauthenticated
-        // (pre-login) traffic, so map.len() at cap is not evidence the
-        // gateway is actually busy — it may just mean the sweep hasn't run
-        // since the last burst. Trying a GC right here costs one map scan
-        // only on the (rare) at-cap path, and immediately frees room for
-        // real logins sitting behind a burst that's already aged out.
-        if map.len() >= PENDING_FLOWS_MAX_SIZE {
-            let now = Instant::now();
-            map.retain(|_, flow| flow.expires_at > now);
+    ) {
+        let mut flows = self.inner.lock().await;
+        if flows.by_state.len() >= PENDING_FLOWS_MAX_SIZE && !flows.by_state.contains_key(&state) {
+            flows.evict_oldest();
         }
-        if map.len() >= PENDING_FLOWS_MAX_SIZE {
-            return Err(StoreError::StoreFull);
-        }
-        map.insert(
+        flows.order.push_back(state.clone());
+        flows.by_state.insert(
             state,
             PendingFlow {
                 nonce,
@@ -117,32 +119,26 @@ impl PendingFlows {
                 expires_at: Instant::now() + FLOW_TTL,
             },
         );
-        Ok(())
     }
 
     /// Remove and return the pending flow for a given state, if still live
     /// (i.e., not yet expired past the flow TTL).
     pub async fn take(&self, state: &str) -> Option<PendingFlow> {
-        let mut map = self.inner.lock().await;
-        if let Some(flow) = map.remove(state) {
-            // Check expiration before returning: if the flow has passed its TTL,
-            // reject it (treat as if it doesn't exist). The background GC task
-            // will clean up the rest.
-            if flow.expires_at > Instant::now() {
-                Some(flow)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+        let flow = self.inner.lock().await.by_state.remove(state)?;
+        (flow.expires_at > Instant::now()).then_some(flow)
     }
 
-    /// Remove all expired flows. Called periodically by a background task.
-    pub async fn gc_expired(&self) {
-        let mut map = self.inner.lock().await;
+    /// Remove all expired flows and compact the insertion order; returns how
+    /// many flows were removed. Called periodically by a background task.
+    pub async fn gc_expired(&self) -> u64 {
+        let mut flows = self.inner.lock().await;
         let now = Instant::now();
-        map.retain(|_, flow| flow.expires_at > now);
+        let before = flows.by_state.len();
+        flows.by_state.retain(|_, flow| flow.expires_at > now);
+        let removed = (before - flows.by_state.len()) as u64;
+        let Flows { by_state, order } = &mut *flows;
+        order.retain(|state| by_state.contains_key(state));
+        removed
     }
 }
 

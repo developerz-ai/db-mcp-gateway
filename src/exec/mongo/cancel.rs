@@ -29,6 +29,8 @@ use mongodb::bson::{Bson, Document, doc};
 use tracing::Instrument;
 use uuid::Uuid;
 
+use crate::audit::drain::DetachedTasks;
+
 /// Stamp a unique `comment` on `cmd` and return the marker. Unconditional
 /// overwrite — same rationale as the `maxTimeMS` stamp in `dispatch`: a
 /// caller-supplied `comment` could otherwise collide with (or spoof) the
@@ -49,6 +51,8 @@ pub struct KillOpOnDrop {
     /// `Some` while armed: the client (to open the admin-db connection) and
     /// the marker stamped on this request's command.
     armed: Option<(Client, String)>,
+    /// Where the detached kill runs, so a shutdown drain waits for it.
+    detached: DetachedTasks,
 }
 
 impl std::fmt::Debug for KillOpOnDrop {
@@ -65,9 +69,10 @@ impl std::fmt::Debug for KillOpOnDrop {
 }
 
 impl KillOpOnDrop {
-    pub fn armed(client: Client, marker: String) -> Self {
+    pub fn armed(client: Client, marker: String, detached: DetachedTasks) -> Self {
         Self {
             armed: Some((client, marker)),
+            detached,
         }
     }
 
@@ -82,22 +87,23 @@ impl Drop for KillOpOnDrop {
             return;
         };
         // `Drop` can run outside a runtime context (runtime teardown, or a
-        // test dropping the future after the runtime ends). `tokio::spawn`
-        // panics there, and CLAUDE.md forbids panics on the hot path; a
+        // test dropping the future after the runtime ends). Spawning panics
+        // there, and CLAUDE.md forbids panics on the hot path; a
         // panic during unwind is also an abort. Best-effort means "skip",
         // not "abort".
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        if tokio::runtime::Handle::try_current().is_err() {
             tracing::warn!("no tokio runtime at drop; skipping mongo killOp");
             return;
-        };
+        }
         // Inherit the dispatch span so `request_id`, `user`, `server`, and
         // `database` reach the warn lines below — the detached task starts
         // with no parent otherwise, and an operator seeing "killOp failed"
         // could not map it back to a request.
         let span = tracing::Span::current();
         // Detached: the parent future is being dropped, so we can't await
-        // inline. Runs on a fresh task independent of the dropped future.
-        handle.spawn(
+        // inline. Runs on a fresh, tracked task independent of the dropped
+        // future.
+        self.detached.spawn(
             async move {
                 let admin = client.database("admin");
                 let opids = find_opids_by_marker(&admin, &marker).await;
@@ -225,7 +231,8 @@ mod tests {
             .build();
         let client = Client::with_options(options).expect("client constructs");
 
-        let mut guard = KillOpOnDrop::armed(client, "unused-marker".to_string());
+        let mut guard =
+            KillOpOnDrop::armed(client, "unused-marker".to_string(), DetachedTasks::new());
         assert!(guard.armed.is_some());
         guard.disarm();
         assert!(guard.armed.is_none());
@@ -248,7 +255,7 @@ mod tests {
             .build();
         let client = Client::with_options(options).expect("client constructs");
         let marker = "leak-marker-should-not-appear";
-        let guard = KillOpOnDrop::armed(client, marker.to_string());
+        let guard = KillOpOnDrop::armed(client, marker.to_string(), DetachedTasks::new());
         let rendered = format!("{guard:?}");
         assert!(rendered.contains("armed"));
         assert!(!rendered.contains(marker), "leaked marker: {rendered}");

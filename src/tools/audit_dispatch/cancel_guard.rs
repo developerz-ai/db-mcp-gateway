@@ -4,21 +4,24 @@
 use metrics::counter;
 use sqlx::PgPool;
 
-use crate::audit::{self, AuditRow};
-use crate::config::StreamSinkConfig;
+use crate::audit::drain::DetachedTasks;
+use crate::audit::stream::StreamSinks;
+use crate::audit::{self, AuditRow, OutcomeCode};
 
-use super::{Outcome, OutcomeCode, metric_names::TOOL_CALLS};
+use super::Outcome;
+use super::metric_names::{AUDIT_FALLBACK_FAILURES, TOOL_CALLS};
 
-/// Drop-fired guard that writes a `"cancelled"` audit row if the dispatch
-/// future is dropped before `disarm()` is called. The detached
-/// `tokio::spawn` lets the audit write outlive the cancellation.
+const DISCONNECTED: &str = "client disconnected before completion";
+
+/// Drop-fired guard that writes the dispatch's audit row if the dispatch
+/// future is dropped before `disarm()` is called.
 ///
 /// Why this shape: when an agent disconnects, axum drops the handler
 /// future, which drops the in-flight `audit_dispatch` future mid-`.await`.
-/// Without a guard, the audit row is never written. We can't use async
-/// `Drop` (doesn't exist in Rust today), so we spawn the write on the
-/// runtime instead — the spawned task runs to completion independently
-/// of the parent future's lifecycle.
+/// Without a guard, the audit row is never written. There is no async
+/// `Drop`, so the write runs on [`DetachedTasks`]: it outlives the
+/// cancelled request, and `main` drains it at shutdown instead of dropping
+/// it with the runtime.
 ///
 /// Server-side query cancellation is handled separately, in the exec layer:
 /// `PgAdapter` captures the backend PID and fires `pg_cancel_backend` from a
@@ -27,55 +30,72 @@ use super::{Outcome, OutcomeCode, metric_names::TOOL_CALLS};
 /// (Mongo relies on `maxTimeMS` plus cursor-drop.) This guard's only job is
 /// the audit row.
 pub(super) struct CancelledAuditGuard {
-    /// The row the fallback writes. `outcome` stays empty until
-    /// `record_outcome`.
+    /// The row the fallback writes. Starts as the `cancelled` row; the
+    /// recorders overwrite it as the dispatch progresses.
     pub(super) row: AuditRow,
+    /// `false` while the work is still running — the only state in which
+    /// the drop path, not the dispatch, counts the call.
+    pub(super) completed: bool,
     /// `Some` while armed; `disarm()` clears it and `Drop` then writes
-    /// nothing. Cloned pool handle — needed inside the spawned task.
-    /// `PgPool` is `Arc`-internally so cloning is cheap.
+    /// nothing. `PgPool` is `Arc`-internally so cloning is cheap.
     pub(super) state_db: Option<PgPool>,
-    /// Tool name kept separately for the metric counter emitted from the
-    /// drop path (audit row's `tool` field is moved into the spawn).
+    /// The metric label; `row.tool` is an owned copy for the write.
     pub(super) tool: &'static str,
-    /// Owned copy — the spawned task outlives the borrow `audit_dispatch`
-    /// holds. Cheap: at most a handful of enum variants.
-    pub(super) stream_sinks: Vec<StreamSinkConfig>,
+    pub(super) sinks: StreamSinks,
+    pub(super) tasks: DetachedTasks,
 }
 
 impl CancelledAuditGuard {
+    /// Arm the guard on `row`, stamped `cancelled` until an outcome is
+    /// recorded.
+    pub(super) fn arm(
+        mut row: AuditRow,
+        tool: &'static str,
+        state_db: PgPool,
+        sinks: StreamSinks,
+        tasks: DetachedTasks,
+    ) -> Self {
+        row.outcome = OutcomeCode::Cancelled;
+        row.error_message = Some(DISCONNECTED.to_string());
+        Self {
+            tool,
+            row,
+            completed: false,
+            state_db: Some(state_db),
+            sinks,
+            tasks,
+        }
+    }
+
     pub(super) fn disarm(mut self) {
         self.state_db = None;
     }
 
-    /// Record the tool's actual outcome on the pre-built row and return the
-    /// row the primary write persists. Called after `work.await` completes
-    /// so the guard's fallback write — fired if the dispatch future is
-    /// dropped or the primary `audit::log` fails — carries the real outcome
-    /// rather than the placeholder `"cancelled"` that `finalize_dropped_row`
-    /// falls back to when the outcome was never set.
+    /// Record the tool's actual outcome and return the row the primary write
+    /// persists. The guard keeps an identical copy (same `id`), so a fallback
+    /// fired by a drop during the primary write is idempotent with it.
     pub(super) fn record_outcome(&mut self, outcome: &Outcome) -> AuditRow {
         let row = &mut self.row;
-        row.outcome = outcome.code.as_str().to_string();
+        row.outcome = outcome.code;
         row.elapsed_ms = outcome.elapsed_ms;
         row.row_count = outcome.row_count;
         row.truncated = outcome.truncated;
         row.error_message = outcome.error_message.clone();
-        // The guard keeps its copy for the fallback; the caller's copy is
-        // the primary write.
+        self.completed = true;
         row.clone()
     }
-}
 
-/// If the tool never got to set an outcome, the drop is firing mid-work —
-/// the true outcome is unknown, so tag it `"cancelled"` and stamp the
-/// error_message so operators can distinguish it from a forbidden row at a
-/// glance. If the outcome IS set, the drop is firing AFTER work completed
-/// (the primary `audit::log` failed, timed out, or the future was dropped
-/// mid-audit) and the real outcome must be preserved for the retry.
-fn finalize_dropped_row(row: &mut AuditRow) {
-    if row.outcome.is_empty() {
-        row.outcome = OutcomeCode::Cancelled.as_str().to_string();
-        row.error_message = Some("client disconnected before completion".to_string());
+    /// The primary write failed, so the client is told `audit_unavailable`.
+    /// The fallback row records that — the code the client saw — and keeps
+    /// the tool's own outcome in `error_message`.
+    pub(super) fn record_audit_failure(&mut self) {
+        let row = &mut self.row;
+        let tool_outcome = match row.error_message.take() {
+            Some(message) => format!("tool outcome {}: {message}", row.outcome),
+            None => format!("tool outcome {}", row.outcome),
+        };
+        row.outcome = OutcomeCode::AuditUnavailable;
+        row.error_message = Some(tool_outcome);
     }
 }
 
@@ -84,17 +104,8 @@ impl Drop for CancelledAuditGuard {
         let Some(pool) = self.state_db.take() else {
             return;
         };
-        // Owned copy for the spawned task, which outlives `self`.
-        let mut row = self.row.clone();
-        // If the outcome was already recorded, `audit_dispatch` already
-        // emitted the primary TOOL_CALLS increment. Emitting it again here
-        // would double-count every audit-failure path. Only count in Drop
-        // for the mid-work cancellation branch where `finalize_dropped_row`
-        // promotes the empty outcome to `"cancelled"` and no primary
-        // increment ever ran.
-        let outcome_was_recorded = !row.outcome.is_empty();
-        finalize_dropped_row(&mut row);
-        if !outcome_was_recorded {
+        if !self.completed {
+            // Mid-work drop: the dispatch never reached its own count.
             counter!(
                 TOOL_CALLS,
                 "tool" => self.tool,
@@ -102,18 +113,25 @@ impl Drop for CancelledAuditGuard {
             )
             .increment(1);
         }
-        // Detached spawn. We can't await it; if it fails, there's no
-        // surface to report the failure to — the agent already disconnected
-        // (or the primary write already returned an error the caller saw).
-        // `audit::log` has its own timeout so a wedged state DB does not
-        // stall the detached task forever. The row shares `id` with any
-        // prior primary write, so `ON CONFLICT (id) DO NOTHING` makes this
-        // second attempt idempotent.
-        let stream_sinks = std::mem::take(&mut self.stream_sinks);
-        tokio::spawn(async move {
+        let row = self.row.clone();
+        let sinks = self.sinks.clone();
+        let tasks = self.tasks.clone();
+        // `audit::log` has its own deadline, so this cannot run unbounded.
+        // Nobody awaits it — the client is gone or already got its error —
+        // so a failure is surfaced by log line and counter only.
+        self.tasks.spawn(async move {
             match audit::log(&pool, &row).await {
-                Ok(()) => audit::stream::send(&stream_sinks, &row),
-                Err(err) => tracing::error!(%err, "fallback audit row write failed"),
+                Ok(()) => sinks.send(&row, &tasks),
+                Err(err) => {
+                    counter!(AUDIT_FALLBACK_FAILURES).increment(1);
+                    tracing::error!(
+                        %err,
+                        class = %err.class(),
+                        request_id = %row.request_id,
+                        outcome = %row.outcome,
+                        "fallback audit row write failed"
+                    );
+                }
             }
         });
     }

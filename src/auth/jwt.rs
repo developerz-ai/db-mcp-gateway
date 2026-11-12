@@ -24,40 +24,82 @@ pub struct SessionClaims {
     pub exp: u64,
 }
 
+/// Clock skew tolerated on `exp`. Explicit rather than the library default so
+/// the session GC grace (`session_store::GC_GRACE`) is provably longer.
+const LEEWAY_SECS: u64 = 30;
+
+/// Session-JWT signer/verifier with its keys and validation built once, not
+/// per request. `Debug` redacts the keys.
+#[derive(Clone)]
+pub struct SessionJwt {
+    encoding: EncodingKey,
+    decoding: DecodingKey,
+    validation: Validation,
+}
+
+impl std::fmt::Debug for SessionJwt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionJwt").finish_non_exhaustive()
+    }
+}
+
+impl SessionJwt {
+    pub fn new(signing_key: &[u8]) -> Self {
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_issuer(&[ISSUER]);
+        validation.validate_exp = true;
+        validation.leeway = LEEWAY_SECS;
+        // We don't issue an aud claim; disable the default audience check.
+        validation.validate_aud = false;
+        Self {
+            encoding: EncodingKey::from_secret(signing_key),
+            decoding: DecodingKey::from_secret(signing_key),
+            validation,
+        }
+    }
+
+    pub fn issue(
+        &self,
+        session_id: SessionId,
+        user_sub: &str,
+        ttl: Duration,
+    ) -> Result<String, AuthError> {
+        let now = unix_now();
+        let claims = SessionClaims {
+            iss: ISSUER.to_string(),
+            sub: user_sub.to_string(),
+            sid: session_id.into(),
+            iat: now,
+            exp: now.saturating_add(ttl.as_secs()),
+        };
+        Ok(jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &self.encoding,
+        )?)
+    }
+
+    pub fn verify(&self, token: &str) -> Result<SessionClaims, AuthError> {
+        let data = jsonwebtoken::decode::<SessionClaims>(token, &self.decoding, &self.validation)?;
+        Ok(data.claims)
+    }
+}
+
+/// One-shot [`SessionJwt::issue`]; rebuilds the keys, so keep it off the
+/// request path.
 pub fn issue(
     signing_key: &[u8],
     session_id: SessionId,
     user_sub: &str,
     ttl: Duration,
 ) -> Result<String, AuthError> {
-    let now = unix_now();
-    let claims = SessionClaims {
-        iss: ISSUER.to_string(),
-        sub: user_sub.to_string(),
-        sid: session_id.into(),
-        iat: now,
-        exp: now + ttl.as_secs(),
-    };
-    let token = jsonwebtoken::encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(signing_key),
-    )?;
-    Ok(token)
+    SessionJwt::new(signing_key).issue(session_id, user_sub, ttl)
 }
 
+/// One-shot [`SessionJwt::verify`]; rebuilds the keys, so keep it off the
+/// request path.
 pub fn verify(signing_key: &[u8], token: &str) -> Result<SessionClaims, AuthError> {
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.set_issuer(&[ISSUER]);
-    validation.validate_exp = true;
-    // We don't issue an aud claim; disable the default audience check.
-    validation.validate_aud = false;
-    let data = jsonwebtoken::decode::<SessionClaims>(
-        token,
-        &DecodingKey::from_secret(signing_key),
-        &validation,
-    )?;
-    Ok(data.claims)
+    SessionJwt::new(signing_key).verify(token)
 }
 
 fn unix_now() -> u64 {
@@ -93,8 +135,8 @@ mod tests {
 
     #[test]
     fn expired_token_is_rejected() {
-        // Construct directly with exp far enough in the past that jsonwebtoken's
-        // default 60s leeway can't save it.
+        // Construct directly with exp far enough in the past that the leeway
+        // can't save it.
         let key = b"k";
         let sid = SessionId::new();
         let now = unix_now();
@@ -112,5 +154,31 @@ mod tests {
         )
         .unwrap();
         assert!(verify(key, &token).is_err());
+    }
+
+    #[test]
+    fn expiry_within_leeway_still_verifies() {
+        let key = b"k";
+        let now = unix_now();
+        let claims = SessionClaims {
+            iss: ISSUER.into(),
+            sub: "u".into(),
+            sid: SessionId::new().into(),
+            iat: now - 600,
+            exp: now - (LEEWAY_SECS / 2),
+        };
+        let token = jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(key),
+        )
+        .unwrap();
+        assert!(SessionJwt::new(key).verify(&token).is_ok());
+    }
+
+    #[test]
+    fn debug_carries_no_key_material() {
+        let rendered = format!("{:?}", SessionJwt::new(b"super-secret-key"));
+        assert!(!rendered.contains("super-secret-key"), "{rendered}");
     }
 }

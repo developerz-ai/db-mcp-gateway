@@ -1,34 +1,29 @@
-//! Input validation + error-mapping helpers for the grants handlers.
+//! Input validation + error mapping specific to the grants handlers. The
+//! cross-entity helpers live in [`super::super::validation`].
 
 use serde_json::{Value as JsonValue, json};
 
+use crate::authz::ConstraintsPatch;
 use crate::config::Constraints;
-use crate::state::permissions::{GrantAction, GrantTarget, PermissionsGrant, RepoError};
+use crate::state::permissions::{GrantAction, GrantTarget, RepoError};
 
 use super::super::error::AdminError;
+use super::super::validation::{store_error, trimmed_non_empty};
 use super::dto::CreateGrantRequest;
 
-pub(super) fn invalid_body(request_id: &str) -> AdminError {
-    AdminError::invalid("invalid JSON body").with_request_id(request_id)
-}
-
-pub(super) fn invalid_id(request_id: &str) -> AdminError {
-    AdminError::invalid("invalid grant id").with_request_id(request_id)
-}
-
 /// Parse the request body's target fields into a `GrantTarget`, rejecting
-/// every illegal combination the storage XOR CHECK would later catch. Surfaces
-/// `invalid_request` instead of a generic 500 from the DB constraint.
+/// every illegal combination the storage XOR CHECK would later catch.
 ///
 /// Legal forms (spec 12 §"Wildcard grants"):
 ///   - `database_id` set, `server` absent, `db_name_wildcard` absent/false
 ///     → `GrantTarget::Specific`
 ///   - `database_id` absent, `server` set, `db_name_wildcard == true`
-///     → `GrantTarget::Wildcard`
-///
-/// Anything else (both set, neither set, mismatched flag) → 400.
+///     → `GrantTarget::Wildcard`, where `server` must be a server the
+///     gateway config declares: `*` is not a server, and a typo would
+///     otherwise sit as a dormant grant that a later config change arms.
 pub(super) fn parse_grant_target(
     body: &CreateGrantRequest,
+    known_servers: &[String],
     request_id: &str,
 ) -> Result<GrantTarget, AdminError> {
     let wildcard = body.db_name_wildcard.unwrap_or(false);
@@ -37,14 +32,14 @@ pub(super) fn parse_grant_target(
             database_id: *database_id,
         }),
         (None, Some(server), true) => {
-            let trimmed = server.trim();
-            if trimmed.is_empty() {
-                Err(AdminError::invalid("server must be non-empty").with_request_id(request_id))
-            } else {
-                Ok(GrantTarget::Wildcard {
-                    server: trimmed.to_string(),
-                })
+            let server = trimmed_non_empty(server, "server", request_id)?;
+            if !known_servers.contains(&server) {
+                return Err(AdminError::invalid(
+                    "server must name a server declared in the gateway config",
+                )
+                .with_request_id(request_id));
             }
+            Ok(GrantTarget::Wildcard { server })
         }
         _ => Err(AdminError::invalid(
             "must set exactly one target: \
@@ -65,10 +60,47 @@ pub(super) fn parse_action(value: &str, request_id: &str) -> Result<GrantAction,
     })
 }
 
+/// `row_limit` / `statement_timeout_ms` of `0` would disable the call, not
+/// bound it (Postgres reads `statement_timeout = 0` as "no timeout"), so a
+/// bound, when given, must be positive. Applies to a POST body.
+pub(super) fn positive_bounds(c: &Constraints, request_id: &str) -> Result<(), AdminError> {
+    reject_zero(c.row_limit, c.statement_timeout_ms, request_id)
+}
+
+/// [`positive_bounds`] for the keys a PATCH names; `null` (clear) is fine.
+pub(super) fn positive_patch_bounds(
+    p: &ConstraintsPatch,
+    request_id: &str,
+) -> Result<(), AdminError> {
+    reject_zero(
+        p.row_limit.flatten(),
+        p.statement_timeout_ms.flatten(),
+        request_id,
+    )
+}
+
+fn reject_zero(
+    row_limit: Option<u32>,
+    statement_timeout_ms: Option<u32>,
+    request_id: &str,
+) -> Result<(), AdminError> {
+    for (field, value) in [
+        ("row_limit", row_limit),
+        ("statement_timeout_ms", statement_timeout_ms),
+    ] {
+        if value == Some(0) {
+            return Err(AdminError::invalid(format!(
+                "constraints.{field} must be positive when set"
+            ))
+            .with_request_id(request_id));
+        }
+    }
+    Ok(())
+}
+
+/// The JSONB layout the resolver reads back — identical whether the grant
+/// came from a POST or a merged PATCH, so symmetric merge can rely on it.
 pub(super) fn constraints_to_json(c: &Constraints) -> JsonValue {
-    // Mirrors the JSONB shape the resolver reads back in #49's loader.
-    // Stored in the same layout regardless of whether the original write
-    // came from YAML or the admin API — symmetric merge depends on it.
     json!({
         "require_reason": c.require_reason,
         "row_limit": c.row_limit,
@@ -76,74 +108,79 @@ pub(super) fn constraints_to_json(c: &Constraints) -> JsonValue {
     })
 }
 
-/// Audit-payload shape — full grant row after the change, for `before`/`after`.
-pub(super) fn grant_payload(g: &PermissionsGrant) -> JsonValue {
-    let (database_id, server) = match &g.target {
-        GrantTarget::Specific { database_id } => (Some(*database_id), None),
-        GrantTarget::Wildcard { server } => (None, Some(server.clone())),
-    };
-    let wildcard = matches!(&g.target, GrantTarget::Wildcard { .. });
-    json!({
-        "id": g.id,
-        "user_id": g.user_id,
-        "database_id": database_id,
-        "server": server,
-        "db_name_wildcard": wildcard,
-        "action": g.action.as_db_str(),
-        "constraints": g.constraints,
-        "created_at": g.created_at,
-        "updated_at": g.updated_at,
-    })
-}
-
-/// Same logging discipline as [`super::super::users`] and
-/// [`super::super::databases`]: we log `stage` + `error_type` + `request_id`
-/// but NEVER the underlying error string. A sqlx error's `Display` impl can
-/// quote constraint-violation detail that could echo back row content.
-/// CLAUDE.md non-negotiable #1.
-pub(super) fn internal<E>(stage: &'static str, _err: E, request_id: &str) -> AdminError {
-    let error_type = std::any::type_name::<E>();
-    tracing::error!(
-        stage,
-        error_type,
-        %request_id,
-        "admin grants endpoint failed"
-    );
-    AdminError::internal().with_request_id(request_id)
-}
-
-/// Map [`tx_create_grant`](super::sql::tx_create_grant) failures so DB-level
-/// constraint violations come back as stable `invalid_request` (400) instead
-/// of `internal` (500). The constraints we care about:
-///
-/// - `23503` foreign_key_violation — `user_id` or `database_id` references
-///   a row that does not exist or has been soft-deleted.
-/// - `23514` check_violation — the XOR target / action CHECKs from migration
-///   `0004_permissions.sql`. The handler pre-validates both, so this branch
-///   is belt-and-suspenders for direct API misuse and future schema CHECKs.
-///
-/// No `23505` (unique_violation) mapping: `permissions_grants` has no UNIQUE
-/// index, so it cannot raise this. Stays in the `_` arm if a future migration
-/// adds one — failing closed is fine until we have a stable message for it.
-///
-/// Anything else (pool exhaustion, encoder bug, etc.) stays `internal`. The
-/// error string is intentionally not echoed — same redaction as
-/// [`internal`] above.
+/// Map `tx_create_grant` failures so a DB-level CHECK violation comes back
+/// as `invalid_request` (400). `23514` covers the XOR target / action CHECKs
+/// the handler already pre-validates — belt-and-suspenders for future CHECKs.
+/// A dead reference is not an error here: `tx_create_grant` returns `None`.
+/// Anything else goes through the redacted [`store_error`].
 pub(super) fn map_create_grant_error(err: RepoError, request_id: &str) -> AdminError {
-    if let RepoError::Sqlx(sqlx::Error::Database(db_err)) = &err {
-        match db_err.code().as_deref() {
-            Some("23503") => {
-                return AdminError::invalid(
-                    "invalid grant reference: user or database does not exist",
-                )
-                .with_request_id(request_id);
+    if let RepoError::Sqlx(sqlx::Error::Database(db_err)) = &err
+        && db_err.code().as_deref() == Some("23514")
+    {
+        return AdminError::invalid("grant violates target/action constraints")
+            .with_request_id(request_id);
+    }
+    store_error("create_grant", err, request_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+
+    use super::*;
+
+    fn wildcard_body(server: &str) -> CreateGrantRequest {
+        serde_json::from_value(json!({
+            "user_id": Uuid::nil(),
+            "server": server,
+            "db_name_wildcard": true,
+            "action": "query_read",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn zero_bounds_are_rejected_and_positive_or_absent_pass() {
+        let zero_rows = Constraints {
+            row_limit: Some(0),
+            ..Constraints::default()
+        };
+        let zero_timeout = Constraints {
+            statement_timeout_ms: Some(0),
+            ..Constraints::default()
+        };
+        assert!(positive_bounds(&zero_rows, "r").is_err());
+        assert!(positive_bounds(&zero_timeout, "r").is_err());
+        assert!(positive_bounds(&Constraints::default(), "r").is_ok());
+        let patch = |row_limit| ConstraintsPatch {
+            row_limit,
+            ..ConstraintsPatch::default()
+        };
+        assert!(positive_patch_bounds(&patch(Some(Some(0))), "r").is_err());
+        assert!(positive_patch_bounds(&patch(Some(None)), "r").is_ok());
+        assert!(positive_patch_bounds(&patch(Some(Some(1))), "r").is_ok());
+    }
+
+    #[test]
+    fn wildcard_on_declared_server_is_accepted() {
+        let known = vec!["prod".to_string()];
+        let target = parse_grant_target(&wildcard_body(" prod "), &known, "r").unwrap();
+        assert_eq!(
+            target,
+            GrantTarget::Wildcard {
+                server: "prod".into()
             }
-            Some("23514") => {
-                return AdminError::invalid("grant violates target/action constraints")
-                    .with_request_id(request_id);
-            }
-            _ => {}
+        );
+    }
+
+    #[test]
+    fn wildcard_on_star_or_unknown_server_is_rejected() {
+        let known = vec!["prod".to_string()];
+        for server in ["*", "staging", "", "PROD"] {
+            assert!(
+                parse_grant_target(&wildcard_body(server), &known, "r").is_err(),
+                "{server:?} must be rejected"
+            );
         }
     }
-    internal("create_grant", err, request_id)
 }

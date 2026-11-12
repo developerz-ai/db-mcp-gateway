@@ -1,4 +1,5 @@
 use super::*;
+use chrono::Duration as ChronoDuration;
 
 fn base_session() -> Session {
     Session {
@@ -21,19 +22,19 @@ fn identity_clone_carries_fields() {
 }
 
 #[test]
-fn revoked_or_expired_is_inactive() {
+fn revoked_or_expired_reports_why() {
     let now = Utc::now();
     let base = base_session();
-    assert!(base.is_active(now));
+    assert_eq!(base.inactive(now), None);
     let revoked = Session {
         revoked_at: Some(now),
         ..base.clone()
     };
-    assert!(!revoked.is_active(now));
+    assert_eq!(revoked.inactive(now), Some(Inactive::Revoked));
     let expired = Session {
         issued_at: now - ChronoDuration::hours(2),
         expires_at: now - ChronoDuration::seconds(1),
         ..base
     };
-    assert!(!expired.is_active(now));
+    assert_eq!(expired.inactive(now), Some(Inactive::Expired));
 }

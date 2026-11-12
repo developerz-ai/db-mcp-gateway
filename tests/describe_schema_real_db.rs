@@ -1,12 +1,17 @@
 //! Real-DB test for `describe_schema`: create a test table in `target-db`,
 //! run the catalog query through the same exec path the tool uses, assert the
-//! response shape. Doesn't exercise auth / MCP transport — those land in the
-//! combined inspection-tools e2e in slice 4.
+//! response shape. The last test drives the tool over MCP and asserts the
+//! audit row names the schema and table it read.
 
 mod common;
 
+use std::time::Duration;
+
+use common::gateway::spawn_logged_in;
+use common::idp::MockUser;
 use common::pg_target::adapter;
-use db_mcp_gateway::exec::{DbAdapter, ExecError, ExecQuery, ExecResult, PgAdapter};
+use db_mcp_gateway::exec::{Access, DbAdapter, ExecError, ExecQuery, ExecResult, PgAdapter};
+use serde_json::json;
 
 async fn run(a: &PgAdapter, sql: &str) -> Result<ExecResult, ExecError> {
     a.execute(ExecQuery {
@@ -14,6 +19,7 @@ async fn run(a: &PgAdapter, sql: &str) -> Result<ExecResult, ExecError> {
         binds: &[],
         statement_timeout_ms: None,
         row_limit: 10,
+        access: Access::ReadWrite,
     })
     .await
 }
@@ -56,6 +62,7 @@ async fn catalog_query_returns_expected_columns_and_types() {
             binds: &[&schema],
             statement_timeout_ms: None,
             row_limit: 500,
+            access: Access::ReadWrite,
         })
         .await
         .expect("catalog query runs");
@@ -114,6 +121,7 @@ async fn table_filter_narrows_results() {
             binds: &[&schema, "b"],
             statement_timeout_ms: None,
             row_limit: 500,
+            access: Access::ReadWrite,
         })
         .await
         .expect("filtered catalog query runs");
@@ -124,4 +132,85 @@ async fn table_filter_narrows_results() {
     assert_eq!(result.rows.len(), 2);
     let names: Vec<&str> = result.rows.iter().map(|r| r[2].as_str().unwrap()).collect();
     assert_eq!(names, vec!["y", "z"]);
+}
+
+const E2E_YAML: &str = r#"
+servers:
+  - name: target
+    kind: postgres
+    description: E2E target DB
+    host: localhost
+    port: 5434
+    tls: insecure
+    databases:
+      - { name: app, role: app, password: app-dev-only }
+
+permissions:
+  - group: engineers
+    grants:
+      - { server: target, database: app, action: schema_read }
+"#;
+
+/// The audit row of a catalog read records what was read — `schema.table` —
+/// and an intent row preceded it.
+#[tokio::test]
+async fn describe_schema_audit_row_names_the_table_read() {
+    let a = adapter().await;
+    let schema = fresh_schema_name();
+    run(&a, &format!("CREATE SCHEMA \"{schema}\""))
+        .await
+        .expect("create schema");
+    run(&a, &format!("CREATE TABLE \"{schema}\".\"users\" (id int)"))
+        .await
+        .expect("create users");
+    let booted = spawn_logged_in(
+        E2E_YAML,
+        MockUser {
+            sub: format!("describe-{}", uuid::Uuid::new_v4().simple()),
+            email: "describe-e2e@example.com".to_string(),
+            groups: vec!["engineers".to_string()],
+        },
+    )
+    .await;
+
+    let resp: serde_json::Value = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .unwrap()
+        .post(format!("{}/mcp", booted.url))
+        .bearer_auth(&booted.bearer)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "describe_schema",
+                "arguments": { "server": "target", "database": "app",
+                               "schema": schema, "table": "users" }
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let _ = run(&a, &format!("DROP SCHEMA \"{schema}\" CASCADE")).await;
+
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let row = common::audit::latest_audit(
+        &booted.state_db,
+        &booted.user_sub,
+        "describe_schema",
+        "describe users",
+    )
+    .await;
+    assert_eq!(row.outcome, "success");
+    assert_eq!(row.sql.as_deref(), Some(format!("{schema}.users").as_str()));
+    assert_eq!(
+        common::audit::find_intent(&booted.state_db, &row.request_id)
+            .await
+            .as_deref(),
+        Some("read")
+    );
 }

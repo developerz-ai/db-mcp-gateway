@@ -30,10 +30,10 @@ use common::cleanup::{
     delete_permissions_user,
 };
 use common::env::state_pool;
-use common::gateway::{EMPTY_YAML, GatewayBuilder};
+use common::gateway::GatewayBuilder;
 use db_mcp_gateway::auth::{AuthConfig, SessionStore, jwt};
 use db_mcp_gateway::authz::PermissionsCache;
-use db_mcp_gateway::state::permissions::{DbType, PermissionsRepo, pg::PgPermissionsRepo};
+use db_mcp_gateway::state::permissions::{DbType, PermissionsSeed, pg::PgPermissionsRepo};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -41,6 +41,17 @@ use sqlx::Row;
 use uuid::Uuid;
 
 const ADMIN_GROUP: &str = "db-mcp-gateway-admins";
+
+/// `prod` is the one declared server: the only legal wildcard target.
+const GRANTS_YAML: &str = "servers:
+  - name: prod
+    kind: postgres
+    description: E2E prod
+    host: prod.example.invalid
+    databases:
+      - { name: app, role: ro, password: hunter2 }
+permissions: []
+";
 
 async fn mint_session(
     sessions: &SessionStore,
@@ -66,7 +77,7 @@ async fn mint_session(
 struct Harness {
     base_url: String,
     pool: PgPool,
-    repo: Arc<dyn PermissionsRepo>,
+    repo: Arc<PgPermissionsRepo>,
     cache: PermissionsCache,
     cleanup_grant_ids: Vec<Uuid>,
     cleanup_database_ids: Vec<Uuid>,
@@ -117,9 +128,9 @@ impl Harness {
 
 async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
     let pool = state_pool().await;
-    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
+    let repo = Arc::new(PgPermissionsRepo::new(pool.clone()));
     let cache = PermissionsCache::new(repo.clone(), Duration::from_secs(60));
-    let gw = GatewayBuilder::new(EMPTY_YAML)
+    let gw = GatewayBuilder::new(GRANTS_YAML)
         .admin(ADMIN_GROUP, true)
         .repo(repo.clone())
         .cache(cache.clone())
@@ -365,9 +376,8 @@ async fn unknown_action_is_rejected() {
     h.cleanup().await;
 }
 
-/// FK violations on `tx_create_grant` must surface as `invalid_request` (400)
-/// — they're client-correctable input errors (typo'd `user_id`, deleted
-/// `database_id`), not gateway faults. Anything else is an `internal` (500).
+/// A reference to a missing user or database must surface as
+/// `invalid_request` (400) — client-correctable input, not a gateway fault.
 #[tokio::test]
 async fn create_grant_with_unknown_user_or_database_is_400() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
@@ -394,7 +404,7 @@ async fn create_grant_with_unknown_user_or_database_is_400() {
             .as_str()
             .unwrap()
             .contains("invalid grant reference"),
-        "FK violation must surface a stable message; got {err}"
+        "dead reference must surface a stable message; got {err}"
     );
 
     // Unknown database_id → FK violation on permissions_grants.database_id.
@@ -417,7 +427,7 @@ async fn create_grant_with_unknown_user_or_database_is_400() {
             .as_str()
             .unwrap()
             .contains("invalid grant reference"),
-        "FK violation must surface a stable message; got {err}"
+        "dead reference must surface a stable message; got {err}"
     );
 
     h.cleanup().await;
@@ -659,6 +669,7 @@ async fn live_grant_change_invalidates_cache_for_user() {
         user_email: "target@example.com".to_string(),
         groups: vec!["engineers".to_string()],
         issued_at: chrono::Utc::now(),
+        kind: db_mcp_gateway::auth::IdentityKind::Sso,
     };
 
     // Pre-warm the cache for this user — observed grants: 0.
@@ -798,4 +809,223 @@ async fn anonymous_gets_401() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// POST a specific grant for a freshly seeded user/database; returns its id.
+async fn create_specific_grant(h: &mut Harness, jwt: &str, constraints: Value) -> Uuid {
+    let (user_id, db_id, _) = seed_target_user_and_db(h).await;
+    let v: Value = client()
+        .post(format!("{}/admin/v1/grants", h.base_url))
+        .bearer_auth(jwt)
+        .json(&json!({
+            "user_id": user_id, "database_id": db_id,
+            "action": "query_read", "constraints": constraints,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id: Uuid = v["id"].as_str().unwrap().parse().unwrap();
+    h.track_grant(id);
+    id
+}
+
+async fn patch_grant(h: &Harness, jwt: &str, id: Uuid, body: Value) -> reqwest::Response {
+    client()
+        .patch(format!("{}/admin/v1/grants/{}", h.base_url, id))
+        .bearer_auth(jwt)
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// **No silent loosening.** A PATCH naming only `row_limit` keeps
+/// `require_reason` and `statement_timeout_ms`; an explicit `null` clears
+/// exactly the key it names.
+#[tokio::test]
+async fn patch_merges_per_key_and_never_drops_unnamed_constraints() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
+    let initial = json!({ "require_reason": true, "row_limit": 500, "statement_timeout_ms": 2000 });
+    let id = create_specific_grant(&mut h, &jwt, initial).await;
+
+    let resp = patch_grant(&h, &jwt, id, json!({ "constraints": { "row_limit": 100 } })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["constraints"]["row_limit"], 100);
+    assert_eq!(v["constraints"]["require_reason"], true, "unnamed key kept");
+    assert_eq!(v["constraints"]["statement_timeout_ms"], 2000);
+
+    let body = json!({ "constraints": { "statement_timeout_ms": null } });
+    let v: Value = patch_grant(&h, &jwt, id, body).await.json().await.unwrap();
+    assert!(v["constraints"]["statement_timeout_ms"].is_null());
+    assert_eq!(v["constraints"]["require_reason"], true);
+    assert_eq!(v["constraints"]["row_limit"], 100);
+
+    h.cleanup().await;
+}
+
+/// A stale `expected_updated_at` is a 409 and changes nothing.
+#[tokio::test]
+async fn patch_with_stale_precondition_is_409() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
+    let id = create_specific_grant(&mut h, &jwt, json!({ "row_limit": 10 })).await;
+
+    let body = json!({
+        "constraints": { "row_limit": 5 },
+        "expected_updated_at": "2000-01-01T00:00:00Z",
+    });
+    let resp = patch_grant(&h, &jwt, id, body).await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let err: Value = resp.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "conflict");
+    let audit = latest_audit_for_target(&h.pool, id).await.expect("audit");
+    assert_eq!(audit.0, "create", "a refused PATCH writes no audit row");
+
+    h.cleanup().await;
+}
+
+/// Concurrent PATCHes serialise on the grant row: every request applies and
+/// the audit rows form an unbroken chain, `after[n] == before[n + 1]`.
+#[tokio::test]
+async fn concurrent_patches_leave_a_continuous_audit_chain() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
+    let id = create_specific_grant(&mut h, &jwt, json!({ "row_limit": 1000 })).await;
+
+    let patches = (1..=8u32).map(|n| {
+        let body = json!({ "constraints": { "row_limit": n } });
+        patch_grant(&h, &jwt, id, body)
+    });
+    for resp in futures::future::join_all(patches).await {
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let rows = sqlx::query(
+        "SELECT before, after FROM permissions_audit \
+         WHERE target_id = $1 AND target_type = 'grant' AND action = 'update' ORDER BY id",
+    )
+    .bind(id)
+    .fetch_all(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 8);
+    let chain: Vec<(Value, Value)> = rows
+        .iter()
+        .map(|r| (r.get("before"), r.get("after")))
+        .collect();
+    for pair in chain.windows(2) {
+        assert_eq!(pair[0].1, pair[1].0, "audit chain broken");
+    }
+
+    h.cleanup().await;
+}
+
+/// A wildcard must name a server the config declares: `*` and unknown
+/// names are 400 and write nothing.
+#[tokio::test]
+async fn wildcard_on_star_or_undeclared_server_is_400() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
+    let (user_id, _, _) = seed_target_user_and_db(&mut h).await;
+
+    for server in ["*", "staging"] {
+        let resp = client()
+            .post(format!("{}/admin/v1/grants", h.base_url))
+            .bearer_auth(&jwt)
+            .json(&json!({
+                "user_id": user_id, "server": server,
+                "db_name_wildcard": true, "action": "query_read",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "server {server:?}");
+    }
+    let n: i64 = sqlx::query("SELECT COUNT(*) FROM permissions_grants WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 0);
+
+    h.cleanup().await;
+}
+
+/// A grant cannot attach to a soft-deleted user or database.
+#[tokio::test]
+async fn grant_on_soft_deleted_user_or_database_is_400() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
+    let (user_id, db_id, _) = seed_target_user_and_db(&mut h).await;
+    let (live_user, deleted_db, _) = seed_target_user_and_db(&mut h).await;
+    assert!(h.repo.soft_delete_user(user_id).await.unwrap());
+    assert!(h.repo.soft_delete_database(deleted_db).await.unwrap());
+
+    for (user, db) in [(user_id, db_id), (live_user, deleted_db)] {
+        let resp = client()
+            .post(format!("{}/admin/v1/grants", h.base_url))
+            .bearer_auth(&jwt)
+            .json(&json!({ "user_id": user, "database_id": db, "action": "query_read" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err: Value = resp.json().await.unwrap();
+        assert_eq!(err["error"]["code"], "invalid_request");
+    }
+
+    h.cleanup().await;
+}
+
+/// Slice 05 step 8: a zero bound would disable the limit, not tighten it —
+/// POST and PATCH reject `row_limit: 0` / `statement_timeout_ms: 0` with 400
+/// and write nothing.
+#[tokio::test]
+async fn zero_row_limit_or_timeout_is_400() {
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
+    let (user_id, db_id, _) = seed_target_user_and_db(&mut h).await;
+
+    for constraints in [
+        json!({ "row_limit": 0 }),
+        json!({ "statement_timeout_ms": 0 }),
+    ] {
+        let resp = client()
+            .post(format!("{}/admin/v1/grants", h.base_url))
+            .bearer_auth(&jwt)
+            .json(&json!({
+                "user_id": user_id, "database_id": db_id,
+                "action": "query_read", "constraints": constraints,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{constraints}");
+        let err: Value = resp.json().await.unwrap();
+        assert_eq!(err["error"]["code"], "invalid_request");
+    }
+    let n: i64 = sqlx::query("SELECT COUNT(*) FROM permissions_grants WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 0, "a refused POST writes no grant");
+
+    let id = create_specific_grant(&mut h, &jwt, json!({ "row_limit": 10 })).await;
+    let body = json!({ "constraints": { "statement_timeout_ms": 0 } });
+    let resp = patch_grant(&h, &jwt, id, body).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let audit = latest_audit_for_target(&h.pool, id).await.expect("audit");
+    assert_eq!(audit.0, "create", "a refused PATCH writes no audit row");
+
+    h.cleanup().await;
 }

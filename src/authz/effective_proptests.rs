@@ -20,12 +20,12 @@
 //! [`appending_non_matching_grant_is_a_noop`]: appending a grant that doesn't apply to `(s, d, a)`
 //! cannot change the outcome. That's tested here.
 
+use super::proptest_support::{
+    TEST_GROUP, any_action, any_constraints, as_yaml_for, identity_in, no_more_permissive_than,
+};
 use super::{Decision, evaluate_effective, grant_applies};
-use crate::auth::{Identity, SessionId};
-use crate::config::{Action, Constraints, Grant, Permission};
+use crate::config::{Action, Grant};
 use proptest::prelude::*;
-
-const TEST_GROUP: &str = "g";
 
 /// Small alphabet — the resolver doesn't care about the string values
 /// themselves, only that wildcards (`*`) match anything and non-wildcards
@@ -46,30 +46,6 @@ fn any_database() -> impl Strategy<Value = String> {
         Just("billing".to_string()),
         Just("*".to_string()),
     ]
-}
-
-fn any_action() -> impl Strategy<Value = Action> {
-    prop_oneof![
-        Just(Action::SchemaRead),
-        Just(Action::QueryRead),
-        Just(Action::QueryWrite),
-        Just(Action::HistoryRead),
-    ]
-}
-
-fn any_constraints() -> impl Strategy<Value = Constraints> {
-    (
-        any::<bool>(),
-        proptest::option::of(0u32..=1_000_000),
-        proptest::option::of(0u32..=600_000),
-    )
-        .prop_map(
-            |(require_reason, row_limit, statement_timeout_ms)| Constraints {
-                require_reason,
-                row_limit,
-                statement_timeout_ms,
-            },
-        )
 }
 
 fn any_grant() -> impl Strategy<Value = Grant> {
@@ -100,50 +76,6 @@ fn any_request() -> impl Strategy<Value = (String, String, Action)> {
     (req_server, req_db, any_action())
 }
 
-fn identity() -> Identity {
-    Identity {
-        session_id: SessionId::new(),
-        user_sub: "test-sub".to_string(),
-        user_email: "test@example.com".to_string(),
-        groups: vec![TEST_GROUP.to_string()],
-        issued_at: chrono::Utc::now(),
-    }
-}
-
-/// Wrap a flat `Vec<Grant>` into a single-group `Permission` so the YAML side
-/// (which the resolver filters by group) treats all of them as in-scope.
-fn as_yaml(grants: Vec<Grant>) -> Vec<Permission> {
-    vec![Permission {
-        group: TEST_GROUP.to_string(),
-        grants,
-    }]
-}
-
-/// True iff field-wise, `a` is no more permissive than `b`. Used as the
-/// safety predicate for the narrowing property. The ordering on each field:
-///   - `require_reason: true` is *more restrictive* than `false`.
-///   - lower `row_limit` / `statement_timeout_ms` is *more restrictive*.
-///   - `Some(n)` is more restrictive than `None` (the bound binds vs. doesn't).
-fn no_more_permissive_than(a: &Constraints, b: &Constraints) -> bool {
-    // require_reason: a stricter ≥ b stricter   <=>   (a => true) implies (b => true OR a == b)
-    // Concretely: a.require_reason being true while b.require_reason is false would be MORE strict,
-    // which is allowed by the predicate. The violation is a relaxing b=true → a=false.
-    let reason_ok = a.require_reason || !b.require_reason;
-    let rl_ok = match (a.row_limit, b.row_limit) {
-        (Some(av), Some(bv)) => av <= bv,
-        (Some(_), None) => true,  // a binds, b doesn't — a is stricter.
-        (None, Some(_)) => false, // a doesn't bind, b does — a is laxer. Violation.
-        (None, None) => true,
-    };
-    let to_ok = match (a.statement_timeout_ms, b.statement_timeout_ms) {
-        (Some(av), Some(bv)) => av <= bv,
-        (Some(_), None) => true,
-        (None, Some(_)) => false,
-        (None, None) => true,
-    };
-    reason_ok && rl_ok && to_ok
-}
-
 proptest! {
     /// **Symmetric swap.** Swapping which set is "yaml" vs "db" must not
     /// change the resolver's decision. Codifies spec 12 §"Two sources, one
@@ -154,10 +86,10 @@ proptest! {
         db in any_grants(),
         req in any_request(),
     ) {
-        let id = identity();
+        let id = identity_in(TEST_GROUP);
         let (s, d, a) = req;
-        let with_yaml_first = evaluate_effective(&id, a, &s, &d, &as_yaml(yaml.clone()), &db);
-        let with_db_first = evaluate_effective(&id, a, &s, &d, &as_yaml(db.clone()), &yaml);
+        let with_yaml_first = evaluate_effective(&id, a, &s, &d, &as_yaml_for(TEST_GROUP, yaml.clone()), &db);
+        let with_db_first = evaluate_effective(&id, a, &s, &d, &as_yaml_for(TEST_GROUP, db.clone()), &yaml);
         prop_assert_eq!(with_yaml_first, with_db_first);
     }
 
@@ -171,9 +103,9 @@ proptest! {
         db in any_grants(),
         req in any_request(),
     ) {
-        let id = identity();
+        let id = identity_in(TEST_GROUP);
         let (s, d, a) = req;
-        let yaml_perms = as_yaml(yaml);
+        let yaml_perms = as_yaml_for(TEST_GROUP, yaml);
         let union = evaluate_effective(&id, a, &s, &d, &yaml_perms, &db);
         let yaml_only = evaluate_effective(&id, a, &s, &d, &yaml_perms, &[]);
         let db_only = evaluate_effective(&id, a, &s, &d, &[], &db);
@@ -204,9 +136,9 @@ proptest! {
         db in any_grants(),
         req in any_request(),
     ) {
-        let id = identity();
+        let id = identity_in(TEST_GROUP);
         let (s, d, a) = req;
-        let yaml_perms = as_yaml(yaml);
+        let yaml_perms = as_yaml_for(TEST_GROUP, yaml);
         let yaml_only = evaluate_effective(&id, a, &s, &d, &yaml_perms, &[]);
         let db_only = evaluate_effective(&id, a, &s, &d, &[], &db);
         let union = evaluate_effective(&id, a, &s, &d, &yaml_perms, &db);
@@ -226,7 +158,7 @@ proptest! {
     /// deny — no implicit allow from group membership alone.
     #[test]
     fn empty_match_denies(req in any_request()) {
-        let id = identity();
+        let id = identity_in(TEST_GROUP);
         let (s, d, a) = req;
         prop_assert_eq!(
             evaluate_effective(&id, a, &s, &d, &[], &[]),
@@ -247,9 +179,9 @@ proptest! {
         extra in any_grant(),
         req in any_request(),
     ) {
-        let id = identity();
+        let id = identity_in(TEST_GROUP);
         let (s, d, a) = req;
-        let yaml_perms = as_yaml(base_yaml.clone());
+        let yaml_perms = as_yaml_for(TEST_GROUP, base_yaml.clone());
         let before = evaluate_effective(&id, a, &s, &d, &yaml_perms, &base_db);
 
         // Skip the case where the extra grant *does* apply — that's the
@@ -265,7 +197,7 @@ proptest! {
             a,
             &s,
             &d,
-            &as_yaml(yaml_extended),
+            &as_yaml_for(TEST_GROUP, yaml_extended),
             &base_db,
         );
         prop_assert_eq!(&before, &after_yaml, "appending non-matching YAML grant changed outcome");

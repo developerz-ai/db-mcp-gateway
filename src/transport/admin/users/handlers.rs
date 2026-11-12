@@ -1,4 +1,8 @@
 //! CRUD handler functions for `/admin/v1/users`.
+//!
+//! Lock order: the actor row, then the target row — except when the target
+//! *is* the actor, where the one row plays both parts. `user_sub` is
+//! immutable, so an unlocked read of it picks the branch before any lock.
 
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
@@ -7,86 +11,66 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use uuid::Uuid;
 
-use crate::audit::permissions::{
-    self, PermissionsAuditAction, PermissionsAuditRow, PermissionsAuditTargetType,
-};
-use crate::authz::PermissionsCache;
+use crate::audit::permissions::{PermissionsAuditAction as Action, PermissionsAuditTargetType};
+use crate::state::permissions::PermissionsChange;
+use crate::state::permissions::pg::{grants, users};
 
+use super::super::audited_tx::AuditedTx;
 use super::super::error::AdminError;
-use super::super::middleware::{AdminActor, tx_upsert_actor};
+use super::super::middleware::AdminActor;
 use super::super::page_query::{PageQuery, invalid_query};
-use super::tx::{
-    tx_get_user_by_id, tx_get_user_by_sub, tx_soft_delete_user, tx_update_user, tx_upsert_user,
+use super::super::payload::{grant_payload, user_payload};
+use super::super::validation::{
+    check_unchanged, internal, invalid_body, invalid_id, not_found, store_error, trimmed_non_empty,
 };
 use super::{CreateUserRequest, UpdateUserRequest, UserResponse, UsersState};
-use super::{internal, invalid_body, invalid_id, trimmed_non_empty, user_payload, validate_groups};
+use super::{sso_subject, validate_groups};
+
+const USER: PermissionsAuditTargetType = PermissionsAuditTargetType::User;
 
 pub async fn create(
     State(state): State<UsersState>,
     Extension(actor): Extension<AdminActor>,
-    // Fallible extractor: rejection (malformed/non-JSON body) returns the
-    // stable admin error JSON with a `request_id`, not Axum's default 400/422
-    // body that lacks our `code`/`request_id` contract.
     body: Result<Json<CreateUserRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, AdminError> {
-    let Json(body) = body.map_err(|_| invalid_body(&actor.request_id))?;
-    let user_sub = trimmed_non_empty(&body.user_sub, "user_sub", &actor.request_id)?;
-    let user_email = trimmed_non_empty(&body.user_email, "user_email", &actor.request_id)?;
-    let groups = validate_groups(&body.groups, &actor.request_id)?;
+    let rid = actor.request_id.as_str();
+    let Json(body) = body.map_err(|_| invalid_body(rid))?;
+    let user_sub = sso_subject(&body.user_sub, rid)?;
+    let user_email = trimmed_non_empty(&body.user_email, "user_email", rid)?;
+    let groups = validate_groups(&body.groups, rid)?;
 
-    let mut tx = state
-        .state_db
-        .begin()
+    let mut atx = AuditedTx::begin(&state.state_db, &actor).await?;
+    let is_self = actor.sub == user_sub;
+    if !is_self {
+        atx.lock_actor().await?;
+    }
+    let before = users::tx_lock_user_by_sub(atx.tx(), &user_sub)
         .await
-        .map_err(|err| internal("begin tx", err, &actor.request_id))?;
-
-    // Read + write share the SAME transaction so the audit write (below) can
-    // roll back both halves atomically. Hitting the pool directly for the
-    // data write — as an early draft of this handler did — leaves the data
-    // committed even if the audit step fails. CLAUDE.md non-negotiable #4.
-    let before = tx_get_user_by_sub(&mut tx, &user_sub)
+        .map_err(|err| store_error("lock_user", err, rid))?;
+    let user = users::tx_upsert_user(atx.tx(), &user_sub, &user_email, &groups)
         .await
-        .map_err(|err| internal("get_user_by_sub", err, &actor.request_id))?;
-
-    let user = tx_upsert_user(&mut tx, &user_sub, &user_email, &groups)
-        .await
-        .map_err(|err| internal("upsert_user", err, &actor.request_id))?;
-
-    // Upsert the actor's own row in the same tx as the audit write (atomicity).
-    // Guard: if the actor is mutating their own row, skip the upsert — the
-    // `tx_upsert_user` call above already wrote the correct state for that sub,
-    // and running `tx_upsert_actor` would overwrite it with the session snapshot
-    // (stale email/groups), clobbering the just-applied mutation.
-    let actor_id = if actor.sub == user_sub {
-        user.id
-    } else {
-        tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
-            .await
-            .map_err(|err| internal("upsert_actor", err, &actor.request_id))?
-    };
-
+        .map_err(|err| store_error("upsert_user", err, rid))?;
+    if is_self {
+        atx.actor_is(user.id);
+    }
     let action = if before.is_some() {
-        PermissionsAuditAction::Update
+        Action::Update
     } else {
-        PermissionsAuditAction::Create
+        Action::Create
     };
-    let audit_row = PermissionsAuditRow {
-        actor_id,
-        actor_email: actor.email.clone(),
+    let before_json = before.as_ref().map(user_payload);
+    atx.audit(
         action,
-        target_type: PermissionsAuditTargetType::User,
-        target_id: user.id,
-        before: before.as_ref().map(user_payload),
-        after: Some(user_payload(&user)),
-        request_id: actor.request_id.clone(),
-    };
-    permissions::log(&mut *tx, &audit_row)
-        .await
-        .map_err(|err| internal("audit log", err, &actor.request_id))?;
-
-    tx.commit()
-        .await
-        .map_err(|err| internal("commit tx", err, &actor.request_id))?;
+        USER,
+        user.id,
+        before_json,
+        Some(user_payload(&user)),
+    )
+    .await?;
+    // A re-POST of an existing subject can change its groups — and the
+    // cached entry for that subject — so even an upsert invalidates.
+    let change = PermissionsChange::User(user.user_sub.clone());
+    atx.commit(&state.cache, Some(change)).await?;
 
     let status = if before.is_some() {
         StatusCode::OK
@@ -115,13 +99,14 @@ pub async fn get_one(
     Extension(actor): Extension<AdminActor>,
     id: Result<Path<Uuid>, PathRejection>,
 ) -> Result<Json<UserResponse>, AdminError> {
-    let Path(id) = id.map_err(|_| invalid_id(&actor.request_id))?;
+    let rid = actor.request_id.as_str();
+    let Path(id) = id.map_err(|_| invalid_id("user", rid))?;
     let user = state
         .repo
         .get_user(id)
         .await
-        .map_err(|err| internal("get_user", err, &actor.request_id))?
-        .ok_or_else(|| AdminError::not_found().with_request_id(&actor.request_id))?;
+        .map_err(|err| internal("get_user", err, rid))?
+        .ok_or_else(|| not_found(rid))?;
     Ok(Json(UserResponse::from(user)))
 }
 
@@ -131,139 +116,111 @@ pub async fn patch(
     id: Result<Path<Uuid>, PathRejection>,
     body: Result<Json<UpdateUserRequest>, JsonRejection>,
 ) -> Result<Json<UserResponse>, AdminError> {
-    let Path(id) = id.map_err(|_| invalid_id(&actor.request_id))?;
-    let Json(body) = body.map_err(|_| invalid_body(&actor.request_id))?;
+    let rid = actor.request_id.as_str();
+    let Path(id) = id.map_err(|_| invalid_id("user", rid))?;
+    let Json(body) = body.map_err(|_| invalid_body(rid))?;
     if body.user_email.is_none() && body.groups.is_none() {
         return Err(
             AdminError::invalid("PATCH body must set at least one of user_email, groups")
-                .with_request_id(&actor.request_id),
+                .with_request_id(rid),
         );
     }
-    let user_email = match body.user_email.as_deref() {
-        Some(e) => Some(trimmed_non_empty(e, "user_email", &actor.request_id)?),
-        None => None,
-    };
-    let groups = match body.groups.as_deref() {
-        Some(g) => Some(validate_groups(g, &actor.request_id)?),
-        None => None,
-    };
+    let user_email = body
+        .user_email
+        .as_deref()
+        .map(|e| trimmed_non_empty(e, "user_email", rid))
+        .transpose()?;
+    let groups = body
+        .groups
+        .as_deref()
+        .map(|g| validate_groups(g, rid))
+        .transpose()?;
 
-    let mut tx = state
-        .state_db
-        .begin()
+    let mut atx = AuditedTx::begin(&state.state_db, &actor).await?;
+    let is_self = lock_actor_unless_self(&mut atx, &actor, id).await?;
+    let before = users::tx_lock_user(atx.tx(), id)
         .await
-        .map_err(|err| internal("begin tx", err, &actor.request_id))?;
-
-    let before = tx_get_user_by_id(&mut tx, id)
+        .map_err(|err| store_error("lock_user", err, rid))?
+        .ok_or_else(|| not_found(rid))?;
+    check_unchanged(body.expected_updated_at, before.updated_at, rid)?;
+    let after = users::tx_update_user(atx.tx(), id, user_email.as_deref(), groups.as_deref())
         .await
-        .map_err(|err| internal("get_user", err, &actor.request_id))?
-        .ok_or_else(|| AdminError::not_found().with_request_id(&actor.request_id))?;
-
-    let after = tx_update_user(&mut tx, id, user_email.as_deref(), groups.as_deref())
-        .await
-        .map_err(|err| internal("update_user", err, &actor.request_id))?
-        // Race: someone soft-deleted the user between our read and our write.
-        // Surface as 404 — the PATCH didn't apply.
-        .ok_or_else(|| AdminError::not_found().with_request_id(&actor.request_id))?;
-
-    // Upsert the actor's own row in the same tx as the audit write (atomicity).
-    // Guard: if the actor is patching their own row, skip the upsert to avoid
-    // overwriting the freshly-patched state with the session snapshot.
-    let actor_id = if actor.sub == before.user_sub {
-        after.id
-    } else {
-        tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
-            .await
-            .map_err(|err| internal("upsert_actor", err, &actor.request_id))?
-    };
-
-    let audit_row = PermissionsAuditRow {
-        actor_id,
-        actor_email: actor.email.clone(),
-        action: PermissionsAuditAction::Update,
-        target_type: PermissionsAuditTargetType::User,
-        target_id: after.id,
-        before: Some(user_payload(&before)),
-        after: Some(user_payload(&after)),
-        request_id: actor.request_id.clone(),
-    };
-    permissions::log(&mut *tx, &audit_row)
-        .await
-        .map_err(|err| internal("audit log", err, &actor.request_id))?;
-
-    tx.commit()
-        .await
-        .map_err(|err| internal("commit tx", err, &actor.request_id))?;
-
-    // A group change flips constraint-merge results; invalidate even on
-    // email-only patches so the cache never lags a mutation admins observe.
-    // Fire-and-forget (see [`PermissionsCache::spawn_invalidate`]) — the
-    // write-lock cleanup must not be tied to the request future's lifetime.
-    PermissionsCache::spawn_invalidate(&state.cache, Some(&after.user_sub));
-
+        .map_err(|err| store_error("update_user", err, rid))?
+        .ok_or_else(|| not_found(rid))?;
+    if is_self {
+        atx.actor_is(after.id);
+    }
+    let (before_json, after_json) = (user_payload(&before), user_payload(&after));
+    atx.audit(
+        Action::Update,
+        USER,
+        id,
+        Some(before_json),
+        Some(after_json),
+    )
+    .await?;
+    let change = PermissionsChange::User(after.user_sub.clone());
+    atx.commit(&state.cache, Some(change)).await?;
     Ok(Json(UserResponse::from(after)))
 }
 
+/// Soft-delete the user and revoke every live grant it holds, in one
+/// transaction with one audit row per revoked grant plus the user's.
 pub async fn delete(
     State(state): State<UsersState>,
     Extension(actor): Extension<AdminActor>,
     id: Result<Path<Uuid>, PathRejection>,
 ) -> Result<StatusCode, AdminError> {
-    let Path(id) = id.map_err(|_| invalid_id(&actor.request_id))?;
-    let mut tx = state
-        .state_db
-        .begin()
-        .await
-        .map_err(|err| internal("begin tx", err, &actor.request_id))?;
+    let rid = actor.request_id.as_str();
+    let Path(id) = id.map_err(|_| invalid_id("user", rid))?;
 
-    let before = tx_get_user_by_id(&mut tx, id)
+    let mut atx = AuditedTx::begin(&state.state_db, &actor).await?;
+    let is_self = lock_actor_unless_self(&mut atx, &actor, id).await?;
+    let before = users::tx_lock_user(atx.tx(), id)
         .await
-        .map_err(|err| internal("get_user", err, &actor.request_id))?
-        .ok_or_else(|| AdminError::not_found().with_request_id(&actor.request_id))?;
-
-    let deleted = tx_soft_delete_user(&mut tx, id)
-        .await
-        .map_err(|err| internal("soft_delete_user", err, &actor.request_id))?;
-    if !deleted {
-        return Err(AdminError::not_found().with_request_id(&actor.request_id));
+        .map_err(|err| store_error("lock_user", err, rid))?
+        .ok_or_else(|| not_found(rid))?;
+    if is_self {
+        atx.actor_is(before.id);
     }
-
-    // Upsert the actor's own row in the same tx as the audit write (atomicity).
-    // Guard: if the actor is deleting their own row, skip the upsert — the
-    // DELETE already soft-deleted the row, and re-inserting via upsert would
-    // create a new active row that immediately cancels the soft-delete.
-    let actor_id = if actor.sub == before.user_sub {
-        before.id
-    } else {
-        tx_upsert_actor(&mut tx, &actor.sub, &actor.email, &actor.groups)
-            .await
-            .map_err(|err| internal("upsert_actor", err, &actor.request_id))?
-    };
-
-    let audit_row = PermissionsAuditRow {
-        actor_id,
-        actor_email: actor.email.clone(),
-        action: PermissionsAuditAction::Delete,
-        target_type: PermissionsAuditTargetType::User,
-        target_id: id,
-        before: Some(user_payload(&before)),
-        after: None,
-        request_id: actor.request_id.clone(),
-    };
-    permissions::log(&mut *tx, &audit_row)
+    let revoked = grants::tx_revoke_grants_for_user(atx.tx(), id)
         .await
-        .map_err(|err| internal("audit log", err, &actor.request_id))?;
-
-    tx.commit()
+        .map_err(|err| store_error("revoke_user_grants", err, rid))?;
+    if !users::tx_soft_delete_user(atx.tx(), id)
         .await
-        .map_err(|err| internal("commit tx", err, &actor.request_id))?;
-
-    // A soft-deleted user must not keep landing authz decisions from cache
-    // until the TTL expires — drop the entry so the next request reloads
-    // (and now sees no active row, i.e. no grants). Fire-and-forget so a
-    // client disconnect can't strand the entry (see
-    // [`PermissionsCache::spawn_invalidate`]).
-    PermissionsCache::spawn_invalidate(&state.cache, Some(&before.user_sub));
-
+        .map_err(|err| store_error("soft_delete_user", err, rid))?
+    {
+        return Err(not_found(rid));
+    }
+    for grant in &revoked {
+        let target = PermissionsAuditTargetType::Grant;
+        let before_json = Some(grant_payload(grant));
+        atx.audit(Action::Delete, target, grant.id, before_json, None)
+            .await?;
+    }
+    atx.audit(Action::Delete, USER, id, Some(user_payload(&before)), None)
+        .await?;
+    let change = PermissionsChange::User(before.user_sub.clone());
+    atx.commit(&state.cache, Some(change)).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Pick the lock order for a mutation of user `id`: lock the actor row first
+/// unless `id` is the actor's own row. Returns whether it is. A missing id
+/// is a 404.
+pub(super) async fn lock_actor_unless_self(
+    atx: &mut AuditedTx<'_>,
+    actor: &AdminActor,
+    id: Uuid,
+) -> Result<bool, AdminError> {
+    let rid = actor.request_id.as_str();
+    let sub = users::tx_user_sub(atx.tx(), id)
+        .await
+        .map_err(|err| store_error("user_sub", err, rid))?
+        .ok_or_else(|| not_found(rid))?;
+    let is_self = sub == actor.sub;
+    if !is_self {
+        atx.lock_actor().await?;
+    }
+    Ok(is_self)
 }

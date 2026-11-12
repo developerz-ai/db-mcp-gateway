@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
+use crate::authz::ConstraintsPatch;
 use crate::config::Constraints;
-use crate::state::permissions::{GrantTarget, Page, PermissionsGrant};
+use crate::state::permissions::{Page, PermissionsGrant};
 
 /// `GrantTarget` is an XOR in the storage schema (migration 0004's
 /// `permissions_grants_target_xor_wildcard_check`): exactly one of
@@ -48,13 +49,21 @@ pub struct CreateGrantRequest {
 /// different grant. To re-target, callers DELETE then POST. `deny_unknown_fields`
 /// enforces this: attempting to send `database_id`/`server`/`db_name_wildcard`
 /// via PATCH returns `400 invalid_request`.
+///
+/// `constraints` is a per-key patch merged onto the stored object: a key the
+/// body leaves out keeps its value, so a PATCH can never loosen a constraint
+/// it did not name.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateGrantRequest {
     #[serde(default)]
     pub action: Option<String>,
     #[serde(default)]
-    pub constraints: Option<Constraints>,
+    pub constraints: Option<ConstraintsPatch>,
+    /// Optimistic-concurrency precondition: 409 if the row's `updated_at`
+    /// differs.
+    #[serde(default)]
+    pub expected_updated_at: Option<DateTime<Utc>>,
 }
 
 /// Public response shape. Mirrors `permissions_grants` rows; storage carries
@@ -78,15 +87,12 @@ pub struct GrantResponse {
 
 impl From<PermissionsGrant> for GrantResponse {
     fn from(g: PermissionsGrant) -> Self {
-        let (database_id, server, db_name_wildcard) = match &g.target {
-            GrantTarget::Specific { database_id } => (Some(*database_id), None, false),
-            GrantTarget::Wildcard { server } => (None, Some(server.clone()), true),
-        };
+        let (server, database_id, db_name_wildcard) = g.target.columns();
         Self {
             id: g.id,
             user_id: g.user_id,
             database_id,
-            server,
+            server: server.map(str::to_string),
             db_name_wildcard,
             action: g.action.as_db_str().to_string(),
             constraints: g.constraints,

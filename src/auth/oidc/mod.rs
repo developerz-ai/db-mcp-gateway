@@ -4,20 +4,24 @@
 //! `jsonwebtoken` for the crypto (signature, alg, exp) — the historically
 //! risky bits — and validate `iss` / `aud` / `nonce` / `kid` ourselves.
 
+mod discovery;
 mod helpers;
+mod jwks;
 mod types;
 
+use discovery::get_json;
 use helpers::*;
+use jwks::{JwksCache, Probe};
 use types::*;
 
+pub(crate) use helpers::is_loopback;
 pub use types::{DiscoveryDocument, VerifiedIdentity};
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use jsonwebtoken::{Algorithm, DecodingKey, Validation};
-use tokio::sync::RwLock;
+use jsonwebtoken::Validation;
+use tokio::sync::{Mutex, RwLock};
 
 use super::config::AuthConfig;
 use super::errors::AuthError;
@@ -26,10 +30,21 @@ use super::errors::AuthError;
 #[derive(Clone, Debug)]
 pub struct OidcClient {
     config: Arc<AuthConfig>,
+    /// `config.issuer` without a trailing slash: the one form used to build
+    /// the discovery URL and to compare against the discovery document.
+    issuer: Arc<str>,
     http: reqwest::Client,
-    discovery: Arc<RwLock<Option<DiscoveryDocument>>>,
+    discovery: Arc<RwLock<Option<(DiscoveryDocument, Instant)>>>,
+    /// Serializes discovery refetches; holders re-check the cache first.
+    discovery_refresh: Arc<Mutex<()>>,
     jwks: Arc<RwLock<Option<JwksCache>>>,
+    /// Serializes JWKS refetches; holders re-check the cache first.
+    jwks_refresh: Arc<Mutex<()>>,
 }
+
+/// Discovery is re-read this often, so an IdP that moves an endpoint or its
+/// `jwks_uri` is picked up without a restart.
+const DISCOVERY_TTL: Duration = Duration::from_secs(3600);
 
 /// Cap on an IdP metadata round-trip (discovery, JWKS). These are small,
 /// cacheable GETs against static documents; if one is slow, something is wrong
@@ -56,7 +71,6 @@ impl OidcClient {
         // task open indefinitely (T3). connect_timeout caps the TCP/TLS dial;
         // timeout caps the whole request. The code exchange overrides the
         // latter — see `TOKEN_EXCHANGE_TIMEOUT`.
-        use std::time::Duration;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(DEFAULT_IDP_TIMEOUT)
@@ -64,10 +78,13 @@ impl OidcClient {
             .build()
             .map_err(|_| AuthError::HttpClient)?;
         Ok(Self {
+            issuer: Arc::from(config.issuer.trim_end_matches('/')),
             config: Arc::new(config),
             http,
             discovery: Arc::new(RwLock::new(None)),
+            discovery_refresh: Arc::new(Mutex::new(())),
             jwks: Arc::new(RwLock::new(None)),
+            jwks_refresh: Arc::new(Mutex::new(())),
         })
     }
 
@@ -141,9 +158,16 @@ impl OidcClient {
     ) -> Result<VerifiedIdentity, AuthError> {
         let header = jsonwebtoken::decode_header(id_token).map_err(|_| AuthError::IdToken)?;
         let kid = header.kid.ok_or(AuthError::IdToken)?;
-        let key = self.decoding_key(&kid).await?;
+        // The JWKS decides which algorithms each key may verify; a header alg
+        // outside that set (HS256, `none`, RSA-vs-EC confusion) never decodes.
+        let verify_key = self.verify_key(&kid).await?;
+        let key = verify_key.for_alg(header.alg).ok_or(AuthError::IdToken)?;
+        // OIDC Core 3.1.3.7 step 2: `iss` must exactly match the discovery
+        // document's issuer — compare against that, not the configured string,
+        // so a trailing-slash difference in config can't reject valid tokens.
+        let issuer = self.discover().await?.issuer;
 
-        let mut validation = Validation::new(Algorithm::RS256);
+        let mut validation = Validation::new(header.alg);
         // `set_issuer` / `set_audience` only constrain a claim that is *present*:
         // in `jsonwebtoken` 9.3 an absent `iss`/`aud` falls through the match to
         // `_ => {}`. `required_spec_claims` defaults to `{exp}` alone, and our
@@ -151,14 +175,14 @@ impl OidcClient {
         // them to exist — a token from the IdP's JWKS with no `aud` would verify.
         // Demanding them here is OIDC Core 3.1.3.7 step 3.
         validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
-        validation.set_issuer(&[&self.config.issuer]);
+        validation.set_issuer(&[&issuer]);
         validation.set_audience(&[&self.config.audience]);
         validation.validate_exp = true;
         // `jsonwebtoken` leaves `nbf` off by default; without this a future-dated
         // ID token (not-yet-valid) would be accepted.
         validation.validate_nbf = true;
 
-        let data = jsonwebtoken::decode::<serde_json::Value>(id_token, &key, &validation)
+        let data = jsonwebtoken::decode::<serde_json::Value>(id_token, key, &validation)
             .map_err(|_| AuthError::IdToken)?;
         let claims = data.claims;
 
@@ -203,95 +227,51 @@ impl OidcClient {
     }
 
     async fn discover(&self) -> Result<DiscoveryDocument, AuthError> {
-        if let Some(d) = self.discovery.read().await.as_ref() {
-            return Ok(d.clone());
+        if let Some(doc) = self.fresh_discovery().await {
+            return Ok(doc);
         }
-        // The configured issuer must be https (else discovery, code exchange,
-        // and client_secret travel in plaintext — A4). Loopback http is allowed
-        // for local dev / mock IdPs.
-        require_secure_url(&self.config.issuer)?;
-        let url = format!(
-            "{}/.well-known/openid-configuration",
-            self.config.issuer.trim_end_matches('/')
-        );
-        let doc: DiscoveryDocument = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|_| AuthError::Discovery)?
-            .error_for_status()
-            .map_err(|_| AuthError::Discovery)?
-            .json()
-            .await
-            .map_err(|_| AuthError::Discovery)?;
-
-        // Issuer per OIDC §4: must match the one we asked for. Stops a tampered
-        // discovery doc from quietly pointing us at a different IdP.
-        if doc.issuer.trim_end_matches('/') != self.config.issuer.trim_end_matches('/') {
-            return Err(AuthError::Discovery);
+        let _refresh = self.discovery_refresh.lock().await;
+        if let Some(doc) = self.fresh_discovery().await {
+            return Ok(doc);
         }
-
-        // A discovery doc can repoint us at http endpoints even when the issuer
-        // is https; reject any non-https (non-loopback) endpoint before we ever
-        // POST the code + client_secret to it (A4).
-        require_secure_url(&doc.authorization_endpoint)?;
-        require_secure_url(&doc.token_endpoint)?;
-        require_secure_url(&doc.jwks_uri)?;
-
-        *self.discovery.write().await = Some(doc.clone());
+        let doc = discovery::fetch(&self.http, &self.issuer).await?;
+        *self.discovery.write().await = Some((doc.clone(), Instant::now()));
         Ok(doc)
     }
 
-    async fn decoding_key(&self, kid: &str) -> Result<DecodingKey, AuthError> {
-        // Fast path: live cache that hasn't aged out.
-        if let Some(key) = self.jwks.read().await.as_ref().and_then(|cache| {
-            (cache.fetched_at.elapsed() < JWKS_TTL)
-                .then(|| cache.keys.get(kid).cloned())
-                .flatten()
-        }) {
+    async fn fresh_discovery(&self) -> Option<DiscoveryDocument> {
+        self.discovery
+            .read()
+            .await
+            .as_ref()
+            .filter(|(_, fetched_at)| fetched_at.elapsed() < DISCOVERY_TTL)
+            .map(|(doc, _)| doc.clone())
+    }
+
+    /// The key for `kid`. An unknown `kid` refetches the JWKS (the IdP rotated
+    /// keys) at most once per [`jwks::UNKNOWN_KID_REFETCH`], and concurrent
+    /// misses share one fetch.
+    async fn verify_key(&self, kid: &str) -> Result<jwks::VerifyKey, AuthError> {
+        if let Some(key) = self.probe_jwks(kid).await? {
+            return Ok(key);
+        }
+        let _refresh = self.jwks_refresh.lock().await;
+        if let Some(key) = self.probe_jwks(kid).await? {
             return Ok(key);
         }
         let discovery = self.discover().await?;
-        let jwks: Jwks = self
-            .http
-            .get(&discovery.jwks_uri)
-            .send()
-            .await
-            .map_err(|_| AuthError::Discovery)?
-            .error_for_status()
-            .map_err(|_| AuthError::Discovery)?
-            .json()
-            .await
-            .map_err(|_| AuthError::Discovery)?;
+        let cache = JwksCache::new(get_json(&self.http, &discovery.jwks_uri).await?);
+        let key = cache.get(kid);
+        *self.jwks.write().await = Some(cache);
+        key.ok_or(AuthError::IdToken)
+    }
 
-        let mut by_kid: HashMap<String, DecodingKey> = HashMap::new();
-        for jwk in jwks.keys {
-            let Some(jwk_kid) = jwk.kid.clone() else {
-                continue;
-            };
-            if jwk.kty != "RSA" {
-                continue;
-            }
-            if let Some(use_) = &jwk.use_
-                && use_ != "sig"
-            {
-                continue;
-            }
-            let (Some(n), Some(e)) = (jwk.n.as_deref(), jwk.e.as_deref()) else {
-                continue;
-            };
-            if let Ok(key) = DecodingKey::from_rsa_components(n, e) {
-                by_kid.insert(jwk_kid, key);
-            }
+    /// `Ok(Some)` hit, `Ok(None)` fetch needed, `Err` known-unknown `kid`.
+    async fn probe_jwks(&self, kid: &str) -> Result<Option<jwks::VerifyKey>, AuthError> {
+        match jwks::probe(self.jwks.read().await.as_ref(), kid) {
+            Probe::Hit(key) => Ok(Some(key)),
+            Probe::Fetch => Ok(None),
+            Probe::Unknown => Err(AuthError::IdToken),
         }
-        // Write cache before lookup to prevent refetch amplification when a key is
-        // unknown: subsequent requests for the same unknown kid use the cached JWKS set.
-        *self.jwks.write().await = Some(JwksCache {
-            keys: by_kid.clone(),
-            fetched_at: Instant::now(),
-        });
-        let key = by_kid.get(kid).cloned().ok_or(AuthError::IdToken)?;
-        Ok(key)
     }
 }

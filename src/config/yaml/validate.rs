@@ -6,6 +6,7 @@ use std::collections::HashSet;
 
 use crate::config::schema::{Permission, Server, ServiceAccount, StreamSinkConfig};
 
+use super::limits::{validate_constraint_values, validate_server_values};
 use super::roles::{reject_superuser_role, validate_role};
 use super::{
     AdminBlock, ConfigFile, ConfigFileError, PermissionsStoreBlock, PermissionsStoreDriver,
@@ -19,7 +20,8 @@ impl ConfigFile {
         let server_names = validate_servers(&self.servers)?;
         let group_names = validate_permissions(&self.permissions, &self.servers, &server_names)?;
         validate_service_accounts(&self.service_accounts, &group_names, admin)?;
-        validate_stream_sinks(&self.logging.stream)
+        validate_stream_sinks(&self.logging.stream)?;
+        self.reject_production_literals()
     }
 }
 
@@ -60,6 +62,7 @@ fn validate_permissions_store(
 fn validate_servers(servers: &[Server]) -> Result<HashSet<&str>, ConfigFileError> {
     let mut server_names: HashSet<&str> = HashSet::new();
     for server in servers {
+        validate_server_values(server)?;
         if !server_names.insert(&server.name) {
             return Err(ConfigFileError::Invalid(format!(
                 "duplicate server name `{}`",
@@ -137,6 +140,7 @@ fn validate_permissions<'a>(
             )));
         }
         validate_grants(permission, servers, server_names)?;
+        validate_constraint_values(permission)?;
     }
     Ok(group_names)
 }

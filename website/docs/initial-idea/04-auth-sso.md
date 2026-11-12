@@ -86,15 +86,19 @@ Operators should enforce this at deployment time (reverse-proxy validation, netw
 
 ### Dynamic Client Registration — `POST /register`
 
-Accepts JSON. Required field: `redirect_uris` (non-empty array). Optional: `client_name`.
+Accepts JSON. Required field: `redirect_uris` (1–8 entries, each at most 2048 bytes). Optional: `client_name`. A body that is not valid JSON gets `invalid_client_metadata` (RFC 7591 §3.2.2).
 
-Each redirect URI must be **HTTPS** (any host) or **HTTP with a loopback host** (`localhost`, `127.0.0.0/8`, `::1`). Anything else — including `http://` to a non-loopback host — is rejected with `invalid_redirect_uri`.
+Each redirect URI must be **HTTPS** (any host) or **HTTP with a loopback host** (`localhost`, `127.0.0.0/8`, `::1`). Anything else — including `http://` to a non-loopback host, or more/longer URIs than the bounds above — is rejected with `invalid_redirect_uri`.
 
-Returns `{ "client_id": "mcp-<uuid>", "redirect_uris": […], "token_endpoint_auth_method": "none" }`.
+Returns `{ "client_id": "mcp-<uuid>", "redirect_uris": […], "token_endpoint_auth_method": "none", "grant_types": ["authorization_code", "refresh_token"], "response_types": ["code"] }`.
+
+`/token` and `/revoke` answer an undecodable form (wrong content type, unreadable body) with the RFC 6749 §5.2 shape `{"error": "invalid_request", "error_description": …}`, never plain text.
 
 The registry is persisted in the state DB (`oauth_clients`, migration 0008) and bounded (TTL + hard cap) because this endpoint is unauthenticated. Registrations **survive restarts and redeploys** and are shared across replicas, so a client that caches its `client_id` (most do) keeps working across a gateway rollout instead of hitting `invalid_client`. (Auth codes and pending logins remain in-process — see [State & persistence](#state--persistence) below.)
 
-The TTL is **90 days and sliding**: every successful `/authorize` renews it, so a client that keeps signing in keeps its registration and only an abandoned one ages out. It was 24 h, which held only if a client re-registered per login. Real clients don't — they cache the `client_id` for as long as they stay signed in, then replay it days later against a registration that has since been GC'd.
+A new registration lives **1 hour** until it is first used. The first successful `/authorize` promotes it to **90 days, sliding**: every later `/authorize` renews it, so a client that keeps signing in keeps its registration and only an abandoned one ages out. (A client adopted by `/authorize` counts as used at once.) The long window exists because real clients cache the `client_id` for as long as they stay signed in, then replay it days later. The hard cap is 10 000 rows. At the cap a registration first evicts the oldest expired or never-used row, in the same statement as the insert. A client that has authorized is never evicted, so an unauthenticated `/register` flood only displaces its own junk. Only a table full of used clients refuses with `503 temporarily_unavailable`. Expired rows are deleted by the background GC task, not on the request path.
+
+Pending IdP logins (`/auth/login`, bridged `/authorize`) are capped at 10 000 in-process. At the cap the **oldest** pending login is evicted, so a flood can never block a fresh login. Every pending login has the same 15-minute TTL, so the oldest one is also the first to expire.
 
 #### Unknown `client_id`: adopt on loopback, reject off-box
 
@@ -107,7 +111,7 @@ So `/authorize` self-heals, in exactly one direction:
 | HTTP loopback (`localhost`, `127.0.0.0/8`, `::1`) | **Adopted** — the id is registered against that URI and the flow proceeds |
 | Anything else (including HTTPS) | `invalid_client` — hard reject |
 
-Adoption is safe only for loopback because the authorization code can then only be delivered to the user's own machine — there is no third party to leak it to (RFC 8252 §7.3, the same carve-out that lets a loopback redirect vary its port). An HTTPS redirect is precisely the case the allowlist exists to stop: waving an unknown client through would let a code be sent to a host nobody vouched for. Adopted ids are length- and charset-bounded (≤128 printable-ASCII characters) and still subject to the registry's hard cap, so `/authorize` can't be used to stuff the table.
+Adoption is safe only for loopback because the authorization code can then only be delivered to the user's own machine — there is no third party to leak it to (RFC 8252 §7.3, the same carve-out that lets a loopback redirect vary its port). An HTTPS redirect is precisely the case the allowlist exists to stop: waving an unknown client through would let a code be sent to a host nobody vouched for. Adopted ids are length- and charset-bounded (≤128 printable-ASCII characters), the adopted redirect URI obeys the same 2048-byte bound as `/register`, and the id is recorded only after every other `/authorize` parameter (PKCE, `state`) validates — a request that fails validation leaves nothing in the registry. Adoption is still subject to the registry's hard cap, so `/authorize` can't be used to stuff the table.
 
 ### Authorization endpoint — `GET /authorize`
 
@@ -123,7 +127,9 @@ All parameters below are **required**. Missing or invalid → `invalid_request` 
 | `state` | non-empty string; echoed back verbatim on the `302` as the client's CSRF token |
 | `resource` | optional; forwarded as-is to the token response (RFC 8707) |
 
-On success the browser is redirected to the IdP login. After the user authenticates, the gateway 302s back to the registered `redirect_uri` with `?code=<one-time>&state=<echoed>`. On IdP failure the 302 carries `?error=access_denied&state=<echoed>` so the client's loopback handler completes rather than hanging.
+On success the browser is redirected to the IdP login. After the user authenticates, the gateway 302s back to the registered `redirect_uri` with `?code=<one-time>&state=<echoed>`. On IdP failure the 302 carries `?error=<code>&state=<echoed>` so the client's loopback handler completes rather than hanging.
+
+**`/auth/callback` without a code.** The IdP may send the browser back with `error` (RFC 6749 §4.1.2.1 — the user declined, or the IdP failed) and no `code`. The gateway takes the pending flow by `state` either way. For an OAuth-bridge login it 302s to the client's redirect with `error=temporarily_unavailable` or `server_error` when the IdP said so, else `access_denied`; the IdP's `error_description` is logged server-side only. For the bespoke `/auth/login` flow it shows a `400` "sign-in not completed" page. A missing or unknown `state` shows the "login session expired" page, as before.
 
 #### Redirect-URI matching (OAuth 2.1 + RFC 8252 §7.3)
 
@@ -152,7 +158,7 @@ The code is consumed on first use (replay → `invalid_grant`).
 |---|---|
 | `refresh_token` | the token from a previous `/token` response |
 
-Refresh tokens rotate: presenting one consumes it and a new pair is returned. A replayed (already-rotated) token → `invalid_grant`.
+Refresh tokens rotate: presenting one consumes it and a new pair is returned. A replayed (already-rotated) token → `invalid_grant`. Each refresh token is paired with the access session minted alongside it (`oauth_refresh_tokens.session_id`, migration 0012); rotation revokes that previous session, so after a refresh the old access token is rejected. Consuming the old token, revoking its session, and storing the new session and token are one state-DB transaction: a failure part-way commits nothing, the response is a 5xx, and the presented refresh token stays redeemable — a transient error is never a sign-out.
 
 Rotation does **not** extend the token's lifetime. A chain has an **absolute TTL** measured from the *first* token's mint; the original `issued_at` is carried verbatim through every rotation, so a continuously refreshed chain still expires on schedule and forces a fresh `/authorize` login. The TTL is set by `REFRESH_TTL_DAYS` (**default 1 day**); an operator who wants a longer "stay signed in" window — up to 90 days — raises it there. The default is deliberately short because a refresh re-mints the session from the IdP identity — **groups included** — that was frozen at the original login; until the chain dies, a group change at the IdP (off-boarding, role downgrade) can't reach the gateway. So the TTL is directly a group-staleness window: one day keeps it within a normal deprovisioning cadence while still spanning a working day of silent renewals, and a 90-day setting trades that freshness for convenience — pair it with prompt out-of-band revocation (`POST /revoke`, logout) for off-boarding. (Re-validating the identity against the IdP on each refresh would decouple lifetime from staleness but needs an IdP refresh token / `offline_access` the bridge doesn't yet hold — deferred.) Refresh tokens (and the short-lived authorization codes) are stored **hashed** (SHA-256) — the store holds only digests, so neither a memory dump nor a dump of `oauth_refresh_tokens` can be replayed as a live token. Lowering `REFRESH_TTL_DAYS` applies to chains already minted under the old, longer window: redemption re-checks the chain's birth against the *currently configured* TTL rather than honoring the deadline stamped at mint time.
 
@@ -181,10 +187,10 @@ RFC 7009 OAuth 2.0 Token Revocation. Accepts `application/x-www-form-urlencoded`
 
 The gateway invalidates whichever the token matches:
 
-- **Refresh token** → dropped from the rotation store. Since a rotated chain keeps exactly one live token, this ends the whole chain.
+- **Refresh token** → dropped from the rotation store, and its paired access session revoked in the same transaction. Since a rotated chain keeps exactly one live token, this ends the whole chain and leaves no live bearer for it.
 - **Access token** (session JWT) → its backing session row is revoked, so the bearer stops working on the next request (RFC 7009 §2.1 — kill the access token too, not just the refresh token).
 
-Per RFC 7009 §2.2 the response is **`200` for any well-formed request** — an unknown, expired, forged, or already-revoked token included — so the endpoint can't be used to probe token validity. A missing `token` is the lone malformed case → `invalid_request` (400). Responses carry `Cache-Control: no-store`.
+Per RFC 7009 §2.2.1 the response is **`200` for any well-formed request** — an unknown, expired, forged, or already-revoked token included — so the endpoint can't be used to probe token validity. A missing `token` is the lone malformed case → `invalid_request` (400). When the state DB cannot record the revocation the response is **`503`** (`server_error`), never a `200` claiming a revoke that did not happen; the client should retry. Responses carry `Cache-Control: no-store`.
 
 ### Proxy / WAF requirements
 
@@ -214,7 +220,9 @@ State that is *meant* to outlive the process is in the state DB: **dynamic clien
 - Short TTL (default 8 hours; `expires_in` in the token response reflects the actual value).
 - **Bespoke flow:** refresh by re-running SSO. No long-lived refresh token on the developer's machine.
 - **OAuth bridge flow:** a rotating opaque refresh token is returned at `/token`. Presenting it issues a new access+refresh pair and consumes the old refresh token (replay → `invalid_grant`). Rotation never extends the chain: an absolute TTL (`REFRESH_TTL_DAYS`, default 1 day, raise up to 90 for a longer "stay signed in" window) runs from the first token's mint, after which the client must re-authenticate via `/authorize`. The TTL doubles as the staleness bound for a revoked group — refresh re-uses the groups frozen at login — so a longer window trades group freshness for convenience (see the `/token` section above). Refresh tokens are stored hashed (SHA-256) in the state DB, so a chain survives a restart or redeploy — the configured window is the real one.
-- Revocation: server-side, in the state DB. Logout (`POST /auth/logout`) revokes the session row **and** purges every refresh-token chain for that identity — otherwise a logged-out client could silently mint a fresh session via the refresh grant. Clients may also revoke a single token out-of-band via `POST /revoke` (RFC 7009). Every `/mcp` request resolves the session through a small in-memory cache fronting the state DB: a cache hit newer than `SESSION_CACHE_TTL_SECONDS` (default 30s) is served without a DB read; an older hit re-reads and re-validates against `revoked_at`. The replica that processes the revoke evicts its own entry immediately, so the next call there is rejected at once.
+- Revocation: server-side, in the state DB. Logout (`POST /auth/logout`) signs the identity out **everywhere**: it revokes every live session of that `sub` (every device) **and** deletes every refresh-token chain for it, in one transaction — otherwise a logged-out client could silently mint a fresh session via the refresh grant. If the state DB cannot record that, logout answers 5xx instead of a `204` that would leave bearers live. Clients may also revoke a single token out-of-band via `POST /revoke` (RFC 7009). Every `/mcp` request resolves the session through a small in-memory cache fronting the state DB: a cache hit newer than `SESSION_CACHE_TTL_SECONDS` (default 30s) is served without a DB read; an older hit re-reads and re-validates against `revoked_at`. Concurrent requests that miss the cache for the same session share one DB read. The replica that processes the revoke leaves a **tombstone** for the session (kept at least `max(SESSION_CACHE_TTL_SECONDS, 60s)`): the next call there is rejected without a DB read, and a lookup that read the row just before the revoke committed cannot re-cache it. A session found revoked, expired or missing is tombstoned the same way.
+- **Credential vs. gateway failure.** A missing, malformed, expired or revoked bearer is a `401` with `WWW-Authenticate` — the client should re-run login. A state-DB or other gateway-side failure while checking the bearer is a `5xx` with no `WWW-Authenticate`: re-login would not fix it, so a state-DB blip never signs a working user out.
+- **Garbage collection.** A background task deletes session rows that expired more than one hour ago (`sessions_expires_at_idx`). Revoked rows are kept until they expire — until then they are the denylist entry for a JWT that still verifies — so the table holds at most the live sessions plus one hour of expired ones. The session JWT allows 30 s of clock skew on `exp`, well inside that hour.
   - **Multi-replica (HA) caveat.** A revoke only evicts the cache on the replica that handled it. On other replicas the session stays honored until their cached entry ages past `SESSION_CACHE_TTL_SECONDS` (≤30s by default), at which point the next lookup re-reads the DB and sees the revoke. Lower the TTL to tighten this cross-replica window (`0` = re-validate every request) at the cost of more state-DB reads; raise it to spend fewer reads for a wider window. The cache is also size-bounded, so a flood of distinct sessions can't grow it without limit.
 
 ## Service tokens (headless clients)
@@ -285,6 +293,9 @@ Recommended values by risk tolerance:
 |---|---|
 | IdP unreachable during login | Surface clearly; do not fall back to local auth |
 | IdP unreachable mid-session | Existing valid tokens keep working (we don't introspect every request) |
+| State DB unreachable | Bearer checks that miss the session cache, logout, `/token` and `/revoke` answer 5xx (no `WWW-Authenticate`); clients retry rather than re-login |
+| IdP rotates its signing keys | An ID token naming an unknown `kid` refetches the JWKS — at most once per 60 s, and concurrent misses share one fetch — so a rotation is picked up without a restart and a bogus `kid` can't turn into a flood of IdP requests. The JWKS is otherwise cached for an hour and the discovery document for an hour. RSA keys verify `RS256`/`PS256`, P-256 keys `ES256`; a JWK that declares its `alg` verifies only that one, and `none`/HMAC are never accepted |
+| Configured `OIDC_ISSUER` differs from the IdP's only by a trailing slash | Accepted: discovery compares the normalized form, and the ID token's `iss` is checked against the discovery document's `issuer` exactly (OIDC Core 3.1.3.7) |
 | User removed from IdP | Token still valid until TTL; revoke explicitly via admin command if needed |
 | Group changed mid-session | Old group snapshot applies until re-login (documented; reduces every-request IdP load) |
 | Token leaked | Revoke via admin command; user re-runs login |

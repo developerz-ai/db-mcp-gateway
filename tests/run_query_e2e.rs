@@ -215,13 +215,15 @@ async fn run_query_full_acceptance() {
         assert_eq!(resp["result"]["isError"], true, "{label}: {resp}");
         let body = payload(&resp);
         assert_eq!(body["code"], "forbidden_sql", "{label}: {body}");
-        // MCP error contract (website/docs/initial-idea/03-mcp-tools.md §Errors):
-        // every error body echoes the JSON-RPC request id.
-        assert_eq!(
-            body["request_id"], 1,
-            "{label}: missing or wrong request_id in error payload: {body}"
-        );
         assert_audit_outcome(pool, sub, "run_query", "forbidden_sql", label).await;
+        // MCP error contract (website/docs/initial-idea/03-mcp-tools.md §Errors):
+        // the error body's `request_id` is the one the audit row carries.
+        let row = latest_audit(pool, sub, "run_query", label).await;
+        assert_eq!(
+            body["request_id"].as_str(),
+            Some(row.request_id.as_str()),
+            "{label}: error payload request_id must key the audit row: {body}"
+        );
     }
 
     // 8. Function denylist: `pg_read_file` and siblings are blocked by the
@@ -548,6 +550,7 @@ async fn run_query_cache_backed_db_grant() {
         user_email: "cache-test@example.com".to_string(),
         groups: vec![], // Intentionally empty: no YAML grants.
         issued_at: chrono::Utc::now(),
+        kind: db_mcp_gateway::auth::IdentityKind::Sso,
     };
 
     // Load grants via cache; this will populate the cache from the DB.
@@ -656,6 +659,54 @@ async fn run_query_preserves_client_id_but_audit_row_carries_gateway_uuid() {
         row.request_id, hostile_client_id,
         "audit request_id must not be derived from the client's JSON-RPC id"
     );
+}
+
+/// The `request_id` an agent reads from an error body — and from the
+/// `x-request-id` header — is the one in `audit_calls.request_id`, so ops can
+/// find the row from what the agent pastes back. A denied call needs no
+/// target database, so this runs against the state DB alone.
+#[tokio::test]
+async fn error_response_request_id_matches_the_audit_row() {
+    let booted = boot_gateway().await;
+    let resp = client()
+        .post(format!("{}/mcp", booted.url))
+        .bearer_auth(&booted.bearer)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": {
+                "name": "run_query",
+                "arguments": { "server": "no-such-server", "database": "app", "sql": "SELECT 1" },
+            },
+        }))
+        .send()
+        .await
+        .unwrap();
+    let header = resp
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let resp: Value = resp.json().await.unwrap();
+
+    assert_eq!(resp["id"], 42, "envelope echoes the client id: {resp}");
+    let body = payload(&resp);
+    assert_eq!(body["code"], "forbidden", "{body}");
+    let row = latest_audit(
+        &booted.state_db,
+        &booted.user_sub,
+        "run_query",
+        "denied call",
+    )
+    .await;
+    assert_eq!(row.outcome, "forbidden");
+    assert_eq!(
+        body["request_id"].as_str(),
+        Some(row.request_id.as_str()),
+        "{body}"
+    );
+    assert_eq!(header.as_deref(), Some(row.request_id.as_str()));
 }
 
 /// A `tools/call` sent as a JSON-RPC notification (no `id`) must NOT execute
@@ -797,6 +848,7 @@ async fn concurrency_test_server(
             user_email: "concurrency@example.com".into(),
             groups: vec![],
             issued_at: chrono::Utc::now(),
+            kind: db_mcp_gateway::auth::IdentityKind::Sso,
         });
         next.run(req).await
     }

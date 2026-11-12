@@ -4,13 +4,19 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Delete every `audit_calls` row for `user_sub`; panics on failure.
+/// Delete every `audit_calls` and `audit_call_intents` row for `user_sub`;
+/// panics on failure.
 pub async fn delete_audit_calls(pool: &PgPool, user_sub: &str) {
-    sqlx::query("DELETE FROM audit_calls WHERE user_sub = $1")
-        .bind(user_sub)
-        .execute(pool)
-        .await
-        .expect("cleanup audit_calls rows");
+    for sql in [
+        "DELETE FROM audit_call_intents WHERE user_sub = $1",
+        "DELETE FROM audit_calls WHERE user_sub = $1",
+    ] {
+        sqlx::query(sql)
+            .bind(user_sub)
+            .execute(pool)
+            .await
+            .expect("cleanup audit rows");
+    }
 }
 
 /// Best-effort: drop the `permissions_audit` rows about `target_id`.

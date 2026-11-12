@@ -9,6 +9,8 @@
 //! - within the TTL, the other replica still serves the (now-revoked) session —
 //!   the multi-replica staleness bound operators must size against.
 //!
+//! Also covers logout-everywhere, session GC and the state-DB-failure class.
+//!
 //! No mocking — these run against the real dev state DB (`bin/dev up`).
 
 mod common;
@@ -157,4 +159,120 @@ async fn revocation_denied_after_real_ttl_elapses() {
     assert!(matches!(err, AuthError::RevokedSession), "got {err:?}");
 
     cleanup(&pool, &user_sub).await;
+}
+
+/// Logout-everywhere: every live session of the subject is rejected at once,
+/// on the revoking replica, without waiting for a cache TTL.
+#[tokio::test]
+async fn revoke_all_for_sub_rejects_every_session_of_that_subject() {
+    let pool = state_pool().await;
+    let user_sub = format!("a3-all-{}", Uuid::new_v4().simple());
+    let other_sub = format!("a3-all-other-{}", Uuid::new_v4().simple());
+    let store = replica(&pool, Duration::from_secs(3600));
+
+    let laptop = create_session(&store, &user_sub).await;
+    let phone = create_session(&store, &user_sub).await;
+    let other = create_session(&store, &other_sub).await;
+    // Warm the cache so the test proves the revoke tombstones, not just misses.
+    assert!(store.lookup(laptop.id).await.is_ok());
+
+    assert_eq!(
+        store.revoke_all_for_sub(&user_sub).await.expect("revoke"),
+        2
+    );
+    for id in [laptop.id, phone.id] {
+        let err = store.lookup(id).await.expect_err("revoked");
+        assert!(matches!(err, AuthError::RevokedSession), "got {err:?}");
+    }
+    assert!(
+        store.lookup(other.id).await.is_ok(),
+        "other subject untouched"
+    );
+
+    cleanup(&pool, &user_sub).await;
+    cleanup(&pool, &other_sub).await;
+}
+
+/// GC deletes rows expired past the grace window and keeps live rows —
+/// including revoked-but-unexpired ones, which are the denylist entry for a
+/// still-signed JWT.
+#[tokio::test]
+async fn gc_deletes_long_expired_rows_and_keeps_the_rest() {
+    let pool = state_pool().await;
+    let user_sub = format!("a3-gc-{}", Uuid::new_v4().simple());
+    let store = replica(&pool, Duration::ZERO);
+
+    let live = create_session(&store, &user_sub).await;
+    let revoked = create_session(&store, &user_sub).await;
+    store.revoke(revoked.id).await.expect("revoke");
+    let expired = Uuid::new_v4();
+    let recently_expired = Uuid::new_v4();
+    for (id, ended) in [(expired, "3 hours"), (recently_expired, "5 minutes")] {
+        sqlx::query(
+            "INSERT INTO sessions (id, user_sub, user_email, issued_at, expires_at) \
+             VALUES ($1, $2, 'gc@example.com', now() - interval '1 day', now() - $3::interval)",
+        )
+        .bind(id)
+        .bind(&user_sub)
+        .bind(ended)
+        .execute(&pool)
+        .await
+        .expect("insert expired row");
+    }
+
+    store.gc_expired().await.expect("gc");
+
+    let remaining: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM sessions WHERE user_sub = $1")
+        .bind(&user_sub)
+        .fetch_all(&pool)
+        .await
+        .expect("remaining rows");
+    assert!(!remaining.contains(&expired), "long-expired row deleted");
+    for kept in [
+        Uuid::from(live.id),
+        Uuid::from(revoked.id),
+        recently_expired,
+    ] {
+        assert!(remaining.contains(&kept), "{kept} kept");
+    }
+
+    cleanup(&pool, &user_sub).await;
+}
+
+/// An expired session is rejected even when the row was never revoked.
+#[tokio::test]
+async fn expired_session_is_rejected() {
+    let pool = state_pool().await;
+    let user_sub = format!("a3-exp-{}", Uuid::new_v4().simple());
+    let store = replica(&pool, Duration::ZERO);
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO sessions (id, user_sub, user_email, issued_at, expires_at) \
+         VALUES ($1, $2, 'exp@example.com', now() - interval '2 hours', now() - interval '1 minute')",
+    )
+    .bind(id)
+    .bind(&user_sub)
+    .execute(&pool)
+    .await
+    .expect("insert expired row");
+
+    let err = store.lookup(id.into()).await.expect_err("expired");
+    assert!(matches!(err, AuthError::ExpiredSession), "got {err:?}");
+
+    cleanup(&pool, &user_sub).await;
+}
+
+/// A state-DB failure is `AuthError::State` — the gateway's fault, which the
+/// transport maps to 5xx — never a credential error that would force re-login.
+#[tokio::test]
+async fn lookup_with_closed_pool_is_a_state_error() {
+    let pool = state_pool().await;
+    let store = replica(&pool, Duration::ZERO);
+    pool.close().await;
+    let err = store
+        .lookup(Uuid::new_v4().into())
+        .await
+        .expect_err("closed pool");
+    assert!(matches!(err, AuthError::State(_)), "got {err:?}");
+    assert!(!err.is_credential_failure());
 }

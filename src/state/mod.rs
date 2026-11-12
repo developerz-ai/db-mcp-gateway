@@ -10,11 +10,13 @@ pub mod oauth;
 pub mod permissions;
 pub mod sessions;
 
+use std::num::NonZeroU32;
+use std::str::FromStr;
 use std::time::Duration;
 
 use sqlx::mysql::MySqlPoolOptions;
-use sqlx::postgres::PgPoolOptions;
-use sqlx::{MySqlPool, PgPool};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::{Executor, MySqlPool, PgPool};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StateDbError {
@@ -29,15 +31,27 @@ pub enum StateDbError {
     Migrate(#[source] sqlx::migrate::MigrateError),
 }
 
-/// Connect to the state DB and run pending migrations. Returned pool is shared
-/// across the process — Postgres-only, never re-pointed at a target DB.
-pub async fn connect(url: &str, pool_size: u32) -> Result<PgPool, StateDbError> {
-    let pool = PgPoolOptions::new()
-        .max_connections(pool_size)
-        .acquire_timeout(Duration::from_secs(5))
-        .connect(url)
-        .await
-        .map_err(StateDbError::Connect)?;
+/// Session settings `SET` on every new state-DB connection. The request pool
+/// (session lookup, authz read, audit insert) gets a 10 s statement ceiling,
+/// bounding how long a wedged statement holds a connection a caller waits on;
+/// the background pool runs batched prunes and history reads and gets 60 s.
+/// Both end a session left idle inside a transaction after 30 s, so it cannot
+/// hold row locks against the next writer.
+const REQUEST_SESSION_SQL: &str =
+    "SET statement_timeout = '10s'; SET idle_in_transaction_session_timeout = '30s'";
+const BACKGROUND_SESSION_SQL: &str =
+    "SET statement_timeout = '60s'; SET idle_in_transaction_session_timeout = '30s'";
+/// Background work (pruner, GC, reaper) is sequential and low-rate; two
+/// connections keep it off the request pool without competing with it.
+const BACKGROUND_POOL_SIZE: u32 = 2;
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Connect the **request** pool to the state DB and run pending migrations.
+/// Sessions, authz and the audit insert share it; background jobs use
+/// [`connect_background`] so a long prune never takes a request's connection.
+/// Postgres-only, never re-pointed at a target DB.
+pub async fn connect(url: &str, pool_size: NonZeroU32) -> Result<PgPool, StateDbError> {
+    let pool = open_pg(url, pool_size.get(), REQUEST_SESSION_SQL).await?;
 
     sqlx::migrate!("./migrations")
         .run(&pool)
@@ -45,6 +59,33 @@ pub async fn connect(url: &str, pool_size: u32) -> Result<PgPool, StateDbError> 
         .map_err(StateDbError::Migrate)?;
 
     Ok(pool)
+}
+
+/// Connect the small **background** pool (pruner, GC, reaper, history reads).
+/// Call after [`connect`]: it does not migrate.
+pub async fn connect_background(url: &str) -> Result<PgPool, StateDbError> {
+    open_pg(url, BACKGROUND_POOL_SIZE, BACKGROUND_SESSION_SQL).await
+}
+
+/// The timeouts are `SET` per connection in `after_connect`, not sent as the
+/// startup `options` parameter: D1 reaches the state DB through pgcat, which
+/// does not forward `options`. Its state pool is session-mode, so a session
+/// `SET` stays with this client's server connection.
+async fn open_pg(
+    url: &str,
+    max_connections: u32,
+    session_sql: &'static str,
+) -> Result<PgPool, StateDbError> {
+    let options = PgConnectOptions::from_str(url).map_err(StateDbError::Connect)?;
+    PgPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(ACQUIRE_TIMEOUT)
+        .after_connect(move |conn, _meta| {
+            Box::pin(async move { conn.execute(session_sql).await.map(|_| ()) })
+        })
+        .connect_with(options)
+        .await
+        .map_err(StateDbError::Connect)
 }
 
 /// Connect to a MySQL permissions store and run the mysql migrations.
@@ -55,11 +96,11 @@ pub async fn connect(url: &str, pool_size: u32) -> Result<PgPool, StateDbError> 
 /// tables.
 pub async fn connect_permissions_mysql(
     url: &str,
-    pool_size: u32,
+    pool_size: NonZeroU32,
 ) -> Result<MySqlPool, StateDbError> {
     let pool = MySqlPoolOptions::new()
-        .max_connections(pool_size)
-        .acquire_timeout(Duration::from_secs(5))
+        .max_connections(pool_size.get())
+        .acquire_timeout(ACQUIRE_TIMEOUT)
         .connect(url)
         .await
         .map_err(StateDbError::Connect)?;
@@ -70,6 +111,15 @@ pub async fn connect_permissions_mysql(
         .map_err(StateDbError::Migrate)?;
 
     Ok(pool)
+}
+
+/// Round-trip `SELECT 1` on an already-acquired state-DB connection
+/// (readiness probe). The caller owns acquisition policy.
+pub async fn ping(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
+    sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(conn)
+        .await
+        .map(drop)
 }
 
 /// Classify a connect-time [`sqlx::Error`] into a short, **credential-free**

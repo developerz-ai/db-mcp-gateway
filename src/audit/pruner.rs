@@ -1,17 +1,28 @@
-//! Retention pruner. Deletes `audit_calls` rows older than the configured
-//! hot-storage TTL.
+//! Retention pruner. Deletes `audit_call_intents` and `audit_calls` rows
+//! older than the configured hot-storage TTL (spec 07 §"Retention
+//! pruning"); no archive tier ships, so nothing is exported first.
 //!
-//! Spec 07 §"Retention pruning": a background task runs hourly, archives
-//! aged rows if an archive sink is configured, then deletes from hot. For
-//! #8 we ship only the delete — the archive tier (S3/GCS/Azure) lands in a
-//! follow-up.
+//! Deletes run in bounded batches, each its own transaction under a
+//! transaction-scoped advisory lock: a large backlog never holds one long
+//! transaction or bloats the synchronous audit insert's lock queue, and two
+//! replicas never delete the same batch. A replica that finds the lock taken
+//! stops — the other one is pruning.
 //!
-//! `run_once` is the pure DB call so tests can drive it directly; the
-//! production loop in `main.rs` ticks `tokio::time::interval` and calls it.
+//! `run_once` is the DB call tests drive directly; the background loop in
+//! `startup` ticks hourly and calls it.
 
 use sqlx::PgPool;
 
+use crate::state::audit::{AuditTable, delete_expired_batch};
+
 use super::AuditError;
+
+/// Advisory-lock key for retention batches — arbitrary, fixed, distinct from
+/// the reaper's.
+const PRUNER_LOCK_KEY: i64 = 0x6462_6d63_7072_756e; // "dbmcprun"
+
+/// Rows per batch: small enough that one batch commits in milliseconds.
+const PRUNE_BATCH_ROWS: u32 = 5_000;
 
 /// The floor below which retention can never drop: `ttl_days == 0` would make
 /// the prune predicate `occurred_at < now()` and delete *every* audit row — a
@@ -23,14 +34,43 @@ fn effective_ttl_days(ttl: u32) -> u32 {
     ttl.max(1)
 }
 
-/// Delete every row whose `occurred_at` is older than `ttl_days`. Returns
-/// the number of rows removed.
+/// Delete every `audit_call_intents` and `audit_calls` row whose
+/// `occurred_at` is older than `ttl_days`. Returns the rows removed across
+/// both tables (zero when another replica holds the lock).
 pub async fn run_once(pool: &PgPool, ttl_days: u32) -> Result<u64, AuditError> {
     let days = effective_ttl_days(ttl_days);
     let days = i32::try_from(days).unwrap_or(i32::MAX);
-    crate::state::audit::delete_calls_older_than(pool, days)
+    // Intents first: deleting a completion row before its intent would let a
+    // concurrent reaper sweep mistake the intent for an abandoned call.
+    let intents = prune_table(pool, AuditTable::Intents, days).await?;
+    let calls = prune_table(pool, AuditTable::Calls, days).await?;
+    Ok(intents + calls)
+}
+
+/// Delete batches until one comes back short (the backlog is gone) or the
+/// lock is held elsewhere.
+async fn prune_table(pool: &PgPool, table: AuditTable, days: i32) -> Result<u64, AuditError> {
+    let mut total = 0;
+    loop {
+        let batch = delete_expired_batch(
+            pool,
+            PRUNER_LOCK_KEY,
+            table,
+            days,
+            i64::from(PRUNE_BATCH_ROWS),
+        )
         .await
-        .map_err(AuditError::Write)
+        .map_err(AuditError::Write)?;
+        match batch {
+            Some(deleted) => {
+                total += deleted;
+                if deleted < u64::from(PRUNE_BATCH_ROWS) {
+                    return Ok(total);
+                }
+            }
+            None => return Ok(total),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -4,17 +4,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 
 use super::refresh_chain::{DEFAULT_REFRESH_TTL, chain_expired};
+use super::refresh_db::{NewDbToken, REFRESH_TOKENS_MAX_SIZE, store_db};
 use super::{GrantIdentity, StoreError, hash_secret};
-use crate::state::oauth::{self as db, NewRefreshToken};
-
-/// Size cap on the refresh tokens map. This cap bounds resource exhaustion
-/// from tokens belonging to many users or leaked tokens stored indefinitely.
-const REFRESH_TOKENS_MAX_SIZE: usize = 100_000;
+use crate::auth::SessionId;
+use crate::state::oauth::{self as db, RefreshTokenRow};
 
 /// Refresh-token store: hashed token → the verified identity it renews. Rotated
 /// on every redemption (the old token is removed, a new one issued), per OAuth
@@ -32,12 +30,12 @@ const REFRESH_TOKENS_MAX_SIZE: usize = 100_000;
 /// threads the configured `AuthConfig::refresh_ttl` via [`RefreshTokens::with_db`].
 #[derive(Clone)]
 pub struct RefreshTokens {
-    backend: RefreshBackend,
+    pub(super) backend: RefreshBackend,
     ttl: Duration,
 }
 
 #[derive(Clone)]
-enum RefreshBackend {
+pub(super) enum RefreshBackend {
     Db(PgPool),
     Memory(Arc<Mutex<HashMap<[u8; 32], RefreshToken>>>),
 }
@@ -71,6 +69,23 @@ pub struct RefreshToken {
     /// chain expires an absolute TTL after the first token — rotation renews the
     /// opaque value but never the deadline.
     pub issued_at: DateTime<Utc>,
+    /// The access session minted alongside this token; rotation and `/revoke`
+    /// revoke it. `None` for rows written before migration 0012.
+    pub session_id: Option<SessionId>,
+}
+
+impl From<RefreshTokenRow> for RefreshToken {
+    fn from(row: RefreshTokenRow) -> Self {
+        Self {
+            identity: GrantIdentity {
+                sub: row.user_sub,
+                email: row.email,
+                groups: row.groups.0,
+            },
+            issued_at: row.chain_issued_at,
+            session_id: row.session_id.map(SessionId::from),
+        }
+    }
 }
 
 impl RefreshTokens {
@@ -101,7 +116,7 @@ impl RefreshTokens {
     /// Insert a token that starts a fresh chain (birth = now). Used when the
     /// token is minted off an authorization-code redemption, not a rotation.
     pub async fn insert(&self, token: &str, identity: GrantIdentity) -> Result<(), StoreError> {
-        self.store(token, identity, Utc::now()).await
+        self.store(token, identity, Utc::now(), None).await
     }
 
     /// Insert a rotated token, carrying the chain's original `issued_at` forward
@@ -112,25 +127,35 @@ impl RefreshTokens {
         identity: GrantIdentity,
         issued_at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        self.store(token, identity, issued_at).await
+        self.store(token, identity, issued_at, None).await
     }
 
-    async fn store(
+    pub(super) async fn store(
         &self,
         token: &str,
         identity: GrantIdentity,
         issued_at: DateTime<Utc>,
+        session_id: Option<SessionId>,
     ) -> Result<(), StoreError> {
         match &self.backend {
             RefreshBackend::Db(pool) => {
-                store_db(pool, hash_secret(token), &identity, issued_at, self.ttl)
-                    .await
-                    .map_err(|_| {
+                let mut conn = pool.acquire().await.map_err(|_| StoreError::Backend)?;
+                let new = NewDbToken {
+                    token_hash: hash_secret(token),
+                    identity: &identity,
+                    issued_at,
+                    session_id,
+                };
+                match store_db(&mut conn, &new, self.ttl).await {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(StoreError::StoreFull),
+                    Err(_) => {
                         // Deliberately no error source: a `sqlx::Error` can render
                         // the DSN (password) in its `Display` (see `state::connect`).
                         tracing::warn!("refresh token insert failed (state DB)");
-                        StoreError::Backend
-                    })
+                        Err(StoreError::Backend)
+                    }
+                }
             }
             RefreshBackend::Memory(map) => {
                 let mut map = map.lock().await;
@@ -145,6 +170,7 @@ impl RefreshTokens {
                     RefreshToken {
                         identity,
                         issued_at,
+                        session_id,
                     },
                 );
                 Ok(())
@@ -166,14 +192,7 @@ impl RefreshTokens {
                     tracing::warn!("refresh token lookup failed (state DB)");
                     None
                 })
-                .map(|row| RefreshToken {
-                    identity: GrantIdentity {
-                        sub: row.user_sub,
-                        email: row.email,
-                        groups: serde_json::from_value(row.groups).unwrap_or_default(),
-                    },
-                    issued_at: row.chain_issued_at,
-                })
+                .map(RefreshToken::from)
                 // The row's own `expires_at` already gates redemption, but
                 // re-check against the *current* configured TTL so lowering
                 // `REFRESH_TTL_DAYS` takes effect on chains minted under the
@@ -217,61 +236,26 @@ impl RefreshTokens {
         }
     }
 
-    /// Remove all expired refresh token chains. Called periodically by a
-    /// background task.
-    pub async fn gc_expired(&self) {
+    /// Remove all expired refresh token chains; returns how many. Called
+    /// periodically by a background task. A DB failure is logged and counts 0.
+    pub async fn gc_expired(&self) -> u64 {
         match &self.backend {
-            RefreshBackend::Db(pool) => {
-                if db::delete_expired_refresh_tokens(pool).await.is_err() {
+            RefreshBackend::Db(pool) => db::delete_expired_refresh_tokens(pool)
+                .await
+                .unwrap_or_else(|_| {
                     // No error source — see the DSN-leak note on `store`.
                     tracing::warn!("refresh token GC failed (state DB)");
-                }
-            }
+                    0
+                }),
             RefreshBackend::Memory(map) => {
                 let mut map = map.lock().await;
                 let now = Utc::now();
+                let before = map.len();
                 map.retain(|_, t| !chain_expired(t.issued_at, now, self.ttl));
+                (before - map.len()) as u64
             }
         }
     }
-}
-
-/// DB insert: enforce the cap against live rows (a rotation replaces its own
-/// row, so it never grows the table and is let through at cap), then upsert.
-/// The count/insert pair isn't atomic, but the cap is a resource ceiling, not
-/// an invariant — a transient one-over is harmless.
-async fn store_db(
-    pool: &PgPool,
-    token_hash: [u8; 32],
-    identity: &GrantIdentity,
-    issued_at: DateTime<Utc>,
-    ttl: Duration,
-) -> Result<(), sqlx::Error> {
-    if !db::refresh_token_exists(pool, &token_hash).await?
-        && db::count_refresh_tokens(pool).await? >= REFRESH_TOKENS_MAX_SIZE as i64
-    {
-        return Err(sqlx::Error::Protocol("refresh token store full".into()));
-    }
-
-    let groups =
-        serde_json::to_value(&identity.groups).unwrap_or_else(|_| serde_json::Value::Array(vec![]));
-    // `expires_at` materializes the absolute deadline so GC and the CHECK
-    // constraint are plain comparisons. Infallible for any sane TTL; clamp
-    // rather than panic (CLAUDE.md: no unwrap outside main/tests).
-    let expires_at =
-        issued_at + ChronoDuration::from_std(ttl).unwrap_or_else(|_| ChronoDuration::days(1));
-    db::upsert_refresh_token(
-        pool,
-        &NewRefreshToken {
-            token_hash: &token_hash,
-            user_sub: &identity.sub,
-            email: &identity.email,
-            groups: &groups,
-            chain_issued_at: issued_at,
-            expires_at,
-        },
-    )
-    .await
 }
 
 #[cfg(test)]

@@ -23,7 +23,6 @@ pub(super) fn check_statement_shape(stmt: &Statement, access: Access) -> Result<
         Statement::Delete(_) if access == Access::ReadWrite => Ok(()),
 
         Statement::Query(_) => Ok(()),
-        Statement::ExplainTable { .. } => Ok(()), // `\d table` analog; read-only.
 
         // Explicit rejections so the error message names the family, rather
         // than the generic "unsupported" that the catch-all below emits.
@@ -50,6 +49,9 @@ pub(super) fn check_statement_shape(stmt: &Statement, access: Access) -> Result<
         }
         Statement::Set(_) => Err(GuardError::NotAllowed("SET")),
         Statement::Copy { .. } => Err(GuardError::NotAllowed("COPY")),
+        // `DESCRIBE t` / `EXPLAIN t`: not Postgres syntax, so nothing a real
+        // client sends — and nothing this guard should pass by default.
+        Statement::ExplainTable { .. } => Err(GuardError::NotAllowed("EXPLAIN TABLE")),
         _ => Err(GuardError::NotAllowed("unsupported")),
     }
 }

@@ -2,8 +2,9 @@
 //! of `run_query` calls to populate the audit table, then call
 //! `tools/call get_query_history` and assert (a) the caller's own rows come
 //! back, (b) a *smuggled* `user` field in the JSON-RPC arguments is rejected
-//! at the boundary, and (c) the limit ceiling clamps a hostile
-//! `limit: u32::MAX` request.
+//! at the boundary, (c) the page ceiling clamps a hostile `limit`, (d) long
+//! SQL is truncated in the response, (e) keyset pages never overlap and
+//! (f) the history query is served by `audit_calls_history_idx` (0011).
 //!
 //! Every integration test that hits a tool asserts an audit row exists.
 
@@ -11,9 +12,10 @@ mod common;
 
 use std::time::Duration;
 
+use common::cleanup::delete_audit_calls;
 use common::gateway::{LoggedInGateway, spawn_logged_in};
 use common::idp::MockUser;
-use db_mcp_gateway::audit::{AuditRow, log};
+use db_mcp_gateway::audit::{AuditRow, HISTORY_SQL_MAX_BYTES, OutcomeCode, log};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -77,7 +79,7 @@ async fn write_audit_row(
         database: Some("app".to_string()),
         sql: Some(sql.to_string()),
         reason: None,
-        outcome: "success".to_string(),
+        outcome: OutcomeCode::Success,
         elapsed_ms: Some(42),
         row_count: Some(1),
         truncated: Some(false),
@@ -246,6 +248,19 @@ async fn history_rejects_smuggled_user_field() {
         err["code"].as_i64() == Some(-32602), // JSON-RPC invalid params
         "expected invalid_params (-32602), got {err}",
     );
+
+    // The smuggling attempt itself is audited — with no target, since the
+    // arguments never parsed.
+    let row = common::audit::latest_audit(
+        &booted.state_db,
+        &booted.user_sub,
+        "get_query_history",
+        "smuggled user",
+    )
+    .await;
+    assert_eq!(row.outcome, "invalid_arguments");
+    assert_eq!(row.server, None);
+    assert_eq!(row.database, None);
 }
 
 /// A caller asking for `u32::MAX` rows gets the ceiling, not the whole
@@ -375,4 +390,170 @@ async fn history_rejects_malformed_since_and_audits_it() {
     );
 
     assert_dispatch_audited(&booted.state_db, &booted.user_sub, "invalid_arguments").await;
+}
+
+/// Seed `count` history rows for `user_sub` in one statement, one second
+/// apart, newest first by `n`.
+async fn seed_rows(pool: &sqlx::PgPool, user_sub: &str, database: &str, count: i32) {
+    sqlx::query(
+        "INSERT INTO audit_calls \
+         (id, request_id, user_sub, user_email, tool, server_name, database_name, sql, outcome, \
+          occurred_at) \
+         SELECT gen_random_uuid(), gen_random_uuid()::text, $1, 'seed@example.com', 'run_query', \
+                'target', $2, 'SELECT ' || n, 'success', now() - make_interval(secs => n) \
+         FROM generate_series(1, $3) AS n",
+    )
+    .bind(user_sub)
+    .bind(database)
+    .bind(count)
+    .execute(pool)
+    .await
+    .expect("seed history rows");
+}
+
+/// A page is at most 1 000 entries however large `limit` is; the rest is
+/// reachable through `next_cursor`.
+#[tokio::test]
+async fn history_page_is_capped_at_the_ceiling() {
+    let booted = boot_gateway().await;
+    seed_rows(&booted.state_db, &booted.user_sub, "app", 1005).await;
+
+    let resp = call_history(
+        &booted.url,
+        &booted.bearer,
+        json!({ "server": "target", "database": "app", "limit": 100_000 }),
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let body = payload(&resp);
+    assert_eq!(body["entries"].as_array().unwrap().len(), 1000);
+    assert_eq!(body["truncated"], true);
+    assert!(body["next_cursor"].is_string(), "{}", body["next_cursor"]);
+
+    assert_dispatch_audited(&booted.state_db, &booted.user_sub, "success").await;
+    delete_audit_calls(&booted.state_db, &booted.user_sub).await;
+}
+
+/// One huge statement must not make the response huge: `sql` is cut and
+/// flagged.
+#[tokio::test]
+async fn history_truncates_oversized_sql() {
+    let booted = boot_gateway().await;
+    let long_sql = format!("SELECT '{}'", "x".repeat(10 * 1024));
+    write_audit_row(&booted.state_db, &booted.user_sub, &long_sql, 1).await;
+
+    let resp = call_history(
+        &booted.url,
+        &booted.bearer,
+        json!({ "server": "target", "database": "app" }),
+    )
+    .await;
+    let body = payload(&resp);
+    let entry = &body["entries"][0];
+    let sql = entry["sql"].as_str().expect("sql string");
+    assert!(sql.len() <= HISTORY_SQL_MAX_BYTES, "{}", sql.len());
+    assert!(long_sql.starts_with(sql));
+    assert_eq!(entry["sql_truncated"], true);
+
+    assert_dispatch_audited(&booted.state_db, &booted.user_sub, "success").await;
+}
+
+/// Walking `next_cursor` visits every entry once, newest first, and ends
+/// with a `null` cursor.
+#[tokio::test]
+async fn history_keyset_pages_do_not_overlap() {
+    let booted = boot_gateway().await;
+    seed_rows(&booted.state_db, &booted.user_sub, "app", 5).await;
+
+    let mut seen = Vec::new();
+    let mut cursor = Value::Null;
+    for _ in 0..3 {
+        let mut arguments = json!({ "server": "target", "database": "app", "limit": 2 });
+        if !cursor.is_null() {
+            arguments["cursor"] = cursor.clone();
+        }
+        let body = payload(&call_history(&booted.url, &booted.bearer, arguments).await);
+        for entry in body["entries"].as_array().unwrap() {
+            seen.push(entry["sql"].as_str().unwrap().to_string());
+        }
+        cursor = body["next_cursor"].clone();
+    }
+    assert!(cursor.is_null(), "last page has no cursor, got {cursor}");
+    let expected: Vec<String> = (1..=5).map(|n| format!("SELECT {n}")).collect();
+    assert_eq!(seen, expected);
+
+    assert_dispatch_audited(&booted.state_db, &booted.user_sub, "success").await;
+    delete_audit_calls(&booted.state_db, &booted.user_sub).await;
+}
+
+/// A cursor the gateway did not mint is an argument error, audited.
+#[tokio::test]
+async fn history_rejects_forged_cursor() {
+    let booted = boot_gateway().await;
+    let resp = call_history(
+        &booted.url,
+        &booted.bearer,
+        json!({ "server": "target", "database": "app", "cursor": "not-a-cursor" }),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+
+    assert_dispatch_audited(&booted.state_db, &booted.user_sub, "invalid_arguments").await;
+}
+
+/// The 0011 index serves the history query's filter and keyset order with
+/// no sort step. The SQL is copied from
+/// `src/state/audit/history.rs` on purpose (see
+/// `tests/permissions_indexes_mysql.rs`): a rewrite that stops matching the
+/// index shows up as a diff between the two.
+#[tokio::test]
+async fn history_query_uses_the_history_index() {
+    let booted = boot_gateway().await;
+    let pool = &booted.state_db;
+    // Skewed on purpose: most of the caller's rows are for another database,
+    // the shape where 0003's `(user_sub, occurred_at)` index must filter
+    // row by row and 0011's index seeks straight to the page.
+    seed_rows(pool, &booted.user_sub, "app", 200).await;
+    seed_rows(pool, &booted.user_sub, "other", 4000).await;
+    sqlx::query("ANALYZE audit_calls")
+        .execute(pool)
+        .await
+        .expect("analyze");
+
+    // The table is shared with every other test, so its statistics — and
+    // the planner's choice between the 0003 and 0011 indexes — drift run to
+    // run. Pin what 0011 is for instead: with sorting priced out, the only
+    // cheap plan is an index that serves both the WHERE and the
+    // `(occurred_at, id)` order, and only `audit_calls_history_idx` does.
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL enable_sort = off")
+        .execute(&mut *tx)
+        .await
+        .expect("disable sort");
+    sqlx::query("SET LOCAL enable_incremental_sort = off")
+        .execute(&mut *tx)
+        .await
+        .expect("disable incremental sort");
+    let plan: Value = sqlx::query_scalar(&format!(
+        "EXPLAIN (FORMAT JSON) \
+         SELECT id, request_id, sql, reason, outcome, elapsed_ms, row_count, occurred_at \
+         FROM audit_calls \
+         WHERE user_sub = '{sub}' AND server_name = 'target' AND database_name = 'app' \
+           AND (NULL::timestamptz IS NULL OR occurred_at >= NULL::timestamptz) \
+           AND (NULL::timestamptz IS NULL OR (occurred_at, id) < (NULL::timestamptz, NULL::uuid)) \
+         ORDER BY occurred_at DESC, id DESC \
+         LIMIT 101",
+        sub = booted.user_sub,
+    ))
+    .fetch_one(&mut *tx)
+    .await
+    .expect("explain runs");
+    tx.rollback().await.expect("rollback");
+    let plan = plan.to_string();
+    assert!(plan.contains("audit_calls_history_idx"), "{plan}");
+    assert!(
+        !plan.contains("Sort\""),
+        "index must serve the order: {plan}"
+    );
+    delete_audit_calls(pool, &booted.user_sub).await;
 }

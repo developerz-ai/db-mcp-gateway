@@ -1,8 +1,9 @@
 //! Sink behaviour without a state DB: stdout field contract, RFC 5424 shape,
-//! UDP delivery on loopback.
+//! datagram size cap, UDP delivery on loopback.
 
-use super::syslog::format_rfc5424;
+use super::syslog::{MAX_DATAGRAM_BYTES, TRUNCATION_MARKER, datagram, format_rfc5424};
 use super::*;
+use crate::audit::OutcomeCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing_subscriber::fmt::MakeWriter;
@@ -40,7 +41,7 @@ fn sample_row() -> AuditRow {
         database: Some("app".into()),
         sql: Some("SELECT 1".into()),
         reason: None,
-        outcome: "success".into(),
+        outcome: OutcomeCode::Success,
         elapsed_ms: Some(4),
         row_count: Some(1),
         truncated: Some(false),
@@ -54,7 +55,7 @@ fn sample_row() -> AuditRow {
 /// No sinks configured → no-op. The common case (pre-#218 default).
 #[test]
 fn empty_sinks_is_a_no_op() {
-    send(&[], &sample_row());
+    StreamSinks::from_config(&[]).send(&sample_row(), &DetachedTasks::new());
 }
 
 /// The `stdout` sink emits one `audit_stream`-targeted event carrying the
@@ -69,7 +70,8 @@ fn stdout_sink_emits_audit_stream_event_with_row_fields() {
         .finish();
 
     tracing::subscriber::with_default(subscriber, || {
-        send(&[StreamSinkConfig::Stdout], &sample_row());
+        StreamSinks::from_config(&[StreamSinkConfig::Stdout])
+            .send(&sample_row(), &DetachedTasks::new());
     });
 
     let output = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
@@ -104,7 +106,7 @@ fn stdout_sink_emits_every_spec_07_field() {
     row.reason = Some("incident-42".into());
 
     tracing::subscriber::with_default(subscriber, || {
-        send(&[StreamSinkConfig::Stdout], &row);
+        StreamSinks::from_config(&[StreamSinkConfig::Stdout]).send(&row, &DetachedTasks::new());
     });
 
     let raw = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
@@ -172,13 +174,12 @@ async fn syslog_sink_delivers_udp_datagram_to_configured_host_port() {
         .expect("bind ephemeral UDP listener");
     let port = listener.local_addr().unwrap().port();
 
-    send(
-        &[StreamSinkConfig::Syslog {
-            host: "127.0.0.1".to_string(),
-            port,
-        }],
-        &sample_row(),
-    );
+    let tasks = DetachedTasks::new();
+    StreamSinks::from_config(&[StreamSinkConfig::Syslog {
+        host: "127.0.0.1".to_string(),
+        port,
+    }])
+    .send(&sample_row(), &tasks);
 
     let mut buf = [0u8; 4096];
     let (n, _from) = tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut buf))
@@ -201,14 +202,51 @@ async fn syslog_sink_delivers_udp_datagram_to_configured_host_port() {
 fn syslog_sink_with_bad_host_does_not_block_the_caller() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        send(
-            &[StreamSinkConfig::Syslog {
-                host: "this-host-does-not-resolve.invalid".to_string(),
-                port: 514,
-            }],
-            &sample_row(),
-        );
+        StreamSinks::from_config(&[StreamSinkConfig::Syslog {
+            host: "this-host-does-not-resolve.invalid".to_string(),
+            port: 514,
+        }])
+        .send(&sample_row(), &DetachedTasks::new());
         // `send` already returned above without awaiting the spawned
         // task — the assertion is simply that we got here.
     });
+}
+
+/// A row whose JSON exceeds one datagram is cut, not dropped: the SQL is
+/// shortened with a marker so the body is still valid JSON.
+#[test]
+fn oversized_row_is_cut_to_one_datagram_with_valid_json() {
+    let mut row = sample_row();
+    row.sql = Some(format!("SELECT '{}'", "x".repeat(100 * 1024)));
+
+    let message = datagram(&row);
+
+    assert!(message.len() <= MAX_DATAGRAM_BYTES, "{}", message.len());
+    let body: serde_json::Value =
+        serde_json::from_str(&message[message.find('{').unwrap()..]).expect("body is JSON");
+    let sql = body["sql"].as_str().unwrap();
+    assert!(sql.starts_with("SELECT 'xxx"), "{sql}");
+    assert!(sql.ends_with(TRUNCATION_MARKER), "{sql}");
+    assert_eq!(body["request_id"].as_str(), Some("req-stream-1"));
+}
+
+/// No `sql` to shorten (an oversized error message, say): the message
+/// itself is cut, still within the cap and still marked.
+#[test]
+fn oversized_row_without_sql_is_hard_cut_with_marker() {
+    let mut row = sample_row();
+    row.sql = None;
+    row.error_message = Some("e".repeat(20_000));
+
+    let message = datagram(&row);
+
+    assert!(message.len() <= MAX_DATAGRAM_BYTES);
+    assert!(message.ends_with(TRUNCATION_MARKER));
+}
+
+#[test]
+fn small_row_is_sent_whole() {
+    let message = datagram(&sample_row());
+    assert!(!message.contains(TRUNCATION_MARKER));
+    assert!(message.contains("SELECT 1"));
 }

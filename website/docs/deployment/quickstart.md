@@ -11,12 +11,12 @@ This gateway is mid-build (see [../initial-idea/11-roadmap.md](../initial-idea/1
 | Capability | Status |
 |---|---|
 | MCP tools, OIDC login, per-DB pools, synchronous audit | works |
-| `/healthz`, `/readyz`, `/metrics` | **works** — [#13](https://github.com/developerz-ai/db-mcp-gateway/issues/13). k8s probes + Prometheus scrape; see [Probes & metrics](#probes--metrics) below |
+| `/healthz`, `/readyz`, `/metrics` | **works** — [#13](https://github.com/developerz-ai/db-mcp-gateway/issues/13). k8s probes on the main listener; Prometheus scrape on its own `METRICS_BIND` listener; see [Probes & metrics](#probes--metrics) below |
 | In-process TLS + cert reload on `SIGHUP` | **works** — [#12](https://github.com/developerz-ai/db-mcp-gateway/issues/12). `TLS_CERT_PATH` + `TLS_KEY_PATH` point at PEM files; `kill -HUP <pid>` reloads them in place without dropping live connections. Boot refuses to start without TLS unless `TLS_DISABLED=true` is set explicitly (dev-only). |
 | `${ENV:NAME}` + `${FILE:/path}` secret refs | **works** — resolved at boot ([#15](https://github.com/developerz-ai/db-mcp-gateway/issues/15)); an unset env or missing file aborts startup |
 | `vault:` / `aws-sm:` / `gcp-sm:` secret backends | recognised but **not implemented** — these abort at boot until the backends land |
-| Strict config validation | **works** — [#16](https://github.com/developerz-ai/db-mcp-gateway/issues/16): an unknown/misspelled key under `servers`/`databases`/`permissions`/`grants`/`constraints` aborts boot with a `line:column` pointer. Full key list: [config-reference.md](config-reference.md) |
-| Unified `config.yml` | **not yet** — the `--config` file carries `servers:` + `permissions:` only; `gateway:` / `auth:` / `logging:` are accepted-but-ignored and come from environment variables today (see below) |
+| Strict config validation | **works** — an unknown/misspelled key anywhere in the file, including the top level, aborts boot with a `line:column` pointer; so do zero/blank values and, under `gateway.env: production`, inline literal secrets. Full key list: [config-reference.md](config-reference.md) |
+| Unified `config.yml` | **not yet** — listener, state DB, TLS and OIDC settings come from environment variables (see below); `auth:` in the YAML is a boot error |
 | `gateway admin …` subcommands | planned — phase 8 |
 
 ## Run it locally
@@ -64,7 +64,7 @@ The binary needs its config path. The published image bakes `DB_MCP_GATEWAY_CONF
 
 The `:main` tag is published on every push to `main` (see [#10](https://github.com/developerz-ai/db-mcp-gateway/issues/10)). Building from source instead? `docker build -t db-mcp-gateway:dev .` and swap that tag into the `docker run` above.
 
-`RUST_LOG` matters: without it the default filter suppresses the startup lines. If you mistype a secret ref or leave `TARGET_DB_PASSWORD` unset, the gateway **fails fast at boot** rather than at first query — e.g. `Error: env var TARGET_DB_PASSWORD referenced in config but not set in process environment`.
+With `RUST_LOG` unset the gateway logs at `info`. If you mistype a secret ref or leave `TARGET_DB_PASSWORD` unset, the gateway **fails fast at boot** rather than at first query — e.g. `Error: env var TARGET_DB_PASSWORD referenced in config but not set in process environment`.
 
 You should see the gateway load config, migrate the state DB, and start listening:
 
@@ -83,7 +83,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8443/mcp \
 # 401
 ```
 
-> **About login.** The bundled dev stack has no identity provider. The gateway boots and serves without one, but completing an SSO login — and therefore running an *authenticated* query — needs `OIDC_ISSUER` (plus `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET`) pointed at a real IdP: your org's, or a throwaway local Keycloak/Dex. Without it, `/auth/login` returns `502` because OIDC discovery fails.
+> **About login.** The bundled dev stack has no identity provider. The gateway refuses to boot without `OIDC_ISSUER` and `OIDC_CLIENT_ID`; it does not contact the IdP at boot, but completing an SSO login — and therefore running an *authenticated* query — needs them (plus `OIDC_CLIENT_SECRET`) pointed at a real IdP: your org's, or a throwaway local Keycloak/Dex. If the IdP is unreachable, `/auth/login` returns `502` because OIDC discovery fails.
 
 Tear down with `bin/dev down` (add `reset` to wipe the volumes).
 
@@ -94,20 +94,29 @@ The env→YAML unification is still pending, so these come from the environment,
 | Variable | Default | Purpose |
 |---|---|---|
 | `STATE_DB_URL` | `postgres://gateway:gateway-dev-only@localhost:5433/gateway` | Gateway's own Postgres (sessions + audit) |
-| `GATEWAY_BIND` | `127.0.0.1:8443` | Listen address |
-| `OIDC_ISSUER` | — | IdP issuer URL (OIDC discovery base) |
-| `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | — | Gateway's OIDC client credentials |
+| `GATEWAY_BIND` | `127.0.0.1:8443` (image: `0.0.0.0:8443`) | Listen address |
+| `METRICS_BIND` | `127.0.0.1:9090` | Prometheus `/metrics` listener — separate from `GATEWAY_BIND`, which no longer serves `/metrics`. Set `0.0.0.0:9090` for an in-cluster scrape and fence the port with a NetworkPolicy; must differ from `GATEWAY_BIND` |
+| `MAX_CONCURRENT_REQUESTS` / `MAX_CONCURRENT_PER_IDENTITY` | `512` / `16` | In-flight ceilings (global → 503, per caller → 429). `0` aborts boot |
+| `STATE_DB_POOL_SIZE` | `10` | Request-path state-DB pool. `0`, or more than the concurrent-request ceiling (512), aborts boot. Pruner/GC use a separate fixed pool of 2 |
+| `OIDC_ISSUER` | — (required) | IdP issuer URL (OIDC discovery base). A trailing slash is ignored |
+| `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | — (client id required) | Gateway's OIDC client credentials |
 | `OIDC_REDIRECT_URL` | `http://localhost:8443/auth/callback` | Must match the IdP app's redirect URI |
 | `OIDC_GROUPS_CLAIM` | `groups` | ID-token claim carrying group membership |
-| `SESSION_SIGNING_KEY` | dev-only default | HMAC key for gateway-issued session JWTs — **set this in any real deploy**. Minimum 32 bytes; empty or shorter values are refused at boot |
+| `SESSION_SIGNING_KEY` | dev-only default | HMAC key for gateway-issued session JWTs — **set this in any real deploy**. Minimum 32 bytes; empty, shorter or the dev default are refused at boot |
+| `ALLOW_INSECURE_SIGNING_KEY` | `false` | Local dev only: accept a short or dev-default `SESSION_SIGNING_KEY`. Refused at boot unless `OIDC_ISSUER` is a loopback URL; logs a `WARN` when set |
+| `SESSION_TTL_HOURS` | `8` | Session (access token) lifetime, `1`–`168` |
+| `REFRESH_TTL_DAYS` | `1` | Absolute refresh-chain lifetime, `1`–`90`; see [auth & SSO](../initial-idea/04-auth-sso.md#token-endpoint--post-token) |
 | `TLS_CERT_PATH` | — | PEM-encoded leaf cert (+ intermediates). Required unless `TLS_DISABLED=true` |
 | `TLS_KEY_PATH` | — | PEM-encoded private key. Required unless `TLS_DISABLED=true` |
 | `TLS_DISABLED` | `false` | Dev-only escape. `true` serves plain HTTP and emits a `WARN` log on startup |
 | `AUDIT_RETENTION_DAYS` | `90` | Hot-retention window for the audit log |
+| `PERMISSIONS_CACHE_TTL_SECONDS` | `60` | Per-user DB-grant cache TTL; bounds how long a revoked grant is honoured on a replica that missed the invalidation. Above `300` aborts boot |
 | `SESSION_CACHE_TTL_SECONDS` | `30` | Freshness window for the in-memory session cache. Bounds how long a revoked session stays honored on *other* HA replicas; `0` re-validates every request. See [auth & SSO](../initial-idea/04-auth-sso.md#session-tokens) |
-| `RUST_LOG` | (off) | Log filter — set `info` (or `info,db_mcp_gateway=debug`) to see startup/request logs |
+| `RUST_LOG` | `info,sqlx::query=warn` | Log filter. Invalid directives are skipped. The `audit_stream` target always logs at INFO regardless |
 
-> **Cert rotation.** `kill -HUP <pid>` (or a pod lifecycle hook, sidecar, or reload controller that sends `SIGHUP`) re-reads `TLS_CERT_PATH` + `TLS_KEY_PATH` in place. In-flight connections keep their old cert until they close; new handshakes pick up the new one. Kubernetes does not send `SIGHUP` on its own — `terminationGracePeriodSeconds` only governs `SIGTERM` at shutdown — so operators must wire the reload signal explicitly. Cert-manager integration can automate this once #17 lands the infra stack.
+> **Shutdown.** On `SIGTERM` the gateway stops accepting work, gives in-flight requests up to 55 s, waits up to 20 s for detached audit writes, then closes its state-DB pools (≤ 10 s each). Set `terminationGracePeriodSeconds: 75` or more, or Kubernetes `SIGKILL`s a pod mid-drain.
+
+> **Cert rotation.** `kill -HUP <pid>` (or a pod lifecycle hook, sidecar, or reload controller that sends `SIGHUP`) re-reads `TLS_CERT_PATH` + `TLS_KEY_PATH` in place. The `SIGHUP` handler is installed with TLS off too, so the signal never kills the process. In-flight connections keep their old cert until they close; new handshakes pick up the new one. Kubernetes does not send `SIGHUP` on its own — `terminationGracePeriodSeconds` only governs `SIGTERM` at shutdown — so operators must wire the reload signal explicitly. Cert-manager integration can automate this once #17 lands the infra stack.
 
 ### Permissions in a nutshell
 
@@ -217,24 +226,11 @@ Note the `client_id` and `client_secret`.
 
 ## 3. Configure the gateway
 
-Drop `config.yml` somewhere — full target shape below. **Heads-up:** the running binary reads only `servers:` and `permissions:` from this file; the `gateway:` / `auth:` / `logging:` blocks shown here are the planned shape but are accepted-but-ignored today and come from environment variables (see the env table above). Unknown keys *inside* `servers`/`databases`/`permissions`/`grants`/`constraints` abort boot ([#16](https://github.com/developerz-ai/db-mcp-gateway/issues/16)). `databases[*].password` accepts `${ENV:NAME}` and `${FILE:/path}` refs today — both resolved at boot. `vault:` / `aws-sm:` / `gcp-sm:` refs parse but are **recognised-and-rejected** at boot until the backends land (see the status table above); use env or file refs in the meantime.
+Drop `config.yml` somewhere — full shape below. Listener, state DB and OIDC settings are environment variables (see the env table above), not YAML; an unknown key anywhere in the file — `auth:` included — aborts boot with a `line:column` pointer. `databases[*].password` accepts `${ENV:NAME}` and `${FILE:/path}` refs today — both resolved at boot. `vault:` / `aws-sm:` / `gcp-sm:` refs parse but are **recognised-and-rejected** at boot until the backends land (see the status table above); use env or file refs in the meantime.
 
 ```yaml
 gateway:
-  bind: 0.0.0.0:8443
-  external_url: https://db.internal.acme.com
-  env: production
-  state_db:
-    url: ${STATE_DB_URL}
-    pool_size: 10
-
-auth:
-  oidc:
-    issuer: https://acme.okta.com
-    client_id: ${OIDC_CLIENT_ID}
-    client_secret: ${OIDC_CLIENT_SECRET}
-    groups_claim: groups
-    session_ttl_hours: 8
+  env: production        # inline literal secrets abort boot
 
 servers:
   - name: prod
@@ -265,9 +261,6 @@ permissions:
           require_reason: true
           statement_timeout_ms: 5000
           row_limit: 1000
-
-logging:
-  hot_retention_days: 90
 ```
 
 See [../initial-idea/08-config.md](../initial-idea/08-config.md) for the full schema and validation rules.
@@ -336,13 +329,36 @@ For richer signals use the dedicated endpoints below.
 
 ## Probes & metrics
 
-Three unauthenticated ops endpoints, mounted alongside `/mcp`:
+Three unauthenticated ops endpoints. `/healthz` and `/readyz` are mounted alongside `/mcp`; `/metrics` is served only on `METRICS_BIND` (default `127.0.0.1:9090`) — never on the public listener, because its labels name every configured database:
 
 | Endpoint | Returns | What's behind it |
 |---|---|---|
 | `/healthz` | `200 ok` while running; `503 shutting down` once the process catches SIGTERM/Ctrl-C | Process liveness only — does not touch the state DB |
 | `/readyz` | `200 ok` when the state DB answers `SELECT 1` within 2s; `503` otherwise (or during shutdown) | Pulls the pod out of the Service endpoint set on transient DB outages, no restart |
-| `/metrics` | Prometheus text exposition (`text/plain; version=0.0.4`) | `tool_calls{tool,outcome}`, `query_duration_seconds`, `audit_write_duration_seconds`, `active_sessions`, `pool_size{db}` |
+| `/metrics` (on `METRICS_BIND`) | Prometheus text exposition (`text/plain; version=0.0.4`) | See the metric catalogue below |
+
+### Metric catalogue
+
+Names are fixed — dashboards and alerts are written against them. No label carries a user, email, SQL text or request id.
+
+| Series | Type | Labels |
+|---|---|---|
+| `tool_calls` | counter | `tool`, `outcome`, `access` (`read`/`write`), `identity_kind` (`sso`/`service`) |
+| `query_duration_seconds` | histogram (fixed buckets 5 ms – 60 s) | `tool` |
+| `audit_write_duration_seconds` | histogram (fixed buckets 1 ms – 5 s) | — |
+| `audit_write_failures_total` | counter | `phase` (`intent`/`completion`/`fallback`) |
+| `audit_abandoned_total` | counter | — |
+| `audit_pruner_runs_total` | counter | `result` (`ok`/`error`) |
+| `audit_pruner_last_success_timestamp` | gauge (unix seconds) | — |
+| `requests_shed_total` | counter | `scope` (`global`/`identity`/`oauth`) |
+| `target_pool_connections` | gauge | `db`, `state` (`idle`/`in_use`) |
+| `state_pool_acquire_seconds` | histogram | `pool` |
+| `sessions_created_total` / `sessions_revoked_total` | counter | — |
+| `config_reloads_total` | counter | `result` |
+| `log_lines_dropped_total` | counter | — |
+| `audit_stream_dropped_total` | counter | — |
+
+Histograms use fixed buckets so they aggregate across replicas. Gauges and histograms untouched for an hour leave the output (an evicted database's labels do not linger); counters never expire.
 
 ### k8s probes
 
@@ -360,16 +376,18 @@ readinessProbe:
 ### Prometheus scrape
 
 ```yaml
+# METRICS_BIND=0.0.0.0:9090 on the pod; port 9090 reachable only from the
+# Prometheus namespace (NetworkPolicy). Never route it through the ingress.
 - job_name: db-mcp-gateway
   metrics_path: /metrics
   static_configs:
-    - targets: ['db-mcp-gateway.gateway.svc:8443']
+    - targets: ['db-mcp-gateway.gateway.svc:9090']
 ```
 
-Smoke test:
+Smoke test (from inside the pod or cluster — the public hostname returns 404):
 
 ```bash
-curl -s https://db.internal.acme.com/metrics | head
+curl -s http://127.0.0.1:9090/metrics | head
 # # TYPE tool_calls counter
 # tool_calls{tool="list_servers",outcome="success"} 4
 # …
@@ -393,8 +411,8 @@ Point them at [../usage/first-query.md](../usage/first-query.md) — 5-minute ha
 
 | Task | How |
 |---|---|
-| Change permissions | PR against the gateway config repo. Operator merges, `kill -HUP` on the container. |
-| Rotate a DB password | Update in secret manager, `kill -HUP`. New connections use the new password; old ones drain. |
+| Change permissions / service accounts | PR against the gateway config repo. Operator merges, `kill -HUP` on every pod. The reload is atomic: a bad file is logged, counted in `config_reloads_total{result="error"}`, and the old config keeps serving. Admin API mount/group and `permissions_store` need a restart. |
+| Rotate a DB password | Update in secret manager. `${FILE:…}` refs are re-read whenever a pool opens; to force it, change the ref (or anything else on that database) and `kill -HUP` — changed databases get a fresh pool, old connections drain. |
 | Revoke a session | A `gateway admin` CLI is planned (phase 8). Today: insert the session into the state DB denylist directly via `psql`. |
 | Audit a query | `psql` into state DB → `select * from audit_log where ...` (see [../initial-idea/07-logging-retention.md](../initial-idea/07-logging-retention.md)) |
 | Upgrade | Bump the image tag, redeploy. Migrations run on startup. |
@@ -402,7 +420,7 @@ Point them at [../usage/first-query.md](../usage/first-query.md) — 5-minute ha
 ## Production hardening checklist
 
 - [ ] All DB passwords sourced from secret manager, not env literals.
-- [ ] `env: production` in config — locks out inline secrets.
+- [ ] `gateway: { env: production }` in config — inline literal secrets abort boot.
 - [ ] TLS terminating on the gateway or fronting proxy; never plain HTTP from devs.
 - [ ] State DB on its own volume, backed up.
 - [ ] Two replicas behind a load balancer for HA. The OAuth bridge keeps its login-flow state in-process, so pin `/register`, `/authorize`, `/auth/callback`, and `/token` with sticky routing (or run a single replica); steady-state `/mcp` traffic needs no stickiness. See [../initial-idea/02-architecture.md](../initial-idea/02-architecture.md#ha).

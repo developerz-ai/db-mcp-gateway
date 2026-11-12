@@ -106,7 +106,11 @@ Verify the proxy endpoint and port with your infrastructure team. Proxy unavaila
 
 - `/healthz` (liveness) — always returns 200 if the binary is up.
 - `/readyz` (readiness) — 200 only when the state DB is reachable (and the gateway is not shutting down).
-- `/metrics` (Prometheus): per-tool latency histograms, per-database connection counts, auth failures, audit write latency.
-- Structured JSON logs to stdout.
+- `/metrics` (Prometheus) on its own listener, `METRICS_BIND` (default `127.0.0.1:9090`) — not on the public listener, whose hostname returns 404 for it. Catalogue: [deployment quickstart](../deployment/quickstart.md#metric-catalogue).
+- Structured JSON logs to stdout; `RUST_LOG` defaults to `info`, and the `audit_stream` target is always at INFO.
+
+## Shutdown
+
+`SIGTERM` flips `/healthz` and `/readyz` to 503, stops background loops, and gives in-flight requests a 55 s drain window (state-pool acquire 5 s + target statement ceiling 30 s + audit write 10 s + slack). Detached audit writes then get up to 20 s, and the state-DB pools close (bounded). `terminationGracePeriodSeconds` must be ≥ 75. `SIGHUP` never terminates the process — the handler is installed whether TLS is on or off.
 
 See [11-roadmap](11-roadmap.md) for what's deferred (k8s operator, multi-replica leader election, etc.).

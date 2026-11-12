@@ -28,6 +28,8 @@ A request is allowed iff *some* grant matches. Denies are not explicit — absen
 
 `query_read` implies `schema_read`. `query_write` implies `query_read`.
 
+**Read-only is enforced by the target database, not only by the gateway's parser.** A call without `query_write` runs in a `READ ONLY` transaction, so even a write-capable target role cannot write through a read grant; the SQL guard and its function denylist are the layers behind it. **Zero is not a constraint value:** a `statement_timeout_ms` or `row_limit` of `0` is rejected by config validation and the admin API, and the exec layer clamps the timeout to at least 1 ms as belt and braces (Postgres reads `statement_timeout = 0` as "no limit").
+
 ## Worked examples
 
 **Backend engineer on staging:** full query, schema-read on prod.
@@ -83,16 +85,16 @@ A request is allowed iff *some* grant matches. Denies are not explicit — absen
 For a request `(user, groups, server, db, action)`:
 
 1. Resolve groups from the session.
-2. Collect every grant matching one of the user's groups and the target `(server, db)`.
-3. If no grant has an action ≥ the requested action → `forbidden`.
-4. Merge constraints across matching grants: take the **most restrictive** value for each (lowest `row_limit`, lowest `statement_timeout_ms`, `require_reason` = true wins, schema/table allow/deny intersected).
+2. Collect every grant matching one of the user's groups and the target `(server, db)`, plus the subject's DB-backed grants ([12](12-dynamic-permissions.md)) — none for a `service:<name>` identity, whose authority is exactly its YAML group. A `database: "*"` grant matches every database the config declares on that server.
+3. If no grant has an action that includes the requested one → `forbidden`. `history_read` is outside the `query_write ⊇ query_read ⊇ schema_read` chain: it neither grants nor is granted by any of them.
+4. Merge constraints across matching grants: take the **most restrictive** value for each (lowest `row_limit`, lowest `statement_timeout_ms`, `require_reason` = true wins, schema/table allow/deny intersected). Zero is a bound, the tightest one — never "unset".
 5. Apply constraints to the call.
 
-Most-restrictive merging means you can't accidentally upgrade your access by being in two groups.
+Most-restrictive merging means you can't accidentally upgrade your access by being in two groups. The decision depends only on the *set* of matching grants, never their order (`src/authz/resolver_proptests.rs`).
 
 ## Hot reload
 
-Permission changes land via PR → merge → operator runs `kill -HUP` on the gateway (or rolling restart). Live sessions keep their existing grants snapshot until next login (matches [04-auth-sso](04-auth-sso.md)).
+Permission changes land via PR → merge → operator runs `kill -HUP` on the gateway (or rolling restart). The reload swaps the YAML grants atomically or not at all and invalidates every cached grant, so the next call evaluates against the new file — see [08-config §Hot reload](08-config.md#hot-reload) for what a reload can and cannot change (the admin API's mount, group and known-server list are fixed at boot). Group memberships still come from the session's IdP snapshot until next login (matches [04-auth-sso](04-auth-sso.md)).
 
 ## Admin operations
 

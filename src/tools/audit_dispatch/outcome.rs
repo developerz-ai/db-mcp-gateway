@@ -1,24 +1,27 @@
 use std::time::Instant;
 
 use serde_json::Value;
+use uuid::Uuid;
 
-use crate::exec::ExecError;
-use crate::transport::jsonrpc::Response;
-use crate::transport::protocol::{CallToolResult, TextContent};
+use crate::exec::{ExecError, RejectionKind};
+use crate::mcp::jsonrpc::{ErrorObject, Response};
+use crate::mcp::protocol::{CallToolResult, TextContent};
 
-use super::{Outcome, OutcomeCode};
+use super::{Outcome, OutcomeCode, Reply};
 
-/// Build a structured tool error response per spec 03 §Errors. `request_id`
-/// is duplicated inside the JSON body so agents that only read the tool
-/// payload still get it.
-///
-/// Exposed to `super` (`audit_dispatch::mod`) so audit-write failures can
-/// surface the spec-03 code (`"timeout"` / `"internal"`) instead of a bare
-/// JSON-RPC internal error. External tool callers keep using
-/// `error_outcome` / `outcome_from_exec_error`.
-pub(super) fn tool_error(id: Value, code: OutcomeCode, message: &str) -> Response {
+/// Build a structured tool error response per spec 03 §Errors. The body's
+/// `request_id` is the gateway UUID — the value in `audit_calls.request_id`
+/// and the `x-request-id` header — so the id an agent pastes back to ops
+/// finds the row. `id` is the client's JSON-RPC id, echoed in the envelope
+/// only. Called only by the chokepoint, the one place that knows both.
+pub(super) fn tool_error(
+    id: Value,
+    request_id: Uuid,
+    code: OutcomeCode,
+    message: &str,
+) -> Response {
     let body = serde_json::json!({
-        "request_id": id.clone(),
+        "request_id": request_id.to_string(),
         "code": code.as_str(),
         "message": message,
     });
@@ -42,16 +45,34 @@ pub fn tool_success(id: Value, text: String) -> Response {
     )
 }
 
-/// Shortcut for the common error-outcome shape: a typed tool_error response
-/// plus the matching audit fields (the message is mirrored into
-/// `error_message` so operators can read it from the audit row).
+/// Shortcut for the common error-outcome shape: a spec 03 tool error the
+/// chokepoint renders, with the message mirrored into `error_message` (it is
+/// both the client text and the audit row's).
 ///
 /// Scoped to `crate::tools`: the tools own their per-tool wording. Anything
 /// outside must route target-DB errors through [`outcome_from_exec_error`].
-pub(in crate::tools) fn error_outcome(id: Value, code: OutcomeCode, message: &str) -> Outcome {
+pub(in crate::tools) fn error_outcome(code: OutcomeCode, message: &str) -> Outcome {
     Outcome {
-        response: tool_error(id, code, message),
+        reply: Reply::ToolError,
         code,
+        elapsed_ms: None,
+        row_count: None,
+        truncated: None,
+        error_message: Some(message.to_string()),
+    }
+}
+
+/// A rejected argument (spec 03 §Errors `invalid_arguments`): the wire keeps
+/// the JSON-RPC `invalid_params` (-32602) envelope — a structural error, not
+/// a tool result — while the audit row records `invalid_arguments`, so a
+/// caller probing the argument boundary still leaves a trail.
+pub(in crate::tools) fn invalid_arguments(id: Value, message: &str) -> Outcome {
+    Outcome {
+        reply: Reply::Response(Box::new(Response::error(
+            id,
+            ErrorObject::invalid_params(message),
+        ))),
+        code: OutcomeCode::InvalidArguments,
         elapsed_ms: None,
         row_count: None,
         truncated: None,
@@ -89,7 +110,6 @@ pub struct ToolErrorMessages {
 /// #57 made that pain visible. Per-tool wording rides in
 /// [`ToolErrorMessages`] so the shared mapping stays one function.
 pub fn outcome_from_exec_error(
-    id: Value,
     err: ExecError,
     started: Instant,
     messages: &ToolErrorMessages,
@@ -101,6 +121,27 @@ pub fn outcome_from_exec_error(
             (OutcomeCode::Unavailable, "target database is unreachable")
         }
         ExecError::Sql => (OutcomeCode::SyntaxError, messages.sql_rejected),
+        // Every DB rejection carries the SQLSTATE and the server's primary
+        // message (role already redacted by exec) so the agent can act on it;
+        // two SQLSTATEs get their own codes.
+        ExecError::Rejected(rejection) => match rejection.kind() {
+            RejectionKind::PermissionDenied => {
+                owned = rejection.to_string();
+                (OutcomeCode::PermissionDenied, owned.as_str())
+            }
+            RejectionKind::UndefinedObject => {
+                owned = rejection.to_string();
+                (OutcomeCode::UndefinedObject, owned.as_str())
+            }
+            RejectionKind::Other => {
+                owned = format!("{}: {rejection}", messages.sql_rejected);
+                (OutcomeCode::SyntaxError, owned.as_str())
+            }
+        },
+        ExecError::Decode => (
+            OutcomeCode::Internal,
+            "target returned a value the gateway could not decode",
+        ),
         ExecError::Forbidden(reason) => {
             owned = format!(
                 "{prefix} rejected by gateway: {reason}",
@@ -114,7 +155,7 @@ pub fn outcome_from_exec_error(
             (OutcomeCode::Internal, "server-side configuration error")
         }
     };
-    let mut outcome = error_outcome(id, code, message);
+    let mut outcome = error_outcome(code, message);
     outcome.elapsed_ms = Some(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
     outcome
 }
@@ -128,7 +169,7 @@ pub fn success_outcome(
     truncated: Option<bool>,
 ) -> Outcome {
     Outcome {
-        response: tool_success(id, text),
+        reply: Reply::Response(Box::new(tool_success(id, text))),
         code: OutcomeCode::Success,
         elapsed_ms,
         row_count,
@@ -143,15 +184,18 @@ mod tests {
 
     #[test]
     fn tool_error_payload_shape() {
-        let response = tool_error(Value::from(7), OutcomeCode::Forbidden, "nope");
+        let request_id = Uuid::new_v4();
+        let response = tool_error(Value::from(7), request_id, OutcomeCode::Forbidden, "nope");
         let value = serde_json::to_value(&response).unwrap();
+        // The client's JSON-RPC id stays in the envelope only…
         assert_eq!(value["id"], 7);
         assert_eq!(value["result"]["isError"], true);
         let text = value["result"]["content"][0]["text"].as_str().unwrap();
         let body: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(body["code"], "forbidden");
         assert_eq!(body["message"], "nope");
-        assert_eq!(body["request_id"], 7);
+        // …the body carries the gateway id that keys the audit row.
+        assert_eq!(body["request_id"], request_id.to_string());
     }
 
     #[test]
@@ -168,7 +212,7 @@ mod tests {
 
     #[test]
     fn error_outcome_mirrors_message_into_audit() {
-        let outcome = error_outcome(Value::from(1), OutcomeCode::Forbidden, "no grants");
+        let outcome = error_outcome(OutcomeCode::Forbidden, "no grants");
         assert_eq!(outcome.code, OutcomeCode::Forbidden);
         assert_eq!(outcome.error_message.as_deref(), Some("no grants"));
         assert!(outcome.row_count.is_none());
@@ -189,7 +233,6 @@ mod tests {
             forbidden_prefix: "query",
         };
         let outcome = outcome_from_exec_error(
-            Value::from(1),
             ExecError::UnsupportedAdapter(ServerKind::Mysql),
             Instant::now(),
             &messages,
@@ -202,6 +245,21 @@ mod tests {
         // The backend identity must not ride along into the client-facing text.
         let msg = outcome.error_message.unwrap_or_default().to_lowercase();
         assert!(!msg.contains("mysql"), "{msg}");
+    }
+
+    #[test]
+    fn invalid_arguments_uses_the_invalid_params_envelope() {
+        let outcome = invalid_arguments(Value::from(3), "`limit` must be at least 1");
+        assert_eq!(outcome.code, OutcomeCode::InvalidArguments);
+        let Reply::Response(response) = &outcome.reply else {
+            panic!("invalid arguments keep the JSON-RPC envelope");
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["error"]["code"], -32602);
+        assert_eq!(
+            outcome.error_message.as_deref(),
+            Some("`limit` must be at least 1")
+        );
     }
 
     #[test]

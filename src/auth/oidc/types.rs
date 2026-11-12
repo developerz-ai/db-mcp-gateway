@@ -1,7 +1,3 @@
-use std::collections::HashMap;
-use std::time::Instant;
-
-use jsonwebtoken::DecodingKey;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -23,8 +19,14 @@ pub(super) struct Jwk {
     pub(super) kty: String,
     #[serde(rename = "use")]
     pub(super) use_: Option<String>,
+    pub(super) alg: Option<String>,
+    /// RSA modulus / exponent.
     pub(super) n: Option<String>,
     pub(super) e: Option<String>,
+    /// EC curve and point.
+    pub(super) crv: Option<String>,
+    pub(super) x: Option<String>,
+    pub(super) y: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,23 +40,4 @@ pub struct VerifiedIdentity {
     pub sub: String,
     pub email: String,
     pub groups: Vec<String>,
-}
-
-/// JWKS with a fetched-at timestamp so we can rotate keys without a restart.
-#[derive(Clone)]
-pub(super) struct JwksCache {
-    pub(super) keys: HashMap<String, DecodingKey>,
-    pub(super) fetched_at: Instant,
-}
-
-impl std::fmt::Debug for JwksCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `DecodingKey` from `jsonwebtoken` 9.x doesn't derive `Debug`. Print
-        // the count and freshness instead — opaque key material never belongs
-        // in a log line anyway.
-        f.debug_struct("JwksCache")
-            .field("keys", &self.keys.len())
-            .field("fetched_at", &self.fetched_at)
-            .finish()
-    }
 }

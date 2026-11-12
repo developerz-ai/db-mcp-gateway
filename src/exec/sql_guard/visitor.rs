@@ -6,27 +6,72 @@ use std::ops::ControlFlow;
 
 use super::GuardError;
 
-/// Functions that the gateway always blocks, regardless of the Postgres role's
-/// privileges. These access the server filesystem or trigger network I/O —
-/// primary data-exfiltration / credential-theft vectors:
+/// Functions the gateway always blocks, regardless of the Postgres role's
+/// privileges. Matched case-insensitively on the last name component, so a
+/// schema-qualified call (`pg_catalog.pg_read_file`) is caught too.
 ///
-/// - `pg_read_file` / `pg_read_binary_file` — read arbitrary server-side files
-///   (e.g. `pg_hba.conf`, `.pgpass`). A read-only role that is accidentally
-///   granted execute on these can exfiltrate credentials without any writes.
-/// - `pg_ls_dir` / `pg_stat_file` — enumerate and stat server filesystem paths;
-///   information-gathering step for targeted file reads.
-/// - `lo_export` — writes a large object to a server-side path (filesystem write
-///   from inside a SELECT body — the read-only role boundary does not stop it if
-///   execute is granted).
-/// - `lo_import` — reads a file into a large object; symmetric to `lo_export`.
-const DENIED_FUNCTIONS: &[&str] = &[
-    "pg_read_file",
-    "pg_read_binary_file",
-    "pg_ls_dir",
-    "pg_stat_file",
-    "lo_export",
-    "lo_import",
+/// This is layer three. The DB role is layer one and the read-only
+/// transaction layer two; the list exists for the functions those two do
+/// not stop — ones a read-only transaction still runs, or that run SQL the
+/// guard never sees:
+///
+/// - filesystem: `pg_read_file`, `pg_read_binary_file`, `pg_stat_file`,
+///   `pg_ls_*` (every directory listing), `pg_current_logfile`, and the
+///   large-object family `lo_*` / `lowrite` (`lo_export` writes a server
+///   file; `lo_from_bytea` creates an object — no side effect is allowed
+///   from a read).
+/// - session state: `set_config` (a session-level change would outlive the
+///   query on a pooled connection) and every advisory lock function (a
+///   session lock blocks other users until the connection is reset).
+/// - other backends: `pg_cancel_backend`, `pg_terminate_backend`.
+/// - dynamic SQL: `query_to_xml*`, `cursor_to_xml*`, `table_to_xml*`,
+///   `schema_to_xml*`, `database_to_xml*` execute SQL text or whole-schema
+///   reads the guard cannot inspect; `dblink*` reaches other servers.
+const DENIED_FUNCTIONS: &[Denied] = &[
+    Denied::Exact("pg_read_file"),
+    Denied::Exact("pg_read_binary_file"),
+    Denied::Exact("pg_stat_file"),
+    Denied::Exact("pg_current_logfile"),
+    Denied::Exact("pg_ls_dir"),
+    Denied::Prefix("pg_ls_", "pg_ls_*"),
+    Denied::Exact("lo_export"),
+    Denied::Exact("lo_import"),
+    Denied::Prefix("lo_", "lo_*"),
+    Denied::Exact("lowrite"),
+    Denied::Exact("set_config"),
+    Denied::Prefix("pg_advisory_", "pg_advisory_*"),
+    Denied::Prefix("pg_try_advisory_", "pg_try_advisory_*"),
+    Denied::Exact("pg_cancel_backend"),
+    Denied::Exact("pg_terminate_backend"),
+    Denied::Prefix("query_to_xml", "query_to_xml*"),
+    Denied::Prefix("cursor_to_xml", "cursor_to_xml*"),
+    Denied::Prefix("table_to_xml", "table_to_xml*"),
+    Denied::Prefix("schema_to_xml", "schema_to_xml*"),
+    Denied::Prefix("database_to_xml", "database_to_xml*"),
+    Denied::Prefix("dblink", "dblink*"),
 ];
+
+/// One denylist entry. Exact names come first in [`DENIED_FUNCTIONS`] so a
+/// well-known name is reported as itself rather than as its family.
+#[derive(Debug, Clone, Copy)]
+enum Denied {
+    Exact(&'static str),
+    /// `(prefix, label)` — the label is what the error reports.
+    Prefix(&'static str, &'static str),
+}
+
+impl Denied {
+    /// The name to report if `fn_name` matches this entry.
+    fn matches(self, fn_name: &str) -> Option<&'static str> {
+        match self {
+            Self::Exact(name) => name.eq_ignore_ascii_case(fn_name).then_some(name),
+            Self::Prefix(prefix, label) => fn_name
+                .get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                .then_some(label),
+        }
+    }
+}
 
 /// Substructure guard, run once the top-level [`check_statement_shape`] has
 /// admitted the statement. Enforces four things via sqlparser's `Visit`
@@ -103,8 +148,15 @@ impl Visitor for GuardVisitor {
         // `FROM pg_ls_dir(...)` and `FROM LATERAL pg_ls_dir(...)` place the
         // denied name on a TableFactor, not an Expr::Function — check both
         // shapes here so it is caught symmetrically with the expression pass.
+        // A `Table` without arguments is a relation, not a call: a table
+        // named `lo_items` must not trip the `lo_*` family.
         let name = match tf {
-            TableFactor::Table { name, .. } | TableFactor::Function { name, .. } => name,
+            TableFactor::Table {
+                name,
+                args: Some(_),
+                ..
+            }
+            | TableFactor::Function { name, .. } => name,
             _ => return ControlFlow::Continue(()),
         };
         if let Err(err) = check_denied_name(name) {
@@ -141,11 +193,8 @@ fn check_denied_name(name: &ObjectName) -> Result<(), GuardError> {
             None => return Err(GuardError::NotAllowed("computed function name")),
         },
     };
-    match DENIED_FUNCTIONS
-        .iter()
-        .find(|&&d| d.eq_ignore_ascii_case(fn_name))
-    {
-        Some(&denied) => Err(GuardError::DeniedFunction(denied)),
+    match DENIED_FUNCTIONS.iter().find_map(|d| d.matches(fn_name)) {
+        Some(denied) => Err(GuardError::DeniedFunction(denied)),
         None => Ok(()),
     }
 }

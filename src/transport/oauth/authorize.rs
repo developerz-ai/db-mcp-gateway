@@ -1,3 +1,4 @@
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
@@ -5,10 +6,14 @@ use serde::Deserialize;
 
 use crate::auth::pkce;
 
-use super::super::app_state::AppState;
-use super::helpers::{build_redirect, oauth_error, random_token, redirect_with_error};
-use super::register::{is_loopback_redirect_uri, redirect_uri_matches};
-use crate::auth::oauth::{GrantIdentity, OAuthBridge};
+use super::super::app_state::OAuthState;
+use super::helpers::{
+    build_redirect, oauth_error, query_rejected, random_token, redirect_with_error,
+};
+use super::register::{
+    is_loopback_redirect_uri, redirect_uri_matches, redirect_uris_acceptable, registry_error,
+};
+use crate::auth::oauth::{AuthFacade, GrantIdentity, OAuthBridge};
 
 /// Upper bound on a `client_id` the gateway will *adopt* at `/authorize` (as
 /// opposed to one it minted at `/register`). `/authorize` is unauthenticated, so
@@ -41,9 +46,13 @@ pub struct AuthorizeParams {
 /// redirect/state/challenge, and 302 the browser into the IdP login. The IdP
 /// lands back at `/auth/callback`, which calls `complete_bridge_login`.
 pub async fn authorize(
-    State(state): State<AppState>,
-    Query(p): Query<AuthorizeParams>,
+    State(state): State<OAuthState>,
+    params: Result<Query<AuthorizeParams>, QueryRejection>,
 ) -> Response {
+    let Query(p) = match params {
+        Ok(params) => params,
+        Err(rejection) => return query_rejected(&rejection),
+    };
     if p.response_type.as_deref() != Some("code") {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -69,7 +78,10 @@ pub async fn authorize(
             "redirect_uri is required",
         );
     };
-    let redirect_uri = match state.client_registry.redirect_uris(client_id).await {
+    // Resolve the client now, but record an adopted one only after every
+    // other parameter validates: a request that fails PKCE or `state` must
+    // leave nothing behind in the registry.
+    let adopt = match state.client_registry.redirect_uris(client_id).await {
         Some(registered) => {
             if !registered
                 .iter()
@@ -81,7 +93,7 @@ pub async fn authorize(
                     "redirect_uri must exactly match a registered redirect URI",
                 );
             }
-            requested_uri
+            false
         }
         // Unknown client_id, loopback redirect: adopt the id rather than
         // dead-end. A client caches its `client_id` and replays it for as long
@@ -93,20 +105,11 @@ pub async fn authorize(
         // An https redirect stays a hard reject — that is the case where waving
         // an unknown client through would let a code be sent to an attacker's
         // host, which is exactly what the allowlist exists to prevent.
-        None if is_loopback_redirect_uri(&requested_uri) && is_adoptable_client_id(client_id) => {
-            if !state
-                .client_registry
-                .insert(client_id.to_string(), vec![requested_uri.clone()])
-                .await
-            {
-                return oauth_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "temporarily_unavailable",
-                    "client registration capacity reached; retry later",
-                );
-            }
-            tracing::info!("adopted an unregistered client_id for a loopback redirect");
-            requested_uri
+        None if is_loopback_redirect_uri(&requested_uri)
+            && redirect_uris_acceptable(std::slice::from_ref(&requested_uri))
+            && is_adoptable_client_id(client_id) =>
+        {
+            true
         }
         None => {
             return oauth_error(
@@ -142,14 +145,20 @@ pub async fn authorize(
             "state is required",
         );
     };
-
-    let Some(auth) = state.auth.as_ref() else {
-        return oauth_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            "auth not configured",
-        );
-    };
+    if adopt {
+        // `adopt` starts the row on the authorised-client TTL: this
+        // `/authorize` is its first use.
+        if let Err(err) = state
+            .client_registry
+            .adopt(client_id.to_string(), requested_uri.clone())
+            .await
+        {
+            return registry_error(err);
+        }
+        tracing::info!("adopted an unregistered client_id for a loopback redirect");
+    }
+    let redirect_uri = requested_uri;
+    let auth = &state.auth;
 
     // Drive the IdP login. We reuse the gateway's own registered redirect
     // (`OIDC_REDIRECT_URL` → /auth/callback); the bridge context recovered
@@ -173,8 +182,7 @@ pub async fn authorize(
             );
         }
     };
-    if auth
-        .flows
+    auth.flows
         .insert_bridge(
             csrf_state,
             nonce,
@@ -187,15 +195,7 @@ pub async fn authorize(
                 resource: p.resource,
             },
         )
-        .await
-        .is_err()
-    {
-        return oauth_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server_error",
-            "gateway temporarily overloaded; try again",
-        );
-    }
+        .await;
 
     Redirect::to(idp_url.as_str()).into_response()
 }
@@ -208,16 +208,12 @@ pub async fn authorize(
 /// On any IdP-side failure we still 302 back with an `error` param (never a
 /// raw 5xx) so the client's loopback handler completes instead of hanging.
 pub async fn complete_bridge_login(
-    state: &AppState,
+    auth: &AuthFacade,
     bridge: OAuthBridge,
     code: &str,
     nonce: &str,
     idp_verifier: &str,
 ) -> Response {
-    let Some(auth) = state.auth.as_ref() else {
-        return redirect_with_error(&bridge, "server_error");
-    };
-
     let verified = match auth
         .oidc
         .exchange_and_verify(code, nonce, idp_verifier)

@@ -5,7 +5,7 @@
 mod common;
 
 use common::pg_target::adapter;
-use db_mcp_gateway::exec::{DbAdapter, ExecQuery};
+use db_mcp_gateway::exec::{Access, DbAdapter, ExecQuery};
 
 /// The shape `explain::extract_plan` relies on: one row, one column, with
 /// JSON-shaped content. Postgres returns it as a `json` column which sqlx
@@ -20,6 +20,7 @@ async fn explain_returns_parseable_json_plan() {
             binds: &[],
             statement_timeout_ms: None,
             row_limit: 10,
+            access: Access::ReadWrite,
         })
         .await
         .expect("EXPLAIN runs");

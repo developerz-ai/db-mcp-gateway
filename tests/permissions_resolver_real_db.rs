@@ -21,7 +21,10 @@ use db_mcp_gateway::authz::{
 };
 use db_mcp_gateway::config::{Action, ConfigFile};
 use db_mcp_gateway::state::permissions::pg::PgPermissionsRepo;
-use db_mcp_gateway::state::permissions::{DbType, GrantAction, GrantTarget, PermissionsRepo};
+use db_mcp_gateway::state::permissions::{
+    DbType, GrantAction, GrantTarget, LiveGrant, Page, PermissionsChange, PermissionsDatabase,
+    PermissionsGrant, PermissionsRepo, PermissionsSeed, PermissionsUser, RepoError,
+};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -36,6 +39,7 @@ fn identity_for(sub: &str, groups: &[&str]) -> Identity {
         user_email: format!("{sub}@example.com"),
         groups: groups.iter().map(|g| g.to_string()).collect(),
         issued_at: chrono::Utc::now(),
+        kind: db_mcp_gateway::auth::IdentityKind::Sso,
     }
 }
 
@@ -82,7 +86,7 @@ async fn loader_projects_specific_grant_into_config_grant_shape() {
     .unwrap();
 
     let id = identity_for(&sub, &[]);
-    let grants = load_db_grants_for(&repo, &id).await.expect("load");
+    let grants = load_db_grants_for(&repo, &id.user_sub).await.expect("load");
     assert_eq!(grants.len(), 1, "one Specific grant should round-trip");
     assert_eq!(grants[0].server, server);
     assert_eq!(grants[0].database, "app");
@@ -120,7 +124,7 @@ async fn loader_drops_grants_whose_database_was_soft_deleted() {
     assert!(repo.soft_delete_database(db.id).await.unwrap());
 
     let id = identity_for(&sub, &[]);
-    let grants = load_db_grants_for(&repo, &id).await.expect("load");
+    let grants = load_db_grants_for(&repo, &id.user_sub).await.expect("load");
     assert!(
         grants.is_empty(),
         "grant on a soft-deleted db must not surface, got {:?}",
@@ -138,7 +142,7 @@ async fn loader_returns_empty_for_user_with_no_permissions_row() {
     // user, no admin-API onboarding yet) gets an empty DB-grant set — NOT
     // an error. The YAML path still applies.
     let id = identity_for(&fresh("no-row-user"), &["devs"]);
-    let grants = load_db_grants_for(&repo, &id).await.expect("load");
+    let grants = load_db_grants_for(&repo, &id.user_sub).await.expect("load");
     assert!(grants.is_empty());
 }
 
@@ -164,7 +168,7 @@ async fn evaluate_effective_grants_via_db_with_no_yaml_match() {
     .unwrap();
 
     let id = identity_for(&sub, &[]); // no YAML group membership
-    let db_grants = load_db_grants_for(&repo, &id).await.unwrap();
+    let db_grants = load_db_grants_for(&repo, &id.user_sub).await.unwrap();
 
     // No YAML permissions, but DB grant matches → Allow.
     let decision = evaluate_effective(&id, Action::QueryRead, &server, "app", &[], &db_grants);
@@ -216,7 +220,7 @@ permissions:
     let cfg = ConfigFile::from_yaml_str(&yaml).expect("yaml parses");
 
     let id = identity_for(&sub, &["devs"]);
-    let db_grants = load_db_grants_for(&repo, &id).await.unwrap();
+    let db_grants = load_db_grants_for(&repo, &id.user_sub).await.unwrap();
 
     let decision = evaluate_effective(
         &id,
@@ -274,7 +278,7 @@ servers:
     let cfg = ConfigFile::from_yaml_str(&yaml).expect("yaml parses");
 
     let id = identity_for(&sub, &[]); // no YAML group → YAML alone would deny
-    let db_grants = load_db_grants_for(&repo, &id).await.unwrap();
+    let db_grants = load_db_grants_for(&repo, &id.user_sub).await.unwrap();
 
     let server = cfg.servers.iter().find(|s| s.name == server_name).unwrap();
     assert!(
@@ -292,7 +296,7 @@ async fn cache_hits_avoid_db_round_trip_and_invalidate_busts_it() {
     let p = state_pool().await;
     let sub = fresh("cache");
     let server = fresh("cache-server");
-    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(p.clone()));
+    let repo = Arc::new(PgPermissionsRepo::new(p.clone()));
 
     let user = repo.upsert_user(&sub, "u@example.com", &[]).await.unwrap();
     let db = repo
@@ -343,7 +347,7 @@ async fn cache_hits_avoid_db_round_trip_and_invalidate_busts_it() {
     );
 
     // Admin API would call this after a write.
-    cache.invalidate(&sub).await;
+    cache.apply(&PermissionsChange::User(sub.clone())).await;
     let third = cache.get_for(&id).await.expect("third load");
     assert_eq!(third.len(), 2, "post-invalidate must reload from DB");
 
@@ -373,7 +377,7 @@ async fn spawn_invalidate_drops_the_targeted_users_entry() {
     let p = state_pool().await;
     let sub = fresh("spawn-inv");
     let server = fresh("spawn-inv-server");
-    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(p.clone()));
+    let repo = Arc::new(PgPermissionsRepo::new(p.clone()));
 
     let user = repo.upsert_user(&sub, "u@example.com", &[]).await.unwrap();
     let db = repo
@@ -412,8 +416,7 @@ async fn spawn_invalidate_drops_the_targeted_users_entry() {
     .unwrap();
 
     // Fire-and-forget via the canonical detach helper.
-    let opt = Some(cache.clone());
-    PermissionsCache::spawn_invalidate(&opt, Some(&sub));
+    cache.spawn_apply(PermissionsChange::User(sub.clone()));
 
     // After the spawned task lands, the next load must see both grants.
     await_condition(|| async {
@@ -429,24 +432,12 @@ async fn spawn_invalidate_drops_the_targeted_users_entry() {
 }
 
 #[tokio::test]
-async fn spawn_invalidate_is_a_noop_when_cache_is_none() {
-    // YAML-only installs pass `None`; calling the helper must not panic and
-    // must not spawn a task that would try to lock a missing cache.
-    PermissionsCache::spawn_invalidate(&None, Some("any-sub"));
-    // Also tolerate a missing user_sub even when the cache is wired.
-    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(state_pool().await));
-    let cache = Some(PermissionsCache::new(repo, Duration::from_secs(60)));
-    PermissionsCache::spawn_invalidate(&cache, None);
-    // If we got here without panicking or hanging, the no-op contract holds.
-}
-
-#[tokio::test]
 async fn spawn_invalidate_all_flushes_every_users_entry() {
     let p = state_pool().await;
     let sub_a = fresh("spawn-all-a");
     let sub_b = fresh("spawn-all-b");
     let server = fresh("spawn-all-server");
-    let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(p.clone()));
+    let repo = Arc::new(PgPermissionsRepo::new(p.clone()));
 
     let user_a = repo
         .upsert_user(&sub_a, "a@example.com", &[])
@@ -498,8 +489,7 @@ async fn spawn_invalidate_all_flushes_every_users_entry() {
     .await
     .unwrap();
 
-    let opt = Some(cache.clone());
-    PermissionsCache::spawn_invalidate_all(&opt);
+    cache.spawn_apply(PermissionsChange::All);
 
     await_condition(|| async {
         cache
@@ -521,8 +511,146 @@ async fn spawn_invalidate_all_flushes_every_users_entry() {
     cleanup(&p, &sub_b, &server).await.expect("cleanup b");
 }
 
+/// Real pg repo that counts store round trips the resolver makes.
+#[derive(Debug)]
+struct CountingRepo {
+    inner: PgPermissionsRepo,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingRepo {
+    fn bump(&self) {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl PermissionsRepo for CountingRepo {
+    async fn get_user(&self, id: Uuid) -> Result<Option<PermissionsUser>, RepoError> {
+        self.bump();
+        self.inner.get_user(id).await
+    }
+    async fn list_users(&self, page: Page) -> Result<Vec<PermissionsUser>, RepoError> {
+        self.bump();
+        self.inner.list_users(page).await
+    }
+    async fn get_database(&self, id: Uuid) -> Result<Option<PermissionsDatabase>, RepoError> {
+        self.bump();
+        self.inner.get_database(id).await
+    }
+    async fn list_databases(&self, page: Page) -> Result<Vec<PermissionsDatabase>, RepoError> {
+        self.bump();
+        self.inner.list_databases(page).await
+    }
+    async fn get_grant(&self, id: Uuid) -> Result<Option<PermissionsGrant>, RepoError> {
+        self.bump();
+        self.inner.get_grant(id).await
+    }
+    async fn list_grants(
+        &self,
+        user_id: Option<Uuid>,
+        database_id: Option<Uuid>,
+        page: Page,
+    ) -> Result<Vec<PermissionsGrant>, RepoError> {
+        self.bump();
+        self.inner.list_grants(user_id, database_id, page).await
+    }
+    async fn live_grants_for_sub(&self, user_sub: &str) -> Result<Vec<LiveGrant>, RepoError> {
+        self.bump();
+        self.inner.live_grants_for_sub(user_sub).await
+    }
+}
+
+/// A cache miss costs exactly one store round trip, however many grants and
+/// databases the subject has.
 #[tokio::test]
-async fn spawn_invalidate_all_is_a_noop_when_cache_is_none() {
-    PermissionsCache::spawn_invalidate_all(&None);
-    // No panic, no hang — contract holds.
+async fn cache_miss_is_one_store_query() {
+    let p = state_pool().await;
+    let sub = fresh("one-query");
+    let server = fresh("one-query-server");
+    let seed = PgPermissionsRepo::new(p.clone());
+    let user = seed.upsert_user(&sub, "u@example.com", &[]).await.unwrap();
+    for name in ["app", "warehouse", "billing"] {
+        let db = seed
+            .create_database(&server, name, DbType::Postgres)
+            .await
+            .unwrap();
+        seed.create_grant(
+            user.id,
+            GrantTarget::Specific { database_id: db.id },
+            GrantAction::QueryRead,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    }
+    let repo = Arc::new(CountingRepo {
+        inner: PgPermissionsRepo::new(p.clone()),
+        calls: Default::default(),
+    });
+    let cache = PermissionsCache::new(repo.clone(), Duration::from_secs(60));
+
+    let grants = cache.get_for(&identity_for(&sub, &[])).await.unwrap();
+    assert_eq!(grants.len(), 3);
+    assert_eq!(repo.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    cleanup(&p, &sub, &server).await.expect("cleanup succeeds");
+}
+
+/// Two caches stand in for two replicas. A revoke committed with its
+/// `NOTIFY` reaches the replica that did not make it, well inside the TTL.
+#[tokio::test]
+async fn second_replica_converges_after_a_notified_revoke() {
+    use db_mcp_gateway::state::permissions::pg::{grants, notify};
+
+    let p = state_pool().await;
+    let sub = fresh("replica");
+    let server = fresh("replica-server");
+    let seed = PgPermissionsRepo::new(p.clone());
+    let user = seed.upsert_user(&sub, "u@example.com", &[]).await.unwrap();
+    let db = seed
+        .create_database(&server, "app", DbType::Postgres)
+        .await
+        .unwrap();
+    let grant = seed
+        .create_grant(
+            user.id,
+            GrantTarget::Specific { database_id: db.id },
+            GrantAction::QueryRead,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+    let repo = Arc::new(PgPermissionsRepo::new(p.clone()));
+    let replica_b = PermissionsCache::new(repo, Duration::from_secs(600));
+    let listener = tokio::spawn({
+        let cache = replica_b.clone();
+        notify::listen(p.clone(), move |change| {
+            let cache = cache.clone();
+            async move { cache.apply(&change).await }
+        })
+    });
+    let id = identity_for(&sub, &[]);
+    assert_eq!(replica_b.get_for(&id).await.unwrap().len(), 1);
+
+    // Replica A's admin write: revoke + NOTIFY in one transaction.
+    let mut tx = p.begin().await.unwrap();
+    assert!(grants::tx_revoke_grant(&mut tx, grant.id).await.unwrap());
+    notify::tx_notify(&mut tx, &PermissionsChange::User(sub.clone()))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    await_condition(|| async {
+        replica_b
+            .get_for(&id)
+            .await
+            .map(|g| g.is_empty())
+            .unwrap_or(false)
+    })
+    .await;
+
+    listener.abort();
+    cleanup(&p, &sub, &server).await.expect("cleanup succeeds");
 }

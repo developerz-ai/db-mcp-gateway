@@ -10,15 +10,15 @@
 //! the session-cache real-DB tests.
 //!
 //! All tests are `#[serial]`: they share one global `oauth_clients` table, and
-//! the cap test seeds it to the 10k `CLIENT_CAP`. Run in parallel, that seed
-//! makes every sibling test's `insert` of a brand-new `client_id` trip the cap
-//! check and fail closed (`false`) — a nondeterministic flake where the victim
-//! changes per run. Serializing keeps the shared table consistent.
+//! the cap tests seed it to the 10k `CLIENT_CAP`. Run in parallel, that seed
+//! would evict or refuse a sibling test's registration — a nondeterministic
+//! flake where the victim changes per run. Serializing keeps the table
+//! consistent.
 
 mod common;
 
 use common::env::state_pool;
-use db_mcp_gateway::auth::oauth::ClientRegistry;
+use db_mcp_gateway::auth::oauth::{ClientRegistry, StoreError};
 use serial_test::serial;
 use sqlx::PgPool;
 
@@ -46,11 +46,10 @@ async fn registration_survives_a_restart() {
     cleanup(&pool, &client_id).await;
 
     let before_restart = ClientRegistry::with_db(pool.clone());
-    assert!(
-        before_restart
-            .insert(client_id.clone(), vec!["http://127.0.0.1:0/cb".into()])
-            .await
-    );
+    before_restart
+        .insert(client_id.clone(), vec!["http://127.0.0.1:0/cb".into()])
+        .await
+        .expect("registered");
 
     // New instance, same DB — the "restarted pod".
     let after_restart = ClientRegistry::with_db(pool.clone());
@@ -79,14 +78,12 @@ async fn re_register_updates_redirect_uris() {
     cleanup(&pool, &client_id).await;
 
     let reg = ClientRegistry::with_db(pool.clone());
-    assert!(
-        reg.insert(client_id.clone(), vec!["https://a/cb".into()])
-            .await
-    );
-    assert!(
-        reg.insert(client_id.clone(), vec!["https://b/cb".into()])
-            .await
-    );
+    reg.insert(client_id.clone(), vec!["https://a/cb".into()])
+        .await
+        .expect("registered");
+    reg.insert(client_id.clone(), vec!["https://b/cb".into()])
+        .await
+        .expect("registered");
     assert_eq!(
         reg.redirect_uris(&client_id).await,
         Some(vec!["https://b/cb".into()])
@@ -96,9 +93,8 @@ async fn re_register_updates_redirect_uris() {
 }
 
 /// An expired registration is not returned by lookup and is swept by the
-/// insert-time GC (`DELETE ... WHERE expires_at <= now()`) — the DB-backed
-/// analogue of the in-memory store's TTL. We age the row directly rather than
-/// sleep out the 24h TTL.
+/// background GC (`DELETE ... WHERE expires_at <= now()`). We age the row
+/// directly rather than sleep out the TTL.
 #[tokio::test]
 #[serial]
 async fn expired_registration_is_swept_and_not_returned() {
@@ -108,7 +104,9 @@ async fn expired_registration_is_swept_and_not_returned() {
     cleanup(&pool, &stale).await;
 
     let reg = ClientRegistry::with_db(pool.clone());
-    assert!(reg.insert(stale.clone(), vec!["https://a/cb".into()]).await);
+    reg.insert(stale.clone(), vec!["https://a/cb".into()])
+        .await
+        .expect("registered");
 
     // Backdate the whole row into the past — both columns, so the
     // `expires_at > created_at` CHECK still holds while `expires_at <= now()`.
@@ -129,9 +127,9 @@ async fn expired_registration_is_swept_and_not_returned() {
         "an expired registration must not resolve"
     );
 
-    // ...and the next insert's GC pass physically removes it.
-    let fresh = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
-    assert!(reg.insert(fresh.clone(), vec!["https://b/cb".into()]).await);
+    // ...and the background GC pass physically removes it (the request path
+    // never sweeps).
+    assert!(reg.gc_expired().await >= 1, "GC must report the stale row");
     let still_there: bool =
         sqlx::query_scalar("SELECT exists(SELECT 1 FROM oauth_clients WHERE client_id = $1)")
             .bind(&stale)
@@ -140,61 +138,81 @@ async fn expired_registration_is_swept_and_not_returned() {
             .expect("existence check");
     assert!(!still_there, "GC must have deleted the expired row");
 
-    cleanup(&pool, &fresh).await;
     cleanup(&pool, &stale).await;
 }
 
-/// The 10k hard cap, against the real SQL backend: at capacity a brand-new
-/// `client_id` is refused, but an already-registered one may still update (an
-/// upsert doesn't grow the table). Seeds the cap in one statement rather than
-/// 10k round-trips; the seeded rows carry a live TTL so the insert-time GC keeps
-/// them. Everything is namespaced under a unique prefix and cleaned up.
-#[tokio::test]
-#[serial]
-async fn at_cap_rejects_new_but_updates_existing_real_db() {
-    let _serial = SERIAL.lock().await;
-    let pool = state_pool().await;
-    let prefix = format!("capfill-{}-", uuid::Uuid::new_v4().simple());
-
-    // Fill to the 10k cap in a single INSERT. Even if the table holds other
-    // rows, this guarantees count(*) >= CLIENT_CAP for the duration.
+/// Seed `CLIENT_CAP` rows under `prefix`, `created_at` ascending with `g`, each
+/// living `lifetime` past its creation. One statement, not 10k round trips.
+async fn seed_to_cap(pool: &PgPool, prefix: &str, lifetime: &str) {
     sqlx::query(
-        "INSERT INTO oauth_clients (client_id, redirect_uris, expires_at) \
-         SELECT $1 || g, '[\"https://seed/cb\"]'::jsonb, now() + interval '1 hour' \
+        "INSERT INTO oauth_clients (client_id, redirect_uris, created_at, expires_at) \
+         SELECT $1 || g, '[\"https://seed/cb\"]'::jsonb, \
+                now() - make_interval(secs => 20000 - g), \
+                now() - make_interval(secs => 20000 - g) + $2::interval \
          FROM generate_series(1, 10000) g",
     )
-    .bind(&prefix)
-    .execute(&pool)
+    .bind(prefix)
+    .bind(lifetime)
+    .execute(pool)
     .await
     .expect("seed to cap");
+}
+
+async fn delete_prefixed(pool: &PgPool, prefix: &str) {
+    sqlx::query("DELETE FROM oauth_clients WHERE client_id LIKE $1")
+        .bind(format!("{prefix}%"))
+        .execute(pool)
+        .await
+        .expect("cleanup seeded rows");
+}
+
+/// At the 10k cap, a registration evicts the oldest never-authorised row
+/// instead of failing: an unauthenticated `/register` flood only produces
+/// such rows, so it recycles its own junk rather than wedging registration.
+#[tokio::test]
+#[serial]
+async fn at_cap_evicts_the_oldest_never_authorised_client_real_db() {
+    let _serial = SERIAL.lock().await;
+    let pool = state_pool().await;
+    let prefix = format!("capjunk-{}-", uuid::Uuid::new_v4().simple());
+    // Still within the 1 h never-authorised window, so not expired — only
+    // evictable.
+    seed_to_cap(&pool, &prefix, "1 hour").await;
 
     let reg = ClientRegistry::with_db(pool.clone());
-
-    // At cap: a brand-new client is refused (fails closed as `false`).
     let newcomer = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
-    assert!(
-        !reg.insert(newcomer.clone(), vec!["https://new/cb".into()])
+    reg.insert(newcomer.clone(), vec!["https://new/cb".into()])
+        .await
+        .expect("a registration at the cap evicts junk instead of failing");
+    assert_eq!(
+        reg.redirect_uris(&newcomer).await,
+        Some(vec!["https://new/cb".into()])
+    );
+
+    cleanup(&pool, &newcomer).await;
+    delete_prefixed(&pool, &prefix).await;
+}
+
+/// A store full of clients that have authorized is never evicted from: the
+/// newcomer gets `StoreFull`, which `/register` surfaces as `503
+/// temporarily_unavailable`.
+#[tokio::test]
+#[serial]
+async fn at_cap_of_authorised_clients_is_store_full_real_db() {
+    let _serial = SERIAL.lock().await;
+    let pool = state_pool().await;
+    let prefix = format!("capauth-{}-", uuid::Uuid::new_v4().simple());
+    // An expiry past created_at + 1 h marks a client that has authorized.
+    seed_to_cap(&pool, &prefix, "90 days").await;
+
+    let reg = ClientRegistry::with_db(pool.clone());
+    let newcomer = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
+    assert_eq!(
+        reg.insert(newcomer.clone(), vec!["https://new/cb".into()])
             .await,
-        "a new client must be rejected at the cap"
+        Err(StoreError::StoreFull)
     );
     assert_eq!(reg.redirect_uris(&newcomer).await, None);
 
-    // But an already-registered client updating its URIs still succeeds — the
-    // upsert doesn't grow the table, so it bypasses the cap check.
-    let existing = format!("{prefix}1");
-    assert!(
-        reg.insert(existing.clone(), vec!["https://updated/cb".into()])
-            .await,
-        "an existing client must still update at the cap"
-    );
-    assert_eq!(
-        reg.redirect_uris(&existing).await,
-        Some(vec!["https://updated/cb".into()])
-    );
-
-    sqlx::query("DELETE FROM oauth_clients WHERE client_id LIKE $1")
-        .bind(format!("{prefix}%"))
-        .execute(&pool)
-        .await
-        .expect("cleanup seeded rows");
+    delete_prefixed(&pool, &prefix).await;
 }

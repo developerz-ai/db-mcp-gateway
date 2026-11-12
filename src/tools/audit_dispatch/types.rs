@@ -1,18 +1,32 @@
 //! Shared data types for the audit-dispatch chokepoint.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 
+use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::transport::jsonrpc::Response;
+use crate::audit::OutcomeCode;
+use crate::audit::drain::DetachedTasks;
+use crate::audit::stream::StreamSinks;
+use crate::mcp::jsonrpc::Response;
 
-use super::OutcomeCode;
+/// What goes back to the client for one dispatch.
+#[derive(Debug)]
+pub enum Reply {
+    /// A finished response (a tool result, or a JSON-RPC error envelope).
+    /// Boxed: a `Response` dwarfs the unit `ToolError` variant.
+    Response(Box<Response>),
+    /// A spec 03 tool error. Rendered by the chokepoint from the outcome's
+    /// `code` and `error_message`, because only it knows the gateway
+    /// `request_id` the error body carries.
+    ToolError,
+}
 
-/// Result of a tool's compute step. Carries the response to send back AND
+/// Result of a tool's compute step. Carries the reply to send back AND
 /// the audit fields the helper will persist.
 #[derive(Debug)]
 pub struct Outcome {
-    pub response: Response,
+    pub reply: Reply,
     /// Stringified once, into the audit row, by the chokepoint.
     pub code: OutcomeCode,
     pub elapsed_ms: Option<i64>,
@@ -29,8 +43,10 @@ pub struct Outcome {
 }
 
 /// Audit context known up-front from the tool's arguments — before any work
-/// runs. `server`/`database` are `Some` for per-DB tools; `sql` is `Some` for
-/// query tools (`run_query`, `sample_table`'s generated SQL).
+/// runs. `server`/`database` are `Some` for per-DB tools whose arguments
+/// parsed; `sql` is what the call reads — the agent's SQL for `run_query` /
+/// `explain`, the target `schema.table` for `sample_table` /
+/// `describe_schema`.
 #[derive(Debug, Clone, Copy)]
 pub struct AuditHeader<'a> {
     pub tool: &'static str,
@@ -44,10 +60,35 @@ pub struct AuditHeader<'a> {
     pub db_type: Option<&'a str>,
 }
 
+impl AuditHeader<'_> {
+    /// A header for a call whose arguments never parsed: no target, nothing
+    /// read.
+    pub fn untargeted(tool: &'static str) -> Self {
+        Self {
+            tool,
+            server: None,
+            database: None,
+            sql: None,
+            reason: None,
+            db_type: None,
+        }
+    }
+}
+
+/// Where a dispatch's audit rows go: the state DB, the stream sinks fed
+/// after each durable write, and the tracked set the drop-guard's fallback
+/// write runs on.
+#[derive(Debug, Clone, Copy)]
+pub struct AuditStore<'a> {
+    pub pool: &'a PgPool,
+    pub sinks: &'a StreamSinks,
+    pub tasks: &'a DetachedTasks,
+}
+
 /// Per-request context the transport layer captures (IP, agent client).
 /// Threaded through `dispatch_call` so every tool's audit row gets the same
 /// view of the request, with no per-tool plumbing.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct RequestContext {
     pub ip: Option<IpAddr>,
     pub agent_client: Option<String>,
@@ -58,23 +99,8 @@ pub struct RequestContext {
     /// only ever echoed back in the JSON-RPC response envelope, never
     /// persisted. `request_id` is what both the `tool_dispatch` tracing span
     /// and `audit_calls.request_id` use, so a log line and its audit row
-    /// always correlate through one canonical, well-formed value. Defaults
-    /// to the nil UUID via `#[derive(Default)]` — fine for tests that don't
-    /// care about it; every production request goes through
-    /// [`Self::from_request`], which always mints a fresh one.
+    /// always correlate through one canonical, well-formed value. No
+    /// `Default`: a shared nil id would collide on `audit_call_intents`'
+    /// primary key, so every caller supplies a fresh one.
     pub request_id: Uuid,
-}
-
-impl RequestContext {
-    /// Build from an axum `ConnectInfo<SocketAddr>` + an optional User-Agent
-    /// header. Both are best-effort; missing values just stay `None`. Mints
-    /// a fresh `request_id` — see the field doc for why this, not the
-    /// client's JSON-RPC id, is the correlation value.
-    pub fn from_request(addr: Option<SocketAddr>, user_agent: Option<&str>) -> Self {
-        Self {
-            ip: addr.map(|a| a.ip()),
-            agent_client: user_agent.map(str::to_string),
-            request_id: Uuid::new_v4(),
-        }
-    }
 }

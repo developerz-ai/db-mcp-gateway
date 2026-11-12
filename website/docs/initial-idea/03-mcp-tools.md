@@ -7,7 +7,7 @@ The set of tools the gateway exposes to agents. This is the agent-facing contrac
 1. **Read-only by default.** A write-capable tool exists only if [06-permissions](06-permissions.md) explicitly enables it for the calling identity.
 2. **Every tool accepts `server` + `database`** (except `list_servers` / `list_databases`). The pair fully scopes the call.
 3. **`reason` is optional in the protocol but may be required by policy.** If policy requires it and it's absent, the gateway returns a structured error telling the agent to ask the user for one.
-4. **Results are size-capped.** `run_query` and `sample_table` accept a caller-supplied `limit`; most-restrictive-wins: the effective row limit is `min(caller.limit, grant.row_limit, gateway-ceiling)`. The **gateway-wide ceiling is 100,000 rows** and applies regardless of what the caller asks for or whether the grant sets `row_limit` — an absent or oversized grant still clamps to the ceiling, never "unbounded". A grant may only tighten below the ceiling; it may not loosen past it. When neither the caller nor the grant names a limit, `run_query` defaults to **1,000 rows** and `sample_table` defaults to **10 rows**. Other result-returning tools (`list_servers`, `list_databases`, `describe_schema`, `explain`) do not accept a caller `limit`; they enforce internal caps sized to their output shape.
+4. **Results are size-capped.** `run_query` and `sample_table` accept a caller-supplied `limit`; most-restrictive-wins: the effective row limit is `min(caller.limit, grant.row_limit, gateway-ceiling)`. The **gateway-wide ceiling is 100,000 rows** and applies regardless of what the caller asks for or whether the grant sets `row_limit` — an absent or oversized grant still clamps to the ceiling, never "unbounded". A grant may only tighten below the ceiling; it may not loosen past it. When neither the caller nor the grant names a limit, `run_query` defaults to **1,000 rows** and `sample_table` defaults to **10 rows**. Results are also capped at **32 MiB of decoded values** per call (`exec::MAX_RESULT_BYTES`), whatever the row limit: past it the gateway stops collecting and sets `truncated: true`, exactly as for the row cap. Mongo commands get the same row and byte budget; `find` and `aggregate` also carry a server-side limit of `row_limit + 1`. Other result-returning tools (`list_servers`, `list_databases`, `describe_schema`, `explain`) do not accept a caller `limit`; they enforce internal caps sized to their output shape.
 5. **No tool exposes credentials, connection strings, or hostnames.** Servers and databases are referenced by their config-defined logical name.
 
 ## Tools
@@ -22,7 +22,7 @@ Args: `server`. Returns databases on that server visible to the caller, with des
 
 ### `describe_schema`
 
-Args: `server`, `database`, optional `schema`, optional `table`. Returns tables/columns/types/PK/FK/indexes. Cached aggressively — schema doesn't change per query.
+Args: `server`, `database`, optional `schema` (default `public`), optional `table`. Returns `{ "tables": [{ "schema", "name", "columns": [{ "name", "data_type", "nullable" }] }], "truncated": bool }`. The catalog scan is capped at 50,000 columns; when the cap is hit `truncated` is `true`, tables past the cut are missing, and the table the cut fell in is dropped rather than returned with only some of its columns — every table returned is complete. Narrow with `table` to see one table past the cap. PK/FK/indexes are not returned yet.
 
 ### `sample_table`
 
@@ -35,6 +35,8 @@ Args: `server`, `database`, `table`, optional `schema`, optional `limit` (defaul
 Args: `server`, `database`, `sql`, optional `limit`, optional `reason`. Executes under the caller's grant with statement timeout. Returns rows + truncation flag + execution stats. The primary tool.
 
 **Read vs. write is per-grant.** With a `query_read` grant the sql guard accepts only read-only statements (`SELECT` / `EXPLAIN`). A `query_write` grant on the target `(server, database)` additionally lets a single top-level `INSERT` / `UPDATE` / `DELETE` through — **data writes only**. Schema modification (`CREATE` / `ALTER` / `DROP` / `TRUNCATE`), `GRANT` / `REVOKE`, `COPY`, transaction control, and multi-statement bodies are rejected in **both** modes; the gateway never issues DDL. Writes also require the target-DB role to actually hold write privileges — the gateway does not provision them (see [06-permissions](06-permissions.md) and CLAUDE.md non-negotiable #3). Writes commit synchronously before the response returns, and every write is audited exactly like a read. Mongo targets remain read-only regardless of grant.
+
+**Read access is enforced by the database too.** A `query_read` call runs in a `READ ONLY` transaction, so even a write-capable target role cannot write through it; the sql guard is the second layer, not the only one. **A write is never cut short:** when a `RETURNING` write produces more rows than the limit (or the byte cap), the gateway stops collecting, drains the rest, commits, and returns the capped rows with `truncated: true` and `rows_affected` — the number of rows the statement actually changed. A write's result always carries `rows_affected`; a read's never does. A read past the cap is cancelled and rolled back (nothing to lose).
 
 **Statement-timeout ceiling:** every query is subject to a hard 30 s ceiling regardless of the per-grant `statement_timeout_ms` value. A grant may set a shorter timeout; it may not exceed 30 s — the gateway clamps it. The timeout is enforced both DB-side (`SET LOCAL statement_timeout`) and by a Tokio guard as belt-and-suspenders. A query that exceeds it returns `timeout`.
 
@@ -54,7 +56,12 @@ Rendering rules for the non-obvious types:
 | `uuid` | string |
 | `bytea` | Postgres' own `\x`-prefixed hex string |
 | `json` / `jsonb` | inlined as JSON |
-| arrays, enums, ranges, user-defined | `{"unsupported_type": "…"}` |
+| `float4` / `float8` NaN, ±infinity | `"NaN"`, `"Infinity"`, `"-Infinity"` — JSON numbers cannot hold them, and `null` would read as SQL NULL |
+| `text[]` / `varchar[]`, `int2[]` / `int4[]` / `int8[]`, `uuid[]` | JSON array (elements may be `null`) |
+| `interval` | ISO-8601 duration, e.g. `"P1Y2M3DT4H5M6.5S"` |
+| `inet` / `cidr` | Postgres text form, e.g. `"10.0.0.1"`, `"10.0.0.0/8"` |
+| enums | the label, as a string |
+| other arrays, ranges, composites, user-defined | `{"unsupported_type": "…"}` |
 
 ### `explain`
 
@@ -64,15 +71,21 @@ Args: `server`, `database`, `sql`, optional `reason`. Returns `EXPLAIN` (or vend
 
 ### `get_query_history`
 
-Args: `server`, `database`, optional `since` (RFC 3339), optional `limit`. Returns *the caller's own* recent queries (request id, SQL, reason, timestamp, duration, row count, outcome) for that `(server, database)`, ordered newest-first. Lets the agent recover context across sessions without exposing other users' queries.
+Args: `server`, `database`, optional `since` (RFC 3339), optional `limit`, optional `cursor`, optional `reason`. Returns *the caller's own* recent queries (request id, SQL, reason, timestamp, duration, row count, outcome) for that `(server, database)`, ordered newest-first, one page at a time. Lets the agent recover context across sessions without exposing other users' queries.
 
-**Scoping is the security-critical contract.** The filter is on the SSO-verified identity (`identity.user_sub`) from the session middleware — NEVER on a client-supplied `user` field. The arguments struct uses `#[serde(deny_unknown_fields)]`; any attempt to pass `user` (or any other unknown key) is rejected with JSON-RPC `invalid_params` before the request reaches the audit table. The `WHERE` clause is `user_sub = $1 AND server_name = $2 AND database_name = $3` (the composite index `audit_calls_user_occurred_idx` from migration 0003 covers it).
+**Scoping is the security-critical contract.** The filter is on the SSO-verified identity (`identity.user_sub`) from the session middleware — NEVER on a client-supplied `user` field. The arguments struct uses `#[serde(deny_unknown_fields)]`; any attempt to pass `user` (or any other unknown key) is rejected with JSON-RPC `invalid_params` before any history is read — and the attempt itself is audited as `invalid_arguments`. The `WHERE` clause is `user_sub = $1 AND server_name = $2 AND database_name = $3`, ordered by `(occurred_at, id)` descending; the composite index `audit_calls_history_idx` (migration 0011) covers both.
 
-`limit` defaults to 100 and is clamped to `GATEWAY_ROW_LIMIT_CEILING` (100,000); a hostile `u32::MAX` request is clamped, not honoured. The `truncated` flag reports exactly that clamp: it is `true` when the caller's `limit` exceeded the ceiling and was lowered. It does **not** mean "more entries exist" — a caller who asks for 10 of their 50 entries gets 10 with `truncated: false`, because nothing was withheld beyond what they asked for. To see further back, widen `since` rather than raising `limit`.
+`limit` defaults to 100 and is clamped to a page ceiling of **1,000**; a hostile `u32::MAX` request is clamped, not honoured. The `truncated` flag reports exactly that clamp: it is `true` when the caller's `limit` exceeded the ceiling and was lowered. It does **not** mean "more entries exist" — that is `next_cursor`.
+
+**Pagination is keyset on `(occurred_at, id)`.** The response carries `next_cursor` — an opaque string, `null` on the last page. Pass it back as `cursor` (with the same `server`, `database`, `since`) for the next older page; pages never overlap, however many new calls land in between. A `cursor` the gateway did not mint is rejected with `invalid_params` (audited `invalid_arguments`).
+
+Each entry's `sql` is capped at 4,096 bytes (cut on a character boundary); `sql_truncated: true` marks an entry whose statement was cut.
 
 `since` is parsed at the edge as RFC 3339; a malformed value is rejected with `invalid_params` rather than silently dropping the filter.
 
-Requires the `history_read` grant, which is standalone (per [#170](https://github.com/developerz-ai/db-mcp-gateway/issues/170) — `query_read` does not imply it). A caller without an explicit `history_read` grant for `(server, database)` gets `forbidden`. The call itself is audited like any other tool dispatch (`tool = "get_query_history"`, `sql = NULL`).
+Response shape: `{ "entries": [{ "request_id", "sql", "sql_truncated", "reason", "occurred_at", "elapsed_ms", "row_count", "outcome" }], "truncated": bool, "next_cursor": string | null }`.
+
+Requires the `history_read` grant, which is standalone (per [#170](https://github.com/developerz-ai/db-mcp-gateway/issues/170) — `query_read` does not imply it). A caller without an explicit `history_read` grant for `(server, database)` gets `forbidden`. The merged constraints of the matching grants apply as for every other tool: when `require_reason` is set, a call without a non-empty `reason` gets `reason_required` (audited), and the `reason` given is recorded in the audit row. The call itself is audited like any other tool dispatch (`tool = "get_query_history"`, `sql = NULL`).
 
 **Implemented with [#169](https://github.com/developerz-ai/db-mcp-gateway/issues/169).**
 
@@ -83,32 +96,53 @@ Errors are structured JSON, not free-text strings. Shape: `{ "error": { "categor
 | Code | HTTP | When |
 |---|---|---|
 | `unauthenticated` | 401 | Token missing/expired — agent triggers re-login |
+| `expired_session` | 401 | Session outlived its TTL (distinct from `revoked_session`: routine, not a sign-out). Agent triggers re-login |
 | `forbidden` | 403 | Authenticated but permission denied for this server/db/action |
 | `forbidden_sql` | 403 | SQL rejected before reaching the DB: statement not covered by the grant (a write without `query_write`, or a schema mod / `COPY` / multi-statement in any mode), `EXPLAIN ANALYZE`, or dangerous function (`pg_read_file`, `lo_export`, …) |
-| `invalid_arguments` | 400 | Post-deserialisation argument validation failed (`limit: 0`, malformed `since`, other per-tool bounds). JSON-RPC envelope carries `invalid_params` (-32602); the audit row records the code so the boundary rejection is still accountable. |
+| `invalid_arguments` | 400 | Arguments rejected: they do not deserialise (missing or mistyped field, unknown key), fail a per-tool bound (`limit: 0`, malformed `since` or `cursor`, a `sample_table` name that is not an identifier), the tool name is unknown, or `name` is missing. JSON-RPC envelope carries `invalid_params` (-32602); the audit row records `invalid_arguments` — with `server`/`database` NULL when the arguments never parsed, and `tool = "unknown"` for an unknown or missing name (the caller's name, capped at 64 bytes, is in `error_message`) — so every boundary rejection is accountable. |
 | `reason_required` | 400 | Policy requires a reason for this call; none provided |
 | `timeout` | 408 | Statement timeout fired (30 s ceiling) |
 | `row_limit_exceeded` | 200 | Result truncated at configured cap (flag in response, not an error response) |
-| `syntax_error` | 400 | DB rejected the SQL |
-| `unavailable` | 503 | DB unreachable or pool exhausted |
+| `syntax_error` | 400 | DB rejected the SQL. When the DB gave a SQLSTATE the message carries it and the server's primary message (configured role name redacted), so the agent can fix the query |
+| `permission_denied` | 403 | The target role lacks a privilege the statement needs (SQLSTATE `42501`); message carries SQLSTATE + server message |
+| `undefined_object` | 400 | The statement names a table or column that does not exist (SQLSTATE `42P01` / `42703`); message carries SQLSTATE + server message |
+| `unavailable` | 503 | DB unreachable, its credentials rejected, or no pooled connection free within 5 s. Waiting for a connection is not counted against the statement timeout, so a saturated pool is `unavailable`, never `timeout` |
 | `rate_limited` | 429 | Calling identity has too many concurrent in-flight requests (per-identity cap). `Retry-After: 1` header is set. |
 | `service_overloaded` | 503 | Gateway-wide concurrency ceiling reached. `Retry-After: 1` header is set. |
+| `audit_unavailable` | 503 | The audit store refused a write — the intent row before a target call, or the completion row after the tool ran — or the gateway has no audit store. The request is refused; nothing is returned unaudited. The audit row (if the store recovers for the drop-guard retry) records `audit_unavailable` with the tool's own outcome in `error_message`. |
 | `internal` | 500 | Bug. Has a request ID that matches a server-side log line |
 
-Every error includes a `request_id` the user can paste back to ops.
+Two codes appear only in `audit_calls.outcome`, never in a response: `cancelled` (the client disconnected before the tool finished) and `abandoned` (the gateway stopped between reaching the target and recording the outcome — see [07-logging-retention](07-logging-retention.md) §"Intent and completion").
+
+**Shed requests are not audit rows.** A `429` `rate_limited` or `503` `service_overloaded` answer is a log line and a metric only: under overload the gateway does not add a state-DB write per rejected request. No tool ran and no target was reached, so MUST #2 (every DB call → audit row) is not in play.
+
+Every error includes a `request_id` the user can paste back to ops: the gateway-minted UUID that is also the response's `x-request-id` header, the `request_id` on the server-side log line, and `audit_calls.request_id` — never the client's JSON-RPC `id`.
 
 ## Resource safety
 
-Two independent concurrency caps protect the query path:
+Two concurrency budgets protect the gateway. The bearer-gated budget covers `/mcp`, `POST /auth/logout` and the admin API (`/admin/v1/*`):
 
 | Limit | Default | Response when exceeded |
 |---|---|---|
 | **Global** (process-wide) | 512 concurrent requests | `503` `service_overloaded` |
-| **Per-identity** (per SSO `sub`) | 16 concurrent requests | `429` `rate_limited` |
+| **Per-identity** (per SSO `sub` / service account) | 16 concurrent requests | `429` `rate_limited` |
 
-Both caps are checked on the bearer-gated router *after* authentication. A per-identity permit is held for the full lifetime of the request. The global cap is checked first to keep the per-identity map lookup cheap on a saturated gateway.
+Both caps are checked *after* authentication. A per-identity permit is held for the full lifetime of the request. The global cap is checked first to keep the per-identity map lookup cheap on a saturated gateway. A cap of `0` is refused at boot.
 
-The **global** cap also fronts the unauthenticated OAuth flow routes — `POST /auth/login`, `GET /auth/callback`, `GET /authorize`, `POST /token`, `POST /revoke`, `POST /register` — because each writes into a size-capped in-memory store (`PendingFlows`, `AuthCodes`) or drives IdP/DB work, so an unauthenticated flood must be bounded the same way authenticated traffic is. When the cap is exhausted these routes return `503` `service_overloaded` with `Retry-After: 1`, identical to the bearer-gated path. The per-identity cap does not apply here (no `Identity` extension exists pre-session). The configured MCP SSE endpoint (`GET` on `mcp_path`), discovery metadata, `/healthz`, `/readyz`, and `/metrics` are deliberately *not* gated — probes are trusted infra traffic and discovery documents are static.
+The unauthenticated OAuth flow routes — `POST /auth/login`, `GET /auth/callback`, `GET /authorize`, `POST /token`, `POST /revoke`, `POST /register` — have their **own, smaller** budget: one eighth of the global cap (64 by default, never below 1). Each of them writes into a size-capped store or drives IdP/DB work, so a flood must be bounded; none carries an identity, and sharing the gated budget would let anonymous traffic (stalled bodies, an `/authorize` flood) take `/mcp` down. Exhausted, these routes answer `503` `service_overloaded`. `GET` on `mcp_path` (a constant `405`), the discovery metadata, `/healthz` and `/readyz` are not gated — probes are trusted infra traffic and discovery documents are static (`/metrics` is on its own listener). `/readyz` answers from a one-second cache and never queues for a state-DB connection: at most one probe runs at a time (concurrent callers get the last result), it takes an idle connection or opens one only when the pool has room, and a pool saturated with request traffic counts as ready.
+
+Every shed response carries `Retry-After: 1`, the body `{"error": {"category", "code"}, "request_id"}`, a `warn` log line with the request id and budget, and increments `requests_shed_total{scope="global"|"identity"|"oauth"}`.
+
+**Time and size bounds.** Every request is bounded end to end; past the timeout the request is dropped (for a tool call: the same path as a client disconnect — query cancelled, audit row `cancelled`) and answered `504`.
+
+| Routes | Timeout | Body limit |
+|---|---|---|
+| `/mcp`, `/auth/logout` | 75 s — the 30 s statement ceiling + pool acquire + both audit writes + slack | 1 MiB |
+| OAuth flow routes | 60 s — covers the 45 s IdP code exchange | 16 KiB |
+| Admin API | 30 s | 64 KiB |
+| Probes + discovery | 5 s | 1 KiB |
+
+A request body must arrive in full within 10 s, so a slow-loris sender cannot pin a concurrency permit.
 
 The 30 s statement-timeout ceiling (see `run_query` above) is the complementary per-query bound: it limits how long one request can hold its permits.
 

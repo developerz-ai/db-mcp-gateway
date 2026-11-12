@@ -25,6 +25,7 @@ pub mod rejector;
 #[cfg(test)]
 mod tests;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -32,6 +33,7 @@ use mongodb::Client;
 use mongodb::options::{ClientOptions, Credential, ServerAddress, Tls as MongoTls, TlsOptions};
 use secrecy::ExposeSecret;
 
+use crate::audit::drain::DetachedTasks;
 use crate::config::{Database, Server, Tls};
 
 use super::adapter::{
@@ -39,6 +41,12 @@ use super::adapter::{
     SchemaQuery, TOKIO_TIMEOUT_SLACK_MS, effective_timeout_ms,
 };
 use super::pg::resolve_password;
+use super::pool_sizing::PoolSizing;
+
+/// Bound on server selection and on opening one connection — the Mongo
+/// analogue of the pg pool's acquire timeout. Without it the driver waits
+/// 30 s for an unreachable host.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Per-`(server, database)` mongo adapter. Wraps a `mongodb::Client`; one
 /// instance per logical DB so a slow query on DB A can never block DB B.
@@ -52,6 +60,11 @@ pub struct MongoAdapter {
     /// protocol needs the database explicitly on every `run_command`;
     /// stashing it here keeps the per-request dispatch lookup-free.
     database_name: String,
+    /// Set when the server rejected the credentials; the registry then
+    /// replaces this adapter so the password is resolved again.
+    stale: AtomicBool,
+    /// Tracks drop-guard kills so a shutdown drain waits for them.
+    detached: DetachedTasks,
 }
 
 impl std::fmt::Debug for MongoAdapter {
@@ -71,7 +84,12 @@ impl MongoAdapter {
     /// connection; the first operation does. Same posture as
     /// `PgAdapter::open` — misconfiguration surfaces on first use, not at
     /// boot.
-    pub async fn open(server: &Server, database: &Database) -> Result<Self, ExecError> {
+    pub async fn open(
+        server: &Server,
+        database: &Database,
+        sizing: PoolSizing,
+        detached: DetachedTasks,
+    ) -> Result<Self, ExecError> {
         let password = resolve_password(&database.password).await?;
 
         // Structured credentials avoid any URI-string assembly: a
@@ -105,9 +123,21 @@ impl MongoAdapter {
             .credential(credential)
             .default_database(database.name.clone())
             .build();
-        if matches!(server.tls, Tls::Required) {
-            options.tls = Some(MongoTls::Enabled(TlsOptions::default()));
-        }
+        // The driver verifies chain and hostname by default, so `required`
+        // and `verify_full` are the same here; Postgres `required` is not.
+        options.tls = match server.tls {
+            Tls::Required | Tls::VerifyFull => Some(MongoTls::Enabled(
+                TlsOptions::builder()
+                    .ca_file_path(server.tls_ca_file.clone())
+                    .build(),
+            )),
+            Tls::Insecure => None,
+        };
+        options.max_pool_size = Some(sizing.max_connections);
+        options.min_pool_size = Some(sizing.min_connections);
+        options.max_idle_time = Some(sizing.idle_timeout);
+        options.server_selection_timeout = Some(CONNECT_TIMEOUT);
+        options.connect_timeout = Some(CONNECT_TIMEOUT);
 
         let client = Client::with_options(options).map_err(|_| ExecError::Connection)?;
         let db_label = format!("{}/{}", server.name, database.name);
@@ -116,22 +146,22 @@ impl MongoAdapter {
             client,
             db_label,
             database_name,
+            stale: AtomicBool::new(false),
+            detached,
         })
     }
 }
 
 #[async_trait]
 impl DbAdapter for MongoAdapter {
-    fn kind(&self) -> AdapterKind {
-        AdapterKind::Mongo
-    }
-
     /// Read-only enforcement first; on accept, dispatch the parsed BSON
     /// command to the mongo driver under the gateway's time budget.
     ///
     /// A rejected command maps to [`ExecError::Forbidden`] (→ tool code
     /// `forbidden_sql`), matching the pg path's `sql_guard::is_read_only`
     /// posture. Per spec 03, this is a policy denial, not a syntax error.
+    /// Mongo targets are read-only whatever `query.access` says: a
+    /// `query_write` grant on a Mongo database still hits the rejector.
     ///
     /// **Timeout** — identical semantics to `PgAdapter::execute`. The budget
     /// is [`effective_timeout_ms`]: always present, and clamped so a grant
@@ -192,17 +222,8 @@ impl DbAdapter for MongoAdapter {
         Err(unsupported("explain"))
     }
 
-    /// Cheap liveness probe — ping the admin database. Same role as pg's
-    /// `SELECT 1`: confirms the client can hand out a working connection
-    /// and the server is responding. Costs one round-trip.
-    async fn health(&self) -> Result<(), ExecError> {
-        use mongodb::bson::doc;
-        self.client
-            .database("admin")
-            .run_command(doc! { "ping": 1 })
-            .await
-            .map(|_| ())
-            .map_err(|_| ExecError::Unavailable)
+    fn is_stale(&self) -> bool {
+        self.stale.load(Ordering::Relaxed)
     }
 }
 

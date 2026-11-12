@@ -67,6 +67,11 @@ COPY --from=builder /src/config/example.yaml /etc/gateway/example.yaml
 # bare `docker run -v ./config.yml:/etc/gateway/config.yml ...` boots, while
 # extra CLI flags still compose and an explicit `--config <path>` overrides.
 ENV DB_MCP_GATEWAY_CONFIG=/etc/gateway/config.yml
+# The binary's own default is loopback (safe for a dev `cargo run`); in a
+# container loopback is unreachable, so the image listens on all interfaces.
+# METRICS_BIND keeps its loopback default: set `0.0.0.0:9090` to scrape, and
+# fence that port to the Prometheus namespace.
+ENV GATEWAY_BIND=0.0.0.0:8443
 
 EXPOSE 8443
 USER nonroot

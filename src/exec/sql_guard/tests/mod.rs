@@ -1,5 +1,6 @@
 use super::*;
 
+mod denied_families;
 mod denied_functions;
 mod read_only;
 mod write_access;

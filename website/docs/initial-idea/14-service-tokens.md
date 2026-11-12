@@ -68,8 +68,8 @@ Every headless call attributes to the service identity, through the same
 
 Names are boot-validated to `^[a-z0-9][a-z0-9-]{0,62}$` so audit fields stay
 clean and greppable. There is no session row behind a service identity: no
-revocation bitmap, no expiry, no refresh chain — and `active_sessions`
-metrics are untouched.
+revocation bitmap, no expiry, no refresh chain — and the
+`sessions_created_total` / `sessions_revoked_total` counters are untouched.
 
 ### Scope
 
@@ -78,11 +78,13 @@ the service's group (`server`/`database`/`action`/`constraints`, including
 `row_limit`, `statement_timeout_ms`, `require_reason`), identical to human
 groups. Per-table scope remains what it is for humans: out of scope.
 
-Service identities resolve grants from **YAML only**. The DB-backed grant
-resolver keys off `permissions_users` rows, which only SSO login and admin
-mutations create — a service token never has one, so dynamic grants simply
-do not apply. That is deliberate: every grant a service token can exercise
-is reviewed by PR.
+Service identities resolve grants from **YAML only**, enforced twice. The
+resolver never reads the permissions store for a service identity, so even a
+DB grant planted for `service:<name>` by direct database access is inert
+(`tests/service_tokens_e2e.rs`). And `POST /admin/v1/users` rejects any
+`service:*` subject with `400`, so the audited admin API cannot create one.
+That is deliberate: every grant a service token can exercise is reviewed by
+PR.
 
 ### Mint / rotate / revoke
 
@@ -114,9 +116,9 @@ about tokens is callable over HTTP — the lifecycle is GitOps:
   (`<name>-next` is the recommended convention); (2) add a *second*
   `service_accounts:` entry (with its own matching `permissions:` block)
   to the gateway YAML so new pods accept the new value; (3) roll the
-  deployment and wait until the rollout completes; (4) update every
-  client to use the new value; (5) remove the old `service_accounts:`
-  entry and roll again. **Audit-identity trade-off**: because the
+  deployment (or `kill -HUP` every pod) and wait until it completes; (4)
+  update every client to use the new value; (5) remove the old
+  `service_accounts:` entry and roll or `SIGHUP` again. **Audit-identity trade-off**: because the
   temporary entry uses a different name, audit rows for the rotation
   window attribute to `service:<name>-next` instead of `service:<name>` —
   pick deliberately and document the trade-off in the PR. If preserving
@@ -125,14 +127,17 @@ about tokens is callable over HTTP — the lifecycle is GitOps:
   first; until then same-name rotation is not supported and must not be
   documented.
 - **Revoke** — remove the complete `service_accounts:` stanza (the name,
-  the group, and the token reference together) and roll. Emptying or
+  the group, and the token reference together) and `kill -HUP` every pod
+  (or roll). A reload rebuilds the token store in the same swap as the
+  config, so the removed token gets 401 on its next call. Emptying or
   unsetting the secret is **not** a valid revocation: unresolved or empty
   secret references abort boot (`SecretError::EnvNotSet` /
   `SecretError::FileUnreadable` for unreadable / missing files, and
   `SecretError::FileEmpty` for a present-but-empty file), and a gateway
   that refuses to start on a misconfigured stanza is a feature, not a
-  bypass. There is no instant
-  revocation; the exposure window is the rollout time. That is the honest
+  bypass — on reload the same failure keeps the old store, token
+  included. There is no instant revocation; the exposure window is the
+  time to merge and signal. That is the honest
   price of a stateless compare, and it is documented rather than papered
   over.
 

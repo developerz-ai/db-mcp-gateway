@@ -24,7 +24,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::audit::{find_audit, latest_audit};
+use common::audit::{DispatchSinks, find_audit, latest_audit};
 use common::cleanup::delete_audit_calls;
 use common::env::state_pool;
 use db_mcp_gateway::audit;
@@ -130,6 +130,7 @@ fn identity(user_sub: &str) -> Identity {
         user_email: "cancel-test@example.com".to_string(),
         groups: vec!["test".to_string()],
         issued_at: chrono::Utc::now(),
+        kind: db_mcp_gateway::auth::IdentityKind::Sso,
     }
 }
 
@@ -140,7 +141,11 @@ async fn dropped_dispatch_leaves_cancelled_audit_row() {
     let p = state_pool().await;
     let user = format!("cancel-test-{}", Uuid::new_v4().simple());
     let id = Value::from(Uuid::new_v4().to_string());
-    let ctx = RequestContext::default();
+    let ctx = RequestContext {
+        ip: None,
+        agent_client: None,
+        request_id: Uuid::new_v4(),
+    };
 
     // `armed` signals the moment `work.await` is first polled — at that
     // point `CancelledAuditGuard` is already on the stack (it's built
@@ -174,10 +179,9 @@ async fn dropped_dispatch_leaves_cancelled_audit_row() {
         let _ = audit_dispatch(
             id_in,
             &identity,
-            Some(&pool_for_dispatch),
             &ctx,
             header,
-            &[],
+            DispatchSinks::new(&[]).store(&pool_for_dispatch),
             work,
         )
         .await;
@@ -227,7 +231,8 @@ async fn dropped_dispatch_streams_cancelled_row_when_stdout_configured() {
     let id = Value::from(Uuid::new_v4().to_string());
     let ctx = RequestContext {
         request_id,
-        ..RequestContext::default()
+        ip: None,
+        agent_client: None,
     };
 
     let buf = BufWriter::default();
@@ -271,10 +276,9 @@ async fn dropped_dispatch_streams_cancelled_row_when_stdout_configured() {
         let _ = audit_dispatch(
             id_in,
             &identity,
-            Some(&pool_for_dispatch),
             &ctx,
             header,
-            &[StreamSinkConfig::Stdout],
+            DispatchSinks::new(&[StreamSinkConfig::Stdout]).store(&pool_for_dispatch),
             work,
         )
         .await;
@@ -312,13 +316,17 @@ async fn dropped_dispatch_streams_cancelled_row_when_stdout_configured() {
 /// every successful dispatch).
 #[tokio::test]
 async fn completed_dispatch_does_not_leave_cancelled_row() {
-    use db_mcp_gateway::tools::audit_dispatch::Outcome;
-    use db_mcp_gateway::transport::jsonrpc::Response;
+    use db_mcp_gateway::mcp::jsonrpc::Response;
+    use db_mcp_gateway::tools::audit_dispatch::{Outcome, Reply};
 
     let p = state_pool().await;
     let user = format!("cancel-test-{}", Uuid::new_v4().simple());
     let id = Value::from(Uuid::new_v4().to_string());
-    let ctx = RequestContext::default();
+    let ctx = RequestContext {
+        ip: None,
+        agent_client: None,
+        request_id: Uuid::new_v4(),
+    };
 
     let identity = identity(&user);
     let header = AuditHeader {
@@ -332,7 +340,10 @@ async fn completed_dispatch_does_not_leave_cancelled_row() {
     let id_for_outcome = id.clone();
     let work = async move {
         Outcome {
-            response: Response::result(id_for_outcome, &serde_json::json!({"ok":true})),
+            reply: Reply::Response(Box::new(Response::result(
+                id_for_outcome,
+                &serde_json::json!({"ok":true}),
+            ))),
             code: OutcomeCode::Success,
             elapsed_ms: Some(7),
             row_count: Some(1),
@@ -340,7 +351,15 @@ async fn completed_dispatch_does_not_leave_cancelled_row() {
             error_message: None,
         }
     };
-    let _ = audit_dispatch(id, &identity, Some(&p), &ctx, header, &[], work).await;
+    let _ = audit_dispatch(
+        id,
+        &identity,
+        &ctx,
+        header,
+        DispatchSinks::new(&[]).store(&p),
+        work,
+    )
+    .await;
     // Give the detached write (audit::log) time to land.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -361,8 +380,8 @@ async fn completed_dispatch_does_not_leave_cancelled_row() {
 /// via `id.to_string()`).
 #[tokio::test]
 async fn audit_row_request_id_is_gateway_uuid_not_client_id() {
-    use db_mcp_gateway::tools::audit_dispatch::Outcome;
-    use db_mcp_gateway::transport::jsonrpc::Response;
+    use db_mcp_gateway::mcp::jsonrpc::Response;
+    use db_mcp_gateway::tools::audit_dispatch::{Outcome, Reply};
 
     let p = state_pool().await;
     let user = format!("cancel-test-{}", Uuid::new_v4().simple());
@@ -370,10 +389,14 @@ async fn audit_row_request_id_is_gateway_uuid_not_client_id() {
     // used to end up verbatim (with escaping) in `audit_calls.request_id`
     // under `id.to_string()`.
     let id = Value::from(r#"weird"client"id"#);
-    // `from_request` mints a real UUID, same as the production transport
-    // layer — `default()` (nil UUID) is used elsewhere in this file where
-    // the value doesn't matter; here it's the whole point.
-    let ctx = RequestContext::from_request(None, None);
+    // A real gateway UUID, as the transport mints — `default()` (nil UUID)
+    // is used elsewhere in this file where the value doesn't matter; here
+    // it's the whole point.
+    let ctx = RequestContext {
+        request_id: Uuid::new_v4(),
+        ip: None,
+        agent_client: None,
+    };
     let expected_request_id = ctx.request_id.to_string();
 
     let identity = identity(&user);
@@ -388,7 +411,10 @@ async fn audit_row_request_id_is_gateway_uuid_not_client_id() {
     let id_for_outcome = id.clone();
     let work = async move {
         Outcome {
-            response: Response::result(id_for_outcome, &serde_json::json!({"ok":true})),
+            reply: Reply::Response(Box::new(Response::result(
+                id_for_outcome,
+                &serde_json::json!({"ok":true}),
+            ))),
             code: OutcomeCode::Success,
             elapsed_ms: Some(1),
             row_count: Some(1),
@@ -396,7 +422,15 @@ async fn audit_row_request_id_is_gateway_uuid_not_client_id() {
             error_message: None,
         }
     };
-    let _ = audit_dispatch(id.clone(), &identity, Some(&p), &ctx, header, &[], work).await;
+    let _ = audit_dispatch(
+        id.clone(),
+        &identity,
+        &ctx,
+        header,
+        DispatchSinks::new(&[]).store(&p),
+        work,
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let row = latest_audit(&p, &user, "run_query", "run_query dispatch").await;

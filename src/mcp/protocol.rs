@@ -2,6 +2,8 @@
 //!
 //! Wire transport is Streamable HTTP — see website/docs/initial-idea/02-architecture.md.
 
+use std::sync::LazyLock;
+
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -85,10 +87,12 @@ pub struct ToolsListResult {
     pub tools: Vec<Tool>,
 }
 
+/// The `tools/list` payload. Static, so its JSON schemas are built once per
+/// process rather than on every call.
+pub static TOOLS_LIST: LazyLock<ToolsListResult> = LazyLock::new(ToolsListResult::build);
+
 impl ToolsListResult {
-    /// Snapshot of the currently registered MCP tools. Grows as more tools
-    /// land in later issues.
-    pub fn current() -> Self {
+    fn build() -> Self {
         Self {
             tools: vec![
                 Tool {
@@ -203,9 +207,15 @@ impl ToolsListResult {
                                            "description": "RFC 3339 timestamp; only entries \
                                                             occurred at or after this instant are \
                                                             returned." },
-                            "limit":    { "type": "integer", "minimum": 1,
+                            "limit":    { "type": "integer", "minimum": 1, "maximum": 1000,
                                            "description": "Max entries to return; clamped to \
-                                                            the gateway ceiling." }
+                                                            the gateway ceiling." },
+                            "cursor":   { "type": "string",
+                                           "description": "Opaque `next_cursor` from a previous \
+                                                            page; returns the entries after it." },
+                            "reason":   { "type": "string",
+                                           "description": "Why you are reading history; required \
+                                                            when the grant sets require_reason." }
                         },
                         "required": ["server", "database"],
                         "additionalProperties": false

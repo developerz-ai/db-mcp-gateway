@@ -3,6 +3,8 @@
 
 use sqlx::PgPool;
 
+use crate::audit::drain::DetachedTasks;
+use crate::audit::stream::StreamSinks;
 use crate::auth::Identity;
 use crate::authz::PermissionsCache;
 use crate::config::ConfigFile;
@@ -16,8 +18,13 @@ pub struct ToolCtx<'a> {
     pub identity: &'a Identity,
     pub config: &'a ConfigFile,
     pub registry: &'a AdapterRegistry,
-    pub permissions_cache: Option<&'a PermissionsCache>,
-    /// `None` makes every dispatch refuse: no audit store, no tool call.
-    pub state_db: Option<&'a PgPool>,
+    pub permissions_cache: &'a PermissionsCache,
+    /// The audit store; also what `get_query_history` reads.
+    pub state_db: &'a PgPool,
+    /// Fed each audit row after its durable write.
+    pub audit_sinks: &'a StreamSinks,
+    /// Where detached audit work (the drop-guard fallback, sink deliveries)
+    /// runs, so shutdown can drain it.
+    pub detached: &'a DetachedTasks,
     pub request: &'a RequestContext,
 }

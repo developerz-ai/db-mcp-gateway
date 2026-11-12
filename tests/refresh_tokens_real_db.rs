@@ -15,9 +15,11 @@ use std::time::Duration;
 
 use common::env::state_pool;
 use db_mcp_gateway::auth::oauth::{GrantIdentity, RefreshTokens};
+use db_mcp_gateway::auth::{AuthError, SessionStore};
 use sqlx::PgPool;
 
 const TTL: Duration = Duration::from_secs(60 * 24 * 3600);
+const SESSION_TTL: Duration = Duration::from_secs(3600);
 
 /// Namespaced per test so the whole file can run in parallel: every test owns a
 /// unique `sub` and cleans up by it.
@@ -34,11 +36,29 @@ fn unique_sub(tag: &str) -> String {
 }
 
 async fn cleanup(pool: &PgPool, sub: &str) {
-    sqlx::query("DELETE FROM oauth_refresh_tokens WHERE user_sub = $1")
-        .bind(sub)
-        .execute(pool)
-        .await
-        .expect("cleanup");
+    for table in ["oauth_refresh_tokens", "sessions"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE user_sub = $1"))
+            .bind(sub)
+            .execute(pool)
+            .await
+            .expect("cleanup");
+    }
+}
+
+fn token() -> String {
+    format!("tok-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Every session store over the pool; a zero TTL makes each lookup re-read
+/// the DB, so assertions see committed state, not this process's cache.
+fn session_store(pool: &PgPool) -> SessionStore {
+    SessionStore::with_cache_config(
+        pool.clone(),
+        db_mcp_gateway::auth::SessionCacheConfig {
+            ttl: Duration::ZERO,
+            max_entries: 100,
+        },
+    )
 }
 
 /// The regression this table exists for: a chain minted before a restart still
@@ -201,4 +221,161 @@ async fn shortening_the_configured_ttl_applies_to_existing_chains() {
     );
 
     cleanup(&pool, &sub).await;
+}
+
+/// Rotation revokes the session paired with the redeemed token: after a
+/// refresh, the previous access token no longer authenticates.
+#[tokio::test]
+async fn rotation_revokes_the_previous_session() {
+    let pool = state_pool().await;
+    let sub = unique_sub("pair");
+    let store = RefreshTokens::with_db(pool.clone(), TTL);
+    let sessions = session_store(&pool);
+
+    let first = store
+        .mint(&sessions, identity(&sub), token(), SESSION_TTL)
+        .await
+        .expect("mint");
+    let second = store
+        .rotate(&sessions, &first.refresh_token, token(), SESSION_TTL)
+        .await
+        .expect("rotate")
+        .expect("live token rotates");
+
+    let old = session_store(&pool).lookup(first.session.id).await;
+    assert!(matches!(old, Err(AuthError::RevokedSession)), "got {old:?}");
+    assert!(session_store(&pool).lookup(second.session.id).await.is_ok());
+    // The DB stores microseconds; the in-memory first stamp has nanoseconds.
+    let drift = second.session.issued_at - first.session.issued_at;
+    assert!(
+        drift.num_microseconds().is_some_and(|us| us.abs() < 1),
+        "the new session keeps the original login time, drift {drift}"
+    );
+    let replay = store
+        .rotate(&sessions, &first.refresh_token, token(), SESSION_TTL)
+        .await
+        .expect("replay is not an error");
+    assert!(replay.is_none(), "a rotated token must not renew twice");
+
+    cleanup(&pool, &sub).await;
+}
+
+/// A rotation that fails part-way commits nothing: the presented token and its
+/// session stay usable, so a transient error is not a sign-out.
+#[tokio::test]
+async fn failed_rotation_leaves_the_old_chain_usable() {
+    let pool = state_pool().await;
+    let sub = unique_sub("rollback");
+    let sessions = session_store(&pool);
+    let first = RefreshTokens::with_db(pool.clone(), TTL)
+        .mint(&sessions, identity(&sub), token(), SESSION_TTL)
+        .await
+        .expect("mint");
+
+    // An unrepresentable chain TTL makes the new refresh row violate its CHECK
+    // after the old row was deleted and the old session revoked in the tx.
+    let broken = RefreshTokens::with_db(pool.clone(), Duration::MAX);
+    let result = broken
+        .rotate(&sessions, &first.refresh_token, token(), SESSION_TTL)
+        .await;
+    assert!(matches!(result, Err(AuthError::State(_))), "got {result:?}");
+
+    assert!(
+        sessions.lookup(first.session.id).await.is_ok(),
+        "old session live"
+    );
+    let retried = RefreshTokens::with_db(pool.clone(), TTL)
+        .rotate(&sessions, &first.refresh_token, token(), SESSION_TTL)
+        .await
+        .expect("retry");
+    assert!(retried.is_some(), "old refresh token still redeemable");
+
+    cleanup(&pool, &sub).await;
+}
+
+/// RFC 7009 on a refresh token ends the chain and its paired access session.
+#[tokio::test]
+async fn revoking_a_refresh_token_revokes_its_session() {
+    let pool = state_pool().await;
+    let sub = unique_sub("revoke");
+    let store = RefreshTokens::with_db(pool.clone(), TTL);
+    let sessions = session_store(&pool);
+    let minted = store
+        .mint(&sessions, identity(&sub), token(), SESSION_TTL)
+        .await
+        .expect("mint");
+
+    assert!(
+        store
+            .revoke(&sessions, &minted.refresh_token)
+            .await
+            .expect("revoke")
+    );
+    let lookup = sessions.lookup(minted.session.id).await;
+    assert!(
+        matches!(lookup, Err(AuthError::RevokedSession)),
+        "got {lookup:?}"
+    );
+    assert!(
+        !store
+            .revoke(&sessions, &minted.refresh_token)
+            .await
+            .expect("revoke"),
+        "an unknown token is reported as not revoked"
+    );
+
+    cleanup(&pool, &sub).await;
+}
+
+/// Logout ends every session and chain of the identity, not just the caller's.
+#[tokio::test]
+async fn end_all_for_sub_leaves_no_live_bearer() {
+    let pool = state_pool().await;
+    let sub = unique_sub("logout");
+    let theirs = unique_sub("logout-theirs");
+    let store = RefreshTokens::with_db(pool.clone(), TTL);
+    let sessions = session_store(&pool);
+    let laptop = store
+        .mint(&sessions, identity(&sub), token(), SESSION_TTL)
+        .await
+        .expect("mint");
+    let phone = store
+        .mint(&sessions, identity(&sub), token(), SESSION_TTL)
+        .await
+        .expect("mint");
+    let other = store
+        .mint(&sessions, identity(&theirs), token(), SESSION_TTL)
+        .await
+        .expect("mint");
+
+    assert_eq!(
+        store
+            .end_all_for_sub(&sessions, &sub)
+            .await
+            .expect("logout"),
+        2
+    );
+    for minted in [&laptop, &phone] {
+        assert!(sessions.lookup(minted.session.id).await.is_err());
+        assert!(store.take(&minted.refresh_token).await.is_none());
+    }
+    assert!(
+        sessions.lookup(other.session.id).await.is_ok(),
+        "others untouched"
+    );
+
+    cleanup(&pool, &sub).await;
+    cleanup(&pool, &theirs).await;
+}
+
+/// A closed state pool is an error the caller can report, never a silent
+/// "nothing to revoke".
+#[tokio::test]
+async fn revoke_with_closed_pool_is_an_error() {
+    let pool = state_pool().await;
+    let sessions = session_store(&pool);
+    let store = RefreshTokens::with_db(pool.clone(), TTL);
+    pool.close().await;
+    let result = store.revoke(&sessions, &token()).await;
+    assert!(matches!(result, Err(AuthError::State(_))), "got {result:?}");
 }

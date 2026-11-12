@@ -1,66 +1,31 @@
-//! Boot wiring and the detached background tasks the server runs alongside.
+//! Boot wiring, signals, and the background work the server runs alongside.
 
-use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
 
-use db_mcp_gateway::audit;
-use db_mcp_gateway::auth::oauth::{AuthCodes, PendingFlows, RefreshTokens};
-use db_mcp_gateway::transport::probes::ShutdownFlag;
+use db_mcp_gateway::config::reload::ReloadTargets;
+use db_mcp_gateway::config::{self, TlsConfig};
 use db_mcp_gateway::transport::tls;
 
+mod background;
 mod boot;
+mod logging;
+mod metrics;
 mod serve;
 
-pub(crate) use boot::{build_app_state, connect_state_db, init_tracing};
+pub(crate) use background::{
+    AuthGcTargets, spawn_audit_pruner, spawn_audit_reaper, spawn_auth_state_gc,
+};
+pub(crate) use boot::{build_app_state, connect_state_db};
+pub(crate) use logging::{init_logging, spawn_dropped_lines_exporter};
+pub(crate) use metrics::{install_recorder, spawn_listener as spawn_metrics_listener};
 pub(crate) use serve::serve;
-
-/// Background task: tick hourly and prune any audit row older than the
-/// configured TTL. The task is detached — `tokio::time::interval` survives
-/// missed ticks (DelayBehavior) and the runtime cancels it on graceful
-/// shutdown, which is safe because the only DB write is a single DELETE.
-pub(crate) fn spawn_audit_pruner(pool: PgPool, ttl_days: u32) {
-    use std::time::Duration;
-    use tokio::time::{MissedTickBehavior, interval};
-
-    tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(3600));
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            match audit::pruner::run_once(&pool, ttl_days).await {
-                Ok(0) => tracing::debug!("audit pruner: no expired rows"),
-                Ok(n) => tracing::info!(rows = n, ttl_days, "pruned old audit rows"),
-                Err(err) => tracing::error!(%err, "audit pruner run failed"),
-            }
-        }
-    });
-}
-
-/// Background task: tick every 30 seconds and remove expired OAuth state
-/// (authorization codes, pending flows, refresh tokens). The task is
-/// detached — cancellation on graceful shutdown is safe because it's pure
-/// memory-local operations (no I/O).
-pub(crate) fn spawn_oauth_state_gc(flows: PendingFlows, codes: AuthCodes, refresh: RefreshTokens) {
-    use std::time::Duration;
-    use tokio::time::{MissedTickBehavior, interval};
-
-    tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(30));
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            flows.gc_expired().await;
-            codes.gc_expired().await;
-            refresh.gc_expired().await;
-            tracing::debug!("oauth state gc completed");
-        }
-    });
-}
 
 /// Install the shutdown signal handlers and return a future that resolves on
 /// the first Ctrl-C or (on Unix) SIGTERM, so containers drain cleanly on
-/// `docker stop`. The awaited future flips `shutdown` *before* axum starts
-/// draining, so `/healthz` and `/readyz` go 503 in time for k8s to pull the
-/// pod out of the Service endpoint set.
+/// `docker stop`. The awaited future cancels `stop` — the token `AppState`
+/// carries as `shutdown` — *before* axum starts draining, so `/healthz` and
+/// `/readyz` go 503 in time for k8s to pull the pod out of the Service
+/// endpoint set, and background loops and the metrics listener wind down.
 ///
 /// The SIGTERM handler is registered **synchronously** here so a registration
 /// failure surfaces as an `Err` the caller bubbles to `main`, failing boot —
@@ -70,7 +35,7 @@ pub(crate) fn spawn_oauth_state_gc(flows: PendingFlows, codes: AuthCodes, refres
 /// when the future is polled; there we log and stall that arm so `select!`
 /// still waits for a real signal rather than shutting down spuriously.
 pub(crate) fn install_shutdown_signal(
-    shutdown: ShutdownFlag,
+    stop: CancellationToken,
 ) -> std::io::Result<impl std::future::Future<Output = ()>> {
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -95,54 +60,97 @@ pub(crate) fn install_shutdown_signal(
             _ = terminate => {},
         }
 
-        shutdown.trigger();
+        stop.cancel();
         tracing::info!("shutdown signal received");
     })
 }
 
-/// Install the SIGHUP handler and spawn the cert hot-reload loop: on every
-/// signal, re-read cert+key from the configured paths and hand them to the
-/// running `RustlsConfig`. Reload failure (bad file mid-swap) is logged loudly
-/// but never crashes the gateway — the old cert keeps serving until the next
-/// signal succeeds.
+/// Install the SIGHUP handler and spawn the reload loop: on every signal,
+/// re-read cert+key (when TLS is on) into the running `RustlsConfig`, then
+/// reload the YAML config ([`config::reload::reload`]). Either failure is
+/// logged loudly but never crashes the gateway — the previous cert and config
+/// keep serving until the next signal succeeds.
+///
+/// Installed whether or not TLS is on: SIGHUP's default disposition
+/// terminates the process, so with TLS off an operator's `kill -HUP` (the
+/// documented reload signal) used to kill the gateway.
 ///
 /// The handler is registered **synchronously** so a registration failure
-/// bubbles to `main` and fails boot, rather than serving on with a dead
-/// `kill -HUP` TLS reload path (`docs/deployment/quickstart.md`). The loop
-/// itself runs in a detached task because `signal(SIGHUP)` is a long-lived
-/// stream; the runtime cancels it on shutdown.
+/// bubbles to `main` and fails boot. The loop runs in a detached task until
+/// `stop` fires.
 #[cfg(unix)]
 pub(crate) fn spawn_reload_on_sighup(
-    rustls: axum_server::tls_rustls::RustlsConfig,
-    cert_path: std::path::PathBuf,
-    key_path: std::path::PathBuf,
+    tls_config: TlsConfig,
+    rustls: Option<axum_server::tls_rustls::RustlsConfig>,
+    reload: ReloadTargets,
+    stop: CancellationToken,
 ) -> std::io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut hup = signal(SignalKind::hangup())?;
     tokio::spawn(async move {
-        while hup.recv().await.is_some() {
-            match tls::reload(&rustls, &cert_path, &key_path).await {
-                Ok(()) => tracing::info!(
-                    cert_path = %cert_path.display(),
-                    "TLS certificate reloaded"
-                ),
-                Err(error) => tracing::error!(
-                    %error,
-                    cert_path = %cert_path.display(),
-                    "TLS certificate reload failed; keeping previous cert"
-                ),
+        loop {
+            tokio::select! {
+                _ = stop.cancelled() => return,
+                received = hup.recv() => {
+                    if received.is_none() {
+                        return;
+                    }
+                    tracing::info!("SIGHUP received");
+                    if let (TlsConfig::Enabled { cert_path, key_path }, Some(rustls)) =
+                        (&tls_config, rustls.as_ref())
+                    {
+                        reload_tls(rustls, cert_path, key_path).await;
+                    }
+                    reload_config(&reload).await;
+                }
             }
         }
     });
     Ok(())
 }
 
+#[cfg(unix)]
+async fn reload_tls(
+    rustls: &axum_server::tls_rustls::RustlsConfig,
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) {
+    match tls::reload(rustls, cert_path, key_path).await {
+        Ok(()) => tracing::info!(cert_path = %cert_path.display(), "TLS certificate reloaded"),
+        Err(error) => tracing::error!(
+            %error,
+            cert_path = %cert_path.display(),
+            "TLS certificate reload failed; keeping previous cert"
+        ),
+    }
+}
+
+async fn reload_config(targets: &ReloadTargets) {
+    match config::reload::reload(targets).await {
+        Ok(evicted) => tracing::info!(
+            path = %targets.path.display(),
+            evicted_pools = evicted,
+            "config reloaded"
+        ),
+        // `ReloadError` names files, env vars and settings — never a secret.
+        Err(error) => tracing::error!(
+            %error,
+            path = %targets.path.display(),
+            "config reload failed; keeping previous config"
+        ),
+    }
+}
+
 #[cfg(not(unix))]
 pub(crate) fn spawn_reload_on_sighup(
-    _rustls: axum_server::tls_rustls::RustlsConfig,
-    _cert_path: std::path::PathBuf,
-    _key_path: std::path::PathBuf,
+    _tls_config: TlsConfig,
+    _rustls: Option<axum_server::tls_rustls::RustlsConfig>,
+    _reload: ReloadTargets,
+    _stop: CancellationToken,
 ) -> std::io::Result<()> {
     // SIGHUP doesn't exist outside Unix; deployment targets are Linux only.
     Ok(())
 }
+
+#[cfg(all(test, unix))]
+mod sighup_tests;

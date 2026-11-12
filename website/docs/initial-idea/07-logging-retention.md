@@ -4,45 +4,56 @@ Two distinct streams. Don't confuse them.
 
 | Stream | Where | Purpose |
 |---|---|---|
-| **Audit log** | State Postgres `audit_log` table | Forensic record. Synchronous, mandatory, append-only. |
+| **Audit log** | State Postgres: `audit_calls` (one row per call) and `audit_call_intents` (one row per target call, written first) | Forensic record. Synchronous, mandatory, append-only. |
 | **Stdout log** | Process stdout, one JSON object per line | Operational observability. Ingested by Loki / Splunk / etc. via Alloy. |
 
 The audit log is the system of record. The stdout log is a sidecar for operators; it MUST NOT be the only place a tool call leaves a trace.
 
 ## What "audit log" means here
 
-Append-only record of every tool invocation that hits a target database, written synchronously **before** results return to the agent. If the audit write fails, the request fails. There is no "best effort" audit.
+Append-only record of every tool invocation, written synchronously **before** results return to the agent. If the audit write fails, the request fails. There is no "best effort" audit.
+
+Every `tools/call` gets one `audit_calls` row — including calls rejected before a tool ran (unknown tool, arguments that do not parse: `outcome = invalid_arguments`, `server_name`/`database_name` NULL). The one carve-out: a request shed at the concurrency caps (`429 rate_limited`, `503 service_overloaded`) is a log line and a metric only, so overload never adds a state-DB write per rejected request (spec [03](03-mcp-tools.md) §Errors).
+
+### Intent and completion (two-phase)
+
+A call that reaches a target database is written twice:
+
+1. **Intent** — after authz, before the gateway opens the target pool, it commits an `audit_call_intents` row: `request_id`, `occurred_at`, `user_sub`, `user_email`, `tool`, `server_name`, `database_name`, `db_type`, `access` (`read` or `write`). If that write fails, the call is refused with `audit_unavailable` and the target is never reached.
+2. **Completion** — after the tool's work, the `audit_calls` row with the outcome, under the same `request_id`. If that write fails, the client gets `audit_unavailable`; a drop guard retries the row with outcome `audit_unavailable` and the tool's own outcome in `error_message`.
+
+Every target call writes an intent — reads and writes alike (owner decision, plan 101). Revisit writes-only if the benchmark shows the extra insert matters; production volume today is tens of calls a day.
+
+**Reaper.** An intent with no `audit_calls` row of the same `request_id` means the gateway stopped between the two writes (crash, OOM kill, a shutdown drain that ran out of time). Every replica runs a sweep each minute under a transaction-scoped advisory lock (one sweep at a time across replicas); it writes an `audit_calls` row with `outcome = abandoned`, `occurred_at` from the intent, and `error_message` naming the access (`access: write` means the statement may have committed). A sweep only considers intents older than the grace — target open allowance (60 s) + statement ceiling (30 s) + two audit-write deadlines (2 × 15 s) + shutdown drain (20 s) = 140 s — so a call still running is never reaped.
+
+**Shutdown drain.** The drop guard's retry, stream-sink deliveries and the exec layer's cancels run on a tracked task set, not bare `tokio::spawn`. After the server stops accepting work, `main` waits for that set for up to 20 s; anything still running past it is left to the reaper.
+
+**Client disconnect.** The dispatch future is dropped; the guard writes `outcome = cancelled` with `error_message = "client disconnected before completion"`.
 
 ## Fields
 
-| Field | Source |
+`audit_calls` columns:
+
+| Column | Source |
 |---|---|
-| `request_id` | Generated per request, returned to client |
-| `ts` | Server-side, monotonic |
-| `user_email`, `user_id`, `groups`, `session_id` | From session (see [04-auth-sso](04-auth-sso.md)) |
-| `agent_client` | Self-reported MCP client banner |
-| `ip` | Request socket |
-| `server`, `database` | Logical names |
-| `tool` | `run_query`, `describe_schema`, … |
-| `sql` | Full SQL (or redacted / metadata-only per policy) |
-| `reason` | User-provided reason string if policy required one |
+| `id` | Gateway-minted UUID per row |
+| `request_id` | Gateway-minted UUID per request (also the `x-request-id` header and the dispatch log line's `request_id`) |
+| `occurred_at` | Server-side `now()` at insert |
+| `user_sub`, `user_email`, `groups` | From the session (see [04-auth-sso](04-auth-sso.md)); `groups` is a JSONB snapshot at request time |
+| `agent_client` | Self-reported MCP client banner (`User-Agent`) |
+| `ip` | Request socket, as text |
+| `server_name`, `database_name` | Logical names; NULL for tools that address neither, or when the arguments never parsed |
+| `db_type` | `postgres` / `mongo`; NULL for tools that reach no target |
+| `tool` | `run_query`, `describe_schema`, …; `unknown` for an unknown or missing tool name |
+| `sql` | What the call read: the agent's SQL for `run_query` / `explain`; `schema.table` for `sample_table`; `schema` or `schema.table` for `describe_schema`; NULL for tools that read no table |
+| `reason` | User-provided reason string, if any |
 | `row_count` | Final row count returned (after truncation) |
-| `truncated` | Whether `row_limit` cut the result |
-| `duration_ms` | Wall-clock for the DB call |
-| `outcome` | `ok`, `forbidden`, `timeout`, `error_*` |
-| `error_message` | Sanitized — no credentials or raw connection details |
+| `truncated` | Whether the row cap cut the result |
+| `elapsed_ms` | Wall-clock of the tool's work |
+| `outcome` | The spec [03](03-mcp-tools.md) code the client saw: `success`, `forbidden`, `forbidden_sql`, `invalid_arguments`, `reason_required`, `timeout`, `syntax_error`, `unavailable`, `audit_unavailable`, `internal`, …; plus `cancelled` and `abandoned`, which only the audit log carries |
+| `error_message` | The sanitized message the client got — no credentials or raw connection details |
 
-## SQL capture policies
-
-Per-database setting:
-
-| Policy | Effect |
-|---|---|
-| `full` (default) | Raw SQL stored verbatim |
-| `redacted` | Literals and string constants replaced with placeholders before storage |
-| `metadata_only` | SQL not stored; only tables touched (parsed from the query plan) and counts |
-
-`redacted` is the right default for databases known to contain PII in literal values (e.g. `WHERE email='alice@example.com'`). `metadata_only` is for the truly paranoid; it costs you the ability to reproduce a query later.
+`sql` is stored verbatim. There is no per-database `sql_capture` (redacted / metadata-only) policy; a database whose literals must not be stored should not be reachable through `run_query`.
 
 ## Storage
 
@@ -52,46 +63,46 @@ Per-database setting:
 | **Archive** | S3 / GCS / Azure Blob, optional | 1y / 7y / forever | Compliance retention | Not shipped — [roadmap Phase 4](11-roadmap.md) |
 | **Stream** | Optional sink: `stdout`, `syslog` (config: `logging.stream: [{kind: stdout}, {kind: syslog, host: ..., port: ...}]`), OTLP, Kafka | live | Plug into existing SIEM/Splunk/Datadog | `stdout` + `syslog` shipped (#218); OTLP/Kafka not shipped |
 
-Hot and stream are independent — you can send everything to Splunk *and* keep 90 days in Postgres. Archive is a periodic batch job that exports hot entries to compressed JSONL files keyed by date.
+Hot and stream are independent — you can send everything to Splunk *and* keep 90 days in Postgres. A row is streamed only after its durable write commits.
+
+**Syslog sink.** RFC 5424 over UDP, MSG body = the row as JSON. The receiver address is resolved and the socket bound once, then reused; a failed send forgets both so the next row re-resolves. A datagram is at most 8 KiB: an oversized row has its `sql` cut and suffixed `...[truncated]` (the body stays valid JSON); if that cannot make it fit, the message itself is cut with the same suffix. A row a sink cannot deliver increments `audit_stream_dropped_total{sink}`; the error log is rate-limited to one line a minute carrying the count dropped since the last one.
 
 ## Retention pruning
 
-A background task runs hourly:
-
-1. Find audit rows older than hot TTL.
-2. If archive is configured and the row hasn't been archived yet → export.
-3. Delete from hot once successfully archived (or unconditionally if no archive configured and TTL exceeded).
-
-Pruning is logged. Failures alert (and refuse to delete the row that failed to archive).
+A background task runs hourly and deletes `audit_call_intents` rows, then `audit_calls` rows, older than the hot TTL (intents first, so the reaper never sees an intent whose completion was just pruned). TTL is floored at one day. Deletes run in batches of 5,000 rows, oldest first, each in its own transaction under a transaction-scoped advisory lock — a large backlog never becomes one long transaction, and a replica that finds the lock held leaves the pruning to the replica holding it. No archive tier is shipped, so nothing is exported before the delete. Pruning is logged.
 
 ## Operator queries
 
-Common questions, runnable directly against state DB:
+Common questions, runnable directly against the state DB:
 
 ```sql
 -- Who ran what against prod in the last hour?
-select ts, user_email, database, sql, row_count
-from audit_log
-where server = 'prod' and ts > now() - interval '1 hour'
-order by ts desc;
+select occurred_at, user_email, database_name, sql, row_count, outcome
+from audit_calls
+where server_name = 'prod' and occurred_at > now() - interval '1 hour'
+order by occurred_at desc;
 
--- Top queries by user for the week
-select user_email, count(*) from audit_log
-where ts > now() - interval '7 days'
+-- Top callers for the week
+select user_email, count(*) from audit_calls
+where occurred_at > now() - interval '7 days'
 group by user_email order by 2 desc;
 
 -- Find every query that touched a sensitive table
-select * from audit_log
+select * from audit_calls
 where sql ilike '%customer_pii%'
-and ts > now() - interval '30 days';
-```
+and occurred_at > now() - interval '30 days';
 
-A small read-only SQL view shipped with the gateway exposes the same fields with friendlier column names.
+-- Calls the gateway never finished recording (crash between target and audit)
+select occurred_at, user_email, server_name, database_name, error_message
+from audit_calls
+where outcome = 'abandoned'
+order by occurred_at desc;
+```
 
 ## What is *not* in the audit log
 
 - The DB password / connection string. Never.
-- Result row contents. Counts and column names only. (Storing actual rows would defeat the purpose of redacted-SQL mode.)
+- Result row contents. Counts only.
 - Anything that would re-identify a user beyond what's already in the session.
 
 ## Stdout log — dispatch line contract
@@ -115,7 +126,7 @@ The dispatch line (`message = "tool dispatched"`) carries additionally:
 | `tool` | string | Tool name (`run_query`, `explain`, …) |
 | `server` | string | Logical server name from call args, empty for tools that aren't server-scoped |
 | `db` | string | Logical database name from call args, empty for tools that aren't database-scoped |
-| `outcome` | string | One of the spec 03 codes (`success` / `forbidden` / `forbidden_sql` / `invalid_arguments` / `timeout` / `syntax_error` / `unavailable` / `rate_limited` / `service_overloaded` / `internal`) |
+| `outcome` | string | The spec 03 code the client saw (`success` / `forbidden` / `forbidden_sql` / `invalid_arguments` / `timeout` / `syntax_error` / `unavailable` / `audit_unavailable` / `internal` / …). Emitted after the audit write, so an audit failure logs `audit_unavailable` |
 | `duration_ms` | integer | Wall-clock the tool itself took. `0` for outcomes where no tool work ran (e.g. `forbidden` before dispatch). |
 
 The audit-write-failure line adds:
@@ -123,6 +134,10 @@ The audit-write-failure line adds:
 | Field | Type | Notes |
 |---|---|---|
 | `audit_write_duration_ms` | integer | Wall-clock the failed audit insert took. `duration_ms` on the same line keeps the contract above — tool execution time, not audit latency. |
+| `class` | string | Credential-free cause (`pool_timed_out`, `database/<sqlstate>`, `timeout`, …) — never the driver error's text |
+| `tool_outcome` | string | The outcome the tool produced before the audit write failed |
+
+Audit metrics: `tool_calls{tool,outcome}` (outcome as above), `audit_write_duration_seconds`, `audit_fallback_failures_total` (a drop-guard retry that also failed — that call's row exists only if its intent is reaped), `audit_stream_dropped_total{sink}`.
 
 Renames or removals of any field above are contract breaks. Additions are fine.
 
@@ -149,8 +164,12 @@ Sentry inits **first** in `fn main`, *before* the tokio runtime is built. The in
 
 Every outbound event passes through a `before_send` hook that redacts secrets. This is defense-in-depth on top of the typed-error discipline in the stdout contract — GlitchTip payloads cross the process boundary and must never carry a credential. The hook scrubs, replacing the secret portion with `***REDACTED***`:
 
-- database connection strings with embedded credentials — `postgres://user:pass@host`, `mysql://…`, `mongodb://…`, and any `scheme://user:pass@host` shape;
-- bare password-like values in `message`, exception `value`/`type`, breadcrumb `message`/`data`, `tags`, `user`, `request`, and `extra`/`contexts`.
+- URL userinfo — `scheme://user:pass@host`, password-only `scheme://:pass@host`, passwords containing `/` or `@` (the last `@` before whitespace, `?` or `#` delimits the host), and username-only `scheme://token@host`;
+- bare service tokens (`dbmcp_svc_…`, truncated ones included), JWTs (`eyJ…`), and `Bearer …` / `Basic …` credentials;
+- `key=value`, `key: value` and JSON `"key":"value"` assignments for the keywords `password`, `passwd`, `pwd`, `secret`, `token`, `dsn`, `api_key`/`apikey`, `authorization`, `cookie`, `credential`, `private_key` (plurals included, case-insensitive), with quoted values containing spaces;
+- by **key**: every value under a JSON object key that names a credential (same keyword list, matched on the key lowercased with `-`/`_` dropped, so `X-Api-Key`, `access_token`, `Set-Cookie` count), whatever its shape.
+
+The hook serialises the whole event to JSON, walks it once, and deserialises it, so every protocol field is covered — `message`, `logentry.message/params`, `culprit`, `transaction`, `fingerprint`, exception `type`/`value`/`module`/`mechanism.data`, stack-frame `vars`, breadcrumbs, `tags`, `user`, `request` (headers, cookies, env), `extra`, `contexts` — including fields a future SDK adds. An event that cannot round-trip is **dropped**, never shipped unscrubbed.
 
 Env keys whose values must never leak (the scrubber targets their shapes, not the values themselves):
 

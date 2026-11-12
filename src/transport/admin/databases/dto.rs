@@ -60,4 +60,8 @@ pub struct UpdateDatabaseRequest {
     pub db_name: Option<String>,
     #[serde(default)]
     pub db_type: Option<String>,
+    /// Optimistic-concurrency precondition: 409 if the row's `updated_at`
+    /// differs.
+    #[serde(default)]
+    pub expected_updated_at: Option<DateTime<Utc>>,
 }

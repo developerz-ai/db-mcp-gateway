@@ -17,8 +17,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value as JsonValue, json};
 
 /// Admin-API failure modes. Variants map 1:1 to stable JSON error codes:
-/// `forbidden`, `unauthorized`, `not_found`, `invalid_request`, `internal`,
-/// `session_too_old`.
+/// `forbidden`, `unauthorized`, `not_found`, `invalid_request`, `conflict`,
+/// `internal`, `session_too_old`.
 #[derive(Debug)]
 pub enum AdminErrorKind {
     /// Caller authenticated but is not in the configured admin group.
@@ -33,6 +33,10 @@ pub enum AdminErrorKind {
     NotFound,
     /// Request body fails validation (empty fields, malformed UUID, etc.).
     Invalid(String),
+    /// The write raced another one: an `expected_updated_at` precondition
+    /// failed, or Postgres aborted the transaction to break a deadlock. Safe
+    /// to re-read and retry.
+    Conflict(String),
     /// Anything we can't classify — DB outage, audit-write failure, encoder
     /// bug. Logged with the source; the user-facing body is generic.
     Internal,
@@ -75,6 +79,10 @@ impl AdminError {
         Self::new(AdminErrorKind::Invalid(msg.into()))
     }
 
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        Self::new(AdminErrorKind::Conflict(msg.into()))
+    }
+
     pub const fn internal() -> Self {
         Self::new(AdminErrorKind::Internal)
     }
@@ -95,6 +103,7 @@ impl AdminError {
             AdminErrorKind::SessionTooOld => StatusCode::FORBIDDEN,
             AdminErrorKind::NotFound => StatusCode::NOT_FOUND,
             AdminErrorKind::Invalid(_) => StatusCode::BAD_REQUEST,
+            AdminErrorKind::Conflict(_) => StatusCode::CONFLICT,
             AdminErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -106,6 +115,7 @@ impl AdminError {
             AdminErrorKind::SessionTooOld => "session_too_old",
             AdminErrorKind::NotFound => "not_found",
             AdminErrorKind::Invalid(_) => "invalid_request",
+            AdminErrorKind::Conflict(_) => "conflict",
             AdminErrorKind::Internal => "internal",
         }
     }
@@ -118,9 +128,9 @@ impl AdminError {
                 "session is too old for admin operations; re-authenticate".to_string()
             }
             AdminErrorKind::NotFound => "not found".to_string(),
-            // The constructor of `Invalid` is responsible for not embedding
-            // sensitive values — strings here are field-name level only.
-            AdminErrorKind::Invalid(msg) => msg.clone(),
+            // The constructors of `Invalid` / `Conflict` are responsible for
+            // not embedding sensitive values — field-name level only.
+            AdminErrorKind::Invalid(msg) | AdminErrorKind::Conflict(msg) => msg.clone(),
             AdminErrorKind::Internal => "internal error".to_string(),
         }
     }
@@ -176,6 +186,17 @@ mod tests {
             body["error"].get("request_id").is_none(),
             "absent id must not render an empty/null field"
         );
+    }
+
+    #[tokio::test]
+    async fn conflict_renders_409_with_stable_code() {
+        let resp = AdminError::conflict("changed concurrently")
+            .with_request_id("r2")
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "conflict");
+        assert_eq!(body["error"]["request_id"], "r2");
     }
 
     #[tokio::test]

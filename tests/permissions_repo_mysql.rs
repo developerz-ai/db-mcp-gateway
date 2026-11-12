@@ -9,7 +9,9 @@ mod common;
 
 use common::env::mysql_pool;
 use db_mcp_gateway::state::permissions::mysql::MysqlPermissionsRepo;
-use db_mcp_gateway::state::permissions::{DbType, GrantAction, GrantTarget, Page, PermissionsRepo};
+use db_mcp_gateway::state::permissions::{
+    DbType, GrantAction, GrantTarget, Page, PermissionsRepo, PermissionsSeed,
+};
 use serde_json::json;
 use sqlx::MySqlPool;
 use uuid::Uuid;
@@ -769,4 +771,81 @@ async fn raw_insert_with_both_specific_and_wildcard_is_rejected_by_check() {
         msg.contains("permissions_grants_target_xor_wildcard_check"),
         "expected XOR check violation, got: {msg}"
     );
+}
+
+/// Migration 0004: subjects differing only in case are two identities. Under
+/// the old case-insensitive collation the second upsert overwrote the first.
+#[tokio::test]
+async fn subjects_differing_only_in_case_stay_distinct() {
+    let r = repo().await;
+    let pool = mysql_pool().await;
+    let lower = unique_sub("mysql-case");
+    let upper = lower.to_uppercase();
+    let a = r.upsert_user(&lower, "a@example.com", &[]).await.unwrap();
+    let b = r.upsert_user(&upper, "b@example.com", &[]).await.unwrap();
+    assert_ne!(a.id, b.id, "case-variant subject must not hit the same row");
+    let fetched = r.get_user_by_sub(&lower).await.unwrap().unwrap();
+    assert_eq!(fetched.user_email, "a@example.com");
+    cleanup_user(&pool, &lower).await;
+    cleanup_user(&pool, &upper).await;
+}
+
+/// Migration 0005: a Mongo target registers.
+#[tokio::test]
+async fn mongo_db_type_round_trips() {
+    let r = repo().await;
+    let pool = mysql_pool().await;
+    let server = unique_sub("mysql-mongo");
+    let db = r
+        .create_database(&server, "events", DbType::Mongo)
+        .await
+        .expect("mongo accepted");
+    assert_eq!(
+        r.get_database(db.id).await.unwrap().unwrap().db_type,
+        DbType::Mongo
+    );
+    cleanup_server(&pool, &server).await;
+}
+
+/// The resolver's one-query join drops a specific grant whose database is
+/// soft-deleted and keeps wildcards, exactly like the pg store.
+#[tokio::test]
+async fn live_grants_for_sub_drops_soft_deleted_databases() {
+    let r = repo().await;
+    let pool = mysql_pool().await;
+    let sub = unique_sub("mysql-live");
+    let server = unique_sub("mysql-live-server");
+    let user = r.upsert_user(&sub, "l@example.com", &[]).await.unwrap();
+    let kept = r
+        .create_database(&server, "app", DbType::Postgres)
+        .await
+        .unwrap();
+    let gone = r
+        .create_database(&server, "old", DbType::Postgres)
+        .await
+        .unwrap();
+    for target in [
+        GrantTarget::Specific {
+            database_id: kept.id,
+        },
+        GrantTarget::Specific {
+            database_id: gone.id,
+        },
+        GrantTarget::Wildcard {
+            server: server.clone(),
+        },
+    ] {
+        r.create_grant(user.id, target, GrantAction::QueryRead, json!({}))
+            .await
+            .unwrap();
+    }
+    assert!(r.soft_delete_database(gone.id).await.unwrap());
+
+    let live = r.live_grants_for_sub(&sub).await.unwrap();
+    let mut names: Vec<Option<String>> = live.iter().map(|g| g.db_name.clone()).collect();
+    names.sort();
+    assert_eq!(names, vec![None, Some("app".to_string())]);
+    assert!(live.iter().all(|g| g.server == server));
+    cleanup_user(&pool, &sub).await;
+    cleanup_server(&pool, &server).await;
 }

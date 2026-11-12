@@ -29,7 +29,7 @@ use mongodb::Client;
 use mongodb::bson::{Document, doc};
 
 use common::mongo_target::{TARGET_DB, adapter, drop_collection, side_client, unique_collection};
-use db_mcp_gateway::exec::{DbAdapter, ExecQuery};
+use db_mcp_gateway::exec::{Access, DbAdapter, ExecQuery};
 
 const SERVER_NAME: &str = "mongo-cancel-test";
 
@@ -135,6 +135,7 @@ async fn dropped_execute_future_kills_the_mongo_op() {
                 binds: &[],
                 statement_timeout_ms: Some(30_000),
                 row_limit: 1,
+                access: Access::ReadOnly,
             })
             .await
     });
@@ -210,6 +211,7 @@ async fn completed_command_leaves_nothing_in_current_op() {
             binds: &[],
             statement_timeout_ms: Some(5_000),
             row_limit: 10,
+            access: Access::ReadOnly,
         })
         .await;
 

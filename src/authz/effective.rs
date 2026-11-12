@@ -77,6 +77,7 @@ mod tests {
             user_email: "test@example.com".to_string(),
             groups: groups.iter().map(|g| g.to_string()).collect(),
             issued_at: chrono::Utc::now(),
+            kind: crate::auth::IdentityKind::Sso,
         }
     }
 
@@ -87,6 +88,7 @@ mod tests {
             password: Password::Literal("pw".into()),
             description: String::new(),
             auth_database: None,
+            pool: None,
         }
     }
 
@@ -98,6 +100,8 @@ mod tests {
             host: "h".to_string(),
             port: 5432,
             tls: Tls::Required,
+            tls_ca_file: None,
+            pool: None,
             databases: vec![database("app")],
         }
     }

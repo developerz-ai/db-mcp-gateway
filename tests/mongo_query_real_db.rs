@@ -14,7 +14,8 @@ mod common;
 use common::mongo_target::{
     TARGET_DB, adapter, database, drop_collection, server, side_client, unique_collection,
 };
-use db_mcp_gateway::exec::{DbAdapter, ExecError, ExecQuery, MongoAdapter};
+use db_mcp_gateway::audit::drain::DetachedTasks;
+use db_mcp_gateway::exec::{Access, DbAdapter, ExecError, ExecQuery, MongoAdapter, PoolSizing};
 
 const SERVER_NAME: &str = "mongo";
 
@@ -80,6 +81,7 @@ async fn find_returns_documents_under_document_column() {
             binds: &[],
             statement_timeout_ms: None,
             row_limit: 100,
+            access: Access::ReadOnly,
         })
         .await
         .expect("find runs");
@@ -118,6 +120,7 @@ async fn find_respects_row_limit_with_truncation_flag() {
             binds: &[],
             statement_timeout_ms: None,
             row_limit: 5,
+            access: Access::ReadOnly,
         })
         .await
         .expect("find runs");
@@ -146,6 +149,7 @@ async fn aggregate_runs_pipeline_and_returns_groups() {
             binds: &[],
             statement_timeout_ms: None,
             row_limit: 100,
+            access: Access::ReadOnly,
         })
         .await
         .expect("aggregate runs");
@@ -185,6 +189,7 @@ async fn count_returns_scalar_under_count_column() {
             binds: &[],
             statement_timeout_ms: None,
             row_limit: 100,
+            access: Access::ReadOnly,
         })
         .await
         .expect("count runs");
@@ -212,6 +217,7 @@ async fn distinct_returns_unique_values_one_per_row() {
             binds: &[],
             statement_timeout_ms: None,
             row_limit: 100,
+            access: Access::ReadOnly,
         })
         .await
         .expect("distinct runs");
@@ -265,6 +271,7 @@ async fn max_time_ms_surfaces_as_typed_timeout() {
                 binds: &[],
                 statement_timeout_ms: Some(1),
                 row_limit: 10000,
+                access: Access::ReadOnly,
             })
             .await;
         match result {
@@ -291,6 +298,40 @@ async fn max_time_ms_surfaces_as_typed_timeout() {
     );
 }
 
+/// A `$db` key would re-target the command at another database. Before the
+/// key allow-list the gateway forwarded it and this server refused the
+/// duplicate `$db` (`FailedToParse`, code 9 → `syntax_error`) — safe only by
+/// the server's grace. Now the gateway refuses it, whatever the server does.
+#[tokio::test]
+async fn dollar_db_pointing_at_another_database_is_rejected() {
+    let side = side_client();
+    let coll = unique_collection("mongodollardb");
+    let other = format!("dbmcp_other_{}", coll);
+    side.database(&other)
+        .collection::<mongodb::bson::Document>(&coll)
+        .insert_one(mongodb::bson::doc! { "secret": 1 })
+        .await
+        .expect("seed the second database");
+
+    let a = adapter(SERVER_NAME).await;
+    let sql = format!(r#"{{"find":"{coll}","filter":{{}},"$db":"{other}"}}"#);
+    let result = a
+        .execute(ExecQuery {
+            sql: &sql,
+            binds: &[],
+            statement_timeout_ms: None,
+            row_limit: 10,
+            access: Access::ReadOnly,
+        })
+        .await;
+    let _ = side.database(&other).drop().await;
+
+    match result {
+        Err(ExecError::Forbidden(reason)) => assert!(reason.contains("$db"), "{reason}"),
+        other => panic!("expected Forbidden naming `$db`, got {other:?}"),
+    }
+}
+
 /// Rejected write commands surface as `ExecError::Forbidden`, NOT
 /// `ExecError::Sql`. The mongo wire layer never sees them — the rejector
 /// stops them in the gateway. Pins the contract claudetm shipped in #57's
@@ -306,6 +347,7 @@ async fn rejected_write_command_does_not_reach_mongo() {
             binds: &[],
             statement_timeout_ms: None,
             row_limit: 10,
+            access: Access::ReadOnly,
         })
         .await
         .expect_err("insert is denied by the rejector");
@@ -339,7 +381,9 @@ async fn auth_database_none_falls_back_to_database_name() {
     let mut db = database();
     db.auth_database = None;
     let s = server(SERVER_NAME);
-    let a = MongoAdapter::open(&s, &db).await.expect("client builds");
+    let a = MongoAdapter::open(&s, &db, PoolSizing::default(), DetachedTasks::new())
+        .await
+        .expect("client builds");
 
     let sql = r#"{"count":"missing","query":{}}"#;
     let result = a
@@ -348,6 +392,7 @@ async fn auth_database_none_falls_back_to_database_name() {
             binds: &[],
             statement_timeout_ms: None,
             row_limit: 10,
+            access: Access::ReadOnly,
         })
         .await;
     assert!(

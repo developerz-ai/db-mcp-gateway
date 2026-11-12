@@ -3,32 +3,65 @@
 //! Postgres write. A sink outage must never fail an agent's request; only
 //! `audit::log`'s synchronous write does that (CLAUDE.md non-negotiable #4).
 //!
-//! Callers invoke [`send`] only after the durable write has already
-//! succeeded (see `tools::audit_dispatch`) — a row that isn't yet the system
-//! of record must not be streamed as if it were.
+//! Callers invoke [`StreamSinks::send`] only after the durable write has
+//! already succeeded (see `tools::audit_dispatch`) — a row that isn't yet the
+//! system of record must not be streamed as if it were.
 //!
 //! Payload: the row is streamed as-is, matching the durable `audit_calls`
-//! row byte-for-byte. Redaction (`sql_capture: redacted | metadata_only`)
-//! is a per-database policy applied at the audit-row layer (spec 07/08),
-//! not per-sink — so `stdout`, `syslog`, and the durable row all see the
-//! same policy-redacted `sql`, and no sink can silently drift into a
-//! different field list.
+//! row field-for-field, so no sink can silently drift into a different field
+//! list. The one exception is size: syslog cuts an oversized row to fit one
+//! datagram, with a marker (see `syslog`).
 
 mod syslog;
 
-use super::AuditRow;
-use crate::config::StreamSinkConfig;
-use syslog::send_syslog;
+use std::sync::Arc;
 
-/// Fan `row` out to every configured sink. `stdout` is a local `tracing`
-/// emission — nothing to spawn. `syslog` touches the network (DNS + a UDP
-/// send), so it spawns a detached task: this function returns immediately
-/// either way, keeping the fire-and-forget contract callers rely on.
-pub fn send(sinks: &[StreamSinkConfig], row: &AuditRow) {
-    for sink in sinks {
-        match sink {
-            StreamSinkConfig::Stdout => send_stdout(row),
-            StreamSinkConfig::Syslog { host, port } => send_syslog(host, *port, row),
+use super::AuditRow;
+use super::drain::DetachedTasks;
+use crate::config::StreamSinkConfig;
+use syslog::SyslogSink;
+
+/// Counter: rows a sink failed to deliver. Label `sink` is the sink kind.
+const STREAM_DROPPED: &str = "audit_stream_dropped_total";
+
+/// The configured sinks, built once at boot so network sinks can keep their
+/// resolved address and socket across rows. Cheap to clone.
+#[derive(Debug, Clone, Default)]
+pub struct StreamSinks(Arc<[Sink]>);
+
+#[derive(Debug)]
+enum Sink {
+    Stdout,
+    Syslog(Arc<SyslogSink>),
+}
+
+impl StreamSinks {
+    pub fn from_config(config: &[StreamSinkConfig]) -> Self {
+        let sinks: Vec<Sink> = config
+            .iter()
+            .map(|sink| match sink {
+                StreamSinkConfig::Stdout => Sink::Stdout,
+                StreamSinkConfig::Syslog { host, port } => {
+                    Sink::Syslog(Arc::new(SyslogSink::new(host.clone(), *port)))
+                }
+            })
+            .collect();
+        Self(sinks.into())
+    }
+
+    /// Fan `row` out to every sink. `stdout` is a local `tracing` emission;
+    /// `syslog` touches the network, so its delivery runs on `tasks` and this
+    /// returns immediately either way.
+    pub fn send(&self, row: &AuditRow, tasks: &DetachedTasks) {
+        for sink in self.0.iter() {
+            match sink {
+                Sink::Stdout => send_stdout(row),
+                Sink::Syslog(syslog) => {
+                    let syslog = Arc::clone(syslog);
+                    let datagram = syslog::datagram(row);
+                    tasks.spawn(async move { syslog.deliver(datagram).await });
+                }
+            }
         }
     }
 }
