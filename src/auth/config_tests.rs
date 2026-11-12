@@ -112,8 +112,8 @@ fn ttl_parses_whole_units_in_bounds() {
         Duration::from_secs(8 * 3600)
     );
     assert_eq!(
-        parse_ttl("REFRESH_TTL_DAYS", "90", 86_400, REFRESH_TTL_DAYS_MAX).unwrap(),
-        Duration::from_secs(90 * 86_400)
+        parse_ttl("REFRESH_TTL_DAYS", "365", 86_400, REFRESH_TTL_DAYS_MAX).unwrap(),
+        Duration::from_secs(365 * 86_400)
     );
 }
 
@@ -128,4 +128,14 @@ fn ttl_rejects_zero_over_max_overflow_and_garbage() {
             "{value:?}"
         );
     }
+}
+
+#[test]
+fn refresh_ttl_allows_a_year_and_rejects_past_it() {
+    // Deployments run year-long logins; 366 covers a leap year.
+    assert!(parse_ttl("REFRESH_TTL_DAYS", "366", 86_400, REFRESH_TTL_DAYS_MAX).is_ok());
+    assert!(matches!(
+        parse_ttl("REFRESH_TTL_DAYS", "367", 86_400, REFRESH_TTL_DAYS_MAX),
+        Err(AuthConfigError::Ttl { .. })
+    ));
 }

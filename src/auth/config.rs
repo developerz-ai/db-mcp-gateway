@@ -16,8 +16,10 @@ const DEFAULT_DEV_SIGNING_KEY: &str = "dev-only-session-signing-key-change-me";
 /// leaked one; refresh keeps a client signed in past that.
 const SESSION_TTL_HOURS_MAX: u64 = 7 * 24;
 /// Bounds on `REFRESH_TTL_DAYS`: the chain TTL is also the group-staleness
-/// window (see [`DEFAULT_REFRESH_TTL`]).
-const REFRESH_TTL_DAYS_MAX: u64 = 90;
+/// window (see [`DEFAULT_REFRESH_TTL`]). A year (+1 for leap years) because
+/// deployments run year-long logins by owner decision, offset by prompt
+/// revocation (logout, `/revoke`, admin revoke-sessions).
+const REFRESH_TTL_DAYS_MAX: u64 = 366;
 /// Shortest `SESSION_SIGNING_KEY` the gateway will boot with, in bytes.
 /// Matches the HS256 output length (RFC 7518 §3.2 floor). Also catches the
 /// empty key: `SESSION_SIGNING_KEY=${SIGNING_KEY}` with the outer variable
