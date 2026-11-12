@@ -56,6 +56,20 @@ impl AcquireFailure {
     }
 }
 
+/// SQLSTATE `0A000`: the server lacks the feature the statement needs.
+const FEATURE_NOT_SUPPORTED: &str = "0A000";
+
+pub(super) fn is_feature_not_supported(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(db) => sqlstate_is_feature_not_supported(db.code().as_deref()),
+        _ => false,
+    }
+}
+
+fn sqlstate_is_feature_not_supported(code: Option<&str>) -> bool {
+    code == Some(FEATURE_NOT_SUPPORTED)
+}
+
 /// The variant and SQLSTATE of a discarded error, for the operator. Never
 /// the error's `Display` (see module docs).
 pub(super) fn log_discarded(err: &sqlx::Error, what: &'static str) {
@@ -118,5 +132,13 @@ mod tests {
             AcquireFailure::of(&sqlx::Error::PoolTimedOut),
             AcquireFailure::Other
         );
+    }
+
+    #[test]
+    fn only_sqlstate_0a000_is_feature_not_supported() {
+        assert!(sqlstate_is_feature_not_supported(Some("0A000")));
+        assert!(!sqlstate_is_feature_not_supported(Some("42501")));
+        assert!(!sqlstate_is_feature_not_supported(None));
+        assert!(!is_feature_not_supported(&sqlx::Error::PoolTimedOut));
     }
 }
