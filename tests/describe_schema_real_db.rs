@@ -7,23 +7,18 @@ mod common;
 
 use std::time::Duration;
 
+use common::env::target_db_url;
 use common::gateway::spawn_logged_in;
 use common::idp::MockUser;
 use common::pg_target::adapter;
-use db_mcp_gateway::exec::{Access, DbAdapter, ExecError, ExecQuery, ExecResult, PgAdapter};
+use db_mcp_gateway::exec::{Access, DbAdapter, ExecQuery};
 use serde_json::json;
 
-async fn run(a: &PgAdapter, sql: &str) -> Result<ExecResult, ExecError> {
-    a.execute(ExecQuery {
-        sql,
-        binds: &[],
-        statement_timeout_ms: None,
-        row_limit: 10,
-        access: Access::ReadWrite,
-        dry_run: false,
-        request_id: uuid::Uuid::new_v4(),
-    })
-    .await
+/// Fixture DDL/DML over a plain owner connection — never through the
+/// adapter, which only reads on a database without a `write_role`.
+async fn ddl(sql: &str) -> Result<(), sqlx::Error> {
+    let pool = sqlx::PgPool::connect(&target_db_url()).await?;
+    sqlx::query(sql).execute(&pool).await.map(|_| ())
 }
 
 /// Generates a unique schema name per test run so concurrent runs (and any
@@ -38,19 +33,17 @@ async fn catalog_query_returns_expected_columns_and_types() {
     let schema = fresh_schema_name();
 
     // Setup: a schema with a couple of tables of known shape.
-    run(&a, &format!("CREATE SCHEMA \"{schema}\""))
+    ddl(&format!("CREATE SCHEMA \"{schema}\""))
         .await
         .expect("create schema");
-    run(
-        &a,
-        &format!("CREATE TABLE \"{schema}\".\"users\" (id bigint NOT NULL, email text)"),
-    )
+    ddl(&format!(
+        "CREATE TABLE \"{schema}\".\"users\" (id bigint NOT NULL, email text)"
+    ))
     .await
     .expect("create users");
-    run(
-        &a,
-        &format!("CREATE TABLE \"{schema}\".\"orders\" (id bigint NOT NULL, total numeric)"),
-    )
+    ddl(&format!(
+        "CREATE TABLE \"{schema}\".\"orders\" (id bigint NOT NULL, total numeric)"
+    ))
     .await
     .expect("create orders");
 
@@ -64,7 +57,7 @@ async fn catalog_query_returns_expected_columns_and_types() {
             binds: &[&schema],
             statement_timeout_ms: None,
             row_limit: 500,
-            access: Access::ReadWrite,
+            access: Access::ReadOnly,
             dry_run: false,
             request_id: uuid::Uuid::new_v4(),
         })
@@ -72,7 +65,7 @@ async fn catalog_query_returns_expected_columns_and_types() {
         .expect("catalog query runs");
 
     // Cleanup before assertions so a failed assert still leaves the DB clean.
-    let _ = run(&a, &format!("DROP SCHEMA \"{schema}\" CASCADE")).await;
+    let _ = ddl(&format!("DROP SCHEMA \"{schema}\" CASCADE")).await;
 
     // Expect 4 rows: users.id, users.email, orders.id, orders.total.
     assert_eq!(result.rows.len(), 4, "rows: {:?}", result.rows);
@@ -103,18 +96,15 @@ async fn table_filter_narrows_results() {
     let a = adapter().await;
     let schema = fresh_schema_name();
 
-    run(&a, &format!("CREATE SCHEMA \"{schema}\""))
+    ddl(&format!("CREATE SCHEMA \"{schema}\""))
         .await
         .expect("create schema");
-    run(&a, &format!("CREATE TABLE \"{schema}\".\"a\" (x int)"))
+    ddl(&format!("CREATE TABLE \"{schema}\".\"a\" (x int)"))
         .await
         .expect("create a");
-    run(
-        &a,
-        &format!("CREATE TABLE \"{schema}\".\"b\" (y text, z bool)"),
-    )
-    .await
-    .expect("create b");
+    ddl(&format!("CREATE TABLE \"{schema}\".\"b\" (y text, z bool)"))
+        .await
+        .expect("create b");
 
     let result = a
         .execute(ExecQuery {
@@ -125,14 +115,14 @@ async fn table_filter_narrows_results() {
             binds: &[&schema, "b"],
             statement_timeout_ms: None,
             row_limit: 500,
-            access: Access::ReadWrite,
+            access: Access::ReadOnly,
             dry_run: false,
             request_id: uuid::Uuid::new_v4(),
         })
         .await
         .expect("filtered catalog query runs");
 
-    let _ = run(&a, &format!("DROP SCHEMA \"{schema}\" CASCADE")).await;
+    let _ = ddl(&format!("DROP SCHEMA \"{schema}\" CASCADE")).await;
 
     // Only the 2 columns of "b" — not "a".x.
     assert_eq!(result.rows.len(), 2);
@@ -161,12 +151,11 @@ permissions:
 /// and an intent row preceded it.
 #[tokio::test]
 async fn describe_schema_audit_row_names_the_table_read() {
-    let a = adapter().await;
     let schema = fresh_schema_name();
-    run(&a, &format!("CREATE SCHEMA \"{schema}\""))
+    ddl(&format!("CREATE SCHEMA \"{schema}\""))
         .await
         .expect("create schema");
-    run(&a, &format!("CREATE TABLE \"{schema}\".\"users\" (id int)"))
+    ddl(&format!("CREATE TABLE \"{schema}\".\"users\" (id int)"))
         .await
         .expect("create users");
     let booted = spawn_logged_in(
@@ -201,7 +190,7 @@ async fn describe_schema_audit_row_names_the_table_read() {
         .json()
         .await
         .unwrap();
-    let _ = run(&a, &format!("DROP SCHEMA \"{schema}\" CASCADE")).await;
+    let _ = ddl(&format!("DROP SCHEMA \"{schema}\" CASCADE")).await;
 
     assert_eq!(resp["result"]["isError"], false, "{resp}");
     let row = common::audit::latest_audit(
