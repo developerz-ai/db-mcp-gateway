@@ -6,10 +6,12 @@ on:
   pull_request:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  # PRs: cancel superseded runs. Pushes to main: never — Argo Image Updater
-  # pins to the short SHA (see the `build` job), so cancelling the first of two
-  # closely-landed merges leaves that commit with no image at its tag.
+  # PRs: one group per ref, superseded runs cancelled. Pushes to main: one
+  # group per SHA — Argo Image Updater pins the short SHA (see the `build`
+  # job), and a shared group still cancels a *pending* run when a third merge
+  # queues behind it (GitHub keeps one pending run per group), leaving that
+  # commit with no image at its tag.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
