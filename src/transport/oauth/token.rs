@@ -9,10 +9,11 @@ use serde_json::json;
 
 use crate::auth::{jwt, pkce};
 
-use super::super::app_state::{AppState, AuthFacade};
-use super::super::oauth_state::GrantIdentity;
+use super::super::app_state::AppState;
 use super::helpers::{oauth_error, random_token};
 use super::urls::MCP_SCOPE;
+use crate::auth::oauth::AuthFacade;
+use crate::auth::oauth::GrantIdentity;
 
 #[derive(Debug, Deserialize)]
 pub struct TokenForm {

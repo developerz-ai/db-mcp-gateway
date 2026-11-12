@@ -15,11 +15,9 @@ pub mod tls;
 
 mod auth_middleware;
 mod auth_routes;
-mod client_registry;
 mod dispatch;
 pub mod limit;
 mod oauth;
-mod oauth_state;
 mod sse;
 
 use std::net::SocketAddr;
@@ -35,10 +33,12 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde_json::Value;
 
-pub use app_state::{AppState, AuthFacade};
-pub use client_registry::ClientRegistry;
+pub use crate::auth::oauth::{
+    AuthCodes, AuthFacade, ClientRegistry, DEFAULT_REFRESH_TTL, GrantIdentity, PendingFlows,
+    RefreshTokens,
+};
+pub use app_state::AppState;
 pub use errors::TransportError;
-pub use oauth_state::{AuthCodes, DEFAULT_REFRESH_TTL, GrantIdentity, PendingFlows, RefreshTokens};
 
 use crate::auth::Identity;
 use crate::config::Config;

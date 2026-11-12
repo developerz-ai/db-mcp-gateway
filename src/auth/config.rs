@@ -7,13 +7,10 @@
 
 use std::time::Duration;
 
+use super::oauth::DEFAULT_REFRESH_TTL;
+
 const DEFAULT_GROUPS_CLAIM: &str = "groups";
 const DEFAULT_SESSION_TTL_HOURS: u64 = 8;
-/// Default absolute refresh-chain lifetime, in days, when `REFRESH_TTL_DAYS` is
-/// unset. Conservative on purpose — see [`crate::transport::DEFAULT_REFRESH_TTL`]
-/// for the group-staleness rationale. Operators raise it (up to a 90-day "stay
-/// signed in" window) via `REFRESH_TTL_DAYS`.
-const DEFAULT_REFRESH_TTL_DAYS: u64 = 1;
 const DEFAULT_DEV_SIGNING_KEY: &str = "dev-only-session-signing-key-change-me";
 /// Shortest `SESSION_SIGNING_KEY` a non-mock gateway will boot with, in bytes.
 /// Matches the HS256 output length (RFC 7518 §3.2 floor). Also catches the
@@ -35,9 +32,9 @@ pub struct AuthConfig {
     pub audience: String,
     pub groups_claim: String,
     pub session_ttl: Duration,
-    /// Absolute lifetime of a refresh-token *chain* (see
-    /// [`crate::transport::DEFAULT_REFRESH_TTL`]). Rotation renews the opaque
-    /// value but never this deadline. Overridable via `REFRESH_TTL_DAYS`.
+    /// Absolute lifetime of a refresh-token *chain* (see [`DEFAULT_REFRESH_TTL`]
+    /// for the group-staleness rationale). Rotation renews the opaque value but
+    /// never this deadline. Overridable via `REFRESH_TTL_DAYS`.
     pub refresh_ttl: Duration,
     /// HMAC key for the gateway-issued session JWT. Distinct from IdP keys —
     /// we re-sign so we can revoke via the state DB denylist.
@@ -96,7 +93,7 @@ impl Default for AuthConfig {
             audience: String::new(),
             groups_claim: DEFAULT_GROUPS_CLAIM.to_string(),
             session_ttl: Duration::from_secs(DEFAULT_SESSION_TTL_HOURS * 3600),
-            refresh_ttl: Duration::from_secs(DEFAULT_REFRESH_TTL_DAYS * 24 * 3600),
+            refresh_ttl: DEFAULT_REFRESH_TTL,
             session_signing_key: DEFAULT_DEV_SIGNING_KEY.as_bytes().to_vec(),
             mock_mode: false,
         }

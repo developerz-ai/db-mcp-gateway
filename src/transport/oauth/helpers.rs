@@ -5,7 +5,7 @@ use serde_json::json;
 use url::Url;
 use uuid::Uuid;
 
-use super::super::oauth_state::OAuthBridge;
+use crate::auth::oauth::OAuthBridge;
 
 pub(super) fn build_redirect(base: &str, params: &[(&str, &str)]) -> Option<String> {
     let mut url = Url::parse(base).ok()?;

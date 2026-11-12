@@ -6,9 +6,9 @@ use serde::Deserialize;
 use crate::auth::pkce;
 
 use super::super::app_state::AppState;
-use super::super::oauth_state::{GrantIdentity, OAuthBridge};
 use super::helpers::{build_redirect, oauth_error, random_token, redirect_with_error};
 use super::register::{is_loopback_redirect_uri, redirect_uri_matches};
+use crate::auth::oauth::{GrantIdentity, OAuthBridge};
 
 /// Upper bound on a `client_id` the gateway will *adopt* at `/authorize` (as
 /// opposed to one it minted at `/register`). `/authorize` is unauthenticated, so
