@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use super::errors::AuthError;
 use super::session_cache::{SessionCache, SessionCacheConfig};
+use crate::state::sessions::{self, NewSession, SessionRow};
 
 /// Newtype over the session row UUID. Construct via `new()` or `from(Uuid)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -171,18 +172,18 @@ impl SessionStore {
         let expires_at = now + ChronoDuration::from_std(ttl).unwrap_or(ChronoDuration::hours(8));
         let groups_json = serde_json::to_value(groups).unwrap_or(serde_json::Value::Array(vec![]));
 
-        sqlx::query(
-            "INSERT INTO sessions (id, user_sub, user_email, groups, agent_client, \
-             issued_at, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        sessions::insert(
+            &self.pool,
+            &NewSession {
+                id: Uuid::from(id),
+                user_sub,
+                user_email,
+                groups: &groups_json,
+                agent_client,
+                issued_at,
+                expires_at,
+            },
         )
-        .bind(Uuid::from(id))
-        .bind(user_sub)
-        .bind(user_email)
-        .bind(&groups_json)
-        .bind(agent_client)
-        .bind(issued_at)
-        .bind(expires_at)
-        .execute(&self.pool)
         .await?;
 
         let session = Session {
@@ -213,14 +214,7 @@ impl SessionStore {
             return Ok(session.identity());
         }
 
-        let row = sqlx::query_as::<_, SessionRow>(
-            "SELECT id, user_sub, user_email, groups, agent_client, \
-             issued_at, expires_at, revoked_at \
-             FROM sessions WHERE id = $1",
-        )
-        .bind(Uuid::from(id))
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sessions::fetch(&self.pool, Uuid::from(id)).await?;
 
         let Some(row) = row else {
             self.cache.remove(id).await;
@@ -237,32 +231,15 @@ impl SessionStore {
 
     /// Mark a session revoked in the DB and drop it from cache. Idempotent.
     pub async fn revoke(&self, id: SessionId) -> Result<(), AuthError> {
-        let result = sqlx::query(
-            "UPDATE sessions SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
-        )
-        .bind(Uuid::from(id))
-        .execute(&self.pool)
-        .await?;
+        let revoked = sessions::revoke(&self.pool, Uuid::from(id)).await?;
         self.cache.remove(id).await;
         // Decrement only on a real revoke — the `AND revoked_at IS NULL` guard
         // makes a double-logout a DB no-op, so the gauge can't go negative.
-        if result.rows_affected() > 0 {
+        if revoked > 0 {
             metrics::gauge!("active_sessions").decrement(1.0);
         }
         Ok(())
     }
-}
-
-#[derive(sqlx::FromRow)]
-struct SessionRow {
-    id: Uuid,
-    user_sub: String,
-    user_email: String,
-    groups: serde_json::Value,
-    agent_client: Option<String>,
-    issued_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
-    revoked_at: Option<DateTime<Utc>>,
 }
 
 impl From<SessionRow> for Session {
@@ -281,44 +258,5 @@ impl From<SessionRow> for Session {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn base_session() -> Session {
-        Session {
-            id: SessionId::new(),
-            user_sub: "sub".into(),
-            user_email: "e@example.com".into(),
-            groups: vec!["a".into(), "b".into()],
-            agent_client: Some("claude-code/0.x".into()),
-            issued_at: Utc::now(),
-            expires_at: Utc::now() + ChronoDuration::hours(1),
-            revoked_at: None,
-        }
-    }
-
-    #[test]
-    fn identity_clone_carries_fields() {
-        let identity = base_session().identity();
-        assert_eq!(identity.user_sub, "sub");
-        assert_eq!(identity.groups, vec!["a".to_string(), "b".to_string()]);
-    }
-
-    #[test]
-    fn revoked_or_expired_is_inactive() {
-        let now = Utc::now();
-        let base = base_session();
-        assert!(base.is_active(now));
-        let revoked = Session {
-            revoked_at: Some(now),
-            ..base.clone()
-        };
-        assert!(!revoked.is_active(now));
-        let expired = Session {
-            issued_at: now - ChronoDuration::hours(2),
-            expires_at: now - ChronoDuration::seconds(1),
-            ..base
-        };
-        assert!(!expired.is_active(now));
-    }
-}
+#[path = "session_tests.rs"]
+mod tests;

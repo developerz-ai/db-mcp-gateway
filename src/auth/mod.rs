@@ -8,6 +8,7 @@
 pub mod config;
 pub mod errors;
 pub mod jwt;
+pub mod oauth;
 pub mod oidc;
 pub mod pkce;
 mod service_token;

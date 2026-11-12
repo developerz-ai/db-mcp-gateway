@@ -23,6 +23,8 @@ use chrono::{Duration as ChronoDuration, Utc};
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 
+use crate::state::oauth as db;
+
 /// TTL for a Dynamic-Client-Registration entry, refreshed on every successful
 /// `/authorize` lookup so an actively-used client never lapses.
 ///
@@ -177,43 +179,22 @@ impl ClientRegistry {
         client_id: &str,
         redirect_uris: &[String],
     ) -> Result<bool, sqlx::Error> {
-        sqlx::query("DELETE FROM oauth_clients WHERE expires_at <= now()")
-            .execute(pool)
-            .await?;
+        db::delete_expired_clients(pool).await?;
 
         // Only enforce the cap for a brand-new client; an existing `client_id`
         // updating its URIs doesn't grow the table, so let it through at cap.
-        let exists: bool =
-            sqlx::query_scalar("SELECT exists(SELECT 1 FROM oauth_clients WHERE client_id = $1)")
-                .bind(client_id)
-                .fetch_one(pool)
-                .await?;
-        if !exists {
-            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM oauth_clients")
-                .fetch_one(pool)
-                .await?;
-            if count >= CLIENT_CAP {
-                return Ok(false);
-            }
+        if !db::client_exists(pool, client_id).await?
+            && db::count_clients(pool).await? >= CLIENT_CAP
+        {
+            return Ok(false);
         }
 
         let uris = serde_json::to_value(redirect_uris).unwrap_or(serde_json::Value::Array(vec![]));
-        // Infallible in practice (CLIENT_TTL is 24h), but avoid a hot-path panic
-        // — fall back to the equivalent literal, mirroring `SessionStore::create`.
+        // Infallible in practice (CLIENT_TTL is 90 days), but avoid a hot-path
+        // panic — fall back to a literal, mirroring `SessionStore::create`.
         let ttl =
             ChronoDuration::from_std(CLIENT_TTL).unwrap_or_else(|_| ChronoDuration::hours(24));
-        let expires_at = Utc::now() + ttl;
-        sqlx::query(
-            "INSERT INTO oauth_clients (client_id, redirect_uris, expires_at) \
-             VALUES ($1, $2, $3) \
-             ON CONFLICT (client_id) DO UPDATE \
-               SET redirect_uris = EXCLUDED.redirect_uris, expires_at = EXCLUDED.expires_at",
-        )
-        .bind(client_id)
-        .bind(&uris)
-        .bind(expires_at)
-        .execute(pool)
-        .await?;
+        db::upsert_client(pool, client_id, &uris, Utc::now() + ttl).await?;
         Ok(true)
     }
 
@@ -223,15 +204,7 @@ impl ClientRegistry {
     async fn touch_db(pool: &PgPool, client_id: &str) -> Result<Option<Vec<String>>, sqlx::Error> {
         // Infallible for the const TTL; clamp rather than panic (CLAUDE.md).
         let ttl = ChronoDuration::from_std(CLIENT_TTL).unwrap_or_else(|_| ChronoDuration::days(90));
-        let row: Option<serde_json::Value> = sqlx::query_scalar(
-            "UPDATE oauth_clients SET expires_at = $2 \
-             WHERE client_id = $1 AND expires_at > now() \
-             RETURNING redirect_uris",
-        )
-        .bind(client_id)
-        .bind(Utc::now() + ttl)
-        .fetch_optional(pool)
-        .await?;
+        let row = db::touch_client(pool, client_id, Utc::now() + ttl).await?;
         Ok(row.map(|v| serde_json::from_value(v).unwrap_or_default()))
     }
 
@@ -242,53 +215,5 @@ impl ClientRegistry {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn insert_then_lookup_roundtrips() {
-        let reg = ClientRegistry::default();
-        assert!(reg.insert("c1".into(), vec!["https://app/cb".into()]).await);
-        assert_eq!(
-            reg.redirect_uris("c1").await,
-            Some(vec!["https://app/cb".into()])
-        );
-        assert_eq!(reg.redirect_uris("unknown").await, None);
-    }
-
-    #[tokio::test]
-    async fn at_cap_rejects_new_but_updates_existing() {
-        let reg = ClientRegistry::default();
-        let Backend::Memory(map) = &reg.backend else {
-            unreachable!("default() is the memory backend");
-        };
-        {
-            let mut map = map.lock().await;
-            for i in 0..CLIENT_CAP {
-                map.insert(
-                    format!("c{i}"),
-                    RegisteredClient {
-                        redirect_uris: vec!["https://app/cb".into()],
-                        expires_at: Instant::now() + CLIENT_TTL,
-                    },
-                );
-            }
-        }
-        // At cap: a brand-new client is refused, no live client evicted.
-        assert!(
-            !reg.insert("overflow".into(), vec!["https://app/cb".into()])
-                .await
-        );
-        assert_eq!(reg.redirect_uris("overflow").await, None);
-        assert!(reg.redirect_uris("c0").await.is_some());
-        // Updating an already-registered client still succeeds at cap.
-        assert!(
-            reg.insert("c0".into(), vec!["https://app/new".into()])
-                .await
-        );
-        assert_eq!(
-            reg.redirect_uris("c0").await,
-            Some(vec!["https://app/new".into()])
-        );
-    }
-}
+#[path = "client_registry_tests.rs"]
+mod tests;

@@ -21,9 +21,10 @@ use serde_json::json;
 
 use crate::auth::{AuthError, Identity, SessionId, SessionStore, jwt};
 
-use super::app_state::{AppState, AuthFacade};
+use super::app_state::AppState;
 use super::auth_routes::{LOGIN_URL, auth_error_fields};
 use super::oauth;
+use crate::auth::oauth::AuthFacade;
 
 pub async fn bearer_auth(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     let Some(auth) = state.auth.as_ref() else {
