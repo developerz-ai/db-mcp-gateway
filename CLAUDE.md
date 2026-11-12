@@ -29,7 +29,7 @@ Self-hosted MCP gateway. AI agents get audited, SSO-gated, read-only DB access. 
 | MCP | hand-rolled JSON-RPC over HTTP+SSE → swap for SDK when one stabilizes |
 | Config | serde + serde-saphyr (not serde_yaml), validated at boot |
 | State store | Postgres (co-deployed): sessions, audit log, denylist. Permissions store `pg` (`src/state/permissions/pg.rs`) or `mysql` (`src/state/permissions/mysql/`) |
-| Error tracking | GlitchTip (Sentry protocol), credential-scrubbed by `src/sentry_scrub.rs` |
+| Error tracking | GlitchTip (Sentry protocol), credential-scrubbed by `src/sentry_scrub/` |
 | Metrics | `metrics` + Prometheus exporter on `/metrics` |
 | Distribution | `ghcr.io/developerz-ai/db-mcp-gateway` **and** `registry.digitalocean.com/developerz-ai/db-mcp-gateway` — `.github/workflows/ci.yml` (`build` + `merge`) pushes per-arch images and the multi-arch manifest to both registries on pushes to `main`; `.github/workflows/release.yml` pushes the `v*` tag builds (semver + `:latest` + GitHub release) |
 
@@ -116,7 +116,7 @@ GitHub Actions on GitHub-hosted runners — `ubuntu-latest` default (`ubuntu-24.
 | `clippy` | `clippy -D warnings` (all-targets + release cfg, `--profile ci`) + `bin/check-scrub-features` |
 | `test` | `cargo nextest run --profile ci --cargo-profile ci --all-targets --all-features` against the service containers; JUnit uploaded (`.config/nextest.toml`) |
 | `audit` | `cargo audit --ignore RUSTSEC-2023-0071` |
-| `secret-scan` | advisory — `git grep -nE` over every tracked file for `dbmcp_svc_[0-9a-f]{64}`; exempt paths: `tests/**`, `website/**`, `config/example.yaml`, `.github/**`, `src/config/yaml.rs` |
+| `secret-scan` | advisory — `git grep -nE` over every tracked file for `dbmcp_svc_[0-9a-f]{64}`; exempt paths: `tests/**`, `website/**`, `config/example.yaml`, `.github/**`, `src/config/yaml/**` |
 | `weekly` (`weekly.yml`) | Mondays: `cargo audit` on `main` + `cargo update --dry-run` report |
 | `build` + `merge` | on `main`: per-arch image → multi-arch manifest, pushed to GHCR **and** DOCR |
 
@@ -132,8 +132,8 @@ Touching any of these requires a `(security review required)` label on the PR: `
 src/
   main.rs           # entry, signals, graceful shutdown
   lib.rs            # library root the integration tests drive
-  startup.rs        # background tasks
-  sentry_scrub.rs   # credential scrubbing for GlitchTip
+  startup/          # boot helpers (tracing, state DB, app state, serve) + background tasks
+  sentry_scrub/     # credential scrubbing for GlitchTip
   config/           # YAML schema, validation, secrets, hot reload
   transport/        # MCP over HTTP+SSE, admin API
   auth/             # OIDC, JWT, sessions, service tokens

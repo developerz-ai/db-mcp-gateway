@@ -197,7 +197,7 @@ job_reached 'secret-scan'
   set +e
   matches="$(git grep -nE "dbmcp_svc_[0-9a-f]{64}" \
       -- ":!tests/**" ":!website/**" ":!config/example.yaml" \
-      ":!.github/**" ":!src/config/yaml.rs")"
+      ":!.github/**" ":!src/config/yaml/**")"
   rc=$?
   set -e
   if [[ $rc -eq 0 && -n $matches ]]; then
