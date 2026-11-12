@@ -4,8 +4,8 @@ status: in_progress        # not_started | in_progress | blocked | complete | su
 created_by: sebi
 worked_by: "sebi"              # executor fills with their git user.name
 owner: sebi
-percent: 78
-current_focus: "v2.0.0 release; then 14 (D1 roles/secrets/service accounts), 15 (tesote), 16 (developerz.ai)"
+percent: 96
+current_focus: "16 live test (needs dz-runner build >= 21145e9 after canary soak 2026-11-13 13:36Z); 15 step 5 retire tesote developerz account after one clean day; 01 step 2 baseline via weekly load gate"
 slices:
   - file: 01-live-baseline.md
     status: in_progress
@@ -47,19 +47,23 @@ slices:
     status: complete
     percent: 100
   - file: 14-infra-developerz.md
-    status: in_progress
-    percent: 15
+    status: complete
+    percent: 100
   - file: 15-infra-tesote.md
-    status: not_started
-    percent: 0
+    status: in_progress
+    percent: 90
   - file: 16-developerz-platform.md
-    status: not_started
-    percent: 0
+    status: in_progress
+    percent: 90
   - file: 17-devex-build-ci.md
     status: complete
     percent: 100
 evidence:
   - "PRs #279-#293 merged (02-13, 17); #291 TTL hotfix; infra developerz-ai/infrastructure#2282 (14 step 1) live-tested: Prometheus up=1 on :9090"
+  - "v2.0.0 (#294) and v2.0.1 (#297, Yugabyte reset fix #296) released; #298 audit_abandoned_total + metric catalogue"
+  - "14: developerz-ai/infrastructure #2282-#2290, #2293 merged; live: coding reads all 5 DBs as *_ro, devops no-op write as *_rw, zitadel write forbidden, reason_required, missing x-dbmcp-* rejected, history shows run ids; NetworkPolicy live, 0 restarts"
+  - "15: tesote/infrastructure D2 on v2.0.1 (#791, 1d6b2c2e): 73/73 audited success, pool steady at 4, 0 reset warnings"
+  - "16: developerz-ai/developerz.ai #8760 merged (21145e9), deployed sha-d6afbb2, db_gateway integration connected d1+d2; live test pending runner release"
   - "01 step 2 benchmark baseline deferred: target Postgres unavailable on the dev box; weekly load gate captures it on first run"
 notes: "Production measurements in 01 were taken 2026-11-12 (read-only); the benchmark baseline in 01 step 2 is still to be captured. Owner decisions are listed in overview.md Risks."
 last_updated: 2026-11-12
