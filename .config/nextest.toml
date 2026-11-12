@@ -2,8 +2,11 @@
 # does (`--profile ci`).
 #
 # nextest runs every test in its own process, and tests from different binaries
-# run at the same time. `cargo test` ran one binary at a time, so cross-binary
-# isolation used to come free; here it has to be declared.
+# run at the same time. Two consequences for this repo's integration tests:
+# `#[serial]` (an in-process lock) no longer serialises anything, and binaries
+# sharing the state DB / MySQL store / target DBs truncate each other's rows.
+# So every integration-test binary is in one group that runs one test at a
+# time — the isolation `cargo test` gave for free. Unit tests stay parallel.
 
 [profile.default]
 # A test past 60 s is reported as slow; past 5 min it is killed. The real-DB
@@ -11,13 +14,12 @@
 slow-timeout = { period = "60s", terminate-after = 5 }
 fail-fast = false
 
-# `client_registry_real_db` fills the shared `oauth_clients` table to the 10k
-# registration cap, so any concurrent registration — in that binary or any
-# other — is refused and flakes. `#[serial]` only serialised the binary's own
-# tests inside one process; claiming every slot runs each of them alone.
+[test-groups]
+shared-db = { max-threads = 1 }
+
 [[profile.default.overrides]]
-filter = "binary(client_registry_real_db)"
-threads-required = "num-test-threads"
+filter = "kind(test)"
+test-group = "shared-db"
 
 [profile.ci]
 retries = 0
