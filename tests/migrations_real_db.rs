@@ -78,6 +78,7 @@ async fn migrations_apply_from_empty_and_rerun_as_a_no_op() {
         .expect("migration history");
 
     let intent_columns = columns(&fresh, "audit_call_intents").await;
+    let session_columns = columns(&fresh, "sessions").await;
     let intents_idx = index_exists(
         &fresh,
         "audit_call_intents",
@@ -119,4 +120,8 @@ async fn migrations_apply_from_empty_and_rerun_as_a_no_op() {
     assert!(intents_idx, "0010 index missing");
     assert!(history_idx, "0011 index missing");
     assert!(superseded_idx.is_empty(), "0015 left {superseded_idx:?}");
+    assert!(
+        !session_columns.iter().any(|c| c == "agent_client"),
+        "0016 left sessions.agent_client: {session_columns:?}"
+    );
 }
