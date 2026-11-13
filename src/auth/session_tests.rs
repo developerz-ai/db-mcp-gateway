@@ -7,7 +7,6 @@ fn base_session() -> Session {
         user_sub: "sub".into(),
         user_email: "e@example.com".into(),
         groups: vec!["a".into(), "b".into()],
-        agent_client: Some("claude-code/0.x".into()),
         issued_at: Utc::now(),
         expires_at: Utc::now() + ChronoDuration::hours(1),
         revoked_at: None,

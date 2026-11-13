@@ -84,7 +84,6 @@ pub struct Session {
     pub user_sub: String,
     pub user_email: String,
     pub groups: Vec<String>,
-    pub agent_client: Option<String>,
     /// Wall-clock instant the gateway inserted this row (DB `DEFAULT now()`).
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
@@ -98,7 +97,6 @@ impl std::fmt::Debug for Session {
             .field("user_sub", &self.user_sub)
             .field("user_email", &"<redacted>")
             .field("groups", &self.groups)
-            .field("agent_client", &self.agent_client)
             .field("issued_at", &self.issued_at)
             .field("expires_at", &self.expires_at)
             .field("revoked_at", &self.revoked_at)
@@ -138,7 +136,6 @@ impl From<SessionRow> for Session {
             user_sub: row.user_sub,
             user_email: row.user_email,
             groups: row.groups.0,
-            agent_client: row.agent_client,
             issued_at: row.issued_at,
             expires_at: row.expires_at,
             revoked_at: row.revoked_at,

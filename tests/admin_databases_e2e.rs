@@ -44,14 +44,7 @@ async fn mint_session(
     groups: &[String],
 ) -> String {
     let session = sessions
-        .create(
-            user_sub,
-            user_email,
-            groups,
-            Duration::from_secs(600),
-            Some("admin-db-e2e/0.1"),
-            None,
-        )
+        .create(user_sub, user_email, groups, Duration::from_secs(600), None)
         .await
         .expect("create session");
     jwt::issue(signing_key, session.id, user_sub, Duration::from_secs(600)).expect("issue JWT")

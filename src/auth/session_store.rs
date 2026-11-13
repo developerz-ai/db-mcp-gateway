@@ -73,13 +73,9 @@ impl SessionStore {
         user_email: &str,
         groups: &[String],
         ttl: std::time::Duration,
-        agent_client: Option<&str>,
         original_issued_at: Option<DateTime<Utc>>,
     ) -> Result<Session, AuthError> {
-        let session = Session {
-            agent_client: agent_client.map(str::to_string),
-            ..Self::prepare(user_sub, user_email, groups, ttl, original_issued_at)
-        };
+        let session = Self::prepare(user_sub, user_email, groups, ttl, original_issued_at);
         let mut conn = self.pool.acquire().await?;
         Self::insert_in(&mut conn, &session).await?;
         self.committed(Some(&session), &[]).await;
@@ -107,7 +103,6 @@ impl SessionStore {
             user_sub: user_sub.to_string(),
             user_email: user_email.to_string(),
             groups: groups.to_vec(),
-            agent_client: None,
             issued_at: original_issued_at.unwrap_or(now),
             expires_at,
             revoked_at: None,
@@ -122,7 +117,6 @@ impl SessionStore {
                 user_sub: &session.user_sub,
                 user_email: &session.user_email,
                 groups: &session.groups,
-                agent_client: session.agent_client.as_deref(),
                 issued_at: session.issued_at,
                 expires_at: session.expires_at,
             },

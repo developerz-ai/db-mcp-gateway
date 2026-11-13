@@ -85,6 +85,12 @@ async fn migrations_apply_from_empty_and_rerun_as_a_no_op() {
     )
     .await;
     let history_idx = index_exists(&fresh, "audit_calls", "audit_calls_history_idx").await;
+    let mut superseded_idx = Vec::new();
+    for index in ["audit_calls_user_sub_idx", "audit_calls_db_type_idx"] {
+        if index_exists(&fresh, "audit_calls", index).await {
+            superseded_idx.push(index);
+        }
+    }
 
     fresh.close().await;
     admin
@@ -112,4 +118,5 @@ async fn migrations_apply_from_empty_and_rerun_as_a_no_op() {
     }
     assert!(intents_idx, "0010 index missing");
     assert!(history_idx, "0011 index missing");
+    assert!(superseded_idx.is_empty(), "0015 left {superseded_idx:?}");
 }

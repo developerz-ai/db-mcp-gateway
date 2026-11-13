@@ -417,7 +417,7 @@ const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
 async fn cold_bearer(gw: &common::gateway::TestGateway, sub: &str) -> String {
     let store = db_mcp_gateway::auth::SessionStore::new(gw.state_db.clone());
     let session = store
-        .create(sub, "cold@example.com", &[], HOUR, None, None)
+        .create(sub, "cold@example.com", &[], HOUR, None)
         .await
         .expect("session row");
     db_mcp_gateway::auth::jwt::issue(&gw.auth_config.session_signing_key, session.id, sub, HOUR)
@@ -493,7 +493,7 @@ async fn logout_during_state_db_outage_is_5xx_not_204() {
     // check passes with the pool closed — only the revoke hits the DB.
     let session = gw
         .sessions
-        .create(&sub, "warm@example.com", &[], HOUR, None, None)
+        .create(&sub, "warm@example.com", &[], HOUR, None)
         .await
         .expect("session row");
     let bearer = db_mcp_gateway::auth::jwt::issue(
