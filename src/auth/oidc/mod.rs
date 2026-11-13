@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use jsonwebtoken::Validation;
+use secrecy::ExposeSecret;
 use tokio::sync::{Mutex, RwLock};
 
 use super::config::AuthConfig;
@@ -136,7 +137,7 @@ impl OidcClient {
                 ("code", code),
                 ("redirect_uri", &self.config.redirect_url),
                 ("client_id", &self.config.client_id),
-                ("client_secret", &self.config.client_secret),
+                ("client_secret", self.config.client_secret.expose_secret()),
                 ("code_verifier", code_verifier),
             ])
             .timeout(TOKEN_EXCHANGE_TIMEOUT)

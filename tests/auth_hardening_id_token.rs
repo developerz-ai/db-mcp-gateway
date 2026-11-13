@@ -82,7 +82,7 @@ async fn mock(
     let client = OidcClient::new(AuthConfig {
         issuer: format!("{issuer}{issuer_suffix}"),
         client_id: CLIENT_ID.to_string(),
-        client_secret: "hardening-secret".to_string(),
+        client_secret: "hardening-secret".into(),
         audience: CLIENT_ID.to_string(),
         ..AuthConfig::default()
     })

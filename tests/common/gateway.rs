@@ -230,7 +230,7 @@ impl GatewayBuilder {
         let auth_config = AuthConfig {
             issuer: self.idp.issuer,
             client_id: self.idp.client_id.clone(),
-            client_secret: self.idp.client_secret,
+            client_secret: self.idp.client_secret.into(),
             audience: self.idp.client_id,
             redirect_url: format!("{url}/auth/callback"),
             ..AuthConfig::default()

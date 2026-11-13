@@ -7,6 +7,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use secrecy::{ExposeSecret, SecretSlice};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -44,7 +45,8 @@ impl std::fmt::Debug for SessionJwt {
 }
 
 impl SessionJwt {
-    pub fn new(signing_key: &[u8]) -> Self {
+    pub fn new(signing_key: &SecretSlice<u8>) -> Self {
+        let signing_key = signing_key.expose_secret();
         let mut validation = Validation::new(Algorithm::HS256);
         validation.set_issuer(&[ISSUER]);
         validation.validate_exp = true;
@@ -88,7 +90,7 @@ impl SessionJwt {
 /// One-shot [`SessionJwt::issue`]; rebuilds the keys, so keep it off the
 /// request path.
 pub fn issue(
-    signing_key: &[u8],
+    signing_key: &SecretSlice<u8>,
     session_id: SessionId,
     user_sub: &str,
     ttl: Duration,
@@ -98,7 +100,7 @@ pub fn issue(
 
 /// One-shot [`SessionJwt::verify`]; rebuilds the keys, so keep it off the
 /// request path.
-pub fn verify(signing_key: &[u8], token: &str) -> Result<SessionClaims, AuthError> {
+pub fn verify(signing_key: &SecretSlice<u8>, token: &str) -> Result<SessionClaims, AuthError> {
     SessionJwt::new(signing_key).verify(token)
 }
 
@@ -115,9 +117,13 @@ fn unix_now() -> u64 {
 mod tests {
     use super::*;
 
+    fn secret(bytes: &[u8]) -> SecretSlice<u8> {
+        bytes.to_vec().into()
+    }
+
     #[test]
     fn round_trip_succeeds() {
-        let key = b"test-key-please-ignore";
+        let key = &secret(b"test-key-please-ignore");
         let sid = SessionId::new();
         let token = issue(key, sid, "user-42", Duration::from_secs(300)).unwrap();
         let claims = verify(key, &token).unwrap();
@@ -129,8 +135,8 @@ mod tests {
     #[test]
     fn wrong_key_is_rejected() {
         let sid = SessionId::new();
-        let token = issue(b"key-a", sid, "user", Duration::from_secs(300)).unwrap();
-        assert!(verify(b"key-b", &token).is_err());
+        let token = issue(&secret(b"key-a"), sid, "user", Duration::from_secs(300)).unwrap();
+        assert!(verify(&secret(b"key-b"), &token).is_err());
     }
 
     #[test]
@@ -153,7 +159,7 @@ mod tests {
             &EncodingKey::from_secret(key),
         )
         .unwrap();
-        assert!(verify(key, &token).is_err());
+        assert!(verify(&secret(key), &token).is_err());
     }
 
     #[test]
@@ -173,12 +179,12 @@ mod tests {
             &EncodingKey::from_secret(key),
         )
         .unwrap();
-        assert!(SessionJwt::new(key).verify(&token).is_ok());
+        assert!(SessionJwt::new(&secret(key)).verify(&token).is_ok());
     }
 
     #[test]
     fn debug_carries_no_key_material() {
-        let rendered = format!("{:?}", SessionJwt::new(b"super-secret-key"));
+        let rendered = format!("{:?}", SessionJwt::new(&secret(b"super-secret-key")));
         assert!(!rendered.contains("super-secret-key"), "{rendered}");
     }
 }

@@ -29,6 +29,7 @@ use common::gateway::{EMPTY_YAML, GatewayBuilder};
 use db_mcp_gateway::auth::{AuthConfig, SessionStore, jwt};
 use db_mcp_gateway::state::permissions::{PermissionsRepo, pg::PgPermissionsRepo};
 use reqwest::StatusCode;
+use secrecy::SecretSlice;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::Row;
@@ -38,7 +39,7 @@ const ADMIN_GROUP: &str = "db-mcp-gateway-admins";
 
 async fn mint_session(
     sessions: &SessionStore,
-    signing_key: &[u8],
+    signing_key: &SecretSlice<u8>,
     user_sub: &str,
     user_email: &str,
     groups: &[String],

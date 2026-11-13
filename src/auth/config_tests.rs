@@ -32,10 +32,13 @@ fn default_signing_key_allowed_when_waived_for_loopback_issuer() {
 fn custom_signing_key_allowed() {
     // 32 bytes: the shortest key a non-mock gateway accepts.
     let config = AuthConfig {
-        session_signing_key: b"a-unique-production-signing-key!".to_vec(),
+        session_signing_key: b"a-unique-production-signing-key!".to_vec().into(),
         ..AuthConfig::default()
     };
-    assert_eq!(config.session_signing_key.len(), MIN_SIGNING_KEY_BYTES);
+    assert_eq!(
+        config.session_signing_key.expose_secret().len(),
+        MIN_SIGNING_KEY_BYTES
+    );
     assert!(check_signing_key(&config).is_ok());
 }
 
@@ -44,7 +47,7 @@ fn custom_signing_key_allowed() {
 #[test]
 fn empty_signing_key_rejected() {
     let config = AuthConfig {
-        session_signing_key: Vec::new(),
+        session_signing_key: Vec::new().into(),
         ..AuthConfig::default()
     };
     assert!(matches!(
@@ -56,7 +59,7 @@ fn empty_signing_key_rejected() {
 #[test]
 fn short_signing_key_rejected() {
     let config = AuthConfig {
-        session_signing_key: vec![b'k'; MIN_SIGNING_KEY_BYTES - 1],
+        session_signing_key: vec![b'k'; MIN_SIGNING_KEY_BYTES - 1].into(),
         ..AuthConfig::default()
     };
     assert!(matches!(
@@ -72,12 +75,29 @@ fn short_and_empty_signing_keys_allowed_when_waived() {
     for key in [Vec::new(), b"short".to_vec()] {
         let config = AuthConfig {
             issuer: "http://localhost:9000".into(),
-            session_signing_key: key,
+            session_signing_key: key.into(),
             allow_insecure_signing_key: true,
             ..AuthConfig::default()
         };
         assert!(check_signing_key(&config).is_ok());
     }
+}
+
+#[test]
+fn debug_redacts_client_secret_and_signing_key() {
+    let config = AuthConfig {
+        client_secret: "oidc-client-secret-value".into(),
+        session_signing_key: b"a-unique-production-signing-key!".to_vec().into(),
+        ..AuthConfig::default()
+    };
+    let rendered = format!("{config:?}");
+    assert!(!rendered.contains("oidc-client-secret-value"), "{rendered}");
+    assert!(
+        !rendered.contains("a-unique-production-signing-key!"),
+        "{rendered}"
+    );
+    let key_bytes = format!("{:?}", b"a-unique-production-signing-key!".as_slice());
+    assert!(!rendered.contains(&key_bytes), "{rendered}");
 }
 
 /// The rejection message must never carry key material — it lands in logs.
