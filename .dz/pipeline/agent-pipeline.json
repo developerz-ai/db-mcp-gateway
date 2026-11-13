@@ -1,0 +1,20 @@
+{
+  "repo": "developerz-ai/db-mcp-gateway",
+  "ci": {
+    "requiredChecks": [
+      "clippy",
+      "audit",
+      "fmt",
+      "test"
+    ]
+  },
+  "merge": {
+    "reviewGate": "ci-only",
+    "standingAuthorization": true,
+    "classificationParks": "autonomous"
+  },
+  "policy": {
+    "defaultTier": "GREEN"
+  },
+  "labels": { "ready": "ready", "afk": "afk", "hitl": "hitl" }
+}

@@ -10,7 +10,9 @@ last=$(git describe --tags --abbrev=0 --match 'v[0-9]*' origin/main)
 git log --format='%h %cI %s' "$last"..origin/main -- src migrations migrations-mysql Cargo.toml Cargo.lock Dockerfile
 ```
 
-Those paths are what reaches users; look there for a commit that fixes a security advisory.
+These are `.dz/briefs/release-due.md` § Decide's own commands and pathspec; keep the two in step. Those paths are what reaches users; look there for a commit that fixes a security advisory.
+
+If any command above fails, stop and report `unknown: <failure>` with the evidence. An unreadable window is never an empty one, and never a `no release:`.
 
 ## What qualifies
 
@@ -28,4 +30,5 @@ File one ask, **Release `<next>`**, opening with the advisory's id and source UR
 
 ## Rows
 
+- `security-window` — The Run block resolved `$last` and its shipping-path window; a failed command is unknown, never empty.
 - `security-fix-unreleased` — A commit since the last tag fixes an advisory a first-tier source confirms, naming something the image ships, and no release carries it yet.

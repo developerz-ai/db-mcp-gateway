@@ -20,11 +20,11 @@ a missing publish and a stuck Dependabot PR belong to `health`.
 1. Anything the gate found broken or flaky: the root cause, never a retry or a skip.
 2. Advisories, then dependency majors Dependabot could not land, one per PR.
 3. Open bugs, each starting from a test that fails on `main`.
-4. Spec drift under `website/docs/`: a behaviour change updates the spec in the same PR.
+4. Spec and docs drift: `website/docs/initial-idea/` is the canonical spec, and a behaviour change updates it in the same PR. `.dz/schedules/docs-drift.md` lists which guards exist and what they leave uncovered.
 
 ## Ship
 
-One small PR per improvement, its evidence in the body, `bin/ci` green first. Never bump the version, and never touch release automation, audit semantics or grant handling from this checkup: open an issue instead.
+One small PR per improvement, its evidence in the body, `bin/ci` green first. A PR touching a CLAUDE.md security-review path (`src/auth/`, `src/authz/`, credential loading or storage, the audit write path, `src/tools/`, SQL execution) carries the `security review required` label and waits for a human merge (`pr.human_merge`). Never bump the version, and never touch release automation, audit semantics or grant handling from this checkup: open an issue instead. A breaking change is never merged by this lane (`escalate.ask_before_acting: [breaking_change]`): open the PR or issue and leave it for a maintainer.
 Check no open PR or issue already covers it. If nothing is worth changing, do nothing: no empty PRs, no churn.
 
 ## Rows

@@ -1,6 +1,6 @@
 # Brief: is the project healthy?
 
-Daily checkup fired by `schedules: health`: the failures no issue or PR announces.
+Weekly checkup (Mondays 07:00 UTC) fired by `schedules: health`: the failures no issue or PR announces.
 
 | Signal | Command | Healthy |
 |---|---|---|
@@ -17,6 +17,9 @@ For each unhealthy signal, one ask, unless an open issue already carries its exa
 Titles are stable: nothing that changes run to run (sha, run URL, version) goes in one; that goes in the body,
 with the command and its output. Unreadable evidence is no verdict: re-run it, never file it as a defect.
 A red `main` comes first: nothing releases from it.
+
+This lane reads and files; it never repairs. It never re-runs a publish, re-tags, moves or deletes a tag,
+pushes an image by hand, force-pushes `main` or merges with `--admin`. Recovery is a maintainer's.
 
 ## Rows
 
