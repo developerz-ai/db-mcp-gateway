@@ -48,9 +48,26 @@ RUN cargo chef prepare --recipe-path recipe.json
 # (moby/buildkit#2370, docker/build-push-action#1011), so mounts would help
 # only local rebuilds while tempting us to drop the layer split that actually
 # carries between CI runs. Keeping this layer *valid* is the win.
+#
+# A gha-cache miss cold-fetches the whole graph in one shot, and crates.io
+# drops connections in bursts: run 43362461536 lost the amd64 build 19 s in on
+# a single reset (h2 0.4.16, curl [56], exit 101) while arm64 built the same
+# recipe green. Retries stay inside one RUN so cargo resumes from crates
+# already downloaded (CARGO_NET_RETRY widens cargo's own budget, default 3);
+# the final attempt still exits 1, so a persistent error keeps failing.
 FROM chef AS builder
 COPY --from=planner /src/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+ENV CARGO_NET_RETRY=10
+RUN for attempt in 1 2 3 4 5; do \
+      if cargo chef cook --release --recipe-path recipe.json; then \
+        break; \
+      elif [ "$attempt" = 5 ]; then \
+        exit 1; \
+      else \
+        echo "cargo chef cook failed on attempt $attempt/5; retrying" >&2; \
+        sleep 15; \
+      fi; \
+    done
 
 COPY . .
 RUN cargo build --release --locked
