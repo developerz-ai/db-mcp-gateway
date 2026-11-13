@@ -1,8 +1,21 @@
 # yaml-language-server: $schema=https://developerz.ai/schemas/maintainer.v1.json
 # developerz.ai maintainer policy: developerz-ai/db-mcp-gateway
 #
-# AI-maintained: the agent triages, answers, reviews, closes what has stalled and merges on green.
-# A merge here can reach a running deployment, so see `auto_merge_scope` under `pr:`.
+# AI-maintained, on the same posture as developerz-ai/wurk: for everyone, org members, collaborators
+# and the dependency bots alike, the agent triages, answers, reviews, declines with a reason, merges
+# on green and closes what has stalled on its reporter or author. A human is asked before the agent
+# acts on two things: a PR on a CLAUDE.md security-review path (`pr.human_merge`) and a breaking
+# change (`escalate`).
+#
+# CLAUDE.md is the authority and this file never relaxes it. Its five non-negotiables (credentials
+# never leave the gateway, every DB call traces to an SSO-verified identity, read-only by default,
+# synchronous audit, permissions only by reviewed YAML or the audited admin API) are `non_goals`
+# below: a PR that weakens one is declined with the rule quoted, whoever opened it.
+#
+# The gate is the repo's `main-protection` ruleset, not this file: it requires `fmt`, `clippy`,
+# `test` and `audit`. Read it before trusting any sentence here about it:
+# `gh api repos/developerz-ai/db-mcp-gateway/rulesets`. A docs-only PR skips `clippy` and `test`
+# through a per-job `if:` in ci.yml, and GitHub counts a skipped required job as passed.
 version: 1
 
 # No `services:`: this repo brings its own. `bin/test` starts `docker-compose.dev.yml` itself (state
@@ -21,13 +34,19 @@ triage:
   close_unanswered_repro_after_days: 14
   stale_after_days: 30
   stale_action: comment_then_close
+  # What this project will not take: CLAUDE.md's non-negotiables and the NEVER entries that
+  # describe a change someone could propose. A PR that matches one is closed with it quoted; an
+  # issue is answered with it. The schema caps this list at 10.
   non_goals:
     - "DB credentials leaving the gateway: in responses, logs, errors or admin endpoints"
-    - "Best-effort audit: an audit write that fails must fail the request"
-    - "A DB call that does not trace to an SSO-verified identity"
+    - "Best-effort or skipped audit: an audit write that fails must fail the request"
+    - "A DB call that does not trace to an SSO-verified identity (or a boot-validated service account)"
     - "The gateway provisioning write grants, or anything that drops read-only as the default"
-    - "An in-band admin UI"
-    - "Outside human contributors' changes to CI, release or publish automation (.github/, bin/, Dockerfile): members own that pipeline"
+    - "An in-band admin UI for permissions: YAML by PR or the audited admin API only"
+    - "Mocking the target DB in query-path tests"
+    - "Running as DB superuser instead of a per-DB read-only role"
+    - "Promoting a request from one user's session to another"
+    - "Outside human contributors' changes to CI, release or publish automation (.github/, bin/, Dockerfile, .dz/): members own that pipeline"
 
 handoff:
   mode: fleet
@@ -35,32 +54,104 @@ handoff:
 
 pr:
   wait_for_other_bots: [coderabbit]
-  # Named so the agent knows which red check is the author's to fix. Re-check against the
-  # repo's ruleset and `.github/workflows/` when either changes; this list is not the ruleset.
+  # The `main-protection` ruleset's required checks, named so the agent knows which red check is
+  # the author's to fix. Re-check against the ruleset when either changes; this list is not the
+  # ruleset. `secret-scan` is advisory in ci.yml and not required.
   required_checks:
     - "fmt"
     - "clippy"
     - "test"
     - "audit"
   auto_merge: true
-  # The bot's own and the dependency bots' merge on green; an outside contributor's PR waits.
-  auto_merge_scope: own_and_dependency_bots
+  # Every author's PR is reviewed, babysat and merged on green, except what `human_merge` and
+  # `escalate` hold for a human and what `non_goals` declines. Whether an author is outside is the
+  # platform's read of their real repo permission, never `author_association`.
+  auto_merge_scope: any
   require_review: true
+  # CLAUDE.md "Security review required": auth, authz, credential loading or storage, the audit
+  # write path, MCP tools and SQL execution. A PR touching one carries the label
+  # `security review required` (exact name) and is merged by a human after that review, never by
+  # the bot. The review lane's `path_instructions` below make a missing label a must-fix finding.
+  human_merge:
+    paths:
+      - "src/auth/**"
+      - "src/authz/**"
+      - "src/audit/**"
+      - "src/exec/**"
+      - "src/tools/**"
+      - "src/config/secret.rs"
+      - "src/config/secret/**"
+      - "src/state/**"
   close_awaiting_author_after_days: 21
 
 review:
-  force: true # CodeRabbit is active here; without this the native review defers forever
+  enabled: true
+  force: true                 # CodeRabbit is active here; without this the native review defers forever
+  depth: inline
+  profile: chill
+  request_changes: true       # a finding that must be fixed is a change request, as a maintainer's would be
+  approval: false             # the review never APPROVES; CI green and the ruleset gate the merge
+  high_level_summary: true
+  learnings: false            # no KB write-back on a public repo yet
+  chat_auto_reply: true
+  mandatory_passes: [correctness, security, tests]
+  auto_review:
+    enabled: true
+    incremental: true
+    drafts: false
+    base_branches: [main]
+    ignore_title_keywords: [WIP, "DO NOT MERGE"]
+  anti_noise:
+    severity_floor: minor
+    max_comments: 10
+    dedupe: true
+  path_filters: []
+  # CLAUDE.md "Security review required": the label is `security review required`, exactly.
+  path_instructions:
+    - path: "src/auth/**"
+      instructions: &security_review >-
+        Security-review path (CLAUDE.md "Security review required": auth, authz, credential
+        loading or storage, the audit write path, MCP tools, SQL execution). The PR must carry
+        the `security review required` label; a missing label is a must-fix finding. Look for
+        credentials in errors or logs, missing audit rows, authz bypass via constraint-merge
+        edges, SQL injection and timeout or row-cap bypass. Never weaken a CLAUDE.md
+        non-negotiable.
+    - path: "src/authz/**"
+      instructions: *security_review
+    - path: "src/audit/**"
+      instructions: *security_review
+    - path: "src/exec/**"
+      instructions: *security_review
+    - path: "src/tools/**"
+      instructions: *security_review
+    - path: "src/config/secret.rs"
+      instructions: *security_review
+    - path: "src/config/secret/**"
+      instructions: *security_review
+    - path: "src/state/**"
+      instructions: *security_review
+    - path: "src/**"
+      instructions: >-
+        A behaviour change updates website/docs/initial-idea/ in the same PR; a missing spec
+        update is a finding.
 
 release:
   # `none`: there is no release manager. Empty channels: the agent publishes nothing itself.
-  # A `v*` tag runs release.yml, which builds and pushes the image. See `.dz/briefs/release-due.md`.
+  # The release is a `chore(release): <next>` PR that bumps Cargo.toml, Cargo.lock and README.md;
+  # once it merges, an annotated `v<next>` tag on the merge commit runs release.yml, which pushes
+  # the image to GHCR and DOCR and cuts the GitHub Release. See `.dz/briefs/release-due.md`.
   manager: none
   channels: []
 
 escalate:
-  # Empty: nothing beyond the platform's hardcoded asks (security, license, CLA).
-  ask_before_acting: []
+  # `breaking_change`: a human decides a change to the MCP tool surface, error codes, config schema
+  # or audit shape that a running deployment must react to. Security needs no entry here: it is one
+  # of the platform's hardcoded asks (security, license, CLA), which this list cannot remove, and a
+  # PR on a security-review path is also held for a human merge by `pr.human_merge.paths`.
+  ask_before_acting: [breaking_change]
 
+# The checkups nothing else triggers. Bot-authored alarm issues never pass intake, so a red `main`
+# or a tag that did not publish reaches the bot only through `health`.
 schedules:
   # Weekly and judged, so a merge never cuts a release (owner, 2026-11-01: "no auto, not dependabot,
   # us developerz.ai AI decides if needed"). One weekday per repo, so the fleet is not hit at once.
@@ -73,10 +164,12 @@ schedules:
     days: [tue, wed, thu, fri, sat, sun]
     hours_utc: [6]
     brief_file: .dz/briefs/security-release.md
+  # Weekly (owner, 2026-11-06: routine maintenance weekly, CVE daily). Security has its own lanes.
   - name: health
-    days: [mon, tue, wed, thu, fri, sat, sun]
+    days: [mon]
     hours_utc: [7]
     brief_file: .dz/briefs/health.md
+  # Monthly: fires every Monday and the brief acts only on the first Monday of the month.
   - name: improve
     days: [mon]
     hours_utc: [8]

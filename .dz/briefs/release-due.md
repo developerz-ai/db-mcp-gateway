@@ -1,6 +1,6 @@
 # Brief: is a release needed?
 
-Weekly checkup, Mondays 03:00 UTC, fired by `schedules: release-due`. It covers the published version people pull: the `v*` tag, the GHCR image and the GitHub Release. The block below gathers facts and you make the call. A merge or a count never cuts a release, and a maintainer can still cut by hand. This does not govern the `main` image each merge publishes for the project's own deployment.
+Weekly checkup, Mondays 03:00 UTC, fired by `schedules: release-due`. It covers the published version people pull: the `v*` tag, the image on GHCR (`ghcr.io/developerz-ai/db-mcp-gateway`) and DOCR (`registry.digitalocean.com/developerz-ai/db-mcp-gateway`), and the GitHub Release. The block below gathers facts and you make the call. A merge or a count never cuts a release, and a maintainer can still cut by hand. This does not govern the `main` image each merge publishes for the project's own deployment.
 
 ## Judge
 
@@ -43,12 +43,12 @@ The pathspec names what reaches users. Prose, tests, CI and docs ship nothing.
 File nothing if an open issue title is exactly `Release <next>`, or an open PR is already that release. Body, for the box that takes it:
 
 1. Re-run Decide on fresh `main`; still needed, or stop.
-2. Bump `version` in `Cargo.toml`, run `cargo update -p db-mcp-gateway`, and update the version in `README.md`. Nothing else in the diff.
-3. `bin/ci`, then one PR titled `chore(release): <next>`. It merges on green like any PR.
-4. After it merges: `git fetch origin && git tag v<next> <merge sha> && git push origin v<next>`. Only after `git show <merge sha>:Cargo.toml` shows `<next>`.
-5. Watch `release.yml` to the end. A failure is an issue for a maintainer.
+2. Bump `version` in `Cargo.toml`, run `cargo update -p db-mcp-gateway` (so `Cargo.lock` carries it), and update the version in `README.md`. Nothing else in the diff: no source change, so no security-review path and no spec update.
+3. `bin/ci`, then one PR titled `chore(release): <next>`. It merges on green like any PR: `fmt`, `clippy`, `test` and `audit` required, never `--admin`.
+4. After it merges: `git fetch origin`, confirm `git show <merge sha>:Cargo.toml` shows `<next>`, then `git tag -a v<next> -m "v<next>" <merge sha> && git push origin v<next>`. An annotated tag on the merge commit, nothing else.
+5. Watch `release.yml` to the end: per-arch images, the multi-arch manifest on GHCR and DOCR at the semver tags and `:latest`, then the GitHub Release. A failure is an issue for a maintainer.
 
-Never re-tag, move or delete a tag, and never publish by hand. A failed publish is an issue for a maintainer; the fix ships as the next patch.
+Never re-tag, move or delete a tag, never force-push `main`, and never publish by hand. A failed publish is an issue for a maintainer; the fix ships as the next patch.
 
 ## Rows
 
