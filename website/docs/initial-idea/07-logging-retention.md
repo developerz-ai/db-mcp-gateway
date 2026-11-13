@@ -45,7 +45,7 @@ Every target call writes an intent — reads and writes alike (owner decision, p
 | `server_name`, `database_name` | Logical names; NULL for tools that address neither, or when the arguments never parsed |
 | `db_type` | `postgres` / `mongo`; NULL for tools that reach no target |
 | `tool` | `run_query`, `describe_schema`, …; `unknown` for an unknown or missing tool name |
-| `sql` | What the call read: the agent's SQL for `run_query` / `explain`; `schema.table` for `sample_table` / `table_stats`; `schema` or `schema.table` for `describe_schema` (`database[.collection]` on Mongo); the target `request_id` for `cancel_query`; NULL for tools that read no table |
+| `sql` | What the call read: the agent's SQL for `run_query` / `explain`; `schema.table` for `sample_table` / `table_stats` (on Mongo, `sample_table` stores the `find` it runs, e.g. `{"find":"events","filter":{}}`); `schema` or `schema.table` for `describe_schema` (`database[.collection]` on Mongo); the target `request_id` for `cancel_query`; NULL for tools that read no table |
 | `sql_truncated` | `sql` was cut at the 64 KiB stored-SQL cap (on a character boundary) — one huge statement must not make a huge row in the store or the SIEM export |
 | `reason` | User-provided reason string, if any |
 | `row_count` | Final row count returned (after truncation) |

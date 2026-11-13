@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use super::super::Identifier;
 use super::super::adapter::{
     DbAdapter, ExecError, ExecResult, TOKIO_TIMEOUT_SLACK_MS, effective_timeout_ms,
 };
@@ -91,7 +92,7 @@ impl MongoAdapter {
         &self,
         query: SampleQuery<'_>,
     ) -> Result<ExecResult, ExecError> {
-        let command = json!({ "find": query.table.as_str(), "filter": {} }).to_string();
+        let command = sample_command(query.table);
         self.execute(ExecQuery {
             sql: &command,
             binds: &[],
@@ -123,6 +124,12 @@ impl MongoAdapter {
         })
         .await
     }
+}
+
+/// The `find` a sample runs. `sample_table` stores it as the audit row's
+/// `sql`, so the record names exactly the command that read the collection.
+pub fn sample_command(collection: Identifier<'_>) -> String {
+    json!({ "find": collection.as_str(), "filter": {} }).to_string()
 }
 
 /// A string field the server always sends; its absence is a decode error,

@@ -23,6 +23,8 @@ mod cancel;
 mod catalog;
 mod dispatch;
 pub mod rejector;
+
+pub use catalog::sample_command;
 #[cfg(test)]
 mod tests;
 
