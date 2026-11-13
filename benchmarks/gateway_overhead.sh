@@ -263,6 +263,11 @@ export SERVICE_TOKEN_BENCH="dbmcp_svc_$(openssl rand -hex 32)"
 # never mints a session JWT — it authenticates with the service token — but the
 # key is still required at boot, so generate a throwaway one per run.
 export SESSION_SIGNING_KEY="$(openssl rand -hex 32)"
+# OIDC issuer and client id are required at boot too. Discovery is lazy and
+# the benchmark never logs in, so a loopback issuer nothing listens on is
+# never contacted.
+export OIDC_ISSUER="${OIDC_ISSUER:-http://127.0.0.1:9}"
+export OIDC_CLIENT_ID="${OIDC_CLIENT_ID:-bench}"
 export STATE_DB_URL="${STATE_DB_URL:-postgres://gateway:gateway-dev-only@localhost:5433/gateway}"
 export BENCH_DIRECT_URL="${BENCH_DIRECT_URL:-postgres://app:app-dev-only@localhost:5434/app}"
 # Dev credential already public in docker-compose.dev.yml — the mongo
