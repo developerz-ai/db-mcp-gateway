@@ -6,6 +6,7 @@
 //! migrate refuses to start the process.
 
 pub mod audit;
+mod migrate;
 pub mod oauth;
 pub mod permissions;
 pub mod sessions;
@@ -53,8 +54,7 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 pub async fn connect(url: &str, pool_size: NonZeroU32) -> Result<PgPool, StateDbError> {
     let pool = open_pg(url, pool_size.get(), REQUEST_SESSION_SQL).await?;
 
-    sqlx::migrate!("./migrations")
-        .run(&pool)
+    migrate::state_db(&pool)
         .await
         .map_err(StateDbError::Migrate)?;
 
@@ -105,8 +105,7 @@ pub async fn connect_permissions_mysql(
         .await
         .map_err(StateDbError::Connect)?;
 
-    sqlx::migrate!("./migrations-mysql")
-        .run(&pool)
+    migrate::permissions_mysql(&pool)
         .await
         .map_err(StateDbError::Migrate)?;
 

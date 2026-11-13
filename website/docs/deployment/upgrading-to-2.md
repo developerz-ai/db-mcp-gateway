@@ -33,4 +33,10 @@ Migrations `0010`–`0014` apply at boot (additive): `audit_call_intents`, histo
 
 ## Rollback
 
-Roll back the image; the 2.0 migrations are additive and 1.6 ignores the new columns/table. Revert config changes that only 2.0 understands (`write_role`, `pool:`, `gateway:`), or 1.6 will ignore them — it does not reject unknown keys.
+**From 2.0.3, rolling back one release works in place.** The gateway boots on a state DB (or MySQL permissions store) that a newer release has migrated. It skips the migration versions it does not know and logs `schema was migrated by a newer gateway release` at boot. Migrations follow expand/contract: a drop lands only in a release *after* the one that stopped using the object. So release N-1 always runs on schema N. Going back further is not guaranteed, because the older code may need something a later migration dropped. If you need to go back further, roll forward instead, or restore the state DB from a backup.
+
+A migration that already ran and whose file was later edited still refuses boot, on every version. The gateway never re-runs or skips a changed migration.
+
+**Up to and including 2.0.2 (and every 1.x), rollback across a migration is not possible in place.** Those images refuse to boot on a schema that carries a migration they don't know: `migration N was previously applied but is missing in the resolved migrations`. Deleting rows from `_sqlx_migrations` to force the older image to boot is not a fix. The next upgrade would re-run migrations that are not idempotent, and it fails on objects that already exist. To get back to one of those images, restore the state DB from a backup taken before the upgrade. For 2.0 → 1.6 that means migrations `0010` onward. Otherwise, roll forward.
+
+In every case, revert any config the newer release introduced (`write_role`, `pool:`, `gateway:`). 2.0 refuses unknown YAML keys at boot, and 1.x silently ignores them.

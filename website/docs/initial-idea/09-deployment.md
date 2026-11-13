@@ -115,7 +115,7 @@ Login state for the OAuth bridge (pending `/authorize` flows and authorization c
 ## Upgrades
 
 - Containers: tag-pinned pulls; the operator bumps the tag and redeploys.
-- Migrations: the gateway runs its own state-DB migrations on startup; safe to roll across versions one minor at a time.
+- Migrations: the gateway runs its own state-DB (and MySQL permissions-store) migrations on startup. They follow expand/contract: a migration that drops or narrows an object ships only in a release after the one that stopped using it has run everywhere, so release N-1 runs on schema N. An image therefore boots on a schema a newer release migrated, skipping the versions it does not know and logging `schema was migrated by a newer gateway release`. That makes a one-release rollback an image swap (from 2.0.3). A migration that already ran and was later edited (checksum mismatch) still refuses boot. Procedure: [upgrading-to-2 §Rollback](../deployment/upgrading-to-2.md#rollback).
 - Backward compat: config schema changes that drop or rename fields ship with a one-version deprecation window; the gateway warns when it sees the old name.
 
 ## Observability
