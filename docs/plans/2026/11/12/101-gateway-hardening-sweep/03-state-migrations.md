@@ -13,14 +13,15 @@ All state-DB schema changes for the plan, in one place. One migration file per r
 | `migrations/0012_refresh_tokens_session_id.sql` | `oauth_refresh_tokens.session_id` nullable FK → `sessions(id)` | 08 | Rotation and `/revoke` must kill the paired access session |
 | `migrations/0013_permissions_db_type_mongo.sql` | extend `permissions_databases.db_type` CHECK with `mongo` (`migrations/0004:45-46`) | 07 | Mongo targets cannot be registered today |
 | `migrations/0014_audit_upstream_identity.sql` | `audit_calls.upstream_actor text`, `upstream_run_id text`, `rows_affected bigint`, `sql_truncated bool not null default false`; same two upstream columns on `audit_call_intents` | 12 | Headless agents share one service identity; rows must carry the claimed task/run and requester |
-| `migrations/0015_sessions_drop_unused.sql` | drop `sessions_expires_at_idx` only if 01 shows the GC query does not use it; drop dead column `sessions.agent_client` | 08 | Unused index + always-NULL column (`migrations/0001:18-19`) |
+| `migrations/0015_audit_calls_drop_superseded_idx.sql` | drop `audit_calls_user_sub_idx`, `audit_calls_db_type_idx` (moved out of 0011, which stayed additive) | 04 | Prefix of the 0003/0011 indexes; no query reads `db_type` |
+| `migrations/0016_sessions_drop_agent_client.sql` | drop dead column `sessions.agent_client`; **after** 2.0.2 (code stops writing it) runs in both clusters — 2.0.1 still inserts it. `sessions_expires_at_idx` stays: the GC `DELETE … WHERE expires_at < …` reads it (`src/state/sessions.rs` `delete_expired`) | 08 | Always-NULL column (`migrations/0001:18`) |
 | `migrations-mysql/0004_identity_collation.sql` | `utf8mb4_bin` on `user_sub`, `live_user_sub`, `server`, `db_name` and live columns | 07 | Case-insensitive default collation merges `Alice`/`alice` (`migrations-mysql/0001:22-37`) |
 | `migrations-mysql/0005_db_type_mongo.sql` | same CHECK change as 0013 | 07 | Store parity |
 
 ## Steps
 
 1. Confirm the highest existing numbers (`ls migrations migrations-mysql`) before creating files; renumber here if `main` moved.
-2. Each migration is additive or index-only except 0011 (drops) and 0015 (drops). Drops go in their own PR **after** the code that stopped depending on them is deployed in both clusters (slices 14, 15).
+2. Each migration is additive or index-only except 0015 and 0016 (drops). Drops go in their own PR **after** the code that stopped depending on them is deployed in both clusters (slices 14, 15).
 3. Build large indexes `CONCURRENTLY` — requires `-- no-transaction` at the top of the sqlx migration file. 01 gives `audit_calls` row counts per cluster; skip `CONCURRENTLY` only if both are small.
 4. `audit_call_intents` is pruned by the audit pruner (10) on the same retention as `audit_calls`; no FK between the two (append-only, independent retention deletes).
 5. Do not touch the dead MySQL `permissions_audit` table (`migrations-mysql/0002`); 07 decides its fate.

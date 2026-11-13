@@ -88,7 +88,7 @@ async fn replica(pool: &PgPool, admin: bool, refresh: RefreshTokens) -> TestGate
 async fn bearer(gw: &TestGateway, sub: &str, groups: &[String]) -> String {
     let session = gw
         .sessions
-        .create(sub, "replica@example.com", groups, SESSION_TTL, None, None)
+        .create(sub, "replica@example.com", groups, SESSION_TTL, None)
         .await
         .expect("session row");
     jwt::issue(

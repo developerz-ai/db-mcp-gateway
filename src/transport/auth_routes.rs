@@ -119,7 +119,6 @@ pub async fn callback(
             &verified.email,
             &verified.groups,
             auth.config.session_ttl,
-            None,
             None, // fresh login: stamp issued_at now
         )
         .await

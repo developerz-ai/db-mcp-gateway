@@ -165,7 +165,6 @@ impl RefreshTokens {
                     &identity.email,
                     &identity.groups,
                     session_ttl,
-                    None,
                     chain_born,
                 )
                 .await?;

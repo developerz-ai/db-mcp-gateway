@@ -15,7 +15,6 @@ pub struct NewSession<'a> {
     pub user_sub: &'a str,
     pub user_email: &'a str,
     pub groups: &'a [String],
-    pub agent_client: Option<&'a str>,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -28,7 +27,6 @@ impl std::fmt::Debug for NewSession<'_> {
             .field("user_sub", &self.user_sub)
             .field("user_email", &"<redacted>")
             .field("groups", &self.groups)
-            .field("agent_client", &self.agent_client)
             .field("issued_at", &self.issued_at)
             .field("expires_at", &self.expires_at)
             .finish()
@@ -43,7 +41,6 @@ pub struct SessionRow {
     pub user_sub: String,
     pub user_email: String,
     pub groups: Json<Vec<String>>,
-    pub agent_client: Option<String>,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
@@ -57,7 +54,6 @@ impl std::fmt::Debug for SessionRow {
             .field("user_sub", &self.user_sub)
             .field("user_email", &"<redacted>")
             .field("groups", &self.groups.0)
-            .field("agent_client", &self.agent_client)
             .field("issued_at", &self.issued_at)
             .field("expires_at", &self.expires_at)
             .field("revoked_at", &self.revoked_at)
@@ -70,14 +66,13 @@ pub async fn insert(
     session: &NewSession<'_>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO sessions (id, user_sub, user_email, groups, agent_client, \
-         issued_at, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        "INSERT INTO sessions (id, user_sub, user_email, groups, issued_at, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(session.id)
     .bind(session.user_sub)
     .bind(session.user_email)
     .bind(Json(session.groups))
-    .bind(session.agent_client)
     .bind(session.issued_at)
     .bind(session.expires_at)
     .execute(conn)
@@ -87,8 +82,7 @@ pub async fn insert(
 
 pub async fn fetch(conn: impl PgExecutor<'_>, id: Uuid) -> Result<Option<SessionRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, user_sub, user_email, groups, agent_client, \
-         issued_at, expires_at, revoked_at \
+        "SELECT id, user_sub, user_email, groups, issued_at, expires_at, revoked_at \
          FROM sessions WHERE id = $1",
     )
     .bind(id)
