@@ -6,6 +6,8 @@
 
 use std::time::Duration;
 
+use secrecy::{ExposeSecret, SecretSlice, SecretString};
+
 use super::oauth::DEFAULT_REFRESH_TTL;
 use super::oidc::is_loopback;
 
@@ -27,13 +29,13 @@ const REFRESH_TTL_DAYS_MAX: u64 = 366;
 /// session JWT with a zero-length key.
 const MIN_SIGNING_KEY_BYTES: usize = 32;
 
-/// `Debug` is hand-rolled to redact `client_secret` and `session_signing_key`.
-/// Both are secrets and CLAUDE.md forbids them from appearing in logs/errors.
-#[derive(Clone)]
+/// Secrets are `secrecy` types: they zero on drop and `Debug` prints them
+/// redacted, so a logged config never carries key material (CLAUDE.md MUST #1).
+#[derive(Debug, Clone)]
 pub struct AuthConfig {
     pub issuer: String,
     pub client_id: String,
-    pub client_secret: String,
+    pub client_secret: SecretString,
     pub redirect_url: String,
     /// OIDC `aud` value our ID tokens must carry. Most IdPs default this to
     /// `client_id`, but it can differ (e.g. resource-server-style audiences).
@@ -46,30 +48,10 @@ pub struct AuthConfig {
     pub refresh_ttl: Duration,
     /// HMAC key for the gateway-issued session JWT. Distinct from IdP keys —
     /// we re-sign so we can revoke via the state DB denylist.
-    pub session_signing_key: Vec<u8>,
+    pub session_signing_key: SecretSlice<u8>,
     /// `ALLOW_INSECURE_SIGNING_KEY`: accept the committed dev key or a short
     /// key. Local dev only — refused unless the issuer is a loopback URL.
     pub allow_insecure_signing_key: bool,
-}
-
-impl std::fmt::Debug for AuthConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AuthConfig")
-            .field("issuer", &self.issuer)
-            .field("client_id", &self.client_id)
-            .field("client_secret", &"<redacted>")
-            .field("redirect_url", &self.redirect_url)
-            .field("audience", &self.audience)
-            .field("groups_claim", &self.groups_claim)
-            .field("session_ttl", &self.session_ttl)
-            .field("refresh_ttl", &self.refresh_ttl)
-            .field("session_signing_key", &"<redacted>")
-            .field(
-                "allow_insecure_signing_key",
-                &self.allow_insecure_signing_key,
-            )
-            .finish()
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -102,13 +84,13 @@ impl Default for AuthConfig {
         Self {
             issuer: String::new(),
             client_id: String::new(),
-            client_secret: String::new(),
+            client_secret: SecretString::default(),
             redirect_url: "http://localhost:8443/auth/callback".to_string(),
             audience: String::new(),
             groups_claim: DEFAULT_GROUPS_CLAIM.to_string(),
             session_ttl: Duration::from_secs(DEFAULT_SESSION_TTL_HOURS * 3600),
             refresh_ttl: DEFAULT_REFRESH_TTL,
-            session_signing_key: DEFAULT_DEV_SIGNING_KEY.as_bytes().to_vec(),
+            session_signing_key: DEFAULT_DEV_SIGNING_KEY.as_bytes().to_vec().into(),
             allow_insecure_signing_key: false,
         }
     }
@@ -125,7 +107,7 @@ impl AuthConfig {
             ..AuthConfig::default()
         };
         if let Ok(value) = std::env::var("OIDC_CLIENT_SECRET") {
-            config.client_secret = value;
+            config.client_secret = value.into();
         }
         if let Ok(value) = std::env::var("OIDC_REDIRECT_URL") {
             config.redirect_url = value;
@@ -144,7 +126,7 @@ impl AuthConfig {
                 parse_ttl("REFRESH_TTL_DAYS", &value, 24 * 3600, REFRESH_TTL_DAYS_MAX)?;
         }
         if let Ok(value) = std::env::var("SESSION_SIGNING_KEY") {
-            config.session_signing_key = value.into_bytes();
+            config.session_signing_key = value.into_bytes().into();
         }
         if let Ok(value) = std::env::var("ALLOW_INSECURE_SIGNING_KEY") {
             config.allow_insecure_signing_key = matches!(value.as_str(), "1" | "true" | "TRUE");
@@ -198,9 +180,8 @@ fn check_signing_key(config: &AuthConfig) -> Result<(), AuthConfigError> {
             _ => Err(AuthConfigError::InsecureKeyWithRemoteIssuer),
         };
     }
-    if config.session_signing_key == DEFAULT_DEV_SIGNING_KEY.as_bytes()
-        || config.session_signing_key.len() < MIN_SIGNING_KEY_BYTES
-    {
+    let key = config.session_signing_key.expose_secret();
+    if key == DEFAULT_DEV_SIGNING_KEY.as_bytes() || key.len() < MIN_SIGNING_KEY_BYTES {
         return Err(AuthConfigError::DefaultSigningKey);
     }
     Ok(())

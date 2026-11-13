@@ -35,6 +35,7 @@ use db_mcp_gateway::auth::{AuthConfig, SessionStore, jwt};
 use db_mcp_gateway::authz::PermissionsCache;
 use db_mcp_gateway::state::permissions::{DbType, PermissionsSeed, pg::PgPermissionsRepo};
 use reqwest::StatusCode;
+use secrecy::SecretSlice;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::Row;
@@ -55,7 +56,7 @@ permissions: []
 
 async fn mint_session(
     sessions: &SessionStore,
-    signing_key: &[u8],
+    signing_key: &SecretSlice<u8>,
     user_sub: &str,
     user_email: &str,
     groups: &[String],

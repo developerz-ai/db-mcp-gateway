@@ -37,6 +37,7 @@ use db_mcp_gateway::transport::admin;
 use db_mcp_gateway::transport::admin::middleware::AdminActor;
 use db_mcp_gateway::transport::admin::users::UsersState;
 use reqwest::StatusCode;
+use secrecy::SecretSlice;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::Row;
@@ -47,7 +48,7 @@ const ADMIN_GROUP: &str = "db-mcp-gateway-admins";
 /// Insert a session row, mint a JWT for it, and return both.
 async fn mint_session(
     sessions: &SessionStore,
-    signing_key: &[u8],
+    signing_key: &SecretSlice<u8>,
     user_sub: &str,
     user_email: &str,
     groups: &[String],
