@@ -6,9 +6,11 @@
 //!      bare `schema_read` grant satisfies, leaking table contents),
 //!   2. a `query_read` grant samples rows,
 //!   3. `constraints.require_reason` blocks a sample without a reason and the
-//!      audit row carries the reason when one is supplied.
+//!      audit row carries the reason when one is supplied,
+//!   4. on Mongo the audit row names the `find` command, not a schema.
 //!
-//! Real Postgres throughout (`bin/dev up` → state DB :5435, target DB :5434).
+//! Real Postgres throughout (`bin/dev up` → state DB :5435, target DB :5434);
+//! the Mongo case is refused before any target call, so it needs neither.
 
 mod common;
 
@@ -37,11 +39,18 @@ servers:
         role: app
         password: app-dev-only
         description: Local target-db
+  - name: analytics
+    kind: mongo
+    description: E2E analytics (never reached)
+    host: analytics.example.invalid
+    databases:
+      - { name: dw, role: ro, password: dwpw }
 
 permissions:
   - group: metadata-only
     grants:
       - { server: target, database: app, action: schema_read }
+      - { server: analytics, database: dw, action: schema_read }
   - group: engineers
     grants:
       - { server: target, database: app, action: query_read }
@@ -63,9 +72,11 @@ async fn boot_gateway(group: &str) -> LoggedInGateway {
     spawn_logged_in(E2E_YAML, user).await
 }
 
+/// `args` addresses `target`/`app` unless it names its own server/database.
 async fn call_sample_table(booted: &LoggedInGateway, mut args: Value) -> Value {
-    args["server"] = json!("target");
-    args["database"] = json!("app");
+    let fields = args.as_object_mut().expect("arguments are an object");
+    fields.entry("server").or_insert_with(|| json!("target"));
+    fields.entry("database").or_insert_with(|| json!("app"));
     reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()
@@ -274,4 +285,28 @@ async fn require_reason_grant_blocks_sample_without_reason() {
         row.reason.as_deref(),
         Some("ticket OPS-42 data shape check")
     );
+}
+
+/// Mongo has no schemas, so `schema.table` would audit a namespace that does
+/// not exist. The row carries the `find` the adapter runs instead — never a
+/// credential. Denied before the target, so the header alone is under test.
+#[tokio::test]
+async fn mongo_sample_audits_the_find_command() {
+    let booted = boot_gateway("metadata-only").await;
+
+    let resp = call_sample_table(
+        &booted,
+        json!({ "server": "analytics", "database": "dw", "table": "events" }),
+    )
+    .await;
+
+    assert_eq!(payload(&resp)["code"], "forbidden", "{resp}");
+    let row = latest_audit(&booted, "mongo sample").await;
+    assert_eq!(row.outcome, "forbidden");
+    assert_eq!(row.db_type.as_deref(), Some("mongo"));
+    assert_eq!(row.database.as_deref(), Some("dw"));
+    let sql = row.sql.expect("the Mongo sample names what it read");
+    assert!(!sql.contains("dwpw"), "{sql}");
+    let find: Value = serde_json::from_str(&sql).expect("the audited read is a JSON command");
+    assert_eq!(find, json!({ "find": "events", "filter": {} }));
 }

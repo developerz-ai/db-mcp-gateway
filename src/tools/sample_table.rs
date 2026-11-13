@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{Action, Grant};
+use crate::exec::mongo::sample_command;
 use crate::exec::sql_guard::Access;
 use crate::exec::{IDENTIFIER_PATTERN, Identifier, SampleQuery};
 use crate::mcp::jsonrpc::Response;
@@ -89,7 +90,7 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
             return audit_outcome(ctx, id, header, outcome).await;
         }
     };
-    let read = format!("{}.{}", table.schema.as_str(), table.table.as_str());
+    let read = audited_read(header.db_type, table);
     header.sql = Some(&read);
     let args = &args;
     run_audited(ctx, id, header, |id, grants| async move {
@@ -103,6 +104,15 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
 struct TableRef<'a> {
     schema: Identifier<'a>,
     table: Identifier<'a>,
+}
+
+/// What the audit row's `sql` says was read: `schema.table`, or on Mongo,
+/// which has no schemas, the `find` command the adapter runs.
+fn audited_read(db_type: Option<&str>, table: TableRef<'_>) -> String {
+    match db_type {
+        Some("mongo") => sample_command(table.table),
+        _ => format!("{}.{}", table.schema.as_str(), table.table.as_str()),
+    }
 }
 
 /// `Err` names the argument that is not an identifier.
@@ -202,5 +212,14 @@ mod tests {
             Some("schema")
         );
         assert_eq!(parse_table(None, "users; drop").err(), Some("table"));
+    }
+
+    #[test]
+    fn audited_read_names_the_table_or_the_mongo_find() {
+        let table = parse_table(Some("sales"), "orders").expect("valid");
+        assert_eq!(audited_read(Some("postgres"), table), "sales.orders");
+        let find: Value = serde_json::from_str(&audited_read(Some("mongo"), table))
+            .expect("the Mongo read is a JSON command");
+        assert_eq!(find, serde_json::json!({ "find": "orders", "filter": {} }));
     }
 }
