@@ -97,7 +97,10 @@ async-trait = "0.1"
 mongodb = { version = "3.7", default-features = false, features = ["rustls-tls-aws-lc", "dns-resolver", "compat-3-3-0", "bson-3"] }
 
 # auth / crypto
-jsonwebtoken = "9"
+# `aws_lc_rs`, not `rust_crypto`: 10+ needs exactly one backend or it panics
+# at the first sign/verify, and `rust_crypto` pulls `rsa` (RUSTSEC-2023-0071)
+# into the shipping graph. aws-lc-rs is already here via rustls and mongodb.
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form", "query"] }
 url = "2"
 # PKCE S256 for the MCP OAuth bridge: base64url-no-pad(sha256(verifier))
