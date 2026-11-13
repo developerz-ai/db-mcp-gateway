@@ -37,7 +37,7 @@ jobs:
   # artifact upload.
   build:
     if: github.event_name == 'pull_request'
-    # GitHub-hosted runner (org rule: private repos on Ubicloud, public on GitHub-hosted).
+    # GitHub-hosted runner: this repository is public.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

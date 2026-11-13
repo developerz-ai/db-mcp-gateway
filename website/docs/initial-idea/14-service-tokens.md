@@ -184,7 +184,7 @@ revoke anything — there is no session row to revoke.
 
 Two homes, both pre-existing conventions:
 
-- **Record of truth:** the org secret store (an operator-held Vaultwarden
+- **Record of truth:** the org secret store (an operator-held password-manager
   item), because the gateway cannot recover the value — it is shown once at
   mint.
 - **Delivery to the gateway:** the same secret-reference mechanism DB

@@ -3,7 +3,7 @@ name: authz-permissions
 description: Owns grant evaluation, constraint merge and the permissions YAML schema. Use for permissions, grants, constraints, row_limit, statement_timeout. Do NOT use for SQL execution.
 ---
 
-> Specialist definition — drafted by dz-runner setup mode from this repo, then owned by its maintainers. Correct it in place; setup never overwrites a definition that exists.
+> Specialist definition — drafted from this repo and owned by this repository's maintainers. Correct it in place; setup never overwrites a definition that exists.
 
 ## Identity
 

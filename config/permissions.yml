@@ -1,62 +1,60 @@
-# Deployable gateway config for the worker-db Postgres cluster.
+# Deployable gateway config for one shared Postgres cluster fronted by pgcat.
 #
-# Pairs with the infra stack PR (#17): mounted as a sealed-secret at
-# /etc/gateway/config.yml. The Zitadel `groups` claim feeds the `permissions:`
-# group names below (devs / devops / cto). Per-dev mapping lives in
-# ../infrastructure/scripts/lib/sso/dev-mapping.ts — collective ownership in v1.
+# Mounted as a secret at /etc/gateway/config.yml (#17). The IdP's `groups`
+# claim feeds the `permissions:` group names below (devs / devops / cto);
+# mapping people to groups is the IdP's job — collective ownership in v1.
 #
 # Schema: website/docs/initial-idea/08-config.md.
 # Spec for grants + constraint merge: website/docs/initial-idea/06-permissions.md.
 
 servers:
-  - name: worker-db
+  - name: shared-pg
     kind: postgres
-    description: "Shared CNPG cluster on worker-db, fronted by pgcat"
-    # In-cluster route: gateway → pgcat → postgres. Apps never connect to
-    # postgres-rw directly (per stacks/stateful/README.md). The pod ↔ pgcat ↔
-    # postgres legs are all cluster-internal mesh traffic, so TLS terminates
-    # at the gateway's public ingress (Traefik) and the per-DB legs are plain.
+    description: "Shared Postgres cluster, fronted by pgcat"
+    # In-cluster route: gateway → pgcat → postgres; nothing connects to the
+    # primary directly. The pod ↔ pgcat ↔ postgres legs are all
+    # cluster-internal mesh traffic, so TLS terminates at the gateway's public
+    # ingress (Traefik) and the per-DB legs are plain.
     host: pgcat.pgcat.svc.cluster.local
     port: 6432
     tls: insecure
     databases:
-      # App DBs — declared by stacks/apps/*/cnpg-database.yml in
-      # developerz-ai/infrastructure. Each RO role is provisioned out-of-band
-      # by the infra stack PR; gateway never creates roles.
-      - name: discord_server
-        role: mcp_gateway_discord_server_ro
-        password: ${FILE:/run/secrets/worker-db/discord_server_ro}
-        description: "discord-server bot state"
+      # App DBs. Each RO role is provisioned out-of-band by the deployment;
+      # the gateway never creates roles.
+      - name: orders
+        role: mcp_gateway_orders_ro
+        password: ${FILE:/run/secrets/shared-pg/orders_ro}
+        description: "orders app DB"
 
-      - name: legaldiligencemedellin
-        role: mcp_gateway_legaldiligencemedellin_ro
-        password: ${FILE:/run/secrets/worker-db/legaldiligencemedellin_ro}
-        description: "legaldiligencemedellin app DB"
+      - name: billing
+        role: mcp_gateway_billing_ro
+        password: ${FILE:/run/secrets/shared-pg/billing_ro}
+        description: "billing app DB"
 
       # Infra-side DBs — cto-only.
-      - name: zitadel
-        role: mcp_gateway_zitadel_ro
-        password: ${FILE:/run/secrets/worker-db/zitadel_ro}
-        description: "Zitadel state (SSO IdP)"
+      - name: idp
+        role: mcp_gateway_idp_ro
+        password: ${FILE:/run/secrets/shared-pg/idp_ro}
+        description: "SSO IdP state"
 
-      - name: vaultwarden
-        role: mcp_gateway_vaultwarden_ro
-        password: ${FILE:/run/secrets/worker-db/vaultwarden_ro}
-        description: "Vaultwarden state (password vault)"
+      - name: vault
+        role: mcp_gateway_vault_ro
+        password: ${FILE:/run/secrets/shared-pg/vault_ro}
+        description: "password vault state"
 
 permissions:
   # devs: read-only on every app DB. Per-dev DB ownership isn't expressible in
   # the group-based model; revisit if scope demands it (see issue #19 thread).
   - group: devs
     grants:
-      - server: worker-db
-        database: discord_server
+      - server: shared-pg
+        database: orders
         action: query_read
         constraints: &app_db_caps
           statement_timeout_ms: 30000
           row_limit: 10000
-      - server: worker-db
-        database: legaldiligencemedellin
+      - server: shared-pg
+        database: billing
         action: query_read
         constraints: *app_db_caps
 
@@ -64,19 +62,19 @@ permissions:
   # (e.g. infra-DB schema_read, longer timeouts) without rewriting dev grants.
   - group: devops
     grants:
-      - server: worker-db
-        database: discord_server
+      - server: shared-pg
+        database: orders
         action: query_read
         constraints: *app_db_caps
-      - server: worker-db
-        database: legaldiligencemedellin
+      - server: shared-pg
+        database: billing
         action: query_read
         constraints: *app_db_caps
 
   # cto: app DBs + infra-side DBs. Still read-only; writes are out of scope for v1.
   - group: cto
     grants:
-      - server: worker-db
+      - server: shared-pg
         database: "*"
         action: query_read
         constraints: *app_db_caps

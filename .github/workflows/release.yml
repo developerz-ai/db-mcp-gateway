@@ -15,7 +15,7 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  # DOCR mirror (#907) — the in-cluster source the ArgoCD Image Updater tracks.
+  # DOCR mirror — the in-cluster source the ArgoCD Image Updater tracks.
   # Per-arch builds push the image to both registries under the per-arch tag
   # `${PLATFORM_PAIR}-${version}` (e.g. `linux-amd64-1.4.5`,
   # `linux-arm64-1.4.5`); the `merge` job reads those per-arch tag refs and
@@ -56,7 +56,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            # GitHub-hosted runner (org rule: private repos on Ubicloud, public on GitHub-hosted).
+            # GitHub-hosted runner: this repository is public.
             runner: ubuntu-latest
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
@@ -184,7 +184,7 @@ jobs:
           # (shared name, no per-step suffix); with two metadata steps in the same
           # job the second overwrites the first. Mirror the DOCR step's `json`
           # output into a step-scoped env var so the jq below reads the right
-          # tag set (#907).
+          # tag set.
           DOCR_METADATA_JSON: ${{ steps.meta-docr.outputs.json }}
         run: |
           # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag
@@ -221,7 +221,7 @@ jobs:
         with:
           generate_release_notes: true
           body: |
-            Container images for this release are dual-pushed (#907):
+            Container images for this release are dual-pushed:
 
             ```
             ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.version }}

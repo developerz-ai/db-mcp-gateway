@@ -53,7 +53,7 @@ jobs:
           echo "code-affecting changes: $code"
 
   fmt:
-    # GitHub-hosted runner (org rule: private repos on Ubicloud, public on GitHub-hosted).
+    # GitHub-hosted runner: this repository is public.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -305,6 +305,26 @@ jobs:
         # Wired into CI so it actually runs (was dead code otherwise).
         run: bash tests/bin/secret-scan-regex.test.sh
 
+  # The public-tree guard (tests/public_tree.rs) runs on every PR, docs-only
+  # included: the leaks it catches live mostly in markdown, which the
+  # `changes` filter keeps out of `test`. Reads tracked files only — no
+  # service containers.
+  public-tree:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+        with:
+          key: public-tree
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test --profile ci --test public_tree
+
   # Publish a multi-arch image on push to main, tagged with the short commit
   # SHA (what Argo Image Updater pins to, #17) + a moving `main` tag. Gated by
   # the quality jobs above so an unpublishable commit never ships an image.
@@ -315,10 +335,9 @@ jobs:
   # replaces QEMU emulation, which tripled build time once the mysql/mongo deps
   # landed and blew the 30-min ceiling — no `main` image shipped for a week.
   #
-  # DUAL-PUSH (#907): every per-arch image is also pushed to DOCR
+  # DUAL-PUSH: every per-arch image is also pushed to DOCR
   # (registry.digitalocean.com/developerz-ai/db-mcp-gateway) using the org-level
-  # `DOCR_TOKEN` Actions secret (the same secret proven live on discord-server,
-  # mmarketing, venom-astrology). GHCR stays the public artifact; DOCR is the
+  # `DOCR_TOKEN` Actions secret. GHCR stays the public artifact; DOCR is the
   # in-cluster source Image Updater tracks, so the per-arch images must live in
   # DOCR too — a cross-registry manifest list (per-arch in GHCR, manifest in
   # DOCR) would fail to pull on a reschedule. `merge` then creates the
@@ -466,7 +485,7 @@ jobs:
           # (shared name, no per-step suffix); with two metadata steps in the same
           # job the second overwrites the first. Mirror the DOCR step's `json`
           # output into a step-scoped env var so the jq below reads the right
-          # tag set (#907).
+          # tag set.
           DOCR_METADATA_JSON: ${{ steps.meta-docr.outputs.json }}
         run: |
           # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag

@@ -6,7 +6,7 @@
 //! - **gateway → upstream IdP**: the gateway acts as an OAuth *client*;
 //!   `auth::oidc` generates a verifier/challenge pair and proves possession at
 //!   the IdP's token endpoint. Required because IdPs increasingly mandate PKCE
-//!   for every client (e.g. equipo's `/authorize` rejects any request without
+//!   for every client (some IdPs' `/authorize` rejects any request without
 //!   `code_challenge_method=S256`).
 //!
 //! `challenge = base64url-no-pad(SHA256(verifier))`.

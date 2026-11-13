@@ -2,7 +2,7 @@
 
 > Part of [`overview.md`](overview.md). Depends on: 03 (`0014`), 04, 05, 06, 07, 10. **`(security review required)`** — new MCP tools, write path, service-token auth, config schema. Reviewers look for: a read tier reaching a write role, missing audit rows on new tools, unverified upstream identity treated as verified.
 
-Three audiences: **humans + Claude Code** (SSO session), **headless agents** (dz, tesote.ai — service tokens), in two tiers: read (coding agents) and read+write (devops agents). More power is delivered inside the five non-negotiables, not around them.
+Three audiences: **humans + Claude Code** (SSO session), **headless agents** (agent platforms — service tokens), in two tiers: read (coding agents) and read+write (devops agents). More power is delivered inside the five non-negotiables, not around them.
 
 ## Files to change
 
