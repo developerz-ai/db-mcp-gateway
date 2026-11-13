@@ -157,7 +157,7 @@ async fn authorize(
     if q.response_type != "code" || q.client_id != s.client_id {
         return Err(StatusCode::BAD_REQUEST);
     }
-    // PKCE S256 is mandatory (mirrors equipo's /authorize). The gateway, acting
+    // PKCE S256 is mandatory (mirrors IdPs whose /authorize requires it). The gateway, acting
     // as an OAuth client, MUST send a challenge — absence is a regression.
     let challenge = match (q.code_challenge, q.code_challenge_method.as_deref()) {
         (Some(c), Some("S256")) if !c.is_empty() => c,

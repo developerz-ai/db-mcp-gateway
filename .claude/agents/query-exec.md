@@ -3,7 +3,7 @@ name: query-exec
 description: Owns per-database pools, statement timeouts, row caps and cancellation. Use for run_query, explain, pool, timeout, cancel, sql guard. Do NOT use for grant evaluation.
 ---
 
-> Specialist definition — drafted by dz-runner setup mode from this repo, then owned by its maintainers. Correct it in place; setup never overwrites a definition that exists.
+> Specialist definition — drafted from this repo and owned by this repository's maintainers. Correct it in place; setup never overwrites a definition that exists.
 
 ## Identity
 

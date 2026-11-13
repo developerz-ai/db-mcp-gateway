@@ -2,7 +2,7 @@
 
 > Part of [`overview.md`](overview.md). Depends on: none. Read-only measurement of both production deployments; the numbers every sizing decision in 06, 10, 14, 15 must cite. Re-measure after 16 puts agent traffic on the gateway.
 
-D1 = developerz-ai (`db.developerz.ai`), D2 = tesote (`db-mcp.miamibeachstart.com`). Both run gateway v1.6.0, one replica.
+D1 = the first production cluster, D2 = the second, each run by its own infrastructure repo. Both run gateway v1.6.0, one replica.
 
 ## What was measured
 
@@ -12,7 +12,7 @@ D1 = developerz-ai (`db.developerz.ai`), D2 = tesote (`db-mcp.miamibeachstart.co
 | Pod memory | 8 Mi (2d15h old) – 18 Mi (fresh) | 19 Mi now; 30-day max 19.6 Mi, 7-day avg 10.6 Mi |
 | Pod CPU | 1m | 1m; 7-day avg 0.18m, 5-min peak 0.44m |
 | Requests / limits | 100m / 256 Mi; limit 512 Mi; no CPU limit | same |
-| Node | worker-1: memory **requests 92 %** committed, limits 309 % | worker-7: requests 45 %, limits 131 % |
+| Node | memory **requests 92 %** committed, limits 309 % | requests 45 %, limits 131 % |
 | Restarts / OOM | 0 | 0 in 30 d |
 | PDB / HPA | none / none | `minAvailable: 0` (no-op) / none |
 | Tool dispatches | **0 in 64 h of logs**; 0 audit inserts and 0 target-role statements since 2026-10-06 | 104 in 11.9 d, 3 users, ≤ 24/day |
@@ -22,7 +22,7 @@ D1 = developerz-ai (`db.developerz.ai`), D2 = tesote (`db-mcp.miamibeachstart.co
 | App metrics scraped | ServiceMonitor exists; no read-only query verb | **not scraped at all** |
 | TLS in pod | on (8443) | `TLS_DISABLED=true` (plain HTTP behind the tunnel) |
 
-D2 `run_query` (79 calls): p50 13 ms, p95 100 ms, max 6 089 ms (two calls > 5 s — target-query time). Outcomes: 64 success, 8 `syntax_error`, 6 `forbidden`, 1 `forbidden_sql`. Targets: yugabyte/`tesote_ai` 42, `equipo_production` 17, `sales_production` 4.
+D2 `run_query` (79 calls): p50 13 ms, p95 100 ms, max 6 089 ms (two calls > 5 s — target-query time). Outcomes: 64 success, 8 `syntax_error`, 6 `forbidden`, 1 `forbidden_sql`. Targets: the Yugabyte database 42, two Postgres app databases 17 and 4.
 
 D1 state-DB statements for role `gateway` since 2026-10-06: `SELECT 1` (readyz) 641 501 calls; `DELETE FROM oauth_refresh_tokens WHERE expires_at <= now()` 106 937 calls as a seq scan (index never used); audit pruner DELETE 898 calls. No audit INSERT and no session query in the window.
 
@@ -39,7 +39,7 @@ D1 state-DB statements for role `gateway` since 2026-10-06: `SELECT 1` (readyz) 
 | 7 | D2: one `audit pruner run failed`; state connections killed by an admin command three times, pool recovered | measured | 10 step 4 metrics; nothing alerts today |
 | 8 | D2 has no gateway metrics, alerts or dashboard | measured | 15 step 1 |
 | 9 | D1: 20 of 26 state-DB indexes never scanned, incl. `audit_calls` pkey | measured, weak (no traffic) | Do **not** drop on this evidence; 03 `0011`/`0015` drops wait for a re-measure under load |
-| 10 | D1 Deployment rolled at 15:28:29Z (Reloader, ConfigMap `db-mcp-gateway-config` changed) during the inspection | measured; cause not identified | Not caused by the read-only inspection. Confirm who changed the ConfigMap before 14 |
+| 10 | D1 Deployment rolled at 15:28:29Z (Reloader, gateway ConfigMap changed) during the inspection | measured; cause not identified | Not caused by the read-only inspection. Confirm who changed the ConfigMap before 14 |
 | 11 | D1 `sessions`: reltuples 55, live 0, never analyzed | measured | 08 step 6 (GC) + autovacuum will fix; no action alone |
 
 ## Not measured
@@ -49,7 +49,7 @@ D1 state-DB statements for role `gateway` since 2026-10-06: `SELECT 1` (readyz) 
 
 ## Steps (for the executor)
 
-1. Before sizing anything in 06/10/14/15, re-read this table; if agent traffic has started, re-measure with the same commands: D1 `bun scripts/k8s/pods.ts`, `bun scripts/k8s/logs.ts`, `bun scripts/db/stats.ts`; D2 `bin/k8s/kubectl.sh get|describe|top|logs`, `bun scripts/observability/query.ts`. Read-only verbs only; no secret values. Note: `stats.ts` and `query.ts` use `kubectl exec` internally (psql as `stats_reader`; an HTTP GET to Prometheus).
+1. Before sizing anything in 06/10/14/15, re-read this table; if agent traffic has started, re-measure with the same read-only verbs each infrastructure repo provides (pod status, logs, top, state-DB stats as `stats_reader`, Prometheus queries). No secret values. Note: the stats and Prometheus verbs use `kubectl exec` internally.
 2. Capture a local benchmark baseline with `benchmarks/harness` (throughput, p50/p95/p99, peak RSS for a 100k × 20 result, state-DB round trips per call) on `main` before 04–06 land; store the numbers in this file.
 3. Append each re-measurement as a dated table; never overwrite.
 
@@ -60,7 +60,7 @@ D1 state-DB statements for role `gateway` since 2026-10-06: `SELECT 1` (readyz) 
 
 ## Re-measurement 2026-11-13 (post-rollout, agent traffic present)
 
-D1 on 2.0.3 (`sha-75ac3ab`), D2 on 2.0.3 (tesote#795). Agent traffic: developerz.ai `db_*` tools (slice 16 live test), dz-coding / dz-devops service accounts, slice 14/15 live tests. Read-only: Prometheus queries over 24 h, pod status, gateway history.
+D1 on 2.0.3 (`sha-75ac3ab`), D2 on 2.0.3. Agent traffic: the platform's `db_*` tools (slice 16 live test), the coding / devops service accounts, slice 14/15 live tests. Read-only: Prometheus queries over 24 h, pod status, gateway history.
 
 | Metric (D1, 24 h) | Value | Note |
 |---|---|---|
@@ -75,9 +75,9 @@ D1 on 2.0.3 (`sha-75ac3ab`), D2 on 2.0.3 (tesote#795). Agent traffic: developerz
 
 | Check (D2) | Result |
 |---|---|
-| Yugabyte reset fix (2.0.1) | 0 `connection reset failed` warnings; tesote_ai read pool steady at 4 connections over 72 calls |
+| Yugabyte reset fix (2.0.1) | 0 `connection reset failed` warnings; Yugabyte read pool steady at 4 connections over 72 calls |
 | 2.0.3 roll | migrations 15 + 16 applied, 0 restarts, 0 WARN/ERROR over 5 min |
-| Attribution | every dz call carries `upstream_run_id` = task id; platform `integration.used.gatewayRequestId` joins gateway audit rows (developerz.ai#8759) |
+| Attribution | every platform call carries `upstream_run_id` = task id; the platform's own audit row stores the gateway request id, which joins gateway audit rows |
 
 ### Benchmark baseline (step 2)
 

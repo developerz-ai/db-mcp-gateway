@@ -1,9 +1,9 @@
 plan: 101-gateway-hardening-sweep
 title: Gateway hardening + agent power sweep
 status: complete        # not_started | in_progress | blocked | complete | superseded
-created_by: sebi
-worked_by: "sebi"              # executor fills with their git user.name
-owner: sebi
+created_by: plan-author
+worked_by: ""
+owner: plan-owner
 percent: 100
 current_focus: "complete; follow-ups tracked outside the plan"
 slices:
@@ -46,27 +46,27 @@ slices:
   - file: 13-tests.md
     status: complete
     percent: 100
-  - file: 14-infra-developerz.md
+  - file: 14-infra-d1.md
     status: complete
     percent: 100
-  - file: 15-infra-tesote.md
+  - file: 15-infra-d2.md
     status: complete
     percent: 100
-  - file: 16-developerz-platform.md
+  - file: 16-platform.md
     status: complete
     percent: 100
   - file: 17-devex-build-ci.md
     status: complete
     percent: 100
 evidence:
-  - "PRs #279-#293 merged (02-13, 17); #291 TTL hotfix; infra developerz-ai/infrastructure#2282 (14 step 1) live-tested: Prometheus up=1 on :9090"
+  - "PRs #279-#293 merged (02-13, 17); #291 TTL hotfix; D1 infra PR for 14 step 1 live-tested: Prometheus up=1 on :9090"
   - "v2.0.0 (#294) and v2.0.1 (#297, Yugabyte reset fix #296) released; #298 audit_abandoned_total + metric catalogue"
-  - "14: developerz-ai/infrastructure #2282-#2290, #2293 merged; live: coding reads all 5 DBs as *_ro, devops no-op write as *_rw, zitadel write forbidden, reason_required, missing x-dbmcp-* rejected, history shows run ids; NetworkPolicy live, 0 restarts"
-  - "15: tesote/infrastructure D2 on v2.0.1 (#791, 1d6b2c2e): 73/73 audited success, pool steady at 4, 0 reset warnings"
-  - "16: developerz-ai/developerz.ai #8760 merged (21145e9), deployed sha-d6afbb2, db_gateway integration connected d1+d2; live test pending runner release"
-  - "15 step 5: legacy developerz account retired (tesote#792); dz groups history_read (tesote#793)"
-  - "16 live: read + devops tiers on d1 and d2 via mothership proxy, gatewayRequestId joins platform and gateway audit rows (issue #8759)"
-  - "v2.0.2 (#300-#304) and v2.0.3 (#307-#309: migration 0016, rollback-tolerant migrator) live on D1 (sha-75ac3ab) and D2 (tesote#795)"
+  - "14: D1 infra PRs merged; live: coding reads all 5 DBs as *_ro, devops no-op write as *_rw, IdP-database write forbidden, reason_required, missing x-dbmcp-* rejected, history shows run ids; NetworkPolicy live, 0 restarts"
+  - "15: D2 on v2.0.1: 73/73 audited success, pool steady at 4, 0 reset warnings"
+  - "16: platform PR merged and deployed, gateway integration connected to D1 + D2; live test pending runner release"
+  - "15 step 5: legacy shared service account retired; platform groups gain history_read"
+  - "16 live: read + devops tiers on D1 and D2 via the control-plane proxy; the gateway request id joins platform and gateway audit rows"
+  - "v2.0.2 (#300-#304) and v2.0.3 (#307-#309: migration 0016, rollback-tolerant migrator) live on D1 (sha-75ac3ab) and D2"
   - "01: post-rollout re-measurement appended 2026-11-13; benchmark baseline from CI load gate (#305), captured after 04-06"
 notes: "Production measurements in 01 were taken 2026-11-12 (read-only); the benchmark baseline in 01 step 2 is still to be captured. Owner decisions are listed in overview.md Risks."
 last_updated: 2026-11-13

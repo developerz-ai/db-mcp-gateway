@@ -194,10 +194,9 @@ reviews:
     # CI workflows
     - path: ".github/workflows/**"
       instructions: |
-        Runners: GitHub-hosted only (public repo — org rule: private repos on
-        Ubicloud, public on GitHub-hosted). `ubuntu-latest` is the default;
-        `ubuntu-24.04-arm` for native arm64 jobs. Flag any Blacksmith,
-        Ubicloud or self-hosted runner label.
+        Runners: GitHub-hosted only (public repo). `ubuntu-latest` is the
+        default; `ubuntu-24.04-arm` for native arm64 jobs. Flag any runner
+        label that is not a GitHub-hosted one, self-hosted included.
         Pin every action to a full commit SHA with the version in a trailing
         comment (`uses: owner/action@<40-hex> # v3`, or `# stable` for
         toolchain-channel actions like `dtolnay/rust-toolchain`) — a tag or

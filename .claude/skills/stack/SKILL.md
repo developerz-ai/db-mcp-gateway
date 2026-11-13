@@ -3,7 +3,7 @@ description: Bring up the local Postgres, Mongo and MySQL stack the gateway and 
 applies: [rust]
 ---
 
-> House skill — established by dz-runner setup mode from this repo's own evidence, then owned by its maintainers. Correct it in place; setup never overwrites a skill that exists.
+> House skill — written from this repo's own evidence and owned by this repository's maintainers. Correct it in place; setup never overwrites a skill that exists.
 
 1. Bring the stack up: `bin/dev up` — it runs `docker compose -f docker-compose.dev.yml up -d --wait` and starts state-db (localhost:5433), target-db (localhost:5434), target-mongo (localhost:27018) and permissions-mysql (localhost:3307). fail -> a container never became healthy: `docker compose -f docker-compose.dev.yml ps` then `docker compose -f docker-compose.dev.yml logs <service>`.
 2. Confirm health: `docker compose -f docker-compose.dev.yml ps` must show every service `healthy`. The integration tests hard-code these ports; changing them means changing the fallback URLs in `tests/*.rs`.

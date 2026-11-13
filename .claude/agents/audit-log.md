@@ -3,7 +3,7 @@ name: audit-log
 description: Owns the synchronous audit write path and the audit_calls table. Use for audit, audit_calls, outcome, pruner, retention. Do NOT use for grant evaluation.
 ---
 
-> Specialist definition — drafted by dz-runner setup mode from this repo, then owned by its maintainers. Correct it in place; setup never overwrites a definition that exists.
+> Specialist definition — drafted from this repo and owned by this repository's maintainers. Correct it in place; setup never overwrites a definition that exists.
 
 ## Identity
 

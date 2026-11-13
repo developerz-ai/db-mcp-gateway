@@ -118,7 +118,7 @@ run_mint() {
 
 # Extract just the YAML stanza (lines between "service_accounts:" and the
 # first blank line that follows). The raw token is shown ONCE at the top of
-# the output by design (operator copies it into Vaultwarden), so checking
+# the output by design (operator copies it into the secret store), so checking
 # "raw token absent from output" is wrong — the assertion must scope to the
 # YAML block only, where the secret reference is the right surface.
 extract_stanza() {

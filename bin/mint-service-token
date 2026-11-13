@@ -9,7 +9,7 @@
 # the gateway: there is deliberately no in-band mint API.
 #
 # After minting:
-#   1. Store the token value in the org secret store (Vaultwarden) — the
+#   1. Store the token value in the org secret store of record — the
 #      value is shown ONCE here and is not recoverable from the gateway.
 #   2. Deliver it to the pod as a k8s Secret / SealedSecret mounted env var
 #      (or file + `${FILE:…}` ref).
@@ -44,7 +44,7 @@ env_var="SERVICE_TOKEN_$(tr 'a-z-' 'A-Z_' <<< "$name")"
 cat <<EOF
 token (store this — shown once): ${token}
 
-1. Put the value in Vaultwarden (org secret store of record), then deliver it
+1. Put the value in the org secret store of record, then deliver it
    to the gateway pod as env var ${env_var} (SealedSecret) — or as a mounted
    file and use \${FILE:/run/secrets/...} below instead.
 

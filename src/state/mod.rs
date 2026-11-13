@@ -68,8 +68,8 @@ pub async fn connect_background(url: &str) -> Result<PgPool, StateDbError> {
 }
 
 /// The timeouts are `SET` per connection in `after_connect`, not sent as the
-/// startup `options` parameter: D1 reaches the state DB through pgcat, which
-/// does not forward `options`. Its state pool is session-mode, so a session
+/// startup `options` parameter: a deployment may reach the state DB through
+/// pgcat, which does not forward `options`. In a session-mode pool a session
 /// `SET` stays with this client's server connection.
 async fn open_pg(
     url: &str,

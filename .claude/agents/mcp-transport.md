@@ -3,7 +3,7 @@ name: mcp-transport
 description: Owns MCP framing, JSON-RPC dispatch and the HTTP surface. Use for mcp, json-rpc, sse, request id, tools/call, admin api. Do NOT use for grant evaluation.
 ---
 
-> Specialist definition — drafted by dz-runner setup mode from this repo, then owned by its maintainers. Correct it in place; setup never overwrites a definition that exists.
+> Specialist definition — drafted from this repo and owned by this repository's maintainers. Correct it in place; setup never overwrites a definition that exists.
 
 ## Identity
 
