@@ -57,3 +57,36 @@ D1 state-DB statements for role `gateway` since 2026-10-06: `SELECT 1` (readyz) 
 
 - Every resource, pool-size and index decision in the plan cites a row here or a benchmark number.
 - A post-rollout measurement (agent traffic present) is appended.
+
+## Re-measurement 2026-11-13 (post-rollout, agent traffic present)
+
+D1 on 2.0.3 (`sha-75ac3ab`), D2 on 2.0.3 (tesote#795). Agent traffic: developerz.ai `db_*` tools (slice 16 live test), dz-coding / dz-devops service accounts, slice 14/15 live tests. Read-only: Prometheus queries over 24 h, pod status, gateway history.
+
+| Metric (D1, 24 h) | Value | Note |
+|---|---|---|
+| `query_duration_seconds` p50 / p95 | 15.8 ms / 45.4 ms | through pgcat |
+| `audit_write_duration_seconds` p95 | 24.6 ms | two-phase (intent + completion) |
+| Peak working set per pod | 20.0 MB | limit-sizing evidence for 14 step 1 (64Mi request holds) |
+| Peak CPU (5 m rate) | 1 mcore | 20m request holds |
+| `audit_abandoned_total`, `requests_shed_total` | 0 / 0 | no abandoned calls, no shedding |
+| Restarts | 0 | after every 2.0.x roll |
+
+`tool_calls` increases are understated: counters reset on each of the day's ~10 pod rolls.
+
+| Check (D2) | Result |
+|---|---|
+| Yugabyte reset fix (2.0.1) | 0 `connection reset failed` warnings; tesote_ai read pool steady at 4 connections over 72 calls |
+| 2.0.3 roll | migrations 15 + 16 applied, 0 restarts, 0 WARN/ERROR over 5 min |
+| Attribution | every dz call carries `upstream_run_id` = task id; platform `integration.used.gatewayRequestId` joins gateway audit rows (developerz.ai#8759) |
+
+### Benchmark baseline (step 2)
+
+Captured after 04–06 landed (2.0.2, `1ff42f5`), not before — the dev box's target port was unavailable. CI load gate, `ubuntu-latest`, 4 vCPU, concurrency 8, 2000 requests/shape; full file `benchmarks/baselines/ci-ubuntu-latest-postgres.json` (#305).
+
+| Shape | Direct p50 / p95 | Gateway p50 / p95 / p99 | Gateway req/s | Peak RSS |
+|---|---|---|---|---|
+| point_lookup | 1.0 / 1.6 ms | 5.5 / 8.2 / 9.7 ms | 1381 | 26 MiB |
+| range_scan (2000 rows) | 3.5 / 5.1 ms | 9.3 / 13.9 / 18.3 ms | 764 | 28 MiB |
+| aggregate | 11.7 / 19.1 ms | 16.5 / 24.2 / 28.6 ms | — | — |
+
+Gateway overhead ≈ 4.5–6 ms p50 per call (auth + authz + two audit writes + JSON). Pre-hardening comparison is not available; future runs compare against this file.
