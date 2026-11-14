@@ -19,13 +19,16 @@ use serde_json::Value;
 
 use super::app_state::McpState;
 use super::dispatch;
+use super::mcp_headers;
 use super::request_id::{ClientRequestId, GatewayRequestId};
 use super::upstream;
 use crate::auth::{Identity, ServicePolicy};
 use crate::mcp::jsonrpc::{self, ErrorObject, Request, RequestId};
+use crate::mcp::protocol::PROTOCOL_VERSION;
 use crate::tools;
 
 const TOOLS_CALL: &str = "tools/call";
+const INITIALIZE: &str = "initialize";
 const MCP_CLIENT_HEADER: HeaderName = HeaderName::from_static("x-mcp-client");
 
 /// Who `bearer_auth` authenticated: the `Identity` (absent only on the
@@ -72,10 +75,34 @@ pub(super) async fn post_handler(
                 .into_response();
         }
     };
+    if !mcp_headers::is_json_content_type(&headers) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(jsonrpc::Response::error(
+                Value::Null,
+                ErrorObject::invalid_request_with("Content-Type must be application/json"),
+            )),
+        )
+            .into_response();
+    }
     let request = match parse(&body) {
         Ok(request) => request,
         Err(response) => return Json(response).into_response(),
     };
+    // `initialize` is what negotiates the version, so only later requests are
+    // held to it.
+    if request.method != INITIALIZE && !mcp_headers::is_supported_protocol_version(&headers) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(jsonrpc::Response::error(
+                request.id.response_id(),
+                ErrorObject::invalid_request_with(format!(
+                    "unsupported MCP-Protocol-Version; this gateway speaks {PROTOCOL_VERSION}"
+                )),
+            )),
+        )
+            .into_response();
+    }
 
     let Caller { identity, policy } = caller;
     let user_sub = identity

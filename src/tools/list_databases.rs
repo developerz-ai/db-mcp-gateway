@@ -16,6 +16,7 @@ use crate::config::{Action, ConfigFile, Database, Grant};
 use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
+use super::args::parse_arguments;
 use super::audit_dispatch::{
     AuditHeader, Outcome, OutcomeCode, error_outcome, reject_arguments, run_audited,
     success_outcome,
@@ -24,6 +25,7 @@ use super::audit_dispatch::{
 const TOOL_NAME: &str = "list_databases";
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Arguments {
     pub server: String,
 }
@@ -42,11 +44,9 @@ struct ListDatabasesResult {
 }
 
 pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Response {
-    let args: Arguments = match arguments.map(serde_json::from_value::<Arguments>) {
-        Some(Ok(a)) => a,
-        _ => {
-            return reject_arguments(ctx, id, TOOL_NAME, "list_databases requires `server`").await;
-        }
+    let args: Arguments = match parse_arguments(arguments) {
+        Ok(args) => args,
+        Err(message) => return reject_arguments(ctx, id, TOOL_NAME, &message).await,
     };
 
     let header = AuditHeader {

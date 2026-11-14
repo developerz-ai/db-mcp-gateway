@@ -20,7 +20,10 @@ const ROLE_PLACEHOLDER: &str = "\"<role>\"";
 /// What a rejection means to the caller. Tools map each to a stable code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectionKind {
-    /// SQLSTATE `42501` (`insufficient_privilege`).
+    /// SQLSTATE `42501` (`insufficient_privilege`), or `25006`
+    /// (`read_only_sql_transaction`): a write attempted inside the read
+    /// tier's read-only transaction — e.g. by a function the guard cannot
+    /// see into — is a missing write privilege, not a syntax error.
     PermissionDenied,
     /// SQLSTATE `42P01` (`undefined_table`) or `42703` (`undefined_column`).
     UndefinedObject,
@@ -57,7 +60,7 @@ impl DbRejection {
 
     pub fn kind(&self) -> RejectionKind {
         match self.sqlstate.as_str() {
-            "42501" => RejectionKind::PermissionDenied,
+            "42501" | "25006" => RejectionKind::PermissionDenied,
             "42P01" | "42703" => RejectionKind::UndefinedObject,
             _ => RejectionKind::Other,
         }
@@ -78,6 +81,7 @@ mod tests {
     fn kind_follows_sqlstate() {
         let kind = |code| DbRejection::new(code, "m", "app").kind();
         assert_eq!(kind("42501"), RejectionKind::PermissionDenied);
+        assert_eq!(kind("25006"), RejectionKind::PermissionDenied);
         assert_eq!(kind("42P01"), RejectionKind::UndefinedObject);
         assert_eq!(kind("42703"), RejectionKind::UndefinedObject);
         assert_eq!(kind("42601"), RejectionKind::Other);

@@ -35,7 +35,10 @@ pub(super) struct TokenResponse {
 }
 
 /// Verified ID-token payload, narrowed to what the gateway actually uses.
+/// Built only by `OidcClient`, which refuses the reserved service prefix in
+/// `sub`; `non_exhaustive` keeps other crates from building one.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct VerifiedIdentity {
     pub sub: String,
     pub email: String,

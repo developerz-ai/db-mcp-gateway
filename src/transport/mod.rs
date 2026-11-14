@@ -20,6 +20,7 @@ mod auth_routes;
 mod bounds;
 mod dispatch;
 mod mcp_handler;
+mod mcp_headers;
 mod oauth;
 mod upstream;
 

@@ -25,7 +25,7 @@ use common::cleanup::{
     delete_permissions_audit, delete_permissions_database, delete_permissions_user,
 };
 use common::env::state_pool;
-use common::gateway::{EMPTY_YAML, GatewayBuilder};
+use common::gateway::GatewayBuilder;
 use db_mcp_gateway::auth::{AuthConfig, SessionStore, jwt};
 use db_mcp_gateway::state::permissions::{PermissionsRepo, pg::PgPermissionsRepo};
 use reqwest::StatusCode;
@@ -36,6 +36,30 @@ use sqlx::Row;
 use uuid::Uuid;
 
 const ADMIN_GROUP: &str = "db-mcp-gateway-admins";
+
+/// Databases may only be registered on a config-declared server, so declare
+/// every server these tests register on.
+const ADMIN_YAML: &str = "servers:
+  - name: prod
+    kind: postgres
+    description: admin e2e
+    host: prod.example.invalid
+    databases:
+      - { name: app, role: ro, password: hunter2 }
+  - name: staging
+    kind: postgres
+    description: admin e2e
+    host: staging.example.invalid
+    databases:
+      - { name: app, role: ro, password: hunter2 }
+  - name: docs
+    kind: postgres
+    description: admin e2e
+    host: docs.example.invalid
+    databases:
+      - { name: app, role: ro, password: hunter2 }
+permissions: []
+";
 
 async fn mint_session(
     sessions: &SessionStore,
@@ -81,7 +105,7 @@ impl Harness {
 async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
     let pool = state_pool().await;
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
-    let gw = GatewayBuilder::new(EMPTY_YAML)
+    let gw = GatewayBuilder::new(ADMIN_YAML)
         .admin(ADMIN_GROUP, true)
         .repo(repo)
         .spawn(pool)

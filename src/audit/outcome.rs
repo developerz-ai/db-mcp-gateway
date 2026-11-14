@@ -23,6 +23,7 @@ pub enum OutcomeCode {
     Timeout,
     SyntaxError,
     Unavailable,
+    UnsupportedBackend,
     Internal,
     Cancelled,
     Abandoned,
@@ -30,7 +31,7 @@ pub enum OutcomeCode {
 }
 
 impl OutcomeCode {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 16] = [
         Self::Success,
         Self::DryRun,
         Self::Forbidden,
@@ -42,6 +43,7 @@ impl OutcomeCode {
         Self::Timeout,
         Self::SyntaxError,
         Self::Unavailable,
+        Self::UnsupportedBackend,
         Self::Internal,
         Self::Cancelled,
         Self::Abandoned,
@@ -62,6 +64,7 @@ impl OutcomeCode {
             Self::Timeout => "timeout",
             Self::SyntaxError => "syntax_error",
             Self::Unavailable => "unavailable",
+            Self::UnsupportedBackend => "unsupported_backend",
             Self::Internal => "internal",
             Self::Cancelled => "cancelled",
             Self::Abandoned => "abandoned",
@@ -108,6 +111,7 @@ mod tests {
             (OutcomeCode::Timeout, "timeout"),
             (OutcomeCode::SyntaxError, "syntax_error"),
             (OutcomeCode::Unavailable, "unavailable"),
+            (OutcomeCode::UnsupportedBackend, "unsupported_backend"),
             (OutcomeCode::Internal, "internal"),
             (OutcomeCode::Cancelled, "cancelled"),
             (OutcomeCode::Abandoned, "abandoned"),

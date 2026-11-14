@@ -55,6 +55,22 @@ pub(super) fn routing_name(
     Ok(trimmed)
 }
 
+/// A server name the gateway config declares. Admin rows on any other server
+/// would sit dormant until a later config change silently armed them.
+pub(super) fn declared_server(
+    server: String,
+    known_servers: &[String],
+    request_id: &str,
+) -> Result<String, AdminError> {
+    if known_servers.contains(&server) {
+        return Ok(server);
+    }
+    Err(
+        AdminError::invalid("server must name a server declared in the gateway config")
+            .with_request_id(request_id),
+    )
+}
+
 /// Optimistic-concurrency precondition: when the caller names the
 /// `updated_at` it last read, a row changed since then is a 409.
 pub(super) fn check_unchanged(

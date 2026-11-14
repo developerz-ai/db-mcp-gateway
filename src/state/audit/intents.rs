@@ -15,11 +15,15 @@ use crate::exec::sql_guard::Access;
 /// dispatch and a dispatch reaches the target at most once, so a duplicate
 /// is a bug worth failing on.
 pub async fn insert_intent(pool: &PgPool, intent: &CallIntent<'_>) -> Result<(), sqlx::Error> {
+    let (sql, sql_truncated) = match intent.sql.map(crate::audit::cap_stored_sql) {
+        Some((sql, truncated)) => (Some(sql), truncated),
+        None => (None, false),
+    };
     sqlx::query(
         "INSERT INTO audit_call_intents \
          (request_id, user_sub, user_email, tool, server_name, database_name, db_type, access, \
-          upstream_actor, upstream_run_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+          upstream_actor, upstream_run_id, sql, sql_truncated, reason) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
     )
     .bind(intent.request_id.to_string())
     .bind(intent.user_sub)
@@ -31,6 +35,9 @@ pub async fn insert_intent(pool: &PgPool, intent: &CallIntent<'_>) -> Result<(),
     .bind(access_label(intent.access))
     .bind(intent.upstream_actor)
     .bind(intent.upstream_run_id)
+    .bind(sql)
+    .bind(sql_truncated)
+    .bind(intent.reason)
     .execute(pool)
     .await?;
     Ok(())
@@ -145,11 +152,13 @@ pub async fn reap_abandoned_batch(
          ), reaped AS ( \
            INSERT INTO audit_calls \
            (id, request_id, user_sub, user_email, tool, server_name, database_name, db_type, \
-            outcome, error_message, occurred_at, upstream_actor, upstream_run_id) \
+            outcome, error_message, occurred_at, upstream_actor, upstream_run_id, \
+            sql, sql_truncated, reason) \
            SELECT gen_random_uuid(), i.request_id, i.user_sub, i.user_email, i.tool, \
                   i.server_name, i.database_name, i.db_type, $1, \
                   'no completion recorded before the gateway stopped (access: ' || i.access || ')', \
-                  i.occurred_at, i.upstream_actor, i.upstream_run_id \
+                  i.occurred_at, i.upstream_actor, i.upstream_run_id, \
+                  i.sql, i.sql_truncated, i.reason \
            FROM scanned s JOIN audit_call_intents i ON i.request_id = s.request_id \
            WHERE NOT EXISTS (SELECT 1 FROM audit_calls c WHERE c.request_id = i.request_id) \
            RETURNING 1 \

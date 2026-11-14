@@ -8,6 +8,7 @@
 //! MUST go through a credential-free view type (see `SafeServerView`); never
 //! serialize a `crate::config::Server` to the wire.
 
+mod args;
 pub mod audit_dispatch;
 pub mod cancel_query;
 mod context;
@@ -129,6 +130,23 @@ pub async fn dispatch_call(id: Value, ctx: ToolCtx<'_>, params: Option<Value>) -
     // refused before any tool runs — and audited like any bad argument.
     if let Upstream::Rejected(message) = ctx.request.upstream {
         return audit_dispatch::reject_arguments(ctx, id, audited_tool_name(&call.name), message)
+            .await;
+    }
+
+    // The argument edge: nothing unbounded or control-bearing reaches the
+    // span, the intent row, the target or the audit row. Audited untargeted,
+    // so the refused value is never written anywhere.
+    if call.name.chars().any(char::is_control) {
+        return audit_dispatch::reject_arguments(
+            ctx,
+            id,
+            UNKNOWN_TOOL,
+            "`name` contains a control character",
+        )
+        .await;
+    }
+    if let Some(Err(message)) = call.arguments.as_ref().map(args::check_arguments) {
+        return audit_dispatch::reject_arguments(ctx, id, audited_tool_name(&call.name), &message)
             .await;
     }
 

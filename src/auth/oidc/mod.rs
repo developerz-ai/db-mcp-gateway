@@ -26,6 +26,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::config::AuthConfig;
 use super::errors::AuthError;
+use super::session::is_service_subject;
 
 /// OIDC Relying Party client. Cheap to clone; shares the inner cache.
 #[derive(Clone, Debug)]
@@ -199,6 +200,13 @@ impl OidcClient {
             .and_then(|v| v.as_str())
             .ok_or(AuthError::IdToken)?
             .to_string();
+        if is_service_subject(&sub) {
+            // The subject itself stays out of the log: it is IdP-controlled.
+            tracing::warn!(
+                "ID token subject uses the reserved service-account prefix; login refused"
+            );
+            return Err(AuthError::IdToken);
+        }
         // Email is the audit/admin identity: persisted to `permissions_users`
         // and stamped on every audit row. Many IdPs let a user set an arbitrary
         // address that stays `email_verified: false`, so trusting an unverified

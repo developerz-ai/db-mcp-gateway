@@ -15,6 +15,7 @@ use crate::exec::{Access, TableStatsQuery};
 use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
+use super::args::parse_arguments;
 use super::audit_dispatch::{
     AuditHeader, Outcome, ToolErrorMessages, outcome_from_exec_error, reject_arguments, run_audited,
 };
@@ -46,14 +47,9 @@ pub struct Arguments {
 }
 
 pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Response {
-    let Some(Ok(args)) = arguments.map(serde_json::from_value::<Arguments>) else {
-        return reject_arguments(
-            ctx,
-            id,
-            TOOL_NAME,
-            "table_stats requires `server` and `database` arguments",
-        )
-        .await;
+    let args: Arguments = match parse_arguments(arguments) {
+        Ok(args) => args,
+        Err(message) => return reject_arguments(ctx, id, TOOL_NAME, &message).await,
     };
 
     let schema = args.schema.as_deref().unwrap_or(DEFAULT_SCHEMA);
@@ -71,7 +67,7 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
     };
     let args = &args;
     run_audited(ctx, id, header, |id, grants| async move {
-        compute_outcome(ctx, id, &grants, args, schema).await
+        compute_outcome(ctx, id, &grants, &header, args, schema).await
     })
     .await
 }
@@ -80,6 +76,7 @@ async fn compute_outcome(
     ctx: ToolCtx<'_>,
     id: Value,
     db_grants: &[Grant],
+    header: &AuditHeader<'_>,
     args: &Arguments,
     schema: &str,
 ) -> Outcome {
@@ -95,7 +92,7 @@ async fn compute_outcome(
     if let Err(rejected) = ensure_reason(&target.constraints, args.reason.as_deref()) {
         return *rejected;
     }
-    if let Err(refused) = record_intent(ctx, TOOL_NAME, &target, Access::ReadOnly).await {
+    if let Err(refused) = record_intent(ctx, header, &target, Access::ReadOnly).await {
         return *refused;
     }
 

@@ -88,7 +88,7 @@ Operators should enforce this at deployment time (reverse-proxy validation, netw
 
 Accepts JSON. Required field: `redirect_uris` (1–8 entries, each at most 2048 bytes). Optional: `client_name`. A body that is not valid JSON gets `invalid_client_metadata` (RFC 7591 §3.2.2).
 
-Each redirect URI must be **HTTPS** (any host) or **HTTP with a loopback host** (`localhost`, `127.0.0.0/8`, `::1`). Anything else — including `http://` to a non-loopback host, or more/longer URIs than the bounds above — is rejected with `invalid_redirect_uri`.
+Each redirect URI must be **HTTPS** (any host) or **HTTP with a loopback host** (`localhost`, `127.0.0.0/8`, `::1`). Anything else — including `http://` to a non-loopback host, or more/longer URIs than the bounds above — is rejected with `invalid_redirect_uri`. A redirect URI carrying a fragment — even an empty `#` — is rejected the same way (RFC 6749 §3.1.2), both here and on the loopback-adopt path of `/authorize`.
 
 Returns `{ "client_id": "mcp-<uuid>", "redirect_uris": […], "token_endpoint_auth_method": "none", "grant_types": ["authorization_code", "refresh_token"], "response_types": ["code"] }`.
 
@@ -297,7 +297,7 @@ Recommended values by risk tolerance:
 | Field | Source |
 |---|---|
 | `user_email` | OIDC `email` claim — required, and only trusted when the token also asserts `email_verified == true` (see Failure modes) |
-| `user_id` | OIDC `sub` |
+| `user_id` | OIDC `sub` — never starting with the reserved `service:` prefix (see Failure modes) |
 | `groups` | snapshot at token issue time |
 | `session_id` | gateway-issued, links to login event |
 | `agent_client` | self-reported by the MCP client (`claude-code/0.x`, `cursor/x.y`, …) |
@@ -316,6 +316,7 @@ Recommended values by risk tolerance:
 | Group changed mid-session | Old group snapshot applies until re-login (documented; reduces every-request IdP load) |
 | Token leaked | Revoke via admin command; user re-runs login |
 | Session revoked under HA | Effective immediately on the revoking replica (cache evicted); on other replicas honored until their session-cache entry ages out (≤ `SESSION_CACHE_TTL_SECONDS`, default 30s), then re-validated against the DB |
+| ID token `sub` starts with `service:` (any case) | Login rejected (`oidc_id_token_invalid`, server-side warn names the reason, not the subject). The prefix is reserved for YAML service identities (spec 14); a pre-existing session or refresh chain with such a subject is refused too |
 | ID token has no `email`, or `email_verified` is not `true` | Login rejected (`oidc_email_unverified`). Email is the audit/admin identity, so an absent or unverified — often user-settable — address is never minted into a session |
 | ID token is expired (`exp`) or not yet valid (`nbf`) | Login rejected (`oidc_id_token_invalid`). Both claims are enforced; a future-dated `nbf` token is refused before any claim is trusted |
 

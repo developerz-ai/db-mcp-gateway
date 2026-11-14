@@ -23,6 +23,11 @@ pub struct CallIntent<'a> {
     pub db_type: Option<&'static str>,
     /// Whether the call may write; an abandoned write may have committed.
     pub access: Access,
+    /// What the call runs, as the completion row would record it (capped at
+    /// [`super::AUDIT_SQL_MAX_BYTES`] on insert), so an `abandoned` row still
+    /// says what may have run.
+    pub sql: Option<&'a str>,
+    pub reason: Option<&'a str>,
     /// The caller's claimed upstream attribution, carried so an `abandoned`
     /// row keeps it (see [`crate::audit::AuditRow::upstream_actor`]).
     pub upstream_actor: Option<&'a str>,

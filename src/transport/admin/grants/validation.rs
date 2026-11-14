@@ -8,7 +8,7 @@ use crate::config::Constraints;
 use crate::state::permissions::{GrantAction, GrantTarget, RepoError};
 
 use super::super::error::AdminError;
-use super::super::validation::{store_error, trimmed_non_empty};
+use super::super::validation::{declared_server, store_error, trimmed_non_empty};
 use super::dto::CreateGrantRequest;
 
 /// Parse the request body's target fields into a `GrantTarget`, rejecting
@@ -33,12 +33,7 @@ pub(super) fn parse_grant_target(
         }),
         (None, Some(server), true) => {
             let server = trimmed_non_empty(server, "server", request_id)?;
-            if !known_servers.contains(&server) {
-                return Err(AdminError::invalid(
-                    "server must name a server declared in the gateway config",
-                )
-                .with_request_id(request_id));
-            }
+            let server = declared_server(server, known_servers, request_id)?;
             Ok(GrantTarget::Wildcard { server })
         }
         _ => Err(AdminError::invalid(

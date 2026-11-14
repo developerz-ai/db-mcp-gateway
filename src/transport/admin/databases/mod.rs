@@ -42,6 +42,9 @@ pub struct DatabasesState {
     pub repo: Arc<dyn PermissionsRepo>,
     pub state_db: PgPool,
     pub cache: PermissionsCache,
+    /// Server names the gateway config declares — the only servers a
+    /// database may be registered on.
+    pub known_servers: Arc<[String]>,
 }
 
 impl std::fmt::Debug for DatabasesState {
@@ -50,6 +53,7 @@ impl std::fmt::Debug for DatabasesState {
             .field("repo", &"<Arc<dyn PermissionsRepo>>")
             .field("state_db", &"<PgPool>")
             .field("cache", &self.cache)
+            .field("known_servers", &self.known_servers)
             .finish()
     }
 }

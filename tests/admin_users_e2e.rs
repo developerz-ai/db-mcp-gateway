@@ -43,6 +43,24 @@ use sqlx::PgPool;
 use sqlx::Row;
 use uuid::Uuid;
 
+/// Databases may only be registered on a config-declared server, so declare
+/// every server these tests register on.
+const ADMIN_YAML: &str = "servers:
+  - name: prod
+    kind: postgres
+    description: admin e2e
+    host: prod.example.invalid
+    databases:
+      - { name: app, role: ro, password: hunter2 }
+  - name: cap
+    kind: postgres
+    description: admin e2e
+    host: cap.example.invalid
+    databases:
+      - { name: app, role: ro, password: hunter2 }
+permissions: []
+";
+
 const ADMIN_GROUP: &str = "db-mcp-gateway-admins";
 
 /// Insert a session row, mint a JWT for it, and return both.
@@ -101,7 +119,7 @@ async fn spawn_gateway_inner(
 ) -> (Harness, AuthConfig, SessionStore) {
     let pool = state_pool().await;
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
-    let mut builder = GatewayBuilder::new(EMPTY_YAML)
+    let mut builder = GatewayBuilder::new(ADMIN_YAML)
         .admin(ADMIN_GROUP, true)
         .repo(repo);
     if let Some(cache) = cache {
@@ -1580,7 +1598,7 @@ async fn admin_routes_are_concurrency_capped_per_identity() {
         .await
         .expect("state DB up");
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
-    let gw = GatewayBuilder::new(EMPTY_YAML)
+    let gw = GatewayBuilder::new(ADMIN_YAML)
         .admin(ADMIN_GROUP, true)
         .repo(repo)
         .spawn(pool.clone())

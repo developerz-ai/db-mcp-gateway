@@ -47,7 +47,7 @@ pub async fn register(
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_redirect_uri",
-            "redirect_uris must hold 1-8 URIs of at most 2048 bytes; each loopback or https",
+            "redirect_uris must hold 1-8 URIs of at most 2048 bytes; each loopback or https, without a fragment",
         );
     }
     let client_id = format!("mcp-{}", Uuid::new_v4().simple());
@@ -97,13 +97,14 @@ pub(super) fn redirect_uris_acceptable(uris: &[String]) -> bool {
 }
 
 /// A redirect URI the gateway will *record* at registration: HTTPS (any host)
-/// or an HTTP loopback address (MCP spec §Communication Security). Anything else
-/// is rejected up front so the `/authorize` allowlist only holds safe targets.
+/// or an HTTP loopback address (MCP spec §Communication Security), with no
+/// fragment (RFC 6749 §3.1.2). Anything else is rejected up front so the
+/// `/authorize` allowlist only holds safe targets.
 /// This is the registration gate; `/authorize` additionally requires an exact
 /// match against a registered URI (see [`redirect_uri_matches`]).
 pub fn is_valid_redirect_uri(raw: &str) -> bool {
     match Url::parse(raw) {
-        Ok(url) => url.scheme() == "https" || is_http_loopback(&url),
+        Ok(url) => url.fragment().is_none() && (url.scheme() == "https" || is_http_loopback(&url)),
         Err(_) => false,
     }
 }
@@ -165,6 +166,18 @@ mod tests {
         assert!(!is_valid_redirect_uri("http://evil.example.com/cb"));
         assert!(!is_valid_redirect_uri("ftp://localhost/cb"));
         assert!(!is_valid_redirect_uri("not a url"));
+    }
+
+    /// RFC 6749 §3.1.2: a redirection endpoint URI MUST NOT include a
+    /// fragment component — not even an empty one.
+    #[test]
+    fn redirect_uri_with_fragment_is_rejected() {
+        assert!(!is_valid_redirect_uri("https://app.example.com/cb#frag"));
+        assert!(!is_valid_redirect_uri("https://app.example.com/cb#"));
+        assert!(!is_valid_redirect_uri("http://127.0.0.1:9/cb#x"));
+        assert!(!redirect_uris_acceptable(&[
+            "http://localhost:9/cb#a".to_string()
+        ]));
     }
 
     #[test]

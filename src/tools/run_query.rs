@@ -16,6 +16,7 @@ use crate::exec::{Access, ExecQuery, ExecResult, GuardedSql};
 use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
+use super::args::parse_arguments;
 use super::audit_dispatch::{
     AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, WriteEffect, error_outcome,
     invalid_arguments, outcome_from_exec_error, reject_arguments, run_audited, success_outcome,
@@ -34,6 +35,7 @@ const ERROR_MESSAGES: ToolErrorMessages = ToolErrorMessages {
 const DEFAULT_ROW_LIMIT: u32 = 1000;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Arguments {
     pub server: String,
     pub database: String,
@@ -65,17 +67,9 @@ const DRY_RUN_NEEDS_WRITE: &str =
     "`dry_run` applies only to an INSERT/UPDATE/DELETE under a query_write grant";
 
 pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Response {
-    let args: Arguments = match arguments.map(serde_json::from_value::<Arguments>) {
-        Some(Ok(a)) => a,
-        _ => {
-            return reject_arguments(
-                ctx,
-                id,
-                TOOL_NAME,
-                "run_query requires `server`, `database`, `sql` arguments",
-            )
-            .await;
-        }
+    let args: Arguments = match parse_arguments(arguments) {
+        Ok(args) => args,
+        Err(message) => return reject_arguments(ctx, id, TOOL_NAME, &message).await,
     };
 
     let header = AuditHeader {
@@ -88,7 +82,7 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
     };
     let args = &args;
     run_audited(ctx, id, header, |id, grants| async move {
-        compute_outcome(ctx, id, &grants, args).await
+        compute_outcome(ctx, id, &grants, &header, args).await
     })
     .await
 }
@@ -97,6 +91,7 @@ async fn compute_outcome(
     ctx: ToolCtx<'_>,
     id: Value,
     db_grants: &[Grant],
+    header: &AuditHeader<'_>,
     args: &Arguments,
 ) -> Outcome {
     // Constraints come from the read-level merge: it matches *every* grant that
@@ -165,7 +160,7 @@ async fn compute_outcome(
         "tool.run_query.dispatch"
     );
 
-    if let Err(refused) = record_intent(ctx, TOOL_NAME, &target, access).await {
+    if let Err(refused) = record_intent(ctx, header, &target, access).await {
         return *refused;
     }
 

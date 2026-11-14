@@ -184,3 +184,15 @@ fn read_mode_rejects_writes_write_mode_gates_them() {
     ));
     assert!(check_sql("INSERT INTO t VALUES (1)", Access::ReadWrite).is_ok());
 }
+
+/// The refusal wording must hold in the write tier too, where INSERT /
+/// UPDATE / DELETE are admitted.
+#[test]
+fn not_allowed_message_is_accurate_in_both_tiers() {
+    let read = is_read_only("DROP TABLE t").expect_err("DDL refused");
+    let write = check_sql("DROP TABLE t", Access::ReadWrite).expect_err("DDL refused");
+    for msg in [read.to_string(), write.to_string()] {
+        assert!(!msg.contains("only SELECT and EXPLAIN"), "{msg}");
+        assert!(msg.contains("INSERT/UPDATE/DELETE"), "{msg}");
+    }
+}

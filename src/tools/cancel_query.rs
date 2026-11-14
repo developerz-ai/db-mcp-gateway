@@ -18,6 +18,7 @@ use crate::exec::Access;
 use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
+use super::args::parse_arguments;
 use super::audit_dispatch::{
     AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, audit_outcome, error_outcome,
     invalid_arguments, outcome_from_exec_error, reject_arguments, run_audited, success_outcome,
@@ -48,14 +49,9 @@ struct SuccessPayload {
 }
 
 pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Response {
-    let Some(Ok(args)) = arguments.map(serde_json::from_value::<Arguments>) else {
-        return reject_arguments(
-            ctx,
-            id,
-            TOOL_NAME,
-            "cancel_query requires `server`, `database`, `request_id` arguments",
-        )
-        .await;
+    let args: Arguments = match parse_arguments(arguments) {
+        Ok(args) => args,
+        Err(message) => return reject_arguments(ctx, id, TOOL_NAME, &message).await,
     };
     // The audit row's `sql` names the request this call targets.
     let header = AuditHeader {
@@ -72,7 +68,7 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
     };
     let args = &args;
     run_audited(ctx, id, header, |id, grants| async move {
-        compute_outcome(ctx, id, &grants, args, victim).await
+        compute_outcome(ctx, id, &grants, &header, args, victim).await
     })
     .await
 }
@@ -81,6 +77,7 @@ async fn compute_outcome(
     ctx: ToolCtx<'_>,
     id: Value,
     db_grants: &[Grant],
+    header: &AuditHeader<'_>,
     args: &Arguments,
     victim: Uuid,
 ) -> Outcome {
@@ -99,7 +96,7 @@ async fn compute_outcome(
     if let Err(rejected) = ensure_owned(ctx, &target, victim).await {
         return *rejected;
     }
-    if let Err(refused) = record_intent(ctx, TOOL_NAME, &target, Access::ReadOnly).await {
+    if let Err(refused) = record_intent(ctx, header, &target, Access::ReadOnly).await {
         return *refused;
     }
 
