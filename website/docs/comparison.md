@@ -104,7 +104,7 @@ permissions:
 | **Development Time** | Hours (initial) | Days (setup) |
 | **Maintenance Burden** | High (ongoing) | Low (upstream) |
 | **Security Features** | Basic (DIY) | Complete (SSO + audit) |
-| **Multi-Database** | Reinvent per DB type | Built-in (PG + Mongo) |
+| **Multi-Database** | Reinvent per DB type | Built-in (PG, YugabyteDB, Mongo, Redis) |
 | **Compliance Ready** | ❌ Build yourself | ✅ Built-in |
 | **Performance** | Yours to tune | [Measured](benchmarks.md) |
 | **Error Handling** | Custom | Typed errors with stable codes |
@@ -188,7 +188,7 @@ should evaluate that option.
 | **Gateway-specific work per query** | Pool checkout | Authz check, query guard, synchronous audit write |
 | **User Tracking** | Connection name only | Full query attribution |
 | **Configuration** | INI files | YAML + git |
-| **Multi-Database** | PostgreSQL only | PG + Mongo |
+| **Multi-Database** | PostgreSQL only | PG, YugabyteDB, Mongo, Redis |
 
 ### VSQL (General SQL Proxy)
 
@@ -339,7 +339,7 @@ from, so we are not going to invent one.
 | **Audit Trail** | ❌ None | ⚠️ Optional | ❌ Basic | ❌ Basic | ✅ Complete |
 | **SSO Integration** | ❌ No | ⚠️ DIY | ❌ No | ❌ No | ✅ Built-in |
 | **User Attribution** | ❌ Shared | ⚠️ DIY | ❌ IP-based | ❌ Connection name | ✅ Per-query SSO |
-| **Multi-Database** | ✅ Native | ❌ Reinvent | ❌ MySQL only | ❌ PG only | ✅ PG+Mongo |
+| **Multi-Database** | ✅ Native | ❌ Reinvent | ❌ MySQL only | ❌ PG only | ✅ PG+Mongo+Redis |
 | **MCP Protocol** | ❌ No | ✅ Yes | ❌ No | ❌ No | ✅ Yes |
 | **Configuration** | Ad-hoc | Custom code | SQL/Tables | INI files | ✅ YAML + Git |
 | **Maintenance** | Ongoing | High | Medium | Low | ✅ Low (upstream) |

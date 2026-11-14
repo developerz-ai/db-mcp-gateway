@@ -23,7 +23,9 @@ pub enum RejectionKind {
     /// SQLSTATE `42501` (`insufficient_privilege`), or `25006`
     /// (`read_only_sql_transaction`): a write attempted inside the read
     /// tier's read-only transaction — e.g. by a function the guard cannot
-    /// see into — is a missing write privilege, not a syntax error.
+    /// see into — is a missing write privilege, not a syntax error. Also a
+    /// Redis `NOPERM` reply: the ACL user may not run that command or touch
+    /// that key.
     PermissionDenied,
     /// SQLSTATE `42P01` (`undefined_table`) or `42703` (`undefined_column`).
     UndefinedObject,
@@ -33,6 +35,7 @@ pub enum RejectionKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbRejection {
+    /// A Postgres SQLSTATE, or a Redis error code (`NOPERM`, `WRONGTYPE`).
     sqlstate: String,
     message: String,
 }
@@ -60,7 +63,9 @@ impl DbRejection {
 
     pub fn kind(&self) -> RejectionKind {
         match self.sqlstate.as_str() {
-            "42501" | "25006" => RejectionKind::PermissionDenied,
+            // Redis error codes are upper-case words, never five-character
+            // SQLSTATEs, so the two code spaces cannot collide.
+            "42501" | "25006" | "NOPERM" => RejectionKind::PermissionDenied,
             "42P01" | "42703" => RejectionKind::UndefinedObject,
             _ => RejectionKind::Other,
         }
@@ -85,6 +90,8 @@ mod tests {
         assert_eq!(kind("42P01"), RejectionKind::UndefinedObject);
         assert_eq!(kind("42703"), RejectionKind::UndefinedObject);
         assert_eq!(kind("42601"), RejectionKind::Other);
+        assert_eq!(kind("NOPERM"), RejectionKind::PermissionDenied);
+        assert_eq!(kind("WRONGTYPE"), RejectionKind::Other);
     }
 
     #[test]

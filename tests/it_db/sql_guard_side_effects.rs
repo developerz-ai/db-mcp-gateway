@@ -9,8 +9,8 @@ use std::time::Duration;
 use sqlx::postgres::PgListener;
 use uuid::Uuid;
 
+use crate::common::pg_target::owner_url;
 use crate::common::pg_target::{READ_ROLE, writable_adapter};
-use crate::common::pg_target::{TARGET_DB, TARGET_HOST, TARGET_PASSWORD, TARGET_PORT, TARGET_USER};
 use db_mcp_gateway::exec::sql_guard::{GuardError, check_sql};
 use db_mcp_gateway::exec::{Access, DbAdapter, ExecQuery};
 
@@ -27,10 +27,9 @@ fn read_query(sql: &str) -> ExecQuery<'_> {
 }
 
 async fn listener(channel: &str) -> PgListener {
-    let url = format!(
-        "postgres://{TARGET_USER}:{TARGET_PASSWORD}@{TARGET_HOST}:{TARGET_PORT}/{TARGET_DB}"
-    );
-    let mut listener = PgListener::connect(&url).await.expect("listener connects");
+    let mut listener = PgListener::connect(&owner_url())
+        .await
+        .expect("listener connects");
     listener.listen(channel).await.expect("LISTEN");
     listener
 }

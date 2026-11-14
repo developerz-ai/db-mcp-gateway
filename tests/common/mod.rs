@@ -15,3 +15,4 @@ pub mod idp;
 pub mod mongo_target;
 pub mod offline;
 pub mod pg_target;
+pub mod redis_target;

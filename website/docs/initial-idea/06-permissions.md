@@ -11,7 +11,7 @@ group  ⨯  (server, database)  ⨯  action  ⨯  constraints  →  allowed
 | Piece | Meaning |
 |---|---|
 | **Group** | An SSO group claim (e.g. `backend-engineers`, `oncall`, `data-platform`). Synced from IdP. |
-| **Server / database** | Logical names from the config — never raw hosts. |
+| **Server / database** | Logical names from the config — never raw hosts. On a `redis` server the database is the numeric logical DB index (`prod-cache/0`). |
 | **Action** | `schema_read`, `query_read`, `query_write`, `history_read`. |
 | **Constraint** | Per-grant overrides: `require_reason`, `row_limit`, `statement_timeout_ms`. A business-hours `time_window` is roadmap ([11](11-roadmap.md)). |
 
@@ -19,13 +19,15 @@ A request is allowed iff *some* grant matches. Denies are not explicit — absen
 
 **Table and schema scoping belongs to the target-DB role, not to a grant.** There is no `allowed_schemas` / `denied_tables` constraint: a SQL parser cannot see through views, functions or `search_path`, so a gateway-side table list would be a promise it cannot keep. Grant the database role exactly the tables it may read (`GRANT SELECT ON …`); that is the boundary the database itself enforces for every statement.
 
+The same holds for keys on a Redis target: there is no `allowed_keys` constraint. Scope the ACL user the gateway logs in as — `ACL SETUSER gateway_ro on >… resetkeys %R~app:* resetchannels -@all +@read -keys` grants read-only access to the *values* under `app:*` and nothing else, and Redis enforces it on every command that names a key. ACL key patterns do **not** filter `SCAN` or `DBSIZE`: that user still sees other key *names* through `SCAN` (verified on Redis and Dragonfly). When key names are sensitive, add `-scan -dbsize`; a non-zero DB index also needs `+select`. Recipe and each part explained in [config-reference §Redis](../deployment/config-reference.md#redis). On Mongo, the role's per-database (or per-collection) privileges play the same part.
+
 ## Actions in detail
 
 | Action | What it unlocks |
 |---|---|
 | `schema_read` | `list_databases`, `describe_schema`, `table_stats`, `db_activity` (own requests only) |
 | `query_read` | `run_query` with read-only enforcement, `explain` (incl. `analyze: true` on reads), `sample_table` (size-capped), `cancel_query` (own requests only) |
-| `query_write` | `run_query` data writes (single `INSERT` / `UPDATE` / `DELETE`, optionally `dry_run`) and `explain` of them, run as the database's `write_role` — which must exist in config and hold write privileges |
+| `query_write` | `run_query` data writes (single `INSERT` / `UPDATE` / `DELETE`, optionally `dry_run`) and `explain` of them, run as the database's `write_role` — which must exist in config and hold write privileges. Postgres only. Mongo and Redis targets have no write path: `write_role` on them fails boot, so a YAML `query_write` grant matching one fails boot, and a DB-backed one is refused with `forbidden` |
 | `history_read` | Read your *own* query history via the `get_query_history` tool ([#169](https://github.com/developerz-ai/db-mcp-gateway/issues/169)). Scoping is on the SSO-verified identity, never a client-supplied user field. Admin-only history access remains via the state DB. |
 
 `query_read` implies `schema_read`. `query_write` implies `query_read`.

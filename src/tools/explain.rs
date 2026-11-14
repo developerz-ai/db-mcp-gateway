@@ -101,9 +101,9 @@ async fn compute_outcome(
         return *rejected;
     }
 
-    // The plan comes from Postgres' EXPLAIN; a Mongo target has no SQL to
-    // parse, so it is answered before the parser can call it malformed.
-    if target.server.kind == ServerKind::Mongo {
+    // The plan comes from Postgres' EXPLAIN; a Mongo or Redis target has no
+    // SQL to parse, so it is answered before the parser can call it malformed.
+    if matches!(target.server.kind, ServerKind::Mongo | ServerKind::Redis) {
         return error_outcome(
             OutcomeCode::UnsupportedBackend,
             "explain is not supported on this database's backend",

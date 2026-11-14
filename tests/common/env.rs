@@ -16,11 +16,10 @@ pub fn state_db_url() -> String {
     })
 }
 
-/// Target Postgres (:5434) as a plain DSN, for monitor connections that
-/// bypass the adapter.
+/// Target Postgres (:5434, or `TARGET_DB_PORT`) as a plain DSN, for monitor
+/// connections that bypass the adapter.
 pub fn target_db_url() -> String {
-    std::env::var("TARGET_DB_URL")
-        .unwrap_or_else(|_| "postgres://app:app-dev-only@localhost:5434/app".into())
+    std::env::var("TARGET_DB_URL").unwrap_or_else(|_| super::pg_target::owner_url())
 }
 
 /// MySQL permissions store (:3307).

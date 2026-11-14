@@ -7,14 +7,14 @@ The set of tools the gateway exposes to agents. This is the agent-facing contrac
 1. **Read-only by default.** A write-capable tool exists only if [06-permissions](06-permissions.md) explicitly enables it for the calling identity.
 2. **Every tool accepts `server` + `database`** (except `list_servers` / `list_databases`). The pair fully scopes the call.
 3. **`reason` is optional in the protocol but may be required by policy.** If policy requires it and it's absent, the gateway returns a structured error telling the agent to ask the user for one.
-4. **Results are size-capped.** `run_query` and `sample_table` accept a caller-supplied `limit`; most-restrictive-wins: the effective row limit is `min(caller.limit, grant.row_limit, gateway-ceiling)`. The **gateway-wide ceiling is 100,000 rows** and applies regardless of what the caller asks for or whether the grant sets `row_limit` — an absent or oversized grant still clamps to the ceiling, never "unbounded". A grant may only tighten below the ceiling; it may not loosen past it. When neither the caller nor the grant names a limit, `run_query` defaults to **1,000 rows** and `sample_table` defaults to **10 rows**. Results are also capped at **32 MiB of decoded values** per call (`exec::MAX_RESULT_BYTES`), whatever the row limit: past it the gateway stops collecting and sets `truncated: true`, exactly as for the row cap. Mongo commands get the same row and byte budget; `find` and `aggregate` also carry a server-side limit of `row_limit + 1`. Other result-returning tools (`list_servers`, `list_databases`, `describe_schema`, `explain`) do not accept a caller `limit`; they enforce internal caps sized to their output shape.
+4. **Results are size-capped.** `run_query` and `sample_table` accept a caller-supplied `limit`; most-restrictive-wins: the effective row limit is `min(caller.limit, grant.row_limit, gateway-ceiling)`. The **gateway-wide ceiling is 100,000 rows** and applies regardless of what the caller asks for or whether the grant sets `row_limit` — an absent or oversized grant still clamps to the ceiling, never "unbounded". A grant may only tighten below the ceiling; it may not loosen past it. When neither the caller nor the grant names a limit, `run_query` defaults to **1,000 rows** and `sample_table` defaults to **10 rows**. Results are also capped at **32 MiB of decoded values** per call (`exec::MAX_RESULT_BYTES`), whatever the row limit: past it the gateway stops collecting and sets `truncated: true`, exactly as for the row cap. Mongo commands get the same row and byte budget; `find` and `aggregate` also carry a server-side limit of `row_limit + 1`. Redis replies get the same row and byte budget; the `SCAN` family also carries a `COUNT` of at most 1,000. Other result-returning tools (`list_servers`, `list_databases`, `describe_schema`, `explain`) do not accept a caller `limit`; they enforce internal caps sized to their output shape.
 5. **No tool exposes credentials, connection strings, or hostnames.** Servers and databases are referenced by their config-defined logical name.
 
 ## Tools
 
 ### `list_servers`
 
-Returns the servers the caller can see — logical name, kind (`postgres`, `mysql`, `mssql`, …), human description. No connection info.
+Returns the servers the caller can see — logical name, kind (`postgres`, `mongo`, `redis`), human description. No connection info. The kind is the configured `server.kind`, so a YugabyteDB (YSQL) target, declared `kind: postgres`, reports `postgres`; a Dragonfly, Valkey or KeyDB target reports `redis`. `mysql` / `mssql` never appear: boot refuses them ([08-config](08-config.md)).
 
 ### `list_databases`
 
@@ -26,9 +26,11 @@ Args: `server`, `database`, optional `schema` (default `public`), optional `tabl
 
 **Mongo:** `schema` is ignored (the database is the namespace) and `table` names one collection. Returns `{ "collections": [{ "database", "name", "type", "indexes": [{ "name", "key", "unique" }] }], "truncated": bool }` from `listCollections` + `listIndexes`; `type` is `collection`, `view`, …, and a view has no indexes.
 
+**Redis:** not offered — `unsupported_backend`. A keyspace has no catalog to describe; list keys with `SCAN` (`MATCH`, `TYPE`) and inspect one with `TYPE` through `run_query`.
+
 ### `sample_table`
 
-Args: `server`, `database`, `table`, optional `schema`, optional `limit` (default 10, capped), optional `reason`. Returns a small sample. Useful for "what does this data look like" without writing SQL. On Mongo, `table` names a collection and the sample is a limited `find`, one `document` column per row.
+Args: `server`, `database`, `table`, optional `schema`, optional `limit` (default 10, capped), optional `reason`. Returns a small sample. Useful for "what does this data look like" without writing SQL. On Mongo, `table` names a collection and the sample is a limited `find`, one `document` column per row. Not offered on Redis (`unsupported_backend`): there is no table to sample.
 
 **Requires `query_read`, not `schema_read`.** This tool returns row data, so it is authorized exactly like `run_query` and honours the same `require_reason` constraint. A `schema_read` grant covers metadata only (`describe_schema`, `list_databases`).
 
@@ -36,11 +38,21 @@ Args: `server`, `database`, `table`, optional `schema`, optional `limit` (defaul
 
 Args: `server`, `database`, `sql`, optional `limit`, optional `dry_run`, optional `reason`. Executes under the caller's grant with statement timeout. Returns rows + truncation flag + execution stats, and `rows_affected` for a write. The primary tool.
 
+**`sql` carries the target's own query language.** One argument, three shapes, picked by the server's `kind`:
+
+| `kind` | `sql` carries | Example |
+|---|---|---|
+| `postgres` (PostgreSQL, YugabyteDB YSQL) | one SQL statement | `SELECT count(*) FROM users` |
+| `mongo` | a JSON-encoded command document | `{"find":"users","filter":{"active":true}}` |
+| `redis` (Redis, Dragonfly, Valkey, KeyDB) | a JSON array: the command and its arguments | `["HGETALL","user:1"]` |
+
+The rest of this section describes the SQL path; the Mongo rules are in [12-dynamic-permissions](12-dynamic-permissions.md) §"Mongo adapter", the Redis rules under [Redis payload](#redis-payload) below.
+
 **Read vs. write is per-grant.** With a `query_read` grant the sql guard accepts only read-only statements (`SELECT` / `EXPLAIN`). A `query_write` grant on the target `(server, database)` additionally lets a single top-level `INSERT` / `UPDATE` / `DELETE` through — **data writes only**. Schema modification (`CREATE` / `ALTER` / `DROP` / `TRUNCATE`), `GRANT` / `REVOKE`, `COPY`, transaction control, and multi-statement bodies are rejected in **both** modes; the gateway never issues DDL. Writes also require the target-DB role to actually hold write privileges — the gateway does not provision them (see [06-permissions](06-permissions.md) and CLAUDE.md non-negotiable #3).
 
 **Two roles per database, one per tier.** A database that accepts writes names a `write_role` (+ `write_password`) next to its read `role`; a `query_write` grant on a database without one fails boot. The access a call runs with is decided per statement: a write-tier caller's `SELECT` still runs as the read `role` inside a read-only transaction, and only a data write runs as `write_role`. The read tier can therefore never reach a write-capable role — the separation is role-level, not parser-level.
 
-**`dry_run: true`** (write tier only) executes the write, reports `rows_affected`, and rolls the transaction back: nothing changes. The response carries `"dry_run": true` and the audit row records outcome `dry_run` with `rows_affected`. `dry_run` on a read statement is `invalid_arguments`; on a write without a `query_write` grant the guard answers `forbidden_sql` first. Writes commit synchronously before the response returns, and every write is audited exactly like a read. Mongo targets remain read-only regardless of grant.
+**`dry_run: true`** (write tier only) executes the write, reports `rows_affected`, and rolls the transaction back: nothing changes. The response carries `"dry_run": true` and the audit row records outcome `dry_run` with `rows_affected`. `dry_run` on a read statement is `invalid_arguments`; on a write without a `query_write` grant the guard answers `forbidden_sql` first. Writes commit synchronously before the response returns, and every write is audited exactly like a read. Mongo and Redis targets remain read-only regardless of grant.
 
 **Read access is enforced by the database too.** A `query_read` call runs in a `READ ONLY` transaction, so even a write-capable target role cannot write through it; the sql guard is the second layer, not the only one. **A write is never cut short:** when a `RETURNING` write produces more rows than the limit (or the byte cap), the gateway stops collecting, drains the rest, commits, and returns the capped rows with `truncated: true` and `rows_affected` — the number of rows the statement actually changed. A write's result always carries `rows_affected`; a read's never does. A read past the cap is cancelled and rolled back (nothing to lose).
 
@@ -69,11 +81,57 @@ Rendering rules for the non-obvious types:
 | enums | the label, as a string |
 | other arrays, ranges, composites, user-defined | `{"unsupported_type": "…"}` |
 
+#### Redis payload
+
+`sql` is a JSON array — the argv a Redis client would send — e.g. `["HGETALL","user:1"]` or `["SCAN","0","MATCH","app:user:*","COUNT","200"]`. Elements are strings; a JSON number is accepted and sent as its decimal string.
+
+**Malformed argv is `invalid_arguments`.** A `sql` that is not a JSON array, is empty, or holds an element that is not a string or number (object, array, boolean, `null`) — and a `SCAN`-family call missing its cursor or an option's value, or carrying a `COUNT` that is not a positive integer — is refused at the argument edge with `invalid_arguments` and the message ``"`sql`: <reason>"``, before the intent row and before any network call.
+
+**Deny by default.** The command name (first element, case-insensitive) must be on a read-only allowlist:
+
+| Type | Allowed |
+|---|---|
+| Strings / keys | `GET` `MGET` `STRLEN` `GETRANGE` `SUBSTR` `GETBIT` `BITCOUNT` `BITPOS` `EXISTS` `TYPE` `TTL` `PTTL` `EXPIRETIME` `PEXPIRETIME` `DBSIZE` |
+| Hashes | `HGET` `HMGET` `HGETALL` `HKEYS` `HVALS` `HLEN` `HEXISTS` `HSTRLEN` `HRANDFIELD` `HSCAN` |
+| Lists | `LRANGE` `LLEN` `LINDEX` `LPOS` |
+| Sets | `SMEMBERS` `SISMEMBER` `SMISMEMBER` `SCARD` `SRANDMEMBER` `SSCAN` `SINTER` `SUNION` `SDIFF` `SINTERCARD` |
+| Sorted sets | `ZRANGE` `ZRANGEBYSCORE` `ZRANGEBYLEX` `ZREVRANGE` `ZREVRANGEBYSCORE` `ZREVRANGEBYLEX` `ZSCORE` `ZMSCORE` `ZCARD` `ZCOUNT` `ZLEXCOUNT` `ZRANK` `ZREVRANK` `ZRANDMEMBER` `ZSCAN` |
+| Streams | `XRANGE` `XREVRANGE` `XLEN` |
+| Keyspace | `SCAN` |
+
+Everything else is `forbidden_sql` before any network call — ``command rejected by gateway: redis command `<NAME>` is not in the read-only allowlist``. That covers every write, and on purpose also `KEYS` (unbounded, blocks the server), `SORT` (can `STORE`), `EVAL*` / `FCALL*` / `FUNCTION` (scripts can write), `MONITOR` and `(P)SUBSCRIBE` (unbounded streams), `CLIENT` / `CONFIG` / `DEBUG` / `INFO` / `OBJECT` / `MEMORY` (server administration and introspection), the blocking commands (`BLPOP` / `BRPOP` / `BLMOVE` / `BZPOPMIN` / …, `WAIT*`), connection state (`SELECT`, `AUTH`, `HELLO`, `MULTI` / `EXEC`) and module commands (`JSON.*`, `FT.*`, …). `ZRANGESTORE` is not on the list, so no allowed command can write. Rejection messages name the command or option, never an argument value.
+
+**`SCAN` family options are checked and `COUNT` is clamped.** `MATCH` and `COUNT` are accepted on `SCAN` / `HSCAN` / `SSCAN` / `ZSCAN`; `TYPE` on `SCAN` only. Any other option is `forbidden_sql` (e.g. ``redis command `HSCAN` does not allow option `NOVALUES` `` — `NOVALUES` would drop the values the result shape promises). Every `COUNT` is lowered to at most 1,000, and `COUNT 1000` is appended when absent. Page with the returned `next_cursor` (start at `"0"`; `"0"` again means done).
+
+**Keys are scoped by the target ACL, not a grant** — same rule as tables on Postgres ([06-permissions](06-permissions.md)). The ACL user the gateway logs in as should hold only `+@read` on the key patterns the agent may see. ACL key patterns do **not** filter `SCAN` or `DBSIZE`: a user limited to `~app:*` still sees other key *names* through `SCAN`. The recipe, including `-scan -dbsize` for when key names are sensitive, is in [config-reference §Redis](../deployment/config-reference.md#redis).
+
+**Result shapes.** Every reply becomes the shared `columns` / `rows` shape (the gateway speaks RESP2):
+
+| Reply | `columns` | `rows` |
+|---|---|---|
+| Scalar (string, integer, nil) | `["value"]` | one row |
+| Array (`MGET`, `LRANGE`, `SMEMBERS`, `ZRANGE` without scores, …) | `["value"]` | one row per element; a nested array is one JSON value |
+| `HGETALL`, `HRANDFIELD … WITHVALUES` | `["field","value"]` | one row per pair |
+| `ZRANGE*` / `ZRANDMEMBER … WITHSCORES` | `["member","score"]` | one row per pair |
+| `SCAN` | `["next_cursor","key"]` | one row per key |
+| `SSCAN` | `["next_cursor","member"]` | one row per member |
+| `HSCAN` | `["next_cursor","field","value"]` | one row per field |
+| `ZSCAN` | `["next_cursor","member","score"]` | one row per member |
+| `XRANGE` / `XREVRANGE` | `["id","fields"]` | one row per entry; `fields` is a JSON object |
+
+A sorted-set `score` is the server's decimal **text** (`"2.5"`, `"inf"`), not a JSON number — the same no-precision-loss rule as Postgres `numeric`. The `SCAN` family repeats `next_cursor` on every row; an empty page is one row with `next_cursor` set and the item column(s) `null`, so the cursor is never lost. When `row_limit` or the byte budget cuts a `SCAN`-family page, the items past the cap are dropped (`truncated: true`) while `next_cursor` still points past the whole page — narrow `MATCH` or lower `COUNT` rather than relying on the next page to return them. Outside the empty-page row, `null` is Redis' nil reply — a missing key or field. A bulk string that is not valid UTF-8 comes back as `{"base64": "…"}`, never a lossy string; a non-UTF-8 stream field *name* becomes the object key `base64:<encoded>`. `row_limit` and the 32 MiB byte budget apply as on every target, with `truncated: true` when they cut the reply.
+
+**Errors.** A command the server refuses maps to the shared codes: `NOPERM` (the ACL user lacks the command or key) → `permission_denied`; any other error reply (`WRONGTYPE`, `ERR …`) → `syntax_error` carrying the server's code and message with the ACL username replaced by `<role>`; a connection or I/O failure → `unavailable`; a reply the gateway cannot parse → `internal`. A connect-time rejection (`WRONGPASS` / `NOAUTH`) is `unavailable` and marks the adapter stale so the next call reconnects with a freshly resolved password ([05-credentials](05-credentials.md)); connect-time server messages are never passed through.
+
+**Timeouts are client-side only.** Redis has no per-command server timeout, so `statement_timeout_ms` (clamped to the 30 s ceiling) is enforced by the gateway's Tokio deadline alone, at exactly the effective timeout. A connection goes back to the pool only after a complete reply or a server error reply; one whose command was cut off by the deadline or a client disconnect, or that hit an I/O error, is **closed**, never reused. The server finishes the command on its own — Redis cannot cancel one in flight — which the allowlist keeps short: no blocking commands, no scripts, no `KEYS`, clamped `SCAN` counts.
+
 ### `explain`
 
 Args: `server`, `database`, `sql`, optional `analyze` (default `false`), optional `reason`. Returns `{ "plan", "elapsed_ms" }` from `EXPLAIN (FORMAT JSON)`. Lets the agent estimate cost before running expensive queries. Honours the same `require_reason` constraint as `run_query`.
 
 The statement passes the same guard as `run_query` at the caller's grant: a read needs `query_read`, an `INSERT` / `UPDATE` / `DELETE` needs `query_write` and is planned as the database's `write_role`. Plain `EXPLAIN` never executes the statement, so planning a write changes nothing.
+
+Not offered on Mongo or Redis: `unsupported_backend`, answered before any parsing or target call.
 
 **`analyze: true` executes the statement** for real row counts and timings, so it is accepted for **read statements only** — DML with `analyze` is `forbidden_sql`, whatever the grant. The read runs as the read `role` inside the read-only transaction and under the statement timeout, which is what makes executing it safe.
 
@@ -109,7 +167,9 @@ Args: `server`, `database`, optional `reason`. Requires `schema_read`. Returns `
 
 ### `cancel_query`
 
-Args: `server`, `database`, `request_id`, optional `reason`. Requires `query_read` on that database. Cancels the statement the gateway is running for `request_id` — the id from an error body, the `x-request-id` header, or `db_activity`. **Own identity only:** a `request_id` that is not one of the caller's own on that `(server, database)` answers `forbidden`, exactly like an unknown one, so ids cannot be probed. Returns `{ "cancelled": bool }` — `false` when the request had already finished. The cancelled call answers `cancelled` and writes its own audit row with that outcome; the `cancel_query` call's row records the target `request_id` in `sql`. A malformed `request_id` is `invalid_arguments`.
+Args: `server`, `database`, `request_id`, optional `reason`. Requires `query_read` on that database. Cancels the statement the gateway is running for `request_id` — the id from an error body, the `x-request-id` header, or `db_activity`. **Own identity only:** a `request_id` that is not one of the caller's own on that `(server, database)` answers `forbidden`, exactly like an unknown one, so ids cannot be probed. Returns `{ "cancelled": bool }` — `false` when the request had already finished. The cancelled call answers `cancelled` and writes its own audit row with that outcome; the `cancel_query` call's row records the target `request_id` in `sql`. A malformed `request_id` is `invalid_arguments`. Not offered on Mongo or Redis (`unsupported_backend`); a Redis command is bounded by its client-side timeout instead (see [Redis payload](#redis-payload)).
+
+**YugabyteDB.** `cancel_query` uses `pg_cancel_backend` like any Postgres target, and works when `host` names a single tserver. Backend pids and `pg_stat_activity` are node-local and the cancel pool connects to the same `host` as the query pool, so behind a load balancer across tservers the cancel can land on another node: it finds no backend (`{ "cancelled": false }`), the statement runs on until its statement timeout, and a client-disconnect cancel still records `cancelled` in the audit row. The statement timeout is the bound that always holds; point `host` at one tserver.
 
 ## Errors
 
@@ -120,19 +180,19 @@ Errors are structured JSON, not free-text strings. Shape: `{ "error": { "categor
 | `unauthenticated` | 401 | Token missing/expired — agent triggers re-login |
 | `expired_session` | 401 | Session outlived its TTL (distinct from `revoked_session`: routine, not a sign-out). Agent triggers re-login |
 | `forbidden` | 403 | Authenticated but permission denied for this server/db/action |
-| `forbidden_sql` | 403 | SQL rejected before reaching the DB: statement not covered by the grant (a write without `query_write`, or a schema mod / `COPY` / multi-statement in any mode), `EXPLAIN ANALYZE` in `sql` (either spelling, `ANALYZE`/`ANALYSE`, keyword or option form), `explain` with `analyze: true` on a write, Unicode-escaped identifiers (`U&"…"`), or dangerous function (filesystem `pg_read_file`, `lo_*`; session state `set_config`, `pg_advisory_*`; cross-session messages `pg_notify`, `pg_logical_emit_message`; SQL-text executors `query_to_xml*`, `ts_stat`, `ts_rewrite`, `dblink*`; …) |
-| `invalid_arguments` | 400 | Arguments rejected: they do not deserialise (missing or mistyped field, unknown key), break the argument edge (any string argument or argument name carrying NUL or another control character — identifiers take none, free text keeps tab/newline/carriage return; an identifier — `server`, `database`, `schema`, `table`, `request_id` — over 128 bytes, `reason` over 1,024, `sql` over 64 KiB (the audit cap, so every statement that runs is stored whole), any other string over 1,024; checked before the intent row, so nothing refused here reaches the target and the audit row stores no part of the refused value), fail a per-tool bound (`limit: 0`, malformed `since` or `cursor`, a `sample_table` name that is not an identifier, `dry_run` on a read, a non-UUID `cancel_query` `request_id`), the tool name contains a control character, the tool name is unknown, `name` is missing, or a service-token call's upstream headers are malformed or missing under `require_upstream` ([14-service-tokens](14-service-tokens.md)). JSON-RPC envelope carries `invalid_params` (-32602); the audit row records `invalid_arguments` — with `server`/`database` NULL when the arguments never parsed, and `tool = "unknown"` for an unknown or missing name (the caller's name, capped at 64 bytes, is in `error_message`) — so every boundary rejection is accountable. |
+| `forbidden_sql` | 403 | SQL rejected before reaching the DB: statement not covered by the grant (a write without `query_write`, or a schema mod / `COPY` / multi-statement in any mode), `EXPLAIN ANALYZE` in `sql` (either spelling, `ANALYZE`/`ANALYSE`, keyword or option form), `explain` with `analyze: true` on a write, Unicode-escaped identifiers (`U&"…"`), or dangerous function (filesystem `pg_read_file`, `lo_*`; session state `set_config`, `pg_advisory_*`; cross-session messages `pg_notify`, `pg_logical_emit_message`; SQL-text executors `query_to_xml*`, `ts_stat`, `ts_rewrite`, `dblink*`; …). On Mongo: a malformed command document, a command or top-level field outside the read-only allowlist, or a denied operator (`$out`, `$merge`, `$function`, `$where`, `$accumulator`). On Redis: a command outside the read-only allowlist, or a `SCAN`-family option it does not allow ([Redis payload](#redis-payload)) |
+| `invalid_arguments` | 400 | Arguments rejected: they do not deserialise (missing or mistyped field, unknown key), break the argument edge (any string argument or argument name carrying NUL or another control character — identifiers take none, free text keeps tab/newline/carriage return; an identifier — `server`, `database`, `schema`, `table`, `request_id` — over 128 bytes, `reason` over 1,024, `sql` over 64 KiB (the audit cap, so every statement that runs is stored whole), any other string over 1,024; checked before the intent row, so nothing refused here reaches the target and the audit row stores no part of the refused value), fail a per-tool bound (`limit: 0`, malformed `since` or `cursor`, a `sample_table` name that is not an identifier, `dry_run` on a read, a non-UUID `cancel_query` `request_id`, a malformed Redis argv — see [Redis payload](#redis-payload)), the tool name contains a control character, the tool name is unknown, `name` is missing, or a service-token call's upstream headers are malformed or missing under `require_upstream` ([14-service-tokens](14-service-tokens.md)). JSON-RPC envelope carries `invalid_params` (-32602); the audit row records `invalid_arguments` — with `server`/`database` NULL when the arguments never parsed, and `tool = "unknown"` for an unknown or missing name (the caller's name, capped at 64 bytes, is in `error_message`) — so every boundary rejection is accountable. |
 | `reason_required` | 400 | Policy requires a reason for this call; none provided, or only whitespace |
-| `timeout` | 408 | Statement timeout fired (30 s ceiling) |
+| `timeout` | 408 | Statement timeout fired (30 s ceiling). On Redis the gateway's deadline fired and the connection was closed |
 | `row_limit_exceeded` | 200 | Result truncated at configured cap (flag in response, not an error response) |
-| `syntax_error` | 400 | DB rejected the SQL. When the DB gave a SQLSTATE the message carries it and the server's primary message (configured role name redacted), so the agent can fix the query |
-| `permission_denied` | 403 | The target role lacks a privilege the statement needs (SQLSTATE `42501`), or a write was attempted inside the read tier's read-only transaction (`25006`); message carries SQLSTATE + server message |
+| `syntax_error` | 400 | DB rejected the SQL. When the DB gave a SQLSTATE the message carries it and the server's primary message (configured role name redacted), so the agent can fix the query. On Redis: any server error reply other than `NOPERM` (`WRONGTYPE`, `ERR …`), with its code and message and the ACL username replaced by `<role>` |
+| `permission_denied` | 403 | The target role lacks a privilege the statement needs (SQLSTATE `42501`), or a write was attempted inside the read tier's read-only transaction (`25006`), or a Redis ACL refusal (`NOPERM`); message carries SQLSTATE + server message |
 | `undefined_object` | 400 | The statement names a table or column that does not exist (SQLSTATE `42P01` / `42703`); message carries SQLSTATE + server message |
 | `unavailable` | 503 | DB unreachable, its credentials rejected, or no pooled connection free within 5 s. Waiting for a connection is not counted against the statement timeout, so a saturated pool is `unavailable`, never `timeout` |
 | `rate_limited` | 429 | Calling identity has too many concurrent in-flight requests (per-identity cap). `Retry-After: 1` header is set. |
 | `service_overloaded` | 503 | Gateway-wide concurrency ceiling reached. `Retry-After: 1` header is set. |
 | `audit_unavailable` | 503 | The audit store refused a write — the intent row before a target call, or the completion row after the tool ran — or the gateway has no audit store. The request is refused; nothing is returned unaudited. The audit row (if the store recovers for the drop-guard retry) records `audit_unavailable` with the tool's own outcome in `error_message`. |
-| `unsupported_backend` | 501 | The tool is not offered on the target's engine: `table_stats`, `db_activity` and `cancel_query` on Mongo, and `explain` on Mongo (answered before any SQL parsing or target call) |
+| `unsupported_backend` | 501 | The tool is not offered on the target's engine, answered before any parsing or target call: `explain`, `table_stats`, `db_activity` and `cancel_query` on Mongo; on Redis those four plus `describe_schema` and `sample_table` |
 | `internal` | 500 | Bug. Has a request ID that matches a server-side log line |
 
 `cancelled` is answered to a call whose statement `cancel_query` stopped. `dry_run` is the audit outcome of a successful `run_query` with `dry_run: true` (the response is a normal result with `"dry_run": true`). Two codes appear only in `audit_calls.outcome`, never in a response: `cancelled` when the client disconnected before the tool finished, and `abandoned` (the gateway stopped between reaching the target and recording the outcome — see [07-logging-retention](07-logging-retention.md) §"Intent and completion").
@@ -167,7 +227,7 @@ Every shed response carries `Retry-After: 1`, the body `{"error": {"category", "
 
 A request body must arrive in full within 10 s, so a slow-loris sender cannot pin a concurrency permit.
 
-The 30 s statement-timeout ceiling (see `run_query` above) is the complementary per-query bound: it limits how long one request can hold its permits.
+The 30 s statement-timeout ceiling (see `run_query` above) is the complementary per-query bound: it limits how long one request can hold its permits. On Postgres it is enforced DB-side and by the gateway; on Mongo by `maxTimeMS` and the gateway; on Redis by the gateway alone, which closes the connection of any command it cuts off (see [Redis payload](#redis-payload)).
 
 ## What we don't expose
 

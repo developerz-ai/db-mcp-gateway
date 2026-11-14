@@ -2,7 +2,7 @@
 //! `statement_timeout`, row caps, and cancellation.
 //!
 //! The trait surface lives in [`adapter`]; the Postgres impl in [`pg`], the
-//! Mongo impl in [`mongo`]. Tools consume an `Arc<dyn DbAdapter>` from
+//! Mongo impl in [`mongo`], the Redis impl in [`redis`]. Tools consume an `Arc<dyn DbAdapter>` from
 //! [`AdapterRegistry`] and never see backend-specific types or SQL — mysql
 //! (#59) slots in here without touching `src/tools/`.
 //!
@@ -20,10 +20,12 @@ pub mod mongo;
 pub mod pg;
 mod pool_sizing;
 mod query;
+pub mod redis;
 mod registry;
 mod rejection;
 pub mod sql_guard;
 
+pub use self::redis::{RedisAdapter, RedisDbIndex};
 pub use adapter::{
     AdapterKind, DEFAULT_STATEMENT_TIMEOUT_MS, DbAdapter, ExecError, ExecResult, MAX_RESULT_BYTES,
 };

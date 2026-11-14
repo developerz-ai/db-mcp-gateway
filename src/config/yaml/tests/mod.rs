@@ -5,6 +5,7 @@ mod boot_rules;
 mod load;
 mod logging;
 mod parse_errors;
+mod redis_target;
 mod reload_diff;
 mod service_accounts;
 mod structure;

@@ -6,6 +6,8 @@
 #   bin/dev logs [svc]   follow logs
 #   bin/dev psql state   psql into state-db
 #   bin/dev psql target  psql into target-db
+#   bin/dev ysqlsh       ysqlsh into target-yugabyte (start it: bin/test-yugabyte,
+#                        or `docker compose -f docker-compose.dev.yml --profile yugabyte up -d --wait target-yugabyte`)
 #   bin/dev mongosh      mongosh into target-mongo
 #   bin/dev mysql        mysql into permissions-mysql
 #   bin/dev ps           compose ps
@@ -35,6 +37,13 @@ case "${1:-up}" in
       *) echo "unknown psql target: $target (use 'state' or 'target')" >&2; exit 2 ;;
     esac
     ;;
+  ysqlsh)
+    # yugabyted binds YSQL to the container address, not localhost.
+    exec "${COMPOSE[@]}" --profile yugabyte exec \
+      -e PGPASSWORD="${TARGET_DB_PASSWORD:-app-dev-only}" target-yugabyte \
+      bash -c 'exec bin/ysqlsh -h "$(hostname -i | awk "{print \$1}")" -U "$1" -d "$2"' ysqlsh \
+      "${TARGET_DB_USER:-app}" "${TARGET_DB_NAME:-app}"
+    ;;
   mongosh)
     exec "${COMPOSE[@]}" exec target-mongo mongosh \
       --username "${TARGET_MONGO_USER:-app}" \
@@ -48,5 +57,5 @@ case "${1:-up}" in
       -p"${PERMISSIONS_MYSQL_PASSWORD:-permissions-dev-only}" \
       "${PERMISSIONS_MYSQL_DB:-permissions}"
     ;;
-  *) echo "usage: bin/dev {up|down|reset|logs [svc]|ps|psql state|psql target|mongosh|mysql}" >&2; exit 2 ;;
+  *) echo "usage: bin/dev {up|down|reset|logs [svc]|ps|psql state|psql target|ysqlsh|mongosh|mysql}" >&2; exit 2 ;;
 esac

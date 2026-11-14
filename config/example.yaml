@@ -76,6 +76,45 @@ servers:
         write_password: vault:secret/analytics/db/sandbox_rw_password
         description: "Scratch DB — data-platform writers land here"
 
+  # YugabyteDB (YSQL) is a Postgres target: declare it `kind: postgres`. Its
+  # default YSQL port is 5433, so set `port:` (an omitted port means 5432).
+  # Use a least-privilege role, not the `yugabyte` superuser — the boot
+  # superuser check only knows `postgres` for this kind. Point `host` at a
+  # single tserver, not a load balancer: backend pids are node-local, so a
+  # cancel routed to another tserver finds nothing and the query runs on
+  # until its statement timeout.
+  # - name: ledger
+  #   kind: postgres
+  #   host: yb-tserver-1.db.internal
+  #   port: 5433
+  #   tls: verify_full
+  #   databases:
+  #     - name: ledger
+  #       role: mcp_gateway_ledger_ro
+  #       password: vault:secret/prod/db/ledger_ro_password
+
+  # Redis-protocol target (Redis, Dragonfly, Valkey, KeyDB). Read-only
+  # whatever the grant: `run_query` takes a JSON argv such as
+  # ["HGETALL","user:1"] and only read commands pass. `databases[].name` is
+  # the logical DB index ("0", "1", …; grants address it as prod-cache/0).
+  # `role` is an ACL user — `default` aborts boot — and that ACL user is where
+  # keys are scoped, e.g.
+  #   ACL SETUSER gateway_ro on >*** resetkeys %R~app:* resetchannels -@all +@read -keys
+  # ACL key patterns do not hide key NAMES from SCAN/DBSIZE: add `-scan -dbsize`
+  # when names are sensitive, and `+select` for a DB index other than 0.
+  # `tls: required` and `verify_full` both verify the certificate on redis.
+  # No `auth_database` or `write_role` on redis (both abort boot). Port
+  # defaults to 6379. See website/docs/deployment/config-reference.md#redis.
+  # - name: prod-cache
+  #   kind: redis
+  #   host: cache.db.internal
+  #   tls: verify_full
+  #   databases:
+  #     - name: "0"
+  #       role: gateway_ro
+  #       password: vault:secret/prod/redis/gateway_ro_password
+  #       pool: { max_connections: 4 }
+
 # Spec 12 §"Admin API". Default off — turn on only when you need the
 # SSO-gated runtime CRUD over `/admin/v1/*`. Required when on:
 #   group — the SSO claim that authorizes admin calls.

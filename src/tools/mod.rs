@@ -43,6 +43,7 @@ pub(crate) fn db_type_label(kind: ServerKind) -> &'static str {
         ServerKind::Mysql => "mysql",
         ServerKind::Mssql => "mssql",
         ServerKind::Mongo => "mongo",
+        ServerKind::Redis => "redis",
     }
 }
 

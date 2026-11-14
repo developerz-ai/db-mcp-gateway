@@ -8,22 +8,24 @@ use super::RepoError;
 
 /// Kind of the *target* database a `permissions_databases` row registers —
 /// the engine the gateway queries, not the store this row lives in. Mirrors
-/// the `permissions_databases.db_type` CHECK (pg `0013`, mysql `0005`).
+/// the `permissions_databases.db_type` CHECK (pg `0021`, mysql `0006`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbType {
     Postgres,
     Mysql,
     Mongo,
+    Redis,
 }
 
 impl DbType {
-    pub const ALLOWED: &'static str = "postgres, mysql, mongo";
+    pub const ALLOWED: &'static str = "postgres, mysql, mongo, redis";
 
     pub fn as_db_str(self) -> &'static str {
         match self {
             Self::Postgres => "postgres",
             Self::Mysql => "mysql",
             Self::Mongo => "mongo",
+            Self::Redis => "redis",
         }
     }
 
@@ -32,6 +34,7 @@ impl DbType {
             "postgres" => Ok(Self::Postgres),
             "mysql" => Ok(Self::Mysql),
             "mongo" => Ok(Self::Mongo),
+            "redis" => Ok(Self::Redis),
             other => Err(RepoError::UnknownDbType(other.to_string())),
         }
     }

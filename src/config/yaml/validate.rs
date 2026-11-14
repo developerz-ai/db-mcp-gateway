@@ -4,7 +4,8 @@
 
 use std::collections::HashSet;
 
-use crate::config::schema::{Permission, Server, StreamSinkConfig};
+use crate::config::schema::{Database, Permission, Server, ServerKind, StreamSinkConfig};
+use crate::exec::RedisDbIndex;
 
 use super::limits::{validate_constraint_values, validate_server_values};
 use super::roles::{reject_superuser_role, validate_role};
@@ -61,7 +62,7 @@ fn validate_servers(servers: &[Server]) -> Result<HashSet<&str>, ConfigFileError
             )));
         }
         // The lazy `AdapterRegistry` (src/exec/mod.rs) dispatches only
-        // postgres + mongo today; a `mysql`/`mssql` target parses, boots
+        // postgres, mongo and redis today; a `mysql`/`mssql` target parses, boots
         // clean, then fails every query with `UnsupportedAdapter`. Reject
         // at boot instead — spec 08 "errors at this stage refuse to start".
         // `ServerKind::has_adapter` is the shared source of truth with the
@@ -69,7 +70,7 @@ fn validate_servers(servers: &[Server]) -> Result<HashSet<&str>, ConfigFileError
         if !server.kind.has_adapter() {
             return Err(ConfigFileError::Invalid(format!(
                 "server `{}` has kind `{:?}`, which has no query adapter yet \
-                 (supported kinds: postgres, mongo)",
+                 (supported kinds: postgres, mongo, redis)",
                 server.name, server.kind
             )));
         }
@@ -91,6 +92,9 @@ fn validate_databases(server: &Server) -> Result<(), ConfigFileError> {
         validate_role(&db.role).map_err(ConfigFileError::Invalid)?;
         reject_superuser_role(&db.role, server.kind, &db.name, &server.name)?;
         validate_write_role(db, server)?;
+        if server.kind == ServerKind::Redis {
+            validate_redis_database(db, &server.name)?;
+        }
         // `Some("")` would silently override the `None → name` fallback
         // and force mongo to authenticate against an empty `authSource`,
         // surfacing as a cryptic runtime auth failure instead of a boot
@@ -106,6 +110,27 @@ fn validate_databases(server: &Server) -> Result<(), ConfigFileError> {
                 db.name, server.name
             )));
         }
+    }
+    Ok(())
+}
+
+/// A Redis database is a logical index: `name` must be its canonical decimal
+/// form (`"0"`, not `"00"` or `"+0"`), so one index has one grant address.
+/// `auth_database` has no Redis meaning (ACL users are server-wide).
+fn validate_redis_database(db: &Database, server_name: &str) -> Result<(), ConfigFileError> {
+    if RedisDbIndex::parse(&db.name).is_none() {
+        return Err(ConfigFileError::Invalid(format!(
+            "database `{}` in redis server `{server_name}` must be a logical database \
+             index written as a plain decimal number (e.g. `0`)",
+            db.name
+        )));
+    }
+    if db.auth_database.is_some() {
+        return Err(ConfigFileError::Invalid(format!(
+            "database `{}` in redis server `{server_name}` sets `auth_database`, which \
+             redis targets do not use; remove it",
+            db.name
+        )));
     }
     Ok(())
 }

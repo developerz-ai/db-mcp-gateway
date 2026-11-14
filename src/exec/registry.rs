@@ -14,6 +14,7 @@ use super::adapter::{DbAdapter, ExecError};
 use super::mongo::MongoAdapter;
 use super::pg::PgAdapter;
 use super::pool_sizing::PoolSizing;
+use super::redis::RedisAdapter;
 
 /// How long a failed open is remembered. Opening a dead target costs up to
 /// the pool acquire timeout; without this every request to it would pay that
@@ -44,7 +45,7 @@ struct Slot {
 /// keyed on `(server.name, database.name)` so a slow query on DB A can never
 /// block DB B (each adapter owns its own pool).
 ///
-/// Dispatch is on `server.kind`: `Postgres` and `Mongo` are wired; the
+/// Dispatch is on `server.kind`: `Postgres`, `Mongo` and `Redis` are wired; the
 /// remaining `ServerKind` variants return `ExecError::UnsupportedAdapter`.
 /// `ServerKind::has_adapter` is the shared source of truth — config
 /// validation rejects unwired kinds at boot, so that arm is a backstop a
@@ -183,6 +184,7 @@ async fn open(
         ServerKind::Mongo => {
             Arc::new(MongoAdapter::open(server, database, sizing, detached.clone()).await?)
         }
+        ServerKind::Redis => Arc::new(RedisAdapter::open(server, database, sizing).await?),
         other => return Err(ExecError::UnsupportedAdapter(other)),
     })
 }

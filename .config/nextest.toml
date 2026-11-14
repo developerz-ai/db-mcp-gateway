@@ -27,3 +27,29 @@ fail-fast = false
 
 [profile.ci.junit]
 path = "junit.xml"
+
+# The Postgres query-path suite against YugabyteDB YSQL (`bin/test-yugabyte`,
+# CI job `yugabyte`): every it_db module that runs against the Postgres target,
+# minus the tests YSQL cannot pass — each exclusion names the Yugabyte gap it
+# hit. Everything else must behave exactly as on Postgres.
+#
+# Exclusions (a filterset cannot hold comments):
+# - sql_guard_side_effects::{pg_notify_escapes…, sql_text_in_ts_stat_hides…}:
+#   YSQL ignores NOTIFY ("WARNING: NOTIFY not supported yet and will be
+#   ignored", yugabyte-db#1872), so no LISTENer receives the payload these
+#   tests prove escapes a read-only transaction. The guard's denial is still
+#   covered by the sql_guard unit tests.
+[profile.yugabyte]
+default-filter = """
+binary(it_db) & test(/^(exec_run_query|cancellation_real_db|sql_guard_side_effects|sql_guard_unicode_escape|explain_real_db|explain_e2e|sample_table_real_db|sample_table_authz_e2e|describe_schema_real_db|run_query_e2e|write_tier_e2e|tool_args_edge_e2e|introspection_tools_real_db|get_query_history_real_db|audit_integrity_describe_schema_e2e|audit_integrity_intent_e2e|secret_refs)::/)
+  - test(=sql_guard_side_effects::pg_notify_escapes_a_read_only_transaction_so_the_guard_denies_it)
+  - test(=sql_guard_side_effects::sql_text_in_ts_stat_hides_a_denied_call_so_the_guard_denies_it)
+"""
+
+[profile.ci-yugabyte]
+inherits = "yugabyte"
+retries = 0
+fail-fast = false
+
+[profile.ci-yugabyte.junit]
+path = "junit.xml"

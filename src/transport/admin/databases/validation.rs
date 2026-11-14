@@ -7,7 +7,7 @@ use super::super::error::AdminError;
 use super::super::validation::store_error;
 
 /// Reject anything outside the `permissions_databases.db_type` CHECK — the
-/// target engines (`postgres`, `mysql`, `mongo`). Surfacing it here keeps the
+/// target engines (`postgres`, `mysql`, `mongo`, `redis`). Surfacing it here keeps the
 /// error code stable (`invalid_request`) instead of a 500 from the CHECK.
 pub(super) fn parse_db_type(value: &str, request_id: &str) -> Result<DbType, AdminError> {
     DbType::parse(value.trim()).map_err(|_| {
@@ -74,6 +74,7 @@ mod tests {
             ("postgres", DbType::Postgres),
             (" mysql ", DbType::Mysql),
             ("mongo", DbType::Mongo),
+            ("redis", DbType::Redis),
         ] {
             assert_eq!(parse_db_type(raw, "r").unwrap(), want);
         }

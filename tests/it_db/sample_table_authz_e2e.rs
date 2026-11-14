@@ -9,7 +9,7 @@
 //!      audit row carries the reason when one is supplied,
 //!   4. on Mongo the audit row names the `find` command, not a schema.
 //!
-//! Real Postgres throughout (`bin/dev up` → state DB :5435, target DB :5434);
+//! Real Postgres throughout (`bin/dev up` → state DB :5433, target DB :5434);
 //! the Mongo case is refused before any target call, so it needs neither.
 
 use crate::common;
@@ -31,7 +31,7 @@ servers:
     kind: postgres
     description: E2E target DB
     host: localhost
-    port: 5434
+    port: __TARGET_PORT__
     tls: insecure
     databases:
       - name: app
@@ -68,7 +68,7 @@ async fn boot_gateway(group: &str) -> LoggedInGateway {
         email: "sample-authz-e2e@example.com".to_string(),
         groups: vec![group.to_string()],
     };
-    spawn_logged_in(E2E_YAML, user).await
+    spawn_logged_in(&crate::common::pg_target::config_yaml(E2E_YAML), user).await
 }
 
 /// `args` addresses `target`/`app` unless it names its own server/database.

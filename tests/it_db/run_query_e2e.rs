@@ -35,7 +35,7 @@ servers:
     kind: postgres
     description: E2E target DB
     host: localhost
-    port: 5434
+    port: __TARGET_PORT__
     tls: insecure
     databases:
       - name: app
@@ -46,7 +46,7 @@ servers:
     kind: postgres
     description: Caller has no grant on this one
     host: localhost
-    port: 5434
+    port: __TARGET_PORT__
     tls: insecure
     databases:
       - name: app
@@ -74,7 +74,7 @@ async fn boot_gateway_with(yaml: &str, groups: Vec<String>) -> LoggedInGateway {
         email: "rq-e2e@example.com".to_string(),
         groups,
     };
-    spawn_logged_in(yaml, user).await
+    spawn_logged_in(&crate::common::pg_target::config_yaml(yaml), user).await
 }
 
 fn client() -> reqwest::Client {
@@ -279,7 +279,7 @@ servers:
     kind: postgres
     description: E2E target DB
     host: localhost
-    port: 5434
+    port: __TARGET_PORT__
     tls: insecure
     databases:
       - name: app
@@ -314,7 +314,7 @@ async fn run_query_write_grant_commits_data_but_not_schema() {
 
     // Scratch table created out-of-band (a plain SELECT/DML path can't do DDL).
     // This is real-DB setup, not a mock of the query path.
-    let target = sqlx::PgPool::connect("postgres://app:app-dev-only@localhost:5434/app")
+    let target = sqlx::PgPool::connect(&crate::common::env::target_db_url())
         .await
         .expect("target-db reachable; run `bin/dev up`");
     let table = format!("write_e2e_{}", uuid::Uuid::new_v4().simple());

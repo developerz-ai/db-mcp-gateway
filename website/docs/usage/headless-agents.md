@@ -67,7 +67,7 @@ A read-tier token cannot write even if the SQL guard had a bug: its statements n
 
 ## Write semantics
 
-- **One statement per call.** A single `INSERT`, `UPDATE` or `DELETE`, committed before the response returns. No DDL, no `BEGIN`/`COMMIT`, no multi-statement bodies, no Mongo writes — those are refused `forbidden_sql`.
+- **One statement per call.** A single `INSERT`, `UPDATE` or `DELETE`, committed before the response returns. No DDL, no `BEGIN`/`COMMIT`, no multi-statement bodies, no Mongo or Redis writes — those are refused `forbidden_sql`.
 - **`rows_affected`** is in every write result and in the audit row. With `RETURNING`, rows past the limit are cut from the response (`truncated: true`) but the write itself is never cut short.
 - **Rehearse with `dry_run: true`.** The write runs, reports `rows_affected`, and is rolled back; the response says `"dry_run": true` and the audit row's outcome is `dry_run`.
 

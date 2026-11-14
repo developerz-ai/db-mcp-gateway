@@ -24,7 +24,7 @@ servers:
     kind: postgres
     description: E2E target DB
     host: localhost
-    port: 5434
+    port: __TARGET_PORT__
     tls: insecure
     databases:
       - name: app
@@ -51,7 +51,7 @@ async fn boot_gateway_with(group: &str, sub_prefix: &str, yaml: &str) -> LoggedI
         email: format!("{user_sub}@example.com"),
         groups: vec![group.to_string()],
     };
-    spawn_logged_in(yaml, user).await
+    spawn_logged_in(&crate::common::pg_target::config_yaml(yaml), user).await
 }
 
 fn client() -> reqwest::Client {
@@ -310,7 +310,7 @@ servers:
     kind: postgres
     description: E2E target DB
     host: localhost
-    port: 5434
+    port: __TARGET_PORT__
     tls: insecure
     databases:
       - { name: app, role: app, password: app-dev-only }

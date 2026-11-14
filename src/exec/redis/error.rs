@@ -1,0 +1,128 @@
+//! Driver error → [`ExecError`]. Same discipline as the pg and Mongo
+//! adapters: the driver error is never rendered; only its kind and the
+//! server's error code are logged.
+
+use std::sync::atomic::Ordering;
+
+use redis::{ErrorKind, RedisError};
+
+use super::super::adapter::ExecError;
+use super::super::rejection::DbRejection;
+use super::RedisAdapter;
+
+/// Stand-in for the ACL username inside a server message. Redis names the
+/// user unquoted (`User gateway_ro has no permissions …`).
+const ROLE_PLACEHOLDER: &str = "<role>";
+
+/// Whether the connection is still in step after `err`: a server error is a
+/// complete reply, so the connection can serve the next caller. Anything
+/// else (I/O, a protocol error) leaves it in an unknown state.
+pub(super) fn connection_survives(err: &RedisError) -> bool {
+    matches!(err.kind(), ErrorKind::Server(_) | ErrorKind::Extension)
+}
+
+impl RedisAdapter {
+    /// A command's failure. A server error reply is passed to the agent as a
+    /// [`DbRejection`] (code + message, ACL username redacted) — `NOPERM`
+    /// maps to `permission_denied`, anything else to `syntax_error`.
+    pub(super) fn classify_command(&self, err: RedisError) -> ExecError {
+        if connection_survives(&err) {
+            let code = err.code().unwrap_or("ERR");
+            tracing::warn!(error_kind = "server", code, "target command failed");
+            let message = redact_role(err.detail().unwrap_or_default(), &self.role);
+            return ExecError::Rejected(DbRejection::new(code, &message, &self.role));
+        }
+        self.classify_transport(err)
+    }
+
+    /// A failure to open a connection. Never becomes a [`DbRejection`]: a
+    /// handshake error can name the user or the database.
+    pub(super) fn classify_connect(&self, err: RedisError) -> ExecError {
+        if err.kind() == ErrorKind::AuthenticationFailed {
+            self.stale.store(true, Ordering::Relaxed);
+            tracing::warn!(error_kind = "authentication", "target connect failed");
+            return ExecError::Connection;
+        }
+        if connection_survives(&err) {
+            // e.g. `SELECT` refused: misconfiguration, not the agent's input.
+            let code = err.code().unwrap_or("ERR");
+            tracing::warn!(error_kind = "server", code, "target connect failed");
+            return ExecError::Connection;
+        }
+        self.classify_transport(err)
+    }
+
+    fn classify_transport(&self, err: RedisError) -> ExecError {
+        let (kind, mapped) = match err.kind() {
+            ErrorKind::AuthenticationFailed => {
+                self.stale.store(true, Ordering::Relaxed);
+                ("authentication", ExecError::Connection)
+            }
+            ErrorKind::Io => ("io", ExecError::Unavailable),
+            ErrorKind::Parse | ErrorKind::UnexpectedReturnType => ("decode", ExecError::Decode),
+            ErrorKind::InvalidClientConfig => ("config", ExecError::Connection),
+            _ if err.is_io_error() || err.is_connection_dropped() || err.is_timeout() => {
+                ("io", ExecError::Unavailable)
+            }
+            _ => ("other", ExecError::Sql),
+        };
+        tracing::warn!(error_kind = kind, "target command failed");
+        mapped
+    }
+}
+
+/// Replace every whole-word occurrence of `role` — bounded by characters an
+/// ACL username in the config cannot contain — with [`ROLE_PLACEHOLDER`].
+fn redact_role(message: &str, role: &str) -> String {
+    if role.is_empty() {
+        return message.to_string();
+    }
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(at) = rest.find(role) {
+        let before = rest[..at].chars().next_back();
+        let after = rest[at + role.len()..].chars().next();
+        out.push_str(&rest[..at]);
+        if before.is_some_and(is_word) || after.is_some_and(is_word) {
+            out.push_str(role);
+        } else {
+            out.push_str(ROLE_PLACEHOLDER);
+        }
+        rest = &rest[at + role.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_the_acl_user_as_a_whole_word_only() {
+        assert_eq!(
+            redact_role(
+                "User gateway_ro has no permissions to run the 'set' command",
+                "gateway_ro"
+            ),
+            "User <role> has no permissions to run the 'set' command"
+        );
+        // A key or word that merely contains the name is left alone.
+        assert_eq!(
+            redact_role("key gateway_ro_x and gateway_ro.", "gateway_ro"),
+            "key gateway_ro_x and <role>."
+        );
+        assert_eq!(redact_role("no role here", "ro"), "no role here");
+    }
+
+    #[test]
+    fn only_server_replies_keep_the_connection() {
+        let server = redis::parse_redis_value(b"-NOPERM nope\r\n")
+            .and_then(|v| v.extract_error())
+            .expect_err("a server error");
+        assert!(connection_survives(&server));
+        let io = RedisError::from(std::io::Error::other("reset"));
+        assert!(!connection_survives(&io));
+    }
+}

@@ -8,7 +8,7 @@ The shipped design (see [06-permissions](06-permissions.md), [08-config](08-conf
 
 Sebby's direction (2026-06-10 / 2026-06-11): keep YAML as the simple path. Add a second path — an **SSO-gated admin API** writing into the state DB — for installs that need runtime permissions management. No UI; that non-negotiable stands.
 
-Same direction also asks for multi-database query targets (Postgres + MongoDB initially), dispatched by `db_type` on the grant.
+Same direction also asks for multi-database query targets (Postgres + MongoDB initially; Redis followed), dispatched by `db_type` on the grant.
 
 ## What changes
 
@@ -17,7 +17,7 @@ Same direction also asks for multi-database query targets (Postgres + MongoDB in
 | Permission source | YAML only | YAML **or** DB-backed, via the same authz engine |
 | Permission write audit | Git history (review trail in the PR) | Git history **or** synchronous `permissions_audit` row |
 | Permission management | PR | PR **or** `POST /admin/v1/*` (SSO-gated to an admin group) |
-| Query target | Postgres only | Postgres **or** MongoDB, dispatched on `db_type` |
+| Query target | Postgres only | Postgres, MongoDB **or** Redis, dispatched on `db_type` |
 | Permission storage backend | n/a | Postgres first; MySQL as a second backend behind the same trait |
 
 ## Two sources, one engine
@@ -68,7 +68,7 @@ If `store` is absent, the gateway runs YAML-only and the admin API is disabled. 
 
 **The MySQL store is read-only-provisioned.** The gateway only reads it; the operator fills it with their own tooling. Boot rejects `driver: mysql` together with `admin.enabled: true`, so there is no audited write path to MySQL and none is planned — the `permissions_audit` table its `0002` migration created stays unwritten. With no admin commit there is no cross-replica notification either: a change made in MySQL is honoured within `PERMISSIONS_CACHE_TTL_SECONDS` (clamped to ≤ 300 s). Identity and routing columns (`user_sub`, `server`, `db_name`) use the case- and accent-sensitive `utf8mb4_0900_as_cs` collation (`migrations-mysql/0004`), so `Alice` and `alice` are two subjects, as they are in Postgres.
 
-**`db_type` names the target engine** a `permissions_databases` row registers — `postgres`, `mysql` or `mongo` (`migrations/0013`, `migrations-mysql/0005`) — not the store the row lives in.
+**`db_type` names the target engine** a `permissions_databases` row registers — `postgres`, `mysql`, `mongo` or `redis` (`mongo` added by `migrations/0013` / `migrations-mysql/0005`, `redis` by `migrations/0021_permissions_db_type_redis.sql` / `migrations-mysql/0006_db_type_redis.sql`) — not the store the row lives in. A YugabyteDB target registers as `postgres`.
 
 ## `permissions_audit` table
 
@@ -252,29 +252,29 @@ Polymorphic query execution. CLAUDE.md convention: trait when the second impl ar
 
 ```rust
 #[async_trait]
-pub trait DbAdapter: Send + Sync {
-    /// Identifies the backend kind for dispatch and audit.
-    fn kind(&self) -> DbKind;
-
-    /// Execute a query under the merged constraint set.
-    /// Cancellation safety: drop = cancel the backend operation.
-    async fn execute(
-        &self,
-        request: ExecRequest,
-        constraints: &Constraints,
-    ) -> Result<ExecResult, ExecError>;
-
-    /// Liveness check for the per-DB pool.
-    async fn health(&self) -> Result<(), ExecError>;
-}
-
-pub enum DbKind {
-    Postgres,
-    Mongo,
+pub trait DbAdapter: Send + Sync + std::fmt::Debug {
+    /// Run one query under the gateway timeout + row cap (`run_query`).
+    async fn execute(&self, query: ExecQuery<'_>) -> Result<ExecResult, ExecError>;
+    /// Catalog: one row per column (pg) or per collection (mongo).
+    async fn describe_schema(&self, query: SchemaQuery<'_>) -> Result<ExecResult, ExecError>;
+    /// Up to `row_limit` rows of one table / collection (`sample_table`).
+    async fn sample(&self, query: SampleQuery<'_>) -> Result<ExecResult, ExecError>;
+    /// The plan as one JSON cell, without running the statement.
+    async fn explain(&self, query: ExplainQuery<'_>) -> Result<ExecResult, ExecError>;
+    /// Size, row estimate, vacuum/analyze and index stats per table.
+    async fn table_stats(&self, query: TableStatsQuery<'_>) -> Result<ExecResult, ExecError>;
+    /// The gateway's own non-idle backends on this database.
+    async fn db_activity(&self, query: ActivityQuery) -> Result<ExecResult, ExecError>;
+    /// Cancel what the gateway runs for `request_id`; `Ok(false)` if nothing was.
+    async fn cancel_request(&self, request_id: Uuid) -> Result<bool, ExecError>;
+    /// The target rejected the credentials; the registry replaces this adapter.
+    fn is_stale(&self) -> bool;
 }
 ```
 
-`ExecRequest` carries the raw query (SQL for pg, BSON command for mongo), the user identity, and the request id. The adapter is responsible for backend-specific read-only enforcement before any I/O.
+Source of truth: `src/exec/adapter.rs`. One adapter per `(server, database)`; the registry (`src/exec/registry.rs`) builds it from `server.kind` and hands tools an `Arc<dyn DbAdapter>`. `ExecQuery` carries the raw query text (`sql`: SQL for pg, a JSON command document for mongo, a JSON argv array for redis), the grant's `statement_timeout_ms` and `row_limit`, the `Access` tier the SQL guard decided, `dry_run` and the gateway `request_id`. Identity never reaches the adapter: authz and audit run in the tool layer before and after it. The adapter is responsible for backend-specific read-only enforcement before any I/O.
+
+Every implementation bounds each call by `effective_timeout_ms` (the grant value clamped to the 30 s ceiling) — pushed to the server where the backend has a server-side limit, and always also as a `tokio::time::timeout` — and reports truncation through `ExecResult.truncated`. An operation a backend cannot serve returns `ExecError::NotImplemented { adapter, op }`, which the tools answer as `unsupported_backend` ([03](03-mcp-tools.md)). `ExecError`'s `Display` never carries a connection string, host, password or role name.
 
 ### Postgres adapter
 
@@ -288,8 +288,8 @@ Introspection (`table_stats`, `db_activity`, `cancel_query` — [03](03-mcp-tool
 
 Read-only enforcement is the interesting part. Mongo doesn't have a single "READ ONLY" role flag we can rely on the same way as a Postgres role; some "read" commands can write (`$out`, `$merge` in aggregation pipelines, `$function` server-side JS with side effects). The adapter rejects:
 
-- Any aggregation pipeline containing `$out`, `$merge`, `$function`, or `$where` with non-pure JS.
-- Any command outside the allowed set: `find`, `aggregate`, `count`, `countDocuments`, `distinct`, `estimatedDocumentCount`, `listCollections`, `listIndexes`.
+- Any command containing `$out`, `$merge`, `$function`, `$accumulator` or `$where`, at any depth (pipeline stage, filter, projection, `$lookup` sub-pipeline). All `$where` is rejected: purity of arbitrary JS cannot be checked.
+- Any command outside the allowed set: `find`, `aggregate`, `count`, `distinct`, `listCollections`, `listIndexes` (`src/exec/mongo/rejector/mod.rs`, `ALLOWED_COMMANDS`).
 - Write commands explicitly: `insert`, `update`, `delete`, `findAndModify`, `bulkWrite`, `createIndex`, `drop`.
 - Any top-level key outside the command's own allow-list (`src/exec/mongo/rejector/mod.rs`, `allowed_fields`). The lists hold shape and read options only (`filter`, `sort`, `projection`, `pipeline`, `cursor`, `limit`, `collation`, …), so no `$`-prefixed key (`$db` would re-target the command at another database, `$readPreference` re-routes it), no session or transaction field (`lsid`, `txnNumber`, `autocommit`, `startTransaction`), no `writeConcern`, and no cursor-lifetime knob (`tailable`, `awaitData`, `noCursorTimeout`) reaches the driver. Before this, a `$db` key was forwarded and the server (8.0) refused the duplicate `$db` itself — safe by the server's grace, not the gateway's.
 
@@ -299,7 +299,26 @@ The connection still uses a least-privilege mongo role (read-only on the target 
 
 Timeouts via `maxTimeMS`. Row caps via a server-side limit of `row_limit + 1` (`find` `limit`/`batchSize`, a trailing `$limit` stage on `aggregate`) plus the gateway's row and byte budget at the adapter. A reply missing its documented field, or a document that cannot be rendered, is a typed error — never a fabricated `null`. Cancellation: `killOp` on client disconnect, best-effort and requires an opt-in privilege — see [config-reference.md §Mongo](../deployment/config-reference.md#mongo) for the full contract (`statement_timeout_ms` is the guaranteed bound either way, same as pg's belt-and-suspenders `tokio::time::timeout`).
 
-Audit row shape matches pg's: same envelope (`request_id`, `user`, `server`, `database`, `outcome`, `duration_ms`), payload carries `db_kind: "mongo"` and the BSON command with sensitive values redacted by the same rules as SQL parameter redaction in [07-logging-retention](07-logging-retention.md).
+Audit row shape matches pg's: same `audit_calls` columns, with `db_type = 'mongo'` and the command document in `sql` exactly as sent — stored verbatim like SQL; there is no redaction policy ([07-logging-retention](07-logging-retention.md)).
+
+### Redis adapter
+
+`kind: redis` covers every RESP server — Redis, Dragonfly, Valkey, KeyDB; Redis and Dragonfly are CI-tested. The database is the logical DB index (`name: "0"`), the `role` is an ACL username, and the stock `default` user is refused at boot like `postgres` / `root` ([08-config](08-config.md)). The client (`redis` 1.8.1, `tokio-rustls-comp` only) is built from the structured config fields, never from a URL, so no connection string exists to leak. `tls: required` and `verify_full` both verify chain and hostname over rustls; `insecure` is plain TCP.
+
+Read-only is enforced twice, as on Mongo:
+
+- **Gateway allowlist.** `sql` is a JSON argv array; the command name must be on a deny-by-default, case-insensitive list of read commands (strings, hashes, lists, sets, sorted sets, stream ranges, `SCAN` family — full list in [03 §Redis payload](03-mcp-tools.md#redis-payload)). Everything else — writes, `KEYS`, `SORT`, scripts and functions, `MONITOR` / `SUBSCRIBE`, blocking pops, `WAIT`, `SELECT` / `AUTH` / `HELLO` / `MULTI`, server administration, module commands — is `forbidden_sql` before any network call (`src/exec/redis/rejector/mod.rs`). `query_write` never lifts it; `write_role` on a Redis database fails boot.
+- **Target ACL.** The ACL user holds `+@read -keys` on the key patterns the agent may read and nothing else — the same posture as the pg `ro_*` roles, and the only key scoping there is. ACL key patterns do not filter `SCAN` / `DBSIZE`, so key *names* outside the pattern stay visible unless the user also gets `-scan -dbsize` ([06](06-permissions.md); recipe in [config-reference §Redis](../deployment/config-reference.md#redis)).
+
+A malformed argv (not a non-empty array of strings/numbers, a `SCAN`-family call missing its cursor or an option value, a bad `COUNT`) is `invalid_arguments` at the argument edge, before the intent row; an unlisted command or option is `forbidden_sql`. Messages name the command or option, never an argument value.
+
+Limits: Redis has no per-command server timeout, so `effective_timeout_ms` is a `tokio::time::timeout` alone, with no slack. A connection is reused only after a complete reply or a server error reply; a command the deadline, a client disconnect or an I/O error cuts off closes its connection. `SCAN` / `HSCAN` / `SSCAN` / `ZSCAN` take `MATCH` and `COUNT` (`TYPE` on `SCAN` only; `NOVALUES` refused), every `COUNT` clamped to 1,000 and `COUNT 1000` appended when absent; `row_limit` and `MAX_RESULT_BYTES` truncate the reply with `truncated: true`. The pool is per `(server, database)`, sized by `max_connections` / `idle_timeout_s` (`min_connections` ignored — nothing is pre-opened); each caller holds its own connection, so a slow command never head-of-line-blocks another caller behind one multiplexed connection. A connection the server closed while idle fails that call `unavailable`, without retry.
+
+Errors: `WRONGPASS` / `NOAUTH` at connect → `unavailable` and the adapter is marked stale (reopened with a freshly resolved password); any other connect failure → `unavailable`, not stale; connect-time server text is never passed through. Command errors: `NOPERM` → `permission_denied`; other error replies → `syntax_error` with the ACL username replaced by `<role>`; I/O → `unavailable`; an unparseable reply → `internal`.
+
+`execute` is the whole surface: `describe_schema`, `sample`, `explain`, `table_stats`, `db_activity` and `cancel_request` return `NotImplemented` (`unsupported_backend`). There is no in-flight cancel on Redis — the timeout and the closed connection are the bound.
+
+Audit: `db_type = 'redis'`, and `sql` holds the JSON argv exactly as the agent sent it. Intent and completion rows are written synchronously as for every target.
 
 ## Phasing
 
@@ -311,7 +330,7 @@ Audit row shape matches pg's: same envelope (`request_id`, `user`, `server`, `da
 | Audit | #51 | `permissions_audit` table + sync writer |
 | Admin API | #52, #53, #54 | CRUD endpoints, SSO-gated, audited |
 | Wildcard | #55 | `db_name = "*"` |
-| Multi-DB | #56, #57, #58 | `DbAdapter` trait, mongo adapter, mongo queries |
+| Multi-DB | #56, #57, #58 | `DbAdapter` trait, mongo adapter, mongo queries; redis adapter followed |
 | Backends | #59 | MySQL permission store |
 | Docs | #60 | Operator + developer docs |
 
@@ -322,7 +341,7 @@ Each phase is independently shippable. The gateway stays YAML-only and pg-only u
 1. **Admin bootstrap.** How does the first admin get created when `admin.enabled: true` is first turned on and no users exist? Proposal: a one-shot CLI subcommand (`gateway admin bootstrap <sso-email>`) inserts the first user with the admin group, runs against the state DB directly, audits to `permissions_audit` with `actor_id = NULL` and `request_id = "bootstrap"`.
 2. **API versioning.** `/admin/v1/*` — bake `v1` into the URL now to avoid future churn. Confirmed default.
 3. **YAML ↔ DB import/export.** Out of scope for this milestone. Operators can write a one-off script against the public CRUD if they need to migrate. Revisit if the ask is real.
-4. **Mongo write grants.** Out of scope. `query_write` for mongo would mean lifting the rejector for `$out`/`$merge` etc; that's a future spec doc, not this one.
+4. **Mongo and Redis write grants.** Out of scope; Redis writes would need a write-capable ACL user and a write allowlist. `query_write` for mongo would mean lifting the rejector for `$out`/`$merge` etc; that's a future spec doc, not this one.
 
 ## See also
 

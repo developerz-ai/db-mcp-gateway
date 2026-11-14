@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# bin/test-yugabyte — the Postgres query-path suite against YugabyteDB (YSQL).
+# Starts state-db + target-yugabyte (compose profile `yugabyte`), waits for
+# health, then runs nextest's `yugabyte` profile: .config/nextest.toml holds
+# the suite filter and each Yugabyte exclusion. Set NEXTEST_PROFILE to pick
+# another profile (CI: `ci-yugabyte`); pass-through args go to nextest.
+# Exit 75: a prerequisite is unavailable or the stack never became healthy.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if [[ -f .env ]]; then
+  set -a; . ./.env; set +a
+fi
+
+compose=(docker compose -f docker-compose.dev.yml --profile yugabyte)
+services=(state-db target-yugabyte)
+
+unavailable() { echo "Required prerequisite unavailable: $*" >&2; exit 75; }
+
+command -v docker >/dev/null 2>&1 || unavailable 'Docker CLI'
+docker info >/dev/null 2>&1 || unavailable 'Docker daemon'
+"${compose[@]}" version >/dev/null 2>&1 || unavailable 'Docker Compose'
+# The suite filter lives in nextest config; `cargo test` cannot apply it.
+command -v cargo-nextest >/dev/null 2>&1 || unavailable 'cargo-nextest'
+
+echo "→ ensuring ${services[*]} are healthy"
+up_rc=0
+"${compose[@]}" up -d --wait "${services[@]}" || up_rc=$?
+if (( up_rc != 0 )); then
+  docker info >/dev/null 2>&1 || unavailable 'Docker daemon'
+  config_rc=0
+  "${compose[@]}" config --quiet >/dev/null || config_rc=$?
+  if (( config_rc != 0 )); then
+    echo "docker compose configuration is invalid (rc=$config_rc); not an environment fault" >&2
+    exit "$config_rc"
+  fi
+  # Service name, state and health only — never an environment value.
+  echo 'Required prerequisite unavailable: stack never became healthy:' >&2
+  "${compose[@]}" ps -a --format '{{.Service}} {{.State}} {{.Health}}' "${services[@]}" >&2 || true
+  echo "Inspect with: docker compose -f docker-compose.dev.yml --profile yugabyte logs target-yugabyte" >&2
+  exit 75
+fi
+
+# Point the Postgres fixtures (tests/common/pg_target.rs) at Yugabyte. A
+# TARGET_DB_URL from .env names target-db, so it must not leak in.
+unset TARGET_DB_URL
+export TARGET_FLAVOR=yugabyte
+export TARGET_DB_PORT="${TARGET_YB_PORT:-5435}"
+export NEXTEST_PROFILE="${NEXTEST_PROFILE:-yugabyte}"
+exec cargo nextest run --all-features --test it_db "$@"

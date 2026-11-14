@@ -197,7 +197,7 @@ async fn close_pool(name: &'static str, pool: sqlx::PgPool) {
 }
 
 /// Postgres `tls: required` encrypts without verifying the server certificate
-/// (`sslmode=require`; Mongo's `required` does verify), and `tls: insecure` is
+/// (`sslmode=require`; Mongo's and Redis' `required` do verify), and `tls: insecure` is
 /// plaintext. Neither should go unnoticed in a deploy log.
 fn warn_unverified_target_tls(config_file: &ConfigFile) {
     for server in &config_file.servers {

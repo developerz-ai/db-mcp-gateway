@@ -213,6 +213,69 @@ jobs:
           path: target/nextest/ci/junit.xml
           if-no-files-found: ignore
 
+  # The Postgres query-path suite against YugabyteDB YSQL — the version
+  # production runs (docker-compose.dev.yml `target-yugabyte`, profile
+  # `yugabyte`). The suite filter and every Yugabyte exclusion live in
+  # .config/nextest.toml (`ci-yugabyte`); `bin/test-yugabyte` is the same run
+  # locally. Same shape as `test`: the stack boots while the suite compiles.
+  yugabyte:
+    needs: [changes]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    # ~2x a cold run: `test`'s cold compile (471 s p95) bounds it; the
+    # Yugabyte pull and boot (~25 s) overlap the compile.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: start state-db + target-yugabyte in the background
+        run: |
+          (rc=0
+            docker compose -f docker-compose.dev.yml --profile yugabyte \
+              up -d --wait state-db target-yugabyte \
+              > "$RUNNER_TEMP/stack.log" 2>&1 || rc=$?
+            echo "$rc" > "$RUNNER_TEMP/stack.rc") &
+      - name: install pinned toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install --no-self-update
+          if rustup toolchain list | grep -q '^stable'; then
+            rustup toolchain uninstall stable
+          fi
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+        with:
+          key: yugabyte
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: install cargo-nextest
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
+        with:
+          tool: cargo-nextest@0.9.151
+      - run: cargo nextest run --profile ci-yugabyte --cargo-profile ci --all-features --test it_db --no-run
+      - name: wait for the stack
+        run: |
+          for _ in $(seq 180); do
+            [ -s "$RUNNER_TEMP/stack.rc" ] && break
+            sleep 1
+          done
+          rc=$(cat "$RUNNER_TEMP/stack.rc" 2>/dev/null || echo 'still starting after 180 s')
+          if [ "$rc" != 0 ]; then
+            echo "::error::state-db + target-yugabyte did not come up healthy (rc=$rc)"
+            cat "$RUNNER_TEMP/stack.log"
+            docker compose -f docker-compose.dev.yml --profile yugabyte ps -a
+            docker compose -f docker-compose.dev.yml --profile yugabyte logs --tail 100 target-yugabyte
+            exit 1
+          fi
+      - run: bin/test-yugabyte --cargo-profile ci
+        env:
+          NEXTEST_PROFILE: ci-yugabyte
+      - name: upload JUnit report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: junit-yugabyte
+          path: target/nextest/ci-yugabyte/junit.xml
+          if-no-files-found: ignore
+
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -415,7 +478,7 @@ jobs:
   # so the short-SHA + main tags are pullable from whichever Image Updater (or
   # any external client) is configured to read.
   merge:
-    needs: [build, fmt, clippy, test, audit]
+    needs: [build, fmt, clippy, test, yugabyte, audit]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

@@ -53,13 +53,17 @@ cp .env.example .env
 ./bin/check
 ```
 
-`bin/setup` checks Cargo and Docker before installing missing host packages, fetches Rust dependencies with `cargo fetch --locked`, and starts all four dependency services, waiting for health. Failures stop at the named stage with an actionable diagnostic; subprocess output is suppressed to avoid exposing environment values. Review any detailed diagnostics locally, and never share credentials.
+`bin/setup` checks Cargo and Docker before installing missing host packages, fetches Rust dependencies with `cargo fetch --locked`, and starts all six dependency services, waiting for health. Failures stop at the named stage with an actionable diagnostic; subprocess output is suppressed to avoid exposing environment values. Review any detailed diagnostics locally, and never share credentials.
 
 `bin/dev` defaults to `up`. Running it after setup is safe: it ensures the same dependency services are up, not a second stack. This spins up:
 - State PostgreSQL (gateway metadata, sessions, audit log): `localhost:5433`
 - Target PostgreSQL (testing gateway queries): `localhost:5434`
 - Target MongoDB: `localhost:27018`
 - MySQL permissions store: `localhost:3307`
+- Target Redis (`kind: redis`): `localhost:6380`
+- Target Dragonfly (`kind: redis`): `localhost:6381`
+
+YugabyteDB is **not** in the default stack (it boots in ~21 s and takes ~0.5–0.9 GiB RAM). It sits behind the compose profile `yugabyte`: `bin/test-yugabyte` starts it with the state DB, YSQL on `localhost:5435` (`TARGET_YB_PORT`).
 
 **Neither setup nor bin/dev starts the gateway.** Follow the [deployment quickstart's local walkthrough](website/docs/deployment/quickstart.md#run-it-locally) for separate gateway startup and the unauthenticated MCP smoke request, which should return HTTP `401`.
 
@@ -69,6 +73,7 @@ cp .env.example .env
 **Tear down:** `bin/dev down`  
 **psql into state DB:** `bin/dev psql state`  
 **psql into target DB:** `bin/dev psql target`  
+**ysqlsh into target YugabyteDB:** `bin/dev ysqlsh` (start it first with `bin/test-yugabyte`)  
 
 ### Project Structure
 
@@ -111,7 +116,7 @@ bin/test    # All targets + all features, including bench-harness tests; starts 
 ```
 
 Before invoking cargo, `bin/test` always runs the idempotent
-`docker compose -f docker-compose.dev.yml up -d --wait`, waiting for all four
+`docker compose -f docker-compose.dev.yml up -d --wait`, waiting for all six
 services to become healthy even when the state DB is already running. A stack
 that never became healthy returns **75** without running cargo, and the report
 names every unhealthy service with its state and health. **75** is reserved for
@@ -119,6 +124,13 @@ an unreachable resource or a confirmed health failure: a malformed compose file
 or any other compose command failure keeps its own exit status, so a broken
 compose file is blamed on the change and not on the box. Test arguments pass
 through unchanged.
+
+**Run the suite against YugabyteDB:**
+```bash
+bin/test-yugabyte    # Postgres query-path suite against YugabyteDB (YSQL); needs cargo-nextest
+```
+
+It starts the state DB and `target-yugabyte` (compose profile `yugabyte`), waits for health, and runs nextest's `yugabyte` profile — `.config/nextest.toml` holds the suite filter and each YugabyteDB exclusion. The tests read `TARGET_DB_PORT` and `TARGET_FLAVOR=yugabyte`. CI runs the same suite as the `yugabyte` job. Plain `bin/test` never touches YugabyteDB.
 
 **Run a single test:**
 ```bash

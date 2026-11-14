@@ -10,7 +10,7 @@ use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
 use crate::common::pg_target::{
-    READ_ROLE, READ_ROLE_PASSWORD, TARGET_DB, TARGET_HOST, TARGET_PORT, writable_adapter,
+    READ_ROLE, READ_ROLE_PASSWORD, TARGET_DB, TARGET_HOST, target_port, writable_adapter,
 };
 use db_mcp_gateway::exec::sql_guard::{GuardError, check_sql};
 use db_mcp_gateway::exec::{Access, DbAdapter, ExecQuery};
@@ -34,7 +34,8 @@ async fn unicode_escaped_terminate_kills_another_identitys_query_so_the_guard_re
 
     // Another identity's query: same read role, its own backend.
     let url = format!(
-        "postgres://{READ_ROLE}:{READ_ROLE_PASSWORD}@{TARGET_HOST}:{TARGET_PORT}/{TARGET_DB}"
+        "postgres://{READ_ROLE}:{READ_ROLE_PASSWORD}@{TARGET_HOST}:{}/{TARGET_DB}",
+        target_port()
     );
     let victim = PgPoolOptions::new()
         .max_connections(1)

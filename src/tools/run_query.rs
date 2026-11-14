@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::audit::intent::WRITE_MAY_HAVE_COMMITTED;
 use crate::config::{Action, Grant, ServerKind};
+use crate::exec::redis::rejector as redis_rejector;
 use crate::exec::{Access, ExecQuery, ExecResult, GuardedSql};
 use crate::mcp::jsonrpc::Response;
 
@@ -130,8 +131,14 @@ async fn compute_outcome(
     // statement itself needs — so a write-tier caller's SELECT still runs as
     // the read role. Mongo commands are not SQL: `MongoAdapter::execute` runs
     // its own read-only rejector, and Mongo writes are not offered at all.
+    // Redis is the same, but its argv is checked here too, so a malformed one
+    // is `invalid_arguments` and a refused one never opens a connection.
     let access = match server.kind {
         ServerKind::Postgres => match statement_access(&args.sql, writes_allowed) {
+            Ok(access) => access,
+            Err(rejected) => return *rejected,
+        },
+        ServerKind::Redis => match redis_access(id.clone(), &args.sql) {
             Ok(access) => access,
             Err(rejected) => return *rejected,
         },
@@ -230,6 +237,22 @@ fn statement_access(sql: &str, writes_allowed: bool) -> Result<Access, Box<Outco
         })
 }
 
+/// The Redis rejector, run at the tool edge: a malformed argv is the
+/// caller's argument error, a well-formed but refused command `forbidden_sql`.
+/// `RedisAdapter::execute` runs the same check again before any network call.
+fn redis_access(id: Value, argv: &str) -> Result<Access, Box<Outcome>> {
+    match redis_rejector::validate_command(argv) {
+        Ok(_) => Ok(Access::ReadOnly),
+        Err(err) if err.is_malformed() => {
+            Err(Box::new(invalid_arguments(id, &format!("`sql`: {err}"))))
+        }
+        Err(err) => Err(Box::new(error_outcome(
+            OutcomeCode::ForbiddenSql,
+            &format!("command rejected by gateway: {err}"),
+        ))),
+    }
+}
+
 fn result_outcome(id: Value, result: &ExecResult, dry_run: bool) -> Outcome {
     let elapsed = i64::try_from(result.elapsed_ms).unwrap_or(i64::MAX);
     let row_count = i64::try_from(result.rows.len()).unwrap_or(i64::MAX);
@@ -258,47 +281,5 @@ fn result_outcome(id: Value, result: &ExecResult, dry_run: bool) -> Outcome {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_timed_out_write_says_it_may_have_committed() {
-        let mut outcome = error_outcome(OutcomeCode::Timeout, ERROR_MESSAGES.timeout);
-        note_indeterminate_write(&mut outcome, false);
-        let message = outcome.error_message.unwrap_or_default();
-        assert!(message.contains(WRITE_MAY_HAVE_COMMITTED), "{message}");
-    }
-
-    #[test]
-    fn a_cancelled_write_says_it_may_have_committed() {
-        let mut outcome = error_outcome(
-            OutcomeCode::Cancelled,
-            "query was cancelled by cancel_query",
-        );
-        note_indeterminate_write(&mut outcome, false);
-        let message = outcome.error_message.unwrap_or_default();
-        assert!(message.contains(WRITE_MAY_HAVE_COMMITTED), "{message}");
-    }
-
-    #[test]
-    fn a_rejected_write_is_not_called_indeterminate() {
-        let mut outcome = error_outcome(OutcomeCode::SyntaxError, ERROR_MESSAGES.sql_rejected);
-        note_indeterminate_write(&mut outcome, false);
-        assert_eq!(
-            outcome.error_message.as_deref(),
-            Some(ERROR_MESSAGES.sql_rejected)
-        );
-    }
-
-    #[test]
-    fn a_dry_run_write_is_never_called_indeterminate() {
-        // A dry_run rolls the transaction back (exec/pg/run.rs), so even a
-        // cut-off one cannot have committed anything.
-        let mut outcome = error_outcome(OutcomeCode::Timeout, ERROR_MESSAGES.timeout);
-        note_indeterminate_write(&mut outcome, true);
-        assert_eq!(
-            outcome.error_message.as_deref(),
-            Some(ERROR_MESSAGES.timeout)
-        );
-    }
-}
+#[path = "run_query_tests.rs"]
+mod tests;

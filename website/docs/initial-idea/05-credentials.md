@@ -76,11 +76,13 @@ Per `(server, database)`:
 - Acquire timeout 5 s — fail fast so the agent gets `unavailable`. It is spent before the statement timeout starts, never counted against it
 - A separate cancel pool (2 connections, lazy) carries `pg_cancel_backend`, so cancels never queue behind the queries they are cancelling
 - Mongo: the same sizing, plus a 5 s server-selection and connect timeout
+- Redis: `max_connections` and `idle_timeout_s` as above; `min_connections` is ignored (nothing is opened ahead of use). One connection per in-flight command (no shared multiplexed connection). A connection returns to the pool only after a complete reply or a server error reply; one hit by a timeout, a client disconnect or an I/O error is closed, never reused — its reply may still be in flight. A connection the server closed while idle fails that one call with `unavailable`; there is no retry
+- YugabyteDB (as `kind: postgres`): the Postgres pool unchanged. On release a connection is reset with `RESET ALL; SELECT pg_advisory_unlock_all()`; a server without advisory locks rejects the unlock as `feature_not_supported`, and the gateway then repeats `RESET ALL` alone and keeps the connection (since 2.0.1)
 - TLS required by default; reject non-TLS unless explicitly opted out for local dev
 
 ## Rotation
 
-A rotated password needs no restart. When the target rejects the credentials (SQLSTATE class `28` on Postgres, an authentication error on Mongo), the adapter for that `(server, database)` is marked stale and the registry replaces it on the next call, resolving the password reference again — so a rewritten `${FILE:…}` mount takes effect on its own. The call that hit the rejection fails `unavailable`; the next one uses the new password.
+A rotated password needs no restart. When the target rejects the credentials (SQLSTATE class `28` on Postgres and YugabyteDB, an authentication error on Mongo, `WRONGPASS` / `NOAUTH` at connect on Redis), the adapter for that `(server, database)` is marked stale and the registry replaces it on the next call, resolving the password reference again — so a rewritten `${FILE:…}` mount takes effect on its own. The call that hit the rejection fails `unavailable`; the next one uses the new password.
 
 Credentials are re-read from their source on `SIGHUP` (config reload). Live connections aren't killed — new connections will use the new credential, old ones drain naturally. For forced rotation, restart the gateway; with two replicas, this is zero-downtime.
 

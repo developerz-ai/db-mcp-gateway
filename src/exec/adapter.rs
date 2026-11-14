@@ -77,6 +77,7 @@ pub(super) fn effective_timeout_ms(grant: Option<u32>) -> u32 {
 pub enum AdapterKind {
     Postgres,
     Mongo,
+    Redis,
 }
 
 /// Tabular result. `rows` is row-major; `columns` carries the names in their
@@ -178,7 +179,8 @@ pub enum ExecError {
 
     /// The adapter is registered but does not support the requested
     /// operation. Today this fires on `MongoAdapter`'s `explain`,
-    /// `table_stats`, `db_activity` and `cancel_request`. The error carries the responsible
+    /// `table_stats`, `db_activity` and `cancel_request`, and on every
+    /// `RedisAdapter` operation but `execute`. The error carries the responsible
     /// `AdapterKind` and the operation name so operators see exactly which
     /// gap was hit.
     #[error("adapter `{adapter:?}` has not implemented `{op}` yet")]

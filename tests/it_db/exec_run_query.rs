@@ -12,8 +12,8 @@ use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
 use crate::common::pg_target::{
-    READ_ROLE, TARGET_DB, TARGET_HOST, TARGET_PASSWORD, TARGET_PORT, TARGET_USER, adapter,
-    single_connection_adapter, writable_adapter,
+    READ_ROLE, TARGET_USER, adapter, is_yugabyte, owner_url, single_connection_adapter,
+    writable_adapter,
 };
 use db_mcp_gateway::exec::{
     Access, DbAdapter, ExecError, ExecQuery, MAX_RESULT_BYTES, RejectionKind,
@@ -204,9 +204,7 @@ async fn db_rejection_carries_sqlstate_and_message() {
 /// Separate pool to the SAME target DB, used to observe `pg_stat_activity`
 /// independently of the adapter under test.
 async fn probe_pool() -> sqlx::PgPool {
-    let url = format!(
-        "postgres://{TARGET_USER}:{TARGET_PASSWORD}@{TARGET_HOST}:{TARGET_PORT}/{TARGET_DB}"
-    );
+    let url = owner_url();
     PgPoolOptions::new()
         .max_connections(2)
         .connect(&url)
@@ -552,10 +550,13 @@ async fn read_access_cannot_write_on_a_write_capable_role() {
         .await
         .expect("count large objects");
 
-    for sql in [
-        format!("SELECT nextval('\"{seq}\"')"),
-        "SELECT lo_from_bytea(0, 'x')".to_string(),
-    ] {
+    let mut writes = vec![format!("SELECT nextval('\"{seq}\"')")];
+    // YugabyteDB has no large objects: `lo_from_bytea` fails (XX000) even
+    // outside a read-only transaction, so it proves nothing there.
+    if !is_yugabyte() {
+        writes.push("SELECT lo_from_bytea(0, 'x')".to_string());
+    }
+    for sql in writes {
         let err = a
             .execute(query(&sql, None, 10))
             .await
@@ -660,19 +661,29 @@ async fn rows_affected_is_reported_for_writes_only() {
 /// backend: a session `set_config`, a session advisory lock, the tag. The
 /// pool has one connection, and the backend PID proves it was reused (reset,
 /// not discarded).
+///
+/// YugabyteDB refuses advisory locks (`0A000`), so there the caller takes
+/// none and the test proves the reset's fallback: the unlock is rejected,
+/// `RESET ALL` runs alone, and the connection is still kept.
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn no_session_state_survives_release() {
     let a = single_connection_adapter().await;
     let probe = probe_pool().await;
     let lock_key: i64 = rand_key();
+    let locks = !is_yugabyte();
+    let take_lock = if locks {
+        format!("pg_advisory_lock({lock_key})")
+    } else {
+        "NULL".to_string()
+    };
 
     let first = a
         .execute(query(
             &format!(
                 "SELECT pg_backend_pid() AS pid, \
                         set_config('search_path', 'pg_catalog', false) AS sp, \
-                        pg_advisory_lock({lock_key}) AS lock, \
+                        {take_lock} AS lock, \
                         current_setting('application_name') AS app"
             ),
             None,
@@ -690,15 +701,7 @@ async fn no_session_state_survives_release() {
         .await
         .expect("second call runs");
 
-    let lock_free: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-        .bind(lock_key)
-        .fetch_one(&probe)
-        .await
-        .expect("probe takes the lock");
-    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(lock_key)
-        .execute(&probe)
-        .await;
+    let lock_free = !locks || probe_takes_lock(&probe, lock_key).await;
 
     assert_eq!(first.rows[0][0], second.rows[0][0], "same backend reused");
     assert_ne!(
@@ -712,6 +715,20 @@ async fn no_session_state_survives_release() {
         "transaction carries its tag: {app1}"
     );
     assert_ne!(app1, app2, "each transaction gets a fresh tag");
+}
+
+/// Whether `probe` can take session advisory lock `key` (released again).
+async fn probe_takes_lock(probe: &sqlx::PgPool, key: i64) -> bool {
+    let free: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(key)
+        .fetch_one(probe)
+        .await
+        .expect("probe takes the lock");
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(key)
+        .execute(probe)
+        .await;
+    free
 }
 
 /// Wide rows stop at the byte budget well before the row limit, and the

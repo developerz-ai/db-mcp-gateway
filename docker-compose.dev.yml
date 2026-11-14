@@ -85,6 +85,92 @@ services:
       timeout: 3s
       retries: 20
 
+  # Redis target (kind: redis). `requirepass` sets the `default` superuser,
+  # which the gateway refuses as a role; tests create a least-privilege ACL
+  # user (`+@read`, key-scoped) through it, as an operator would.
+  target-redis:
+    image: redis:8.4-alpine
+    command: ["redis-server", "--requirepass", "${TARGET_REDIS_PASSWORD:-redis-dev-only}", "--save", "", "--appendonly", "no"]
+    ports:
+      # Bind to localhost only (see state-db above).
+      - "127.0.0.1:${TARGET_REDIS_PORT:-6380}:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    environment:
+      REDIS_PASSWORD: ${TARGET_REDIS_PASSWORD:-redis-dev-only}
+
+  # Dragonfly target: Redis-protocol compatible, the same `kind: redis`.
+  # The same Redis suite runs against it so a protocol difference fails CI.
+  target-dragonfly:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:v1.39.0
+    command: ["dragonfly", "--requirepass=${TARGET_DRAGONFLY_PASSWORD:-dragonfly-dev-only}", "--maxmemory=512mb", "--proactor_threads=2", "--dbfilename="]
+    ulimits:
+      memlock: -1
+    ports:
+      # Bind to localhost only (see state-db above).
+      - "127.0.0.1:${TARGET_DRAGONFLY_PORT:-6381}:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$DF_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    environment:
+      DF_PASSWORD: ${TARGET_DRAGONFLY_PASSWORD:-dragonfly-dev-only}
+
+  # YugabyteDB (YSQL) target: Postgres wire protocol, served as `kind: postgres`.
+  # The Postgres query-path suite runs against it (`bin/test-yugabyte`) so a
+  # change that breaks it fails CI. Behind the `yugabyte` profile — `bin/dev up`
+  # and `bin/test` never start it. Pinned to the version production runs.
+  # No volume: yugabyted pins its node to the container address, which changes
+  # on recreate, so every boot is a fresh single-node cluster. The script
+  # mirrors target-db's bootstrap (POSTGRES_USER is a superuser owning `app`)
+  # with password auth on, then waits on yugabyted so its exit stops the
+  # container.
+  target-yugabyte:
+    image: yugabytedb/yugabyte:2.25.2.0-b359
+    profiles: ["yugabyte"]
+    environment:
+      YB_APP_USER: ${TARGET_DB_USER:-app}
+      YB_APP_PASSWORD: ${TARGET_DB_PASSWORD:-app-dev-only}
+      YB_APP_DB: ${TARGET_DB_NAME:-app}
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        addr=$$(hostname -i | awk '{print $$1}')
+        bin/yugabyted start --background=false --ui=false \
+          --advertise_address="$$addr" \
+          --tserver_flags="ysql_enable_auth=true" &
+        yb=$$!
+        export PGPASSWORD=yugabyte
+        until bin/ysqlsh -h "$$addr" -U yugabyte -d yugabyte -tAc 'SELECT 1' >/dev/null 2>&1; do
+          kill -0 "$$yb" 2>/dev/null || exit 1
+          sleep 1
+        done
+        bin/ysqlsh -h "$$addr" -U yugabyte -d yugabyte -v ON_ERROR_STOP=1 \
+          -v user="$$YB_APP_USER" -v pass="$$YB_APP_PASSWORD" -v db="$$YB_APP_DB" <<'SQL'
+        SELECT format('CREATE ROLE %I SUPERUSER LOGIN PASSWORD %L', :'user', :'pass')
+          WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'user') \gexec
+        SELECT format('CREATE DATABASE %I OWNER %I', :'db', :'user')
+          WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = :'db') \gexec
+        SQL
+        touch /tmp/fixtures-ready
+        wait "$$yb"
+    ports:
+      # Bind to localhost only (see state-db above). Not 5433: state-db holds it.
+      - "127.0.0.1:${TARGET_YB_PORT:-5435}:5433"
+    healthcheck:
+      # Ready only once YSQL answers as the fixture role in its database.
+      test: ["CMD-SHELL", "test -f /tmp/fixtures-ready && PGPASSWORD=\"$$YB_APP_PASSWORD\" bin/ysqlsh -h \"$$(hostname -i | awk '{print $$1}')\" -U \"$$YB_APP_USER\" -d \"$$YB_APP_DB\" -tAc 'SELECT 1' | grep -qx 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 60
+      start_period: 120s
+
 volumes:
   state-db-data:
   target-db-data:

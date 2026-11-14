@@ -41,10 +41,10 @@ Boot-time validation (issue #16):
 | Key | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `name` | string | **yes** | — | Stable identifier used in grants, audit, and `list_servers`. |
-| `kind` | `postgres` \| `mongo` \| `mysql` \| `mssql` | **yes** | — | `postgres` and `mongo` work today (#56–#58); `mysql` / `mssql` parse but are **rejected by boot validation** — the process refuses to start (`ServerKind::has_adapter`). Unrelated to `permissions_store.driver: mysql`, which is supported. |
+| `kind` | `postgres` \| `mongo` \| `redis` \| `mysql` \| `mssql` | **yes** | — | `postgres`, `mongo` and `redis` work today; `mysql` / `mssql` parse but are **rejected by boot validation** — the process refuses to start (`ServerKind::has_adapter`). YugabyteDB (YSQL) is `postgres`; Dragonfly, Valkey and KeyDB are `redis` — see [multi-db.md](../usage/multi-db.md). Unrelated to `permissions_store.driver: mysql`, which is supported. |
 | `host` | string | **yes** | — | DNS or IP of the target DB. |
-| `port` | u16 | no | `5432` | |
-| `tls` | `required` \| `verify_full` \| `insecure` | no | `required` | `required` encrypts; on Postgres it does **not** verify the certificate (boot warns), on Mongo it does. `verify_full` verifies chain + hostname. `insecure` is plaintext (boot warns). |
+| `port` | u16 | no | `6379` for `redis`, else `5432` | Set it for Mongo (`27017`) and YugabyteDB YSQL (`5433`) — the default is the Postgres port. |
+| `tls` | `required` \| `verify_full` \| `insecure` | no | `required` | `required` encrypts; on Postgres it does **not** verify the certificate (boot warns), on Mongo and Redis it verifies chain + hostname. `verify_full` verifies chain + hostname. `insecure` is plaintext (boot warns). No client certificates (mTLS) on any target. |
 | `tls_ca_file` | path | no | system roots | CA bundle (PEM) for `verify_full`. Boot error when set without `verify_full` or when unreadable. |
 | `pool` | [Pool](#pool) | no | built-in defaults | Applies to every database on the server; a database's own `pool` wins per field. |
 | `description` | string | no | `""` | Human-readable purpose; surfaced by `list_servers`. |
@@ -56,12 +56,12 @@ Boot-time validation (issue #16):
 
 | Key | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `name` | string | **yes** | — | DB name on the target server. |
-| `role` | string | **yes** | — | Postgres role / mongo username (`^[A-Za-z_][A-Za-z0-9_]*$`). Typo here is caught at boot. |
+| `name` | string | **yes** | — | DB name on the target server. On `redis`, the logical DB index in plain decimal (`"0"`, `"1"`; not `"00"`) — anything else fails boot. |
+| `role` | string | **yes** | — | Postgres role / mongo username / Redis ACL username (`^[A-Za-z_][A-Za-z0-9_]*$`). Typo here is caught at boot. The backend's stock superuser is refused: `postgres`, `root` / `admin` (Mongo), `default` (Redis). |
 | `password` | [secret ref](#secret-references) | **yes** | — | `${ENV:…}` / `${FILE:…}` / `vault:…` / `aws-sm:…` / `gcp-sm:…` / inline literal. |
 | `description` | string | no | `""` | |
 | `pool` | [Pool](#pool) | no | server's `pool`, then built-in defaults | Per-field override of the server's `pool`. |
-| `auth_database` | string | no | `None` (falls back to `name`) | Mongo `authSource`. Set to `"admin"` when the role lives outside the target DB (container-bootstrapped users). Empty/whitespace is a boot error — omit to fall back. Ignored by pg. See [multi-db.md](../usage/multi-db.md). |
+| `auth_database` | string | no | `None` (falls back to `name`) | Mongo `authSource`. Set to `"admin"` when the role lives outside the target DB (container-bootstrapped users). Empty/whitespace is a boot error — omit to fall back. Ignored by pg; a boot error on `redis` (ACL users are server-wide). See [multi-db.md](../usage/multi-db.md). |
 | `write_role` | string | no | none | Postgres only. The role a `query_write` grant runs as; every read — under any grant — still connects as `role` in a read-only transaction. Same shape and stock-superuser checks as `role`, and must differ from it. Set together with `write_password` (one without the other aborts boot). Absent → the database is read-only through the gateway. See [Write tier](#write-tier). |
 | `write_password` | [secret ref](#secret-references) | with `write_role` | none | Password of `write_role`. Same forms and production-literal rule as `password`. |
 
@@ -84,7 +84,7 @@ Boot rules:
   `{ server: "*", database: "*", action: query_write }` needs a `write_role`
   on every database. A `query_write` grant added later through the admin API
   on such a database fails each write with `forbidden`.
-- `write_role` on a non-postgres server aborts boot (Mongo stays read-only).
+- `write_role` on a non-postgres server aborts boot (Mongo and Redis stay read-only).
 - `write_role` equal to `role` aborts boot.
 
 Upgrading: a deployment that wired a write-capable role as `role` for a
@@ -125,6 +125,95 @@ The gateway never creates or grants either role — see
   cancel is a best-effort lookup-then-kill (see the `cancel` module docs in
   `src/exec/mongo/cancel.rs`) — `statement_timeout_ms` remains the
   guaranteed bound either way.
+
+### Redis
+
+`kind: redis` — Redis, Dragonfly, Valkey, KeyDB (any RESP server). Read-only
+whatever the grant; the command allowlist and result shapes are in
+[multi-db.md](../usage/multi-db.md#allowed-redis-commands).
+
+```yaml
+servers:
+  - name: prod-cache
+    kind: redis
+    host: cache.prod.internal
+    # port defaults to 6379
+    tls: verify_full
+    databases:
+      - name: "0"              # logical DB index
+        role: gateway_ro       # ACL user
+        password: ${FILE:/run/secrets/prod-cache-ro-password}
+```
+
+- **`databases[].name` is the logical DB index**, canonical decimal (`"0"`,
+  `"1"`, …; `"00"`, `"+1"`, `"-1"` fail boot). Grants and audit rows address
+  it as `prod-cache/0`. A non-zero index needs `+select` on the ACL user. A
+  Redis Cluster serves only DB `0`.
+- **`role` is an ACL username, never `default`.** `default` is the user
+  every Redis-protocol server starts with (`+@all ~* &*` unless restricted);
+  boot refuses it in any letter case. `password` is required, same secret-ref forms as any
+  target.
+- **TLS** is `rediss://`-equivalent over rustls. `required` and
+  `verify_full` both verify chain and hostname, like Mongo; `tls_ca_file`
+  (with `verify_full` only) replaces the system roots. `insecure` is plain
+  TCP, with the usual boot warning. No client certificates (mTLS). The
+  client is built from `host` / `port` / `tls` / `role` / `password` — the
+  gateway never assembles a `redis://` URL, so no connection string exists
+  to leak into a log or error.
+- **No `auth_database`, no `write_role`** — both fail boot.
+- **Timeouts are client-side only.** Redis has no per-command server
+  timeout; `statement_timeout_ms` is a gateway deadline at exactly the
+  effective timeout. The server still finishes a command the deadline cut
+  off.
+- **Pool** — per `(server, database)`. `max_connections` and
+  `idle_timeout_s` apply; `min_connections` is ignored (nothing is opened
+  ahead of use). One connection per in-flight command, so a slow command
+  never queues another caller behind it. A connection is reused only after
+  a complete reply or a server error reply; a timeout, client disconnect or
+  I/O error closes it. A connection the server closed while idle fails that
+  one call with `unavailable` — no retry.
+- **Errors.** `WRONGPASS` / `NOAUTH` at connect → `unavailable`, and the
+  adapter reconnects with a freshly resolved password on the next call
+  (rotation without restart); other connect failures → `unavailable`. The
+  server's connect-time message is never passed through. `NOPERM` on a
+  command → `permission_denied`.
+
+**Provision a read-only ACL user.** The gateway does not create it. Key
+scoping is the ACL's job — there is no key filter on a grant
+([spec 06](../initial-idea/06-permissions.md)):
+
+```text
+ACL SETUSER gateway_ro on >*** resetkeys %R~app:* resetchannels -@all +@read -keys
+```
+
+Add `-scan -dbsize` when key names are sensitive, and `+select` when the
+database index is not `0` (see the security note below the table).
+
+| Part | Effect |
+|---|---|
+| `gateway_ro` | The username; put it in `role`. |
+| `on` | Enables the user (a new user is `off` and cannot log in). |
+| `>***` | Adds a password — replace `***` with the secret the gateway's `password` ref resolves to. Prefer `#<sha256-hex>` to keep the plaintext out of `ACL LIST` and shell history. |
+| `resetkeys` | Drops any key patterns the user already had, so the next pattern is the only one. |
+| `%R~app:*` | **Read-only** access to keys matching `app:*`. `%R~` (Redis 7+) grants read permission only, so even a command that slipped past the gateway's allowlist could not write those keys. Repeat for more patterns; use `%R~*` for the whole keyspace. |
+| `resetchannels` | No Pub/Sub channels — the gateway never subscribes. |
+| `-@all` | Starts from no commands at all. |
+| `+@read` | Adds the read-only command category. |
+| `-keys` | Removes `KEYS` again (it is in `@read`); it blocks the server for the whole keyspace walk. The gateway refuses it too — this makes the ACL agree. |
+
+| `-scan -dbsize` (optional) | Removes `SCAN` and `DBSIZE`. Add them when key *names* are sensitive — see below. Agents then cannot list keys and must know them. |
+| `+select` (non-zero DB only) | The gateway selects the configured index on connect; without it a DB other than `0` fails to connect. |
+
+> **ACL key patterns do not filter `SCAN` or `DBSIZE`.** A user limited to
+> `~app:*` (or `%R~app:*`) still sees every key *name* in the database
+> through `SCAN`, and `DBSIZE` counts all of them — verified on Redis and
+> Dragonfly. Values outside the pattern stay unreadable (`NOPERM`). If the
+> names themselves are sensitive, add `-scan -dbsize`, or keep sensitive
+> keys in a logical DB the gateway is not configured for.
+
+Check it with `ACL GETUSER gateway_ro` and, logged in as that user,
+`SET app:x 1` (expect `NOPERM`). Dragonfly honours the same syntax,
+`%R~` included (verified); Valkey accepts it too.
 
 ## Permission
 

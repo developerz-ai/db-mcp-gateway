@@ -80,14 +80,17 @@ another MCP client via
 **permissions store** is where the gateway keeps its own grant metadata — an
 agent never touches it.
 
-| | PostgreSQL | MongoDB | MySQL | MSSQL |
-|---|---|---|---|---|
-| **Query target** — agents can query it | yes | yes | no — [rejected at boot](website/docs/usage/multi-db.md) | no — rejected at boot |
-| **Permissions store** — gateway's own state | yes | no, by design | resolver path only, [no admin API](website/docs/deployment/admin-api.md) | no |
+| | PostgreSQL | YugabyteDB (YSQL) | MongoDB | Redis / Dragonfly / Valkey | MySQL | MSSQL |
+|---|---|---|---|---|---|---|
+| **Query target** — agents can query it | yes | yes, as `kind: postgres` — [CI-tested](website/docs/usage/multi-db.md#yugabytedb) | yes, read-only | yes, read-only (`kind: redis`; Redis + Dragonfly CI-tested) | no — [rejected at boot](website/docs/usage/multi-db.md) | no — rejected at boot |
+| **Permissions store** — gateway's own state | yes | not tested | no, by design | no, by design | resolver path only, [no admin API](website/docs/deployment/admin-api.md) | no |
 
 A `server.kind` of `mysql` or `mssql` refuses to start rather than booting
 clean and failing every query, so a wrong config is caught at deploy time and
-not by a user. MySQL and MSSQL query adapters are on the roadmap.
+not by a user. MySQL and MSSQL query adapters are on the roadmap. Writes
+(`query_write`) exist on Postgres-protocol targets only; Mongo and Redis stay
+read-only whatever the grant, and Redis key scoping is the ACL user's job
+([multi-db](website/docs/usage/multi-db.md)).
 
 **Performance:** measured numbers are published in
 [website/docs/benchmarks.md](website/docs/benchmarks.md), with the raw run
@@ -99,7 +102,7 @@ hardware.
 
 ## What it does
 
-- **MCP tool surface** — `list_servers`, `list_databases`, `describe_schema`, `sample_table`, `run_query`, `explain`, `get_query_history`, `table_stats`, `db_activity`, `cancel_query`.
+- **MCP tool surface** — `list_servers`, `list_databases`, `describe_schema`, `sample_table`, `run_query`, `explain`, `get_query_history`, `table_stats`, `db_activity`, `cancel_query`. `run_query` takes SQL on PostgreSQL and YugabyteDB, a JSON command document on MongoDB, and a JSON argv array (`["HGETALL","user:1"]`) on Redis and Dragonfly.
 - **OIDC SSO** — Any OIDC-compliant identity provider (e.g. Okta, Google Workspace, Entra, Authentik, Keycloak). Browser-flow login from the agent.
 - **Read-only by default, writes opt-in per grant** — per-database least-privilege roles; a `query_write` grant permits data writes (INSERT/UPDATE/DELETE), never schema changes. Statement timeouts and row caps enforced at the DB *and* gateway layer.
 - **Permissions in YAML** — group × server × database × action, with per-grant constraints (`require_reason`, `row_limit`, `statement_timeout_ms`). Table and schema scoping is the target-DB role's job, not a grant's. Reviewed by PR, with the full change history git already gives you.
@@ -126,7 +129,7 @@ hardware.
 ## How it works
 
 ```
-┌─────────┐    MCP/HTTPS    ┌──────────────┐    pg wire    ┌──────────┐
+┌─────────┐    MCP/HTTPS    ┌──────────────┐ pg/mongo/redis┌──────────┐
 │ agent   │ ──────────────▶ │   gateway    │ ────────────▶ │ target   │
 │ (Claude │   bearer: jwt   │              │  ro role per  │  DBs     │
 │  Code)  │ ◀────────────── │  authz+audit │ ◀──────────── │          │
@@ -165,7 +168,7 @@ hardware.
 | Language | Rust (stable) |
 | Async runtime | tokio |
 | HTTP | axum |
-| DB driver | sqlx |
+| DB drivers | sqlx (Postgres, YugabyteDB YSQL), mongodb, redis (`tokio-rustls-comp`) |
 | Config | serde + YAML, validated at boot |
 | State store | Postgres (co-deployed) |
 | Distribution | OCI image — `ghcr.io/developerz-ai/db-mcp-gateway` |

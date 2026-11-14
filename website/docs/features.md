@@ -128,7 +128,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
   - `cancel_query` - Cancel one of the caller's own running statements by `request_id`
 
 ### Multi-Database Support
-- **What it does:** Single gateway instance fronts PostgreSQL and MongoDB targets (MySQL/MSSQL are rejected at boot — see [multi-db](usage/multi-db.md))
+- **What it does:** Single gateway instance fronts PostgreSQL, YugabyteDB (YSQL, as a Postgres target), MongoDB and Redis-protocol targets (Redis, Dragonfly, Valkey, KeyDB). MongoDB and Redis are read-only; MySQL/MSSQL are rejected at boot — see [multi-db](usage/multi-db.md)
 - **How it works:** Abstracted database drivers with unified MCP interface
 - **Operations benefit:** One deployment serves mixed database environments
 - **Workflow benefit:** AI agents can cross-reference data across database types

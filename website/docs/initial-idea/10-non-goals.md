@@ -28,7 +28,7 @@ Writes are possible (see [06-permissions](06-permissions.md)): a `query_write` g
 
 - **DDL / migrations** — schema changes belong in your migration tool and CI/CD, reviewed and versioned.
 - **Multi-statement or explicit transactions** — one call is one statement; `BEGIN`/`COMMIT` across calls would pin a connection to an agent.
-- **Mongo writes** — Mongo targets are read-only whatever the grant.
+- **Writes on non-SQL targets** — Mongo and Redis targets are read-only whatever the grant: no `write_role`, and their allowlists hold read commands only. A cache is not a place for an agent to write, and a Redis write cannot be dry-run or rolled back.
 - **In-band approval UI** — no "queue this write for someone to approve" screen (MUST #5: permissions are YAML or the audited admin API).
 - **In-band token minting** — service tokens are config edits plus a rollout ([14](14-service-tokens.md)).
 

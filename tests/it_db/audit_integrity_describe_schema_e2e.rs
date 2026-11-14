@@ -2,7 +2,7 @@
 //! reaches the target: no reason → `reason_required`, audited, catalog never
 //! read; with one → success, and the reason lands in the audit row.
 //!
-//! Real Postgres throughout (`bin/dev up` → state DB :5435, target DB :5434).
+//! Real Postgres throughout (`bin/dev up` → state DB :5433, target DB :5434).
 
 use crate::common;
 use std::time::Duration;
@@ -19,7 +19,7 @@ servers:
     kind: postgres
     description: E2E target DB
     host: localhost
-    port: 5434
+    port: __TARGET_PORT__
     tls: insecure
     databases:
       - name: app
@@ -43,7 +43,7 @@ async fn boot_gateway() -> LoggedInGateway {
         email: "describe-reason-e2e@example.com".to_string(),
         groups: vec!["reason-required".to_string()],
     };
-    spawn_logged_in(E2E_YAML, user).await
+    spawn_logged_in(&crate::common::pg_target::config_yaml(E2E_YAML), user).await
 }
 
 async fn call(booted: &LoggedInGateway, arguments: Value) -> Value {

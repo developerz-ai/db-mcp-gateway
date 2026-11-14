@@ -95,6 +95,12 @@ async-trait = "0.1"
 # stack. Mongo is a target backend, not a permissions storage backend
 # (spec 12 §"Storage backends" excludes it).
 mongodb = { version = "3.7", default-features = false, features = ["rustls-tls-aws-lc", "dns-resolver", "compat-3-3-0", "bson-3"] }
+# Redis / Dragonfly target adapter (`src/exec/redis/`). Default features off:
+# the adapter sends raw argv through `redis::cmd`, so none of the typed
+# command helpers (acl, streams, script, …) are needed. `tokio-rustls-comp`
+# keeps TLS on the rustls stack the rest of the gateway uses; rustls takes the
+# process-wide aws-lc-rs provider installed at boot.
+redis = { version = "1.8", default-features = false, features = ["tokio-rustls-comp"] }
 
 # auth / crypto
 # `aws_lc_rs`, not `rust_crypto`: 10+ needs exactly one backend or it panics

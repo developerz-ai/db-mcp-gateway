@@ -23,6 +23,9 @@ fn stock_superuser_roles(kind: ServerKind) -> &'static [&'static str] {
         ServerKind::Mysql => &["root"],
         ServerKind::Mssql => &["sa"],
         ServerKind::Mongo => &["root", "admin"],
+        // The ACL user every Redis-protocol server starts with: it holds
+        // `+@all ~* &*` unless the operator restricts it.
+        ServerKind::Redis => &["default"],
     }
 }
 

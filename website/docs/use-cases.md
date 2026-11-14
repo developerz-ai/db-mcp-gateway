@@ -92,7 +92,7 @@ Agent: [generates SQL, applies limits, returns results]
 
 ## Use Case 3: Multi-Database AI Workflows
 
-**Problem:** Complex AI workflows need to query across multiple databases (PostgreSQL and MongoDB) with consistent security and auditing across all systems.
+**Problem:** Complex AI workflows need to query across multiple databases (PostgreSQL, MongoDB, Redis) with consistent security and auditing across all systems.
 
 **Solution:** db-mcp-gateway acts as unified access layer, supporting multiple database types with consistent permission model and audit trail.
 
@@ -223,7 +223,7 @@ permissions:
 ### Data Analytics Teams
 - **Why:** You need data access but don't want to manage database accounts
 - **Value:** Self-service analytics without learning every database's SQL dialect
-- **Benefit:** Consistent interface across PostgreSQL and MongoDB
+- **Benefit:** Consistent interface across PostgreSQL, YugabyteDB, MongoDB and Redis
 
 ### Security/Compliance Teams
 - **Why:** You need to control and monitor all database access

@@ -83,12 +83,13 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
 
     // The catalog read is scoped to a schema (and optionally one table);
     // that scope is what the audit row records as what was read.
-    // Mongo has no schemas: the database is the namespace.
+    // Mongo has no schemas: the database is the namespace. Redis has neither
+    // (and answers `unsupported_backend`), so its read is the database.
     let db_type = super::db_type_for_server(ctx.config, &args.server);
     let schema = args.schema.as_deref().unwrap_or(DEFAULT_SCHEMA);
     let read = match (db_type, args.table.as_deref()) {
         (Some("mongo"), Some(collection)) => format!("{}.{collection}", args.database),
-        (Some("mongo"), None) => args.database.clone(),
+        (Some("mongo" | "redis"), _) => args.database.clone(),
         (_, Some(table)) => format!("{schema}.{table}"),
         (_, None) => schema.to_string(),
     };
@@ -164,8 +165,11 @@ fn schema_outcome(id: Value, kind: ServerKind, result: &ExecResult) -> Outcome {
     let rendered = match kind {
         ServerKind::Mongo => mongo::assemble_collections(result)
             .map(|payload| (payload.collections.len(), serde_json::to_string(&payload))),
-        ServerKind::Postgres | ServerKind::Mysql | ServerKind::Mssql => assemble_tables(result)
-            .map(|payload| (payload.tables.len(), serde_json::to_string(&payload))),
+        // Redis never gets here: its adapter answers `unsupported_backend`.
+        ServerKind::Postgres | ServerKind::Mysql | ServerKind::Mssql | ServerKind::Redis => {
+            assemble_tables(result)
+                .map(|payload| (payload.tables.len(), serde_json::to_string(&payload)))
+        }
     };
     let Ok((count, Ok(text))) = rendered else {
         return error_outcome(

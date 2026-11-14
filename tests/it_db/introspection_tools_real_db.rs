@@ -20,6 +20,7 @@ const PEER_TOKEN: &str =
     "dbmcp_svc_5555555555555555555555555555555555555555555555555555555555555555";
 
 fn yaml(peer: &str) -> String {
+    let port = crate::common::pg_target::target_port();
     format!(
         r#"
 servers:
@@ -27,7 +28,7 @@ servers:
     kind: postgres
     description: E2E target DB
     host: localhost
-    port: 5434
+    port: {port}
     tls: insecure
     databases:
       - {{ name: app, role: app, password: app-dev-only }}
@@ -130,7 +131,7 @@ fn payload(response: &Value) -> Value {
 #[serial_test::parallel(world)]
 async fn table_stats_reports_a_table_and_is_audited() {
     let fx = Fixture::new("inspectors").await;
-    let target = sqlx::PgPool::connect("postgres://app:app-dev-only@localhost:5434/app")
+    let target = sqlx::PgPool::connect(&crate::common::env::target_db_url())
         .await
         .expect("target-db reachable; run `bin/dev up`");
     let table = format!("stats_{}", uuid::Uuid::new_v4().simple());

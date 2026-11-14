@@ -137,7 +137,7 @@ servers:
     kind: postgres
     description: E2E target DB
     host: localhost
-    port: 5434
+    port: __TARGET_PORT__
     tls: insecure
     databases:
       - { name: app, role: app, password: app-dev-only }
@@ -161,7 +161,7 @@ async fn describe_schema_audit_row_names_the_table_read() {
         .await
         .expect("create users");
     let booted = spawn_logged_in(
-        E2E_YAML,
+        &crate::common::pg_target::config_yaml(E2E_YAML),
         MockUser {
             sub: format!("describe-{}", uuid::Uuid::new_v4().simple()),
             email: "describe-e2e@example.com".to_string(),

@@ -1,6 +1,6 @@
 //! Integration tests against the real dev stack (state Postgres, target
-//! Postgres, MySQL permissions store, Mongo). One binary so a library change
-//! relinks one test executable, not one per file. Each module was its own
+//! Postgres, MySQL permissions store, Mongo, Redis + Dragonfly). One binary
+//! so a library change relinks one test executable, not one per file. Each module was its own
 //! `tests/*.rs` binary; run one with `bin/test --test it_db <module>::`.
 //!
 //! Under plain `cargo test` every module shares this process, so each test
@@ -52,6 +52,9 @@ mod permissions_repo_mysql;
 mod permissions_repo_real_db;
 mod permissions_resolver_real_db;
 mod permissions_tx_updates_real_db;
+mod redis_query_real_db;
+mod redis_run_query_e2e;
+mod redis_timeout_real_db;
 mod refresh_tokens_real_db;
 mod run_query_e2e;
 mod sample_table_authz_e2e;

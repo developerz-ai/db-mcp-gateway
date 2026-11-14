@@ -49,12 +49,14 @@ Phased plan from skeleton to a deployable gateway. Each phase is mergeable indep
 ## Phase 5 — Beyond Postgres (partial — see note)
 
 - MongoDB adapter ✅ done (v0.2.0) — `DbAdapter` trait implemented; run_query wired; describe_schema (collections + indexes) and sample_table added in plan 101. Mongo stays read-only.
+- Redis adapter ✅ done — `kind: redis` for any RESP server (Redis, Dragonfly, Valkey, KeyDB; Redis and Dragonfly CI-tested). Read-only always: deny-by-default command allowlist, `SCAN` `COUNT` clamped, client-side timeout with the connection closed on a cut-off command. Client: `redis` 1.8.1 (`tokio-rustls-comp` only); TLS verifies chain and hostname. `run_query` only — `describe_schema`, `sample_table`, `explain`, `table_stats`, `db_activity`, `cancel_query` answer `unsupported_backend`. Key scoping is the ACL user's job ([06](06-permissions.md)).
+- YugabyteDB (YSQL) ✅ tested as a `kind: postgres` target — prod-proven on 2.25.2.0-b359, and since 2.0.1 the connection reset falls back to `RESET ALL` alone when the server has no advisory locks. A dedicated CI job (`yugabyte`, gating image publishing; locally `bin/test-yugabyte`) runs the Postgres query-path integration suite against it: 92 pass, 2 excluded because YugabyteDB ignores `NOTIFY` (yugabyte-db#1872; the guard's denial of `pg_notify` stays unit-tested), and one large-object sub-case is skipped. Cancellation needs `host` to name a single tserver, not a load balancer ([03](03-mcp-tools.md#cancel_query)).
 - MySQL adapter — **deferred post-1.0**. Config parses and validates, but dispatch returns `UnsupportedAdapter` at boot. See [note below](#mysql--mssql--deferred).
 - MSSQL adapter — **deferred post-1.0**. Same status as MySQL.
 - BigQuery adapter — not started.
 - Snowflake adapter — not started.
 
-Each adapter implements the `DbAdapter` trait — pool, describe-schema, run-query, explain. Audit + permissions are engine-agnostic.
+Each adapter implements the `DbAdapter` trait ([12](12-dynamic-permissions.md#dbadapter-trait)) — `execute`, `describe_schema`, `sample`, `explain`, `table_stats`, `db_activity`, `cancel_request`, `is_stale`; a tool the engine cannot serve answers `unsupported_backend`. Audit + permissions are engine-agnostic.
 
 ### MySQL / MSSQL — deferred
 

@@ -213,7 +213,7 @@ async fn rotated_password_file_is_picked_up_without_restart() {
             pg_target::TARGET_USER,
             pg_target::TARGET_PASSWORD,
             pg_target::TARGET_HOST,
-            pg_target::TARGET_PORT,
+            pg_target::target_port(),
             pg_target::TARGET_DB
         ))
         .await

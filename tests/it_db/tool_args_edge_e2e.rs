@@ -17,7 +17,7 @@ servers:
     kind: postgres
     description: E2E target DB
     host: localhost
-    port: 5434
+    port: __TARGET_PORT__
     tls: insecure
     databases:
       - name: app
@@ -53,8 +53,8 @@ impl Fixture {
             email: "args-edge@example.com".into(),
             groups: vec!["writers".into()],
         };
-        let gw = spawn_logged_in(YAML, user).await;
-        let target = sqlx::PgPool::connect("postgres://app:app-dev-only@localhost:5434/app")
+        let gw = spawn_logged_in(&crate::common::pg_target::config_yaml(YAML), user).await;
+        let target = sqlx::PgPool::connect(&crate::common::env::target_db_url())
             .await
             .expect("target-db reachable; run `bin/dev up`");
         let table = format!("args_edge_{}", uuid::Uuid::new_v4().simple());

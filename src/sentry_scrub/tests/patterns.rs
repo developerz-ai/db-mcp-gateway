@@ -84,6 +84,10 @@ fn every_db_scheme_loses_userinfo_and_keeps_host() {
         "mongodb+srv://u:p@cluster.h/db",
         "mariadb://u:p@h/db",
         "redis://u:p@h:6379",
+        // Redis target forms: TLS scheme, and the password-only userinfo the
+        // stock `requirepass` setup uses.
+        "rediss://u:p@h:6380/0",
+        "redis://:p@h:6379/3",
     ] {
         let out = scrubber.scrub_str(raw);
         assert!(out.contains("://***REDACTED***@"), "{raw} -> {out}");
