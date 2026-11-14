@@ -3,7 +3,7 @@
 ## Distribution
 
 - **OCI image**: `ghcr.io/developerz-ai/db-mcp-gateway:<version>` on GitHub Container Registry. Multi-arch (amd64, arm64). Distroless base. Single static binary inside. Public, free, no Docker Hub rate limits.
-- **Release trigger**: pushing a `v*` git tag fires `.github/workflows/release.yml`, which builds the multi-arch image, pushes it to GHCR, and cuts a GitHub Release with auto-generated notes.
+- **Release trigger**: pushing a `v*` git tag fires `.github/workflows/release.yml`, which re-tags the multi-arch image `ci.yml` already built and tested for that commit (or builds it when there is none), pushes it to GHCR, and cuts a GitHub Release with auto-generated notes.
 - **GitHub Releases**: prebuilt static binaries for Linux amd64 / arm64 and macOS (dev convenience) attached to the same release.
 - **Helm chart**: published alongside the image on the same tag (roadmap, phase 8).
 - **Example repo**: a separate small repo with `docker-compose.yml` + skeleton `config.yaml` + provisioning SQL for the DB roles. Fork-and-edit shape.

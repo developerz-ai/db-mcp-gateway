@@ -25,8 +25,13 @@ jobs:
   # Docs-only PRs skip the Rust jobs. The skip is per job, not a workflow-level
   # `paths-ignore`: `clippy` and `test` are required checks, and a workflow that
   # never starts leaves them pending forever, while a job skipped by `if:`
-  # reports as passed. Pushes to `main` always run everything — `build` needs
+  # reports as passed. Pushes to `main` always run everything — `merge` needs
   # them. Docs guards (pages.yml) run on their own path filter.
+  #
+  # Docs = `website/`, `docs/`, `.claude/` (agent config; its hooks are tested
+  # by workflow-lint.yml) and `*.md` — except under `.dz/`: tests/brief_rows.rs
+  # reads `.dz/briefs/health.md`, so a `.dz/` change always runs `test`.
+  # public-tree scans every tracked file and runs regardless.
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -46,9 +51,12 @@ jobs:
             exit 0
           fi
           changed=$(git diff --name-only HEAD^1 HEAD)
-          code=$(printf '%s\n' "$changed" \
-            | grep -vE '^(website/|docs/)|\.md$' \
-            | grep -q . && echo true || echo false)
+          code=false
+          if printf '%s\n' "$changed" | grep -qE '^\.dz/' \
+            || printf '%s\n' "$changed" \
+              | grep -vE '^(website/|docs/|\.claude/)|\.md$' | grep -q .; then
+            code=true
+          fi
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "code-affecting changes: $code"
 
@@ -60,10 +68,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
-        with:
-          toolchain: stable
-          components: rustfmt
+      # rust-toolchain.toml pins the exact channel and components; the
+      # runner's rustup installs it. No `dtolnay/rust-toolchain` step: it
+      # downloaded the latest `stable` (~10 s a job) that the toolchain file
+      # then overrode.
+      - name: install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
       - run: cargo fmt --all -- --check
       # Pinning every action to a SHA is only worth anything if it stays that
       # way. Review alone won't hold the line — a single `@v3` merged later
@@ -110,10 +120,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
-        with:
-          toolchain: stable
-          components: clippy
+      # rust-cache keys on every installed toolchain, so the runner image's
+      # preinstalled `stable` would re-key (cold-start) this cache whenever
+      # the image picks up a new release. Only the pinned toolchain stays.
+      - name: install pinned toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install --no-self-update
+          if rustup toolchain list | grep -q '^stable'; then
+            rustup toolchain uninstall stable
+          fi
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -137,79 +152,31 @@ jobs:
     runs-on: ubuntu-latest
     # ~2x the measured p95 (cold, Cargo.lock-changing run: 471 s).
     timeout-minutes: 20
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: gateway
-          POSTGRES_PASSWORD: gateway
-          POSTGRES_DB: gateway
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U gateway"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-      # Separate target DB the exec layer connects to (#4 onward). Matches
-      # the `target-db` service in docker-compose.dev.yml — user/pass/db/port
-      # are the same so the same e2e configs work in CI and locally.
-      target-db:
-        image: postgres:16
-        env:
-          POSTGRES_USER: app
-          POSTGRES_PASSWORD: app-dev-only
-          POSTGRES_DB: app
-        ports: ["5434:5432"]
-        options: >-
-          --health-cmd "pg_isready -U app"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-      # MySQL permissions store for #59's parity tests. Optional in prod
-      # (only opened when `permissions_store.driver = mysql`), but CI
-      # always boots it so the mysql repo tests run on every push.
-      permissions-mysql:
-        image: mysql:8
-        env:
-          MYSQL_ROOT_PASSWORD: mysql-dev-only
-          MYSQL_DATABASE: permissions
-          MYSQL_USER: permissions
-          MYSQL_PASSWORD: permissions-dev-only
-        ports: ["3307:3306"]
-        options: >-
-          --health-cmd "mysqladmin ping -h localhost -u root -pmysql-dev-only"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 20
-      # Mongo target for #58's adapter integration tests. Mirrors the
-      # `target-mongo` service in docker-compose.dev.yml. The dev container
-      # bootstraps a root user in `admin`, which is why the test fixtures
-      # set `Database.auth_database = Some("admin")`.
-      target-mongo:
-        image: mongo:7
-        env:
-          MONGO_INITDB_ROOT_USERNAME: app
-          MONGO_INITDB_ROOT_PASSWORD: app-dev-only
-          MONGO_INITDB_DATABASE: app
-        ports: ["27018:27017"]
-        options: >-
-          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok'"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 20
-    env:
-      DATABASE_URL: postgres://gateway:gateway@localhost:5432/gateway
-      # Read by `Config::from_env` for the gateway's state DB pool. Kept
-      # distinct from DATABASE_URL because we connect to multiple target
-      # DBs (see exec layer, #4).
-      STATE_DB_URL: postgres://gateway:gateway@localhost:5432/gateway
+    # The dev stack (docker-compose.dev.yml) instead of `services:`. Service
+    # containers block the job until every image is pulled and healthy —
+    # measured 30-38 s of "Initialize containers" before the first step.
+    # Started in the background, the pull and boot overlap the toolchain
+    # install, cache restore and compile (~100 s), and CI tests against the
+    # exact stack `bin/test` brings up locally; tests/common/env.rs defaults
+    # to its ports and credentials, so no URL overrides are needed.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
-        with:
-          toolchain: stable
+      - name: start the dev stack in the background
+        # `|| rc=$?`, not a bare `$?`: the step shell runs with `-e`, which
+        # would end the subshell before a failure status was recorded.
+        run: |
+          (rc=0
+            docker compose -f docker-compose.dev.yml up -d --wait \
+              > "$RUNNER_TEMP/stack.log" 2>&1 || rc=$?
+            echo "$rc" > "$RUNNER_TEMP/stack.rc") &
+      - name: install pinned toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install --no-self-update
+          if rustup toolchain list | grep -q '^stable'; then
+            rustup toolchain uninstall stable
+          fi
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -222,6 +189,21 @@ jobs:
       # bench-harness tests in `benchmarks/harness/*`, which are otherwise
       # skipped; no runtime image is produced here, so that bin never ships.
       # `--all-targets` excludes doctests, as `cargo test --all-targets` did.
+      # Built with `--no-run` first so the compile overlaps the stack boot.
+      - run: cargo nextest run --profile ci --cargo-profile ci --all-targets --all-features --no-run
+      - name: wait for the dev stack
+        run: |
+          for _ in $(seq 180); do
+            [ -s "$RUNNER_TEMP/stack.rc" ] && break
+            sleep 1
+          done
+          rc=$(cat "$RUNNER_TEMP/stack.rc" 2>/dev/null || echo 'still starting after 180 s')
+          if [ "$rc" != 0 ]; then
+            echo "::error::dev stack did not come up healthy (rc=$rc)"
+            cat "$RUNNER_TEMP/stack.log"
+            docker compose -f docker-compose.dev.yml ps -a
+            exit 1
+          fi
       - run: cargo nextest run --profile ci --cargo-profile ci --all-targets --all-features
       - name: upload JUnit report
         if: ${{ !cancelled() }}
@@ -240,9 +222,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
-        with:
-          toolchain: stable
+      - name: install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
       # Prebuilt cargo-audit binary instead of `cargo install` (source compile
       # every run). taiki-e/install-action pulls the release binary; the audit
       # invocation and audit.toml ignore semantics below are unchanged.
@@ -316,9 +297,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
-        with:
-          toolchain: stable
+      # rust-cache keys on every installed toolchain, so the runner image's
+      # preinstalled `stable` would re-key (cold-start) this cache whenever
+      # the image picks up a new release. Only the pinned toolchain stays.
+      - name: install pinned toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install --no-self-update
+          if rustup toolchain list | grep -q '^stable'; then
+            rustup toolchain uninstall stable
+          fi
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           key: public-tree
@@ -326,9 +313,16 @@ jobs:
       - run: cargo test --profile ci --test public_tree
 
   # Publish a multi-arch image on push to main, tagged with the short commit
-  # SHA (what Argo Image Updater pins to, #17) + a moving `main` tag. Gated by
-  # the quality jobs above so an unpublishable commit never ships an image.
+  # SHA (what Argo Image Updater pins to, #17) + a moving `main` tag.
   # Release tags (semver + :latest + GitHub release) live in release.yml.
+  #
+  # The gate sits on `merge`, not here: `build` starts with the quality jobs
+  # instead of after them, taking `test` (~190 s) off the main-push critical
+  # path. A red commit still never gets an image at a tag anything consumes:
+  # only its per-arch `linux-<arch>-<sha>` refs exist, Image Updater matches
+  # `^sha-[0-9a-f]{7}$` alone, and `sha-*`/`main` are written by `merge`,
+  # which needs every quality job green. release.yml reuses `sha-*` the same
+  # way, so it inherits the gate.
   #
   # Built on NATIVE per-arch runners in parallel (amd64 + arm64), each pushed at
   # a per-arch tag, then stitched into one manifest list by `merge`. Native arm64
@@ -352,7 +346,6 @@ jobs:
   # carries.
   build:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [fmt, clippy, test, audit]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
@@ -416,12 +409,13 @@ jobs:
           push: true
 
   # Stitch the per-arch digests into one multi-arch manifest under the real
-  # tags. Skipped automatically when `build` is skipped (PRs) or any arch fails.
+  # tags. Skipped automatically when `build` is skipped (PRs), any arch fails,
+  # or any quality job fails — this is the publish gate.
   # DUAL-PUSH: the same multi-arch manifest list is created in BOTH registries
   # so the short-SHA + main tags are pullable from whichever Image Updater (or
   # any external client) is configured to read.
   merge:
-    needs: [build]
+    needs: [build, fmt, clippy, test, audit]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

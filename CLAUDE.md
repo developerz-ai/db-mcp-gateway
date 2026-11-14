@@ -31,7 +31,7 @@ Self-hosted MCP gateway. AI agents get audited, SSO-gated, read-only DB access. 
 | State store | Postgres (co-deployed): sessions, audit log, denylist. Permissions store `pg` (`src/state/permissions/pg.rs`) or `mysql` (`src/state/permissions/mysql/`) |
 | Error tracking | GlitchTip (Sentry protocol), credential-scrubbed by `src/sentry_scrub/` |
 | Metrics | `metrics` + Prometheus exporter on `/metrics` |
-| Distribution | `ghcr.io/developerz-ai/db-mcp-gateway` **and** `registry.digitalocean.com/developerz-ai/db-mcp-gateway` — `.github/workflows/ci.yml` (`build` + `merge`) pushes per-arch images and the multi-arch manifest to both registries on pushes to `main`; `.github/workflows/release.yml` pushes the `v*` tag builds (semver + `:latest` + GitHub release) |
+| Distribution | `ghcr.io/developerz-ai/db-mcp-gateway` **and** `registry.digitalocean.com/developerz-ai/db-mcp-gateway` — `.github/workflows/ci.yml` (`build` + `merge`) pushes per-arch images and the multi-arch manifest to both registries on pushes to `main`; `.github/workflows/release.yml` re-tags that tested `sha-<7>` manifest on a `v*` tag (full build only as fallback) with semver + `:latest` and cuts the GitHub release |
 
 ## Commands
 
@@ -46,7 +46,7 @@ Self-hosted MCP gateway. AI agents get audited, SSO-gated, read-only DB access. 
 | Single test by pattern | `bin/test --test <name>` or `cargo test <pattern>` |
 | Format | `bin/fmt` |
 | Lint (fmt-check + clippy -D warnings) | `bin/lint` |
-| Reproduce CI locally / one-command check | `bin/ci` / `bin/check` |
+| Reproduce CI locally / one-command check (2 build jobs by default; `CARGO_BUILD_JOBS=$(nproc) bin/check` on a dedicated box) | `bin/ci` / `bin/check` |
 | Assert scrubber regex features in the shipping graph | `bin/check-scrub-features` |
 | Mint a static service bearer token | `bin/mint-service-token <name>` |
 | Run the binary (after `bin/dev up`; `config/example.yaml` is a reference — its `vault:` refs abort boot) | write the minimal `config.yml` from `website/docs/deployment/quickstart.md#run-it-locally`, then `TLS_DISABLED=true OIDC_ISSUER=http://localhost:5556 OIDC_CLIENT_ID=dev ALLOW_INSECURE_SIGNING_KEY=true TARGET_DB_PASSWORD=app-dev-only cargo run -- --config config.yml` |
@@ -107,20 +107,21 @@ The bar: idiomatic, boring, readable Rust. No spaghetti, no premature abstractio
 
 ## CI
 
-GitHub Actions on GitHub-hosted runners — `ubuntu-latest` default (`ubuntu-24.04-arm` for arm64), with Postgres, target Postgres, MySQL and Mongo as services. Workflows in `.github/workflows/`; `bin/ci` reproduces them locally.
+GitHub Actions on GitHub-hosted runners — `ubuntu-latest` default (`ubuntu-24.04-arm` for arm64). `test` runs against `docker-compose.dev.yml` (state + target Postgres, MySQL, Mongo) — the stack `bin/test` uses locally — started in the background so its boot overlaps the compile. Rust jobs install the toolchain `rust-toolchain.toml` pins with the runner's `rustup` (no `dtolnay/rust-toolchain`); jobs with a rust-cache uninstall the runner's `stable`, because rust-cache keys on every installed toolchain. Workflows in `.github/workflows/`; `bin/ci` reproduces them locally.
 
 | Job | Does |
 |---|---|
 | `fmt` | `cargo fmt --check`; every action pinned to a 40-hex SHA |
-| `changes` | path filter: docs-only PRs (`website/**`, `docs/**`, `*.md`) skip `clippy`/`test` via per-job `if:` (a skipped required job reads as passed) |
+| `changes` | path filter: docs-only PRs (`website/**`, `docs/**`, `.claude/**`, `*.md` — never `.dz/**`, which `tests/brief_rows.rs` reads) skip `clippy`/`test` via per-job `if:` (a skipped required job reads as passed) |
 | `clippy` | `clippy -D warnings` (all-targets + release cfg, `--profile ci`) + `bin/check-scrub-features` |
-| `test` | `cargo nextest run --profile ci --cargo-profile ci --all-targets --all-features` against the service containers; JUnit uploaded (`.config/nextest.toml`) |
+| `test` | `cargo nextest run --profile ci --cargo-profile ci --all-targets --all-features` (`--no-run` first, then after the dev stack is healthy); JUnit uploaded (`.config/nextest.toml`) |
 | `audit` | `cargo audit --ignore RUSTSEC-2023-0071` |
 | `secret-scan` | advisory — `git grep -nE` over every tracked file for `dbmcp_svc_[0-9a-f]{64}`; exempt paths: `tests/**`, `website/**`, `config/example.yaml`, `.github/**`, `src/config/yaml/**` |
 | `public-tree` | `cargo test --test public_tree` on every PR, docs-only included (no `changes` gate): no internal host, private repo, private CI provider, setup-mode name or home path in any tracked file |
 | `weekly` (`weekly.yml`) | Mondays: `cargo audit` on `main` + `cargo update --dry-run` report |
-| `build` + `merge` | on `main`: per-arch image → multi-arch manifest, pushed to GHCR **and** DOCR |
-| `workflow-lint` (`workflow-lint.yml`) | advisory — actionlint (pinned image digest) + the hook tests (`python3 -I .claude/hooks/test_hooks.py`) on PRs and `main` pushes touching `.github/workflows/**` or `.claude/hooks/**` |
+| `build` + `merge` | on `main`: per-arch image → multi-arch manifest, pushed to GHCR **and** DOCR. `build` starts with the quality jobs; `merge` (which writes `sha-<7>` + `main`) needs `build`, `fmt`, `clippy`, `test` and `audit` — the publish gate. `tests/` is out of the Docker context (`.dockerignore`), so adding a test no longer busts the cargo-chef dependency layer |
+| `release` (`release.yml`) | on `v*`: `preflight` → `reuse` waits for `ci.yml`'s push run on the tagged commit and, when green, `merge` re-tags its `sha-<7>` manifest (per-arch digests = the tested ones; the index digest differs only by the release annotations; release version/revision/source as index annotations); red CI blocks the release; no CI run (or a missing image) falls back to the per-arch `build` with a warning. The fallback reads `main`'s gha layer cache but never writes one (a tag-scoped cache is unreadable by any later run) |
+| `workflow-lint` (`workflow-lint.yml`) | advisory — actionlint (pinned image digest) + the hook tests (`python3 -I .claude/hooks/test_hooks.py`) + the release reuse-decision test (`python3 -I .github/scripts/test_release_reuse_decision.py`) on PRs and `main` pushes touching `.github/workflows/**`, `.github/scripts/**` or `.claude/hooks/**` |
 | `release-smoke` (`release-smoke.yml`) | advisory, post-publish — after each successful `release`, Tuesdays on the Latest release, and by hand: pulls the published GHCR image per arch (amd64 + arm64), checks its platform and that `--version` reports the tag, and on the scheduled run that `:latest` is the Latest release |
 
 Every workflow declares a `concurrency` group, and every job sets `timeout-minutes` (~2× measured p95: clippy 15, test 20, small jobs 5, CI image build 30; the release per-arch build gets 60 to cover a cold compile). Each Rust job keeps its own `Swatinem/rust-cache` key — never a shared key: it made `test` restore clippy's check-only artifacts and rebuild the graph. `ci.yml` cancels superseded **PR** runs only — pushes to `main` get a per-SHA concurrency group and never cancel (a shared group would still drop a *pending* run when a third merge queues), because the Image Updater pins the short SHA, so cancelling the first of two closely-landed merges would leave that commit with no image at its tag (`main` is a moving convenience tag). `release.yml`, `pages.yml` (a half-applied Pages deploy), `weekly.yml` and `release-smoke.yml` are hard `cancel-in-progress: false`. Workflow rules for editing `.github/`: [`.github/CLAUDE.md`](.github/CLAUDE.md); Claude Code hooks: [`.claude/README.md`](.claude/README.md). Public repo, so GitHub-hosted runners only.

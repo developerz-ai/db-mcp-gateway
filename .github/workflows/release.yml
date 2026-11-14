@@ -18,7 +18,8 @@ env:
   # DOCR mirror — the in-cluster source the ArgoCD Image Updater tracks.
   # Per-arch builds push the image to both registries under the per-arch tag
   # `${PLATFORM_PAIR}-${version}` (e.g. `linux-amd64-1.4.5`,
-  # `linux-arm64-1.4.5`); the `merge` job reads those per-arch tag refs and
+  # `linux-arm64-1.4.5`); the `merge` job reads those per-arch tag refs — or,
+  # when `reuse` found ci.yml's tested `sha-<7>` manifest, that manifest — and
   # imagetools-creates a single multi-arch manifest at the semver + `:latest`
   # tag set, applied to BOTH registries. The `DOCR_TOKEN` Actions secret
   # authenticates both per-arch push and the imagetools stitch.
@@ -81,14 +82,97 @@ jobs:
             echo "minor=$minor"
           } >> "$GITHUB_OUTPUT"
 
-  # Native per-arch build (amd64 + arm64), each pushed at the per-arch tag,
-  # then merged into one multi-arch manifest list under the semver + :latest
-  # tags. Native arm64 runners replace the single-runner QEMU build that timed
-  # out at 30 min (see ci.yml). Release compiles are CPU-bound: amd64 runs on
-  # an 8-vCPU runner; arm64 stays on 2-vCPU (no larger arm runner is
-  # provisioned for the org — bumping to an unavailable size would hang the
-  # release). gha layer cache (cache-from/to below) already memoises the
-  # dependency build across runs.
+  # The release tag lands on a commit `main` CI is already building (the tag
+  # is pushed seconds after the `chore(release)` merge). Measured: every
+  # release rebuilt both arches (~7-8 min each) in parallel with ci.yml
+  # building the same commit, and wrote ~1.1 GB of tag-scoped gha cache that
+  # no later run can read (a cache is visible only to its own ref and the
+  # default branch), evicting `main`'s live entries past the 10 GB cap.
+  #
+  # So wait for ci.yml's push run on this commit; when it passed, its `merge`
+  # published `sha-<7>` in both registries, and the release only re-tags that
+  # manifest — the per-arch images (and their digests) are exactly the ones CI
+  # tested and Image Updater deployed; only the index differs, because the
+  # release adds its own annotations to it. A red (failed/cancelled) run BLOCKS the release:
+  # nothing ships from a commit CI rejected. Only two cases fall back to the
+  # full build below, each with a warning naming why: no ci.yml push run for
+  # this commit (a tag off `main`), or a green run whose `sha-<7>` image is
+  # missing. An API error or a run still going after 40 min fails the job —
+  # re-run it.
+  reuse:
+    needs: [preflight]
+    runs-on: ubuntu-latest
+    # ci.yml's push run is ~11 min p90 (build 30-min cap in parallel with
+    # test's 20); the poll gives up at 40 min and fails the job (re-run it).
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      found: ${{ steps.ci.outputs.found }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The shell only observes (Actions API, registry probe) and acts; what to
+      # do with each observation is .github/scripts/release_reuse_decision.py,
+      # pinned by its test in workflow-lint.yml.
+      - name: wait for ci.yml on this commit
+        id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          query="repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&event=push&branch=main"
+          image="$REGISTRY/$IMAGE_NAME:sha-${GITHUB_SHA::7}"
+          deadline=$((SECONDS + 40 * 60))
+          # The tag and the merge push land seconds apart; give GitHub a
+          # moment to register ci.yml's run before calling it absent.
+          grace=$((SECONDS + 120))
+          image_state=unchecked
+          while :; do
+            if ! run=$(gh api "$query" --jq '.workflow_runs | max_by(.run_number) // {} | "\(.status // "none") \(.conclusion // "-")"'); then
+              echo "::error::release blocked: the Actions API did not answer (re-run this job)"
+              exit 1
+            fi
+            read -r status conclusion <<< "$run"
+            verdict=$(python3 -I .github/scripts/release_reuse_decision.py \
+              "$status" "$conclusion" "$image_state" \
+              "$(( SECONDS >= grace ))" "$(( SECONDS >= deadline ))")
+            read -r action reason <<< "$verdict"
+            case "$action" in
+              wait)
+                echo "$reason; waiting"
+                sleep 30 ;;
+              check-image)
+                if docker buildx imagetools inspect "$image" > /dev/null; then
+                  image_state=present
+                else
+                  image_state=missing
+                fi ;;
+              reuse)
+                echo "reusing $image ($reason)"
+                echo "found=true" >> "$GITHUB_OUTPUT"
+                exit 0 ;;
+              build)
+                echo "::warning::NOT reusing a CI-tested image: $reason — building one from the tag instead"
+                echo "found=false" >> "$GITHUB_OUTPUT"
+                exit 0 ;;
+              block)
+                echo "::error::release blocked: $reason"
+                exit 1 ;;
+              *)
+                echo "::error::unknown reuse decision: $verdict"
+                exit 1 ;;
+            esac
+          done
+
+  # Fallback only — runs when `reuse` found no tested `main` image. Native
+  # per-arch build (amd64 + arm64), each pushed at the per-arch tag, then
+  # merged into one multi-arch manifest list under the semver + :latest tags.
+  # Native arm64 runners replace the single-runner QEMU build that timed out
+  # at 30 min (see ci.yml). The gha layer cache `main` writes (cache-from
+  # below) memoises the dependency build.
   #
   # Per-arch tag pattern is intentional. Prior revision used
   # `push-by-digest=true,name-canonical=true,push=true`, which buildx reports
@@ -98,7 +182,10 @@ jobs:
   # imagetools stitch can fetch deterministically — it survives both
   # registries' round-tripping semantics.
   build:
-    needs: [preflight]
+    needs: [preflight, reuse]
+    # Only when `reuse` succeeded and asked for a build; a failed `reuse` is a
+    # blocked release (red CI), never a reason to build.
+    if: ${{ needs.reuse.outputs.found == 'false' }}
     runs-on: ${{ matrix.runner }}
     # A release whose Cargo.lock changed busts the cached cargo layer and forces
     # a cold full recompile, which overran the old 30-min cap on arm64 (v1.2.1).
@@ -167,8 +254,10 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Read `main`'s layer cache; never write one. A tag-scoped cache is
+          # readable by this ref alone, so every write was dead weight that
+          # pushed `main`'s entries out of the repository's 10 GB budget.
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
-          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
           # Plain `tags:` + `push: true` (no `outputs:`) — buildx writes the
           # manifest AT the explicit refs and applies them to BOTH registries
           # via the comma-separated list. The previous `outputs: type=image,name=
@@ -180,7 +269,9 @@ jobs:
           push: true
 
   merge:
-    needs: [preflight, build]
+    needs: [preflight, reuse, build]
+    # Runs on a reused image (`build` skipped) or a successful fallback build.
+    if: ${{ !cancelled() && needs.reuse.result == 'success' && (needs.build.result == 'success' || (needs.build.result == 'skipped' && needs.reuse.outputs.found == 'true')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -192,6 +283,24 @@ jobs:
         # Mirror the build job's derive; keep both jobs reading the same
         # semver (e.g. `1.4.5` not `v1.4.5`).
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      # The per-arch image config labels are baked at build time: on the reuse
+      # path they carry ci.yml's per-arch tag as `version`. Re-labelling would
+      # change the digest (no longer the tested one), so the release identity
+      # goes on the new index instead; `--version` reports the release anyway.
+      - name: source refs
+        id: src
+        # Reused: the `sha-<7>` multi-arch manifest ci.yml's `merge` wrote in
+        # each registry (imagetools re-tags an index as-is). Built: the two
+        # per-arch refs `build` pushed.
+        env:
+          REUSED: ${{ needs.reuse.outputs.found }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          if [ "$REUSED" = true ]; then
+            echo "tags=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=linux-amd64-$VERSION linux-arm64-$VERSION" >> "$GITHUB_OUTPUT"
+          fi
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: log in to ghcr
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
@@ -218,12 +327,21 @@ jobs:
             type=semver,pattern={{major}},enable=${{ needs.preflight.outputs.major == 'true' }}
             type=raw,value=latest,enable=${{ needs.preflight.outputs.latest == 'true' }}
       - name: create ghcr manifest list & push
+        env:
+          SOURCE_TAGS: ${{ steps.src.outputs.tags }}
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
+          sources=()
+          for tag in $SOURCE_TAGS; do sources+=("$REGISTRY/$IMAGE_NAME:$tag"); done
+          annotations=(
+            --annotation "index:org.opencontainers.image.version=$VERSION"
+            --annotation "index:org.opencontainers.image.revision=$GITHUB_SHA"
+            --annotation "index:org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          )
           # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:linux-amd64-${{ steps.ver.outputs.version }}" \
-            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:linux-arm64-${{ steps.ver.outputs.version }}"
+            "${annotations[@]}" "${sources[@]}"
       - name: derive docr image metadata
         id: meta-docr
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -243,12 +361,20 @@ jobs:
           # output into a step-scoped env var so the jq below reads the right
           # tag set.
           DOCR_METADATA_JSON: ${{ steps.meta-docr.outputs.json }}
+          SOURCE_TAGS: ${{ steps.src.outputs.tags }}
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
+          sources=()
+          for tag in $SOURCE_TAGS; do sources+=("$DOCR_REGISTRY/$DOCR_IMAGE_NAME:$tag"); done
+          annotations=(
+            --annotation "index:org.opencontainers.image.version=$VERSION"
+            --annotation "index:org.opencontainers.image.revision=$GITHUB_SHA"
+            --annotation "index:org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          )
           # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCR_METADATA_JSON") \
-            "${{ env.DOCR_REGISTRY }}/${{ env.DOCR_IMAGE_NAME }}:linux-amd64-${{ steps.ver.outputs.version }}" \
-            "${{ env.DOCR_REGISTRY }}/${{ env.DOCR_IMAGE_NAME }}:linux-arm64-${{ steps.ver.outputs.version }}"
+            "${annotations[@]}" "${sources[@]}"
       - name: inspect
         run: |
           docker buildx imagetools inspect \
@@ -258,6 +384,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [preflight, merge]
+    # Explicit: `merge` runs behind a skipped `build` on the reuse path, and a
+    # skipped ancestor would otherwise skip this job too.
+    if: ${{ !cancelled() && needs.merge.result == 'success' }}
     permissions:
       contents: write
     steps:

@@ -1,18 +1,20 @@
 name: workflow-lint
 
 # actionlint over every workflow (expression and type errors, unknown inputs, bad `needs`,
-# shellcheck on `run:` blocks) and the Claude Code hook tests. Advisory, not a ruleset-required
+# shellcheck on `run:` blocks), the Claude Code hook tests and the workflow helper-script tests. Advisory, not a ruleset-required
 # check: it runs only when a workflow or a hook changes, and a path-filtered required check would
 # never report on other PRs.
 on:
   pull_request:
     paths:
       - ".github/workflows/**"
+      - ".github/scripts/**"
       - ".claude/hooks/**"
   push:
     branches: [main]
     paths:
       - ".github/workflows/**"
+      - ".github/scripts/**"
       - ".claude/hooks/**"
   workflow_dispatch:
 
@@ -49,3 +51,15 @@ jobs:
           persist-credentials: false
       - name: hook tests
         run: python3 -I .claude/hooks/test_hooks.py -v
+
+  # release.yml's reuse decision (red CI blocks, absent CI builds, green reuses).
+  scripts:
+    # GitHub-hosted runner: this repository is public. stdlib only.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: release reuse-decision tests
+        run: python3 -I .github/scripts/test_release_reuse_decision.py -v
