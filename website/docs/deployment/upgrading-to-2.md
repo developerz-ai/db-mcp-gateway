@@ -36,6 +36,9 @@ Migrations apply at boot.
 | `0010`–`0014` | Additive: `audit_call_intents`, history index, refresh-token session link, `mongo` db_type, upstream/rows_affected/sql_truncated columns | Nobody — new objects only |
 | `0015` | Drops `audit_calls_user_sub_idx` and `audit_calls_db_type_idx` | Ad-hoc reporting queries that filtered `audit_calls` by `user_sub` alone or by `db_type` lose their dedicated index. `(user_sub, occurred_at)` and the history index still serve per-user lookups. |
 | `0016` | Drops `sessions.agent_client` | **Breaking for reports** that select `sessions.agent_client` — the query fails. The column was always NULL; read the per-call client banner from `audit_calls.agent_client` instead. |
+| `0017` (2.1.0) | Adds `oauth_refresh_tokens.chain_id` and the `oauth_refresh_rotated` tombstone table | None. Refresh-token reuse outside a 10 s grace now revokes the whole chain. `chain_id` keeps a default, so 2.0.3 still inserts after a rollback. |
+| `0018` (2.1.0) | Adds `sql`, `sql_truncated` and `reason` to `audit_call_intents` | None. An `abandoned` row the reaper writes now says what ran. |
+| `0019` (2.2.0) | Adds nullable `oauth_clients.client_name` | None. The consent page shows the self-registered name, marked unverified. 2.1.0 still inserts and reads. |
 
 New outcomes: `abandoned`, `audit_unavailable`, `dry_run`, `cancelled`. Reporting queries that enumerated outcomes should add them.
 
