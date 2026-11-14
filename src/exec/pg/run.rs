@@ -17,7 +17,7 @@ use super::super::query::ExecQuery;
 use super::super::sql_guard::Access;
 use super::cancel::{Backend, BackendTag, CancelOnDrop};
 use super::decode::{decode_row, decoders};
-use super::error::classify;
+use super::error::{classify, classify_commit};
 use super::truncate::cancel_and_rollback;
 
 /// What one run needs besides the query: where cancels go and run, and the
@@ -104,7 +104,9 @@ pub(super) async fn run_query_inner(
             // statement completed, and it commits whether or not the
             // `RETURNING` rows were truncated. A failed commit is an error —
             // never success after a rollback.
-            tx.commit().await.map_err(|e| classify(e, role))?;
+            tx.commit()
+                .await
+                .map_err(|e| classify_commit(e, query.access, role))?;
         }
         let rows_affected = (query.access == Access::ReadWrite).then_some(collected.rows_affected);
         Ok(ExecResult {

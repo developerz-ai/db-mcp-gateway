@@ -5,13 +5,22 @@
 //! the call is accounted for even though nobody saw its result.
 //!
 //! Runs on every replica; a transaction-scoped advisory lock lets only one
-//! sweep at a time.
+//! batch at a time.
+//!
+//! A sweep walks the aged intents in `(occurred_at, request_id)` order in
+//! bounded batches from a [`ReapCursor`], so it never re-examines intents an
+//! earlier sweep already settled and no statement grows with the retention
+//! window. The cursor advances only past committed batches: a failed sweep
+//! leaves it where it was and the next one retries from there, so no intent
+//! is ever skipped. It lives in process memory; a restarted replica starts
+//! from the oldest intent and catches up batch by batch.
 
 use std::time::Duration;
 
 use sqlx::PgPool;
 
 use crate::exec::DEFAULT_STATEMENT_TIMEOUT_MS;
+use crate::state::audit::{IntentKey, reap_abandoned_batch};
 
 use super::drain::DRAIN_TIMEOUT;
 use super::{AUDIT_WRITE_TIMEOUT, AuditError};
@@ -22,6 +31,10 @@ const REAPER_LOCK_KEY: i64 = 0x6462_6d63_7072_6170; // "dbmcprap"
 /// Calls the reaper recorded as `abandoned`: each one reached the target with
 /// no recorded outcome, so an alert on any increase is warranted.
 const ABANDONED_TOTAL: &str = "audit_abandoned_total";
+
+/// Intents one batch examines: a short index range plus key probes, so a
+/// batch stays far below the background pool's statement timeout.
+const REAP_BATCH_ROWS: u32 = 10_000;
 
 /// How often a replica attempts a sweep.
 pub const REAP_INTERVAL: Duration = Duration::from_secs(60);
@@ -42,13 +55,42 @@ pub const REAPER_GRACE: Duration = Duration::from_secs(
         + DRAIN_TIMEOUT.as_secs(),
 );
 
-/// One sweep. `Ok(None)` when another replica holds the lock; otherwise the
-/// number of `abandoned` rows written. `grace` is [`REAPER_GRACE`] in
-/// production; tests pass zero.
-pub async fn run_once(pool: &PgPool, grace: Duration) -> Result<Option<u64>, AuditError> {
-    crate::state::audit::reap_abandoned_intents(pool, REAPER_LOCK_KEY, grace)
+/// Where this process's next sweep resumes: the last intent a committed
+/// batch examined. `Default` starts from the oldest intent.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReapCursor(Option<IntentKey>);
+
+/// One sweep from `cursor`, batch by batch until the aged intents run out.
+/// `Ok(None)` when another replica held the lock before any batch ran;
+/// otherwise the number of `abandoned` rows written. `grace` is
+/// [`REAPER_GRACE`] in production; tests pass zero.
+pub async fn run_once(
+    pool: &PgPool,
+    grace: Duration,
+    cursor: &mut ReapCursor,
+) -> Result<Option<u64>, AuditError> {
+    let mut reaped: Option<u64> = None;
+    loop {
+        let batch = reap_abandoned_batch(
+            pool,
+            REAPER_LOCK_KEY,
+            grace,
+            cursor.0.as_ref(),
+            i64::from(REAP_BATCH_ROWS),
+        )
         .await
-        .map_err(AuditError::Write)
+        .map_err(AuditError::Write)?;
+        let Some(batch) = batch else {
+            return Ok(reaped);
+        };
+        reaped = Some(reaped.unwrap_or(0) + batch.reaped);
+        if let Some(last) = batch.last {
+            cursor.0 = Some(last);
+        }
+        if batch.scanned < u64::from(REAP_BATCH_ROWS) {
+            return Ok(reaped);
+        }
+    }
 }
 
 /// Sweep every [`REAP_INTERVAL`] forever. Spawned once at boot beside the
@@ -56,9 +98,10 @@ pub async fn run_once(pool: &PgPool, grace: Duration) -> Result<Option<u64>, Aud
 pub async fn run(pool: PgPool) {
     let mut ticker = tokio::time::interval(REAP_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut cursor = ReapCursor::default();
     loop {
         ticker.tick().await;
-        match run_once(&pool, REAPER_GRACE).await {
+        match run_once(&pool, REAPER_GRACE, &mut cursor).await {
             Ok(Some(0) | None) => {}
             Ok(Some(n)) => {
                 // Only the lock holder writes rows, so summing across replicas

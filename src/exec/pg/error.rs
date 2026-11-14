@@ -8,6 +8,7 @@
 
 use super::super::adapter::ExecError;
 use super::super::rejection::DbRejection;
+use super::super::sql_guard::Access;
 
 /// Classify an error raised while a statement ran. `role` is redacted from
 /// any server message passed through.
@@ -32,6 +33,20 @@ pub(super) fn classify(err: sqlx::Error, role: &str) -> ExecError {
         return ExecError::Unavailable;
     }
     ExecError::Sql
+}
+
+/// Classify a failed `COMMIT`. A server refusal (deferred constraint,
+/// serialization failure) or a cancel means the transaction rolled back, so
+/// it keeps its statement-level classification. Anything else on a write —
+/// the link dropped, the reply was unreadable — leaves the commit's fate
+/// unknown, which the caller must not report as "nothing happened".
+pub(super) fn classify_commit(err: sqlx::Error, access: Access, role: &str) -> ExecError {
+    match classify(err, role) {
+        ExecError::Unavailable | ExecError::Sql if access == Access::ReadWrite => {
+            ExecError::CommitIndeterminate
+        }
+        other => other,
+    }
 }
 
 /// Why acquiring a connection failed.
@@ -132,6 +147,34 @@ mod tests {
             AcquireFailure::of(&sqlx::Error::PoolTimedOut),
             AcquireFailure::Other
         );
+    }
+
+    fn io_reset() -> sqlx::Error {
+        sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+    }
+
+    #[test]
+    fn lost_connection_at_write_commit_is_indeterminate() {
+        assert!(matches!(
+            classify_commit(io_reset(), Access::ReadWrite, "app"),
+            ExecError::CommitIndeterminate
+        ));
+        assert!(matches!(
+            classify_commit(
+                sqlx::Error::Protocol("eof".into()),
+                Access::ReadWrite,
+                "app"
+            ),
+            ExecError::CommitIndeterminate
+        ));
+    }
+
+    #[test]
+    fn lost_connection_at_read_commit_stays_unavailable() {
+        assert!(matches!(
+            classify_commit(io_reset(), Access::ReadOnly, "app"),
+            ExecError::Unavailable
+        ));
     }
 
     #[test]

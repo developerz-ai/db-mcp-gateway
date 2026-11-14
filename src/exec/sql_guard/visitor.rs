@@ -25,8 +25,12 @@ use super::GuardError;
 ///   session lock blocks other users until the connection is reset).
 /// - other backends: `pg_cancel_backend`, `pg_terminate_backend`.
 /// - dynamic SQL: `query_to_xml*`, `cursor_to_xml*`, `table_to_xml*`,
-///   `schema_to_xml*`, `database_to_xml*` execute SQL text or whole-schema
-///   reads the guard cannot inspect; `dblink*` reaches other servers.
+///   `schema_to_xml*`, `database_to_xml*`, `ts_stat` and `ts_rewrite` execute
+///   SQL text or whole-schema reads the guard cannot inspect — a denied call
+///   inside that text runs unseen; `dblink*` reaches other servers.
+/// - messages to other sessions: `pg_notify` and `pg_logical_emit_message`
+///   run in a read-only transaction and, on its commit, reach every
+///   `LISTEN`er or logical-decoding consumer (job queues, CDC pipelines).
 const DENIED_FUNCTIONS: &[Denied] = &[
     Denied::Exact("pg_read_file"),
     Denied::Exact("pg_read_binary_file"),
@@ -49,6 +53,10 @@ const DENIED_FUNCTIONS: &[Denied] = &[
     Denied::Prefix("schema_to_xml", "schema_to_xml*"),
     Denied::Prefix("database_to_xml", "database_to_xml*"),
     Denied::Prefix("dblink", "dblink*"),
+    Denied::Exact("pg_notify"),
+    Denied::Exact("pg_logical_emit_message"),
+    Denied::Exact("ts_stat"),
+    Denied::Exact("ts_rewrite"),
 ];
 
 /// One denylist entry. Exact names come first in [`DENIED_FUNCTIONS`] so a

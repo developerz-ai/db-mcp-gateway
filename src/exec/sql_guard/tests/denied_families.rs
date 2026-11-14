@@ -30,6 +30,16 @@ const FAMILIES: &[(&str, &str)] = &[
     ("lo_from_bytea(0, 'x')", "lo_*"),
     ("lo_unlink(1)", "lo_*"),
     ("lowrite(1, 'x')", "lowrite"),
+    ("pg_notify('jobs', '{\"run\":\"x\"}')", "pg_notify"),
+    (
+        "pg_logical_emit_message(true, 'p', 'm')",
+        "pg_logical_emit_message",
+    ),
+    ("ts_stat('UPDATE t SET a = 1 RETURNING v')", "ts_stat"),
+    (
+        "ts_rewrite('a'::tsquery, 'SELECT q, r FROM t')",
+        "ts_rewrite",
+    ),
 ];
 
 fn denied_as(sql: &str, want: &str) {
@@ -81,6 +91,7 @@ fn case_and_schema_qualification_do_not_bypass() {
         "set_config",
     );
     denied_as("SELECT public.DBLINK('x', 'y')", "dblink*");
+    denied_as("SELECT PG_CATALOG.PG_NOTIFY('c', 'p')", "pg_notify");
 }
 
 /// A prefix family must not swallow ordinary relations or near-miss names:
@@ -91,6 +102,9 @@ fn prefixes_do_not_match_relations_or_near_misses() {
     ok("SELECT * FROM dblink_audit d JOIN table_to_xml_cache c ON d.id = c.id");
     ok("SELECT lower('A'), lo FROM t");
     ok("SELECT pg_advisory FROM t");
+    // `ts_stat` / `ts_rewrite` are exact: other text-search functions read.
+    ok("SELECT to_tsvector('a b'), ts_rank(v, q), ts_headline('x', q) FROM t");
+    ok("SELECT * FROM ts_stats");
 }
 
 /// `DESCRIBE t` parses as `ExplainTable`; it is not Postgres and is denied.

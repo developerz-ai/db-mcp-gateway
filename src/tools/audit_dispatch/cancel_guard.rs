@@ -5,8 +5,10 @@ use metrics::counter;
 use sqlx::PgPool;
 
 use crate::audit::drain::DetachedTasks;
+use crate::audit::intent::WRITE_MAY_HAVE_COMMITTED;
 use crate::audit::stream::StreamSinks;
 use crate::audit::{self, AuditRow, OutcomeCode};
+use crate::exec::Access;
 
 use super::Outcome;
 use super::metric_names::{ACCESS_UNKNOWN, AUDIT_FALLBACK_FAILURES, TOOL_CALLS};
@@ -116,13 +118,18 @@ impl Drop for CancelledAuditGuard {
             )
             .increment(1);
         }
-        let row = self.row.clone();
+        let mut row = self.row.clone();
         let sinks = self.sinks.clone();
         let tasks = self.tasks.clone();
-        // `audit::log` has its own deadline, so this cannot run unbounded.
-        // Nobody awaits it — the client is gone or already got its error —
-        // so a failure is surfaced by log line and counter only.
+        let dropped_mid_work = !self.completed;
+        // `audit::log` and the intent lookup have their own deadlines, so
+        // this cannot run unbounded. Nobody awaits it — the client is gone
+        // or already got its error — so a failure is surfaced by log line
+        // and counter only.
         self.tasks.spawn(async move {
+            if dropped_mid_work {
+                note_write_access(&pool, &mut row).await;
+            }
             match audit::log(&pool, &row).await {
                 Ok(()) => sinks.send(&row, &tasks),
                 Err(err) => {
@@ -137,6 +144,25 @@ impl Drop for CancelledAuditGuard {
                 }
             }
         });
+    }
+}
+
+/// A dispatch dropped mid-work may have been dropped mid-commit. The work
+/// that knew its access is gone, so ask the intent it committed: a write is
+/// flagged as possibly committed. A failed lookup still writes the row.
+async fn note_write_access(pool: &PgPool, row: &mut AuditRow) {
+    match audit::intent::access_of(pool, &row.request_id).await {
+        Ok(Some(Access::ReadWrite)) => {
+            let message = row.error_message.as_deref().unwrap_or(DISCONNECTED);
+            row.error_message = Some(format!("{message} ({WRITE_MAY_HAVE_COMMITTED})"));
+        }
+        Ok(Some(Access::ReadOnly) | None) => {}
+        Err(err) => tracing::warn!(
+            %err,
+            class = %err.class(),
+            request_id = %row.request_id,
+            "intent access lookup failed; cancelled row carries no access"
+        ),
     }
 }
 

@@ -53,7 +53,8 @@ impl ToolsListResult {
                             "server":   { "type": "string" },
                             "database": { "type": "string" },
                             "schema":   { "type": "string" },
-                            "table":    { "type": "string" }
+                            "table":    { "type": "string" },
+                            "reason":   { "type": "string", "description": REASON_DESCRIPTION }
                         },
                         "required": ["server", "database"],
                         "additionalProperties": false

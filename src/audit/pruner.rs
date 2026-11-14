@@ -11,9 +11,10 @@
 //! `run_once` is the DB call tests drive directly; the background loop in
 //! `startup` ticks hourly and calls it.
 
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
-use crate::state::audit::{AuditTable, delete_expired_batch};
+use crate::state::audit::{AuditTable, delete_expired_batch, retention_cutoff};
 
 use super::AuditError;
 
@@ -40,35 +41,71 @@ fn effective_ttl_days(ttl: u32) -> u32 {
 pub async fn run_once(pool: &PgPool, ttl_days: u32) -> Result<u64, AuditError> {
     let days = effective_ttl_days(ttl_days);
     let days = i32::try_from(days).unwrap_or(i32::MAX);
-    // Intents first: deleting a completion row before its intent would let a
-    // concurrent reaper sweep mistake the intent for an abandoned call.
-    let intents = prune_table(pool, AuditTable::Intents, days).await?;
-    let calls = prune_table(pool, AuditTable::Calls, days).await?;
-    Ok(intents + calls)
+    let cutoff = retention_cutoff(pool, days)
+        .await
+        .map_err(AuditError::Write)?;
+    prune_before(pool, cutoff).await
+}
+
+/// Delete both tables' rows older than `cutoff`: every expired intent
+/// first, and only then the completions. One cutoff for both keeps "intent
+/// survives ⇒ its completion survives" (a completion is never older than its
+/// intent), so the reaper never sees a kept intent whose completion was
+/// pruned and records a call that finished as `abandoned`.
+pub async fn prune_before(pool: &PgPool, cutoff: DateTime<Utc>) -> Result<u64, AuditError> {
+    let intents = prune_table(pool, AuditTable::Intents, cutoff).await?;
+    let Drained::Complete = intents.drained else {
+        // Another replica holds the lock mid-run; expired intents may remain,
+        // so their completions must stay until a run drains them.
+        return Ok(intents.deleted);
+    };
+    let calls = prune_table(pool, AuditTable::Calls, cutoff).await?;
+    Ok(intents.deleted + calls.deleted)
+}
+
+/// Whether a table's backlog was fully deleted or the run yielded the lock.
+#[derive(Debug, Clone, Copy)]
+enum Drained {
+    Complete,
+    LockHeldElsewhere,
+}
+
+#[derive(Debug)]
+struct Pruned {
+    deleted: u64,
+    drained: Drained,
 }
 
 /// Delete batches until one comes back short (the backlog is gone) or the
 /// lock is held elsewhere.
-async fn prune_table(pool: &PgPool, table: AuditTable, days: i32) -> Result<u64, AuditError> {
-    let mut total = 0;
+async fn prune_table(
+    pool: &PgPool,
+    table: AuditTable,
+    cutoff: DateTime<Utc>,
+) -> Result<Pruned, AuditError> {
+    let mut deleted = 0;
     loop {
         let batch = delete_expired_batch(
             pool,
             PRUNER_LOCK_KEY,
             table,
-            days,
+            cutoff,
             i64::from(PRUNE_BATCH_ROWS),
         )
         .await
         .map_err(AuditError::Write)?;
-        match batch {
-            Some(deleted) => {
-                total += deleted;
-                if deleted < u64::from(PRUNE_BATCH_ROWS) {
-                    return Ok(total);
-                }
-            }
-            None => return Ok(total),
+        let Some(batch_deleted) = batch else {
+            return Ok(Pruned {
+                deleted,
+                drained: Drained::LockHeldElsewhere,
+            });
+        };
+        deleted += batch_deleted;
+        if batch_deleted < u64::from(PRUNE_BATCH_ROWS) {
+            return Ok(Pruned {
+                deleted,
+                drained: Drained::Complete,
+            });
         }
     }
 }
