@@ -1,7 +1,8 @@
 //! Retention pruner. Deletes `audit_call_intents`, `audit_calls` and
-//! `permissions_audit` rows older than the configured hot-storage TTL
-//! (spec 07 §"Retention pruning"); no archive tier ships, so nothing is
-//! exported first.
+//! `permissions_audit` rows older than the configured hot-storage TTL, and
+//! permissions rows revoked or soft-deleted longer ago than that (spec 07
+//! §"Retention pruning"); no archive tier ships, so nothing is exported
+//! first.
 //!
 //! Deletes run in bounded batches, each its own transaction under a
 //! transaction-scoped advisory lock: a large backlog never holds one long
@@ -15,7 +16,9 @@
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
-use crate::state::audit::{AuditTable, delete_expired_batch, retention_cutoff};
+use crate::state::audit::{
+    RetentionTable, delete_expired_batch, referenced_expired_parents, retention_cutoff,
+};
 
 use super::AuditError;
 
@@ -40,15 +43,20 @@ fn effective_ttl_days(ttl: u32) -> u32 {
 /// one cutoff for both keeps "intent survives ⇒ its completion survives" (a
 /// completion is never older than its intent), so the reaper never sees a
 /// kept intent whose completion was pruned and records a call that finished
-/// as `abandoned`. `permissions_audit` is independent of both.
-const PRUNE_ORDER: [AuditTable; 3] = [
-    AuditTable::Intents,
-    AuditTable::Calls,
-    AuditTable::PermissionsChanges,
+/// as `abandoned`. Revoked grants go before the users and databases they
+/// reference, so a parent's FK children are gone by the time it is reached.
+const PRUNE_ORDER: [RetentionTable; 6] = [
+    RetentionTable::Intents,
+    RetentionTable::Calls,
+    RetentionTable::PermissionsChanges,
+    RetentionTable::RevokedGrants,
+    RetentionTable::DeletedDatabases,
+    RetentionTable::DeletedUsers,
 ];
 
 /// Delete every audit row older than `ttl_days` (`occurred_at`, or `ts` for
-/// `permissions_audit`). Returns the rows removed across all tables (zero
+/// `permissions_audit`) and every permissions row revoked or soft-deleted
+/// before then; live permissions rows are never touched. Returns the rows removed across all tables (zero
 /// when another replica holds the lock).
 pub async fn run_once(pool: &PgPool, ttl_days: u32) -> Result<u64, AuditError> {
     let days = effective_ttl_days(ttl_days);
@@ -69,10 +77,30 @@ pub async fn prune_before(pool: &PgPool, cutoff: DateTime<Utc>) -> Result<u64, A
         let pruned = prune_table(pool, table, cutoff).await?;
         deleted += pruned.deleted;
         let Drained::Complete = pruned.drained else {
-            break;
+            return Ok(deleted);
         };
     }
+    warn_on_referenced_parents(pool, cutoff).await?;
     Ok(deleted)
+}
+
+/// A soft-deleted parent a grant still references outlives retention; it
+/// can only come from a write outside the admin API, so say so.
+async fn warn_on_referenced_parents(
+    pool: &PgPool,
+    cutoff: DateTime<Utc>,
+) -> Result<(), AuditError> {
+    let (users, databases) = referenced_expired_parents(pool, cutoff)
+        .await
+        .map_err(AuditError::Write)?;
+    if users + databases > 0 {
+        tracing::warn!(
+            users,
+            databases,
+            "soft-deleted permissions rows past retention are still referenced by a grant; not pruned"
+        );
+    }
+    Ok(())
 }
 
 /// Whether a table's backlog was fully deleted or the run yielded the lock.
@@ -92,7 +120,7 @@ struct Pruned {
 /// lock is held elsewhere.
 async fn prune_table(
     pool: &PgPool,
-    table: AuditTable,
+    table: RetentionTable,
     cutoff: DateTime<Utc>,
 ) -> Result<Pruned, AuditError> {
     let mut deleted = 0;
@@ -142,8 +170,16 @@ mod tests {
 
     #[test]
     fn intents_are_pruned_before_their_completions() {
-        assert_eq!(PRUNE_ORDER[0], AuditTable::Intents);
-        assert_eq!(PRUNE_ORDER[1], AuditTable::Calls);
+        assert_eq!(PRUNE_ORDER[0], RetentionTable::Intents);
+        assert_eq!(PRUNE_ORDER[1], RetentionTable::Calls);
+    }
+
+    #[test]
+    fn grants_are_pruned_before_the_rows_they_reference() {
+        let at = |t| PRUNE_ORDER.iter().position(|&x| x == t);
+        let grants = at(RetentionTable::RevokedGrants);
+        assert!(grants < at(RetentionTable::DeletedDatabases));
+        assert!(grants < at(RetentionTable::DeletedUsers));
     }
 
     #[test]

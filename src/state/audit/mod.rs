@@ -16,7 +16,9 @@ pub use intents::{
 pub use permissions::insert_permissions_change;
 #[cfg(any(test, debug_assertions))]
 pub use permissions::latest_permissions_change;
-pub use retention::{AuditTable, delete_expired_batch, retention_cutoff};
+pub use retention::{
+    RetentionTable, delete_expired_batch, referenced_expired_parents, retention_cutoff,
+};
 
 use sqlx::PgPool;
 #[cfg(any(test, debug_assertions))]

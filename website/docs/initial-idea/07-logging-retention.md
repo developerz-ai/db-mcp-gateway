@@ -76,7 +76,9 @@ Hot and stream are independent — you can send everything to Splunk *and* keep 
 
 A background task runs hourly and deletes `audit_call_intents` rows, then `audit_calls` rows, then `permissions_audit` rows (the admin API's change trail, [12](12-dynamic-permissions.md#permissions_audit-table)) older than the hot TTL — `AUDIT_RETENTION_DAYS`, default 90. One cutoff, read from the state DB's clock once per run, applies to every batch of every table (`occurred_at` for the call tables, `ts` for `permissions_audit`), so no row inside the window is ever deleted. Every expired intent is deleted before any completion: a completion is never older than its intent, so an intent that survives always keeps its completion and the reaper never records a finished call as `abandoned`. A run that loses the lock stops there — it never touches a later table — and the replica holding the lock finishes the job. TTL is floored at one day. Deletes run in batches of 5,000 rows, oldest first, each in its own transaction under a transaction-scoped advisory lock — a large backlog never becomes one long transaction, and a replica that finds the lock held leaves the pruning to the replica holding it. No archive tier is shipped, so nothing is exported before the delete. Pruning is logged.
 
-The MySQL permissions store's `permissions_audit` table (`migrations-mysql/0002`) is not pruned: the gateway never writes it (boot rejects `driver: mysql` with `admin.enabled`), so whatever it holds was written — and must be retained — by the operator's own tooling.
+The same run then hard-deletes dead permissions rows on the same cutoff: grants whose `revoked_at` is past it, then databases and users whose `deleted_at` is past it — children before parents, so the foreign keys hold. Live (not revoked, not soft-deleted) rows are never touched. A soft-deleted user or database that a grant still references is skipped and the run logs a `WARN` with the count; the admin API revokes a parent's grants in the transaction that soft-deletes it, so such a row can only come from a write outside the gateway. The deletion itself was already recorded in `permissions_audit`, which ages out on the same horizon. The batches walk partial indexes on the dead rows (migration `0020`).
+
+The MySQL permissions store is not pruned — neither its `permissions_audit` table (`migrations-mysql/0002`) nor its soft-deleted rows. The gateway never writes that store (boot rejects `driver: mysql` with `admin.enabled`); the operator's own tooling fills it and owns its retention.
 
 ### What bounds every table the gateway writes
 
@@ -86,7 +88,7 @@ The MySQL permissions store's `permissions_audit` table (`migrations-mysql/0002`
 | `sessions` (incl. revoked rows — the session denylist) | auth GC, every 5 min | `expires_at` + 1 h grace; `SESSION_TTL_HOURS` ≤ 168 |
 | `oauth_refresh_tokens`, `oauth_refresh_rotated` | auth GC, every 5 min | chain birth + `REFRESH_TTL_DAYS` (default 1, ≤ 366) |
 | `oauth_clients` | auth GC, every 5 min | 90 days after last use (1 h if never authorised) |
-| `permissions_users` / `_databases` / `_grants` | none — live permissions config | soft-deleted rows (`deleted_at`) are kept, including `permissions_users.user_email` |
+| `permissions_grants` (revoked), `permissions_users` / `permissions_databases` (soft-deleted) | hourly pruner, after `permissions_audit` | `revoked_at` / `deleted_at` + `AUDIT_RETENTION_DAYS`; live rows are never touched |
 | Pending OAuth flows, auth codes, session cache | process memory, TTL-swept | minutes; gone on restart |
 
 ### Retention surfaces outside the gateway

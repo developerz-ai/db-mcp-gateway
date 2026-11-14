@@ -89,7 +89,7 @@ All paths are under `/admin/v1`. Request and response bodies are JSON. `Content-
 }
 ```
 
-Response: the full `PermissionsUser` row. Upsert is idempotent on the *live* row — soft-deleted history stays as audit trail.
+Response: the full `PermissionsUser` row. Upsert is idempotent on the *live* row — soft-deleted rows stay until the retention pruner hard-deletes them `AUDIT_RETENTION_DAYS` after deletion.
 
 `GET /admin/v1/users` — list live users, oldest first.
 
@@ -101,7 +101,7 @@ Response: the full `PermissionsUser` row. Upsert is idempotent on the *live* row
 { "user_email": "alice.new@example.com", "groups": ["engineers", "oncall"] }
 ```
 
-`DELETE /admin/v1/users/:id` — soft delete. Sets `deleted_at`; subsequent live lookups return 404. The row stays in the table as audit trail.
+`DELETE /admin/v1/users/:id` — soft delete. Sets `deleted_at` and revokes the user's grants; subsequent live lookups return 404. The row is hard-deleted `AUDIT_RETENTION_DAYS` (default 90) after `deleted_at`; `permissions_audit` keeps the change on the same horizon.
 
 ### Databases
 
