@@ -81,9 +81,11 @@ async fn pruner_hard_deletes_expired_soft_deleted_permissions_rows() {
     let live_user = user(&p, &format!("prune-live-{tag}"), None).await;
     let live_db = database(&p, &format!("live-{tag}"), None).await;
     let live_grant = grant(&p, live_user, live_db, None).await;
-    // Anomaly: an expired soft-deleted user a live grant still references.
+    // Anomaly: expired soft-deleted parents a live grant still references.
     let orphan_user = user(&p, &format!("prune-orphan-{tag}"), Some(100)).await;
     let orphan_grant = grant(&p, orphan_user, live_db, None).await;
+    let orphan_db = database(&p, &format!("orphan-{tag}"), Some(100)).await;
+    let orphan_db_grant = grant(&p, live_user, orphan_db, None).await;
 
     audit::pruner::run_once(&p, 90).await.expect("pruner runs");
 
@@ -103,18 +105,20 @@ async fn pruner_hard_deletes_expired_soft_deleted_permissions_rows() {
         ("permissions_users", live_user),
         ("permissions_grants", orphan_grant),
         ("permissions_users", orphan_user),
+        ("permissions_grants", orphan_db_grant),
+        ("permissions_databases", orphan_db),
     ] {
         assert!(exists(&p, table, id).await, "{table} row {id} deleted");
     }
 
-    for g in [edge_grant, live_grant, orphan_grant] {
+    for g in [edge_grant, live_grant, orphan_grant, orphan_db_grant] {
         sqlx::query("DELETE FROM permissions_grants WHERE id = $1")
             .bind(g)
             .execute(&p)
             .await
             .expect("cleanup grant");
     }
-    for d in [edge_db, live_db] {
+    for d in [edge_db, live_db, orphan_db] {
         sqlx::query("DELETE FROM permissions_databases WHERE id = $1")
             .bind(d)
             .execute(&p)
