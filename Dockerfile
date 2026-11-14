@@ -10,7 +10,7 @@
 # Both arches are fetched because `ADD --checksum` takes a literal; the
 # build's own arch is picked by TARGETARCH. busybox only unpacks the .tar.xz
 # (the rust slim image ships no xz).
-FROM busybox:1.37.0-musl@sha256:f6a95d611e0a8780fabdb2aec43e31275b2720dfefa3e41b16835bfc42454478 AS chef-bin
+FROM busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6 AS chef-bin
 ARG TARGETARCH
 ADD --checksum=sha256:ff390181459f53c787a496c4ee9a52d8c9c7975ab8d02c8dbd1a0fa1626171f4 \
     https://github.com/LukeMathWalker/cargo-chef/releases/download/v0.1.77/cargo-chef-x86_64-unknown-linux-gnu.tar.xz \
