@@ -87,6 +87,8 @@ pub enum GuardError {
     SelectInto,
     #[error("EXPLAIN ANALYZE is not allowed (it executes the query)")]
     ExplainAnalyze,
+    #[error("Unicode-escaped identifiers (U&\"…\") are not allowed; spell the identifier plainly")]
+    UnicodeEscapedIdentifier,
     /// Stable error code: `GUARD_DENIED_FUNCTION`.
     #[error("function `{0}` is not allowed (high-privilege server-side function)")]
     DeniedFunction(&'static str),

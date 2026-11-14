@@ -72,7 +72,7 @@ async fn unicode_escaped_terminate_kills_another_identitys_query_so_the_guard_re
     for access in [Access::ReadOnly, Access::ReadWrite] {
         assert_eq!(
             check_sql(&sql, access),
-            Err(GuardError::NotAllowed("Unicode-escaped identifier"))
+            Err(GuardError::UnicodeEscapedIdentifier)
         );
     }
 }

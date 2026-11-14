@@ -240,6 +240,10 @@ To keep the sentinel from ever reaching the store, `POST` and `PATCH` on `/admin
 
 The rejection runs before any INSERT/UPDATE against `permissions_databases`, so a rejected request leaves the store and `permissions_audit` unchanged (verified end-to-end in `tests/admin_databases_e2e.rs`).
 
+### Declared servers only on `/admin/v1/databases`
+
+`POST` and `PATCH` on `/admin/v1/databases` (a `PATCH` only when it sets `server`) require the trimmed `server` to name a server declared in the gateway's **boot** config — the same set a wildcard grant's `server` is checked against; a SIGHUP reload does not change it. An undeclared server is `400 invalid_request` (`server must name a server declared in the gateway config`). A row on an undeclared server would otherwise sit dormant until a later config change silently armed every specific grant on it. Like the sentinel check, the refusal happens before the transaction opens, so no `permissions_databases` row and no `permissions_audit` entry is written (verified in `tests/transport_wave2_admin_databases.rs`).
+
 The supported way to grant access to every database on a server is `db_name_wildcard: true` + `database_id: null` on `POST /admin/v1/grants` (see [Request shapes](#request-shapes) above), *not* a `permissions_databases` row literally named `"*"`.
 
 ## `DbAdapter` trait
