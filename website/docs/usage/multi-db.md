@@ -136,7 +136,7 @@ Agent disconnect → axum drops the dispatch future → mongo cursor drops → m
 - A pending cursor doesn't pin a connection forever.
 - The audit row still lands. The drop-guard in `audit_dispatch` spawns a detached task that writes `outcome = "cancelled"` with `error_message = "client disconnected before completion"` even though the parent future died.
 
-Pinned by `tests/audit_dispatch_cancellation_real_db.rs`.
+Pinned by `tests/it_db/audit_dispatch_cancellation_real_db.rs`.
 
 ## Audit row shape
 

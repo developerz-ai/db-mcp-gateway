@@ -43,7 +43,7 @@ Self-hosted MCP gateway. AI agents get audited, SSO-gated, read-only DB access. 
 | mongosh — target Mongo | `bin/dev mongosh` |
 | mysql — permissions store | `bin/dev mysql` |
 | Full test (unit + integration; cargo-nextest when installed, else `cargo test`) | `bin/test` |
-| Single test by pattern | `bin/test --test <name>` or `cargo test <pattern>` |
+| Single test by pattern | `bin/test --test <binary> <module>::` (e.g. `bin/test --test it_db run_query_e2e::`) or `cargo test <pattern>` |
 | Format | `bin/fmt` |
 | Lint (fmt-check + clippy -D warnings) | `bin/lint` |
 | Reproduce CI locally / one-command check | `bin/ci` / `bin/check` |
@@ -147,7 +147,7 @@ src/
   audit/            # writer, pruner, archive, sinks
   state/            # state DB queries, permissions store (pg.rs, permissions/mysql/); no central errors.rs — each layer owns its typed error
 migrations/         # state-DB schema (sqlx, Postgres); migrations-mysql/ = MySQL permissions store
-tests/              # integration tests — real DBs, never a mocked target DB
+tests/              # integration tests, one binary per group dir: it_db/ (real DBs, never a mocked target DB), it_offline/, it_global/ (process-global installs); public_tree.rs, brief_rows.rs standalone
 benchmarks/         # load harness (feature-gated, never shipped)
 config/             # example.yaml (commented), permissions.yml (deployable)
 docs/               # internal notes (security QA)

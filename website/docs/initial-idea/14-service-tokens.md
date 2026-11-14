@@ -121,7 +121,7 @@ groups. Per-table scope remains what it is for humans: out of scope.
 Service identities resolve grants from **YAML only**, enforced twice. The
 resolver never reads the permissions store for a service identity, so even a
 DB grant planted for `service:<name>` by direct database access is inert
-(`tests/service_tokens_e2e.rs`). And `POST /admin/v1/users` rejects any
+(`tests/it_db/service_tokens_e2e.rs`). And `POST /admin/v1/users` rejects any
 `service:*` subject with `400`, so the audited admin API cannot create one.
 That is deliberate: every grant a service token can exercise is reviewed by
 PR.

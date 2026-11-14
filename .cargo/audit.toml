@@ -6,7 +6,7 @@
 # The previous justification here claimed this gateway is "Postgres-only" and
 # that the MySQL auth handshake never executes. That is no longer true:
 # Cargo.toml enables sqlx's `mysql` feature deliberately, MySQL is a supported
-# `permissions_store.driver`, and tests/permissions_repo_mysql.rs exercises it
+# `permissions_store.driver`, and tests/it_db/permissions_repo_mysql.rs exercises it
 # against a live server in CI.
 #
 # Accurate status: `rsa` is used by sqlx-mysql only to encrypt the password

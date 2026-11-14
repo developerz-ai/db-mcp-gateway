@@ -129,7 +129,7 @@ cargo test <pattern>         # Unit test by pattern
 **Test coverage:**
 - **Unit tests** — pure logic (authz eval, config validation, SQL rewriting). No real DB. Inline at the bottom of each source file.
 - **Property tests** — authz constraint-merge logic in `*_proptests.rs` files (e.g., `src/authz/effective_proptests.rs`). Uses `proptest` crate.
-- **Integration tests** — `tests/*.rs` files against real Postgres instances. **NEVER mock the target DB** in query-path tests.
+- **Integration tests** — `tests/it_db/*.rs` (+ `tests/it_offline/`, `tests/it_global/`) files against real Postgres instances. **NEVER mock the target DB** in query-path tests.
 
 **MUST DO:** Every tool integration test asserts an audit row exists. Forbidden path → `outcome: forbidden`.
 

@@ -1,7 +1,7 @@
 //! Pure-logic tests for what the guard's fallback row carries at each
 //! stage. Real state-DB coverage lives in
-//! `tests/audit_dispatch_cancellation_real_db.rs` and
-//! `tests/audit_two_phase_real_db.rs`.
+//! `tests/it_db/audit_dispatch_cancellation_real_db.rs` and
+//! `tests/it_db/audit_two_phase_real_db.rs`.
 
 use serde_json::json;
 use uuid::Uuid;
