@@ -83,7 +83,7 @@ jobs:
           if rustup toolchain list | grep -q '^stable'; then
             rustup toolchain uninstall stable
           fi
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+      - uses: Swatinem/rust-cache@f4371d1ec7179bfbd04a82a81e3b3af7f720750f # v2
       - name: run the benchmark harness
         run: ./benchmarks/gateway_overhead.sh --out "$RESULT"
       - name: gate against the stored baseline
