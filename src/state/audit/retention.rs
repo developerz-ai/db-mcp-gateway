@@ -1,4 +1,5 @@
-//! Retention deletes for `audit_calls` and `audit_call_intents`: one bounded
+//! Retention deletes for `audit_calls`, `audit_call_intents` and
+//! `permissions_audit`: one bounded
 //! batch per call, each in its own transaction under a transaction-scoped
 //! advisory lock, so replicas never delete the same rows at once and a
 //! dropped connection can never strand the lock on a pooled session.
@@ -11,11 +12,14 @@ use sqlx::PgPool;
 pub enum AuditTable {
     Calls,
     Intents,
+    /// The admin API's change trail; timestamped by `ts`, not `occurred_at`.
+    PermissionsChanges,
 }
 
 impl AuditTable {
-    // `ORDER BY occurred_at LIMIT` walks `*_occurred_at_idx`, oldest first,
-    // so each batch is an index range plus key lookups, never a full scan.
+    // `ORDER BY <timestamp> LIMIT` walks the table's timestamp index
+    // (`*_occurred_at_idx`, `permissions_audit_ts_idx`), oldest first, so each
+    // batch is an index range plus key lookups, never a full scan.
     fn delete_batch_sql(self) -> &'static str {
         match self {
             Self::Calls => {
@@ -30,12 +34,18 @@ impl AuditTable {
                    WHERE occurred_at < $1 \
                    ORDER BY occurred_at LIMIT $2)"
             }
+            Self::PermissionsChanges => {
+                "DELETE FROM permissions_audit WHERE id IN ( \
+                   SELECT id FROM permissions_audit \
+                   WHERE ts < $1 \
+                   ORDER BY ts LIMIT $2)"
+            }
         }
     }
 }
 
 /// The retention cutoff `days` before the state DB's clock. Computed once
-/// per prune run so every batch of both tables deletes against the same
+/// per prune run so every batch of every table deletes against the same
 /// instant.
 pub async fn retention_cutoff(pool: &PgPool, days: i32) -> Result<DateTime<Utc>, sqlx::Error> {
     sqlx::query_scalar("SELECT now() - make_interval(days => $1)")

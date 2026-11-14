@@ -74,7 +74,29 @@ Hot and stream are independent — you can send everything to Splunk *and* keep 
 
 ## Retention pruning
 
-A background task runs hourly and deletes `audit_call_intents` rows, then `audit_calls` rows, older than the hot TTL. One cutoff, read from the state DB's clock once per run, applies to every batch of both tables, and every expired intent is deleted before any completion: a completion is never older than its intent, so an intent that survives always keeps its completion and the reaper never records a finished call as `abandoned`. A run that loses the lock while intents remain stops before touching `audit_calls`. TTL is floored at one day. Deletes run in batches of 5,000 rows, oldest first, each in its own transaction under a transaction-scoped advisory lock — a large backlog never becomes one long transaction, and a replica that finds the lock held leaves the pruning to the replica holding it. No archive tier is shipped, so nothing is exported before the delete. Pruning is logged.
+A background task runs hourly and deletes `audit_call_intents` rows, then `audit_calls` rows, then `permissions_audit` rows (the admin API's change trail, [12](12-dynamic-permissions.md#permissions_audit-table)) older than the hot TTL — `AUDIT_RETENTION_DAYS`, default 90. One cutoff, read from the state DB's clock once per run, applies to every batch of every table (`occurred_at` for the call tables, `ts` for `permissions_audit`), so no row inside the window is ever deleted. Every expired intent is deleted before any completion: a completion is never older than its intent, so an intent that survives always keeps its completion and the reaper never records a finished call as `abandoned`. A run that loses the lock stops there — it never touches a later table — and the replica holding the lock finishes the job. TTL is floored at one day. Deletes run in batches of 5,000 rows, oldest first, each in its own transaction under a transaction-scoped advisory lock — a large backlog never becomes one long transaction, and a replica that finds the lock held leaves the pruning to the replica holding it. No archive tier is shipped, so nothing is exported before the delete. Pruning is logged.
+
+The MySQL permissions store's `permissions_audit` table (`migrations-mysql/0002`) is not pruned: the gateway never writes it (boot rejects `driver: mysql` with `admin.enabled`), so whatever it holds was written — and must be retained — by the operator's own tooling.
+
+### What bounds every table the gateway writes
+
+| Data | Bound | Max age |
+|---|---|---|
+| `audit_calls`, `audit_call_intents`, `permissions_audit` (state DB) | hourly pruner | `AUDIT_RETENTION_DAYS` (default 90) + ≤ 1 h tick (+ ≤ 5 min first-tick jitter) |
+| `sessions` (incl. revoked rows — the session denylist) | auth GC, every 5 min | `expires_at` + 1 h grace; `SESSION_TTL_HOURS` ≤ 168 |
+| `oauth_refresh_tokens`, `oauth_refresh_rotated` | auth GC, every 5 min | chain birth + `REFRESH_TTL_DAYS` (default 1, ≤ 366) |
+| `oauth_clients` | auth GC, every 5 min | 90 days after last use (1 h if never authorised) |
+| `permissions_users` / `_databases` / `_grants` | none — live permissions config | soft-deleted rows (`deleted_at`) are kept, including `permissions_users.user_email` |
+| Pending OAuth flows, auth codes, session cache | process memory, TTL-swept | minutes; gone on restart |
+
+### Retention surfaces outside the gateway
+
+`AUDIT_RETENTION_DAYS` bounds only the live state DB. The operator must set each of these to match, or audit data outlives the window there:
+
+- **State-DB backups / snapshots / PITR WAL archives** — a 1-year backup retention keeps 1 year of audit rows, however short the hot TTL.
+- **Stdout log stores** (Loki, Splunk, CloudWatch, …) — every dispatch line and every `stdout` stream-sink row lands there under that store's own retention.
+- **Syslog receivers / SIEM** fed by the `syslog` stream sink.
+- **Error tracking** (GlitchTip / Sentry) event retention.
 
 ## Operator queries
 

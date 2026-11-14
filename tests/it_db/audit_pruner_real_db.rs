@@ -160,3 +160,47 @@ async fn pruner_drains_a_backlog_larger_than_one_batch() {
         .await
         .unwrap();
 }
+
+/// `permissions_audit` (the admin API's change trail) is pruned with the same
+/// cutoff: a row past the TTL goes, rows inside it — even a day short of it —
+/// stay.
+#[tokio::test]
+#[serial_test::serial(world)]
+async fn pruner_deletes_permissions_audit_rows_older_than_ttl() {
+    let p = state_pool().await;
+    let actor = Uuid::new_v4();
+    for (request_id, age_days) in [("ancient", 100), ("edge", 89), ("fresh", 0)] {
+        sqlx::query(
+            "INSERT INTO permissions_audit \
+             (ts, actor_id, actor_email, action, target_type, target_id, before, after, request_id) \
+             VALUES (now() - make_interval(days => $1), $2, 'pruner-test@example.com', \
+                     'create', 'user', $3, NULL, '{}'::jsonb, $4)",
+        )
+        .bind(age_days)
+        .bind(actor)
+        .bind(Uuid::new_v4())
+        .bind(request_id)
+        .execute(&p)
+        .await
+        .expect("seed permissions_audit row");
+    }
+
+    let deleted = audit::pruner::run_once(&p, 90).await.expect("pruner runs");
+    assert!(deleted >= 1, "expected ≥1 deletion, got {deleted}");
+
+    let mut left: Vec<String> = sqlx::query_scalar(
+        "SELECT request_id FROM permissions_audit WHERE actor_id = $1 ORDER BY ts",
+    )
+    .bind(actor)
+    .fetch_all(&p)
+    .await
+    .expect("read survivors");
+    left.sort();
+    assert_eq!(left, ["edge", "fresh"], "only the row past the TTL goes");
+
+    sqlx::query("DELETE FROM permissions_audit WHERE actor_id = $1")
+        .bind(actor)
+        .execute(&p)
+        .await
+        .expect("cleanup");
+}

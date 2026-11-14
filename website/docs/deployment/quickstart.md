@@ -116,7 +116,7 @@ The env→YAML unification is still pending, so these come from the environment,
 | `TLS_CERT_PATH` | — | PEM-encoded leaf cert (+ intermediates). Required unless `TLS_DISABLED=true` |
 | `TLS_KEY_PATH` | — | PEM-encoded private key. Required unless `TLS_DISABLED=true` |
 | `TLS_DISABLED` | `false` | Dev-only escape. `true` serves plain HTTP and emits a `WARN` log on startup |
-| `AUDIT_RETENTION_DAYS` | `90` | Hot-retention window for the audit log |
+| `AUDIT_RETENTION_DAYS` | `90` | Hot-retention window for `audit_calls`, `audit_call_intents` and `permissions_audit`; the hourly pruner deletes older rows. State-DB backups and log stores (Loki etc.) keep their own retention — set them to match ([spec 07](../initial-idea/07-logging-retention.md#retention-surfaces-outside-the-gateway)) |
 | `PERMISSIONS_CACHE_TTL_SECONDS` | `60` | Per-user DB-grant cache TTL; bounds how long a revoked grant is honoured on a replica that missed the invalidation. Above `300` aborts boot |
 | `SESSION_CACHE_TTL_SECONDS` | `30` | Freshness window for the in-memory session cache. Bounds how long a revoked session stays honored on *other* HA replicas; `0` re-validates every request. See [auth & SSO](../initial-idea/04-auth-sso.md#session-tokens) |
 | `SENTRY_DSN` / `SENTRY_ENVIRONMENT` | unset (disabled) / `development` | GlitchTip/Sentry error tracking; every event passes a credential scrubber |
