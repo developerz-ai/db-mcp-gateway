@@ -25,12 +25,13 @@ whatever it started. A stack that was already running is left alone.
 |---|---|
 | `./benchmarks/gateway_overhead.sh` | Postgres gateway-vs-direct overhead, baseline → gateway → baseline |
 | `./benchmarks/gateway_overhead.sh --backend mongo` | The same comparison against the `target-mongo` container (localhost:27018, database `app`) |
+| `./benchmarks/gateway_overhead.sh --backend postgres-write` | The write path: a single-row `UPDATE … RETURNING` through `run_query` under a `query_write` grant vs the same statement direct |
 | `./benchmarks/gateway_overhead.sh --instances 4` | Boots four gateway processes and spreads the load over them |
 | `./benchmarks/gateway_overhead.sh --mysql-rejection` | Adds the boot-time MySQL query-target rejection check, in its own report section |
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--backend postgres\|mongo` | `postgres` | Which engine to measure |
+| `--backend postgres\|postgres-write\|mongo` | `postgres` | What to measure: postgres reads, the postgres write tier, or mongo reads |
 | `--queries N` | `2000` | Measured requests per path, per shape |
 | `--concurrent N` | `8` | Concurrent in-flight requests |
 | `--warmup N` | `200` | Requests discarded before measuring |
@@ -59,13 +60,17 @@ Prerequisites per backend:
 
 - **postgres** — the dev stack's `target-db` on `localhost:5434` (user `app`,
   database `app`). Started for you by the script.
+- **postgres-write** — the same `target-db`, reached through the bench
+  config's `target-write` server (see "The write path" below).
 - **mongo** — the dev stack's `target-mongo` on `localhost:27018` (user `app`,
   database `app`, auth database `admin`). The script starts the container if
   the rest of the stack was already up without it, and stops it again
   afterwards.
 
 The runner boots one gateway process per instance on consecutive ports
-(`127.0.0.1:8899`, `:8900`, …), waits for each to answer `/healthz`, and hands
+(`127.0.0.1:8899`, `:8900`, …), each with its own `/metrics` listener
+(`METRICS_BIND=127.0.0.1:9899`, `:9900`, … — instances sharing the default
+`:9090` would fail to boot), waits for each to answer `/healthz`, and hands
 the harness the list of URLs. Everything it starts, it stops.
 
 ## What it measures
@@ -79,7 +84,7 @@ Postgres measures three query shapes: a primary-key lookup (harshest test —
 the gateway is almost the entire measurement), a 1000-row indexed range scan
 (shifts weight to serialization), and a server-side aggregate (database works
 hard, response is tiny). Mongo measures its own read shapes against the
-`target-mongo` container.
+`target-mongo` container. `postgres-write` measures one write shape (below).
 
 The gateway path is the real released binary over the real service-token auth
 path, with the synchronous audit write intact. Nothing reaches into the
@@ -115,6 +120,29 @@ Percentile deltas are differences **between the two distributions at that
 percentile** — not the percentile of per-request differences. Those are
 different statistics and only the first is computable from two independent
 runs.
+
+## The write path
+
+`--backend postgres-write` measures `write_update`: `UPDATE bench_writes SET
+val = val + 1 WHERE id = $n RETURNING id, val`, one row per request, `$n`
+cycling over the 50k seeded rows. It updates in place rather than inserting,
+so the table does not grow between the two baselines.
+
+- The gateway path targets the bench config's `target-write` server — the
+  same `target-db`, declared a second time with a write tier — under a
+  `query_write` grant. Writes run as its `write_role` (`app`); the gateway
+  requires a different read `role` and connects it on first use, so the
+  harness creates a login role `bench_ro` (dev-only password, no privileges
+  beyond the database defaults) if it does not exist. The read benchmark's
+  `target` server and its `query_read` grant are untouched.
+- The direct baseline runs the same statement as the same role (`app`),
+  autocommit.
+- The audit write stays synchronous: every gateway request commits an
+  `audit_calls` row with `rows_affected` before the response goes out.
+- Setup and cleanup: the seed drops and recreates the scratch table
+  `bench_writes`; after the last phase the harness drops it. A run that dies
+  mid-way leaves it behind until the next write run's seed drops it. The
+  `bench_ro` role is kept — it owns nothing and is reused.
 
 ## Horizontal scaling: contention, not scaling
 
@@ -159,8 +187,10 @@ Deliberately absent, because a single host cannot answer them honestly:
   still reported per phase — as what this host achieved — not as a ceiling.
 - **Horizontal scaling.** See above: `--instances` measures contention on one
   host, and is labelled as such. A scaling result needs a separate load host.
-- **Write workloads.** The bench grants are `query_read` only, and the mongo
-  adapter refuses write commands before they reach the server.
+- **Write workloads beyond one shape.** `postgres-write` covers a single-row
+  UPDATE on the Postgres write tier. Multi-row writes, INSERT-heavy growth
+  and `dry_run` are not measured; the mongo adapter refuses write commands
+  before they reach the server.
 - **Real MySQL query behaviour.** MySQL is not a query target; only the
   boot-time rejection is verified.
 
@@ -192,7 +222,7 @@ or the gateway will truncate and the comparison becomes meaningless.
 ```text
 gateway_overhead.sh    runner: stack up, boot gateway, measure, tear down
 load_gate.sh           weekly CI regression gate: result vs stored baseline
-gateway.bench.yaml     gateway config (dev credentials only) — postgres + mongo targets
+gateway.bench.yaml     gateway config (dev credentials only) — postgres, postgres write tier, mongo
 gateway.bench.mysql.yaml
                        a `kind: mysql` target, used only to prove the boot-time rejection
 harness/
@@ -212,10 +242,13 @@ build or the runtime image.
 
 ## Raw results
 
-Named result files are **committed** — `results/postgres.json`,
-`results/mongo.json`, `results/instances4.json` and `results/REPORT.md` are
-the run evidence behind the numbers in `website/docs/benchmarks.md`, which
-links each figure to its artifact. Every run also writes one JSON file under
+Named result files are **committed gzipped** (`gunzip -k` to read; the raw samples make them ~14 MB uncompressed) — `results/*-quiet.json.gz` (the
+bare-metal run the page quotes), the earlier shared-host
+`results/postgres.json`, `results/mongo.json` and `results/instances4.json`,
+and `results/REPORT.md` are the run evidence behind
+`website/docs/benchmarks.md`, which links each figure to its artifact.
+`REPORT.md` is append-only: a new run adds an invocation section, it never
+rewrites an old one. Every run also writes one JSON file under
 `benchmarks/results/`; it carries the workload definition, the effective
 configuration, the software revision (commit hash plus a dirty-tree flag),
 the environment, and the raw measurement samples — enough to re-derive the

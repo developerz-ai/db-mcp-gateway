@@ -118,8 +118,10 @@ finish() {
 }
 trap finish EXIT
 
-# Shared box: cap cargo's build parallelism.
-export CARGO_BUILD_JOBS=2
+# Shared box: cap cargo's build parallelism by default. A dedicated machine
+# lifts it with `CARGO_BUILD_JOBS=$(nproc) bin/check`; otherwise the gate's
+# compile is held to two cores whatever the machine has.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 
 job_reached 'orchestration regression'
 # tests/bin/check.test.sh replaces this entry in its own fixture; the real

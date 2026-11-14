@@ -27,9 +27,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
-        with:
-          toolchain: stable
+      - name: install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
       - name: install cargo-audit
         uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
         with:
@@ -48,9 +47,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
-        with:
-          toolchain: stable
+      - name: install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
       - name: cargo update --dry-run
         run: |
           set -o pipefail
@@ -77,10 +75,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # rust-toolchain.toml pins the channel; rustup installs it on first use.
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
-        with:
-          toolchain: stable
+      # As in ci.yml: only the pinned toolchain, so the runner image's
+      # `stable` never re-keys the rust-cache entry below.
+      - name: install pinned toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install --no-self-update
+          if rustup toolchain list | grep -q '^stable'; then
+            rustup toolchain uninstall stable
+          fi
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
       - name: run the benchmark harness
         run: ./benchmarks/gateway_overhead.sh --out "$RESULT"

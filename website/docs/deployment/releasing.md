@@ -3,7 +3,11 @@
 Releases are triggered by a `v*` git tag. The `.github/workflows/release.yml` workflow then:
 
 1. **Preflight.** Fails the release before any build when the tag (minus its `v`) differs from the `version` in `Cargo.toml`, so an image never reports a version other than its tag. It also decides which moving tags this release may move (below).
-2. Builds the image natively per architecture (amd64 + arm64) and stitches one multi-arch manifest.
+2. **Reuses the tested `main` image.** The tag sits on a commit `main` CI is already building, so the release waits for that `ci.yml` run (up to 40 minutes):
+   - **Green** — its `sha-<7>` multi-arch manifest, the image the quality jobs gated and the Image Updater deployed, is re-tagged: the release index points at the very per-arch images CI tested (same per-arch digests). The index digest itself differs from `sha-<7>`'s, because the release adds its own annotations (below).
+   - **Red** (failed or cancelled) — the release is **blocked** and fails with an error. Nothing ships from a commit CI rejected; fix it and tag the next patch.
+   - **No `ci.yml` run for the commit** (a tag on a commit that never reached `main`, such as a backport) — a loud warning, then the image is built natively per architecture (amd64 + arm64) from the tag and stitched into one multi-arch manifest. The same fallback covers a green run whose `sha-<7>` image is missing.
+   - An Actions API error, or a run still going after 40 minutes, fails the job; re-run it.
 3. Tags it `X.Y.Z` and, where preflight allows, `X.Y`, `X` and `latest`.
 4. Pushes the same tag set to two registries: `ghcr.io/developerz-ai/db-mcp-gateway` (the public artifact) and a DigitalOcean Container Registry mirror (the in-cluster source the ArgoCD Image Updater tracks).
 5. Creates a GitHub Release with auto-generated notes.
@@ -63,7 +67,11 @@ Post-1.0:
 
 ## Image provenance
 
-The image is built from a clean checkout of the tagged commit by GitHub Actions. No SLSA provenance or signature is attached yet: the workflow holds no `id-token: write` permission, and adding provenance is on the roadmap.
+The image is built from a clean checkout of the tagged commit by GitHub Actions — by `ci.yml` on the `main` push, or by `release.yml` itself on the fallback path. No SLSA provenance or signature is attached yet: the workflow holds no `id-token: write` permission, and adding provenance is on the roadmap.
+
+### Image labels on a reused image
+
+The per-arch image config labels are written at build time, so a reused image keeps the ones `ci.yml` gave it: `org.opencontainers.image.version` there is the CI per-arch tag (`linux-amd64-<sha>`). Changing a config label would change the digest — it would no longer be the tested image — so the release identity is set on the multi-arch index instead: annotations `org.opencontainers.image.version` = `X.Y.Z`, `org.opencontainers.image.revision` = the tagged commit, `org.opencontainers.image.source` = the repository. `db-mcp-gateway --version` reports `X.Y.Z` either way (preflight checked it against `Cargo.toml`).
 
 ## Yanking a release
 

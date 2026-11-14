@@ -104,12 +104,13 @@ struct Cli {
     #[arg(long, default_value = "/mcp")]
     mcp_path: String,
 
-    /// Which target backend to measure. `postgres` or `mongo`.
+    /// Which target backend to measure. `postgres`, `postgres-write` or
+    /// `mongo`.
     #[arg(
         long,
         default_value = "postgres",
         value_parser = parse_backend,
-        help = "Which target backend to measure (one of: postgres, mongo)"
+        help = "Which target backend to measure (one of: postgres, postgres-write, mongo)"
     )]
     backend: Backend,
 
@@ -246,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
     let gateway_pids = gateway_pids();
 
     let baseline = Arc::new(connect_baseline(&cli).await?);
-    seed_baseline(&baseline).await?;
+    seed_baseline(&baseline, cli.backend).await?;
 
     // One gateway client for the whole run: one HTTP connection pool, one
     // bearer, one target server/database. The resource sampler needs a
@@ -313,7 +314,7 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
 
-    close_baseline(&baseline).await;
+    close_baseline(&baseline, cli.backend).await?;
 
     let effective_config = effective_config(&cli, plan);
     let mut report = report::Report::new(environment, effective_config, measurements);
@@ -383,7 +384,7 @@ async fn main() -> anyhow::Result<()> {
 /// Open the direct baseline for the selected backend.
 async fn connect_baseline(cli: &Cli) -> anyhow::Result<Baseline> {
     match cli.backend {
-        Backend::Postgres => {
+        Backend::Postgres | Backend::PostgresWrite => {
             let client =
                 direct::DirectClient::connect(cli.direct_url.expose(), cli.concurrent).await?;
             Ok(Baseline::Postgres(client))
@@ -417,11 +418,15 @@ async fn connect_baseline(cli: &Cli) -> anyhow::Result<Baseline> {
 }
 
 /// Seed the benchmark data for the selected backend.
-async fn seed_baseline(baseline: &Arc<Baseline>) -> anyhow::Result<()> {
+async fn seed_baseline(baseline: &Arc<Baseline>, backend: Backend) -> anyhow::Result<()> {
     match &**baseline {
         Baseline::Postgres(client) => {
             eprintln!("seeding {} rows…", workload::SEED_ROWS);
-            client.seed().await?;
+            let ddl = match backend {
+                Backend::PostgresWrite => workload::postgres_write_seed(),
+                _ => workload::postgres_seed(),
+            };
+            client.execute_ddl(&ddl).await?;
         }
         Baseline::Mongo(client) => {
             eprintln!("seeding {} documents…", workload::MONGO_SEED_DOCS);
@@ -431,12 +436,21 @@ async fn seed_baseline(baseline: &Arc<Baseline>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Close the direct baseline.
-async fn close_baseline(baseline: &Arc<Baseline>) {
+/// Close the direct baseline, first dropping the write run's scratch table.
+async fn close_baseline(baseline: &Arc<Baseline>, backend: Backend) -> anyhow::Result<()> {
     match &**baseline {
-        Baseline::Postgres(client) => client.close().await,
+        Baseline::Postgres(client) => {
+            if backend == Backend::PostgresWrite {
+                eprintln!("dropping {}…", workload::WRITE_TABLE);
+                client
+                    .execute_ddl(&workload::postgres_write_cleanup())
+                    .await?;
+            }
+            client.close().await;
+        }
         Baseline::Mongo(client) => client.close().await,
     }
+    Ok(())
 }
 
 /// The effective configuration of this run, for the result file.
@@ -486,7 +500,7 @@ const GATEWAY_CLIENT_TIMEOUT_MS: u64 = 30_000;
 /// separately, and that is the one the mongo client selects.
 fn direct_database(cli: &Cli) -> String {
     match cli.backend {
-        Backend::Postgres => postgres_database(cli.direct_url.expose()),
+        Backend::Postgres | Backend::PostgresWrite => postgres_database(cli.direct_url.expose()),
         Backend::Mongo => cli.mongo_database.clone(),
     }
 }
@@ -510,7 +524,7 @@ fn postgres_database(url: &str) -> String {
 /// report, so a credential cannot ride along into the result file.
 fn direct_target_host(cli: &Cli) -> String {
     match cli.backend {
-        Backend::Postgres => postgres_host(cli.direct_url.expose()),
+        Backend::Postgres | Backend::PostgresWrite => postgres_host(cli.direct_url.expose()),
         Backend::Mongo => match &cli.mongo_direct_url {
             Some(url) => match mongo::parse_mongo_url(url.expose()) {
                 Ok((host, port, _, _, _)) => format!("{host}:{port}"),
@@ -541,7 +555,7 @@ fn postgres_host(url: &str) -> String {
 /// The number of rows (or documents) seeded into the target before the run.
 fn seed_rows(backend: Backend) -> i64 {
     match backend {
-        Backend::Postgres => workload::SEED_ROWS,
+        Backend::Postgres | Backend::PostgresWrite => workload::SEED_ROWS,
         Backend::Mongo => workload::MONGO_SEED_DOCS,
     }
 }
