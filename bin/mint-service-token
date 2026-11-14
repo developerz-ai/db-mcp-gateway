@@ -15,17 +15,23 @@
 #      (or file + `${FILE:…}` ref).
 #   3. Add the printed stanza to the gateway config YAML (reviewed by PR),
 #      with a matching `permissions:` block for the group.
-#   4. Apply it: `kill -HUP` every gateway pod (config reload) or roll the
-#      deployment. A new env var only reaches a pod on restart, so a value
-#      delivered as `${ENV:…}` needs a roll; a mounted `${FILE:…}` does not.
+#   4. Roll the deployment, or `kill -HUP` every pod (a SIGHUP reload swaps
+#      the token store with the config — no restart). Delivery-mode caveat:
+#      a `${ENV:…}` value is re-resolved from the SAME pod environment on
+#      reload, and the pod env is fixed at container start — so a NEW or
+#      changed env var only takes effect on a ROLL; only a mounted file
+#      (`${FILE:…}`) can be swapped in by SIGHUP.
 #
-# Rotation requires an explicit overlap phase because each entry carries one
-# token AND src/config/yaml/service_accounts.rs rejects duplicate
-# service-account names — the new value CANNOT reuse the original <name>.
-# Mint fresh against a DISTINCT temporary name (e.g. `<name>-next`): mint new
-# -> add a SECOND service_accounts entry (with a distinct name + matching
-# `permissions:` block) -> reload (SIGHUP) or roll -> update clients -> remove
-# the OLD entry -> reload or roll again. Audit rows
+# Rotation requires an explicit overlap phase: every configured token loads
+# at once (ServiceTokenStore::from_config resolves ALL of them at boot,
+# src/auth/service_token.rs), and boot rejects duplicate service-account
+# NAMES (src/config/yaml/service_accounts.rs) AND duplicate token VALUES
+# (src/auth/service_token.rs, DuplicateToken) — so the new value CANNOT
+# reuse the original <name> nor the original token value. Mint fresh against a
+# DISTINCT temporary name (e.g. `<name>-next`): mint new -> add a SECOND
+# service_accounts entry (with a distinct name + matching `permissions:` block)
+# -> roll or SIGHUP -> update clients -> remove the OLD entry -> roll or
+# SIGHUP again. Audit rows
 # during the rotation window attribute to the temporary name (`service:<name>-next`)
 # instead of the original — document the choice in the PR.
 set -euo pipefail
@@ -62,13 +68,21 @@ permissions:
   - group: svc-${name}
     grants: []   # fill in the minimal grants this service needs
 
-3. Reload: kill -HUP every gateway pod, or roll the deployment (a value
-   delivered as a new env var needs the roll; a mounted file does not).
-   Revocation = remove the complete stanza (name + group + token ref) and
-   reload again; emptying or unsetting the secret is NOT revocation
-   (unresolved refs fail the reload or boot). Rotation needs an explicit
-   overlap: mint fresh against a DISTINCT temporary name (e.g. <name>-next
-   — the same <name> is rejected as a duplicate), add a SECOND stanza
-   under that distinct name, reload, update clients, remove the OLD
-   stanza, reload again.
+3. Roll the deployment, or SIGHUP every pod (kill -HUP; a reload swaps the
+   token store with the config — no restart). Delivery-mode caveat: an
+   \${ENV:…} value is re-resolved from the same pod environment on reload
+   (fixed at container start), so a new or changed env var only takes
+   effect on a ROLL; only a mounted file (\${FILE:…}) is picked up by
+   SIGHUP. Revocation = remove the
+   complete stanza (name + group + token ref) and roll or SIGHUP again;
+   emptying or unsetting the env is NOT revocation (unresolved refs abort
+   boot). Rotation needs an explicit overlap: every configured token loads
+   at boot (not one per pod), and boot rejects duplicate service-account
+   NAMES and duplicate token VALUES, so mint fresh against a
+   DISTINCT temporary name (e.g. <name>-next
+   — the same <name> is rejected by src/config/yaml/service_accounts.rs as
+   a duplicate; a duplicate token value is rejected by
+   src/auth/service_token.rs), add a SECOND stanza under that distinct
+   name, roll or SIGHUP, update clients, remove the OLD stanza, roll or
+   SIGHUP again.
 EOF

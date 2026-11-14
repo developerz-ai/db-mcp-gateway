@@ -146,10 +146,19 @@ about tokens is callable over HTTP — the lifecycle is GitOps:
   `dbmcp_svc_<64hex>` token (test fixtures under `tests/**` are excluded).
   It is ADVISORY — it fails the job on every PR, but does not by itself
   block a merge until made a required branch-protection check (#190
-  follow-up).
-- **Rotate** — overlap is mandatory, because each entry carries exactly one
-  token, AND the YAML validator (`src/config/yaml/service_accounts.rs`) rejects duplicate
-  service-account names — the new value cannot reuse the original `<name>`.
+  follow-up). So an inline literal is not an option for committed config
+  (the secret-scan job fails it, `tests/**` fixtures excepted) or for
+  production (boot rejects it); the parser itself tolerates one only under
+  the default `gateway.env: development` — which is what the in-code test
+  fixtures exercise via `ConfigFile::from_yaml_str` /
+  `ServiceTokenStore::from_config` (`tests/config/yaml/boot_rules.rs`).
+- **Rotate** — overlap is mandatory: every configured account loads at once
+  (`ServiceTokenStore::from_config` resolves ALL of them at boot,
+  `src/auth/service_token.rs`), and two boot rejections close the shortcuts —
+  the YAML validator (`src/config/yaml/service_accounts.rs`) aborts boot on a duplicate
+  service-account **name**, and the token store (`src/auth/service_token.rs`,
+  `DuplicateToken`) aborts boot on a duplicate token **value** — so the new
+  value can neither reuse the original `<name>` nor the original token value.
   Sequence: (1) mint a new value under a DISTINCT temporary name
   (`<name>-next` is the recommended convention); (2) add a *second*
   `service_accounts:` entry (with its own matching `permissions:` block)

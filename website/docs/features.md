@@ -62,6 +62,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 - **Security benefit:** Multi-tenant databases expose only the schemas the role was granted
 - **Operations benefit:** A single database server can serve multiple security domains, one role per domain
 
+
 ---
 
 ## 📋 Permissions and Configuration
@@ -185,6 +186,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 ### Time Windows (roadmap, not shipped)
 - **What it will do:** Let a grant apply only within a time range (e.g. business hours)
 - **Status:** No `time_window` constraint exists yet — the parser rejects it; see the [roadmap](initial-idea/11-roadmap.md)
+
 
 ### Reason Requirement
 - **What it does:** Production grants can require human-readable reason per query

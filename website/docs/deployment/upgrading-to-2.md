@@ -29,13 +29,15 @@ traffic half-configured. Check each item before you roll.
 
 ## State DB schema
 
-Migrations apply at boot.
+Migrations `0010`–`0018` apply at boot.
 
 | Migration | Change | Who it affects |
 |---|---|---|
 | `0010`–`0014` | Additive: `audit_call_intents`, history index, refresh-token session link, `mongo` db_type, upstream/rows_affected/sql_truncated columns | Nobody — new objects only |
 | `0015` | Drops `audit_calls_user_sub_idx` and `audit_calls_db_type_idx` | Ad-hoc reporting queries that filtered `audit_calls` by `user_sub` alone or by `db_type` lose their dedicated index. `(user_sub, occurred_at)` and the history index still serve per-user lookups. |
 | `0016` | Drops `sessions.agent_client` | **Breaking for reports** that select `sessions.agent_client` — the query fails. The column was always NULL; read the per-call client banner from `audit_calls.agent_client` instead. |
+| `0017` | Additive: `oauth_refresh_tokens.chain_id` + `oauth_refresh_rotated` tombstones — refresh-chain reuse detection; a replayed rotated token revokes the chain | Nobody — new objects only |
+| `0018` | Additive: `audit_call_intents.sql` / `sql_truncated` / `reason` — abandoned intents record the statement + reason | Nobody — new objects only |
 
 New outcomes: `abandoned`, `audit_unavailable`, `dry_run`, `cancelled`. Reporting queries that enumerated outcomes should add them.
 

@@ -3,16 +3,22 @@
 Single-page reference for the gateway's YAML config — every key the parser
 accepts today, with type, requirement, and a short description. The spec at
 [`../initial-idea/08-config.md`](../initial-idea/08-config.md) covers
-*intended* shape (including an `auth:` section that is still env-driven);
-this page is what the binary actually checks at boot.
+*intended* shape — e.g. the illustrative `logging:` block
+([08-config.md §Shape](../initial-idea/08-config.md#shape)), whose
+`hot_retention_days`, `archive: s3` and `otlp` stream sink the parser
+rejects today (retention stays env-driven via `AUDIT_RETENTION_DAYS`);
+this page is what the binary actually checks at boot — top level included.
 
 Boot-time validation (issue #16):
 
-- Unknown keys anywhere — the top level and every section below — are
-  **errors** with a line:column pointer and the list of expected fields. A
-  typo like `statemnt_timeout_ms` aborts startup rather than silently
-  dropping the constraint, and `auth:` or a misspelled section name aborts
-  it too.
+- Unknown keys inside `servers[].*`, `databases[].*`, `permissions[].*`,
+  `grants[].*`, `constraints.*`, and `service_accounts[].*` are **errors**
+  with a line:column pointer
+  and the list of expected fields. A typo like `statemnt_timeout_ms` aborts
+  startup rather than silently dropping the constraint.
+- Unknown keys at the top level are **errors** — the top level denies
+  unknown keys too (see the note under [Top level](#top-level)), so a
+  misspelled section name aborts startup instead of being ignored.
 - Every `${ENV:…}` / `${FILE:…}` ref must resolve cleanly; an unset or empty
   env var, or a missing or empty file, aborts startup (issue #15).
 - Server and database names may not be `*` (reserved for the grant wildcard).

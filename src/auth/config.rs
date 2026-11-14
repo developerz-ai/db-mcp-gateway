@@ -1,7 +1,7 @@
 //! Auth configuration: the OIDC client identity, claim mapping, and the
 //! gateway-side session JWT signing key.
 //!
-//! Lives in env for now; folds into the YAML schema with issue #16. Tests
+//! Tests
 //! build `AuthConfig` directly against an in-process mock IdP (`tests/common/`).
 
 use std::time::Duration;
