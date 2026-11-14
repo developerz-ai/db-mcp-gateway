@@ -4,7 +4,7 @@ Releases are triggered by a `v*` git tag. The `.github/workflows/release.yml` wo
 
 1. **Preflight.** Fails the release before any build when the tag (minus its `v`) differs from the `version` in `Cargo.toml`, so an image never reports a version other than its tag. It also decides which moving tags this release may move (below).
 2. **Reuses the tested `main` image.** The tag sits on a commit `main` CI is already building, so the release waits for that `ci.yml` run (up to 40 minutes):
-   - **Green** — its `sha-<7>` multi-arch manifest, the image the quality jobs gated and the Image Updater deployed, is re-tagged as-is, so the release digest is the tested digest.
+   - **Green** — its `sha-<7>` multi-arch manifest, the image the quality jobs gated and the Image Updater deployed, is re-tagged: the release index points at the very per-arch images CI tested (same per-arch digests). The index digest itself differs from `sha-<7>`'s, because the release adds its own annotations (below).
    - **Red** (failed or cancelled) — the release is **blocked** and fails with an error. Nothing ships from a commit CI rejected; fix it and tag the next patch.
    - **No `ci.yml` run for the commit** (a tag on a commit that never reached `main`, such as a backport) — a loud warning, then the image is built natively per architecture (amd64 + arm64) from the tag and stitched into one multi-arch manifest. The same fallback covers a green run whose `sha-<7>` image is missing.
    - An Actions API error, or a run still going after 40 minutes, fails the job; re-run it.

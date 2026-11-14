@@ -91,8 +91,9 @@ jobs:
   #
   # So wait for ci.yml's push run on this commit; when it passed, its `merge`
   # published `sha-<7>` in both registries, and the release only re-tags that
-  # manifest — the release digest is then exactly the digest CI tested and
-  # Image Updater deployed. A red (failed/cancelled) run BLOCKS the release:
+  # manifest — the per-arch images (and their digests) are exactly the ones CI
+  # tested and Image Updater deployed; only the index differs, because the
+  # release adds its own annotations to it. A red (failed/cancelled) run BLOCKS the release:
   # nothing ships from a commit CI rejected. Only two cases fall back to the
   # full build below, each with a warning naming why: no ci.yml push run for
   # this commit (a tag off `main`), or a green run whose `sha-<7>` image is
@@ -102,7 +103,7 @@ jobs:
     needs: [preflight]
     runs-on: ubuntu-latest
     # ci.yml's push run is ~11 min p90 (build 30-min cap in parallel with
-    # test's 20); the poll gives up at 40 min and falls back to building.
+    # test's 20); the poll gives up at 40 min and fails the job (re-run it).
     timeout-minutes: 45
     permissions:
       contents: read
@@ -110,48 +111,61 @@ jobs:
     outputs:
       found: ${{ steps.ci.outputs.found }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The shell only observes (Actions API, registry probe) and acts; what to
+      # do with each observation is .github/scripts/release_reuse_decision.py,
+      # pinned by its test in workflow-lint.yml.
       - name: wait for ci.yml on this commit
         id: ci
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          fallback() {
-            echo "::warning::NOT reusing a CI-tested image: $1 — building one from the tag instead"
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          }
-          block() {
-            echo "::error::release blocked: $1"
-            exit 1
-          }
           query="repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&event=push&branch=main"
+          image="$REGISTRY/$IMAGE_NAME:sha-${GITHUB_SHA::7}"
           deadline=$((SECONDS + 40 * 60))
           # The tag and the merge push land seconds apart; give GitHub a
           # moment to register ci.yml's run before calling it absent.
-          absent_deadline=$((SECONDS + 120))
+          grace=$((SECONDS + 120))
+          image_state=unchecked
           while :; do
-            if ! run=$(gh api "$query" --jq '.workflow_runs | max_by(.run_number) // {} | "\(.status // "none") \(.conclusion // "")"'); then
-              block "the Actions API did not answer (re-run this job)"
+            if ! run=$(gh api "$query" --jq '.workflow_runs | max_by(.run_number) // {} | "\(.status // "none") \(.conclusion // "-")"'); then
+              echo "::error::release blocked: the Actions API did not answer (re-run this job)"
+              exit 1
             fi
             read -r status conclusion <<< "$run"
-            case "$status" in
-              none)
-                (( SECONDS < absent_deadline )) \
-                  || fallback "no ci.yml push run on main for $GITHUB_SHA" ;;
-              completed) break ;;
+            verdict=$(python3 -I .github/scripts/release_reuse_decision.py \
+              "$status" "$conclusion" "$image_state" \
+              "$(( SECONDS >= grace ))" "$(( SECONDS >= deadline ))")
+            read -r action reason <<< "$verdict"
+            case "$action" in
+              wait)
+                echo "$reason; waiting"
+                sleep 30 ;;
+              check-image)
+                if docker buildx imagetools inspect "$image" > /dev/null; then
+                  image_state=present
+                else
+                  image_state=missing
+                fi ;;
+              reuse)
+                echo "reusing $image ($reason)"
+                echo "found=true" >> "$GITHUB_OUTPUT"
+                exit 0 ;;
+              build)
+                echo "::warning::NOT reusing a CI-tested image: $reason — building one from the tag instead"
+                echo "found=false" >> "$GITHUB_OUTPUT"
+                exit 0 ;;
+              block)
+                echo "::error::release blocked: $reason"
+                exit 1 ;;
+              *)
+                echo "::error::unknown reuse decision: $verdict"
+                exit 1 ;;
             esac
-            (( SECONDS < deadline )) || block "ci.yml still $status after 40 min (re-run this job once it finishes)"
-            echo "ci.yml is $status; waiting"
-            sleep 30
           done
-          [ "$conclusion" = success ] \
-            || block "ci.yml on $GITHUB_SHA concluded '$conclusion'; fix it and ship the next patch"
-          image="$REGISTRY/$IMAGE_NAME:sha-${GITHUB_SHA::7}"
-          docker buildx imagetools inspect "$image" > /dev/null \
-            || fallback "$image is not in the registry"
-          echo "reusing $image"
-          echo "found=true" >> "$GITHUB_OUTPUT"
 
   # Fallback only — runs when `reuse` found no tested `main` image. Native
   # per-arch build (amd64 + arm64), each pushed at the per-arch tag, then
