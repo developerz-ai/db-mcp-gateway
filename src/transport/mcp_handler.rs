@@ -120,14 +120,9 @@ pub(super) async fn post_handler(
         ))
         .into_response();
     };
-    let agent_client = headers
-        .get(USER_AGENT)
-        .or_else(|| headers.get(MCP_CLIENT_HEADER))
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
     let request_ctx = tools::RequestContext {
         ip: connect_info.map(|ConnectInfo(addr)| addr.ip()),
-        agent_client,
+        agent_client: agent_client(&headers),
         request_id: request_id.as_uuid(),
         upstream: upstream::from_headers(&headers, &identity, policy.as_ref()),
     };
@@ -180,6 +175,22 @@ fn parse(body: &[u8]) -> Result<Request, Box<jsonrpc::Response>> {
         return Err(invalid());
     }
     Ok(request)
+}
+
+/// The caller's self-description for the audit row: `User-Agent`, else
+/// `x-mcp-client`. Caller-controlled and copied into every audit row and
+/// stream sink, so it is cut to the same 128-byte bound as the other upstream
+/// headers, on a char boundary.
+fn agent_client(headers: &HeaderMap) -> Option<String> {
+    let raw = headers
+        .get(USER_AGENT)
+        .or_else(|| headers.get(MCP_CLIENT_HEADER))
+        .and_then(|v| v.to_str().ok())?;
+    let mut end = raw.len().min(upstream::UPSTREAM_MAX_BYTES);
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(raw[..end].to_owned())
 }
 
 /// The spec 02 three-way id rule, in one place: an absent id is a

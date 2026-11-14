@@ -31,6 +31,7 @@ use axum::middleware;
 use axum::routing::{get, post};
 
 pub use app_state::{AppState, McpState, OAuthState};
+pub use bounds::MCP_TIMEOUT;
 pub use errors::TransportError;
 
 use crate::config::Config;
@@ -103,6 +104,7 @@ pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError
         // MCP OAuth bridge (RFC 9728 / 8414 / 7591 / 7009 + PKCE). See
         // `transport::oauth`.
         .route("/authorize", get(oauth::authorize))
+        .route(oauth::CONSENT_PATH, post(oauth::consent))
         .route("/token", post(oauth::token))
         .route("/revoke", post(oauth::revoke))
         .route("/register", post(oauth::register))

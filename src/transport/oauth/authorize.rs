@@ -7,13 +7,11 @@ use serde::Deserialize;
 use crate::auth::pkce;
 
 use super::super::app_state::OAuthState;
-use super::helpers::{
-    build_redirect, oauth_error, query_rejected, random_token, redirect_with_error,
-};
+use super::helpers::{oauth_error, query_rejected, random_token};
 use super::register::{
     is_loopback_redirect_uri, redirect_uri_matches, redirect_uris_acceptable, registry_error,
 };
-use crate::auth::oauth::{AuthFacade, GrantIdentity, OAuthBridge};
+use crate::auth::oauth::OAuthBridge;
 
 /// Upper bound on a `client_id` the gateway will *adopt* at `/authorize` (as
 /// opposed to one it minted at `/register`). `/authorize` is unauthenticated, so
@@ -21,6 +19,41 @@ use crate::auth::oauth::{AuthFacade, GrantIdentity, OAuthBridge};
 /// registry; the store's own cap bounds the row count, this bounds the row size.
 /// Comfortably above the 36-char ids `/register` mints.
 const MAX_ADOPTABLE_CLIENT_ID: usize = 128;
+
+/// Bounds on the client-supplied values `/authorize` stashes for the IdP
+/// round-trip. The endpoint is unauthenticated and the pending-flow store holds
+/// up to 10,000 entries for 15 minutes, so every stored value needs a ceiling.
+/// Real clients send a ~32-byte `state` and their own MCP URL as `resource`.
+const MAX_STATE_LEN: usize = 512;
+const MAX_RESOURCE_LEN: usize = 512;
+/// A PKCE S256 challenge is base64url-no-pad of a SHA-256 digest: exactly 43
+/// characters (RFC 7636 §4.2).
+const S256_CHALLENGE_LEN: usize = 43;
+
+fn is_s256_challenge(challenge: &str) -> bool {
+    challenge.len() == S256_CHALLENGE_LEN
+        && challenge
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The first bound a request breaks, as an `invalid_request` description.
+fn bounds_violation(
+    code_challenge: &str,
+    client_state: &str,
+    resource: Option<&str>,
+) -> Option<&'static str> {
+    if !is_s256_challenge(code_challenge) {
+        return Some("code_challenge must be a 43-character base64url S256 digest");
+    }
+    if client_state.len() > MAX_STATE_LEN {
+        return Some("state must be at most 512 bytes");
+    }
+    if resource.is_some_and(|r| r.len() > MAX_RESOURCE_LEN) {
+        return Some("resource must be at most 512 bytes");
+    }
+    None
+}
 
 /// Whether an unregistered `client_id` is shaped like a real one and therefore
 /// safe to record verbatim: bounded length, printable ASCII only (no control
@@ -145,6 +178,10 @@ pub async fn authorize(
             "state is required",
         );
     };
+    if let Some(violation) = bounds_violation(&code_challenge, &client_state, p.resource.as_deref())
+    {
+        return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", violation);
+    }
     if adopt {
         // `adopt` starts the row on the authorised-client TTL: this
         // `/authorize` is its first use.
@@ -200,82 +237,37 @@ pub async fn authorize(
     Redirect::to(idp_url.as_str()).into_response()
 }
 
-/// Finish an MCP OAuth-bridge login: called by `/auth/callback` when the
-/// recovered flow carries [`OAuthBridge`] context. Exchanges the IdP code,
-/// mints a one-time authorization code bound to the freshly-issued session
-/// JWT + PKCE challenge, and 302s back to the client's redirect URI.
-///
-/// On any IdP-side failure we still 302 back with an `error` param (never a
-/// raw 5xx) so the client's loopback handler completes instead of hanging.
-pub async fn complete_bridge_login(
-    auth: &AuthFacade,
-    bridge: OAuthBridge,
-    code: &str,
-    nonce: &str,
-    idp_verifier: &str,
-) -> Response {
-    let verified = match auth
-        .oidc
-        .exchange_and_verify(code, nonce, idp_verifier)
-        .await
-    {
-        Ok(v) => v,
-        Err(err) => {
-            // Log the typed reason. `access_denied` is all the client may learn
-            // (it can't be told whether the IdP was slow, the nonce mismatched,
-            // or the email was unverified), which left this the one login
-            // failure with no server-side trace at all — an operator saw a user
-            // bounced with `access_denied` and had nothing to correlate. Every
-            // `AuthError` Display is secret-free by construction (see
-            // `auth::errors`), so the variant is safe to record.
-            tracing::warn!(reason = %err, "bridge login failed at the IdP exchange");
-            return redirect_with_error(&bridge, "access_denied");
-        }
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Don't mint a session yet — only stash the verified identity. The session
-    // + access/refresh tokens are issued when the code is redeemed at `/token`,
-    // so an abandoned login leaves no orphan session row.
-    let auth_code = random_token();
-    if auth
-        .codes
-        .insert(
-            &auth_code,
-            GrantIdentity {
-                sub: verified.sub,
-                email: verified.email,
-                groups: verified.groups,
-            },
-            bridge.code_challenge.clone(),
-            bridge.client_redirect_uri.clone(),
-            bridge.client_id.clone(),
-        )
-        .await
-        .is_err()
-    {
-        // The browser is sitting on /auth/callback and the client's loopback
-        // listener is waiting for a redirect. A raw 5xx here would hang it (see
-        // the always-redirect contract in this fn's docstring), so 302 back with
-        // a valid OAuth error code instead. `temporarily_unavailable` (RFC 6749
-        // §4.1.2.1) is the overload signal.
-        return redirect_with_error(&bridge, "temporarily_unavailable");
+    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+    #[test]
+    fn s256_challenge_shape_is_exact() {
+        assert!(is_s256_challenge(CHALLENGE));
+        assert!(!is_s256_challenge("abc"));
+        assert!(!is_s256_challenge(&format!("{CHALLENGE}A")));
+        assert!(!is_s256_challenge(&CHALLENGE.replace('-', "+")));
+        assert!(!is_s256_challenge(&"A".repeat(100_000)));
     }
 
-    match build_redirect(
-        &bridge.client_redirect_uri,
-        &[
-            ("code", auth_code.as_str()),
-            ("state", bridge.client_state.as_str()),
-        ],
-    ) {
-        Some(url) => Redirect::to(&url).into_response(),
-        // The 302 target is the registry-matched URI stashed at /authorize, so
-        // this is unreachable in practice; fail closed with a 400 rather than an
-        // open redirect.
-        None => oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "invalid redirect_uri",
-        ),
+    #[test]
+    fn stored_values_are_bounded() {
+        assert_eq!(
+            bounds_violation(CHALLENGE, "s", Some("https://gw/mcp")),
+            None
+        );
+        let max = "x".repeat(MAX_STATE_LEN);
+        assert_eq!(bounds_violation(CHALLENGE, &max, Some(&max)), None);
+        let over = "x".repeat(MAX_STATE_LEN + 1);
+        assert!(bounds_violation(CHALLENGE, &over, None).is_some_and(|v| v.starts_with("state")));
+        assert!(
+            bounds_violation(CHALLENGE, "s", Some(&over))
+                .is_some_and(|v| v.starts_with("resource"))
+        );
+        assert!(
+            bounds_violation("short", "s", None).is_some_and(|v| v.starts_with("code_challenge"))
+        );
     }
 }

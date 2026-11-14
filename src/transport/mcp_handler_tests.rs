@@ -90,3 +90,21 @@ fn string_and_integer_ids_pass_through() {
         assert_eq!(checked_id(&id).ok().flatten(), Some(raw));
     }
 }
+
+#[test]
+fn agent_client_is_capped_at_the_upstream_header_bound() {
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, "a".repeat(4096).parse().unwrap());
+    let client = agent_client(&headers).expect("present");
+    assert_eq!(client.len(), upstream::UPSTREAM_MAX_BYTES);
+}
+
+#[test]
+fn agent_client_prefers_user_agent_and_keeps_short_values() {
+    let mut headers = HeaderMap::new();
+    assert_eq!(agent_client(&headers), None);
+    headers.insert(MCP_CLIENT_HEADER, "mcp-cli/1.0".parse().unwrap());
+    assert_eq!(agent_client(&headers).as_deref(), Some("mcp-cli/1.0"));
+    headers.insert(USER_AGENT, "claude-code/2.1".parse().unwrap());
+    assert_eq!(agent_client(&headers).as_deref(), Some("claude-code/2.1"));
+}

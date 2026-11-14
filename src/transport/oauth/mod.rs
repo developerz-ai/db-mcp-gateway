@@ -15,7 +15,9 @@
 //! 4. `POST /register` → Dynamic Client Registration (RFC 7591); pins the
 //!    client's redirect-URI allowlist so step 5 can match against it.
 //! 5. `GET /authorize` (PKCE) → we drive the IdP login, then 302 back to the
-//!    client's *registered* redirect with a one-time authorization code.
+//!    client's *registered* redirect with a one-time authorization code — for
+//!    a non-loopback redirect only after the user approves the client on the
+//!    gateway's consent page (`POST /authorize/consent`).
 //! 6. `POST /token` (PKCE verifier) → we hand back the gateway session JWT as
 //!    the OAuth `access_token`.
 //!
@@ -28,6 +30,8 @@
 //! a valid-signature bearer.
 
 mod authorize;
+mod bridge_login;
+mod consent;
 mod discovery;
 mod helpers;
 mod register;
@@ -36,7 +40,9 @@ mod token;
 mod urls;
 
 // Re-export everything the parent module (transport) accesses via `oauth::*`
-pub(super) use authorize::{authorize, complete_bridge_login};
+pub(super) use authorize::authorize;
+pub(super) use bridge_login::complete_bridge_login;
+pub(super) use consent::{CONSENT_PATH, consent};
 pub(super) use discovery::{authorization_server_metadata, protected_resource_metadata};
 pub(super) use helpers::{query_rejected, random_token, redirect_with_error};
 pub(super) use register::register;
