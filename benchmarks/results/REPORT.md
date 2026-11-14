@@ -4,7 +4,7 @@ Invocation log for the committed evidence in this directory. Invocations
 1–3 (shared KVM host, 2026-11-04) produced `postgres.json`, `mongo.json` and
 `instances4.json`; invocations 4–9 (bare-metal workstation, 2026-11-14,
 appended at the end under "Quiet-host runs") produced `postgres-quiet.json`,
-`mongo-quiet.json`, `instances4-quiet.json` and `postgres-write-quiet.json`.
+`mongo-quiet.json`, `instances4-quiet.json` and `postgres-write-quiet.json` (committed as `.json.gz`).
 The host table, dirty-tree caveat, credentials and limitations sections
 directly below describe invocations 1–3. One section per `gateway_overhead.sh`
 invocation — the exact command, its exit status, and the harness's complete
@@ -853,7 +853,7 @@ raw results → <scratch>/pg-default-2.json
 - Exit status: **0**; wall time 92s (includes the cargo build step)
 - Host before 2026-11-14T03:38:04Z: loadavg `4.26 8.74 6.88`, `/proc/stat` steal column `0`
 - Host after 2026-11-14T03:39:36Z: loadavg `8.79 9.05 7.16`, `/proc/stat` steal column `0`
-- Artifact: [postgres-quiet.json](postgres-quiet.json)
+- Artifact: [postgres-quiet.json.gz](postgres-quiet.json.gz) (committed gzipped)
 
 ```text
 -- dev stack already running, leaving it up afterwards
@@ -983,7 +983,7 @@ raw results → <scratch>/pg-20k.json
 - Exit status: **0**; wall time 460s (includes the cargo build step)
 - Host before 2026-11-14T03:40:03Z: loadavg `5.95 8.32 6.98`, `/proc/stat` steal column `0`
 - Host after 2026-11-14T03:47:43Z: loadavg `8.21 7.57 7.15`, `/proc/stat` steal column `0`
-- Artifact: [mongo-quiet.json](mongo-quiet.json)
+- Artifact: [mongo-quiet.json.gz](mongo-quiet.json.gz) (committed gzipped)
 
 ```text
 -- dev stack already running, leaving it up afterwards
@@ -1133,7 +1133,7 @@ gateway on port 8899 exited during boot
 - Exit status: **0**; wall time 144s (includes the cargo build step)
 - Host before 2026-11-14T03:48:28Z: loadavg `4.29 6.62 6.84`, `/proc/stat` steal column `0`
 - Host after 2026-11-14T03:50:52Z: loadavg `6.63 6.64 6.82`, `/proc/stat` steal column `0`
-- Artifact: [instances4-quiet.json](instances4-quiet.json)
+- Artifact: [instances4-quiet.json.gz](instances4-quiet.json.gz) (committed gzipped)
 
 ```text
 -- dev stack already running, leaving it up afterwards
@@ -1287,7 +1287,7 @@ raw results → <scratch>/inst4-20k.json
 - Exit status: **0**; wall time 66s (includes the cargo build step)
 - Host before 2026-11-14T03:53:46Z: loadavg `5.44 6.12 6.58`, `/proc/stat` steal column `0`
 - Host after 2026-11-14T03:54:52Z: loadavg `5.66 6.14 6.56`, `/proc/stat` steal column `0`
-- Artifact: [postgres-write-quiet.json](postgres-write-quiet.json)
+- Artifact: [postgres-write-quiet.json.gz](postgres-write-quiet.json.gz) (committed gzipped)
 
 After the run, the state DB held exactly 22000 `audit_calls` rows for `service:bench` on server `target-write` with `outcome = success` and `rows_affected = 1` — 2000 warmup + 20000 measured gateway requests, every one audited synchronously. `bench_writes` was absent from the target afterwards (`to_regclass` returned NULL): the harness dropped it.
 

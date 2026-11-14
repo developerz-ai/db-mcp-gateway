@@ -618,6 +618,28 @@ mod tests {
         assert!(md.contains("CPU steal") || report.environment.cpu_steal_pct_since_boot.is_none());
     }
 
+    /// The write-path item is listed exactly when the run did not measure writes.
+    #[test]
+    fn write_path_is_unmeasured_only_outside_the_write_backend() {
+        let is_write_item = |item: &&str| item.starts_with("write-path overhead");
+        for read_backend in ["postgres", "mongo"] {
+            assert_eq!(
+                not_measured(read_backend)
+                    .iter()
+                    .filter(is_write_item)
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            not_measured("postgres-write")
+                .iter()
+                .filter(is_write_item)
+                .count(),
+            0
+        );
+    }
+
     /// MongoDB is measured now — it must not be listed as unmeasured.
     #[test]
     fn mongodb_is_not_listed_as_unmeasured() {
