@@ -9,9 +9,10 @@
 # own overhead, not to measure it hitting a row cap or a statement timeout. A
 # truncated response would make the gateway and direct paths incomparable.
 #
-# Both query targets live in this one file so a single config serves every
-# backend: `--backend postgres` measures the `target` server, `--backend mongo`
-# measures the `mongo` server. Adapters open lazily, so declaring both costs
+# Every query target lives in this one file so a single config serves every
+# backend: `--backend postgres` measures the `target` server, `--backend
+# postgres-write` the `target-write` server, `--backend mongo` the `mongo`
+# server. Adapters open lazily, so declaring both costs
 # nothing on a run that only uses one.
 
 servers:
@@ -26,6 +27,25 @@ servers:
         role: app
         password: app-dev-only
         description: Benchmark target
+
+  # The same target-db, declared a second time with a write tier, so the read
+  # benchmark keeps its `query_read` grant on `target` untouched. Writes run as
+  # `write_role` (`app`, the role the direct baseline uses too); the read tier
+  # needs a different role, `bench_ro`, which the harness creates with no
+  # privileges beyond the database defaults — the write benchmark never reads.
+  - name: target-write
+    kind: postgres
+    description: Local dev target-db, write tier (docker-compose.dev.yml)
+    host: localhost
+    port: 5434
+    tls: insecure
+    databases:
+      - name: app
+        role: bench_ro
+        password: bench-ro-dev-only
+        write_role: app
+        write_password: app-dev-only
+        description: Write benchmark target (scratch table bench_writes)
 
   - name: mongo
     kind: mongo
@@ -58,6 +78,16 @@ permissions:
           statement_timeout_ms: 30000
           # Off — a required reason adds a field to every request and would
           # measure our own test scaffolding.
+          require_reason: false
+
+      # The write benchmark: one UPDATE ... RETURNING per request on the
+      # write tier. Same wide constraints as the read grants.
+      - server: target-write
+        database: app
+        action: query_write
+        constraints:
+          row_limit: 5000
+          statement_timeout_ms: 30000
           require_reason: false
 
       - server: mongo

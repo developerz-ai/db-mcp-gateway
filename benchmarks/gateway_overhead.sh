@@ -2,7 +2,7 @@
 # benchmarks/gateway_overhead.sh — measure what the gateway adds over talking
 # to the same database directly, from this host, at this moment.
 #
-#   ./benchmarks/gateway_overhead.sh [--backend postgres|mongo] [--queries N]
+#   ./benchmarks/gateway_overhead.sh [--backend postgres|postgres-write|mongo] [--queries N]
 #       [--concurrent N] [--warmup N] [--instances N] [--mysql-rejection]
 #       [--resource-sample-ms N] [--db-name NAME] [--out PATH]
 #
@@ -14,6 +14,13 @@
 # `--backend mongo` measures the same comparison against the `target-mongo`
 # container instead of `target-db`; the query goes through the gateway's mongo
 # adapter, which is read-only by construction (src/exec/mongo/rejector.rs).
+#
+# `--backend postgres-write` measures the write path: an UPDATE ... RETURNING
+# by primary key on a scratch table (`bench_writes`), sent through `run_query`
+# on the `target-write` server under a `query_write` grant, so it runs on the
+# gateway's write tier (`write_role`) with the synchronous audit write intact.
+# The direct baseline runs the same statement as the same role. The harness
+# creates the scratch table before measuring and drops it afterwards.
 #
 # `--instances N` boots N gateway processes and spreads the load across them.
 # On one host that measures contention between the instances, NOT horizontal
@@ -52,9 +59,14 @@ MYSQL_REJECTION=0
 # via `--server`.
 SERVER_TARGET="target"
 SERVER_MONGO="mongo"
+SERVER_TARGET_WRITE="target-write"
 
 # Base port for the first gateway instance; instance i binds base+i.
 GATEWAY_BASE_PORT=8899
+# Each instance also opens its own `/metrics` listener (METRICS_BIND, default
+# 127.0.0.1:9090). Instances sharing one host need one port each, or every
+# instance after the first fails to boot. Instance i binds base+i.
+METRICS_BASE_PORT=9899
 
 # Config declaring a `kind: mysql` query target. Never booted as a working
 # target — it exists so the harness can prove the boot-time rejection.
@@ -71,7 +83,10 @@ Usage:
   ./benchmarks/gateway_overhead.sh [options]
 
 Options:
-  --backend postgres|mongo  Engine to measure (default: postgres)
+  --backend postgres|postgres-write|mongo
+                            What to measure (default: postgres).
+                            postgres-write measures an UPDATE through the
+                            write tier under a query_write grant
   --queries N               Measured requests per path, per shape (default: 2000)
   --concurrent N            Concurrent in-flight requests (default: 8)
   --warmup N                Requests discarded before measuring (default: 200)
@@ -95,6 +110,7 @@ Options:
 
 Backends:
   postgres  target-db    localhost:5434  database `app`  server `target`
+  postgres-write  target-db  localhost:5434  database `app`  server `target-write`
   mongo     target-mongo localhost:27018 database `app`  server `mongo`
 
 Requires: docker, cargo, curl, openssl. Nothing else — no k6, no wrk.
@@ -135,8 +151,8 @@ while [[ $# -gt 0 ]]; do
       shift 2 ;;
     --backend)
       case "$2" in
-        postgres|mongo) BACKEND="$2" ;;
-        *) echo "--backend must be postgres or mongo (got: $2)" >&2; exit 2 ;;
+        postgres|postgres-write|mongo) BACKEND="$2" ;;
+        *) echo "--backend must be postgres, postgres-write or mongo (got: $2)" >&2; exit 2 ;;
       esac
       if [[ -n "$BACKEND_SET" && "$BACKEND_SET" != "--backend" && "$BACKEND" != "postgres" ]]; then
         echo "--backend $BACKEND conflicts with $BACKEND_SET (postgres)" >&2
@@ -171,11 +187,11 @@ if [[ "$DB_NAME" != "app" ]]; then
   exit 2
 fi
 
-if [[ "$BACKEND" == "mongo" ]]; then
-  SERVER="$SERVER_MONGO"
-else
-  SERVER="$SERVER_TARGET"
-fi
+case "$BACKEND" in
+  mongo)          SERVER="$SERVER_MONGO" ;;
+  postgres-write) SERVER="$SERVER_TARGET_WRITE" ;;
+  *)              SERVER="$SERVER_TARGET" ;;
+esac
 
 STACK_WAS_UP=0
 MONGO_STARTED_BY_US=0
@@ -213,7 +229,7 @@ else
   bin/dev up >/dev/null
 fi
 
-if [[ "$BACKEND" == "postgres" ]]; then
+if [[ "$BACKEND" != "mongo" ]]; then
   echo "-- waiting for Postgres"
   postgres_ready=0
   for _ in $(seq 1 60); do
@@ -258,11 +274,13 @@ fi
 
 # Minted per run and never written to disk. A benchmark has no reason to hold
 # a durable credential.
-export SERVICE_TOKEN_BENCH="dbmcp_svc_$(openssl rand -hex 32)"
+SERVICE_TOKEN_BENCH="dbmcp_svc_$(openssl rand -hex 32)"
+export SERVICE_TOKEN_BENCH
 # The gateway refuses to boot on a weak or committed signing key. The benchmark
 # never mints a session JWT — it authenticates with the service token — but the
 # key is still required at boot, so generate a throwaway one per run.
-export SESSION_SIGNING_KEY="$(openssl rand -hex 32)"
+SESSION_SIGNING_KEY="$(openssl rand -hex 32)"
+export SESSION_SIGNING_KEY
 # OIDC issuer and client id are required at boot too. Discovery is lazy and
 # the benchmark never logs in, so a loopback issuer nothing listens on is
 # never contacted.
@@ -297,6 +315,7 @@ for i in $(seq 0 $((INSTANCES - 1))); do
   port=$((GATEWAY_BASE_PORT + i))
   echo "-- booting gateway on 127.0.0.1:${port}"
   GATEWAY_BIND="127.0.0.1:${port}" \
+  METRICS_BIND="127.0.0.1:$((METRICS_BASE_PORT + i))" \
     ./target/release/db-mcp-gateway --config benchmarks/gateway.bench.yaml &
   GATEWAY_PIDS+=($!)
 done
@@ -333,7 +352,8 @@ done
 # Best-effort channel for the harness's resource sampler: the PIDs of the
 # gateway processes this run started. The harness may also discover them from
 # the listening ports; this is a convenience, not a contract.
-export BENCH_GATEWAY_PIDS="$(IFS=,; echo "${GATEWAY_PIDS[*]}")"
+BENCH_GATEWAY_PIDS="$(IFS=,; echo "${GATEWAY_PIDS[*]}")"
+export BENCH_GATEWAY_PIDS
 
 HARNESS_ARGS=(
   --backend "$BACKEND"
