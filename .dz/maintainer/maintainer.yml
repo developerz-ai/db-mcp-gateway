@@ -1,11 +1,11 @@
 # yaml-language-server: $schema=https://developerz.ai/schemas/maintainer.v1.json
 # developerz.ai maintainer policy: developerz-ai/db-mcp-gateway
 #
-# AI-maintained, on the same posture as developerz-ai/wurk: for everyone, org members, collaborators
-# and the dependency bots alike, the agent triages, answers, reviews, declines with a reason, merges
-# on green and closes what has stalled on its reporter or author. A human is asked before the agent
-# acts on two things: a PR on a CLAUDE.md security-review path (`pr.human_merge`) and a breaking
-# change (`escalate`).
+# FULLY AI-MAINTAINED, on the same posture as developerz-ai/wurk (owner, 2026-11-14: no human
+# maintenance unless we add new features). For everyone, org members, collaborators and the
+# dependency bots alike, the agent triages, answers, reviews, declines with a reason, merges on green
+# and closes what has stalled on its reporter or author. A human is asked only for a breaking change
+# (`escalate`) and the platform's hardcoded asks (security reports, license, CLA).
 #
 # CLAUDE.md is the authority and this file never relaxes it. Its five non-negotiables (credentials
 # never leave the gateway, every DB call traces to an SSO-verified identity, read-only by default,
@@ -63,25 +63,15 @@ pr:
     - "test"
     - "audit"
   auto_merge: true
-  # Every author's PR is reviewed, babysat and merged on green, except what `human_merge` and
-  # `escalate` hold for a human and what `non_goals` declines. Whether an author is outside is the
+  # Every author's PR is reviewed, babysat and merged on green, except what `escalate` holds for a
+  # human and what `non_goals` declines. Whether an author is outside is the
   # platform's read of their real repo permission, never `author_association`.
   auto_merge_scope: any
   require_review: true
-  # CLAUDE.md "Security review required": auth, authz, credential loading or storage, the audit
-  # write path, MCP tools and SQL execution. A PR touching one carries the label
-  # `security review required` (exact name) and is merged by a human after that review, never by
-  # the bot. The review lane's `path_instructions` below make a missing label a must-fix finding.
-  human_merge:
-    paths:
-      - "src/auth/**"
-      - "src/authz/**"
-      - "src/audit/**"
-      - "src/exec/**"
-      - "src/tools/**"
-      - "src/config/secret.rs"
-      - "src/config/secret/**"
-      - "src/state/**"
+  # No `human_merge` (owner, 2026-11-14). CLAUDE.md "Security review required" paths are gated by
+  # the review lane instead: `mandatory_passes` includes `security`, and `path_instructions` below
+  # make a missing `security review required` label, or any finding against a non-negotiable, a
+  # must-fix change request, which blocks the merge until resolved.
   close_awaiting_author_after_days: 21
 
 review:
@@ -146,8 +136,7 @@ release:
 escalate:
   # `breaking_change`: a human decides a change to the MCP tool surface, error codes, config schema
   # or audit shape that a running deployment must react to. Security needs no entry here: it is one
-  # of the platform's hardcoded asks (security, license, CLA), which this list cannot remove, and a
-  # PR on a security-review path is also held for a human merge by `pr.human_merge.paths`.
+  # of the platform's hardcoded asks (security, license, CLA), which this list cannot remove.
   ask_before_acting: [breaking_change]
 
 # The checkups nothing else triggers. Bot-authored alarm issues never pass intake, so a red `main`

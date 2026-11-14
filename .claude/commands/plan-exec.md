@@ -26,7 +26,7 @@ $ARGUMENTS
 ## 3. Before the PR
 - An agent's change that contradicts an earlier recorded decision (a brief under `.dz/`, a `CLAUDE.md` rule, a dated `status.yml` decision) is reverted, not merged: the earlier human call wins until a human changes it.
 - Apply the agents' patches for files they did not own, sweep their leftovers (scratch files, `dbg!`, temp configs), then `bin/ci` once, in the background. Stage by path, ≤100 files.
-- A wave touching a `CLAUDE.md` security-review path gets the `security review required` label and waits for a human merge (`pr.human_merge` in `.dz/maintainer/maintainer.yml`).
+- A wave touching a `CLAUDE.md` security-review path gets the `security review required` label and merges only once the review's mandatory security pass has nothing open.
 - PR body claims only what the diff does; evidence you lack is listed as missing.
 
 ## 4. After the merge

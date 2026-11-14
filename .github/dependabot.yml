@@ -12,6 +12,10 @@
 # either take all the breakage or none of it. Majors therefore arrive as
 # individual PRs, one decision each.
 #
+# Cadence follows developerz-ai/wurk: the shipped deps (cargo, the docs site's npm) move weekly;
+# the CI actions and the Dockerfile base image move monthly, since a weekly cadence there is
+# mostly one PR per patch release for no change in what ships.
+#
 # The 14-day cooldown lets a compromised release get caught before it reaches
 # us. Security updates are unaffected.
 version: 2
@@ -20,8 +24,7 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
-      day: monday
+      interval: monthly
     open-pull-requests-limit: 5
     cooldown:
       default-days: 14
@@ -89,8 +92,7 @@ updates:
   - package-ecosystem: docker
     directory: /
     schedule:
-      interval: weekly
-      day: monday
+      interval: monthly
     cooldown:
       default-days: 14
     commit-message:

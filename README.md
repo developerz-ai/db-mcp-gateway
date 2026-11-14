@@ -6,6 +6,18 @@
 
 <p align="center"><strong>Your AI agent needs to read the production database. The connection string is the one thing you cannot hand it.</strong></p>
 
+<div align="center">
+
+[![Maintained by developerz.ai](https://img.shields.io/badge/maintained%20by-developerz.ai-8a2be2.svg)](#ai-maintained)
+[![CI](https://github.com/developerz-ai/db-mcp-gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/developerz-ai/db-mcp-gateway/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/developerz-ai/db-mcp-gateway?sort=semver)](https://github.com/developerz-ai/db-mcp-gateway/releases/latest)
+[![Image](https://img.shields.io/badge/image-ghcr.io-2496ED?logo=docker&logoColor=white)](https://github.com/developerz-ai/db-mcp-gateway/pkgs/container/db-mcp-gateway)
+[![Rust](https://img.shields.io/badge/rust-%E2%89%A5%201.88-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![GitHub stars](https://img.shields.io/github/stars/developerz-ai/db-mcp-gateway?style=flat&logo=github)](https://github.com/developerz-ai/db-mcp-gateway/stargazers)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+</div>
+
 Give an agent a database URL and that credential now lives on a laptop, in a
 config file, in shell history, and in whatever the agent decides to echo back.
 Rotating it means finding every copy. And every query it runs is attributed to
@@ -159,6 +171,31 @@ hardware.
 | Distribution | OCI image — `ghcr.io/developerz-ai/db-mcp-gateway` |
 
 ---
+
+## AI-maintained
+
+db-mcp-gateway is maintained by AI: by [developerz.ai](https://developerz.ai), the way a human maintainer looks after an open-source project. The agent works publicly as `developerz-ai[bot]` and marks every comment it posts as bot-made. Its policy is committed in [`.dz/maintainer/maintainer.yml`](.dz/maintainer/maintainer.yml), and [`CLAUDE.md`](CLAUDE.md) binds it: no policy line relaxes a non-negotiable.
+
+| What arrives | What happens |
+|---|---|
+| an issue | triaged; asked for a reproduction when one is missing; a real bug is fixed and released |
+| a pull request | reviewed (CodeRabbit and the developerz.ai reviewer), driven to green on `fmt`, `clippy`, `test` and `audit`, merged |
+| a pull request on a security-review path (auth, authz, audit, exec, tools, state, secrets) | labelled `security review required`, merged only once the mandatory security pass has nothing open |
+| Dependabot | driven to green and merged; every bump waits 14 days after upstream publishes it (security updates excepted) |
+| an outside change to CI, release or publish automation | declined: members maintain the pipeline that publishes the image |
+| a change that weakens a non-negotiable | declined with the rule quoted |
+| a breaking change (tool surface, error codes, config schema, audit shape) or a new feature | a human decides: the team still designs and builds features, humans and AI together |
+
+Scheduled checkups, briefs in [`.dz/briefs/`](.dz/briefs/): weekly `release-due` judges whether a release is needed, daily `security-release` ships a confirmed security fix off-cycle, weekly `health` catches the failures nothing announces, and monthly `improve` lands at most three small, evidenced improvements.
+
+## Star history
+
+<a href="https://star-history.com/#developerz-ai/db-mcp-gateway&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=developerz-ai/db-mcp-gateway&type=Date&theme=dark">
+    <img alt="Star history of developerz-ai/db-mcp-gateway" src="https://api.star-history.com/svg?repos=developerz-ai/db-mcp-gateway&type=Date" width="600">
+  </picture>
+</a>
 
 ## License
 
