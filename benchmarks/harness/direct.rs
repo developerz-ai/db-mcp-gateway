@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use sqlx::{Row, postgres::PgPoolOptions};
 
-use crate::workload::{Shape, postgres_seed};
+use crate::workload::Shape;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DirectError {
@@ -82,18 +82,21 @@ impl DirectClient {
         Ok(DirectClient { pool })
     }
 
-    /// Create and populate the benchmark table.
+    /// Run `ddl` — the seed or cleanup script for the backend being
+    /// measured ([`crate::workload::postgres_seed`],
+    /// [`crate::workload::postgres_write_seed`] or
+    /// [`crate::workload::postgres_write_cleanup`]).
     ///
-    /// **Destructive.** The DDL opens with `DROP TABLE IF EXISTS bench_rows`,
-    /// so any existing `bench_rows` in the target database is discarded. Point
+    /// **Destructive.** The seeds open with `DROP TABLE IF EXISTS`, so any
+    /// existing table of that name in the target database is discarded. Point
     /// the harness at a disposable database only. The drop is what makes a
     /// re-run measure the same bytes rather than appending to the previous
     /// run's data.
-    pub async fn seed(&self) -> Result<(), DirectError> {
+    pub async fn execute_ddl(&self, ddl: &str) -> Result<(), DirectError> {
         // `execute` on a multi-statement string runs it as one implicit
         // transaction, which is what we want: a half-seeded table would make
         // every subsequent number meaningless.
-        sqlx::raw_sql(&postgres_seed()).execute(&self.pool).await?;
+        sqlx::raw_sql(ddl).execute(&self.pool).await?;
         Ok(())
     }
 

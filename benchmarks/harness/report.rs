@@ -205,17 +205,18 @@ impl Report {
         effective_config: EffectiveConfig,
         measurements: Vec<Measurement>,
     ) -> Self {
+        let backend = measurements
+            .first()
+            .map(|m| m.backend)
+            .unwrap_or("postgres");
         Report {
             environment,
-            backend: measurements
-                .first()
-                .map(|m| m.backend)
-                .unwrap_or("postgres"),
+            backend,
             effective_config,
             measurements,
             scaling: Vec::new(),
             mysql_rejection: None,
-            not_measured: not_measured(),
+            not_measured: not_measured(backend),
         }
     }
 
@@ -459,8 +460,8 @@ impl Report {
 /// Each entry names the reason it cannot be answered on one host. MongoDB is
 /// **not** on this list any more — the harness measures the mongo adapter
 /// against a real MongoDB with the same discipline as the postgres path.
-fn not_measured() -> Vec<&'static str> {
-    vec![
+fn not_measured(backend: &str) -> Vec<&'static str> {
+    let mut items = vec![
         "absolute capacity ceiling (qps) — the load generator shares CPU with the gateway and \
          the database, so the throughput reported above is what the whole box managed, not what \
          the gateway alone can serve",
@@ -468,11 +469,15 @@ fn not_measured() -> Vec<&'static str> {
          saturated measures contention, not scaling; the scaling section above is labelled as such \
          and needs a separate load host to become a scaling result",
         "multi-host or multi-region behaviour — one host, one set of cores, one database",
-        "write-path overhead — both targets are read-only here (the postgres role is read-only \
-         and the mongo adapter runs a read-only rejector), so a write grant's overhead is not \
-         covered",
         "TLS termination cost — the bench gateway runs with TLS disabled",
-    ]
+    ];
+    if backend != "postgres-write" {
+        items.push(
+            "write-path overhead in this run — its grants are `query_read` (and the mongo adapter \
+             is read-only by construction); `--backend postgres-write` measures the write tier",
+        );
+    }
+    items
 }
 
 #[cfg(test)]

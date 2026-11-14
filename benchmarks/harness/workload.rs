@@ -25,25 +25,31 @@ use serde::Serialize;
 #[serde(rename_all = "snake_case")]
 pub enum Backend {
     Postgres,
+    /// The Postgres target's write tier: a `query_write` grant on a database
+    /// with a `write_role`. Its own backend so a run is either all reads or
+    /// all writes, never a mix that would blur the two overheads.
+    PostgresWrite,
     Mongo,
 }
 
 impl Backend {
     pub fn all() -> &'static [Backend] {
-        &[Backend::Postgres, Backend::Mongo]
+        &[Backend::Postgres, Backend::PostgresWrite, Backend::Mongo]
     }
 
     pub fn name(self) -> &'static str {
         match self {
             Backend::Postgres => "postgres",
+            Backend::PostgresWrite => "postgres-write",
             Backend::Mongo => "mongo",
         }
     }
 
-    /// CLI spelling — matches `--backend <postgres|mongo>`.
+    /// CLI spelling — matches `--backend <postgres|postgres-write|mongo>`.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "postgres" | "postgresql" | "pg" => Some(Backend::Postgres),
+            "postgres-write" | "pg-write" => Some(Backend::PostgresWrite),
             "mongo" | "mongodb" => Some(Backend::Mongo),
             _ => None,
         }
@@ -99,6 +105,49 @@ ANALYZE bench_rows;
     )
 }
 
+/// The scratch table the write shape updates. Separate from `bench_rows` so
+/// the read shapes never measure a table the write run has churned.
+pub const WRITE_TABLE: &str = "bench_writes";
+
+/// The login role the `target-write` server's read tier connects as.
+///
+/// The gateway requires a database's `role` and `write_role` to differ and
+/// connects the read tier on first use, so the write benchmark needs a second
+/// role even though it never reads. It is given nothing beyond the database
+/// defaults. Dev-only credential, matching `benchmarks/gateway.bench.yaml`.
+const WRITE_RUN_READ_ROLE: &str = "bench_ro";
+const WRITE_RUN_READ_ROLE_PASSWORD: &str = "bench-ro-dev-only";
+
+/// DDL + seed for the write shape: the read-tier role (created once, kept),
+/// and a fresh `bench_writes` holding [`SEED_ROWS`] rows. Destructive on
+/// `bench_writes`, like [`postgres_seed`] is on `bench_rows`.
+pub fn postgres_write_seed() -> String {
+    format!(
+        "\
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{WRITE_RUN_READ_ROLE}') THEN
+    CREATE ROLE {WRITE_RUN_READ_ROLE} LOGIN PASSWORD '{WRITE_RUN_READ_ROLE_PASSWORD}';
+  END IF;
+END $$;
+DROP TABLE IF EXISTS {WRITE_TABLE};
+CREATE TABLE {WRITE_TABLE} (
+    id    bigint PRIMARY KEY,
+    label text   NOT NULL,
+    val   bigint NOT NULL
+);
+INSERT INTO {WRITE_TABLE} (id, label, val)
+SELECT g, 'label-' || g, (g * 7919) % 100000
+FROM generate_series(1, {SEED_ROWS}) AS g;
+ANALYZE {WRITE_TABLE};
+"
+    )
+}
+
+/// Drops the write shape's scratch table once the run is over.
+pub fn postgres_write_cleanup() -> String {
+    format!("DROP TABLE IF EXISTS {WRITE_TABLE}")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Shape {
@@ -122,6 +171,10 @@ pub enum Shape {
     /// Mongo aggregation with a `$match` and a `$group`, returning one
     /// document. The mongo analogue of [`Shape::Aggregate`].
     MongoAggregate,
+    /// Single-row UPDATE by primary key, `RETURNING` the row, on the write
+    /// tier. Updates in place rather than inserting so the table does not
+    /// grow across phases and the two baselines run against the same table.
+    WriteUpdate,
 }
 
 impl Shape {
@@ -134,6 +187,7 @@ impl Shape {
             Shape::MongoPointFind,
             Shape::MongoRangeFind,
             Shape::MongoAggregate,
+            Shape::WriteUpdate,
         ]
     }
 
@@ -151,6 +205,7 @@ impl Shape {
         match self {
             Shape::PointLookup | Shape::RangeScan | Shape::Aggregate => Backend::Postgres,
             Shape::MongoPointFind | Shape::MongoRangeFind | Shape::MongoAggregate => Backend::Mongo,
+            Shape::WriteUpdate => Backend::PostgresWrite,
         }
     }
 
@@ -162,6 +217,7 @@ impl Shape {
             Shape::MongoPointFind => "mongo_point_find",
             Shape::MongoRangeFind => "mongo_range_find",
             Shape::MongoAggregate => "mongo_aggregate",
+            Shape::WriteUpdate => "write_update",
         }
     }
 
@@ -175,6 +231,7 @@ impl Shape {
             Shape::MongoPointFind => "mongo find by _id, one document returned",
             Shape::MongoRangeFind => "mongo find over the indexed _id range, 1000 documents",
             Shape::MongoAggregate => "mongo $match + $group aggregate, one document returned",
+            Shape::WriteUpdate => "UPDATE one row by primary key, RETURNING it (query_write grant)",
         }
     }
 
@@ -198,6 +255,10 @@ impl Shape {
                 let floor = iteration % 1000;
                 format!("SELECT count(*) AS c, sum(val) AS s FROM bench_rows WHERE val > {floor}")
             }
+            Shape::WriteUpdate => {
+                let id = (iteration % SEED_ROWS as u64) + 1;
+                format!("UPDATE {WRITE_TABLE} SET val = val + 1 WHERE id = {id} RETURNING id, val")
+            }
             // Mongo shapes speak JSON, not SQL. `Shape::command` is the entry
             // point for those; this arm exists only so a mistaken call on a
             // postgres-shaped path fails loudly instead of running SQL against
@@ -214,7 +275,7 @@ impl Shape {
     /// comparison of paths rather than of queries.
     pub fn query(self, iteration: u64) -> String {
         match self.backend() {
-            Backend::Postgres => self.sql(iteration),
+            Backend::Postgres | Backend::PostgresWrite => self.sql(iteration),
             Backend::Mongo => self.command(iteration),
         }
     }
@@ -257,7 +318,7 @@ impl Shape {
     /// response against a complete one.
     pub fn limit(self) -> u32 {
         match self {
-            Shape::PointLookup | Shape::Aggregate => 10,
+            Shape::PointLookup | Shape::Aggregate | Shape::WriteUpdate => 10,
             Shape::RangeScan => 2000,
             Shape::MongoPointFind => 10,
             Shape::MongoRangeFind => 2000,
@@ -317,6 +378,32 @@ mod tests {
         assert!(
             sql.contains(&format!("generate_series(1, {SEED_ROWS})")),
             "seed SQL must derive its row count from SEED_ROWS ({SEED_ROWS}):\n{sql}"
+        );
+    }
+
+    #[test]
+    fn write_update_stays_inside_the_seeded_range() {
+        for i in [0u64, 1, 49_999, 50_000, 123_456] {
+            let sql = Shape::WriteUpdate.sql(i);
+            assert!(sql.starts_with(&format!("UPDATE {WRITE_TABLE} ")), "{sql}");
+            assert!(sql.ends_with("RETURNING id, val"), "{sql}");
+            let id: i64 = sql
+                .split("id = ")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|s| s.parse().ok())
+                .expect("numeric id");
+            assert!((1..=SEED_ROWS).contains(&id), "iteration {i} -> id {id}");
+        }
+    }
+
+    #[test]
+    fn write_seed_and_cleanup_name_the_scratch_table() {
+        assert!(postgres_write_seed().contains(&format!("CREATE TABLE {WRITE_TABLE}")));
+        assert!(postgres_write_seed().contains(&format!("generate_series(1, {SEED_ROWS})")));
+        assert_eq!(
+            postgres_write_cleanup(),
+            format!("DROP TABLE IF EXISTS {WRITE_TABLE}")
         );
     }
 
