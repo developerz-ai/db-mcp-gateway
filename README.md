@@ -13,6 +13,7 @@
 [![Release](https://img.shields.io/github/v/release/developerz-ai/db-mcp-gateway?sort=semver)](https://github.com/developerz-ai/db-mcp-gateway/releases/latest)
 [![Image](https://img.shields.io/badge/image-ghcr.io-2496ED?logo=docker&logoColor=white)](https://github.com/developerz-ai/db-mcp-gateway/pkgs/container/db-mcp-gateway)
 [![Rust](https://img.shields.io/badge/rust-%E2%89%A5%201.88-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![GitHub stars](https://img.shields.io/github/stars/developerz-ai/db-mcp-gateway?style=flat&logo=github)](https://github.com/developerz-ai/db-mcp-gateway/stargazers)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -186,6 +187,15 @@ db-mcp-gateway is maintained by AI: by [developerz.ai](https://developerz.ai), t
 | a breaking change (tool surface, error codes, config schema, audit shape) or a new feature | a human decides: the team still designs and builds features, humans and AI together |
 
 Scheduled checkups, briefs in [`.dz/briefs/`](.dz/briefs/): weekly `release-due` judges whether a release is needed, daily `security-release` ships a confirmed security fix off-cycle, weekly `health` catches the failures nothing announces, and monthly `improve` lands at most three small, evidenced improvements.
+
+## Star history
+
+<a href="https://star-history.com/#developerz-ai/db-mcp-gateway&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=developerz-ai/db-mcp-gateway&type=Date&theme=dark">
+    <img alt="Star history of developerz-ai/db-mcp-gateway" src="https://api.star-history.com/svg?repos=developerz-ai/db-mcp-gateway&type=Date" width="600">
+  </picture>
+</a>
 
 ## License
 
