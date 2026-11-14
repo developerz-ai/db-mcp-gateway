@@ -49,3 +49,12 @@ recipe.json
 # `bench-harness` feature). Keeping it out of the context also keeps a
 # benchmark config out of a shipped layer.
 benchmarks/
+
+# Integration tests are never built into the image, but cargo autodiscovers
+# every `tests/*.rs` as a target and `cargo chef prepare` writes each one into
+# the recipe. A PR that added a test file therefore changed the recipe and
+# re-ran the ~190 s dependency `cook` (plus a ~120 s re-export of its ~490 MB
+# layer to the gha cache): 4 of the 10 cook misses in 20 `main` pushes
+# (2026-11-12..14) changed no dependency, only added test files. Unit tests
+# live under `src/` and stay in the context.
+tests/
