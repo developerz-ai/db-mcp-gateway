@@ -25,7 +25,6 @@ mod oauth;
 mod upstream;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::Router;
 use axum::middleware;
@@ -35,7 +34,7 @@ pub use app_state::{AppState, McpState, OAuthState};
 pub use bounds::MCP_TIMEOUT;
 pub use errors::TransportError;
 
-use crate::config::Config;
+use crate::config::{AdminConfig, Config};
 use bounds::Bounds;
 use limit::ConcurrencyLimiter;
 
@@ -127,16 +126,18 @@ pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError
     // `admin::router`) and shares the gated concurrency budget. Read from the
     // boot snapshot: a reload cannot mount, unmount or regroup the admin API.
     let boot_config = state.mcp.config.load_full();
-    if let Some(admin_cfg) = boot_config.admin.as_ref()
-        && admin_cfg.enabled
+    if let AdminConfig::Enabled {
+        group,
+        session_max_age,
+    } = &boot_config.admin
     {
         let admin = admin::router(admin::AdminDeps {
-            group: admin_cfg.group.clone(),
+            group: group.clone(),
             repo: state.mcp.permissions_repo.clone(),
             state_db: state.mcp.state_db.clone(),
             cache: state.mcp.permissions_cache.clone(),
             sessions: state.oauth.auth.sessions.clone(),
-            max_session_age: admin_cfg.session_max_age_secs.map(Duration::from_secs),
+            max_session_age: *session_max_age,
             known_servers: boot_config
                 .servers
                 .iter()

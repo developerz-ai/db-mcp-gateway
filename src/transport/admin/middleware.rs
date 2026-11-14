@@ -46,6 +46,7 @@ use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 
 use crate::auth::Identity;
+use crate::config::AdminGroup;
 use crate::transport::request_id::GatewayRequestId;
 
 use super::error::AdminError;
@@ -68,7 +69,7 @@ pub struct AdminActor {
 /// middleware needs to gate access.
 #[derive(Clone)]
 pub struct AdminMiddlewareState {
-    pub admin_group: String,
+    pub admin_group: AdminGroup,
     /// When set, sessions older than this are rejected with `session_too_old`
     /// (403) even if the group check would pass. Forces re-login so that IdP
     /// group changes propagate within this bound. `None` = no age cap (rely on
@@ -115,7 +116,11 @@ pub async fn require_admin_group(
             .into_response();
     };
 
-    if !identity.groups.iter().any(|g| g == &state.admin_group) {
+    if !identity
+        .groups
+        .iter()
+        .any(|g| g == state.admin_group.as_str())
+    {
         // Authenticated but not in the admin group: structured tracing carries
         // the user_sub + request_id for ops triage. We deliberately do not
         // upsert into `permissions_users` here — doing so would let any

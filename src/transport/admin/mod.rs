@@ -35,6 +35,7 @@ use sqlx::PgPool;
 
 use crate::auth::SessionStore;
 use crate::authz::PermissionsCache;
+use crate::config::AdminGroup;
 use crate::state::permissions::PermissionsRepo;
 
 use self::databases::DatabasesState;
@@ -46,7 +47,7 @@ use self::users::UsersState;
 #[derive(Debug, Clone)]
 pub struct AdminDeps {
     /// SSO group the caller must carry.
-    pub group: String,
+    pub group: AdminGroup,
     pub repo: Arc<dyn PermissionsRepo>,
     pub state_db: PgPool,
     /// A committed change drops the affected cached grant sets on this

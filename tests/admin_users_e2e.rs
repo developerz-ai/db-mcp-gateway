@@ -89,6 +89,10 @@ impl Harness {
         self.cleanup_subs.push(sub.into());
     }
 
+    /// Deletes only tracked subs. A pattern delete (`LIKE 'admin-e2e-%'`)
+    /// removed rows concurrently running tests still used, and queued behind
+    /// their row locks — stalling those tests' own admin writes past the
+    /// client timeout.
     async fn cleanup(&self) {
         for sub in &self.cleanup_subs {
             // Both the permissions row AND any audit rows referencing it.
@@ -104,10 +108,6 @@ impl Harness {
                 delete_permissions_audit(&self.pool, uid).await;
             }
             delete_permissions_user(&self.pool, sub).await;
-            // Also clean up the admin actor's row (created by middleware).
-            let _ = sqlx::query("DELETE FROM permissions_users WHERE user_sub LIKE 'admin-e2e-%'")
-                .execute(&self.pool)
-                .await;
         }
     }
 }
@@ -177,6 +177,7 @@ async fn latest_audit_for_target(
 async fn admin_can_create_user_then_audit_row_recorded() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    h.track(admin_sub.clone());
     let target_sub = format!("target-e2e-{}", Uuid::new_v4().simple());
     h.track(target_sub.clone());
 
@@ -222,6 +223,7 @@ async fn admin_can_create_user_then_audit_row_recorded() {
 async fn admin_repeat_create_logs_as_update() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    h.track(admin_sub.clone());
     let target_sub = format!("target-e2e-{}", Uuid::new_v4().simple());
     h.track(target_sub.clone());
 
@@ -356,6 +358,7 @@ async fn anonymous_gets_401() {
 async fn admin_patches_user_audit_carries_before_and_after() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    h.track(admin_sub.clone());
     let target_sub = format!("target-e2e-{}", Uuid::new_v4().simple());
     h.track(target_sub.clone());
 
@@ -415,6 +418,7 @@ async fn admin_patches_user_audit_carries_before_and_after() {
 async fn delete_soft_deletes_and_audits() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    h.track(admin_sub.clone());
     let target_sub = format!("target-e2e-{}", Uuid::new_v4().simple());
     h.track(target_sub.clone());
 
@@ -474,6 +478,7 @@ async fn delete_soft_deletes_and_audits() {
 async fn list_excludes_soft_deleted() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    h.track(admin_sub.clone());
     let alive_sub = format!("alive-e2e-{}", Uuid::new_v4().simple());
     let dead_sub = format!("dead-e2e-{}", Uuid::new_v4().simple());
     h.track(alive_sub.clone());
@@ -882,6 +887,7 @@ async fn latest_audit_action(pool: &PgPool, target_id: Uuid) -> Option<String> {
 async fn patch_invalidates_cached_authz_for_user() {
     let (mut h, cache, auth_cfg, sessions) = spawn_gateway_with_cache().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    h.track(admin_sub.clone());
     let target_sub = format!("target-e2e-cache-{}", Uuid::new_v4().simple());
     h.track(target_sub.clone());
 
@@ -1012,6 +1018,7 @@ async fn patch_invalidates_cached_authz_for_user() {
 async fn delete_invalidates_cached_authz_for_user() {
     let (mut h, cache, auth_cfg, sessions) = spawn_gateway_with_cache().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    h.track(admin_sub.clone());
     let target_sub = format!("target-e2e-cache-del-{}", Uuid::new_v4().simple());
     h.track(target_sub.clone());
 
@@ -1133,6 +1140,7 @@ async fn delete_invalidates_cached_authz_for_user() {
 async fn database_mutations_flush_all_cached_authz_for_all_users() {
     let (mut h, cache, auth_cfg, sessions) = spawn_gateway_with_cache().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    h.track(admin_sub.clone());
     let user_a_sub = format!("target-e2e-db-a-{}", Uuid::new_v4().simple());
     let user_b_sub = format!("target-e2e-db-b-{}", Uuid::new_v4().simple());
     h.track(user_a_sub.clone());
@@ -1444,6 +1452,7 @@ async fn create_rejects_service_subject() {
 async fn repeat_create_invalidates_cached_authz_for_user() {
     let (mut h, cache, auth_cfg, sessions) = spawn_gateway_with_cache().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    h.track(admin_sub.clone());
     let target_sub = format!("target-e2e-recreate-{}", Uuid::new_v4().simple());
     h.track(target_sub.clone());
     let jwt = mint_session(
@@ -1486,6 +1495,7 @@ async fn repeat_create_invalidates_cached_authz_for_user() {
 async fn delete_cascades_grant_revocation_with_audit_rows() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    h.track(admin_sub.clone());
     let target_sub = format!("target-e2e-cascade-{}", Uuid::new_v4().simple());
     h.track(target_sub.clone());
     let jwt = mint_session(

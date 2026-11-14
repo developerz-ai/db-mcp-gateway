@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap};
 use crate::config::schema::{Database, Server};
 use crate::config::secret::Password;
 
-use super::ConfigFile;
+use super::{AdminConfig, ConfigFile};
 
 impl ConfigFile {
     /// `(server, database)` pairs whose connection settings differ between
@@ -38,19 +38,14 @@ impl ConfigFile {
     /// are wired once at boot; a reload that changes them is refused whole
     /// rather than half-applied.
     pub fn boot_fixed_change(&self, new: &ConfigFile) -> Option<&'static str> {
-        let admin = |c: &ConfigFile| {
-            c.admin
-                .as_ref()
-                .filter(|a| a.enabled)
-                .map(|a| (a.group.clone(), a.session_max_age_secs))
-        };
         let driver = |c: &ConfigFile| c.permissions_store.as_ref().map(|p| p.driver);
         // A set: the admin API checks membership, so reordering `servers:`
         // is not a change.
         let admin_servers = |c: &ConfigFile| -> Option<BTreeSet<String>> {
-            admin(c).map(|_| c.servers.iter().map(|s| s.name.clone()).collect())
+            matches!(c.admin, AdminConfig::Enabled { .. })
+                .then(|| c.servers.iter().map(|s| s.name.clone()).collect())
         };
-        if admin(self) != admin(new) {
+        if self.admin != new.admin {
             Some("admin")
         } else if driver(self) != driver(new) {
             Some("permissions_store")

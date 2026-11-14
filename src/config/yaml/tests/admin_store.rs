@@ -1,6 +1,6 @@
 //! `admin:`, `permissions_store:`, `auth_database` and server-kind boot gates.
 
-use crate::config::yaml::{ConfigFile, ConfigFileError, PermissionsStoreDriver};
+use crate::config::yaml::{AdminConfig, ConfigFile, ConfigFileError, PermissionsStoreDriver};
 
 /// Spec 12 §"Admin API": when `admin.enabled` is true, `admin.group`
 /// must be non-empty — otherwise every authenticated caller would be an
@@ -60,7 +60,7 @@ fn admin_group_is_required_only_when_enabled() {
 fn accepts_omitted_admin_block() {
     let yaml = "servers: []\npermissions: []\n";
     let cfg = ConfigFile::from_yaml_str(yaml).expect("omitted admin block is valid");
-    assert!(cfg.admin.is_none());
+    assert_eq!(cfg.admin, AdminConfig::Disabled);
     assert!(cfg.permissions_store.is_none());
 }
 
