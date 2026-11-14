@@ -18,7 +18,10 @@ async fn fill(reg: &ClientRegistry, authorised: bool) {
         map.insert(
             format!("c{i}"),
             RegisteredClient {
-                redirect_uris: vec![URI.into()],
+                record: ClientRecord {
+                    redirect_uris: vec![URI.into()],
+                    client_name: None,
+                },
                 created_at,
                 expires_at: created_at + ttl,
             },
@@ -85,7 +88,10 @@ async fn gc_drops_only_expired_clients() {
     map.lock().await.insert(
         "stale".into(),
         RegisteredClient {
-            redirect_uris: vec![URI.into()],
+            record: ClientRecord {
+                redirect_uris: vec![URI.into()],
+                client_name: None,
+            },
             created_at: Utc::now() - ChronoDuration::hours(3),
             expires_at: Utc::now() - ChronoDuration::hours(2),
         },
@@ -116,7 +122,10 @@ async fn adopting_a_lapsed_unswept_client_revives_it() {
     map.lock().await.insert(
         "lapsed".into(),
         RegisteredClient {
-            redirect_uris: vec!["http://127.0.0.1:1/old".into()],
+            record: ClientRecord {
+                redirect_uris: vec!["http://127.0.0.1:1/old".into()],
+                client_name: None,
+            },
             created_at: Utc::now() - ChronoDuration::days(91),
             expires_at: Utc::now() - ChronoDuration::days(1),
         },
@@ -142,4 +151,30 @@ async fn re_registering_a_live_client_keeps_its_expiry() {
         .await
         .unwrap();
     assert_eq!(map.lock().await["c1"].expires_at, before);
+}
+
+#[tokio::test]
+async fn name_roundtrips_and_adoption_records_none() {
+    let reg = ClientRegistry::default();
+    let name = ClientName::parse("Claude").unwrap();
+    reg.register("named".into(), vec![URI.into()], name.clone())
+        .await
+        .unwrap();
+    let record = reg.lookup("named").await.expect("live");
+    assert_eq!(record.client_name, name);
+    reg.adopt("adopted".into(), URI.into()).await.unwrap();
+    assert_eq!(reg.lookup("adopted").await.unwrap().client_name, None);
+}
+
+#[test]
+fn unparseable_stored_name_reads_as_no_name() {
+    let row = |name: &str| db::ClientRow {
+        redirect_uris: sqlx::types::Json(vec![URI.into()]),
+        client_name: Some(name.into()),
+    };
+    assert_eq!(record_from_row(row("a\u{202E}b")).client_name, None);
+    assert_eq!(
+        record_from_row(row("App")).client_name,
+        ClientName::parse("App").unwrap()
+    );
 }

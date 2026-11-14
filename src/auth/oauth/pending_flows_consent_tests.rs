@@ -3,6 +3,7 @@ use super::*;
 fn bridge() -> OAuthBridge {
     OAuthBridge {
         client_id: "mcp-x".into(),
+        client_name: None,
         client_redirect_uri: "https://app.example.com/cb".into(),
         client_state: "s".into(),
         code_challenge: "c".into(),

@@ -16,7 +16,7 @@ use url::Url;
 use super::super::app_state::OAuthState;
 use super::bridge_login::issue_code;
 use super::helpers::{oauth_error, random_token, redirect_with_error};
-use crate::auth::oauth::{AuthFacade, GrantIdentity, OAuthBridge};
+use crate::auth::oauth::{AuthFacade, ClientName, GrantIdentity, OAuthBridge};
 
 /// Where the consent form posts. Mounted by `transport::router`.
 pub(in crate::transport) const CONSENT_PATH: &str = "/authorize/consent";
@@ -42,6 +42,7 @@ pub(super) async fn request_consent(
     let page = consent_page(&ConsentView {
         email: &identity.email,
         client_id: &bridge.client_id,
+        client_name: bridge.client_name.as_ref().map(ClientName::as_str),
         redirect_uri: &bridge.client_redirect_uri,
         redirect_host: &target.host,
         consent_id: &consent_id,
@@ -115,6 +116,7 @@ impl RedirectTarget {
 struct ConsentView<'a> {
     email: &'a str,
     client_id: &'a str,
+    client_name: Option<&'a str>,
     redirect_uri: &'a str,
     redirect_host: &'a str,
     consent_id: &'a str,
@@ -124,6 +126,9 @@ struct ConsentView<'a> {
 fn consent_page(view: &ConsentView<'_>) -> String {
     let email = escape_html(view.email);
     let client_id = escape_html(view.client_id);
+    let client_name = view
+        .client_name
+        .map_or_else(|| "(no name)".to_owned(), escape_html);
     let redirect_uri = escape_html(view.redirect_uri);
     let host = escape_html(view.redirect_host);
     let consent_id = escape_html(view.consent_id);
@@ -134,6 +139,7 @@ fn consent_page(view: &ConsentView<'_>) -> String {
 <title>Authorize application</title><style>\
 body{{font-family:system-ui,sans-serif;max-width:34rem;margin:4rem auto;padding:0 1rem;line-height:1.5}}\
 .host{{font-size:1.4rem;font-weight:700;word-break:break-all}}\
+.unverified{{color:#555;font-size:.9rem}}\
 code{{word-break:break-all}}button{{font-size:1rem;padding:.5rem 1.25rem;margin-right:.75rem}}\
 </style></head><body>\
 <h1>Authorize database access?</h1>\
@@ -143,6 +149,8 @@ be sent to:</p>\
 <p class=\"host\">{host}</p>\
 <p>Full redirect: <code>{redirect_uri}</code><br>Client ID: <code>{client_id}</code> \
 (self-registered; the gateway has not verified who operates it).</p>\
+<p class=\"unverified\">Name the application gave itself (unverified, anyone can \
+claim any name): <span class=\"client-name\">{client_name}</span></p>\
 <p>Only approve if you started this sign-in and recognise <strong>{host}</strong>. \
 Otherwise deny.</p>\
 <form method=\"post\" action=\"{CONSENT_PATH}\">\
@@ -223,6 +231,7 @@ mod tests {
         let page = consent_page(&ConsentView {
             email: "<script>e</script>",
             client_id: "\"><img>",
+            client_name: Some("<script>alert(1)</script>"),
             redirect_uri: "https://evil.example/cb?<x>",
             redirect_host: "evil.example",
             consent_id: "id",
@@ -231,7 +240,28 @@ mod tests {
         assert!(!page.contains("<script>e"));
         assert!(!page.contains("\"><img>"));
         assert!(!page.contains("?<x>"));
+        assert!(!page.contains("<script>alert"));
+        assert!(
+            page.contains("class=\"client-name\">&lt;script&gt;alert(1)&lt;/script&gt;</span>")
+        );
         assert!(page.contains("class=\"host\">evil.example<"));
+    }
+
+    #[test]
+    fn missing_name_reads_as_no_name_and_host_stays_prominent() {
+        let page = consent_page(&ConsentView {
+            email: "u@example.com",
+            client_id: "mcp-1",
+            client_name: None,
+            redirect_uri: "https://app.example/cb",
+            redirect_host: "app.example",
+            consent_id: "id",
+            csrf: "tok",
+        });
+        assert!(page.contains("class=\"client-name\">(no name)</span>"));
+        let host = page.find("class=\"host\"").expect("host line");
+        let name = page.find("class=\"client-name\"").expect("name line");
+        assert!(host < name, "redirect host renders before the claimed name");
     }
 
     #[test]

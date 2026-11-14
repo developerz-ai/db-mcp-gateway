@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
-use super::GrantIdentity;
+use super::{ClientName, GrantIdentity};
 use crate::auth::pkce::ct_eq;
 
 /// Size cap on the pending flows map. A login produces one pending flow;
@@ -37,6 +37,8 @@ pub struct OAuthBridge {
     /// The client_id from `/register` — carried through so `/token` can verify
     /// the presenter matches the registrant.
     pub client_id: String,
+    /// The registrant's self-asserted name, for the consent page only.
+    pub client_name: Option<ClientName>,
     /// The MCP client's registered redirect URI (loopback or https).
     pub client_redirect_uri: String,
     /// The MCP client's `state` — echoed back verbatim on the final redirect.

@@ -21,7 +21,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 
-use super::StoreError;
+use super::{ClientName, StoreError};
 use crate::state::oauth as db;
 
 /// Lifetime of a client that has completed a successful `/authorize`, sliding
@@ -86,9 +86,19 @@ impl Default for ClientRegistry {
     }
 }
 
+/// A live registration: what `/authorize` matches against and what the
+/// consent page shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientRecord {
+    pub redirect_uris: Vec<String>,
+    /// Self-asserted at `/register`, never verified. `None` for an adopted
+    /// client or one registered without a name.
+    pub client_name: Option<ClientName>,
+}
+
 #[derive(Debug, Clone)]
 struct RegisteredClient {
-    redirect_uris: Vec<String>,
+    record: ClientRecord,
     created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
 }
@@ -108,23 +118,34 @@ impl ClientRegistry {
         }
     }
 
-    /// Record a client's redirect URIs (validated by the caller) with the
-    /// short never-authorised TTL. At the cap, evicts the oldest expired or
-    /// never-authorised client first; `StoreFull` only when every row belongs
-    /// to an authorised client. A DB error is `Backend` — fail closed, the
-    /// client retries. Re-registering an existing `client_id` replaces its URIs
-    /// (a lapsed, unswept one restarts as new) and needs the same room as a new
-    /// one.
+    /// [`Self::register`] without a name — the shape of an adopted client.
     pub async fn insert(
         &self,
         client_id: String,
         redirect_uris: Vec<String>,
+    ) -> Result<(), StoreError> {
+        self.register(client_id, redirect_uris, None).await
+    }
+
+    /// Record a client's redirect URIs and name (validated by the caller) with
+    /// the short never-authorised TTL. At the cap, evicts the oldest expired or
+    /// never-authorised client first; `StoreFull` only when every row belongs
+    /// to an authorised client. A DB error is `Backend` — fail closed, the
+    /// client retries. Re-registering an existing `client_id` replaces its URIs
+    /// and name (a lapsed, unswept one restarts as new) and needs the same room
+    /// as a new one.
+    pub async fn register(
+        &self,
+        client_id: String,
+        redirect_uris: Vec<String>,
+        client_name: Option<ClientName>,
     ) -> Result<(), StoreError> {
         let stored = match &self.backend {
             Backend::Db(pool) => db::insert_client_capped(
                 pool,
                 &client_id,
                 &redirect_uris,
+                client_name.as_ref().map(ClientName::as_str),
                 CLIENT_CAP,
                 UNAUTHORISED_CLIENT_TTL,
             )
@@ -135,7 +156,13 @@ impl ClientRegistry {
                 tracing::warn!("client registration insert failed (state DB)");
                 StoreError::Backend
             })?,
-            Backend::Memory(map) => insert_mem(&mut *map.lock().await, client_id, redirect_uris),
+            Backend::Memory(map) => {
+                let record = ClientRecord {
+                    redirect_uris,
+                    client_name,
+                };
+                insert_mem(&mut *map.lock().await, client_id, record)
+            }
         };
         if stored {
             Ok(())
@@ -155,25 +182,31 @@ impl ClientRegistry {
         }
     }
 
-    /// The registered redirect URIs for `client_id`, if the registration is
-    /// still live; `None` means "unknown client". A DB error also yields `None`
-    /// (fail closed). A hit slides `expires_at` to a full [`CLIENT_TTL`] — the
-    /// first one promotes a never-authorised client out of eviction range.
+    /// [`Self::lookup`]'s redirect URIs alone.
     pub async fn redirect_uris(&self, client_id: &str) -> Option<Vec<String>> {
+        self.lookup(client_id).await.map(|c| c.redirect_uris)
+    }
+
+    /// The registration for `client_id`, if still live; `None` means "unknown
+    /// client". A DB error also yields `None` (fail closed). A hit slides
+    /// `expires_at` to a full [`CLIENT_TTL`] — the first one promotes a
+    /// never-authorised client out of eviction range.
+    pub async fn lookup(&self, client_id: &str) -> Option<ClientRecord> {
         match &self.backend {
-            Backend::Db(pool) => db::touch_client(pool, client_id, CLIENT_TTL)
-                .await
-                .unwrap_or_else(|_| {
+            Backend::Db(pool) => match db::touch_client(pool, client_id, CLIENT_TTL).await {
+                Ok(row) => row.map(record_from_row),
+                Err(_) => {
                     // No error source — see the DSN-leak note on `insert`.
                     tracing::warn!("client registration lookup failed (state DB)");
                     None
-                }),
+                }
+            },
             Backend::Memory(map) => {
                 let mut map = map.lock().await;
                 let now = Utc::now();
                 let client = map.get_mut(client_id).filter(|c| c.expires_at > now)?;
                 client.expires_at = now + CLIENT_TTL;
-                Some(client.redirect_uris.clone())
+                Some(client.record.clone())
             }
         }
     }
@@ -198,12 +231,25 @@ impl ClientRegistry {
     }
 }
 
+/// A stored name that no longer parses (written outside `/register`) is shown
+/// as no name rather than failing the lookup.
+fn record_from_row(row: db::ClientRow) -> ClientRecord {
+    let client_name = row
+        .client_name
+        .as_deref()
+        .and_then(|raw| ClientName::parse(raw).ok().flatten());
+    ClientRecord {
+        redirect_uris: row.redirect_uris.0,
+        client_name,
+    }
+}
+
 /// Memory twin of `db::insert_client_capped`. `false` when the map is full of
 /// authorised clients.
 fn insert_mem(
     map: &mut HashMap<String, RegisteredClient>,
     client_id: String,
-    redirect_uris: Vec<String>,
+    record: ClientRecord,
 ) -> bool {
     let now = Utc::now();
     if map.len() >= CLIENT_CAP as usize {
@@ -218,13 +264,13 @@ fn insert_mem(
         map.remove(&oldest);
     }
     match map.get_mut(&client_id) {
-        Some(existing) if existing.expires_at > now => existing.redirect_uris = redirect_uris,
+        Some(existing) if existing.expires_at > now => existing.record = record,
         // Absent, or lapsed but not yet GC'd: (re)start as never-authorised.
         _ => {
             map.insert(
                 client_id,
                 RegisteredClient {
-                    redirect_uris,
+                    record,
                     created_at: now,
                     expires_at: now + UNAUTHORISED_CLIENT_TTL,
                 },
