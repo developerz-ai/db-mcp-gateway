@@ -1,6 +1,7 @@
-//! Shared integration-test harness. Every `tests/*.rs` binary declares
-//! `mod common;` and boots gateways, state pools and target fixtures from
-//! here, so an `AppState` / `AuthConfig` field change lands in one place.
+//! Shared integration-test harness. Every grouped test binary
+//! (`tests/<group>/main.rs`) declares `#[path = "../common/mod.rs"] mod
+//! common;` and boots gateways, state pools and target fixtures from here,
+//! so an `AppState` / `AuthConfig` field change lands in one place.
 //!
 //! Not security-sensitive: test-only code, never on a production path.
 

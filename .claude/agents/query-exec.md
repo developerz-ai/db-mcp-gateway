@@ -30,4 +30,4 @@ Mongo targets stay read-only: `src/exec/mongo/rejector.rs` refuses write command
 A dropped request future must cancel the backend and leave an audit row with `outcome: cancelled`.
 Render a value JSON cannot hold as `{"unsupported_type": "<pg type>"}`; never return a fabricated `null`.
 Keep resolved credentials in `secrecy::SecretString` until the driver boundary; no DSN, role or password in a log line or an error.
-Test the exec path against a real database (`tests/exec_run_query.rs`, `tests/cancellation_real_db.rs`) — the target DB is never mocked.
+Test the exec path against a real database (`tests/it_db/exec_run_query.rs`, `tests/it_db/cancellation_real_db.rs`) — the target DB is never mocked.

@@ -1,5 +1,5 @@
 //! Pure-logic tests — full real-DB coverage lives in
-//! `tests/get_query_history_real_db.rs`.
+//! `tests/it_db/get_query_history_real_db.rs`.
 
 use super::*;
 

@@ -43,7 +43,7 @@ Self-hosted MCP gateway. AI agents get audited, SSO-gated, read-only DB access. 
 | mongosh — target Mongo | `bin/dev mongosh` |
 | mysql — permissions store | `bin/dev mysql` |
 | Full test (unit + integration; cargo-nextest when installed, else `cargo test`) | `bin/test` |
-| Single test by pattern | `bin/test --test <name>` or `cargo test <pattern>` |
+| Single test by pattern | `bin/test --test <binary> <module>::` (e.g. `bin/test --test it_db run_query_e2e::`) or `cargo test <pattern>` |
 | Format | `bin/fmt` |
 | Lint (fmt-check + clippy -D warnings) | `bin/lint` |
 | Reproduce CI locally / one-command check (2 build jobs by default; `CARGO_BUILD_JOBS=$(nproc) bin/check` on a dedicated box) | `bin/ci` / `bin/check` |
@@ -104,6 +104,7 @@ The bar: idiomatic, boring, readable Rust. No spaghetti, no premature abstractio
 | Unit + property | Pure logic (authz evaluation, config validation, SQL rewriting), no real DB. Authz constraint-merge (`proptest`): most restrictive value wins, always. |
 | Integration | Gateway booted against real Postgres (CI service container). Real MCP requests over HTTP. |
 | Audit | Every integration test that hits a tool asserts an audit row exists. Tool failed authz → audit row with `outcome: forbidden`. |
+| Isolation | Every `tests/it_db/` test declares `#[serial_test::serial(world)]` (table-wide side effect: reaper/pruner/GC sweep, cap seeding, global counts) or `#[serial_test::parallel(world)]` — the suites share one process under `cargo test`. Enforced by `it_offline::isolation_guard`. |
 
 ## CI
 
@@ -148,7 +149,7 @@ src/
   audit/            # writer, pruner, archive, sinks
   state/            # state DB queries, permissions store (pg.rs, permissions/mysql/); no central errors.rs — each layer owns its typed error
 migrations/         # state-DB schema (sqlx, Postgres); migrations-mysql/ = MySQL permissions store
-tests/              # integration tests — real DBs, never a mocked target DB
+tests/              # integration tests, one binary per group dir: it_db/ (real DBs, never a mocked target DB), it_offline/, it_global/ (process-global installs); public_tree.rs, brief_rows.rs standalone
 benchmarks/         # load harness (feature-gated, never shipped)
 config/             # example.yaml (commented), permissions.yml (deployable)
 docs/               # internal notes (security QA)

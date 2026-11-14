@@ -115,7 +115,7 @@ mod tests {
     use super::*;
 
     // Structural smoke: `run_once` is exposed and takes the expected shape.
-    // The real-DB behaviour is covered by `tests/audit_pruner_real_db.rs`.
+    // The real-DB behaviour is covered by `tests/it_db/audit_pruner_real_db.rs`.
     #[allow(dead_code)]
     fn _signature_check(pool: &PgPool) {
         // Compiles iff the signature stays stable.

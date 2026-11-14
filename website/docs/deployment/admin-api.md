@@ -115,7 +115,7 @@ Response: the full `PermissionsUser` row. Upsert is idempotent on the *live* row
 
 This row carries only the routing key — **no DSN, no role, no password**. CLAUDE.md non-negotiable #1: connection details stay in YAML / secret backends, never in the admin API.
 
-DSN field names (`connection_string`, `dsn`, `password`, `role`) are rejected with HTTP 400 at parse time via `#[serde(deny_unknown_fields)]`. Pinned by `tests/admin_databases_e2e.rs`.
+DSN field names (`connection_string`, `dsn`, `password`, `role`) are rejected with HTTP 400 at parse time via `#[serde(deny_unknown_fields)]`. Pinned by `tests/it_db/admin_databases_e2e.rs`.
 
 `GET /admin/v1/databases` — list live databases.
 
@@ -164,7 +164,7 @@ Foreign-key violations (`user_id` or `database_id` not in the tables) and CHECK 
 
 `PATCH /admin/v1/grants/:id` — partial update of `action` / `constraints`. **The target is the grant's identity and is NOT mutable** — re-target via DELETE + POST. Bodies that carry `database_id` / `server` / `db_name_wildcard` are rejected at parse time.
 
-`DELETE /admin/v1/grants/:id` — revoke. Sets `revoked_at`; the cache invalidates for the affected user post-commit (`tests/admin_grants_e2e.rs::live_grant_change_invalidates_cache_for_user`).
+`DELETE /admin/v1/grants/:id` — revoke. Sets `revoked_at`; the cache invalidates for the affected user post-commit (`tests/it_db/admin_grants_e2e.rs::live_grant_change_invalidates_cache_for_user`).
 
 ## End-to-end: first user + first grant
 

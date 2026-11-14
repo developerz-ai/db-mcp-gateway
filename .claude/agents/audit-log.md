@@ -30,5 +30,5 @@ Never let a row carry a DSN, password, role name or connection string; rows are 
 Add schema changes as a new numbered file in `migrations/`; never edit an applied migration.
 Keep the retention window driven by `AUDIT_RETENTION_DAYS` and the pruner in `src/audit/pruner.rs`.
 Route stream sinks (`stdout`, `syslog`) through `src/audit/stream.rs`; `archive` and `otlp` are not valid config yet and the parser rejects them.
-Assert the row in every integration test that calls a tool (`tests/*.rs`); the forbidden path must produce `outcome: forbidden`.
+Assert the row in every integration test that calls a tool (`tests/it_db/*.rs` (+ `tests/it_offline/`, `tests/it_global/`)); the forbidden path must produce `outcome: forbidden`.
 Flag every change to the audit write path for the `security review required` label.

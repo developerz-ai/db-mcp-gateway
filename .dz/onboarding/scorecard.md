@@ -57,7 +57,7 @@
 
 ## `smoke_test` — ok
 
-- tests/run_query_e2e.rs in the repository
+- tests/it_db/run_query_e2e.rs in the repository
 - run by ./bin/check exited 0 at head (47.2s)
 
 ## `env_example` — ok
