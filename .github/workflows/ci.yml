@@ -131,7 +131,7 @@ jobs:
           fi
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true # TEMP: seed PR cache to measure a warm run; reverted next commit
       - run: cargo clippy --profile ci --all-targets --all-features -- -D warnings
       # --all-targets enables cfg(test), which makes imports used only by
       # #[cfg(any(test, debug_assertions))] helpers look live. The release
@@ -179,7 +179,7 @@ jobs:
           fi
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true # TEMP: seed PR cache to measure a warm run; reverted next commit
       - name: install cargo-nextest
         uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
         with:
@@ -309,7 +309,7 @@ jobs:
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           key: public-tree
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true # TEMP: seed PR cache to measure a warm run; reverted next commit
       - run: cargo test --profile ci --test public_tree
 
   # Publish a multi-arch image on push to main, tagged with the short commit
