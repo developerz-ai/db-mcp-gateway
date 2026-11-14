@@ -193,16 +193,18 @@ async fn compute_outcome(
         outcome.write = Some(WriteEffect {
             rows_affected: rows_affected.map(|rows| i64::try_from(rows).unwrap_or(i64::MAX)),
         });
-        note_indeterminate_write(&mut outcome);
+        note_indeterminate_write(&mut outcome, args.dry_run);
     }
     outcome
 }
 
 /// A write cut off by the deadline or `cancel_query` may have been cut off
 /// mid-commit: say so in the client message and the audit row instead of
-/// implying nothing happened.
-fn note_indeterminate_write(outcome: &mut Outcome) {
-    if !matches!(outcome.code, OutcomeCode::Timeout | OutcomeCode::Cancelled) {
+/// implying nothing happened. A `dry_run` write is exempt — it rolls the
+/// transaction back and cannot commit, so its outcome is never
+/// indeterminate.
+fn note_indeterminate_write(outcome: &mut Outcome, dry_run: bool) {
+    if dry_run || !matches!(outcome.code, OutcomeCode::Timeout | OutcomeCode::Cancelled) {
         return;
     }
     if let Some(message) = outcome.error_message.as_mut() {
@@ -262,7 +264,18 @@ mod tests {
     #[test]
     fn a_timed_out_write_says_it_may_have_committed() {
         let mut outcome = error_outcome(OutcomeCode::Timeout, ERROR_MESSAGES.timeout);
-        note_indeterminate_write(&mut outcome);
+        note_indeterminate_write(&mut outcome, false);
+        let message = outcome.error_message.unwrap_or_default();
+        assert!(message.contains(WRITE_MAY_HAVE_COMMITTED), "{message}");
+    }
+
+    #[test]
+    fn a_cancelled_write_says_it_may_have_committed() {
+        let mut outcome = error_outcome(
+            OutcomeCode::Cancelled,
+            "query was cancelled by cancel_query",
+        );
+        note_indeterminate_write(&mut outcome, false);
         let message = outcome.error_message.unwrap_or_default();
         assert!(message.contains(WRITE_MAY_HAVE_COMMITTED), "{message}");
     }
@@ -270,10 +283,22 @@ mod tests {
     #[test]
     fn a_rejected_write_is_not_called_indeterminate() {
         let mut outcome = error_outcome(OutcomeCode::SyntaxError, ERROR_MESSAGES.sql_rejected);
-        note_indeterminate_write(&mut outcome);
+        note_indeterminate_write(&mut outcome, false);
         assert_eq!(
             outcome.error_message.as_deref(),
             Some(ERROR_MESSAGES.sql_rejected)
+        );
+    }
+
+    #[test]
+    fn a_dry_run_write_is_never_called_indeterminate() {
+        // A dry_run rolls the transaction back (exec/pg/run.rs), so even a
+        // cut-off one cannot have committed anything.
+        let mut outcome = error_outcome(OutcomeCode::Timeout, ERROR_MESSAGES.timeout);
+        note_indeterminate_write(&mut outcome, true);
+        assert_eq!(
+            outcome.error_message.as_deref(),
+            Some(ERROR_MESSAGES.timeout)
         );
     }
 }

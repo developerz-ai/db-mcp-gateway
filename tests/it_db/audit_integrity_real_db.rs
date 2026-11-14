@@ -1,6 +1,7 @@
 //! Real-DB coverage for the audit-integrity sweep (#314 slice D): the
-//! retention pruner's single cutoff, the reaper's resumable cursor, and the
-//! `cancelled` row of a write dropped mid-work.
+//! retention pruner's single cutoff, the reaper's resumable cursor and its
+//! bounded batches at volume, and the `cancelled` row of a write dropped
+//! mid-work.
 //!
 //! Every test scopes its rows by a fresh `user_sub` and backdates them far
 //! enough that rows of concurrently running tests are never in play.
@@ -163,6 +164,80 @@ async fn reaper_cursor_resumes_without_rescanning_or_skipping() {
         .expect("fresh-cursor sweep runs");
     assert_eq!(calls_for_request(&p, &behind).await[0].0, "abandoned");
     assert_eq!(calls_for_request(&p, &first).await.len(), 1, "never twice");
+
+    delete_audit_calls(&p, &user).await;
+}
+
+/// Volume past one batch: `REAP_BATCH_ROWS` is 10,000, so 10,003 aged intents
+/// force a second batch inside the SAME `run_once` sweep. The sweep stays
+/// bounded and resumable, yet still records every abandon — and a call that
+/// did complete is never given an `abandoned` row on the way past.
+#[tokio::test]
+#[serial_test::serial(world)]
+async fn reaper_records_abandons_across_batch_boundaries() {
+    let p = state_pool().await;
+    let user = format!("integrity-batch-{}", Uuid::new_v4().simple());
+    let token = Uuid::new_v4().simple().to_string();
+    let grace = Duration::from_secs(3600);
+    const SEED: i64 = 10_003;
+
+    // One statement: SEED write intents two hours old — past the grace, one
+    // more than a single batch examines. Deterministic request_ids let the
+    // assertions spot-check the batch boundaries below.
+    let seeded_request_id = |g: i64| format!("reap-boundary-{token}-{g}");
+    sqlx::query(
+        "INSERT INTO audit_call_intents \
+         (request_id, occurred_at, user_sub, user_email, tool, server_name, database_name, access) \
+         SELECT 'reap-boundary-' || $2 || '-' || g, now() - interval '2 hours', $1, \
+                'i@example.com', 'run_query', 'prod', 'app', 'write' \
+         FROM generate_series(1, $3) AS g",
+    )
+    .bind(&user)
+    .bind(&token)
+    .bind(SEED)
+    .execute(&p)
+    .await
+    .expect("seed aged intents");
+
+    // Two calls that DID record their outcome before aging out.
+    let done_a = backdated_call(&p, &user, 2.0 * 3600.0, Some(0.5)).await;
+    let done_b = backdated_call(&p, &user, 2.0 * 3600.0, Some(0.5)).await;
+
+    let reaped = reaper::run_once(&p, grace, &mut ReapCursor::default())
+        .await
+        .expect("bounded sweep runs")
+        .expect("a lone replica holds the reaper lock and sweeps");
+    assert!(
+        reaped >= u64::try_from(SEED).expect("10,003 fits u64"),
+        "one sweep settled both batches: {reaped}"
+    );
+
+    let abandoned: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_calls \
+         WHERE user_sub = $1 AND outcome = 'abandoned'",
+    )
+    .bind(&user)
+    .fetch_one(&p)
+    .await
+    .expect("abandoned count");
+    assert_eq!(
+        abandoned, SEED,
+        "{abandoned} abandoned rows for {user}, want exactly one per intent"
+    );
+
+    // The batch boundaries: first row, the 10,000 cap, the one past it —
+    // each seeded intent carries exactly one `abandoned` row, never two.
+    for g in [1, 10_000, SEED] {
+        let rows = calls_for_request(&p, &seeded_request_id(g)).await;
+        assert_eq!(rows.len(), 1, "seeded intent {g}: {rows:?}");
+        assert_eq!(rows[0].0, "abandoned", "seeded intent {g}: {rows:?}");
+    }
+
+    for id in [&done_a, &done_b] {
+        let rows = calls_for_request(&p, id).await;
+        assert_eq!(rows.len(), 1, "completed pair keeps its row: {rows:?}");
+        assert_eq!(rows[0].0, "success", "no abandoned row invented: {rows:?}");
+    }
 
     delete_audit_calls(&p, &user).await;
 }
