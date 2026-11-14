@@ -73,6 +73,17 @@ async fn intent_exists(pool: &PgPool, request_id: &str) -> bool {
         .expect("intent lookup")
 }
 
+/// `abandoned` `audit_calls` rows the reaper has written for `user_sub`.
+async fn abandoned_rows(pool: &PgPool, user_sub: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM audit_calls WHERE user_sub = $1 AND outcome = 'abandoned'",
+    )
+    .bind(user_sub)
+    .fetch_one(pool)
+    .await
+    .expect("abandoned count query runs")
+}
+
 /// A pair straddling the cutoff by milliseconds: the intent just inside the
 /// TTL, its completion later still. Both tables are pruned against ONE
 /// cutoff, so the surviving intent keeps its completion and a reaper sweep
@@ -163,6 +174,66 @@ async fn reaper_cursor_resumes_without_rescanning_or_skipping() {
         .expect("fresh-cursor sweep runs");
     assert_eq!(calls_for_request(&p, &behind).await[0].0, "abandoned");
     assert_eq!(calls_for_request(&p, &first).await.len(), 1, "never twice");
+
+    delete_audit_calls(&p, &user).await;
+}
+
+/// A backlog larger than one reaper batch drains in one sweep: the sweep
+/// keeps taking batches from the committed cursor until the aged intents run
+/// out. The seed is one bulk INSERT whose rows all share a single
+/// `occurred_at`, so the first batch ends mid-timestamp-group and the next
+/// one must resume strictly past the last examined `(occurred_at,
+/// request_id)`, not merely at a newer timestamp.
+#[tokio::test]
+#[serial_test::serial(world)]
+async fn reaper_drains_a_backlog_larger_than_one_batch() {
+    let p = state_pool().await;
+    let user = format!("integrity-reap-bulk-{}", Uuid::new_v4().simple());
+    // REAP_BATCH_ROWS is a private 10_000 const in src/audit/reaper.rs —
+    // hardcode the batch size here and seed a backlog just past one batch.
+    const BATCH_ROWS: i64 = 10_000;
+    const SEEDED: i64 = BATCH_ROWS + 5;
+
+    // Two hours back: comfortably older than the sweep's one-hour grace.
+    sqlx::query(
+        "INSERT INTO audit_call_intents \
+         (request_id, occurred_at, user_sub, user_email, tool, server_name, database_name, access) \
+         SELECT gen_random_uuid()::text, now() - make_interval(secs => 7200), \
+                $1, 'i@example.com', 'run_query', 'prod', 'app', 'read' \
+         FROM generate_series(1, $2)",
+    )
+    .bind(&user)
+    .bind(SEEDED)
+    .execute(&p)
+    .await
+    .expect("seed the backlog in one statement");
+
+    let mut cursor = ReapCursor::default();
+    let grace = Duration::from_secs(3600);
+    let reaped = reaper::run_once(&p, grace, &mut cursor)
+        .await
+        .expect("sweep runs");
+    // Global count: aged intents of concurrently running tests may be swept
+    // with ours, so the bound is `>=`; ours is asserted exactly below.
+    assert!(reaped.is_some_and(|n| n >= SEEDED as u64), "{reaped:?}");
+    assert_ne!(cursor, ReapCursor::default(), "cursor advanced");
+    assert_eq!(
+        abandoned_rows(&p, &user).await,
+        SEEDED,
+        "every seeded intent reaped exactly once"
+    );
+
+    // A second sweep from the same cursor settles nothing of ours: the
+    // cursor is past the backlog, and the batch's NOT EXISTS guard would
+    // block a duplicate row even if an intent were rescanned.
+    reaper::run_once(&p, grace, &mut cursor)
+        .await
+        .expect("second sweep runs");
+    assert_eq!(
+        abandoned_rows(&p, &user).await,
+        SEEDED,
+        "a second sweep never reaps twice"
+    );
 
     delete_audit_calls(&p, &user).await;
 }
