@@ -26,6 +26,61 @@ env:
   DOCR_IMAGE_NAME: developerz-ai/db-mcp-gateway
 
 jobs:
+  # Gate every publish on two checks, before an hour of builds: the tag must
+  # name the version Cargo.toml (and so `--version`) reports, and the moving
+  # tags may only move forward. A backport `v1.6.1` pushed after `v2.0.3` still
+  # gets its own `1.6.1`, `1.6` and `1` tags, but must not roll `:latest` back.
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      latest: ${{ steps.moving.outputs.latest }}
+      major: ${{ steps.moving.outputs.major }}
+      minor: ${{ steps.moving.outputs.minor }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history for the complete tag list the moving-tag check ranks.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: tag matches Cargo.toml version
+        run: |
+          set -euo pipefail
+          cargo_version=$(sed -n '/^\[package\]/,/^\[/s/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml)
+          if [ "${GITHUB_REF_NAME#v}" != "$cargo_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version '$cargo_version'"
+            exit 1
+          fi
+      - name: decide which moving tags this release may move
+        id: moving
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          releases=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+          # true when this tag is the highest release whose version starts
+          # with the (regex-escaped) prefix; empty prefix = across all releases.
+          newest() {
+            local top
+            top=$(printf '%s\n' "$releases" | grep -E "^v$1" | sort -V | tail -n1)
+            [ "$top" = "$GITHUB_REF_NAME" ] && echo true || echo false
+          }
+          latest=false major=false minor=false
+          # Prereleases and other non-X.Y.Z tags never move a floating tag.
+          if [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            minor_prefix="${version%.*}"
+            latest=$(newest "")
+            major=$(newest "${version%%.*}\.")
+            minor=$(newest "${minor_prefix//./\\.}\.")
+          fi
+          echo "latest=$latest major=$major minor=$minor"
+          {
+            echo "latest=$latest"
+            echo "major=$major"
+            echo "minor=$minor"
+          } >> "$GITHUB_OUTPUT"
+
   # Native per-arch build (amd64 + arm64), each pushed at the per-arch tag,
   # then merged into one multi-arch manifest list under the semver + :latest
   # tags. Native arm64 runners replace the single-runner QEMU build that timed
@@ -43,6 +98,7 @@ jobs:
   # imagetools stitch can fetch deterministically — it survives both
   # registries' round-tripping semantics.
   build:
+    needs: [preflight]
     runs-on: ${{ matrix.runner }}
     # A release whose Cargo.lock changed busts the cached cargo layer and forces
     # a cold full recompile, which overran the old 30-min cap on arm64 (v1.2.1).
@@ -124,7 +180,7 @@ jobs:
           push: true
 
   merge:
-    needs: [build]
+    needs: [preflight, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -154,12 +210,13 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # v1.4.5 → tags: 1.4.5, 1.4, 1, latest
+          # v1.4.5 → tags: 1.4.5, plus 1.4, 1 and latest where preflight says
+          # this is the newest release in that line.
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ needs.preflight.outputs.minor == 'true' }}
+            type=semver,pattern={{major}},enable=${{ needs.preflight.outputs.major == 'true' }}
+            type=raw,value=latest,enable=${{ needs.preflight.outputs.latest == 'true' }}
       - name: create ghcr manifest list & push
         run: |
           # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag
@@ -175,9 +232,9 @@ jobs:
           # mirror the GHCR tag set so the same :<semver> / :latest refs work in DOCR
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ needs.preflight.outputs.minor == 'true' }}
+            type=semver,pattern={{major}},enable=${{ needs.preflight.outputs.major == 'true' }}
+            type=raw,value=latest,enable=${{ needs.preflight.outputs.latest == 'true' }}
       - name: create docr manifest list & push
         env:
           # docker/metadata-action@v5 auto-sets only `DOCKER_METADATA_OUTPUT_JSON`
@@ -200,7 +257,7 @@ jobs:
   github_release:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [merge]
+    needs: [preflight, merge]
     permissions:
       contents: write
     steps:
@@ -220,6 +277,8 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           generate_release_notes: true
+          # A backport must not take the "Latest release" badge either.
+          make_latest: ${{ needs.preflight.outputs.latest }}
           body: |
             Container images for this release are dual-pushed:
 

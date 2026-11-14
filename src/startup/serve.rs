@@ -12,13 +12,17 @@ use db_mcp_gateway::transport::{self, AppState, tls};
 
 use super::{install_shutdown_signal, spawn_reload_on_sighup};
 
-/// How long in-flight requests get after SIGTERM. Covers the slowest request
-/// that can legitimately be running: state-pool acquire (5 s) + the target
-/// statement ceiling (30 s) + the synchronous audit write under its own
-/// statement timeout (10 s) + slack (10 s). The pod's
-/// `terminationGracePeriodSeconds` must exceed this plus the post-serve pool
-/// close — ≥ 75 s (website/docs/deployment).
-pub(crate) const DRAIN_WINDOW: Duration = Duration::from_secs(55);
+/// Headroom past the request ceiling so a request that runs right up to the
+/// router timeout still gets its response out before the connection is cut.
+const DRAIN_MARGIN: Duration = Duration::from_secs(5);
+
+/// How long in-flight requests get after SIGTERM: the `/mcp` request timeout
+/// (the slowest legitimate request) plus margin. A shorter window cuts a slow call mid-flight and
+/// loses its completion audit row. The pod's `terminationGracePeriodSeconds`
+/// must exceed this plus the detached-audit drain and the pool closes
+/// (website/docs/deployment).
+pub(crate) const DRAIN_WINDOW: Duration =
+    Duration::from_secs(transport::MCP_TIMEOUT.as_secs() + DRAIN_MARGIN.as_secs());
 
 pub(crate) async fn serve(
     config: &Config,
@@ -85,4 +89,21 @@ pub(crate) async fn serve(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use db_mcp_gateway::transport::MCP_TIMEOUT;
+
+    use super::DRAIN_WINDOW;
+
+    /// The drain must outlast the slowest `/mcp` request or SIGTERM loses its
+    /// outcome audit row.
+    #[test]
+    fn drain_window_outlasts_the_mcp_request_timeout() {
+        assert!(
+            DRAIN_WINDOW > MCP_TIMEOUT,
+            "{DRAIN_WINDOW:?} <= {MCP_TIMEOUT:?}"
+        );
+    }
 }

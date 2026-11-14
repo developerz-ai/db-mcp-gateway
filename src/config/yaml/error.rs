@@ -115,20 +115,59 @@ impl ConfigFileError {
 /// before it.
 ///
 /// serde puts the *input* token first and the *schema's* alternatives second —
-/// ``unknown variant `hunter2`, expected one of postgres, mysql`` — so keeping
-/// only the text from `expected one of` onward is safe by construction: past
-/// that marker, every word comes from our own enum and struct definitions.
+/// ``unknown variant `hunter2`, expected one of postgres, mysql`` — so only the
+/// text after the **last** `expected one of ` marker is kept: a token that
+/// itself contains the marker sits before the real one. A message with no
+/// schema list (``invalid type: string "… expected one of …", expected u16``)
+/// can still carry the marker inside the token, so the kept list must also
+/// parse as comma-separated identifiers, which a quoted scalar never does.
 ///
 /// The safety therefore does not rest on redacting the token. It rests on never
 /// copying the part of the string the token can appear in. A denylist would
 /// have to keep pace with the parser's phrasing; this cannot silently start
-/// leaking if that phrasing changes — it can only stop finding the marker and
+/// leaking if that phrasing changes — it can only stop finding the list and
 /// return `None`.
 fn schema_expectation(message: &str) -> Option<String> {
     const MARKER: &str = "expected one of ";
-    let tail = &message[message.find(MARKER)?..];
+    let tail = &message[message.rfind(MARKER)? + MARKER.len()..];
     // serde-saphyr appends its own " at line N, column M"; ours is already in
     // `location`, so drop the duplicate.
     let list = tail.split(" at line ").next().unwrap_or(tail);
-    Some(list.trim_end_matches([' ', ',']).to_string())
+    let list = list.trim_end_matches([' ', ',']);
+    list.split(", ")
+        .all(is_schema_identifier)
+        .then(|| format!("{MARKER}{list}"))
+}
+
+fn is_schema_identifier(item: &str) -> bool {
+    !item.is_empty()
+        && item
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::schema_expectation;
+
+    #[test]
+    fn keeps_the_schema_list_after_the_last_marker() {
+        let message = "unknown variant `x, expected one of hunter2`, expected one of \
+                       query_read, schema_read at line 3, column 5";
+        assert_eq!(
+            schema_expectation(message).as_deref(),
+            Some("expected one of query_read, schema_read")
+        );
+    }
+
+    #[test]
+    fn drops_a_marker_that_only_appears_inside_a_quoted_scalar() {
+        let message = "invalid type: string \"expected one of hunter2\", expected u16";
+        assert_eq!(schema_expectation(message), None);
+    }
+
+    #[test]
+    fn no_marker_means_no_expectation() {
+        assert_eq!(schema_expectation("missing field `host`"), None);
+    }
 }

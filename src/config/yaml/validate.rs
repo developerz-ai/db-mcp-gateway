@@ -66,6 +66,7 @@ fn validate_servers(servers: &[Server]) -> Result<HashSet<&str>, ConfigFileError
     let mut server_names: HashSet<&str> = HashSet::new();
     for server in servers {
         validate_server_values(server)?;
+        reject_wildcard_name("server", &server.name)?;
         if !server_names.insert(&server.name) {
             return Err(ConfigFileError::Invalid(format!(
                 "duplicate server name `{}`",
@@ -93,6 +94,7 @@ fn validate_servers(servers: &[Server]) -> Result<HashSet<&str>, ConfigFileError
 fn validate_databases(server: &Server) -> Result<(), ConfigFileError> {
     let mut db_names: HashSet<&str> = HashSet::new();
     for db in &server.databases {
+        reject_wildcard_name("database", &db.name)?;
         if !db_names.insert(&db.name) {
             return Err(ConfigFileError::Invalid(format!(
                 "duplicate database `{}` in server `{}`",
@@ -117,6 +119,17 @@ fn validate_databases(server: &Server) -> Result<(), ConfigFileError> {
                 db.name, server.name
             )));
         }
+    }
+    Ok(())
+}
+
+/// `*` is the grant wildcard; a server or database actually named `*` would
+/// make `server: "*"` ambiguous between "every server" and "that one".
+fn reject_wildcard_name(kind: &str, name: &str) -> Result<(), ConfigFileError> {
+    if name.trim() == "*" {
+        return Err(ConfigFileError::Invalid(format!(
+            "{kind} name `*` is reserved for the grant wildcard; rename the {kind}"
+        )));
     }
     Ok(())
 }

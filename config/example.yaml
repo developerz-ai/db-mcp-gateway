@@ -145,7 +145,9 @@ permissions:
 # the token value. Mint with `bin/mint-service-token <name>`; the value must
 # start with `dbmcp_svc_`. Boot aborts if the group is missing from
 # `permissions:` or equals the admin group. There is no in-band lifecycle:
-# rotate/revoke = update the secret + edit this list + roll the deployment.
+# rotate/revoke = update the secret and/or edit this list, then SIGHUP — a
+# reload rebuilds every token, so `${FILE:…}` refs rotate in place. `${ENV:…}`
+# refs are fixed per process: rotating one still needs a deployment roll.
 #
 # max_concurrent_requests (optional, default: MAX_CONCURRENT_PER_IDENTITY, 16):
 #   in-flight cap for this token, replacing the per-identity cap so a fleet of

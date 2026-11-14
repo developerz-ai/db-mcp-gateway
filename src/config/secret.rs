@@ -98,7 +98,10 @@ pub enum SecretError {
     #[error("malformed secret reference: expected `${{ENV:NAME}}` or `${{FILE:/path}}`")]
     Malformed,
 
-    #[error("env var `{0}` referenced in config but not set in process environment")]
+    /// Unset and set-but-empty share a variant: both leave the ref
+    /// unresolved, and the request path already maps this variant to its
+    /// stable `PasswordUnresolved` shape.
+    #[error("env var `{0}` referenced in config is unset or empty in process environment")]
     EnvNotSet(String),
 
     #[error("env var `{0}` referenced in config holds an invalid UTF-8 value")]
@@ -167,6 +170,9 @@ impl Password {
         match self {
             Password::Literal(s) => Ok(s.clone()),
             Password::EnvVar(name) => match std::env::var(name) {
+                // Spec 08: an empty ref aborts boot like an unset one — an
+                // empty password would otherwise reach the driver.
+                Ok(v) if v.is_empty() => Err(SecretError::EnvNotSet(name.clone())),
                 Ok(v) => Ok(SecretString::from(v)),
                 Err(std::env::VarError::NotPresent) => Err(SecretError::EnvNotSet(name.clone())),
                 Err(std::env::VarError::NotUnicode(_)) => {

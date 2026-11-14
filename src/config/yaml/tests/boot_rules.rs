@@ -149,3 +149,19 @@ fn permission_group_names_are_trimmed_on_load() {
     let config = ConfigFile::from_yaml_str(&yaml).expect("parses");
     assert_eq!(config.permissions[0].group, "backend");
 }
+
+/// `*` is the grant wildcard; a server or database literally named `*`
+/// would alias it.
+#[test]
+fn rejects_server_or_database_named_wildcard() {
+    for yaml in [
+        "servers:\n  - { name: \"*\", kind: postgres, host: a }\n",
+        "servers:\n  - name: prod\n    kind: postgres\n    host: a\n    databases:\n      - { name: \" * \", role: ro, password: x }\n",
+    ] {
+        let err = ConfigFile::from_yaml_str(yaml).expect_err("`*` name must reject");
+        let ConfigFileError::Invalid(msg) = err else {
+            panic!("expected Invalid, got {err:?}");
+        };
+        assert!(msg.contains("reserved for the grant wildcard"), "{msg}");
+    }
+}

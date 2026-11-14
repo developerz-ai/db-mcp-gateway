@@ -39,12 +39,15 @@ pub(crate) async fn connect_state_db(config: &Config) -> anyhow::Result<PgPool> 
 
 /// Wire every `AppState` dependency. Moves `config_file` and `auth_config` in.
 /// `stop` is the process shutdown token; probes go 503 once it is cancelled.
+/// `drained` fires once in-flight requests have drained: work those requests
+/// still depend on, like cross-replica revocations, runs until then.
 pub(crate) async fn build_app_state(
     config_file: ConfigFile,
     config: &Config,
     auth_config: AuthConfig,
     service_tokens: ServiceTokenStore,
     stop: CancellationToken,
+    drained: CancellationToken,
     state_db: &PgPool,
 ) -> anyhow::Result<AppState> {
     let sessions = SessionStore::with_cache_config(
@@ -67,7 +70,7 @@ pub(crate) async fn build_app_state(
     )
     .with_detached(detached.clone());
     if permissions_driver(&config_file) == PermissionsStoreDriver::Pg {
-        spawn_permissions_listener(state_db.clone(), permissions_cache.clone(), stop.clone());
+        spawn_permissions_listener(state_db.clone(), permissions_cache.clone(), drained);
     }
     let mcp = McpState {
         audit_sinks: Arc::new(ArcSwap::from_pointee(StreamSinks::from_config(
@@ -112,7 +115,8 @@ fn permissions_driver(config_file: &ConfigFile) -> PermissionsStoreDriver {
 }
 
 /// Cross-replica cache invalidation: apply every committed permissions change
-/// another replica announces over `LISTEN/NOTIFY`, until shutdown. Postgres
+/// another replica announces over `LISTEN/NOTIFY`, until the drain ends — a
+/// revocation must still bite requests admitted before SIGTERM. Postgres
 /// store only — the MySQL store has no such channel and relies on the TTL.
 /// The listener holds one dedicated connection taken from `pool`.
 fn spawn_permissions_listener(pool: PgPool, cache: PermissionsCache, stop: CancellationToken) {

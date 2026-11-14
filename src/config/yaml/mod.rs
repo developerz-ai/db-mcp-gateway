@@ -59,8 +59,10 @@ pub struct AdminBlock {
     #[serde(default)]
     pub enabled: bool,
     /// SSO group claim that authorizes `/admin/v1/*` calls. Required when
-    /// `enabled = true`; an empty value is a boot error (every authenticated
-    /// user would otherwise be an admin).
+    /// `enabled = true` — absent or blank is then a boot error (every
+    /// authenticated user would otherwise be an admin). Optional, and ignored,
+    /// when disabled.
+    #[serde(default)]
     pub group: String,
     /// Maximum age (in seconds) of a session before admin access is denied.
     /// When set, the admin middleware rejects sessions older than this limit
