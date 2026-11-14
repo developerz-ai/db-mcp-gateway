@@ -40,6 +40,7 @@ Migrations apply at boot.
 | `0018` (2.1.0) | Adds `sql`, `sql_truncated` and `reason` to `audit_call_intents` | None. An `abandoned` row the reaper writes now says what ran. |
 | `0019` (2.2.0) | Adds nullable `oauth_clients.client_name` | None. The consent page shows the self-registered name, marked unverified. 2.1.0 still inserts and reads. |
 | `0020` (2.2.1) | Partial indexes on soft-deleted `permissions_*` rows | None — supports the pruner, which now hard-deletes soft-deleted users/databases/grants and `permissions_audit` rows older than `AUDIT_RETENTION_DAYS` |
+| `0021` (2.3.0) | Widens the `permissions_databases.db_type` CHECK to accept `redis` (MySQL permissions store: `0006`) | None — additive. Rolling back to 2.2.1 is safe while no `redis` database is registered |
 
 New outcomes: `abandoned`, `audit_unavailable`, `dry_run`, `cancelled`. Reporting queries that enumerated outcomes should add them.
 
