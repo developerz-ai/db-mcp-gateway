@@ -41,6 +41,19 @@ admin:
         .expect("disabled admin parses with any group string");
 }
 
+/// config-reference: `admin.group` is required only when enabled. Absent
+/// with `enabled: false` parses; absent with `enabled: true` fails boot.
+#[test]
+fn admin_group_is_required_only_when_enabled() {
+    ConfigFile::from_yaml_str("admin:\n  enabled: false\n").expect("disabled admin needs no group");
+    let err = ConfigFile::from_yaml_str("admin:\n  enabled: true\n")
+        .expect_err("enabled admin without a group must reject");
+    let ConfigFileError::Invalid(msg) = err else {
+        panic!("expected Invalid, got {err:?}");
+    };
+    assert!(msg.contains("admin.group"), "{msg}");
+}
+
 /// The omitted-block path: no `admin:` at all. Absent ≡ disabled and
 /// the `/admin/*` surface stays 404 at the router layer.
 #[test]

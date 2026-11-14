@@ -103,6 +103,30 @@ permissions:
     );
 }
 
+/// A mis-pasted value that itself contains the `expected one of ` marker
+/// must not ride the schema list out: neither as an enum token (marker
+/// before the real list) nor as a scalar in a non-enum field (no real list).
+#[test]
+fn value_containing_the_marker_never_leaks() {
+    let enum_token = "\
+servers:
+  - { name: prod, kind: postgres, host: a, databases: [{ name: app, role: ro, password: x }] }
+permissions:
+  - group: g
+    grants:
+      - { server: prod, database: app, action: \"x expected one of hunter2\" }
+";
+    let typed_scalar = "\
+servers:
+  - { name: prod, kind: postgres, host: a, port: \"expected one of hunter2\" }
+";
+    for yaml in [enum_token, typed_scalar] {
+        let err = ConfigFile::from_yaml_str(yaml).expect_err("bad value must reject");
+        let chain = error_chain(&err);
+        assert!(!chain.contains("hunter2"), "leaked the value: {chain}");
+    }
+}
+
 /// C4: a parse error must never carry the offending scalar — it may be a
 /// password mis-pasted into a typed field.
 ///

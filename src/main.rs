@@ -113,6 +113,9 @@ async fn run() -> anyhow::Result<()> {
     // loops, metrics upkeep and listener, the SIGHUP loop. Cancelled by the
     // signal handler, and again below in case `serve` returns on an error.
     let stop = CancellationToken::new();
+    // Cancelled only after `serve` returns, i.e. once in-flight requests are
+    // drained; the permissions listener keeps applying revocations until then.
+    let drained = CancellationToken::new();
 
     // Install the Prometheus recorder before anything starts emitting metrics.
     // `install_recorder` registers a process-wide global — tests bootstrap
@@ -140,6 +143,7 @@ async fn run() -> anyhow::Result<()> {
         auth_config,
         service_tokens,
         stop.clone(),
+        drained.clone(),
         &state_db,
     )
     .await?;
@@ -171,6 +175,7 @@ async fn run() -> anyhow::Result<()> {
     // let detached audit writes finish (bounded), then close the pools so
     // in-flight state-DB statements complete instead of being cut at exit.
     stop.cancel();
+    drained.cancel();
     if let Err(error) = detached.drain(DRAIN_TIMEOUT).await {
         tracing::error!(%error, "detached audit work still running at shutdown; the reaper will mark it abandoned");
     }

@@ -1,7 +1,7 @@
 //! What a reload changes: target pools to evict, and the boot-fixed settings
 //! a reload is not allowed to touch.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::config::schema::{Database, Server};
 use crate::config::secret::Password;
@@ -45,7 +45,9 @@ impl ConfigFile {
                 .map(|a| (a.group.clone(), a.session_max_age_secs))
         };
         let driver = |c: &ConfigFile| c.permissions_store.as_ref().map(|p| p.driver);
-        let admin_servers = |c: &ConfigFile| -> Option<Vec<String>> {
+        // A set: the admin API checks membership, so reordering `servers:`
+        // is not a change.
+        let admin_servers = |c: &ConfigFile| -> Option<BTreeSet<String>> {
             admin(c).map(|_| c.servers.iter().map(|s| s.name.clone()).collect())
         };
         if admin(self) != admin(new) {

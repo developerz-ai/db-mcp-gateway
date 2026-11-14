@@ -155,6 +155,27 @@ fn resolve_secret_backend_errors_until_implemented() {
     }
 }
 
+/// Spec 08: an empty `${ENV:…}` aborts boot like an unset one, and the
+/// error names the variable — the (empty) value has nothing to show.
+#[test]
+fn resolve_env_var_rejects_empty_value() {
+    let name = format!("DB_MCP_SECRET_TEST_{}", uuid::Uuid::new_v4().simple());
+    // SAFETY: unique name per test — nothing else reads it.
+    unsafe {
+        std::env::set_var(&name, "");
+    }
+    let result = Password::EnvVar(name.clone()).resolve();
+    unsafe {
+        std::env::remove_var(&name);
+    }
+    match result {
+        Err(err @ SecretError::EnvNotSet(_)) => {
+            assert!(format!("{err}").contains(&name), "{err}");
+        }
+        other => panic!("expected EnvNotSet for empty value, got {other:?}"),
+    }
+}
+
 /// Defends the no-creds-in-Display rule across every error variant.
 /// Includes a `Malformed` case to defend the no-payload contract: even if
 /// a typo'd ref were the literal plaintext (e.g. `${hunter2}`), the error

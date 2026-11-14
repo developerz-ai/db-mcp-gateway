@@ -88,6 +88,23 @@ fn admin_and_store_driver_are_boot_fixed() {
     assert_eq!(base().boot_fixed_change(&off), None);
 }
 
+/// With the admin API mounted the server-name *set* is boot-fixed; the
+/// order servers are listed in is not.
+#[test]
+fn reordering_servers_is_not_a_boot_fixed_change() {
+    let admin = "admin: { enabled: true, group: admins }\n";
+    let old = config("", "", "${ENV:D}", admin);
+    let mut reordered = old.clone();
+    reordered.servers.reverse();
+    assert_eq!(old.boot_fixed_change(&reordered), None);
+    let mut renamed = old.clone();
+    renamed.servers[0].name = "s2".to_string();
+    assert_eq!(
+        old.boot_fixed_change(&renamed),
+        Some("servers (names, while the admin API is mounted)")
+    );
+}
+
 fn base_yaml() -> String {
     "servers:\n  - { name: s, kind: postgres, host: h }\n  - name: t\n    kind: postgres\n    host: t\n    databases:\n      - { name: d, role: ro, password: \"${ENV:D}\" }\n      - { name: e, role: ro, password: \"${ENV:E}\" }\n".to_string()
 }
