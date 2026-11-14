@@ -1,25 +1,37 @@
-//! Retention deletes for `audit_calls`, `audit_call_intents` and
-//! `permissions_audit`: one bounded
-//! batch per call, each in its own transaction under a transaction-scoped
-//! advisory lock, so replicas never delete the same rows at once and a
-//! dropped connection can never strand the lock on a pooled session.
+//! Retention deletes for the audit tables (`audit_calls`,
+//! `audit_call_intents`, `permissions_audit`) and for dead permissions rows
+//! (revoked grants, soft-deleted users and databases): one bounded batch per
+//! call, each in its own transaction under a transaction-scoped advisory
+//! lock, so replicas never delete the same rows at once and a dropped
+//! connection can never strand the lock on a pooled session.
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
-/// Which append-only audit table a batch prunes.
+/// Which table a retention batch prunes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuditTable {
+pub enum RetentionTable {
     Calls,
     Intents,
     /// The admin API's change trail; timestamped by `ts`, not `occurred_at`.
     PermissionsChanges,
+    /// `permissions_grants` rows revoked before the cutoff.
+    RevokedGrants,
+    /// `permissions_databases` rows soft-deleted before the cutoff that no
+    /// grant references any more.
+    DeletedDatabases,
+    /// `permissions_users` rows soft-deleted before the cutoff that no grant
+    /// references any more.
+    DeletedUsers,
 }
 
-impl AuditTable {
+impl RetentionTable {
     // `ORDER BY <timestamp> LIMIT` walks the table's timestamp index
-    // (`*_occurred_at_idx`, `permissions_audit_ts_idx`), oldest first, so each
-    // batch is an index range plus key lookups, never a full scan.
+    // (`*_occurred_at_idx`, `permissions_audit_ts_idx`, the 0020 dead-row
+    // indexes), oldest first, so each batch is an index range plus key
+    // lookups, never a full scan. A parent still referenced by any grant is
+    // skipped rather than deleted: the FK would refuse it, and such a row is
+    // an anomaly `referenced_expired_parents` reports.
     fn delete_batch_sql(self) -> &'static str {
         match self {
             Self::Calls => {
@@ -40,8 +52,51 @@ impl AuditTable {
                    WHERE ts < $1 \
                    ORDER BY ts LIMIT $2)"
             }
+            Self::RevokedGrants => {
+                "DELETE FROM permissions_grants WHERE id IN ( \
+                   SELECT id FROM permissions_grants \
+                   WHERE revoked_at < $1 \
+                   ORDER BY revoked_at LIMIT $2)"
+            }
+            Self::DeletedDatabases => {
+                "DELETE FROM permissions_databases WHERE id IN ( \
+                   SELECT d.id FROM permissions_databases d \
+                   WHERE d.deleted_at < $1 \
+                     AND NOT EXISTS ( \
+                       SELECT 1 FROM permissions_grants g WHERE g.database_id = d.id) \
+                   ORDER BY d.deleted_at LIMIT $2)"
+            }
+            Self::DeletedUsers => {
+                "DELETE FROM permissions_users WHERE id IN ( \
+                   SELECT u.id FROM permissions_users u \
+                   WHERE u.deleted_at < $1 \
+                     AND NOT EXISTS ( \
+                       SELECT 1 FROM permissions_grants g WHERE g.user_id = u.id) \
+                   ORDER BY u.deleted_at LIMIT $2)"
+            }
         }
     }
+}
+
+/// Soft-deleted users and databases past `cutoff` that a grant still
+/// references, so retention cannot delete them. The admin API revokes a
+/// parent's grants in the transaction that soft-deletes it, so after the
+/// grants are pruned this should be `(0, 0)`; anything else is a row written
+/// outside the admin API.
+pub async fn referenced_expired_parents(
+    pool: &PgPool,
+    cutoff: DateTime<Utc>,
+) -> Result<(i64, i64), sqlx::Error> {
+    sqlx::query_as(
+        "SELECT \
+           (SELECT count(*) FROM permissions_users u WHERE u.deleted_at < $1 \
+              AND EXISTS (SELECT 1 FROM permissions_grants g WHERE g.user_id = u.id)), \
+           (SELECT count(*) FROM permissions_databases d WHERE d.deleted_at < $1 \
+              AND EXISTS (SELECT 1 FROM permissions_grants g WHERE g.database_id = d.id))",
+    )
+    .bind(cutoff)
+    .fetch_one(pool)
+    .await
 }
 
 /// The retention cutoff `days` before the state DB's clock. Computed once
@@ -59,7 +114,7 @@ pub async fn retention_cutoff(pool: &PgPool, days: i32) -> Result<DateTime<Utc>,
 pub async fn delete_expired_batch(
     pool: &PgPool,
     lock_key: i64,
-    table: AuditTable,
+    table: RetentionTable,
     cutoff: DateTime<Utc>,
     limit: i64,
 ) -> Result<Option<u64>, sqlx::Error> {

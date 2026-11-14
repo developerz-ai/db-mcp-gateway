@@ -91,7 +91,7 @@ Mirrors the query audit invariant from non-negotiable #4: synchronous, write fai
 
 Indexes: `(ts)`, `(actor_id, ts)`, `(target_type, target_id, ts)`.
 
-Retention: the hourly audit pruner deletes `permissions_audit` rows whose `ts` is older than `AUDIT_RETENTION_DAYS` (default 90), with the same cutoff, batching and advisory lock as query audit ([07 §Retention pruning](07-logging-retention.md#retention-pruning)). A change trail needed longer than that must be exported before it ages out. The MySQL store's table is never written by the gateway and is not pruned.
+Retention: the hourly audit pruner deletes `permissions_audit` rows whose `ts` is older than `AUDIT_RETENTION_DAYS` (default 90), with the same cutoff, batching and advisory lock as query audit ([07 §Retention pruning](07-logging-retention.md#retention-pruning)). A change trail needed longer than that must be exported before it ages out. The same run hard-deletes grants revoked, and users and databases soft-deleted, longer ago than the same cutoff (grants first; a parent a grant still references is skipped with a `WARN`), so a deleted subject's email and grants leave the state DB on that horizon; live rows are never touched. The MySQL store is never written by the gateway and is not pruned.
 
 ## Admin API
 

@@ -47,6 +47,7 @@ mod oauth_consent;
 mod oauth_lifecycle_real_db;
 mod permissions_audit_real_db;
 mod permissions_indexes_mysql;
+mod permissions_pruner_real_db;
 mod permissions_repo_mysql;
 mod permissions_repo_real_db;
 mod permissions_resolver_real_db;
