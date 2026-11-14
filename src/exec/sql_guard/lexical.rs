@@ -19,7 +19,7 @@ pub(super) fn check_lexical(sql: &str) -> Result<(), GuardError> {
         .windows(3)
         .any(|w| is_unicode_escaped_identifier(&w[0], &w[1], &w[2]));
     if escaped {
-        return Err(GuardError::NotAllowed("Unicode-escaped identifier"));
+        return Err(GuardError::UnicodeEscapedIdentifier);
     }
     Ok(())
 }

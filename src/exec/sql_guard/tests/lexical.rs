@@ -20,7 +20,7 @@ fn unicode_escaped_identifiers_rejected() {
         r#"EXPLAIN ANALYZE select U&"\0070g_notify"('ch', 'x')"#,
         r#"EXPLAIN select U&"\0070g_notify"('ch', 'x')"#,
     ] {
-        rejected_not_allowed(sql, "Unicode-escaped identifier");
+        rejected(sql, GuardError::UnicodeEscapedIdentifier);
     }
 }
 
@@ -29,7 +29,7 @@ fn unicode_escaped_identifiers_rejected_in_write_mode() {
     let sql = r#"UPDATE t SET a = U&"\0070g_notify"('c', 'p')"#;
     assert_eq!(
         check_sql(sql, Access::ReadWrite),
-        Err(GuardError::NotAllowed("Unicode-escaped identifier"))
+        Err(GuardError::UnicodeEscapedIdentifier)
     );
 }
 
@@ -48,7 +48,7 @@ fn bitwise_and_and_unicode_strings_still_allowed() {
 fn uescape_rejected() {
     assert_eq!(
         is_read_only(r#"select U&"!0070g_notify" UESCAPE '!' ('a', 'b')"#),
-        Err(GuardError::NotAllowed("Unicode-escaped identifier"))
+        Err(GuardError::UnicodeEscapedIdentifier)
     );
     assert_eq!(
         is_read_only(r"select U&'!0070' UESCAPE '!'"),
@@ -75,4 +75,15 @@ fn other_spellings_of_a_denied_name_are_caught() {
             other => panic!("expected pg_notify denied for `{sql}`, got {other:?}"),
         }
     }
+}
+
+/// The refusal names the problem and the fix, not a statement type: the
+/// statement itself is usually a perfectly allowed SELECT.
+#[test]
+fn unicode_escape_message_tells_the_agent_to_spell_it_plainly() {
+    let msg = is_read_only(r#"select U&"col" from t"#)
+        .expect_err("refused")
+        .to_string();
+    assert!(msg.contains("spell the identifier plainly"), "{msg}");
+    assert!(!msg.contains("statement type"), "{msg}");
 }
