@@ -45,7 +45,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 - **Operations benefit:** Production data protection without monitoring every agent conversation
 
 ### Statement Timeouts
-- **What it does:** Every query has configurable execution time limits (default 5000ms)
+- **What it does:** Every query has an execution time limit — 30,000 ms by default, which is also the ceiling; a grant's `statement_timeout_ms` can only tighten it
 - **How it works:** Timeout enforced both at gateway level and via PostgreSQL `statement_timeout`
 - **Performance benefit:** Prevents runaway queries from impacting database performance
 - **Operations benefit:** No more "who locked up production?" incidents
@@ -56,11 +56,11 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 - **Performance benefit:** Prevents large result sets from overwhelming network or agent context
 - **Operations benefit:** Cost control on databases that charge per query byte
 
-### Schema Filtering
-- **What it does:** Grants can restrict access to specific schemas (allow/deny lists)
-- **How it works:** Query analysis enforces schema restrictions before execution
-- **Security benefit:** Multi-tenant databases can expose only relevant schemas per team
-- **Operations benefit:** Single database server can serve multiple security domains
+### Schema and Table Scoping
+- **What it does:** Which schemas and tables a caller can read is decided by the target-DB role the grant connects as — there is no `allowed_schemas` / `denied_tables` grant constraint
+- **How it works:** Grant each read-only role exactly the tables it may `SELECT` (`GRANT SELECT ON …`); the database enforces that for every statement, including through views, functions and `search_path`, which a gateway-side SQL parser cannot see through ([spec 06](initial-idea/06-permissions.md))
+- **Security benefit:** Multi-tenant databases expose only the schemas the role was granted
+- **Operations benefit:** A single database server can serve multiple security domains, one role per domain
 
 ---
 
@@ -74,12 +74,12 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 
 ### Granular Grant System
 - **What it does:** Four-tier permission structure: group × server × database × action
-- **How it works:** Each grant can specify `query_read`, `query_write`, `describe_schema`, `explain`, etc.
+- **How it works:** Each grant names one action: `schema_read`, `query_read`, `query_write` (each implies the one before it) or the standalone `history_read`
 - **Flexibility benefit:** Can grant schema-only access to analysts, full access to DBAs
 - **Security benefit:** Principle of least privilege enforced at technical level
 
 ### Constraint System
-- **What it does:** Each grant can specify constraints: `require_reason`, `row_limit`, `statement_timeout_ms`, `allowed_schemas`, `time_windows`
+- **What it does:** Each grant can specify constraints: `require_reason`, `row_limit`, `statement_timeout_ms`. When several grants match, the most restrictive value of each wins
 - **How it works:** Constraints evaluated per-query before execution
 - **Compliance benefit:** Production queries automatically require incident ticket numbers
 - **Operations benefit:** Different constraints for development vs. production environments
@@ -114,7 +114,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 
 ### Complete MCP Tool Surface
 
-- **What it does:** Seven MCP tools cover all database interaction patterns
+- **What it does:** Ten MCP tools cover all database interaction patterns
 - **Tools included:**
   - `list_servers` - Enumerate target servers visible to the caller
   - `list_databases` - Enumerate available databases on a server
@@ -123,6 +123,9 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
   - `run_query` - Execute SQL with safety limits
   - `explain` - Get query execution plans
   - `get_query_history` - Retrieve a user's own recent queries from the audit log
+  - `table_stats` - Table and index sizes, row estimates, scan and vacuum statistics
+  - `db_activity` - The caller's own statements the gateway is running right now
+  - `cancel_query` - Cancel one of the caller's own running statements by `request_id`
 
 ### Multi-Database Support
 - **What it does:** Single gateway instance fronts PostgreSQL and MongoDB targets (MySQL/MSSQL are rejected at boot — see [multi-db](usage/multi-db.md))
@@ -153,7 +156,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 ### Reproducible Builds
 - **What it does:** Every `v*` git tag produces reproducible OCI images
 - **How it works:** Multi-arch builds (amd64 + arm64) with content-addressable digests
-- **Security benefit:** Images can be verified via digests, no mutable `latest` tags in production
+- **Security benefit:** Pin production to an exact version tag or digest; the moving `latest`, `X` and `X.Y` tags only ever move forward ([releasing](deployment/releasing.md))
 - **Operations benefit:** Consistent behavior across development, testing, and production
 
 ---
@@ -179,11 +182,9 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 
 ## 🎯 Platform Features
 
-### Configurable Time Windows
-- **What it does:** Grants can specify valid time ranges (e.g., business hours only)
-- **How it works:** Queries outside time windows automatically rejected with clear error messages
-- **Security benefit:** Restrict production access to on-call hours
-- **Compliance benefit:** Enforce "no production access on weekends" policies automatically
+### Time Windows (roadmap, not shipped)
+- **What it will do:** Let a grant apply only within a time range (e.g. business hours)
+- **Status:** No `time_window` constraint exists yet — the parser rejects it; see the [roadmap](initial-idea/11-roadmap.md)
 
 ### Reason Requirement
 - **What it does:** Production grants can require human-readable reason per query
@@ -193,7 +194,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 
 ### Constraint Evaluation
 - **What it does:** All constraints evaluated before query execution, fast rejection
-- **How it works:** Query analysis checks row limits, timeouts, schema access before hitting database
+- **How it works:** Grant match, action and `require_reason` are checked before the database is touched; row limits and timeouts bound the query as it runs
 - **Performance benefit:** Invalid queries rejected without database round-trip
 - **Operations benefit:** Clear error messages help users understand permission boundaries
 

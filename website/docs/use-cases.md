@@ -11,14 +11,22 @@ Real-world scenarios where db-mcp-gateway solves specific problems for AI agent 
 **Solution:** Deploy db-mcp-gateway as a secure intermediary. Agents connect via MCP with SSO authentication, and all database access is logged and attributed to individual users.
 
 ### Implementation
+The `permissions:` section of the gateway YAML. One grant names one server, one database (or `"*"`) and one action; every server and database must be declared under `servers:` ([config reference](deployment/config-reference.md)).
+
 ```yaml
-# Permissions config example
-groups:
-  - name: backend-team
+permissions:
+  - group: backend-team
     grants:
       - server: production
-        databases: [app_db, analytics_db]
-        actions: [query_read]
+        database: app_db
+        action: query_read
+        constraints:
+          row_limit: 1000
+          statement_timeout_ms: 5000
+          require_reason: true
+      - server: production
+        database: analytics_db
+        action: query_read
         constraints:
           row_limit: 1000
           statement_timeout_ms: 5000
@@ -47,16 +55,23 @@ groups:
 
 ### Implementation
 ```yaml
-groups:
-  - name: analytics-users
+permissions:
+  - group: analytics-users
     grants:
+      # query_read includes schema_read, so describe_schema works too.
       - server: data-warehouse
-        databases: [sales_metrics, user_analytics]
-        actions: [query_read, describe_schema]
+        database: sales_metrics
+        action: query_read
         constraints:
           row_limit: 10000
-          allowed_schemas: [public, analytics_]
+      - server: data-warehouse
+        database: user_analytics
+        action: query_read
+        constraints:
+          row_limit: 10000
 ```
+
+Schema scoping (only `public` and `analytics`, say) is not a grant setting: grant the database role `USAGE` and `SELECT` on exactly those schemas, and the database enforces it for every statement.
 
 ### Benefits
 - **Self-service:** Analysts ask questions in natural language
@@ -83,18 +98,14 @@ Agent: [generates SQL, applies limits, returns results]
 
 ### Implementation
 ```yaml
-groups:
-  - name: workflow-automation
+permissions:
+  - group: workflow-automation
     grants:
-      - server: postgres-primary
-        databases: [app_db, user_profiles]
-        actions: [query_read]
-      - server: postgres-analytics
-        databases: [event_logs, metrics]
-        actions: [query_read]
-      - server: mongo-documents
-        databases: [content_store]
-        actions: [query_read]
+      - { server: postgres-primary,   database: app_db,        action: query_read }
+      - { server: postgres-primary,   database: user_profiles, action: query_read }
+      # "*" covers every database configured on the server.
+      - { server: postgres-analytics, database: "*",           action: query_read }
+      - { server: mongo-documents,    database: content_store, action: query_read }
 ```
 
 ### Benefits
@@ -127,21 +138,20 @@ All queries go through same gateway with:
 
 ### Implementation
 ```yaml
-groups:
-  - name: oncall-engineers
+permissions:
+  - group: oncall-engineers
     grants:
+      # query_read covers run_query, explain, sample_table and describe_schema.
       - server: production
-        databases: [app_db]
-        actions: [query_read, explain]
+        database: app_db
+        action: query_read
         constraints:
           require_reason: true
           statement_timeout_ms: 10000
           row_limit: 500
-          time_windows:
-            - start: "2024-01-01T00:00:00Z"
-              end: "2024-12-31T23:59:59Z"
-              allowed_hours: [0-23]  # All hours for oncall access
 ```
+
+Restricting access to business hours is not supported yet — a `time_window` constraint is on the [roadmap](initial-idea/11-roadmap.md), and the parser rejects it today. Who is on call is your IdP's group membership.
 
 ### Benefits
 - **Compliance:** Every query requires reason (incident ticket, user story)
@@ -169,29 +179,23 @@ groups:
 
 ### Migration Strategy
 ```yaml
-# Phase 1: Pilot with read-only analytics
-groups:
-  - name: analytics-pilot
+permissions:
+  # Phase 1: Pilot with read-only analytics
+  - group: analytics-pilot
+    grants:
+      - { server: production, database: analytics_db, action: query_read }
+
+  # Phase 2: Expand to development teams
+  - group: dev-team-early-adopters
+    grants:
+      - { server: staging, database: app_db, action: query_read }
+
+  # Phase 3: Production debugging (compliance-approved)
+  - group: oncall-production
     grants:
       - server: production
-        databases: [analytics_db]
-        actions: [query_read]
-
-# Phase 2: Expand to development teams
-groups:
-  - name: dev-team-early-adopters
-    grants:
-      - server: staging
-        databases: [app_db]
-        actions: [query_read, describe_schema]
-
-# Phase 3: Production debugging (compliance-approved)
-groups:
-  - name: oncall-production
-    grants:
-      - server: production
-        databases: [app_db]
-        actions: [query_read]
+        database: app_db
+        action: query_read
         constraints:
           require_reason: true
 ```

@@ -127,6 +127,6 @@ Login state for the OAuth bridge (pending `/authorize` flows and authorization c
 
 ## Shutdown
 
-`SIGTERM` flips `/healthz` and `/readyz` to 503, stops background loops, and gives in-flight requests a 55 s drain window (state-pool acquire 5 s + target statement ceiling 30 s + audit write 10 s + slack). Detached audit writes then get up to 20 s, and the state-DB pools close (bounded). `terminationGracePeriodSeconds` must be ≥ 75. `SIGHUP` never terminates the process — the handler is installed whether TLS is on or off.
+`SIGTERM` flips `/healthz` and `/readyz` to 503, stops background loops, and gives in-flight requests an 80 s drain window: the 75 s `/mcp` request timeout (state-pool acquire 5 s + target statement ceiling 30 s + two audit writes of 15 s + 10 s slack) plus 5 s, so a call that times out still writes its outcome row. The permissions `LISTEN`/`NOTIFY` listener stays up through the drain, so a revoke announced during shutdown still reaches this replica's cache. Detached audit writes then get up to 20 s, and the two state-DB pools close (≤ 10 s each). Worst case 80 + 20 + 2 × 10 = 120 s: `terminationGracePeriodSeconds` must be ≥ 120 (plus any preStop sleep). `SIGHUP` never terminates the process — the handler is installed whether TLS is on or off.
 
 See [11-roadmap](11-roadmap.md) for what's deferred (k8s operator, multi-replica leader election, etc.).

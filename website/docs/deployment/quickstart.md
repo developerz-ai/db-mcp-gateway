@@ -54,17 +54,20 @@ docker run --rm --network host \
   -e STATE_DB_URL='postgres://gateway:gateway-dev-only@localhost:5433/gateway' \
   -e TARGET_DB_PASSWORD='app-dev-only' \
   -e TLS_DISABLED=true \
+  -e OIDC_ISSUER=http://localhost:5556 \
+  -e OIDC_CLIENT_ID=dev \
+  -e ALLOW_INSECURE_SIGNING_KEY=true \
   -v "$PWD/config.yml:/etc/gateway/config.yml:ro" \
   ghcr.io/developerz-ai/db-mcp-gateway:main
 ```
 
-`TLS_DISABLED=true` is the explicit dev-only opt-out — the gateway refuses to boot otherwise (see [#12](https://github.com/developerz-ai/db-mcp-gateway/issues/12)). Real deploys mount cert+key and unset this var.
+`TLS_DISABLED=true` is the explicit dev-only opt-out — the gateway refuses to boot otherwise (see [#12](https://github.com/developerz-ai/db-mcp-gateway/issues/12)). Real deploys mount cert+key and unset this var. `OIDC_ISSUER` and `OIDC_CLIENT_ID` are required at boot but the IdP is not contacted until a login; `ALLOW_INSECURE_SIGNING_KEY=true` lets the dev default session key through and is refused unless the issuer is a loopback URL — see *About login* below.
 
 The binary needs its config path. The published image bakes `DB_MCP_GATEWAY_CONFIG=/etc/gateway/config.yml` in (see [#10](https://github.com/developerz-ai/db-mcp-gateway/issues/10)), but passing it explicitly above keeps the recipe working for a locally-built image too — equivalently, append `--config /etc/gateway/config.yml` as a command argument.
 
 The `:main` tag is published on every push to `main` (see [#10](https://github.com/developerz-ai/db-mcp-gateway/issues/10)). Building from source instead? `docker build -t db-mcp-gateway:dev .` and swap that tag into the `docker run` above.
 
-With `RUST_LOG` unset the gateway logs at `info`. If you mistype a secret ref or leave `TARGET_DB_PASSWORD` unset, the gateway **fails fast at boot** rather than at first query — e.g. `Error: env var TARGET_DB_PASSWORD referenced in config but not set in process environment`.
+With `RUST_LOG` unset the gateway logs at `info`. If you mistype a secret ref or leave `TARGET_DB_PASSWORD` unset, the gateway **fails fast at boot** rather than at first query — e.g. ``Error: env var `TARGET_DB_PASSWORD` referenced in config is unset or empty in process environment``.
 
 You should see the gateway load config, migrate the state DB, and start listening:
 
@@ -93,28 +96,33 @@ The env→YAML unification is still pending, so these come from the environment,
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `DB_MCP_GATEWAY_CONFIG` | — (image: `/etc/gateway/config.yml`) | YAML config path; same as `--config`. One of the two is required |
 | `STATE_DB_URL` | `postgres://gateway:gateway-dev-only@localhost:5433/gateway` | Gateway's own Postgres (sessions + audit) |
+| `PERMISSIONS_DB_DSN` | — | DSN of the MySQL 8 permissions store; required only with `permissions_store.driver: mysql` |
 | `GATEWAY_BIND` | `127.0.0.1:8443` (image: `0.0.0.0:8443`) | Listen address |
+| `MCP_PATH` | `/mcp` | Absolute path the MCP endpoint mounts at. A path the gateway already serves (`/healthz`, `/auth/…`, `/admin…`, `/.well-known…`, …) aborts boot |
 | `METRICS_BIND` | `127.0.0.1:9090` | Prometheus `/metrics` listener — separate from `GATEWAY_BIND`, which no longer serves `/metrics`. Set `0.0.0.0:9090` for an in-cluster scrape and fence the port with a NetworkPolicy; must differ from `GATEWAY_BIND` |
 | `MAX_CONCURRENT_REQUESTS` / `MAX_CONCURRENT_PER_IDENTITY` | `512` / `16` | In-flight ceilings (global → 503, per caller → 429). `0` aborts boot |
 | `STATE_DB_POOL_SIZE` | `10` | Request-path state-DB pool. `0`, or more than the concurrent-request ceiling (512), aborts boot. Pruner/GC use a separate fixed pool of 2 |
 | `OIDC_ISSUER` | — (required) | IdP issuer URL (OIDC discovery base). A trailing slash is ignored |
 | `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | — (client id required) | Gateway's OIDC client credentials |
+| `OIDC_AUDIENCE` | `OIDC_CLIENT_ID` | Expected `aud` of IdP ID tokens |
 | `OIDC_REDIRECT_URL` | `http://localhost:8443/auth/callback` | Must match the IdP app's redirect URI |
 | `OIDC_GROUPS_CLAIM` | `groups` | ID-token claim carrying group membership |
 | `SESSION_SIGNING_KEY` | dev-only default | HMAC key for gateway-issued session JWTs — **set this in any real deploy**. Minimum 32 bytes; empty, shorter or the dev default are refused at boot |
 | `ALLOW_INSECURE_SIGNING_KEY` | `false` | Local dev only: accept a short or dev-default `SESSION_SIGNING_KEY`. Refused at boot unless `OIDC_ISSUER` is a loopback URL; logs a `WARN` when set |
 | `SESSION_TTL_HOURS` | `8` | Session (access token) lifetime, `1`–`168` |
-| `REFRESH_TTL_DAYS` | `1` | Absolute refresh-chain lifetime, `1`–`90`; see [auth & SSO](../initial-idea/04-auth-sso.md#token-endpoint--post-token) |
+| `REFRESH_TTL_DAYS` | `1` | Absolute refresh-chain lifetime, `1`–`366`; see [auth & SSO](../initial-idea/04-auth-sso.md#token-endpoint--post-token) |
 | `TLS_CERT_PATH` | — | PEM-encoded leaf cert (+ intermediates). Required unless `TLS_DISABLED=true` |
 | `TLS_KEY_PATH` | — | PEM-encoded private key. Required unless `TLS_DISABLED=true` |
 | `TLS_DISABLED` | `false` | Dev-only escape. `true` serves plain HTTP and emits a `WARN` log on startup |
 | `AUDIT_RETENTION_DAYS` | `90` | Hot-retention window for the audit log |
 | `PERMISSIONS_CACHE_TTL_SECONDS` | `60` | Per-user DB-grant cache TTL; bounds how long a revoked grant is honoured on a replica that missed the invalidation. Above `300` aborts boot |
 | `SESSION_CACHE_TTL_SECONDS` | `30` | Freshness window for the in-memory session cache. Bounds how long a revoked session stays honored on *other* HA replicas; `0` re-validates every request. See [auth & SSO](../initial-idea/04-auth-sso.md#session-tokens) |
+| `SENTRY_DSN` / `SENTRY_ENVIRONMENT` | unset (disabled) / `development` | GlitchTip/Sentry error tracking; every event passes a credential scrubber |
 | `RUST_LOG` | `info,sqlx::query=warn` | Log filter. Invalid directives are skipped. The `audit_stream` target always logs at INFO regardless |
 
-> **Shutdown.** On `SIGTERM` the gateway stops accepting work, gives in-flight requests up to 55 s, waits up to 20 s for detached audit writes, then closes its state-DB pools (≤ 10 s each). Set `terminationGracePeriodSeconds: 75` or more, or Kubernetes `SIGKILL`s a pod mid-drain.
+> **Shutdown.** On `SIGTERM` the gateway stops accepting work, gives in-flight requests up to 80 s (the 75 s `/mcp` request timeout + 5 s), waits up to 20 s for detached audit writes, then closes its two state-DB pools (≤ 10 s each). Set `terminationGracePeriodSeconds: 120` or more, or Kubernetes `SIGKILL`s a pod mid-drain.
 
 > **Cert rotation.** `kill -HUP <pid>` (or a pod lifecycle hook, sidecar, or reload controller that sends `SIGHUP`) re-reads `TLS_CERT_PATH` + `TLS_KEY_PATH` in place. The `SIGHUP` handler is installed with TLS off too, so the signal never kills the process. In-flight connections keep their old cert until they close; new handshakes pick up the new one. Kubernetes does not send `SIGHUP` on its own — `terminationGracePeriodSeconds` only governs `SIGTERM` at shutdown — so operators must wire the reload signal explicitly. Cert-manager integration can automate this once #17 lands the infra stack.
 
@@ -392,6 +400,8 @@ Names are fixed — dashboards and alerts are written against them. No label car
 | `config_reloads_total` | counter | `result` (`ok`/`error`) |
 | `log_lines_dropped_total` | counter | — |
 | `audit_stream_dropped_total` | counter | `sink` (`syslog`) |
+
+`audit_stream_dropped_total` counts only syslog deliveries that failed. The `stdout` stream sink writes through the same non-blocking log queue as every other log line, so an audit row it drops when that queue is full is counted only in `log_lines_dropped_total` — the two are not separable by metric. Every stream sink is a best-effort copy; the state DB row is the record.
 
 Histograms use fixed buckets so they aggregate across replicas. Gauges and histograms untouched for an hour leave the output (an evicted database's labels do not linger); counters never expire.
 

@@ -87,12 +87,12 @@ async def run_query(sql: str):
 **db-mcp-gateway:**
 ```yaml
 # Production-ready with enterprise features
-groups:
-  - name: analytics-team
+permissions:
+  - group: analytics-team
     grants:
       - server: production
-        databases: [analytics_db]
-        actions: [query_read]
+        database: analytics_db
+        action: query_read
         constraints:
           row_limit: 10000
           require_reason: true

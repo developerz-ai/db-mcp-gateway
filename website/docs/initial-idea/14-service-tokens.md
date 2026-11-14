@@ -134,25 +134,26 @@ about tokens is callable over HTTP — the lifecycle is GitOps:
   `service_accounts[].token` carries a `${ENV:…}` or `${FILE:…}` reference,
   identical to the `password:` policy documented in
   [config-reference.md § ServiceAccount](../deployment/config-reference.md#serviceaccount).
-  The YAML loader accepts inline literal tokens (`Password::Literal`) for
-  dev/test parity with `Database.password` and does **not** reject them at
-  boot — so credential-free committed config is guarded at the CI layer,
-  not at boot: the `secret-scan` job in `.github/workflows/ci.yml` scans
+  Under `gateway.env: production` an inline literal token is rejected at
+  boot (the error names the field, never the value); the default
+  `development` accepts one for dev/test parity with `Database.password`.
+  Committed config is also guarded at the CI layer: the `secret-scan` job in `.github/workflows/ci.yml` scans
   every tracked file (not just YAML) and FAILS on any literal
   `dbmcp_svc_<64hex>` token (test fixtures under `tests/**` are excluded).
   It is ADVISORY — it fails the job on every PR, but does not by itself
   block a merge until made a required branch-protection check (#190
-  follow-up). Inline literals therefore remain valid
-  only in programmatic test fixtures constructed via
-  `ConfigFile::from_yaml_str` / `ServiceTokenStore::from_config` directly.
-- **Rotate** — overlap is mandatory, because each pod only loads one token at
-  boot, AND the YAML validator (`src/config/yaml/validate.rs`) rejects duplicate
+  follow-up).
+- **Rotate** — overlap is mandatory, because each entry carries exactly one
+  token, AND the YAML validator (`src/config/yaml/service_accounts.rs`) rejects duplicate
   service-account names — the new value cannot reuse the original `<name>`.
   Sequence: (1) mint a new value under a DISTINCT temporary name
   (`<name>-next` is the recommended convention); (2) add a *second*
   `service_accounts:` entry (with its own matching `permissions:` block)
-  to the gateway YAML so new pods accept the new value; (3) roll the
-  deployment (or `kill -HUP` every pod) and wait until it completes; (4)
+  to the gateway YAML; (3) `kill -HUP` every pod (or roll the deployment)
+  and wait until it completes — a reload rebuilds the token store, but a
+  `${ENV:…}` ref reads the pod's environment, which only changes on a
+  restart, so a value delivered as a new env var needs a roll, while one
+  delivered as a mounted file (`${FILE:…}`) is picked up by `SIGHUP`; (4)
   update every client to use the new value; (5) remove the old
   `service_accounts:` entry and roll or `SIGHUP` again. **Audit-identity trade-off**: because the
   temporary entry uses a different name, audit rows for the rotation

@@ -3,21 +3,19 @@
 Single-page reference for the gateway's YAML config — every key the parser
 accepts today, with type, requirement, and a short description. The spec at
 [`../initial-idea/08-config.md`](../initial-idea/08-config.md) covers
-*intended* shape (including sections like `gateway:` / `auth:` / `logging:`
-that the parser doesn't enforce yet); this page is what the binary actually
-checks at boot.
+*intended* shape (including an `auth:` section that is still env-driven);
+this page is what the binary actually checks at boot.
 
 Boot-time validation (issue #16):
 
-- Unknown keys inside `servers[].*`, `databases[].*`, `permissions[].*`,
-  `grants[].*`, `constraints.*`, and `service_accounts[].*` are **errors**
-  with a line:column pointer
-  and the list of expected fields. A typo like `statemnt_timeout_ms` aborts
-  startup rather than silently dropping the constraint.
-- Unknown keys at the top level (`gateway:`, `auth:`, `logging:`, …) are
-  ignored for now — strictness there waits on the env→YAML unification.
-- Every `${ENV:…}` / `${FILE:…}` ref must resolve cleanly; unresolved refs
-  abort startup (issue #15).
+- Unknown keys anywhere — the top level and every section below — are
+  **errors** with a line:column pointer and the list of expected fields. A
+  typo like `statemnt_timeout_ms` aborts startup rather than silently
+  dropping the constraint, and `auth:` or a misspelled section name aborts
+  it too.
+- Every `${ENV:…}` / `${FILE:…}` ref must resolve cleanly; an unset or empty
+  env var, or a missing or empty file, aborts startup (issue #15).
+- Server and database names may not be `*` (reserved for the grant wildcard).
 
 ## Top level
 
@@ -29,6 +27,7 @@ Boot-time validation (issue #16):
 | `admin` | [Admin](#admin) | no | `/admin/v1/*` surface gating — see [admin-api.md](admin-api.md). |
 | `permissions_store` | [PermissionsStore](#permissionsstore) | no | Storage backend for users/databases/grants. Absent → state DB (pg). |
 | `service_accounts` | list of [ServiceAccount](#serviceaccount) | no (defaults `[]`) | Static bearer tokens for headless clients — see [spec 14](../initial-idea/14-service-tokens.md). |
+| `logging` | [Logging](#logging) | no | Audit stream sinks. Absent → none. |
 
 > The top level denies unknown keys: `auth:`, `gateway.bind` or a misspelled
 > section name abort boot. Listener, state DB, TLS and OIDC settings come from
@@ -143,7 +142,8 @@ The gateway never creates or grants either role — see
 | Key | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `enabled` | bool | no | `false` | When `false` (or `admin:` absent), `/admin/*` returns 404 — the route never mounts. |
-| `group` | string | **yes when `enabled: true`** | — | SSO group claim that authorizes admin calls. Empty/whitespace with `enabled: true` aborts boot (every authenticated user would otherwise be an admin). |
+| `group` | string | **yes when `enabled: true`** | — | SSO group claim that authorizes admin calls. Required and non-blank when `enabled: true` — empty/whitespace aborts boot (every authenticated user would otherwise be an admin). Optional and ignored when disabled. |
+| `session_max_age_secs` | u64 | no | no cap | Reject admin requests from sessions older than this many seconds, forcing a re-login. Group membership is frozen at login, so this caps how long someone removed from the admin group in the IdP keeps admin access (otherwise up to `SESSION_TTL_HOURS`). See [spec 04](../initial-idea/04-auth-sso.md). |
 
 ## PermissionsStore
 
@@ -163,11 +163,31 @@ The gateway never creates or grants either role — see
 |---|---|---|---|---|
 | `name` | string | **yes** | — | Stable service identity; becomes the audit identity `service:<name>`. Must match `^[a-z0-9][a-z0-9-]{0,62}$`, unique across the list. |
 | `group` | string | **yes** | — | The single permissions group the token acts as. Must be declared in `permissions:` (an empty `grants:` list recognizes a group that grants nothing) and must not equal `admin.group` when the admin surface is enabled — both abort boot. |
-| `token` | [secret ref](#secret-references) | **yes** | — | `${ENV:…}` or `${FILE:…}` (spec 14 — YAML carries the secret reference, never the bearer value). The loader accepts inline literal tokens (`Password::Literal`) for dev/test parity with `password:` and does not reject them at boot; credential-free committed config is guarded at CI by the `secret-scan` job — ADVISORY: it scans every tracked file (not just YAML) and fails the job on any literal `dbmcp_svc_<64hex>` (`tests/**` fixtures excluded), but does not block a merge until made a required check (#190 follow-up), not by the loader. Inline literals are therefore valid only in programmatic test fixtures constructed via `ConfigFile::from_yaml_str` / `ServiceTokenStore::from_config` directly. Resolved value must match `dbmcp_svc_` followed by exactly 64 lowercase hexadecimal characters (`0-9a-f`) — mint with `bin/mint-service-token <name>`. Short, overlong, non-hex, or mixed-case bodies abort boot with `ServiceTokenError::WeakToken`. Two accounts resolving to the same value abort boot (audit attribution would be ambiguous). |
+| `token` | [secret ref](#secret-references) | **yes** | — | `${ENV:…}` or `${FILE:…}` (spec 14 — YAML carries the secret reference, never the bearer value). An inline literal token is accepted under the default `gateway.env: development` (dev/test parity with `password:`) and **rejected at boot under `gateway.env: production`**. Committed config is also checked in CI by the advisory `secret-scan` job, which fails on any literal `dbmcp_svc_<64hex>` in a tracked file outside its exempt paths. Resolved value must match `dbmcp_svc_` followed by exactly 64 lowercase hexadecimal characters (`0-9a-f`) — mint with `bin/mint-service-token <name>`. Short, overlong, non-hex, or mixed-case bodies abort boot with `ServiceTokenError::WeakToken`. Two accounts resolving to the same value abort boot (audit attribution would be ambiguous). |
 | `max_concurrent_requests` | u32 > 0 | no | `MAX_CONCURRENT_PER_IDENTITY` (16) | In-flight request cap for this token, replacing the per-identity cap so a fleet of agents behind one token is not throttled as one user. The global `MAX_CONCURRENT_REQUESTS` cap still applies. `0` aborts boot. |
 | `require_upstream` | bool | no | `false` | Reject calls that lack the `x-dbmcp-run-id` and `x-dbmcp-on-behalf-of` headers (`invalid_arguments`). The headers are **claimed** by the caller: stored on the audit row, never verified, never used for authorization. The audit identity stays `service:<name>`. |
 
 Minting the first production token is an operator action, not a deploy side effect: run `bin/mint-service-token <name>`, store the value in the secret store, deliver it as a SealedSecret env/file, PR the stanza, roll.
+
+## Logging
+
+`#[serde(deny_unknown_fields)]`. Spec 07 §Storage.
+
+| Key | Type | Required | Default | Notes |
+|---|---|---|---|---|
+| `stream` | list of [StreamSink](#streamsink) | no | `[]` | Fire-and-forget copies of every audit row, in addition to the mandatory synchronous state-DB write. A sink outage never fails a request. |
+
+Hot-tier retention stays env-driven (`AUDIT_RETENTION_DAYS`); there is no
+`archive` key yet.
+
+### StreamSink
+
+Tagged by `kind`; unknown keys and unshipped kinds (`otlp`, `kafka`) abort boot.
+
+| `kind` | Other keys | Notes |
+|---|---|---|
+| `stdout` | none | Emits the full audit row as a tracing event with `target: "audit_stream"` on the JSON stdout log. That target always logs at INFO, whatever `RUST_LOG` says. Lines dropped by a full log queue count in `log_lines_dropped_total` — see [logging.md](logging.md). |
+| `syslog` | `host` (string, non-blank), `port` (u16, non-zero) | RFC 5424 over UDP. Blank `host` or `port: 0` aborts boot. |
 
 ## Grant
 
@@ -217,6 +237,17 @@ Boot-time guarantees (issue #15):
 - Missing or empty file → boot abort with `FileUnreadable` / `FileEmpty(path)`.
 - Malformed `${…}` ref (legacy `${VAR}` syntax, empty `${ENV:}`, unknown
   scheme) → YAML parse error pointing at the line.
+
+## Hot reload
+
+`SIGHUP` re-reads the file, validates it and resolves every secret ref; any
+failure keeps the running config whole. A successful reload swaps
+permissions, service accounts, stream sinks and changed target pools at once.
+Some settings are fixed at boot, and a reload that changes them is refused:
+`admin` (enabled, `group`, `session_max_age_secs`), `permissions_store.driver`,
+and — while the admin API is mounted — the set of server names (adding,
+removing or renaming a server). Reordering `servers:` is not a boot-fixed
+change.
 
 ## What the parser does NOT validate (yet)
 
