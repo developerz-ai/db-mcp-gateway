@@ -42,7 +42,7 @@ Every target call writes an intent — reads and writes alike (owner decision, p
 | `request_id` | Gateway-minted UUID per request (also the `x-request-id` header and the dispatch log line's `request_id`) |
 | `occurred_at` | Server-side `now()` at insert |
 | `user_sub`, `user_email`, `groups` | From the session (see [04-auth-sso](04-auth-sso.md)); `groups` is a JSONB snapshot at request time |
-| `agent_client` | Self-reported MCP client banner (`User-Agent`) |
+| `agent_client` | Self-reported MCP client banner — `User-Agent`, else `x-mcp-client` — cut at the 128-byte cap (on a character boundary) |
 | `ip` | Request socket, as text |
 | `server_name`, `database_name` | Logical names; NULL for tools that address neither, or when the arguments never parsed |
 | `db_type` | `postgres` / `mongo`; NULL for tools that reach no target |
