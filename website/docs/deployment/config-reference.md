@@ -177,8 +177,10 @@ Minting the first production token is an operator action, not a deploy side effe
 |---|---|---|---|---|
 | `stream` | list of [StreamSink](#streamsink) | no | `[]` | Fire-and-forget copies of every audit row, in addition to the mandatory synchronous state-DB write. A sink outage never fails a request. |
 
-Hot-tier retention stays env-driven (`AUDIT_RETENTION_DAYS`); there is no
-`archive` key yet.
+Hot-tier retention stays env-driven (`AUDIT_RETENTION_DAYS`, default 90; it
+covers `audit_calls`, `audit_call_intents` and `permissions_audit`); there is no
+`archive` key yet. Backups of the state DB and the stores that ingest stdout or
+syslog (Loki etc.) are separate retention surfaces — set them to match.
 
 ### StreamSink
 

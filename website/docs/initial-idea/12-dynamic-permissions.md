@@ -91,7 +91,7 @@ Mirrors the query audit invariant from non-negotiable #4: synchronous, write fai
 
 Indexes: `(ts)`, `(actor_id, ts)`, `(target_type, target_id, ts)`.
 
-Retention follows the same pruner pattern as query audit. Permission changes are typically lower volume than queries, so hot-window retention can be longer (90+ days) without strain.
+Retention: the hourly audit pruner deletes `permissions_audit` rows whose `ts` is older than `AUDIT_RETENTION_DAYS` (default 90), with the same cutoff, batching and advisory lock as query audit ([07 §Retention pruning](07-logging-retention.md#retention-pruning)). A change trail needed longer than that must be exported before it ages out. The MySQL store's table is never written by the gateway and is not pruned.
 
 ## Admin API
 

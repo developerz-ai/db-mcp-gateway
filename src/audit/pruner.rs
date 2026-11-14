@@ -1,6 +1,7 @@
-//! Retention pruner. Deletes `audit_call_intents` and `audit_calls` rows
-//! older than the configured hot-storage TTL (spec 07 §"Retention
-//! pruning"); no archive tier ships, so nothing is exported first.
+//! Retention pruner. Deletes `audit_call_intents`, `audit_calls` and
+//! `permissions_audit` rows older than the configured hot-storage TTL
+//! (spec 07 §"Retention pruning"); no archive tier ships, so nothing is
+//! exported first.
 //!
 //! Deletes run in bounded batches, each its own transaction under a
 //! transaction-scoped advisory lock: a large backlog never holds one long
@@ -35,9 +36,20 @@ fn effective_ttl_days(ttl: u32) -> u32 {
     ttl.max(1)
 }
 
-/// Delete every `audit_call_intents` and `audit_calls` row whose
-/// `occurred_at` is older than `ttl_days`. Returns the rows removed across
-/// both tables (zero when another replica holds the lock).
+/// Tables in prune order. Every expired intent goes before any completion:
+/// one cutoff for both keeps "intent survives ⇒ its completion survives" (a
+/// completion is never older than its intent), so the reaper never sees a
+/// kept intent whose completion was pruned and records a call that finished
+/// as `abandoned`. `permissions_audit` is independent of both.
+const PRUNE_ORDER: [AuditTable; 3] = [
+    AuditTable::Intents,
+    AuditTable::Calls,
+    AuditTable::PermissionsChanges,
+];
+
+/// Delete every audit row older than `ttl_days` (`occurred_at`, or `ts` for
+/// `permissions_audit`). Returns the rows removed across all tables (zero
+/// when another replica holds the lock).
 pub async fn run_once(pool: &PgPool, ttl_days: u32) -> Result<u64, AuditError> {
     let days = effective_ttl_days(ttl_days);
     let days = i32::try_from(days).unwrap_or(i32::MAX);
@@ -47,20 +59,20 @@ pub async fn run_once(pool: &PgPool, ttl_days: u32) -> Result<u64, AuditError> {
     prune_before(pool, cutoff).await
 }
 
-/// Delete both tables' rows older than `cutoff`: every expired intent
-/// first, and only then the completions. One cutoff for both keeps "intent
-/// survives ⇒ its completion survives" (a completion is never older than its
-/// intent), so the reaper never sees a kept intent whose completion was
-/// pruned and records a call that finished as `abandoned`.
+/// Delete every table's rows older than `cutoff`, in [`PRUNE_ORDER`]. A table
+/// whose run yields the lock ends the whole run: another replica is pruning,
+/// and expired intents may remain, so their completions must stay until a
+/// run drains them.
 pub async fn prune_before(pool: &PgPool, cutoff: DateTime<Utc>) -> Result<u64, AuditError> {
-    let intents = prune_table(pool, AuditTable::Intents, cutoff).await?;
-    let Drained::Complete = intents.drained else {
-        // Another replica holds the lock mid-run; expired intents may remain,
-        // so their completions must stay until a run drains them.
-        return Ok(intents.deleted);
-    };
-    let calls = prune_table(pool, AuditTable::Calls, cutoff).await?;
-    Ok(intents.deleted + calls.deleted)
+    let mut deleted = 0;
+    for table in PRUNE_ORDER {
+        let pruned = prune_table(pool, table, cutoff).await?;
+        deleted += pruned.deleted;
+        let Drained::Complete = pruned.drained else {
+            break;
+        };
+    }
+    Ok(deleted)
 }
 
 /// Whether a table's backlog was fully deleted or the run yielded the lock.
@@ -126,6 +138,12 @@ mod tests {
     fn ttl_zero_clamps_to_one_day() {
         // `0` would delete every audit row; the floor must hold.
         assert_eq!(effective_ttl_days(0), 1);
+    }
+
+    #[test]
+    fn intents_are_pruned_before_their_completions() {
+        assert_eq!(PRUNE_ORDER[0], AuditTable::Intents);
+        assert_eq!(PRUNE_ORDER[1], AuditTable::Calls);
     }
 
     #[test]
