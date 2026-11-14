@@ -109,6 +109,13 @@ pub enum ExecError {
     #[error("DB unavailable")]
     Unavailable,
 
+    /// `COMMIT` of a write failed without a definitive answer from the
+    /// server (lost connection, protocol error): the write may or may not
+    /// have committed. Client-facing it is still `unavailable`; tools must
+    /// say the outcome is unknown, never that nothing changed.
+    #[error("write outcome unknown: the commit did not complete")]
+    CommitIndeterminate,
+
     #[error("query exceeded the configured statement_timeout")]
     Timeout,
 

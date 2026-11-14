@@ -23,7 +23,7 @@ use super::audit_dispatch::{
     AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, error_outcome, outcome_from_exec_error,
     reject_arguments, run_audited, success_outcome,
 };
-use super::target::{forbidden, record_intent, resolve_target};
+use super::target::{ensure_reason, forbidden, record_intent, resolve_target};
 
 const TOOL_NAME: &str = "describe_schema";
 const ERROR_MESSAGES: ToolErrorMessages = ToolErrorMessages {
@@ -46,6 +46,8 @@ pub struct Arguments {
     pub schema: Option<String>,
     #[serde(default)]
     pub table: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -101,7 +103,7 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
         server: Some(&args.server),
         database: Some(&args.database),
         sql: Some(&read),
-        reason: None,
+        reason: args.reason.as_deref(),
         db_type,
     };
     let args = &args;
@@ -126,6 +128,9 @@ async fn compute_outcome(
     ) else {
         return forbidden();
     };
+    if let Err(rejected) = ensure_reason(&target.constraints, args.reason.as_deref()) {
+        return *rejected;
+    }
 
     if let Err(refused) = record_intent(ctx, TOOL_NAME, &target, Access::ReadOnly).await {
         return *refused;

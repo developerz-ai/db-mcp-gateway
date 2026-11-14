@@ -10,6 +10,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::audit::intent::WRITE_MAY_HAVE_COMMITTED;
 use crate::config::{Action, Grant, ServerKind};
 use crate::exec::{Access, ExecQuery, ExecResult, GuardedSql};
 use crate::mcp::jsonrpc::Response;
@@ -197,8 +198,21 @@ async fn compute_outcome(
         outcome.write = Some(WriteEffect {
             rows_affected: rows_affected.map(|rows| i64::try_from(rows).unwrap_or(i64::MAX)),
         });
+        note_indeterminate_write(&mut outcome);
     }
     outcome
+}
+
+/// A write cut off by the deadline or `cancel_query` may have been cut off
+/// mid-commit: say so in the client message and the audit row instead of
+/// implying nothing happened.
+fn note_indeterminate_write(outcome: &mut Outcome) {
+    if !matches!(outcome.code, OutcomeCode::Timeout | OutcomeCode::Cancelled) {
+        return;
+    }
+    if let Some(message) = outcome.error_message.as_mut() {
+        message.push_str(&format!(" ({WRITE_MAY_HAVE_COMMITTED})"));
+    }
 }
 
 /// The access `sql` needs, after the guard at the caller's grant level:
@@ -244,4 +258,27 @@ fn result_outcome(id: Value, result: &ExecResult, dry_run: bool) -> Outcome {
         outcome.code = OutcomeCode::DryRun;
     }
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_timed_out_write_says_it_may_have_committed() {
+        let mut outcome = error_outcome(OutcomeCode::Timeout, ERROR_MESSAGES.timeout);
+        note_indeterminate_write(&mut outcome);
+        let message = outcome.error_message.unwrap_or_default();
+        assert!(message.contains(WRITE_MAY_HAVE_COMMITTED), "{message}");
+    }
+
+    #[test]
+    fn a_rejected_write_is_not_called_indeterminate() {
+        let mut outcome = error_outcome(OutcomeCode::SyntaxError, ERROR_MESSAGES.sql_rejected);
+        note_indeterminate_write(&mut outcome);
+        assert_eq!(
+            outcome.error_message.as_deref(),
+            Some(ERROR_MESSAGES.sql_rejected)
+        );
+    }
 }

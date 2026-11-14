@@ -15,6 +15,7 @@ use std::time::Duration;
 use common::audit::{DispatchSinks, calls_for_request, find_audit, find_intent};
 use common::cleanup::delete_audit_calls;
 use common::env::{state_db_url, state_pool};
+use db_mcp_gateway::audit::reaper::ReapCursor;
 use db_mcp_gateway::audit::{self, CallIntent};
 use db_mcp_gateway::auth::{Identity, SessionId};
 use db_mcp_gateway::exec::Access;
@@ -81,7 +82,7 @@ async fn intent_without_completion_is_reaped_as_abandoned() {
         find_intent(&p, &orphan.to_string()).await.as_deref(),
         Some("write")
     );
-    audit::reaper::run_once(&p, audit::reaper::REAPER_GRACE)
+    audit::reaper::run_once(&p, audit::reaper::REAPER_GRACE, &mut ReapCursor::default())
         .await
         .expect("sweep inside the grace runs");
     assert!(calls_for_request(&p, &orphan.to_string()).await.is_empty());
@@ -108,7 +109,7 @@ async fn intent_without_completion_is_reaped_as_abandoned() {
     )
     .await;
 
-    let reaped = audit::reaper::run_once(&p, Duration::ZERO)
+    let reaped = audit::reaper::run_once(&p, Duration::ZERO, &mut ReapCursor::default())
         .await
         .expect("reaper sweep runs");
     assert!(
@@ -131,7 +132,7 @@ async fn intent_without_completion_is_reaped_as_abandoned() {
     assert_eq!(completed_rows[0].0, "success");
 
     // A second sweep finds nothing new for these intents.
-    audit::reaper::run_once(&p, Duration::ZERO)
+    audit::reaper::run_once(&p, Duration::ZERO, &mut ReapCursor::default())
         .await
         .expect("second sweep runs");
     assert_eq!(calls_for_request(&p, &orphan.to_string()).await.len(), 1);

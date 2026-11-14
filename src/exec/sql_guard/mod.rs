@@ -21,7 +21,8 @@
 //!
 //! Anything not explicitly recognised — a write hidden in a CTE or subquery,
 //! `SELECT ... FOR UPDATE/SHARE`, `SELECT ... INTO`, `EXPLAIN ANALYZE` in
-//! either spelling (`ANALYZE` keyword or `(ANALYZE)` option — both execute)
+//! any spelling (`ANALYZE` keyword or `(ANALYZE)` / `(ANALYSE)` option — all
+//! execute)
 //! — is rejected with a typed error. Conservative on purpose: better
 //! to reject a legitimate exotic statement than quietly send an unintended one.
 //!
@@ -186,12 +187,17 @@ fn required_access(stmt: &Statement) -> Access {
 /// parenthesised form (`EXPLAIN (ANALYZE, FORMAT JSON) …`) leaves `analyze`
 /// false and lands the flag in `options`. Both execute; both must be caught.
 ///
+/// Postgres also accepts the British spelling `ANALYSE` for the option, so
+/// both names match.
+///
 /// An explicit `(ANALYZE false)` is rejected too: the guard does not interpret
 /// option arguments, and there is no reason to write that form.
 fn explain_analyzes(analyze: bool, options: Option<&[UtilityOption]>) -> bool {
     analyze
         || options.is_some_and(|opts| {
-            opts.iter()
-                .any(|opt| opt.name.value.eq_ignore_ascii_case("analyze"))
+            opts.iter().any(|opt| {
+                let name = &opt.name.value;
+                name.eq_ignore_ascii_case("analyze") || name.eq_ignore_ascii_case("analyse")
+            })
         })
 }

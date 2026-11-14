@@ -9,11 +9,14 @@ mod permissions;
 mod retention;
 
 pub use history::select_user_history;
-pub use intents::{insert_intent, reap_abandoned_intents, select_owned_request_ids};
+pub use intents::{
+    IntentKey, ReapBatch, insert_intent, reap_abandoned_batch, select_intent_access,
+    select_owned_request_ids,
+};
 pub use permissions::insert_permissions_change;
 #[cfg(any(test, debug_assertions))]
 pub use permissions::latest_permissions_change;
-pub use retention::{AuditTable, delete_expired_batch};
+pub use retention::{AuditTable, delete_expired_batch, retention_cutoff};
 
 use sqlx::PgPool;
 #[cfg(any(test, debug_assertions))]

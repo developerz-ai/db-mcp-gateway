@@ -71,6 +71,35 @@ fn write_mode_allows_explain_of_a_write() {
     );
 }
 
+/// Postgres accepts the British spelling `ANALYSE` everywhere it accepts
+/// `ANALYZE`, and it executes just the same. Under a write grant an
+/// unrecognised spelling would run and commit the write while the guard
+/// classified the call as a plain EXPLAIN.
+#[test]
+fn write_mode_rejects_explain_analyse_spelling() {
+    for sql in [
+        "EXPLAIN (ANALYSE) DELETE FROM users",
+        "EXPLAIN (analyse) DELETE FROM users",
+        "EXPLAIN (ANALYSE true) DELETE FROM users",
+        "EXPLAIN (ANALYSE on, FORMAT JSON) UPDATE users SET x = 1",
+        "EXPLAIN (ANALYZE on) INSERT INTO t VALUES (1)",
+    ] {
+        rejected_write(sql, GuardError::ExplainAnalyze);
+    }
+    // sqlparser 0.63 does not know the bare `ANALYSE` keyword and fails the
+    // parse; a bump that learns it sets `analyze`. Either way, never Ok.
+    for sql in [
+        "EXPLAIN ANALYSE DELETE FROM users",
+        "EXPLAIN ANALYSE VERBOSE DELETE FROM users",
+    ] {
+        let got = check_sql(sql, Access::ReadWrite);
+        assert!(
+            matches!(got, Err(GuardError::Parse | GuardError::ExplainAnalyze)),
+            "expected `{sql}` rejected, got {got:?}"
+        );
+    }
+}
+
 #[test]
 fn write_mode_still_blocks_schema_mods() {
     // "write data, no schema mods" — DDL and privilege ops stay blocked

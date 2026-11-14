@@ -38,3 +38,19 @@ pub async fn record(pool: &PgPool, intent: &CallIntent<'_>) -> Result<(), AuditE
         Err(_) => Err(AuditError::Timeout(AUDIT_WRITE_TIMEOUT)),
     }
 }
+
+/// Appended to the `error_message` of a write-access call whose outcome is
+/// unknown (`timeout`, `cancelled`): the statement may have committed before
+/// the gateway stopped waiting. Same wording the reaper uses for `abandoned`.
+pub const WRITE_MAY_HAVE_COMMITTED: &str = "access: write; the statement may have committed";
+
+/// The access the intent of `request_id` recorded, under the audit write
+/// deadline. `None` when no intent was committed: the call never reached the
+/// target.
+pub async fn access_of(pool: &PgPool, request_id: &str) -> Result<Option<Access>, AuditError> {
+    let read = crate::state::audit::select_intent_access(pool, request_id);
+    match tokio::time::timeout(AUDIT_WRITE_TIMEOUT, read).await {
+        Ok(result) => result.map_err(AuditError::Write),
+        Err(_) => Err(AuditError::Timeout(AUDIT_WRITE_TIMEOUT)),
+    }
+}
