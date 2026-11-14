@@ -41,20 +41,21 @@ Out of scope:
 
 ## Supported Versions
 
-| Version | Released | End of Life | Support |
-|---------|----------|-------------|---------|
-| 1.0.x   | 2026-06-30 | 2027-06-30 | ✅ Active |
-| 0.2.x   | 2026-06-15 | 2026-12-30 | ⚠️ Security fixes only |
-| 0.1.1   | 2026-03-10 | 2026-09-30 | ❌ Unsupported |
-| 0.1.0   | 2026-02-01 | 2026-08-01 | ❌ Unsupported |
+Security fixes ship in a new release on top of the **latest** `2.x` version, as a new image tag
+(`ghcr.io/developerz-ai/db-mcp-gateway:<version>`; the moving `2` and `latest` tags follow it).
+There is no long-term support line: to pick up a fix, upgrade to the newest `2.x` release. Moving
+from `1.x` is covered by
+[`website/docs/deployment/upgrading-to-2.md`](website/docs/deployment/upgrading-to-2.md).
 
-### Security fix policy
+| Version | Supported |
+|---|---|
+| Latest `2.x` release | ✅ |
+| Older `2.x` releases | Fixed by upgrading to the latest `2.x` |
+| `1.x` and older | ❌ Upgrade to `2.x` |
 
-- **1.0.x (current):** Critical and high-severity fixes + active development.
-- **0.2.x:** Critical and high-severity security fixes only. No new features.
-- **<0.2.0:** No further updates. Upgrade to 0.2.x or 1.0.x.
-
-Critical fixes are backported to the oldest supported version and released within 2 weeks of the fix being ready.
+A fix for an advisory a first-tier source confirms (CISA KEV, NVD, GitHub Security Advisories, or
+the affected vendor) is released within a day of merging (a daily check), without waiting for the weekly release
+window. A backport to an older line is a maintainer's call per advisory, never a promise.
 
 ---
 

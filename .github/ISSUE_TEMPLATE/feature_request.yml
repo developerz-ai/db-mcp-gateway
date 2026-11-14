@@ -1,0 +1,36 @@
+name: Feature request
+description: Suggest a capability the gateway should have.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The gateway's non-negotiables (CLAUDE.md) are fixed: credentials never leave the
+        gateway, every DB call is audited against an SSO-verified identity, read-only by
+        default, synchronous audit, permissions only by reviewed YAML or the audited admin
+        API. A proposal that needs one of them relaxed will be declined with the rule quoted.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: The use case, not just the feature. What can't you or your agents do today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: The MCP tool, config key or behaviour you have in mind, and how it would be audited.
+    validations:
+      required: true
+  - type: input
+    id: spec
+    attributes:
+      label: Spec reference (if any)
+      description: The page under website/docs/initial-idea/ this extends or changes.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false

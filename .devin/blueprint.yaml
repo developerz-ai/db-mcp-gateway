@@ -1,0 +1,47 @@
+# https://docs.devin.ai/onboard-devin/environment-yaml
+# Commands run from the repo root. Owned by this repository's maintainers.
+
+# Baked into the snapshot: the Rust toolchain rust-toolchain.toml pins (rustup reads the file),
+# the test runner CI uses, cargo-audit, and the dev stack's images.
+initialize: |
+  if ! command -v rustup >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+  fi
+  . "$HOME/.cargo/env"
+  rustup show active-toolchain || rustup toolchain install
+  cargo install --locked cargo-nextest@0.9.151
+  cargo install --locked cargo-audit
+  docker compose -f docker-compose.dev.yml pull
+  cargo fetch --locked
+
+# Per session: containers do not survive the snapshot, and the cargo registry does.
+maintenance: |
+  . "$HOME/.cargo/env"
+  bin/dev up
+  cargo fetch --locked
+
+knowledge:
+  - name: stack
+    contents: |
+      Integration tests run against real databases (never a mocked target DB):
+      `bin/dev up` starts state-db (Postgres, 127.0.0.1:5433), target-db (Postgres, :5434),
+      permissions-mysql and target-mongo, and waits until all are healthy. `bin/test` starts
+      the stack itself. `bin/dev reset` drops the volumes for a fresh database.
+  - name: check
+    contents: |
+      bin/ci      # the full gate CI runs: bin/lint, bin/test, cargo audit, website build
+      bin/lint    # cargo fmt --check + clippy -D warnings (debug and --release)
+      bin/test    # cargo test --all-targets --all-features against the dev stack
+      A missing required tool or an unhealthy stack makes bin/ci exit 75: fix the box,
+      not the change.
+  - name: test
+    contents: |
+      cargo test --test <integration test name>
+      cargo test <module::path>
+      cargo test --test public_tree   # no DB; fails on internal hosts or home paths in tracked files
+  - name: rules
+    contents: |
+      CLAUDE.md is binding. Never put a connection string, password or token in a response,
+      error, log, issue or PR. A PR touching src/auth, src/authz, src/audit, src/exec,
+      src/tools, src/state or credential loading carries the `security review required`
+      label and is merged by a human.

@@ -1,0 +1,51 @@
+name: workflow-lint
+
+# actionlint over every workflow (expression and type errors, unknown inputs, bad `needs`,
+# shellcheck on `run:` blocks) and the Claude Code hook tests. Advisory, not a ruleset-required
+# check: it runs only when a workflow or a hook changes, and a path-filtered required check would
+# never report on other PRs.
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".claude/hooks/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - ".claude/hooks/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  actionlint:
+    # GitHub-hosted runner: this repository is public.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The image bundles shellcheck; pinned by digest so the linter cannot change under us.
+      - name: actionlint
+        run: >-
+          docker run --rm -v "$PWD:/repo" -w /repo
+          rhysd/actionlint:1.7.7@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9
+          -no-color
+
+  hooks:
+    # GitHub-hosted runner: this repository is public. The runner's python3 is enough: stdlib only.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: hook tests
+        run: python3 -I .claude/hooks/test_hooks.py -v

@@ -9,6 +9,8 @@ language: en-US
 early_access: false
 enable_free_tier: true
 
+# Hard cap: 250 characters (this one is 245). Over that, CodeRabbit rejects the whole file and
+# silently reviews with its defaults instead.
 tone_instructions: "db-mcp-gateway: Rust, axum, sqlx, tokio. CLAUDE.md Non-negotiables are absolute: no creds in logs/errors/responses, no skipped audit, no mocked target DB, no admin UI. Spec: website/docs/initial-idea/**. Cite the rule. Concrete diffs, skip nits."
 
 reviews:
@@ -49,6 +51,13 @@ reviews:
     biome: { enabled: false }
     eslint: { enabled: false }
     rubocop: { enabled: false }
+
+  # No bot-authored follow-up PRs: docstrings and tests are written with the change.
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
 
   path_instructions:
     - path: "**/*"
@@ -215,6 +224,19 @@ reviews:
       instructions: |
         Multi-stage build. Distroless or chiseled base. Non-root user.
         Healthcheck on the MCP endpoint. No build secrets baked in.
+
+    - path: ".dz/briefs/**"
+      instructions: |
+        A brief is executed by an agent with shell access on a schedule. Its bash must fail
+        loudly on an unreadable API response rather than read it as empty, and an unreadable
+        signal is "no verdict", never healthy. Titles it files are stable (no sha, URL or
+        version). tests/brief_rows.rs pins health.md's signal table against its Rows list.
+
+    - path: ".claude/hooks/**"
+      instructions: |
+        Python 3 stdlib hooks wired in .claude/settings.json. They must fail open (exit 0)
+        on anything they cannot parse, never block normal work, and never print a secret.
+        A new refusal names the CLAUDE.md rule or brief it enforces.
 
     - path: "**/*.md"
       instructions: |
