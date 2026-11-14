@@ -13,7 +13,8 @@
 //! The `*SCAN` family is the one place the rejector rewrites the argv: its
 //! `COUNT` hint is clamped to [`MAX_SCAN_COUNT`] (and injected when absent),
 //! so one call cannot ask the server to walk an unbounded slice of the
-//! keyspace.
+//! keyspace. Every other bound depends on the call's row limit and is
+//! applied when the command runs (`super::bounded`).
 
 use serde_json::Value;
 
@@ -135,6 +136,9 @@ pub enum RejectReason {
 
     #[error("redis command `{0}` needs COUNT to be a positive integer")]
     InvalidCount(&'static str),
+
+    #[error("redis command `{0}` needs its count to be an integer")]
+    NonIntegerCount(&'static str),
 }
 
 impl RejectReason {
@@ -148,6 +152,7 @@ impl RejectReason {
                 | Self::NonStringArgument(_)
                 | Self::MissingArgument { .. }
                 | Self::InvalidCount(_)
+                | Self::NonIntegerCount(_)
         )
     }
 }
@@ -175,6 +180,16 @@ pub fn validate_command(json: &str) -> Result<Command, RejectReason> {
     let shape = match name {
         "SCAN" => scan_options(name, &mut args, 1, true)?,
         "SSCAN" | "HSCAN" | "ZSCAN" => scan_options(name, &mut args, 2, false)?,
+        "HRANDFIELD" | "SRANDMEMBER" | "ZRANDMEMBER" => {
+            // The executor clamps the count; it must be a number to clamp.
+            if args
+                .get(1)
+                .is_some_and(|count| count.parse::<i64>().is_err())
+            {
+                return Err(RejectReason::NonIntegerCount(name));
+            }
+            Shape::for_command(name, &args)
+        }
         _ => Shape::for_command(name, &args),
     };
     Ok(Command { name, args, shape })

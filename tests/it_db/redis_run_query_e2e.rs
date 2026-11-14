@@ -165,21 +165,41 @@ async fn run_query_answers_a_malformed_argv_with_invalid_arguments() {
     f.finish().await;
 }
 
-/// `describe_schema` and `explain` have no Redis meaning: a stable
-/// `unsupported_backend`, audited.
+/// Every per-database tool but `run_query` has no Redis meaning: a stable,
+/// audited `unsupported_backend` — `cancel_query` included, answered before
+/// its ownership lookup (an unknown request_id would otherwise be
+/// `forbidden`).
 #[tokio::test]
 #[serial_test::parallel(world)]
-async fn describe_schema_and_explain_are_unsupported_backend() {
+async fn every_other_per_database_tool_is_unsupported_backend() {
     let f = Fixture::new().await;
     for flavor in Flavor::ALL {
+        let (server, database) = (flavor.name(), DB_INDEX);
+        let unknown_request = uuid::Uuid::new_v4().to_string();
         for (tool, arguments) in [
             (
                 "describe_schema",
-                json!({ "server": flavor.name(), "database": DB_INDEX }),
+                json!({ "server": server, "database": database }),
             ),
             (
                 "explain",
-                json!({ "server": flavor.name(), "database": DB_INDEX, "sql": r#"["GET","k"]"# }),
+                json!({ "server": server, "database": database, "sql": r#"["GET","k"]"# }),
+            ),
+            (
+                "sample_table",
+                json!({ "server": server, "database": database, "table": "anything" }),
+            ),
+            (
+                "table_stats",
+                json!({ "server": server, "database": database }),
+            ),
+            (
+                "db_activity",
+                json!({ "server": server, "database": database }),
+            ),
+            (
+                "cancel_query",
+                json!({ "server": server, "database": database, "request_id": unknown_request }),
             ),
         ] {
             let resp = f.call(tool, arguments).await;
@@ -187,11 +207,11 @@ async fn describe_schema_and_explain_are_unsupported_backend() {
             assert_eq!(
                 tool_payload(&resp)["code"],
                 "unsupported_backend",
-                "{tool}: {resp}"
+                "{tool} on {server}: {resp}"
             );
             let row = f.latest(tool, tool).await;
-            assert_eq!(row.outcome, "unsupported_backend", "{tool}");
-            assert_eq!(row.db_type.as_deref(), Some("redis"), "{tool}");
+            assert_eq!(row.outcome, "unsupported_backend", "{tool} on {server}");
+            assert_eq!(row.db_type.as_deref(), Some("redis"), "{tool} on {server}");
         }
     }
     f.finish().await;

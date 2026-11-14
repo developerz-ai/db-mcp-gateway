@@ -156,7 +156,9 @@ servers:
 - **TLS** is `rediss://`-equivalent over rustls. `required` and
   `verify_full` both verify chain and hostname, like Mongo; `tls_ca_file`
   (with `verify_full` only) replaces the system roots. `insecure` is plain
-  TCP, with the usual boot warning. No client certificates (mTLS). The
+  TCP, with the usual boot warning. A wrong CA, a hostname mismatch or a CA
+  outside the trusted roots is refused before `AUTH` is sent (`unavailable`;
+  covered by tests). No client certificates (mTLS). The
   client is built from `host` / `port` / `tls` / `role` / `password` — the
   gateway never assembles a `redis://` URL, so no connection string exists
   to leak into a log or error.
@@ -198,10 +200,9 @@ database index is not `0` (see the security note below the table).
 | `%R~app:*` | **Read-only** access to keys matching `app:*`. `%R~` (Redis 7+) grants read permission only, so even a command that slipped past the gateway's allowlist could not write those keys. Repeat for more patterns; use `%R~*` for the whole keyspace. |
 | `resetchannels` | No Pub/Sub channels — the gateway never subscribes. |
 | `-@all` | Starts from no commands at all. |
-| `+@read` | Adds the read-only command category. |
+| `+@read` | Adds the read-only command category. It includes `HSCAN` / `SSCAN`, which the gateway uses internally to serve `HGETALL`, `HKEYS`, `HVALS` and `SMEMBERS` in bounded steps — a hand-written ACL that lists commands one by one must allow them too. |
 | `-keys` | Removes `KEYS` again (it is in `@read`); it blocks the server for the whole keyspace walk. The gateway refuses it too — this makes the ACL agree. |
-
-| `-scan -dbsize` (optional) | Removes `SCAN` and `DBSIZE`. Add them when key *names* are sensitive — see below. Agents then cannot list keys and must know them. |
+| `-scan -dbsize` (optional) | Removes `SCAN` and `DBSIZE`. Add them when key *names* are sensitive — see below. Leave `HSCAN` / `SSCAN` in place. Agents then cannot list keys and must know them. |
 | `+select` (non-zero DB only) | The gateway selects the configured index on connect; without it a DB other than `0` fails to connect. |
 
 > **ACL key patterns do not filter `SCAN` or `DBSIZE`.** A user limited to

@@ -105,3 +105,54 @@ async fn a_stalled_server_times_out_and_the_connection_is_discarded() {
         delete_keys(&mut side, &[&first, &second]).await;
     }
 }
+
+/// A saturated pool is `unavailable` after the acquire bound (5 s), not a
+/// `timeout` of the waiting caller's command — the Postgres adapter's
+/// contract. The only connection is pinned by a command the paused server
+/// cannot answer yet; it completes once the pause ends.
+#[tokio::test]
+#[serial_test::serial(world)]
+async fn a_saturated_pool_is_unavailable_not_timeout() {
+    const HOLD_MS: u64 = 7_000;
+    for flavor in Flavor::ALL {
+        let one = PoolSizing {
+            max_connections: NonZeroU32::MIN.get(),
+            ..PoolSizing::default()
+        };
+        let a = std::sync::Arc::new(adapter(flavor, one).await);
+        let mut side = admin(flavor).await;
+        let key = unique_key("held");
+        admin_cmd(&mut side, &["SET", &key, "held"]).await;
+        a.execute(query(r#"["DBSIZE"]"#, None))
+            .await
+            .expect("warm the one connection");
+
+        admin_cmd(&mut side, &["CLIENT", "PAUSE", &HOLD_MS.to_string(), "ALL"]).await;
+        let holder = {
+            let a = std::sync::Arc::clone(&a);
+            let argv = format!(r#"["GET","{key}"]"#);
+            tokio::spawn(async move { a.execute(query(&argv, None)).await.map(|r| r.rows) })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = Instant::now();
+        let waiting = a.execute(query(r#"["DBSIZE"]"#, Some(1_000))).await;
+        let waited = started.elapsed();
+        assert!(
+            matches!(waiting, Err(ExecError::Unavailable)),
+            "{}: {waiting:?}",
+            flavor.name()
+        );
+        assert!(
+            waited >= Duration::from_secs(4),
+            "{waited:?}: the acquire bound, not the 1 s budget"
+        );
+        let held = holder.await.expect("holder task");
+        assert_eq!(
+            held.expect("holder read"),
+            vec![vec![json!("held")]],
+            "{}",
+            flavor.name()
+        );
+        delete_keys(&mut side, &[&key]).await;
+    }
+}

@@ -227,6 +227,16 @@ Pass the returned `next_cursor` back as the cursor; `"0"` means the scan is done
 
 A `score` is the server's decimal text — `"2.5"`, not `2.5` — so no precision is lost. An empty `SCAN`-family page is one row with `next_cursor` set and the item columns `null`, so the cursor is never lost; when the row cap cuts a page, the keys past the cap are dropped (`truncated: true`) and the next cursor will not return them — lower `COUNT` or narrow `MATCH`. Elsewhere `null` is Redis' nil reply (missing key or field). A value that is not valid UTF-8 comes back as `{"base64": "…"}`; a non-UTF-8 stream field name becomes the key `base64:<encoded>`.
 
+**Big replies are bounded before they are sent.** The gateway never asks Redis for more than `row_limit + 1` items (the extra one detects truncation) or 32 MiB:
+
+- `LRANGE`, `ZRANGE` (index, `BYSCORE`, `BYLEX`, `REV`), `ZREVRANGE*`, `ZRANGEBY*`, `XRANGE` / `XREVRANGE`, `LPOS`: the stop index, `LIMIT` or `COUNT` is clamped to the cap (or appended). `LPOS` `MAXLEN` is held to 100,000.
+- `HRANDFIELD`, `SRANDMEMBER`, `ZRANDMEMBER`: the count is clamped to the cap, sign kept; a non-integer count is `invalid_arguments`.
+- `HGETALL`, `HKEYS`, `HVALS`, `SMEMBERS`: run as an internal `HSCAN` / `SSCAN` loop that stops at the cap or 32 MiB. Same output shape; `HGETALL` order is scan order. A custom ACL must allow `HSCAN` / `SSCAN` (both are in `+@read`).
+- `SUNION`, `SINTER`, `SDIFF`: refused `forbidden_sql` when `SCARD` says the result could exceed `row_limit` — read the sets with `SSCAN`, or count with `SINTERCARD`.
+- `GET`, `HGET`, `GETRANGE`, `SUBSTR`: a value over 32 MiB is never fetched — zero rows, `truncated: true`. `MGET`, `HMGET`: at most the cap's worth of keys, and only as many as fit 32 MiB.
+
+A key that grows between the size check and the read is caught by the timeout. A saturated pool (no connection within 5 s) or a refused TLS handshake is `unavailable`.
+
 Server errors map to the shared codes: `NOPERM` → `permission_denied`; `WRONGTYPE` and other `ERR …` replies → `syntax_error` (code and message, ACL username shown as `<role>`); connection trouble → `unavailable`.
 
 ## Timeout + row cap
@@ -248,7 +258,7 @@ permissions:
 | Constraint | Postgres / YugabyteDB | MongoDB | Redis |
 |---|---|---|---|
 | `statement_timeout_ms` (clamped to 30 s) | `SET LOCAL statement_timeout` + Tokio deadline | `maxTimeMS` on the command (code 50 `MaxTimeMSExpired` → `timeout`) + Tokio deadline | Tokio deadline only, at exactly the effective timeout — Redis has no per-command server timeout. The connection of a command cut off is closed, never reused |
-| `row_limit` | Stop collecting at the limit, `truncated: true` | Server-side limit of `row_limit + 1` on `find` / `aggregate`, then stop collecting; `truncated: true` | Reply truncated at the limit, `truncated: true`; `SCAN` `COUNT` ≤ 1,000 |
+| `row_limit` | Stop collecting at the limit, `truncated: true` | Server-side limit of `row_limit + 1` on `find` / `aggregate`, then stop collecting; `truncated: true` | Each command is bounded before it is sent (see below); `truncated: true` when the cap cut anything; `SCAN` `COUNT` ≤ 1,000 |
 | 32 MiB result budget | yes | yes | yes |
 
 The Tokio deadline is belt-and-suspenders on Postgres and Mongo — if the server ignores its own cap, the future still completes. On Redis it is the only bound, which is why the allowlist excludes everything that blocks or runs unbounded.

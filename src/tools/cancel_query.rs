@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::config::{Action, Grant};
+use crate::config::{Action, Grant, ServerKind};
 use crate::exec::Access;
 use crate::mcp::jsonrpc::Response;
 
@@ -92,6 +92,14 @@ async fn compute_outcome(
     };
     if let Err(rejected) = ensure_reason(&target.constraints, args.reason.as_deref()) {
         return *rejected;
+    }
+    // Redis commands cannot be cancelled: the answer is the same for every
+    // request_id, so it comes before the ownership lookup and probes nothing.
+    if target.server.kind == ServerKind::Redis {
+        return error_outcome(
+            OutcomeCode::UnsupportedBackend,
+            "cancel_query is not supported on this database's backend",
+        );
     }
     if let Err(rejected) = ensure_owned(ctx, &target, victim).await {
         return *rejected;

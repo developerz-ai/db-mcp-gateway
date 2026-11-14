@@ -180,3 +180,21 @@ fn the_shape_follows_the_command_and_its_flags() {
     // A key literally named WITHSCORES is a key, not the flag.
     assert_eq!(shape(r#"["ZRANGE","WITHSCORES","0","-1"]"#), Shape::Value);
 }
+
+#[test]
+fn a_random_count_must_be_an_integer() {
+    for argv in [
+        r#"["SRANDMEMBER","s","lots"]"#,
+        r#"["HRANDFIELD","h","1.5","WITHVALUES"]"#,
+        r#"["ZRANDMEMBER","z","-"]"#,
+    ] {
+        let err = validate_command(argv).expect_err(argv);
+        assert!(
+            matches!(err, RejectReason::NonIntegerCount(_)),
+            "{argv}: {err:?}"
+        );
+        assert!(err.is_malformed(), "{argv}");
+    }
+    assert!(validate_command(r#"["SRANDMEMBER","s","-2000000000"]"#).is_ok());
+    assert!(validate_command(r#"["SRANDMEMBER","s"]"#).is_ok());
+}

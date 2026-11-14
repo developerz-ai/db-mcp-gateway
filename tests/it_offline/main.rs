@@ -11,6 +11,7 @@ mod auth_reserved_subject;
 mod isolation_guard;
 mod oauth_discovery;
 mod permissions_shipped_yml;
+mod redis_tls;
 mod tls_reload;
 mod transport;
 mod transport_wave2_mcp_headers;

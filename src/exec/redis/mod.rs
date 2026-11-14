@@ -12,6 +12,7 @@
 //! is assembled from structured parts (host, port, ACL user, password, db
 //! index), and the hand-rolled `Debug` prints only the `server/db` label.
 
+mod bounded;
 mod db_index;
 mod error;
 mod pool;
@@ -39,10 +40,16 @@ use super::pool_sizing::PoolSizing;
 use super::query::{
     ActivityQuery, ExecQuery, ExplainQuery, SampleQuery, SchemaQuery, TableStatsQuery,
 };
+use bounded::{BoundError, Fetched};
 use error::connection_survives;
-use pool::ConnPool;
+use pool::{ConnPool, Lease};
 use rejector::Command;
-use shape::shape_reply;
+use shape::{Shaped, shape_reply};
+
+/// Bound on waiting for a pooled connection, or opening one — spent before
+/// the statement budget starts. Same value and meaning as the Postgres
+/// adapter's acquire timeout.
+const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Per-`(server, database)` Redis adapter: one pool per logical database, so
 /// a slow command on one never blocks another.
@@ -127,34 +134,60 @@ impl RedisAdapter {
         })
     }
 
-    /// Lease a connection, send one accepted command, shape the reply. The
-    /// connection goes back to the pool only after a complete reply; if this
-    /// future is dropped mid-command (timeout, agent disconnect) the lease
-    /// drops with it and the connection is closed, never reused.
-    async fn run(&self, command: Command, row_limit: u32) -> Result<ExecResult, ExecError> {
-        let started = Instant::now();
-        let mut lease = self
-            .pool
-            .lease()
-            .await
-            .map_err(|err| self.classify_connect(err))?;
-        let sent = redis::cmd(command.name)
-            .arg(&command.args)
-            .query_async::<redis::Value>(lease.conn())
-            .await;
-        let reply = match sent {
-            Ok(reply) => {
-                lease.release().await;
-                reply
+    /// A pooled connection, waited for at most [`POOL_ACQUIRE_TIMEOUT`] —
+    /// outside the statement budget, as on Postgres: a saturated pool is
+    /// `unavailable`, never a `timeout` of the caller's command.
+    async fn lease(&self) -> Result<Lease, ExecError> {
+        match tokio::time::timeout(POOL_ACQUIRE_TIMEOUT, self.pool.lease()).await {
+            Ok(Ok(lease)) => Ok(lease),
+            Ok(Err(err)) => Err(self.classify_connect(err)),
+            Err(_elapsed) => {
+                tracing::warn!(db = %self.db_label, "redis pool acquire timed out");
+                Err(ExecError::Unavailable)
             }
-            Err(err) => {
+        }
+    }
+
+    /// Run one accepted command bounded to `row_limit` and shape the reply.
+    /// The connection goes back to the pool only after complete replies; if
+    /// this future is dropped mid-command (timeout, agent disconnect) the
+    /// lease drops with it and the connection is closed, never reused.
+    async fn run(
+        &self,
+        mut lease: Lease,
+        command: Command,
+        row_limit: u32,
+    ) -> Result<ExecResult, ExecError> {
+        let started = Instant::now();
+        let fetched = match bounded::fetch(lease.conn(), &command, row_limit).await {
+            Ok(fetched) => {
+                lease.release().await;
+                fetched
+            }
+            Err(BoundError::Refused(reason)) => {
+                lease.release().await;
+                return Err(ExecError::Forbidden(reason));
+            }
+            Err(BoundError::Redis(err)) => {
                 if connection_survives(&err) {
                     lease.release().await;
                 }
                 return Err(self.classify_command(err));
             }
         };
-        let shaped = shape_reply(command.shape, reply, row_limit)?;
+        let shaped = match fetched {
+            Fetched::Reply(reply) => shape_reply(command.shape, reply, row_limit)?,
+            Fetched::Partial(reply) => Shaped {
+                truncated: true,
+                ..shape_reply(command.shape, reply, row_limit)?
+            },
+            // Only single-value commands (shape `value`) answer `TooLarge`.
+            Fetched::TooLarge => Shaped {
+                columns: vec!["value".to_string()],
+                rows: Vec::new(),
+                truncated: true,
+            },
+        };
         Ok(ExecResult {
             columns: shaped.columns,
             rows: shaped.rows,
@@ -173,14 +206,16 @@ impl DbAdapter for RedisAdapter {
     ///
     /// **Timeout** — Redis has no per-command server-side timeout, so the
     /// gateway budget ([`effective_timeout_ms`]) is enforced client-side
-    /// over the lease *and* the command; on expiry the connection is
-    /// discarded with the dropped future.
+    /// over the command (and any precheck it needs); on expiry the
+    /// connection is discarded with the dropped future. Waiting for a pooled
+    /// connection is bounded separately (`lease`).
     async fn execute(&self, query: ExecQuery<'_>) -> Result<ExecResult, ExecError> {
         let command = rejector::validate_command(query.sql)
             .map_err(|err| ExecError::Forbidden(err.to_string()))?;
+        let lease = self.lease().await?;
         let budget =
             Duration::from_millis(u64::from(effective_timeout_ms(query.statement_timeout_ms)));
-        match tokio::time::timeout(budget, self.run(command, query.row_limit)).await {
+        match tokio::time::timeout(budget, self.run(lease, command, query.row_limit)).await {
             Ok(result) => result,
             Err(_elapsed) => Err(ExecError::Timeout),
         }

@@ -52,6 +52,8 @@ mod permissions_repo_mysql;
 mod permissions_repo_real_db;
 mod permissions_resolver_real_db;
 mod permissions_tx_updates_real_db;
+mod redis_bounded_real_db;
+mod redis_bounded_values_real_db;
 mod redis_query_real_db;
 mod redis_run_query_e2e;
 mod redis_timeout_real_db;

@@ -49,7 +49,17 @@ impl RedisAdapter {
             tracing::warn!(error_kind = "server", code, "target connect failed");
             return ExecError::Connection;
         }
-        self.classify_transport(err)
+        // Unreachable or timed out: the target is down. Anything else — a
+        // TLS certificate the client refused, a bad client config — is the
+        // connection's setup failing, never the agent's command.
+        let (kind, mapped) = if err.kind() == ErrorKind::Io || err.is_io_error() || err.is_timeout()
+        {
+            ("io", ExecError::Unavailable)
+        } else {
+            ("setup", ExecError::Connection)
+        };
+        tracing::warn!(error_kind = kind, "target connect failed");
+        mapped
     }
 
     fn classify_transport(&self, err: RedisError) -> ExecError {

@@ -8,7 +8,9 @@
 //! the admin side connection.
 
 use db_mcp_gateway::config::{Database, Password, Server, ServerKind, Tls};
-use db_mcp_gateway::exec::{PoolSizing, RedisAdapter};
+use db_mcp_gateway::exec::{
+    Access, DbAdapter, ExecError, ExecQuery, ExecResult, PoolSizing, RedisAdapter,
+};
 use redis::aio::MultiplexedConnection;
 use redis::{Client, ConnectionAddr, IntoConnectionInfo, RedisConnectionInfo};
 use uuid::Uuid;
@@ -155,4 +157,60 @@ pub async fn delete_keys(conn: &mut MultiplexedConnection, keys: &[&str]) {
         .arg(keys)
         .query_async::<redis::Value>(conn)
         .await;
+}
+
+/// `execute` a read-only argv as the gateway would, no statement budget.
+pub async fn run(a: &RedisAdapter, argv: &str, row_limit: u32) -> Result<ExecResult, ExecError> {
+    a.execute(ExecQuery {
+        sql: argv,
+        binds: &[],
+        statement_timeout_ms: None,
+        row_limit,
+        access: Access::ReadOnly,
+        dry_run: false,
+        request_id: Uuid::new_v4(),
+    })
+    .await
+}
+
+/// [`run`] that must succeed.
+pub async fn ok(a: &RedisAdapter, flavor: Flavor, argv: &str, row_limit: u32) -> ExecResult {
+    run(a, argv, row_limit)
+        .await
+        .unwrap_or_else(|err| panic!("{}: {argv}: {err:?}", flavor.name()))
+}
+
+/// Seed with one command per 500 items, so a big collection costs a handful
+/// of round trips.
+pub async fn seed(side: &mut MultiplexedConnection, head: &[&str], items: &[String]) {
+    for chunk in items.chunks(500) {
+        let mut argv: Vec<&str> = head.to_vec();
+        argv.extend(chunk.iter().map(String::as_str));
+        admin_cmd(side, &argv).await;
+    }
+}
+
+/// Column `column` of every row, as text.
+pub fn texts(result: &ExecResult, column: usize) -> Vec<String> {
+    result
+        .rows
+        .iter()
+        .map(|row| row[column].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Calls of `command` the server has seen (`INFO commandstats`, which Redis
+/// and Dragonfly both keep).
+pub async fn calls(side: &mut MultiplexedConnection, command: &str) -> u64 {
+    let info = match admin_cmd(side, &["INFO", "commandstats"]).await {
+        redis::Value::BulkString(bytes) => String::from_utf8(bytes).expect("UTF-8 INFO"),
+        redis::Value::VerbatimString { text, .. } => text,
+        other => panic!("INFO: {other:?}"),
+    };
+    let prefix = format!("cmdstat_{command}:calls=");
+    info.lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .and_then(|rest| rest.split(',').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
 }
