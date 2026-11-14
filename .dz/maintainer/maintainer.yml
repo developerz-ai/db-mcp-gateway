@@ -13,7 +13,7 @@
 # below: a PR that weakens one is declined with the rule quoted, whoever opened it.
 #
 # The gate is the repo's `main-protection` ruleset, not this file: it requires `fmt`, `clippy`,
-# `test` and `audit`. Read it before trusting any sentence here about it:
+# `test`, `audit` and `yugabyte`. Read it before trusting any sentence here about it:
 # `gh api repos/developerz-ai/db-mcp-gateway/rulesets`. A docs-only PR skips `clippy` and `test`
 # through a per-job `if:` in ci.yml, and GitHub counts a skipped required job as passed.
 version: 1
@@ -62,6 +62,7 @@ pr:
     - "clippy"
     - "test"
     - "audit"
+    - "yugabyte"
   auto_merge: true
   # Every author's PR is reviewed, babysat and merged on green, except what `escalate` holds for a
   # human and what `non_goals` declines. Whether an author is outside is the
