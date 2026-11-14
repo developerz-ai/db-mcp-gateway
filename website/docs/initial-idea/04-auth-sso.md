@@ -300,7 +300,7 @@ Recommended values by risk tolerance:
 | `user_id` | OIDC `sub` — never starting with the reserved `service:` prefix (see Failure modes) |
 | `groups` | snapshot at token issue time |
 | `session_id` | gateway-issued, links to login event |
-| `agent_client` | self-reported by the MCP client (`claude-code/0.x`, `cursor/x.y`, …) |
+| `agent_client` | self-reported by the MCP client (`claude-code/0.x`, `cursor/x.y`, …): `User-Agent`, else `x-mcp-client`, cut to 128 bytes on a character boundary |
 | `ip` | request socket |
 
 ## Failure modes worth thinking about
