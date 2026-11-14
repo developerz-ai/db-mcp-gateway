@@ -114,9 +114,10 @@ pub async fn authorize(
     // Resolve the client now, but record an adopted one only after every
     // other parameter validates: a request that fails PKCE or `state` must
     // leave nothing behind in the registry.
-    let adopt = match state.client_registry.redirect_uris(client_id).await {
+    let (adopt, client_name) = match state.client_registry.lookup(client_id).await {
         Some(registered) => {
             if !registered
+                .redirect_uris
                 .iter()
                 .any(|r| redirect_uri_matches(r, &requested_uri))
             {
@@ -126,7 +127,7 @@ pub async fn authorize(
                     "redirect_uri must exactly match a registered redirect URI",
                 );
             }
-            false
+            (false, registered.client_name)
         }
         // Unknown client_id, loopback redirect: adopt the id rather than
         // dead-end. A client caches its `client_id` and replays it for as long
@@ -142,7 +143,7 @@ pub async fn authorize(
             && redirect_uris_acceptable(std::slice::from_ref(&requested_uri))
             && is_adoptable_client_id(client_id) =>
         {
-            true
+            (true, None)
         }
         None => {
             return oauth_error(
@@ -226,6 +227,7 @@ pub async fn authorize(
             idp_verifier,
             OAuthBridge {
                 client_id: client_id.to_owned(),
+                client_name,
                 client_redirect_uri: redirect_uri,
                 client_state,
                 code_challenge,

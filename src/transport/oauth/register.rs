@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use super::super::app_state::OAuthState;
 use super::helpers::{json_rejected, oauth_error};
-use crate::auth::oauth::StoreError;
+use crate::auth::oauth::{ClientName, StoreError};
 
 /// Most redirect URIs one registration may pin. Real clients send one or two
 /// (a loopback callback per port strategy); the cap bounds what an
@@ -50,10 +50,25 @@ pub async fn register(
             "redirect_uris must hold 1-8 URIs of at most 2048 bytes; each loopback or https, without a fragment",
         );
     }
+    let client_name = match req.client_name.as_deref().map(ClientName::parse) {
+        None => None,
+        Some(Ok(name)) => name,
+        Some(Err(err)) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_client_metadata",
+                &err.to_string(),
+            );
+        }
+    };
     let client_id = format!("mcp-{}", Uuid::new_v4().simple());
     if let Err(err) = state
         .client_registry
-        .insert(client_id.clone(), req.redirect_uris.clone())
+        .register(
+            client_id.clone(),
+            req.redirect_uris.clone(),
+            client_name.clone(),
+        )
         .await
     {
         return registry_error(err);
@@ -65,8 +80,9 @@ pub async fn register(
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
     });
-    if let Some(name) = req.client_name {
-        body["client_name"] = json!(name);
+    // RFC 7591 §3.2.1: echo the metadata as registered (trimmed).
+    if let Some(name) = &client_name {
+        body["client_name"] = json!(name.as_str());
     }
     (StatusCode::CREATED, Json(body)).into_response()
 }

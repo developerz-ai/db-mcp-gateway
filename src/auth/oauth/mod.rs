@@ -16,6 +16,7 @@
 //! (`crate::state::oauth`).
 
 mod auth_codes;
+mod client_name;
 mod client_registry;
 mod facade;
 mod grants;
@@ -27,7 +28,8 @@ mod refresh_tokens;
 use sha2::{Digest, Sha256};
 
 pub use auth_codes::{AuthCode, AuthCodes};
-pub use client_registry::ClientRegistry;
+pub use client_name::{ClientName, InvalidClientName, MAX_CLIENT_NAME_CHARS};
+pub use client_registry::{ClientRecord, ClientRegistry};
 pub use facade::{AuthFacade, IssuedTokens};
 pub use grants::Minted;
 pub use pending_flows::{OAuthBridge, PendingFlow, PendingFlows};
