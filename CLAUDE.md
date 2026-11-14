@@ -49,7 +49,7 @@ Self-hosted MCP gateway. AI agents get audited, SSO-gated, read-only DB access. 
 | Reproduce CI locally / one-command check | `bin/ci` / `bin/check` |
 | Assert scrubber regex features in the shipping graph | `bin/check-scrub-features` |
 | Mint a static service bearer token | `bin/mint-service-token <name>` |
-| Run the binary | `cargo run -- --config config/example.yaml` |
+| Run the binary (after `bin/dev up`; `config/example.yaml` is a reference — its `vault:` refs abort boot) | write the minimal `config.yml` from `website/docs/deployment/quickstart.md#run-it-locally`, then `TLS_DISABLED=true OIDC_ISSUER=http://localhost:5556 OIDC_CLIENT_ID=dev ALLOW_INSECURE_SIGNING_KEY=true TARGET_DB_PASSWORD=app-dev-only cargo run -- --config config.yml` |
 | Build release image locally | `docker build -t db-mcp-gateway:dev .` |
 
 Secrets and local config: copy `.env.example` → `.env`. `.env` is gitignored.
@@ -121,7 +121,7 @@ GitHub Actions on GitHub-hosted runners — `ubuntu-latest` default (`ubuntu-24.
 | `weekly` (`weekly.yml`) | Mondays: `cargo audit` on `main` + `cargo update --dry-run` report |
 | `build` + `merge` | on `main`: per-arch image → multi-arch manifest, pushed to GHCR **and** DOCR |
 
-Every workflow declares a `concurrency` group with cancel-in-progress, and every job sets `timeout-minutes` (~2× measured p95: clippy 15, test 20, small jobs 5, image build 30). Each Rust job keeps its own `Swatinem/rust-cache` key — never a shared key: it made `test` restore clippy's check-only artifacts and rebuild the graph. `ci.yml` cancels superseded **PR** runs only — pushes to `main` get a per-SHA concurrency group and never cancel (a shared group would still drop a *pending* run when a third merge queues), because the Image Updater pins the short SHA, so cancelling the first of two closely-landed merges would leave that commit with no image at its tag (`main` is a moving convenience tag). The release workflow is hard `cancel-in-progress: false`. Public repo, so GitHub-hosted runners only.
+Every workflow declares a `concurrency` group, and every job sets `timeout-minutes` (~2× measured p95: clippy 15, test 20, small jobs 5, CI image build 30; the release per-arch build gets 60 to cover a cold compile). Each Rust job keeps its own `Swatinem/rust-cache` key — never a shared key: it made `test` restore clippy's check-only artifacts and rebuild the graph. `ci.yml` cancels superseded **PR** runs only — pushes to `main` get a per-SHA concurrency group and never cancel (a shared group would still drop a *pending* run when a third merge queues), because the Image Updater pins the short SHA, so cancelling the first of two closely-landed merges would leave that commit with no image at its tag (`main` is a moving convenience tag). `release.yml`, `pages.yml` (a half-applied Pages deploy) and `weekly.yml` are hard `cancel-in-progress: false`. Public repo, so GitHub-hosted runners only.
 
 ## Security review required
 

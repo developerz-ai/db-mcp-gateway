@@ -105,8 +105,8 @@ logging:
 
 ## Resolution order
 
-1. File at `--config` flag, else `$DB_MCP_GATEWAY_CONFIG`, else `/etc/gateway/config.yml`.
-2. `${ENV:NAME}` placeholders expanded from process env; `${FILE:/path}` placeholders read from disk (trailing newline stripped). Unresolved or empty refs abort boot.
+1. File at `--config` flag, else `$DB_MCP_GATEWAY_CONFIG`. The binary has no default path — with neither set it exits. The published image sets `DB_MCP_GATEWAY_CONFIG=/etc/gateway/config.yml`.
+2. `${ENV:NAME}` placeholders expanded from process env; `${FILE:/path}` placeholders read from disk (trailing newline stripped). A `${ENV:…}` ref whose variable is unset or empty aborts boot, as does a missing or empty file.
 3. `vault:`, `aws-sm:`, `gcp-sm:` references resolved from the named backend (when backend integrations land — until then, recognised refs also abort boot rather than silently failing at first DB connect).
 4. Final config validated against the schema. Errors at this stage refuse to start the process — no half-loaded state.
 
@@ -115,8 +115,9 @@ logging:
 - Unknown keys fail boot — at the top level and in every section. A misspelled `permisions:` is a boot error naming the line, never a silently ignored block.
 - `gateway.env: production` ⇒ inline literal secrets rejected: every `servers[].databases[].password` and `service_accounts[].token` must be a `${ENV:…}` / `${FILE:…}` reference. The error names the field, never the value. `gateway.env` defaults to `development`, which tolerates literals (local dev, tests).
 - Zero and blank values that parse but mean nothing are rejected: blank server/database `name` or `host`, `port: 0`, and `row_limit: 0` / `statement_timeout_ms: 0` in grant constraints (Postgres reads a zero statement timeout as *no* timeout). Env side: `STATE_DB_POOL_SIZE=0` and a pool larger than the concurrent-request ceiling abort boot; `METRICS_BIND` may not equal `GATEWAY_BIND`.
-- Every `permissions[*].group` must be a syntactically valid group name; gateway warns (not errors) if no IdP user is in the group — groups can be defined ahead of population.
+- Every `permissions[*].group` must be non-blank. The gateway never checks whether any IdP user is in the group — groups can be defined ahead of population, and no warning is logged.
 - Every `permissions[*].grants[*].server` / `database` must exist in `servers`, or be the literal `"*"`.
+- Server and database names may not be `*` (reserved for the grant wildcard).
 - `pool:` (on a server and/or a database: `max_connections` > 0, `min_connections` ≥ 0, `idle_timeout_s` > 0) — `min_connections` above `max_connections` at the same level fails boot. Each field resolves database → server → built-in default.
 - `tls_ca_file` is valid only with `tls: verify_full` and must be readable at boot.
 - Target TLS: on Postgres, `tls: required` (the default) encrypts but does **not** verify the server certificate (`sslmode=require`); on Mongo it verifies chain and hostname. `tls: verify_full` verifies chain and hostname on both (Postgres `sslmode=verify-full`), against `tls_ca_file` or the system roots — the setting to use for Postgres in production. `tls: insecure` is plaintext. Boot logs one warning per unverified or plaintext server, naming it.
@@ -127,7 +128,7 @@ logging:
 - A database's `role` must not be the stock superuser account its backend ships with (`postgres` for Postgres, `root` for MySQL, `sa` for MSSQL, `root`/`admin` for Mongo). Matched case-insensitively on the name only — a superuser renamed to `app` still passes; the real least-privilege guarantee lives target-side. Rejected at boot so the "never run as DB superuser" rule (see [05-credentials.md](05-credentials.md)) can't be defeated by a config typo.
 - Every server's `kind` must have a query adapter wired (today `postgres` and `mongo`). A `mysql`/`mssql` target is rejected at boot rather than parsing clean and failing every query at runtime — these kinds are reserved for the roadmap adapters and only become valid when their adapters land.
 - `MCP_PATH` (env-driven for now, folded into YAML with #16) must not collide with a path the gateway already mounts. Reserved exact paths: `/healthz`, `/readyz`, `/metrics`, `/auth/login`, `/auth/callback`, `/auth/logout`, `/authorize`, `/token`, `/revoke`, `/register`. Reserved route families (the path and anything under `<prefix>/…`): `/admin` (owned by the admin API — reserved unconditionally so toggling `admin.enabled` can't turn a working config into a boot panic) and `/.well-known` (RFC 8414/9728 discovery metadata). Segment-based match: `/adminy` or `/tokens` are fine. Overlap surfaces as a typed boot error naming the offending path, not an axum router panic.
-- `admin.enabled` defaults to `false` — absent or false leaves `/admin/v1/*` unmounted (404). When `enabled: true`, `admin.group` is required and must be non-empty/non-whitespace, else boot aborts (every authenticated caller would otherwise be an admin). Full surface in [12-dynamic-permissions.md](12-dynamic-permissions.md).
+- `admin.enabled` defaults to `false` — absent or false leaves `/admin/v1/*` unmounted (404). When `enabled: true`, `admin.group` is required and must be non-empty/non-whitespace, else boot aborts (every authenticated caller would otherwise be an admin); when disabled it is optional and ignored. Full surface in [12-dynamic-permissions.md](12-dynamic-permissions.md).
 - Auth env (until #16 folds it into YAML): `OIDC_ISSUER` and `OIDC_CLIENT_ID` are required (absent or blank aborts boot). `SESSION_TTL_HOURS` must be a whole number in `1..=168`, `REFRESH_TTL_DAYS` in `1..=366`; anything else — `0`, out of range, overflow, non-numeric — aborts boot with the variable named. `SESSION_SIGNING_KEY` must be at least 32 bytes and not the committed dev default, unless `ALLOW_INSECURE_SIGNING_KEY=true`, which is accepted only with a loopback `OIDC_ISSUER` (local dev against a mock or local IdP) and logs a `WARN` at boot; with any other issuer it aborts boot.
 - `permissions_store.driver: mysql` combined with `admin.enabled: true` is rejected at boot — admin handlers are pg-only today. Use `driver: pg` (the default when the block is absent) for the admin path, or `mysql` with YAML grants only.
 
@@ -178,7 +179,7 @@ Outcomes count in `config_reloads_total{result="ok"|"error"}`. A `SIGHUP` with T
 **Fixed at boot — a reload that changes them is refused whole** (restart instead):
 
 - the admin API: whether it is mounted, its `group`, `session_max_age_secs`;
-- the admin API's known-server list (wildcard grants and server checks in `/admin/v1/*`) — while the admin API is mounted, renaming, adding or removing a server is refused;
+- the admin API's known-server list (wildcard grants and server checks in `/admin/v1/*`) — while the admin API is mounted, renaming, adding or removing a server is refused; reordering `servers:` is not a change;
 - `permissions_store.driver`.
 
 Env-driven settings (listeners, state DB, TLS paths, OIDC) are read once at boot.

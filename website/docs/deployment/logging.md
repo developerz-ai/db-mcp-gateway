@@ -28,6 +28,10 @@ On audit-write failure the line additionally carries `audit_write_duration_ms` (
 
 Other code paths emit a subset of these fields when relevant (e.g. the audit pruner emits `rows`, `ttl_days`). Adding new fields is fine; renaming or removing the ones above is a contract break. The canonical contract lives in [docs/initial-idea/07-logging-retention.md](../initial-idea/07-logging-retention.md).
 
+## Dropped lines
+
+Log lines go through a bounded non-blocking queue so a slow stdout consumer never stalls a request. When the queue is full a line is dropped and counted in `log_lines_dropped_total`. That includes `audit_stream` events from the `logging.stream: [{kind: stdout}]` sink: the `audit_stream` target always logs at INFO whatever `RUST_LOG` says, but a row dropped at the queue shows up only in `log_lines_dropped_total`, never in `audit_stream_dropped_total` (which counts failed syslog deliveries). The durable copy of every row is `audit_calls` in the state DB.
+
 ## Redaction
 
 No log line carries:

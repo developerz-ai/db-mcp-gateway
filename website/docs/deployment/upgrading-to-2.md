@@ -15,7 +15,7 @@ traffic half-configured. Check each item before you roll.
 | Unknown YAML keys | ignored | boot fails | Remove stray keys. |
 | Zero / out-of-range values | accepted | boot fails: `row_limit: 0`, `statement_timeout_ms: 0`, `port: 0`, `STATE_DB_POOL_SIZE=0`, `MAX_CONCURRENT_*=0`, `PERMISSIONS_CACHE_TTL_SECONDS` > 300, `REFRESH_TTL_DAYS` outside 1–366, `SESSION_TTL_HOURS` outside 1–168, pool `min_connections` > `max_connections` | Fix the value. |
 | Inline secrets | allowed everywhere | rejected when `gateway.env: production` | Use `${ENV:…}` / `${FILE:…}`. |
-| Shutdown | immediate | drains in-flight requests (≤55 s) then detached audit work (≤20 s) | `terminationGracePeriodSeconds` ≥ 75 plus any preStop sleep. |
+| Shutdown | immediate | drains in-flight requests for 80 s (the 75 s `/mcp` request timeout + 5 s), then detached audit work (≤20 s), then closes the two state-DB pools (≤10 s each) | `terminationGracePeriodSeconds` ≥ 120 plus any preStop sleep. A shorter grace period `SIGKILL`s a pod mid-drain and loses the completion audit rows of slow calls. |
 | Admin API | positional internals | unchanged HTTP surface; PATCH now merges constraints per key (absent keeps, `null` clears) | Clients that sent a full constraints object keep working; clients relying on "omitted key clears it" must send `null`. |
 | `GET /mcp` (SSE) | greeting stream | `405` | Clients POST (Streamable HTTP). |
 
@@ -27,9 +27,21 @@ traffic half-configured. Check each item before you roll.
 - **Target TLS:** `tls: verify_full` + `tls_ca_file` (Postgres `required` encrypts but does not verify).
 - **Per-database pools:** `pool:` on server or database.
 
-## Audit schema
+## State DB schema
 
-Migrations `0010`–`0014` apply at boot (additive): `audit_call_intents`, history index, refresh-token session link, `mongo` db_type, upstream/rows_affected/sql_truncated columns. New outcomes: `abandoned`, `audit_unavailable`, `dry_run`, `cancelled`. Reporting queries that enumerated outcomes should add them.
+Migrations apply at boot.
+
+| Migration | Change | Who it affects |
+|---|---|---|
+| `0010`–`0014` | Additive: `audit_call_intents`, history index, refresh-token session link, `mongo` db_type, upstream/rows_affected/sql_truncated columns | Nobody — new objects only |
+| `0015` | Drops `audit_calls_user_sub_idx` and `audit_calls_db_type_idx` | Ad-hoc reporting queries that filtered `audit_calls` by `user_sub` alone or by `db_type` lose their dedicated index. `(user_sub, occurred_at)` and the history index still serve per-user lookups. |
+| `0016` | Drops `sessions.agent_client` | **Breaking for reports** that select `sessions.agent_client` — the query fails. The column was always NULL; read the per-call client banner from `audit_calls.agent_client` instead. |
+
+New outcomes: `abandoned`, `audit_unavailable`, `dry_run`, `cancelled`. Reporting queries that enumerated outcomes should add them.
+
+## MySQL permissions store
+
+Only for `permissions_store.driver: mysql`. Its migrations `0004` (identity and routing columns move to `utf8mb4_0900_as_cs`, so SSO subjects and server names compare case-sensitively) and `0005` (the `db_type` CHECK constraint is rebuilt to admit `mongo`) need **MySQL 8.0**. MariaDB has no `utf8mb4_0900_as_cs` collation, so `0004` fails there and the gateway refuses to boot. CI and the dev stack run `mysql:8`.
 
 ## Rollback
 
