@@ -21,6 +21,7 @@ pub(super) struct NewDbToken<'a> {
     pub(super) identity: &'a GrantIdentity,
     pub(super) issued_at: DateTime<Utc>,
     pub(super) session_id: Option<SessionId>,
+    pub(super) chain_id: Uuid,
 }
 
 /// DB insert, refused at the cap (`Ok(false)`) in the same statement. The cap
@@ -49,6 +50,7 @@ pub(super) async fn store_db(
             chain_issued_at: token.issued_at,
             expires_at,
             session_id: token.session_id.map(Uuid::from),
+            chain_id: token.chain_id,
         },
         REFRESH_TOKENS_MAX_SIZE as i64,
     )

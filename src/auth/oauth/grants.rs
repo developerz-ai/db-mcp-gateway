@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
 use super::refresh_chain::chain_expired;
 use super::refresh_db::{NewDbToken, store_db};
@@ -15,6 +16,10 @@ use super::refresh_tokens::RefreshBackend;
 use super::{GrantIdentity, RefreshToken, RefreshTokens, hash_secret};
 use crate::auth::{AuthError, Session, SessionId, SessionStore};
 use crate::state::oauth as db;
+
+/// A client firing parallel refreshes with one token (e.g. several MCP
+/// connections) replays it within moments; that is not theft, so no revoke.
+const REUSE_GRACE: chrono::Duration = chrono::Duration::seconds(10);
 
 /// A freshly minted session and the refresh token paired with it. `Debug`
 /// redacts the token.
@@ -48,7 +53,9 @@ impl RefreshTokens {
 
     /// Redeem `presented`: consume it, revoke its paired session, and mint a
     /// new session + refresh token that inherit the chain's birth time.
-    /// `Ok(None)` for an unknown, replayed or lapsed token.
+    /// `Ok(None)` for an unknown, replayed or lapsed token. On the DB backend a
+    /// replay of an already-rotated token also revokes the whole chain (RFC
+    /// 9700 §4.14.2); the memory backend (tests only) does not track chains.
     pub async fn rotate(
         &self,
         sessions: &SessionStore,
@@ -76,9 +83,19 @@ impl RefreshTokens {
         };
 
         let mut tx = pool.begin().await?;
-        let Some(row) = db::take_refresh_token(&mut *tx, &hash_secret(presented)).await? else {
+        let presented_hash = hash_secret(presented);
+        // Lock before consuming, so a concurrent reuse-revocation of this
+        // chain sees either none or all of this rotation.
+        if let Some(chain_id) = db::live_chain(&mut *tx, &presented_hash).await? {
+            db::lock_chain(&mut *tx, chain_id).await?;
+        }
+        let Some(row) = db::rotate_out_refresh_token(&mut *tx, &presented_hash).await? else {
+            let revoked = revoke_reused_chain(&mut tx, &presented_hash).await?;
+            tx.commit().await?;
+            sessions.committed(None, &revoked).await;
             return Ok(None);
         };
+        let chain_id = row.chain_id;
         let old = RefreshToken::from(row);
         if chain_expired(old.issued_at, Utc::now(), self.ttl()) {
             // Commit the delete: a lapsed chain is dead either way.
@@ -93,6 +110,7 @@ impl RefreshTokens {
             &refresh_token,
             &old.identity,
             old.issued_at,
+            chain_id,
             session.id,
         )
         .await?;
@@ -191,6 +209,7 @@ impl RefreshTokens {
             &refresh_token,
             &identity,
             session.issued_at,
+            Uuid::new_v4(),
             session.id,
         )
         .await?;
@@ -208,6 +227,7 @@ impl RefreshTokens {
         refresh_token: &str,
         identity: &GrantIdentity,
         chain_born: DateTime<Utc>,
+        chain_id: Uuid,
         session_id: SessionId,
     ) -> Result<(), AuthError> {
         let token = NewDbToken {
@@ -215,6 +235,7 @@ impl RefreshTokens {
             identity,
             issued_at: chain_born,
             session_id: Some(session_id),
+            chain_id,
         };
         if store_db(conn, &token, self.ttl()).await? {
             Ok(())
@@ -238,6 +259,27 @@ fn new_session(
         ttl,
         chain_born,
     )
+}
+
+/// A miss on a token rotated out more than [`REUSE_GRACE`] ago means it was
+/// replayed — by a thief or by the client it was stolen from,
+/// indistinguishably — so end its chain and the chain's live session. Returns
+/// the sessions this revoked.
+async fn revoke_reused_chain(
+    conn: &mut sqlx::PgConnection,
+    presented_hash: &[u8],
+) -> Result<Vec<SessionId>, AuthError> {
+    let Some(chain_id) = db::rotated_chain(&mut *conn, presented_hash, REUSE_GRACE).await? else {
+        return Ok(Vec::new());
+    };
+    // Waits out an in-flight rotation; the delete below then sees its token.
+    db::lock_chain(&mut *conn, chain_id).await?;
+    let mut revoked = Vec::new();
+    for paired in db::delete_chain(&mut *conn, chain_id).await? {
+        revoked.extend(revoke_paired(conn, paired.map(SessionId::from)).await?);
+    }
+    tracing::warn!(%chain_id, "rotated refresh token replayed; chain revoked");
+    Ok(revoked)
 }
 
 /// Revoke the session paired with a consumed refresh token; returns it only if

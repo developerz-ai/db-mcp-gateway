@@ -22,7 +22,7 @@ const BODY_READ_DEADLINE: Duration = Duration::from_secs(10);
 
 /// `/mcp`: the statement ceiling, one pool acquire, the intent and outcome
 /// audit writes, plus slack for authz and serialisation.
-const MCP_TIMEOUT: Duration = Duration::from_millis(
+pub const MCP_TIMEOUT: Duration = Duration::from_millis(
     DEFAULT_STATEMENT_TIMEOUT_MS as u64
         + POOL_ACQUIRE_ALLOWANCE.as_millis() as u64
         + 2 * AUDIT_WRITE_TIMEOUT.as_millis() as u64

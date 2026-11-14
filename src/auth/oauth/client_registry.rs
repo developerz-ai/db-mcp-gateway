@@ -113,7 +113,8 @@ impl ClientRegistry {
     /// never-authorised client first; `StoreFull` only when every row belongs
     /// to an authorised client. A DB error is `Backend` — fail closed, the
     /// client retries. Re-registering an existing `client_id` replaces its URIs
-    /// and needs the same room as a new one.
+    /// (a lapsed, unswept one restarts as new) and needs the same room as a new
+    /// one.
     pub async fn insert(
         &self,
         client_id: String,
@@ -217,8 +218,9 @@ fn insert_mem(
         map.remove(&oldest);
     }
     match map.get_mut(&client_id) {
-        Some(existing) => existing.redirect_uris = redirect_uris,
-        None => {
+        Some(existing) if existing.expires_at > now => existing.redirect_uris = redirect_uris,
+        // Absent, or lapsed but not yet GC'd: (re)start as never-authorised.
+        _ => {
             map.insert(
                 client_id,
                 RegisteredClient {

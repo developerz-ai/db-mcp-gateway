@@ -145,6 +145,8 @@ impl RefreshTokens {
                     identity: &identity,
                     issued_at,
                     session_id,
+                    // A bare insert has no predecessor, so it starts a chain.
+                    chain_id: uuid::Uuid::new_v4(),
                 };
                 match store_db(&mut conn, &new, self.ttl).await {
                     Ok(true) => Ok(()),

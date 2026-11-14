@@ -104,3 +104,42 @@ async fn adopted_client_is_authorised_immediately() {
     };
     assert!(!map.lock().await["adopted"].evictable(Utc::now()));
 }
+
+/// A cached `client_id` whose registration lapsed but isn't GC'd yet is
+/// exactly what adoption exists for: it must come back live, not 503.
+#[tokio::test]
+async fn adopting_a_lapsed_unswept_client_revives_it() {
+    let reg = ClientRegistry::default();
+    let Backend::Memory(map) = &reg.backend else {
+        unreachable!();
+    };
+    map.lock().await.insert(
+        "lapsed".into(),
+        RegisteredClient {
+            redirect_uris: vec!["http://127.0.0.1:1/old".into()],
+            created_at: Utc::now() - ChronoDuration::days(91),
+            expires_at: Utc::now() - ChronoDuration::days(1),
+        },
+    );
+    reg.adopt("lapsed".into(), URI.into())
+        .await
+        .expect("adoption revives a lapsed registration");
+    assert_eq!(reg.redirect_uris("lapsed").await, Some(vec![URI.into()]));
+    assert!(!map.lock().await["lapsed"].evictable(Utc::now()));
+}
+
+/// Re-registering a still-live client keeps its expiry: only a lapsed row
+/// is reset.
+#[tokio::test]
+async fn re_registering_a_live_client_keeps_its_expiry() {
+    let reg = ClientRegistry::default();
+    reg.adopt("c1".into(), URI.into()).await.unwrap();
+    let Backend::Memory(map) = &reg.backend else {
+        unreachable!();
+    };
+    let before = map.lock().await["c1"].expires_at;
+    reg.insert("c1".into(), vec!["https://other/cb".into()])
+        .await
+        .unwrap();
+    assert_eq!(map.lock().await["c1"].expires_at, before);
+}
