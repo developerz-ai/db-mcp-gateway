@@ -6,7 +6,7 @@
 | `agents/` | Layer agents (`mcp-transport`, `authz-permissions`, `query-exec`, `audit-log`), one per `CLAUDE.md` layer they own |
 | `skills/` | `stack` (dev stack), `state-migrations`, `verify-change` (the pre-commit proof) |
 | `settings.json` | Permissions and hooks. Personal overrides go in `settings.local.json` (gitignored) |
-| `hooks/` | Python 3 stdlib, no packages. A box without `python3` skips them |
+| `hooks/` | Python 3 stdlib, no packages. A box without `python3` skips them. Tests: `python3 -I .claude/hooks/test_hooks.py`, run by `workflow-lint.yml` |
 
 Every agent and skill file carries the marker `owned by this repository's maintainers`; `tests/public_tree.rs` fails a file without it.
 
@@ -22,6 +22,6 @@ The refusal goes to the agent, with the reason, and nothing else happens.
 
 1. Read the reason. Most refusals have a narrower command that passes: a feature branch, a `[b]racket` pattern, a new patch tag instead of a moved one.
 2. If the action is right, a person runs it in their own terminal, or starts the session with `DBMCP_HOOKS_OFF=1 claude`. Prefixing the refused command does nothing: the hook reads the session's environment, not the command's.
-3. Fix the false match in `guard_bash.py` in its own PR, with the command that was wrongly refused in the PR body.
+3. Fix the false match in `guard_bash.py` in its own PR, and add the wrongly refused command to `ALLOWED` in `test_hooks.py`.
 
 An agent never edits a hook to get its own command through, and never rewrites a command to dodge one.
