@@ -5,12 +5,12 @@ use std::collections::HashSet;
 
 use crate::config::schema::ServiceAccount;
 
-use super::{AdminBlock, ConfigFileError};
+use super::{AdminConfig, ConfigFileError};
 
 pub(super) fn validate_service_accounts(
     accounts: &[ServiceAccount],
     group_names: &HashSet<&str>,
-    admin: Option<&AdminBlock>,
+    admin: &AdminConfig,
 ) -> Result<(), ConfigFileError> {
     let mut service_names: HashSet<&str> = HashSet::new();
     for account in accounts {
@@ -49,9 +49,8 @@ pub(super) fn validate_service_accounts(
         // The admin middleware gates on group membership alone, so this
         // boot gate is what keeps a service token off `/admin/*` without
         // widening that middleware. Rejected at boot, not trusted to review.
-        if let Some(admin) = admin
-            && admin.enabled
-            && account.group == admin.group
+        if let AdminConfig::Enabled { group, .. } = admin
+            && account.group == group.as_str()
         {
             return Err(ConfigFileError::Invalid(format!(
                 "service account `{}` maps to group `{}`, which is the admin group — \

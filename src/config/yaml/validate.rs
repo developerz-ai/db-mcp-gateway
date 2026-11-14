@@ -11,13 +11,12 @@ use super::roles::{reject_superuser_role, validate_role};
 use super::service_accounts::validate_service_accounts;
 use super::write_tier::{validate_write_grants, validate_write_role};
 use super::{
-    AdminBlock, ConfigFile, ConfigFileError, PermissionsStoreBlock, PermissionsStoreDriver,
+    AdminConfig, ConfigFile, ConfigFileError, PermissionsStoreBlock, PermissionsStoreDriver,
 };
 
 impl ConfigFile {
     pub(super) fn validate(&self) -> Result<(), ConfigFileError> {
-        let admin = self.admin.as_ref();
-        validate_admin(admin)?;
+        let admin = &self.admin;
         validate_permissions_store(self.permissions_store.as_ref(), admin)?;
         let server_names = validate_servers(&self.servers)?;
         let group_names = validate_permissions(&self.permissions, &self.servers, &server_names)?;
@@ -28,28 +27,16 @@ impl ConfigFile {
     }
 }
 
-fn validate_admin(admin: Option<&AdminBlock>) -> Result<(), ConfigFileError> {
-    if let Some(admin) = admin
-        && admin.enabled
-        && admin.group.trim().is_empty()
-    {
-        return Err(ConfigFileError::Invalid(
-            "admin.group must be non-empty when admin.enabled is true".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 /// #59 scope: mysql is wired for the resolver hot path only. The admin
 /// handlers use raw pg `RETURNING` + `JSONB` operations that haven't been
 /// ported. Boot fails fast rather than running with a half-wired admin surface.
 fn validate_permissions_store(
     store: Option<&PermissionsStoreBlock>,
-    admin: Option<&AdminBlock>,
+    admin: &AdminConfig,
 ) -> Result<(), ConfigFileError> {
-    if let (Some(store), Some(admin)) = (store, admin)
+    if let Some(store) = store
         && store.driver == PermissionsStoreDriver::Mysql
-        && admin.enabled
+        && matches!(admin, AdminConfig::Enabled { .. })
     {
         return Err(ConfigFileError::Invalid(
             "permissions_store.driver = mysql is not supported with admin.enabled = true. \

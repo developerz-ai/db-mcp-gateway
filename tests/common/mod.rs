@@ -12,4 +12,5 @@ pub mod env;
 pub mod gateway;
 pub mod idp;
 pub mod mongo_target;
+pub mod offline;
 pub mod pg_target;

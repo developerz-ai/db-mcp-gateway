@@ -9,10 +9,13 @@ use serde::Deserialize;
 
 use super::schema::{LoggingBlock, Permission, Server, ServiceAccount};
 use super::secret::SecretError;
+use admin::AdminBlock;
 
+pub use admin::{AdminConfig, AdminGroup};
 pub use error::ConfigFileError;
 pub use gateway::{Environment, GatewayBlock};
 
+mod admin;
 mod error;
 mod gateway;
 mod limits;
@@ -22,61 +25,60 @@ mod service_accounts;
 mod validate;
 mod write_tier;
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct ConfigFile {
     /// `env: production` rejects inline literal secrets. Absent → development.
-    #[serde(default)]
     pub gateway: GatewayBlock,
-    #[serde(default)]
     pub servers: Vec<Server>,
-    #[serde(default)]
     pub permissions: Vec<Permission>,
-    /// Spec 12 §"Admin API". Absent or `enabled: false` → entire `/admin/*`
-    /// route returns 404. Belt-and-suspenders for YAML-only installs.
-    #[serde(default)]
-    pub admin: Option<AdminBlock>,
+    /// Spec 12 §"Admin API". Belt-and-suspenders for YAML-only installs.
+    pub admin: AdminConfig,
     /// Spec 12 §"Storage backends" (#59). Absent → use the state DB
     /// (Postgres) as the permissions store too — the default. Present
     /// with `driver: mysql` connects to a separate mysql pool via
     /// `PERMISSIONS_DB_DSN` env. The state DB itself (sessions, audit
     /// rows) stays Postgres regardless.
-    #[serde(default)]
     pub permissions_store: Option<PermissionsStoreBlock>,
     /// Headless service identities (spec 14). Absent → no static bearer
     /// token is accepted; the OIDC session path is the only way in.
-    #[serde(default)]
     pub service_accounts: Vec<ServiceAccount>,
     /// Spec 07 §Storage. Absent → no stream sinks, the pre-#218 behavior.
-    #[serde(default)]
     pub logging: LoggingBlock,
 }
 
-/// Admin API gating. Mirrors spec 12 §"Admin API" YAML schema.
-#[derive(Debug, Clone, Deserialize)]
+/// The YAML as written. Converted into [`ConfigFile`] once, at the parse edge,
+/// so sections with cross-field rules (`admin:`) reach callers already typed.
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AdminBlock {
+struct RawConfigFile {
     #[serde(default)]
-    pub enabled: bool,
-    /// SSO group claim that authorizes `/admin/v1/*` calls. Required when
-    /// `enabled = true` — absent or blank is then a boot error (every
-    /// authenticated user would otherwise be an admin). Optional, and ignored,
-    /// when disabled.
+    gateway: GatewayBlock,
     #[serde(default)]
-    pub group: String,
-    /// Maximum age (in seconds) of a session before admin access is denied.
-    /// When set, the admin middleware rejects sessions older than this limit
-    /// regardless of `session_ttl_hours` — the caller must re-authenticate.
-    ///
-    /// **Why this matters:** group memberships are snapshotted at login. A user
-    /// removed from the admin group in the IdP continues to pass the group check
-    /// until their session expires (up to `session_ttl_hours`, default 8 h). Setting
-    /// `session_max_age_secs` caps this window: e.g. `3600` (1 h) means a removed
-    /// admin can act for at most one hour before the gateway forces re-login.
-    ///
-    /// Absent / `null` means "no age cap — rely on `session_ttl_hours` alone".
+    servers: Vec<Server>,
     #[serde(default)]
-    pub session_max_age_secs: Option<u64>,
+    permissions: Vec<Permission>,
+    #[serde(default)]
+    admin: Option<AdminBlock>,
+    #[serde(default)]
+    permissions_store: Option<PermissionsStoreBlock>,
+    #[serde(default)]
+    service_accounts: Vec<ServiceAccount>,
+    #[serde(default)]
+    logging: LoggingBlock,
+}
+
+impl RawConfigFile {
+    fn into_config(self) -> Result<ConfigFile, ConfigFileError> {
+        Ok(ConfigFile {
+            gateway: self.gateway,
+            servers: self.servers,
+            permissions: self.permissions,
+            admin: AdminConfig::from_block(self.admin)?,
+            permissions_store: self.permissions_store,
+            service_accounts: self.service_accounts,
+            logging: self.logging,
+        })
+    }
 }
 
 /// Permissions storage backend selection. The DSN is **not** in YAML — it
@@ -184,9 +186,9 @@ impl ConfigFile {
     /// through [`non_leaking_options`] too — `serde_saphyr::from_str` defaults
     /// to attaching source snippets, which on this file means credentials.
     pub fn from_yaml_str(raw: &str) -> Result<Self, ConfigFileError> {
-        let mut parsed: ConfigFile =
-            serde_saphyr::from_str_with_options(raw, non_leaking_options())
-                .map_err(|source| ConfigFileError::parse_from(PathBuf::from("<inline>"), source))?;
+        let raw: RawConfigFile = serde_saphyr::from_str_with_options(raw, non_leaking_options())
+            .map_err(|source| ConfigFileError::parse_from(PathBuf::from("<inline>"), source))?;
+        let mut parsed = raw.into_config()?;
         // Group names are compared to IdP claims verbatim; stray YAML
         // whitespace would make a block silently match nobody.
         for permission in &mut parsed.permissions {

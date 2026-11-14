@@ -232,7 +232,7 @@ fn config_with_timeout(statement_timeout_ms: Option<u32>) -> ConfigFile {
                 },
             }],
         }],
-        admin: None,
+        admin: Default::default(),
         permissions_store: None,
         service_accounts: Vec::new(),
         logging: Default::default(),

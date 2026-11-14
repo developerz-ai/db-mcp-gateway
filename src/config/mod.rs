@@ -24,6 +24,6 @@ pub use schema::{
 };
 pub use secret::{Password, SecretError};
 pub use yaml::{
-    AdminBlock, ConfigFile, ConfigFileError, ConfigLoadError, Environment, GatewayBlock,
-    PermissionsStoreBlock, PermissionsStoreDriver,
+    AdminConfig, AdminGroup, ConfigFile, ConfigFileError, ConfigLoadError, Environment,
+    GatewayBlock, PermissionsStoreBlock, PermissionsStoreDriver,
 };
