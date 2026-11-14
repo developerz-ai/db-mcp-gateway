@@ -39,6 +39,7 @@ Migrations apply at boot.
 | `0017` (2.1.0) | Adds `oauth_refresh_tokens.chain_id` and the `oauth_refresh_rotated` tombstone table | None. Refresh-token reuse outside a 10 s grace now revokes the whole chain. `chain_id` keeps a default, so 2.0.3 still inserts after a rollback. |
 | `0018` (2.1.0) | Adds `sql`, `sql_truncated` and `reason` to `audit_call_intents` | None. An `abandoned` row the reaper writes now says what ran. |
 | `0019` (2.2.0) | Adds nullable `oauth_clients.client_name` | None. The consent page shows the self-registered name, marked unverified. 2.1.0 still inserts and reads. |
+| `0020` (2.2.1) | Partial indexes on soft-deleted `permissions_*` rows | None — supports the pruner, which now hard-deletes soft-deleted users/databases/grants and `permissions_audit` rows older than `AUDIT_RETENTION_DAYS` |
 
 New outcomes: `abandoned`, `audit_unavailable`, `dry_run`, `cancelled`. Reporting queries that enumerated outcomes should add them.
 
