@@ -10,30 +10,30 @@
 
 ## MCP tool surface
 
-`list_databases`, `describe_schema`, `sample_table`, `run_query`, `explain`, `get_query_history`. Read-only by default; `query_write` grant unlocks INSERT / UPDATE / DELETE (never DDL) when both YAML *and* the target-DB role permit it.
+`list_servers`, `list_databases`, `describe_schema`, `sample_table`, `run_query`, `explain`, `get_query_history`, `table_stats`, `db_activity`, `cancel_query`. Read-only by default; `query_write` grant unlocks INSERT / UPDATE / DELETE (never DDL) when both YAML *and* the target-DB role permit it.
 
 ## Docs
 
 - [README](https://github.com/developerz-ai/db-mcp-gateway/blob/main/README.md): overview, three pillars, install, quick links.
-- [Overview](https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/initial-idea/01-overview.md): what this is and what it isn't.
-- [Non-goals](https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/initial-idea/10-non-goals.md): things db-mcp-gateway explicitly won't do.
-- [Roadmap](https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/initial-idea/11-roadmap.md): what's built vs planned.
-- [Features](https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/features.md): full feature reference.
-- [Use cases](https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/use-cases.md): who this is for, what problems it solves.
-- [Comparison](https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/comparison.md): db-mcp-gateway vs alternatives.
-- [Benchmarks](https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/benchmarks.md): performance numbers.
+- [Overview](https://github.com/developerz-ai/db-mcp-gateway/blob/main/website/docs/initial-idea/01-overview.md): what this is and what it isn't.
+- [Non-goals](https://github.com/developerz-ai/db-mcp-gateway/blob/main/website/docs/initial-idea/10-non-goals.md): things db-mcp-gateway explicitly won't do.
+- [Roadmap](https://github.com/developerz-ai/db-mcp-gateway/blob/main/website/docs/initial-idea/11-roadmap.md): what's built vs planned.
+- [Features](https://github.com/developerz-ai/db-mcp-gateway/blob/main/website/docs/features.md): full feature reference.
+- [Use cases](https://github.com/developerz-ai/db-mcp-gateway/blob/main/website/docs/use-cases.md): who this is for, what problems it solves.
+- [Comparison](https://github.com/developerz-ai/db-mcp-gateway/blob/main/website/docs/comparison.md): db-mcp-gateway vs alternatives.
+- [Benchmarks](https://github.com/developerz-ai/db-mcp-gateway/blob/main/website/docs/benchmarks.md): performance numbers.
 
 ## Deployment
 
-- [Quickstart](https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/deployment/quickstart.md): stand up the gateway against a target Postgres.
-- [Config reference](https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/deployment/config-reference.md): every YAML field, validated at boot.
-- [Admin API](https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/deployment/admin-api.md): SSO-gated dynamic grants, audited to `permissions_audit`.
-- [Logging](https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/deployment/logging.md): tracing spans, audit sinks (OTLP, syslog, stdout, S3/GCS/Azure archive).
-- [Releasing](https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/deployment/releasing.md): tagging, image build, multi-arch (linux/amd64 + linux/arm64), compatibility policy.
+- [Quickstart](https://github.com/developerz-ai/db-mcp-gateway/blob/main/website/docs/deployment/quickstart.md): stand up the gateway against a target Postgres.
+- [Config reference](https://github.com/developerz-ai/db-mcp-gateway/blob/main/website/docs/deployment/config-reference.md): every YAML field, validated at boot.
+- [Admin API](https://github.com/developerz-ai/db-mcp-gateway/blob/main/website/docs/deployment/admin-api.md): SSO-gated dynamic grants, audited to `permissions_audit`.
+- [Logging](https://github.com/developerz-ai/db-mcp-gateway/blob/main/website/docs/deployment/logging.md): tracing spans, audit sinks (stdout, syslog); object-storage archive and OTLP streaming are roadmap, not shipped.
+- [Releasing](https://github.com/developerz-ai/db-mcp-gateway/blob/main/website/docs/deployment/releasing.md): tagging, image build, multi-arch (linux/amd64 + linux/arm64), compatibility policy.
 
 ## Usage
 
-- [First query](https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/first-query.md): 5-minute walkthrough from `claude mcp add` to a returned result.
-- [Claude Code reference](https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/claude-code.md): full client-side reference.
-- [Other agents](https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/other-agents.md): non-Claude MCP clients (Cursor, Windsurf, etc.).
-- [Multi-DB](https://github.com/developerz-ai/db-mcp-gateway/blob/main/docs/usage/multi-db.md): querying across PostgreSQL and MongoDB with one grant surface.
+- [First query](https://github.com/developerz-ai/db-mcp-gateway/blob/main/website/docs/usage/first-query.md): 5-minute walkthrough from `claude mcp add` to a returned result.
+- [Claude Code reference](https://github.com/developerz-ai/db-mcp-gateway/blob/main/website/docs/usage/claude-code.md): full client-side reference.
+- [Other agents](https://github.com/developerz-ai/db-mcp-gateway/blob/main/website/docs/usage/other-agents.md): non-Claude MCP clients (Cursor, Windsurf, etc.).
+- [Multi-DB](https://github.com/developerz-ai/db-mcp-gateway/blob/main/website/docs/usage/multi-db.md): querying across PostgreSQL and MongoDB with one grant surface.
