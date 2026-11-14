@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/SECURITY.md
+    about: Report security issues privately as SECURITY.md describes, never as a public issue.
+  - name: Question or discussion
+    url: https://github.com/developerz-ai/db-mcp-gateway/discussions
+    about: Usage questions, ideas and general discussion.

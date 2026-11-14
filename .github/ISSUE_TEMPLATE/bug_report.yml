@@ -1,0 +1,54 @@
+name: Bug report
+description: The gateway does something it should not, or fails to do what the docs say.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. For a security vulnerability, follow
+        [SECURITY.md](https://github.com/developerz-ai/db-mcp-gateway/blob/main/SECURITY.md)
+        instead of opening a public issue.
+
+        **Never paste a connection string, password, token, service-account bearer or
+        `.env` content here.** Replace each with `<redacted>`: the issue is public.
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: |
+        The MCP call (tool name and arguments), the relevant part of your gateway YAML with
+        secrets redacted, and the target database type. A `bin/dev up` repro is ideal.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+      description: What should have happened, with the spec or docs page that says so if you know it.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual
+      description: |
+        What happened instead: the error code and message the client saw, and the matching
+        audit row's `outcome` if you can read it. Logs welcome, redacted.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Gateway version
+      description: "`db-mcp-gateway --version`, or the image tag you run."
+      placeholder: "2.1.0"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Target database and identity provider
+      placeholder: "Postgres 16, OIDC via Keycloak 26"
+    validations:
+      required: false

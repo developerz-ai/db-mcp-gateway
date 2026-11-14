@@ -31,4 +31,4 @@ A write needs both the per-grant `query_write` opt-in and a write-privileged tar
 `require_reason` returns `reason_required`; it is a policy failure, not an argument-validation failure.
 Unknown keys under `permissions`, `grants` or `constraints` abort boot with a `line:column` pointer — keep the schema and `website/docs/initial-idea/06-permissions.md` in step.
 The permissions cache (`src/authz/cache.rs`) is in-process; a SIGHUP config reload is what makes a grant change effective.
-Flag every change under `src/authz/` for the `(security review required)` label.
+Flag every change under `src/authz/` for the `security review required` label.

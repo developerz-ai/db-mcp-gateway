@@ -1,4 +1,11 @@
-# Devin auto-fix kill-switch
+# .devin/
+
+| File | What |
+|---|---|
+| `blueprint.yaml` | Devin's environment: the pinned Rust toolchain, `cargo-nextest`, `cargo-audit` and the dev stack's images baked into the snapshot; `bin/dev up` per session; the repo's check commands as knowledge |
+| `autofix-enabled` | Layer 2 of the Devin auto-fix kill-switch (below) |
+
+## Devin auto-fix kill-switch
 
 `autofix-enabled` is **Layer 2** of the Devin auto-fix kill-switch. The Devin `glitchtip-autofix` playbook reads this file as its **first step** and no-ops the run if the value is `false` — no Devin API access required to stop it.
 

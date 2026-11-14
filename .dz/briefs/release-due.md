@@ -40,13 +40,13 @@ The pathspec names what reaches users. Prose, tests, CI and docs ship nothing.
 
 ## The ask
 
-File nothing if an open issue title is exactly `Release <next>`, or an open PR is already that release. Body, for the box that takes it:
+Pre-flight guard: only a lane where `gh auth status` exits 0 files the ask (credentials come through `gh`'s standard `GH_TOKEN`, named here only). File nothing if an open issue title from `gh api --paginate "repos/developerz-ai/db-mcp-gateway/issues?state=open" | jq -r '.[] | select(.pull_request == null) | .title'` is exactly `Release <next>`, or an open PR title from `gh api --paginate "repos/developerz-ai/db-mcp-gateway/pulls?state=open" | jq -r '.[].title'` matches `^chore\(release\):`. A failed read is no verdict: file nothing and say so. Body, for the box that takes it:
 
 1. Re-run Decide on fresh `main`; still needed, or stop.
 2. Bump `version` in `Cargo.toml`, run `cargo update -p db-mcp-gateway` (so `Cargo.lock` carries it), and update the version in `README.md`. Nothing else in the diff: no source change, so no security-review path and no spec update.
 3. `bin/ci`, then one PR titled `chore(release): <next>`. It merges on green like any PR: `fmt`, `clippy`, `test` and `audit` required, never `--admin`.
 4. After it merges: `git fetch origin`, confirm `git show <merge sha>:Cargo.toml` shows `<next>`, then `git tag -a v<next> -m "v<next>" <merge sha> && git push origin v<next>`. An annotated tag on the merge commit, nothing else.
-5. Watch `release.yml` to the end: per-arch images, the multi-arch manifest on GHCR and DOCR at the semver tags and `:latest`, then the GitHub Release. A failure is an issue for a maintainer.
+5. Watch `release.yml` to the end: per-arch images, the multi-arch manifest on GHCR and DOCR at the semver tags and `:latest`, then the GitHub Release. Then `release-smoke.yml`, which it triggers: the published image runs on amd64 and arm64 and reports `<next>`. A failure is an issue for a maintainer.
 
 Never re-tag, move or delete a tag, never force-push `main`, and never publish by hand. A failed publish is an issue for a maintainer; the fix ships as the next patch.
 

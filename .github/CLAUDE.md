@@ -1,0 +1,13 @@
+# .github/ — CI standard and release lane
+
+Root `CLAUDE.md` §CI has the job table. These are the rules for editing anything here.
+
+- **The gate.** The `main-protection` ruleset gates the merge, and its live required-check list is the single authority: `gh api repos/developerz-ai/db-mcp-gateway/rulesets`. Never re-declare the list as fact in a doc; `.dz/maintainer/maintainer.yml` names it only so the agent knows whose red check it is.
+- **Skipped means passed.** GitHub counts a skipped required job as passing. `ci.yml` relies on that for docs-only PRs (`changes` skips `clippy`/`test` through a per-job `if:`), so a job-level `if:` on a required job is a decision, not a convenience: a new skip condition is a merge that ran nothing.
+- **Runners.** GitHub-hosted only (public repo): `ubuntu-latest`, `ubuntu-24.04-arm` for native arm64. No self-hosted runners, so a fork PR never reaches persistent hardware.
+- **Pins.** Every `uses:` is a 40-hex SHA with the version in a trailing comment; `ci.yml`'s `fmt` job and `bin/lint` both fail an unpinned ref. Copy a pin already used in another workflow before adding a new one; Dependabot keeps them fresh (`dependabot.yml`, 14-day cooldown). Docker images run by a step are pinned by digest.
+- **Least privilege.** Top-level `permissions: contents: read`; a job that needs more asks for it itself. `persist-credentials: false` on every checkout.
+- **Concurrency and timeouts.** Every workflow declares a `concurrency` group and every job sets `timeout-minutes`. PR runs cancel in progress; `main` pushes in `ci.yml` get a per-SHA group; `release.yml`, `pages.yml` and `weekly.yml` never cancel.
+- **The release tag is the input.** `release.yml` fires on a `v*` tag pushed onto the merge commit of a `chore(release)` PR, checks it against `Cargo.toml`, builds per arch, stitches the multi-arch manifest and cuts the GitHub Release. A published tag is never moved or deleted; a broken release ships as the next patch (`.dz/briefs/release-due.md`). `release-smoke.yml` then pulls what was published and checks it runs.
+- **Lint workflows before pushing.** `workflow-lint.yml` runs actionlint on every change here. Locally: `docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -no-color`.
+- **Secrets.** `DOCR_TOKEN` is the only repository secret the workflows read, and only in the image-push jobs. A workflow that does not push an image needs no secret; one that does takes it in that job alone.

@@ -13,10 +13,11 @@ relaxes a non-negotiable.
 | `schedules/` | briefs for lanes not registered yet (`docs-drift.md`) |
 | `onboarding/scorecard.md` | the AI-first scorecard the setup pass writes |
 
-Two agent configs stay at the repository root, because the tools that read them look there and
-nowhere else:
+These agent configs stay where the tools that read them look, and nowhere else:
 
 - `.coderabbit.yaml`: CodeRabbit (https://docs.coderabbit.ai/configure-coderabbit)
 - `.mcp.json`: Claude Code (https://code.claude.com/docs/en/mcp)
+- `.claude/`: Claude Code commands, agents, skills, hooks and permissions (`.claude/README.md`)
+- `.devin/`: Devin's environment blueprint and its auto-fix kill-switch (`.devin/README.md`)
 
 Docs: https://developerz.ai/docs/maintainer-yml

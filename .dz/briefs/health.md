@@ -12,11 +12,14 @@ Weekly checkup (Mondays 07:00 UTC) fired by `schedules: health`: the failures no
 
 ## What to file
 
-For each unhealthy signal, one ask, unless an open issue already carries its exact title
-(`gh issue list --state open --search "<title> in:title" --json number,title`, then compare byte for byte).
+For each unhealthy signal, one ask, unless an open issue already carries its exact title. Read the
+open titles first, exactly so: `gh api --paginate "repos/developerz-ai/db-mcp-gateway/issues?state=open" | jq -r '.[] | select(.pull_request == null) | .title'`,
+then compare byte for byte (a search can miss a title; the paginated listing cannot). A failed read is no verdict, never "no open ask".
 Titles are stable: nothing that changes run to run (sha, run URL, version) goes in one; that goes in the body,
 with the command and its output. Unreadable evidence is no verdict: re-run it, never file it as a defect.
-A red `main` comes first: nothing releases from it.
+A red `main` comes first: nothing releases from it. For `last-tag-published`, a red `release-smoke.yml`
+run on that tag (`gh run list --workflow release-smoke.yml --limit 5 --json conclusion,event,url`) is the
+same defect seen after the publish: name it in that ask's body, never as a second ask.
 
 This lane reads and files; it never repairs. It never re-runs a publish, re-tags, moves or deletes a tag,
 pushes an image by hand, force-pushes `main` or merges with `--admin`. Recovery is a maintainer's.

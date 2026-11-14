@@ -1,0 +1,131 @@
+name: release-smoke
+
+# Post-publish evidence that the image people pull runs: per architecture, pull
+# `ghcr.io/<repo>:<version>` from the public registry with no credential, check the platform it
+# resolved to, and check `--version` reports the tag. After every successful release, weekly on
+# the "Latest" release (where it also checks `:latest` is that version), and by hand.
+#
+# Not a gate: it runs after the publish, so a failure rolls nothing back. A red run is a
+# `health` finding for a maintainer; the fix ships as the next patch, never a re-tag.
+on:
+  workflow_run: # reads only the triggering run's tag name; checks out and runs nothing from it
+    workflows: [release]
+    types: [completed]
+  schedule:
+    - cron: "41 6 * * 2"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published version to smoke, e.g. 2.0.3 (empty = the Latest release)
+        required: false
+        type: string
+  pull_request:
+    paths:
+      - ".github/workflows/release-smoke.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-smoke-${{ github.event.workflow_run.head_branch || inputs.version || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    if: >-
+      github.event_name != 'workflow_run' || (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      check_latest: ${{ steps.version.outputs.check_latest }}
+    steps:
+      - name: resolve the version to smoke
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          RUN_TAG: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          version=""
+          check_latest=false
+          case "$GITHUB_EVENT_NAME" in
+            workflow_run) version="${RUN_TAG#v}" ;;
+            workflow_dispatch) version="${INPUT_VERSION#v}" ;;
+          esac
+          if [ -z "$version" ]; then
+            tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+            version="${tag#v}"
+            check_latest=true
+          fi
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$version' is not a release version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "check_latest=$check_latest" >> "$GITHUB_OUTPUT"
+
+  smoke:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      CHECK_LATEST: ${{ needs.resolve.outputs.check_latest }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: pull the published image
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          docker pull -q "$image:$VERSION"
+      - name: it is the platform this runner asked for
+        run: |
+          set -euo pipefail
+          got=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE:$VERSION")
+          if [ "$got" != "linux/$ARCH" ]; then
+            echo "::error::$IMAGE:$VERSION resolved to $got on a linux/$ARCH runner"
+            exit 1
+          fi
+      - name: it runs and reports its tag
+        run: |
+          set -euo pipefail
+          got=$(docker run --rm "$IMAGE:$VERSION" --version)
+          if [ "$got" != "db-mcp-gateway $VERSION" ]; then
+            echo "::error::$IMAGE:$VERSION reports '$got', expected 'db-mcp-gateway $VERSION'"
+            exit 1
+          fi
+          echo "$got on linux/$ARCH" | tee -a "$GITHUB_STEP_SUMMARY"
+      # release.yml moves `:latest` before it cuts the GitHub Release, so while a release runs
+      # the two legitimately disagree: that is a notice, not a failure.
+      - name: ":latest is the Latest release"
+        if: env.CHECK_LATEST == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          docker pull -q "$IMAGE:latest" >/dev/null
+          got=$(docker run --rm "$IMAGE:latest" --version)
+          [ "$got" = "db-mcp-gateway $VERSION" ] && exit 0
+          running=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow release.yml --status in_progress --json databaseId --jq length)
+          if [ "$running" != "0" ]; then
+            echo "::notice::$IMAGE:latest reports '$got' while a release run is in progress; the Latest release is still $VERSION"
+            exit 0
+          fi
+          echo "::error::$IMAGE:latest reports '$got', but the Latest release is $VERSION"
+          exit 1
