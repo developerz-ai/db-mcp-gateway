@@ -46,7 +46,10 @@ pub async fn record(pool: &PgPool, intent: &CallIntent<'_>) -> Result<(), AuditE
 
 /// Appended to the `error_message` of a write-access call whose outcome is
 /// unknown (`timeout`, `cancelled`): the statement may have committed before
-/// the gateway stopped waiting. Same wording the reaper uses for `abandoned`.
+/// the gateway stopped waiting. This wording is the timeout/cancelled note;
+/// the reaper's `abandoned` row words it differently — `no completion
+/// recorded before the gateway stopped (access: …)` — but records the same
+/// access, so `access: write` there signals the same uncertainty.
 pub const WRITE_MAY_HAVE_COMMITTED: &str = "access: write; the statement may have committed";
 
 /// The access the intent of `request_id` recorded, under the audit write
