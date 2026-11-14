@@ -47,6 +47,7 @@ permissions:
 "#;
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn login_via_mock_idp_then_call_tool() {
     let pool = state_pool().await;
     // Don't TRUNCATE: tests must coexist with each other and any dev rows.
@@ -266,6 +267,7 @@ async fn drive_to_callback(gw: &GatewayHandle) -> reqwest::Response {
 /// A6 — ID token with `email_verified: false` must be rejected at the callback
 /// with 502 Bad Gateway and error code `oidc_email_unverified`.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn unverified_email_is_rejected() {
     let pool = state_pool().await;
 
@@ -302,6 +304,7 @@ async fn unverified_email_is_rejected() {
 /// audit/admin identity is derived from `email`, so an empty value cannot mint
 /// an identity even when `email_verified` is true.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn empty_email_is_rejected() {
     let pool = state_pool().await;
 
@@ -335,6 +338,7 @@ async fn empty_email_is_rejected() {
 /// gateway sets `Validation::validate_nbf`, so `jsonwebtoken` refuses the
 /// not-yet-valid token before any claim is trusted.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn future_nbf_id_token_is_rejected() {
     let pool = state_pool().await;
 
@@ -373,6 +377,7 @@ async fn future_nbf_id_token_is_rejected() {
 /// causes `jsonwebtoken` to return `InvalidAlgorithm` before any signature
 /// check — regardless of what key material the attacker holds.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn hs256_id_token_is_rejected() {
     let pool = state_pool().await;
 
@@ -428,6 +433,7 @@ fn ping() -> Value {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn state_db_outage_on_bearer_check_is_5xx_without_challenge() {
     let gw = GatewayBuilder::new(E2E_CONFIG_YAML)
         .spawn(state_pool().await)
@@ -451,6 +457,7 @@ async fn state_db_outage_on_bearer_check_is_5xx_without_challenge() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn logout_ends_every_session_of_the_subject() {
     let gw = GatewayBuilder::new(E2E_CONFIG_YAML)
         .spawn(state_pool().await)
@@ -483,6 +490,7 @@ async fn logout_ends_every_session_of_the_subject() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn logout_during_state_db_outage_is_5xx_not_204() {
     let gw = GatewayBuilder::new(E2E_CONFIG_YAML)
         .spawn(state_pool().await)

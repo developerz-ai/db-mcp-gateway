@@ -8,6 +8,7 @@ mod common;
 mod audit_assertion_guard;
 mod auth_hardening_id_token;
 mod auth_reserved_subject;
+mod isolation_guard;
 mod oauth_discovery;
 mod permissions_shipped_yml;
 mod tls_reload;

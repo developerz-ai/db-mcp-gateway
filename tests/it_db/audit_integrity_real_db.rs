@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::common::audit::{DispatchSinks, SWEEPS, calls_for_request, find_audit};
+use crate::common::audit::{DispatchSinks, calls_for_request, find_audit};
 use crate::common::cleanup::delete_audit_calls;
 use crate::common::env::state_pool;
 use db_mcp_gateway::audit::intent::WRITE_MAY_HAVE_COMMITTED;
@@ -78,8 +78,8 @@ async fn intent_exists(pool: &PgPool, request_id: &str) -> bool {
 /// cutoff, so the surviving intent keeps its completion and a reaper sweep
 /// does not invent an `abandoned` row for a call that succeeded.
 #[tokio::test]
+#[serial_test::serial(world)]
 async fn pruner_never_orphans_a_surviving_intent() {
-    let _serial = SWEEPS.lock().await;
     let p = state_pool().await;
     let user = format!("integrity-prune-{}", Uuid::new_v4().simple());
     const TTL_DAYS: u32 = 400;
@@ -113,8 +113,8 @@ async fn pruner_never_orphans_a_surviving_intent() {
 /// lock leaves the cursor where it was, and a fresh cursor (a restarted
 /// replica) catches up on everything.
 #[tokio::test]
+#[serial_test::serial(world)]
 async fn reaper_cursor_resumes_without_rescanning_or_skipping() {
-    let _serial = SWEEPS.lock().await;
     let p = state_pool().await;
     let user = format!("integrity-reap-{}", Uuid::new_v4().simple());
     let grace = Duration::from_secs(3600);
@@ -258,6 +258,7 @@ async fn cancelled_message_after_drop(access: Access) -> Option<String> {
 /// A write dropped mid-work may have been dropped mid-commit: its
 /// `cancelled` row says so. A read's does not.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn dropped_write_is_audited_as_possibly_committed() {
     let write = cancelled_message_after_drop(Access::ReadWrite)
         .await

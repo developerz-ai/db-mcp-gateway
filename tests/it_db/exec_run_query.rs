@@ -40,6 +40,7 @@ fn write_query(sql: &str, row_limit: u32) -> ExecQuery<'_> {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn quick_query_succeeds_with_columns_and_rows() {
     let a = adapter().await;
     let result = a
@@ -67,6 +68,7 @@ async fn quick_query_succeeds_with_columns_and_rows() {
 /// perfectly ordinary column types. This pins each numeric width to its
 /// probe so a future refactor can't drop one and re-open the hole.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn decodes_every_numeric_width_not_just_i64_and_f64() {
     let a = adapter().await;
     let result = a
@@ -87,6 +89,7 @@ async fn decodes_every_numeric_width_not_just_i64_and_f64() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn row_limit_truncates_and_flags() {
     let a = adapter().await;
     let result = a
@@ -117,6 +120,7 @@ async fn row_limit_truncates_and_flags() {
 /// actually bounds server-side work, not just the client-visible row
 /// count — a full drain cannot possibly finish that fast.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn truncated_query_cancels_instead_of_draining_the_rest() {
     let a = adapter().await;
     let started = Instant::now();
@@ -146,6 +150,7 @@ async fn truncated_query_cancels_instead_of_draining_the_rest() {
 /// killed at the DB and surfaces as the typed `ExecError::Timeout` — not a
 /// raw sqlx error and never the underlying SQLSTATE string.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn statement_timeout_kills_slow_query() {
     let a = adapter().await;
     let err = a
@@ -168,6 +173,7 @@ async fn statement_timeout_kills_slow_query() {
 /// A statement the DB refuses comes back with its SQLSTATE and the server's
 /// message, so the agent can fix the query; the kind picks the stable code.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn db_rejection_carries_sqlstate_and_message() {
     let a = adapter().await;
     let err = a
@@ -250,6 +256,7 @@ async fn wait_for_active_count(
 /// sleep/timeout could account for on its own. Easy to regress: dropping the
 /// `sqlx::Transaction` alone leaves the query running on the backend.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn dropped_query_future_cancels_backend() {
     let a = adapter().await;
     let probe = probe_pool().await;
@@ -301,6 +308,7 @@ async fn dropped_query_future_cancels_backend() {
 /// The types the audit called out — plus the date/time family — must come back
 /// as their actual values, not `null`.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn previously_nulled_types_decode_to_real_values() {
     let adapter = adapter().await;
     let result = adapter
@@ -356,6 +364,7 @@ async fn previously_nulled_types_decode_to_real_values() {
 /// would trade a visibly wrong answer for an invisible one on money columns:
 /// this value needs 29 significant digits and `f64` carries ~15.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn numeric_keeps_precision_a_float_would_lose() {
     let adapter = adapter().await;
     let exact = "12345678901234567890.123456789";
@@ -381,6 +390,7 @@ async fn numeric_keeps_precision_a_float_would_lose() {
 /// SQL NULL still decodes to `null` — including for non-text types, where the
 /// old `Option<String>` probe could not even reach the NULL check.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn sql_null_decodes_to_null_for_every_type() {
     let adapter = adapter().await;
     let result = adapter
@@ -402,6 +412,7 @@ async fn sql_null_decodes_to_null_for_every_type() {
 /// A type the gateway can't render must be marked as such, never passed off as
 /// NULL. The marker names the type so the caller knows to cast it.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn unrenderable_type_is_marked_not_nulled() {
     let adapter = adapter().await;
     let result = adapter
@@ -433,6 +444,7 @@ async fn unrenderable_type_is_marked_not_nulled() {
 /// from "that table has no such columns" — the row loop never runs, so
 /// `columns` was left empty (#136).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn zero_row_result_still_reports_column_names() {
     let a = adapter().await;
     let result = a
@@ -456,6 +468,7 @@ async fn zero_row_result_still_reports_column_names() {
 /// The non-empty path must keep taking names from the rows themselves — the
 /// describe fallback is only for the empty case.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn non_empty_result_column_names_are_unchanged() {
     let a = adapter().await;
     let result = a
@@ -472,6 +485,7 @@ async fn non_empty_result_column_names_are_unchanged() {
 /// attaches to `query.bind(...)`. This pins that path: zero-row + bound query
 /// still surfaces the column name, and stays `truncated: false`.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn zero_row_bound_query_still_reports_column_names() {
     let a = adapter().await;
     let result = a
@@ -524,6 +538,7 @@ async fn drop_table(probe: &sqlx::PgPool, table: &str) {
 /// the SQL guard would also stop — at this layer they must fail at the DB,
 /// with no side effect.
 #[tokio::test]
+#[serial_test::serial(world)]
 async fn read_access_cannot_write_on_a_write_capable_role() {
     let a = adapter().await;
     let probe = probe_pool().await;
@@ -574,6 +589,7 @@ async fn read_access_cannot_write_on_a_write_capable_role() {
 /// response's `truncated` and `rows_affected` match what is in the table.
 /// Rolling it back after reporting success was the bug.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn truncated_write_commits_and_reports_rows_affected() {
     let a = writable_adapter().await;
     let probe = probe_pool().await;
@@ -615,6 +631,7 @@ async fn truncated_write_commits_and_reports_rows_affected() {
 /// A read reports no `rows_affected`; a write without `RETURNING` reports it
 /// with no rows.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn rows_affected_is_reported_for_writes_only() {
     let a = writable_adapter().await;
     let probe = probe_pool().await;
@@ -644,6 +661,7 @@ async fn rows_affected_is_reported_for_writes_only() {
 /// pool has one connection, and the backend PID proves it was reused (reset,
 /// not discarded).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn no_session_state_survives_release() {
     let a = single_connection_adapter().await;
     let probe = probe_pool().await;
@@ -699,6 +717,7 @@ async fn no_session_state_survives_release() {
 /// Wide rows stop at the byte budget well before the row limit, and the
 /// connection is reusable afterwards.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn wide_rows_truncate_at_the_byte_budget() {
     let a = single_connection_adapter().await;
     let one_mib = 1024 * 1024;
@@ -728,6 +747,7 @@ async fn wide_rows_truncate_at_the_byte_budget() {
 
 /// A zero timeout must not reach Postgres as zero (= no limit).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn zero_timeout_is_not_unlimited() {
     let a = adapter().await;
     let err = a
@@ -741,6 +761,7 @@ async fn zero_timeout_is_not_unlimited() {
 /// the only connection pinned, a 100 ms query is `unavailable` after the
 /// acquire timeout, not a `timeout`.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn saturated_pool_is_unavailable_not_timeout() {
     let a = std::sync::Arc::new(single_connection_adapter().await);
     let holder = {
@@ -770,6 +791,7 @@ fn rand_key() -> i64 {
 
 /// JSON has no NaN or infinity; they must not collapse into SQL-NULL `null`.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn non_finite_floats_render_as_strings() {
     let a = adapter().await;
     let r = a
@@ -784,6 +806,7 @@ async fn non_finite_floats_render_as_strings() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn arrays_intervals_and_inet_decode() {
     let a = adapter().await;
     let r = a
@@ -812,6 +835,7 @@ async fn arrays_intervals_and_inet_decode() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn enum_values_decode_as_their_label() {
     let a = adapter().await;
     let probe = probe_pool().await;
@@ -840,6 +864,7 @@ fn current_user(result: &db_mcp_gateway::exec::ExecResult) -> &str {
 /// Reads connect as the read role and writes as the write role — the read
 /// tier never reaches a write-capable role, whatever the SQL.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn reads_run_as_role_and_writes_as_write_role() {
     let a = writable_adapter().await;
     let read = a
@@ -858,6 +883,7 @@ async fn reads_run_as_role_and_writes_as_write_role() {
 /// read tier could not write — but the adapter never offers one: a write on
 /// a database without `write_role` is refused before any connection.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn write_without_write_role_is_refused() {
     let a = adapter().await;
     let err = a
@@ -869,6 +895,7 @@ async fn write_without_write_role_is_refused() {
 
 /// `dry_run` runs the write, reports `rows_affected`, and leaves no change.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn dry_run_reports_rows_affected_and_rolls_back() {
     let a = writable_adapter().await;
     let probe = probe_pool().await;
@@ -901,6 +928,7 @@ fn explain(sql: &str, access: Access, analyze: bool) -> db_mcp_gateway::exec::Ex
 /// `analyze` runs a read and reports actual timings; a write is planned
 /// (under the write role, in a read-only transaction) but never run.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn explain_analyzes_reads_and_only_plans_writes() {
     let a = writable_adapter().await;
     let probe = probe_pool().await;
@@ -943,6 +971,7 @@ async fn explain_analyzes_reads_and_only_plans_writes() {
 /// `table_stats` covers the tables the read role can SELECT, indexes
 /// included.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn table_stats_reports_size_and_indexes() {
     let a = writable_adapter().await;
     let probe = probe_pool().await;
@@ -977,6 +1006,7 @@ async fn table_stats_reports_size_and_indexes() {
 /// id, and `cancel_request` stops it: the victim fails as `Cancelled`, not
 /// `Timeout`.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn activity_lists_and_cancel_stops_a_request() {
     let a = std::sync::Arc::new(writable_adapter().await);
     let victim_id = Uuid::new_v4();

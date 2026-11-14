@@ -115,6 +115,7 @@ fn test_identity(user_sub: &str) -> Identity {
 /// `pg_cancel_backend` and the backend stops actively executing.
 ///
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn pg_cancel_backend_fires_when_execute_future_dropped() {
     let monitor = PgPoolOptions::new()
         .max_connections(2)
@@ -175,6 +176,7 @@ async fn pg_cancel_backend_fires_when_execute_future_dropped() {
 /// aborted mid-query leaves BOTH the DB backend cancelled AND an
 /// `outcome = "cancelled"` audit row.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn cancelled_dispatch_cancels_pg_backend_and_writes_audit_row() {
     let state_pool = state_pool().await;
 
@@ -333,6 +335,7 @@ async fn cancelled_dispatch_cancels_pg_backend_and_writes_audit_row() {
 /// backends the cancels are trying to free. Each `acquire()` would wait for
 /// a slot that only opens when its own target's `statement_timeout` fires.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn concurrent_aborts_do_not_queue_on_query_pool() {
     let monitor = PgPoolOptions::new()
         .max_connections(2)

@@ -53,6 +53,7 @@ async fn cleanup(pool: &PgPool, user_sub: &str) {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn revocation_on_one_replica_is_seen_by_another_after_cache_ttl() {
     let pool = state_pool().await;
     let user_sub = format!("a3-cross-{}", Uuid::new_v4().simple());
@@ -80,6 +81,7 @@ async fn revocation_on_one_replica_is_seen_by_another_after_cache_ttl() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn revocation_is_stale_on_another_replica_within_cache_ttl() {
     let pool = state_pool().await;
     let user_sub = format!("a3-stale-{}", Uuid::new_v4().simple());
@@ -120,6 +122,7 @@ async fn revocation_is_stale_on_another_replica_within_cache_ttl() {
 /// revoked on one replica is denied by another after at most `ttl` wall-clock
 /// time, not only in the degenerate TTL=0 case.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn revocation_denied_after_real_ttl_elapses() {
     let pool = state_pool().await;
     let user_sub = format!("a3-elapsed-{}", Uuid::new_v4().simple());
@@ -176,6 +179,7 @@ async fn revocation_denied_after_real_ttl_elapses() {
 /// Logout-everywhere: every live session of the subject is rejected at once,
 /// on the revoking replica, without waiting for a cache TTL.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn revoke_all_for_sub_rejects_every_session_of_that_subject() {
     let pool = state_pool().await;
     let user_sub = format!("a3-all-{}", Uuid::new_v4().simple());
@@ -209,6 +213,7 @@ async fn revoke_all_for_sub_rejects_every_session_of_that_subject() {
 /// including revoked-but-unexpired ones, which are the denylist entry for a
 /// still-signed JWT.
 #[tokio::test]
+#[serial_test::serial(world)]
 async fn gc_deletes_long_expired_rows_and_keeps_the_rest() {
     let pool = state_pool().await;
     let user_sub = format!("a3-gc-{}", Uuid::new_v4().simple());
@@ -253,6 +258,7 @@ async fn gc_deletes_long_expired_rows_and_keeps_the_rest() {
 
 /// An expired session is rejected even when the row was never revoked.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn expired_session_is_rejected() {
     let pool = state_pool().await;
     let user_sub = format!("a3-exp-{}", Uuid::new_v4().simple());
@@ -277,6 +283,7 @@ async fn expired_session_is_rejected() {
 /// A state-DB failure is `AuthError::State` — the gateway's fault, which the
 /// transport maps to 5xx — never a credential error that would force re-login.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn lookup_with_closed_pool_is_a_state_error() {
     let pool = state_pool().await;
     let store = replica(&pool, Duration::ZERO);

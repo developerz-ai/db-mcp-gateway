@@ -62,6 +62,7 @@ fn session_store(pool: &PgPool) -> SessionStore {
 /// The regression this table exists for: a chain minted before a restart still
 /// renews after it, carrying the identity (groups included) it was minted with.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn chain_survives_a_restart() {
     let pool = state_pool().await;
     let sub = unique_sub("restart");
@@ -89,6 +90,7 @@ async fn chain_survives_a_restart() {
 /// Rotation is single-use: redeeming a token deletes the row, so a replay of the
 /// same value finds nothing (OAuth 2.1 §4.3.1 for public clients).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn redemption_consumes_the_token() {
     let pool = state_pool().await;
     let sub = unique_sub("replay");
@@ -109,6 +111,7 @@ async fn redemption_consumes_the_token() {
 /// measured from the first mint, so a continuously-rotated chain still dies on
 /// schedule (the group-staleness bound, O3b).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn rotation_does_not_slide_the_deadline() {
     let pool = state_pool().await;
     let sub = unique_sub("rotate");
@@ -134,6 +137,7 @@ async fn rotation_does_not_slide_the_deadline() {
 
 /// A chain past its absolute TTL does not renew, and GC reaps the row.
 #[tokio::test]
+#[serial_test::serial(world)]
 async fn expired_chain_is_rejected_and_swept() {
     let pool = state_pool().await;
     let sub = unique_sub("expired");
@@ -167,6 +171,7 @@ async fn expired_chain_is_rejected_and_swept() {
 /// Logout purges every chain for one identity and leaves other users' alone —
 /// otherwise a signed-out user could silently mint a fresh session (O4).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn purge_for_sub_drops_only_that_identitys_chains() {
     let pool = state_pool().await;
     let mine = unique_sub("purge-mine");
@@ -199,6 +204,7 @@ async fn purge_for_sub_drops_only_that_identitys_chains() {
 /// longer window — the store re-checks the row against the *current* TTL rather
 /// than honoring the deadline materialized at mint time.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn shortening_the_configured_ttl_applies_to_existing_chains() {
     let pool = state_pool().await;
     let sub = unique_sub("shrink");
@@ -224,6 +230,7 @@ async fn shortening_the_configured_ttl_applies_to_existing_chains() {
 /// Rotation revokes the session paired with the redeemed token: after a
 /// refresh, the previous access token no longer authenticates.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn rotation_revokes_the_previous_session() {
     let pool = state_pool().await;
     let sub = unique_sub("pair");
@@ -261,6 +268,7 @@ async fn rotation_revokes_the_previous_session() {
 /// A rotation that fails part-way commits nothing: the presented token and its
 /// session stay usable, so a transient error is not a sign-out.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn failed_rotation_leaves_the_old_chain_usable() {
     let pool = state_pool().await;
     let sub = unique_sub("rollback");
@@ -293,6 +301,7 @@ async fn failed_rotation_leaves_the_old_chain_usable() {
 
 /// RFC 7009 on a refresh token ends the chain and its paired access session.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn revoking_a_refresh_token_revokes_its_session() {
     let pool = state_pool().await;
     let sub = unique_sub("revoke");
@@ -327,6 +336,7 @@ async fn revoking_a_refresh_token_revokes_its_session() {
 
 /// Logout ends every session and chain of the identity, not just the caller's.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn end_all_for_sub_leaves_no_live_bearer() {
     let pool = state_pool().await;
     let sub = unique_sub("logout");
@@ -369,6 +379,7 @@ async fn end_all_for_sub_leaves_no_live_bearer() {
 /// A closed state pool is an error the caller can report, never a silent
 /// "nothing to revoke".
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn revoke_with_closed_pool_is_an_error() {
     let pool = state_pool().await;
     let sessions = session_store(&pool);

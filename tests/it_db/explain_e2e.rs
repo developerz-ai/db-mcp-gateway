@@ -113,6 +113,7 @@ fn payload(response: &Value) -> Value {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn explain_full_acceptance() {
     let booted = boot_gateway().await;
     let (url, bearer, pool, sub) = (
@@ -172,6 +173,7 @@ async fn explain_full_acceptance() {
 
 /// `analyze: true` runs a read for real timings; DML is never analyzed.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn explain_analyze_runs_reads_only() {
     common::pg_target::ensure_read_role().await;
     let booted = boot_gateway_with(WRITE_YAML, "writers").await;
@@ -209,6 +211,7 @@ async fn explain_analyze_runs_reads_only() {
 /// Under `query_write`, plain EXPLAIN of DML returns the plan and changes
 /// nothing.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn explain_plans_dml_under_a_write_grant() {
     common::pg_target::ensure_read_role().await;
     let booted = boot_gateway_with(WRITE_YAML, "writers").await;

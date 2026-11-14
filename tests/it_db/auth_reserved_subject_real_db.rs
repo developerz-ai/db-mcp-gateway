@@ -37,6 +37,7 @@ fn session_store(pool: &PgPool) -> SessionStore {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn legacy_session_with_a_service_subject_does_not_authenticate() {
     let pool = state_pool().await;
     let sub = unique_service_sub();
@@ -55,6 +56,7 @@ async fn legacy_session_with_a_service_subject_does_not_authenticate() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn legacy_refresh_chain_with_a_service_subject_does_not_rotate() {
     let pool = state_pool().await;
     let sub = unique_service_sub();

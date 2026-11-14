@@ -104,6 +104,7 @@ async fn cleanup_server(pool: &MySqlPool, server: &str) {
 /// Upsert + get-by-sub round-trip. Same contract as pg: the row exists
 /// after upsert, the fields match what we sent.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn upsert_then_get_by_sub_roundtrips() {
     let r = repo().await;
     let sub = unique_sub("mysql-upsert");
@@ -122,6 +123,7 @@ async fn upsert_then_get_by_sub_roundtrips() {
 /// Upsert on a live row updates in place (same id). Soft-deleted row +
 /// new upsert mints a fresh id — the prior row stays as audit trail.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn upsert_on_live_updates_in_place() {
     let r = repo().await;
     let sub = unique_sub("mysql-update");
@@ -144,6 +146,7 @@ async fn upsert_on_live_updates_in_place() {
 
 /// Soft delete + re-upsert mints a new id (partial-uniqueness emulation).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn soft_delete_then_reupsert_mints_new_id() {
     let r = repo().await;
     let sub = unique_sub("mysql-reup");
@@ -164,6 +167,7 @@ async fn soft_delete_then_reupsert_mints_new_id() {
 /// Create database + create grant for that database + list grants for
 /// the user returns the grant we created. The headline resolver path.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn create_grant_then_list_for_user() {
     let r = repo().await;
     let sub = unique_sub("mysql-grant");
@@ -203,6 +207,7 @@ async fn create_grant_then_list_for_user() {
 /// Wildcard target round-trip — the XOR check on the storage side AND
 /// the type-side mapping both accept the `Wildcard { server }` shape.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn create_wildcard_grant_roundtrips() {
     let r = repo().await;
     let sub = unique_sub("mysql-wild");
@@ -236,6 +241,7 @@ async fn create_wildcard_grant_roundtrips() {
 
 /// Revoke a grant; `list_grants_for_user` no longer returns it.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn revoke_grant_hides_it_from_user_listing() {
     let r = repo().await;
     let sub = unique_sub("mysql-revoke");
@@ -268,6 +274,7 @@ async fn revoke_grant_hides_it_from_user_listing() {
 /// A revoked grant is invisible to `get_grant` too, not just the listings —
 /// the admin read-before-write contract treats revoked as gone.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn revoke_grant_hides_it_from_get() {
     let r = repo().await;
     let sub = unique_sub("mysql-getrevoke");
@@ -299,6 +306,7 @@ async fn revoke_grant_hides_it_from_get() {
 /// wildcard grants carry no `database_id` so the filter excludes them, and
 /// revoked rows drop out entirely.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn list_grants_database_filter_excludes_wildcards_and_revoked() {
     let r = repo().await;
     let sub = unique_sub("mysql-listfilter");
@@ -362,6 +370,7 @@ async fn list_grants_database_filter_excludes_wildcards_and_revoked() {
 /// hide the row from both single-row lookup and the listing, and a second
 /// delete must be a no-op.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn get_user_by_sub_skips_soft_deleted() {
     let r = repo().await;
     let sub = unique_sub("mysql-getsoft");
@@ -397,6 +406,7 @@ async fn get_user_by_sub_skips_soft_deleted() {
 /// query behind `permissions_databases_server_db_name_live_idx`: the loader
 /// reads the live-database listing on every permissions-cache miss.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn database_crud_and_list_filters_soft_deleted() {
     let r = repo().await;
     let server = format!("mysql-dbcrud-{}", Uuid::new_v4().simple());
@@ -446,6 +456,7 @@ async fn database_crud_and_list_filters_soft_deleted() {
 /// asserted against a wide-page baseline so sibling tests in the shared DB
 /// can't make it flaky.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn mysql_list_users_honours_limit_and_offset() {
     let p = mysql_pool().await;
     let r = MysqlPermissionsRepo::new(p.clone());
@@ -509,6 +520,7 @@ async fn mysql_list_users_honours_limit_and_offset() {
 /// verbatim — the contract under test is the query shape and its ORDER BY
 /// tiebreak, not the pool-vs-connection dispatch.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn mysql_paging_covers_every_row_without_duplicates() {
     use sqlx::Connection;
 
@@ -615,6 +627,7 @@ async fn mysql_paging_covers_every_row_without_duplicates() {
 /// windowed reads a few times to survive a concurrent insert landing between
 /// the `wide` snapshot and the offset read.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn mysql_list_databases_honours_limit_and_offset() {
     let p = mysql_pool().await;
     let r = MysqlPermissionsRepo::new(p.clone());
@@ -696,6 +709,7 @@ async fn mysql_list_databases_honours_limit_and_offset() {
 /// shows up once — same duplicate-free / total-ordering property as
 /// `list_users`, since the filter path uses the same `ORDER BY`.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn mysql_list_grants_pagination_covers_every_row_without_duplicates() {
     let p = mysql_pool().await;
     let r = MysqlPermissionsRepo::new(p.clone());
@@ -762,6 +776,7 @@ async fn mysql_list_grants_pagination_covers_every_row_without_duplicates() {
 /// Mysql 8 enforces CHECK constraints, so the XOR is a real safety net behind
 /// the typed `GrantTarget` — not just documentation — on this backend too.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn raw_insert_with_both_specific_and_wildcard_is_rejected_by_check() {
     let p = mysql_pool().await;
     let r = MysqlPermissionsRepo::new(p.clone());
@@ -801,6 +816,7 @@ async fn raw_insert_with_both_specific_and_wildcard_is_rejected_by_check() {
 /// Migration 0004: subjects differing only in case are two identities. Under
 /// the old case-insensitive collation the second upsert overwrote the first.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn subjects_differing_only_in_case_stay_distinct() {
     let r = repo().await;
     let pool = mysql_pool().await;
@@ -817,6 +833,7 @@ async fn subjects_differing_only_in_case_stay_distinct() {
 
 /// Migration 0005: a Mongo target registers.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn mongo_db_type_round_trips() {
     let r = repo().await;
     let pool = mysql_pool().await;
@@ -835,6 +852,7 @@ async fn mongo_db_type_round_trips() {
 /// The resolver's one-query join drops a specific grant whose database is
 /// soft-deleted and keeps wildcards, exactly like the pg store.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn live_grants_for_sub_drops_soft_deleted_databases() {
     let r = repo().await;
     let pool = mysql_pool().await;

@@ -4,7 +4,6 @@
 //! Uses a per-test `user_sub` so concurrent runs (and any dev rows from
 //! other tests) don't interfere with the assertions.
 
-use crate::common::audit::SWEEPS;
 use crate::common::cleanup::delete_audit_calls;
 use crate::common::env::state_pool;
 use db_mcp_gateway::audit::{self, AuditRow, OutcomeCode};
@@ -40,8 +39,8 @@ fn audit_row(user_sub: &str, request_id: &str) -> AuditRow {
 
 /// The acceptance test: an old row gets deleted; a fresh one stays.
 #[tokio::test]
+#[serial_test::serial(world)]
 async fn pruner_deletes_only_rows_older_than_ttl() {
-    let _serial = SWEEPS.lock().await;
     let p = state_pool().await;
     let user = format!("pruner-test-{}", Uuid::new_v4().simple());
 
@@ -109,8 +108,8 @@ async fn pruner_deletes_only_rows_older_than_ttl() {
 /// A backlog larger than one batch is drained in one run, intents included,
 /// while rows inside the TTL survive.
 #[tokio::test]
+#[serial_test::serial(world)]
 async fn pruner_drains_a_backlog_larger_than_one_batch() {
-    let _serial = SWEEPS.lock().await;
     let p = state_pool().await;
     let user = format!("pruner-batch-{}", Uuid::new_v4().simple());
     sqlx::query(

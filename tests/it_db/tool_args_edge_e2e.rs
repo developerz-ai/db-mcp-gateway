@@ -130,6 +130,7 @@ fn tool_error_code(response: &Value) -> Value {
 /// then fail every audit write. Now nothing reaches the target and the
 /// refusal is audited.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn nul_in_reason_never_reaches_the_target_and_is_audited() {
     let f = Fixture::new().await;
     let sql = format!("INSERT INTO \"{}\" (v) VALUES ('nul-test')", f.table);
@@ -158,6 +159,7 @@ async fn nul_in_reason_never_reaches_the_target_and_is_audited() {
 /// An oversized identifier or reason is refused at the edge and audited
 /// untargeted, instead of failing the audit insert (index row too large).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn oversized_values_are_refused_and_audited() {
     let f = Fixture::new().await;
     let cases = [
@@ -189,6 +191,7 @@ async fn oversized_values_are_refused_and_audited() {
 /// spec 03: an unknown key is `invalid_arguments`, and a mistyped field is
 /// named in the message.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn unknown_keys_and_mistyped_fields_are_named() {
     let f = Fixture::new().await;
     for tool in ["run_query", "explain", "sample_table", "describe_schema"] {
@@ -222,6 +225,7 @@ async fn unknown_keys_and_mistyped_fields_are_named() {
 /// `explain` on Mongo has no SQL to parse: a stable `unsupported_backend`,
 /// answered before the parser and before any target call.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn explain_on_mongo_is_unsupported_backend() {
     let f = Fixture::new().await;
     let resp = f

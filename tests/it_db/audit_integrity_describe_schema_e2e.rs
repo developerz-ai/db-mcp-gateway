@@ -75,6 +75,7 @@ fn payload(response: &Value) -> Value {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn require_reason_grant_blocks_describe_schema_without_reason() {
     let booted = boot_gateway().await;
 

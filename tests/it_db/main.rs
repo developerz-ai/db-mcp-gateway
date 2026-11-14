@@ -2,6 +2,14 @@
 //! Postgres, MySQL permissions store, Mongo). One binary so a library change
 //! relinks one test executable, not one per file. Each module was its own
 //! `tests/*.rs` binary; run one with `bin/test --test it_db <module>::`.
+//!
+//! Under plain `cargo test` every module shares this process, so each test
+//! declares its isolation on the `world` key: `#[serial_test::serial(world)]`
+//! when it has a table-wide or global side effect (reaper/pruner/GC sweeps,
+//! cap seeding, global catalog counts) — it then runs alone —, else
+//! `#[serial_test::parallel(world)]`. `it_offline::isolation_guard` fails a
+//! test that declares neither. Nextest runs each test in its own process, so
+//! there the attributes are inert.
 
 #[path = "../common/mod.rs"]
 mod common;

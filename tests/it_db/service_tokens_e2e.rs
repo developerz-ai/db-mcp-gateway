@@ -140,6 +140,7 @@ async fn tool_payload(response: reqwest::Response) -> Value {
 /// exactly its group's grants, and every call is audited to the service
 /// identity.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn service_token_authenticates_scopes_and_audits() {
     let gw = boot_gateway().await;
 
@@ -171,6 +172,7 @@ async fn service_token_authenticates_scopes_and_audits() {
 /// service identity. `svc-ci` has no grant on `prod`, so `describe_schema`
 /// must refuse before any target connection is attempted.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn service_token_outside_group_scope_is_denied_and_audited() {
     let gw = boot_gateway().await;
 
@@ -200,6 +202,7 @@ async fn service_token_outside_group_scope_is_denied_and_audited() {
 /// A recognized group with zero grants authenticates but reaches nothing —
 /// the "wrong scope" floor: authentication never implies authorization.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn service_token_with_empty_grants_sees_nothing() {
     let gw = boot_gateway().await;
 
@@ -228,6 +231,7 @@ async fn service_token_with_empty_grants_sees_nothing() {
 /// token and no token at all are both rejected, and the anonymous case keeps
 /// the exact body the live-test fence and MCP clients rely on.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn unconfigured_or_missing_token_is_unauthorized() {
     let gw = boot_gateway().await;
 
@@ -248,6 +252,7 @@ async fn unconfigured_or_missing_token_is_unauthorized() {
 /// gate (service group != admin group) makes this state unreachable by
 /// config, and this test proves the runtime agrees.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn service_token_cannot_reach_admin_routes() {
     let gw = boot_gateway().await;
 
@@ -265,6 +270,7 @@ async fn service_token_cannot_reach_admin_routes() {
 /// browser-SSO path still mints a working session JWT, and `engineers` scope
 /// is unaffected by the headless surface.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn human_session_jwt_still_works_with_service_accounts_configured() {
     let gw = boot_gateway().await;
 
@@ -311,6 +317,7 @@ async fn human_session_jwt_still_works_with_service_accounts_configured() {
 /// and must NOT kill the token: revocation is a config edit + rollout, never
 /// an in-band call.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn logout_is_a_noop_for_service_tokens() {
     let gw = boot_gateway().await;
 
@@ -351,6 +358,7 @@ async fn logout_is_a_noop_for_service_tokens() {
 /// API refuses to create, so only direct DB access can plant one — is
 /// inert: the call is still `forbidden` and audited as such.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn db_grant_seeded_for_service_identity_is_ignored() {
     let gw = boot_gateway().await;
     let repo = PgPermissionsRepo::new(gw.state_db.clone());

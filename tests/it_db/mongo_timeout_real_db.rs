@@ -105,6 +105,7 @@ async fn profiled_max_time_ms(collection: &str) -> Option<i64> {
 /// One test rather than three because it toggles database-wide profiling;
 /// splitting it would let two tests race on that global.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn command_always_carries_the_clamped_max_time_ms() {
     let a = adapter(SERVER_NAME).await;
     let coll = unique_collection("mongotmo");
@@ -164,6 +165,7 @@ async fn command_always_carries_the_clamped_max_time_ms() {
 /// mapping; the Tokio guard is the backstop for the cursor kinds where the
 /// server does not carry it. The contract under test is the bound itself.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn expensive_cursor_read_is_bounded_by_the_budget() {
     let a = adapter(SERVER_NAME).await;
     let coll = unique_collection("mongotmo");
@@ -250,6 +252,7 @@ fn tool_error_code(response: &db_mcp_gateway::mcp::jsonrpc::Response) -> Option<
 /// non-negotiable #4 — the audit write is synchronous and every failure
 /// mode is recorded, mongo included.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn slow_operation_times_out_and_writes_timeout_audit_row() {
     let pool = state_pool().await;
     let coll = unique_collection("mongotmo");

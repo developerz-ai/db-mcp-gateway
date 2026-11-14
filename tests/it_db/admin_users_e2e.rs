@@ -173,6 +173,7 @@ async fn latest_audit_for_target(
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn admin_can_create_user_then_audit_row_recorded() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
@@ -219,6 +220,7 @@ async fn admin_can_create_user_then_audit_row_recorded() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn admin_repeat_create_logs_as_update() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
@@ -277,6 +279,7 @@ async fn admin_repeat_create_logs_as_update() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn non_admin_gets_403_and_no_writes() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let nonadmin_sub = format!("nonadmin-e2e-{}", Uuid::new_v4().simple());
@@ -338,6 +341,7 @@ async fn non_admin_gets_403_and_no_writes() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn anonymous_gets_401() {
     let (h, _auth_cfg, _sessions) = spawn_gateway().await;
     let resp = client()
@@ -354,6 +358,7 @@ async fn anonymous_gets_401() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn admin_patches_user_audit_carries_before_and_after() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
@@ -414,6 +419,7 @@ async fn admin_patches_user_audit_carries_before_and_after() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn delete_soft_deletes_and_audits() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
@@ -474,6 +480,7 @@ async fn delete_soft_deletes_and_audits() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn list_excludes_soft_deleted() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
@@ -562,6 +569,7 @@ async fn list_excludes_soft_deleted() {
 /// PATCH / DELETE). A GET handler never opens one, so a brand-new admin sub
 /// that only ever GETs should remain absent from `permissions_users`.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn get_does_not_write_user_row() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     // Use a unique sub that has NEVER been written via a mutation.
@@ -616,6 +624,7 @@ async fn get_does_not_write_user_row() {
 ///
 /// This is the integration test deferred from #51 (PR #65).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn audit_write_failure_rolls_back_user_write() {
     let pool = state_pool().await;
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
@@ -708,6 +717,7 @@ async fn audit_write_failure_rolls_back_user_write() {
 /// and grep all three places (response, log, audit). Pairs with the fallible
 /// extractor change in `src/transport/admin/users.rs`.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn malformed_json_returns_invalid_request_envelope() {
     let (h, auth_cfg, sessions) = spawn_gateway().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
@@ -748,6 +758,7 @@ async fn malformed_json_returns_invalid_request_envelope() {
 
 /// Invalid UUID in `:id` must also produce the stable admin-error envelope.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn invalid_path_id_returns_invalid_request_envelope() {
     let (h, auth_cfg, sessions) = spawn_gateway().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
@@ -787,6 +798,7 @@ async fn invalid_path_id_returns_invalid_request_envelope() {
 /// suspenders for YAML-only installs that explicitly opt out (spec 12
 /// §"Admin API"). Pairs with the enabled-path coverage above.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn admin_disabled_returns_404_on_admin_routes() {
     let pool = state_pool().await;
     // Same YAML as the enabled tests but with admin block explicitly disabled.
@@ -883,6 +895,7 @@ async fn latest_audit_action(pool: &PgPool, target_id: Uuid) -> Option<String> {
 /// then PATCH the user. If the PATCH fires the invalidation, the next
 /// `get_for` reloads from the DB and sees the out-of-band grant.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn patch_invalidates_cached_authz_for_user() {
     let (mut h, cache, auth_cfg, sessions) = spawn_gateway_with_cache().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
@@ -1014,6 +1027,7 @@ async fn patch_invalidates_cached_authz_for_user() {
 /// prove the cache reflects the deletion (loader returns empty for the
 /// missing user).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn delete_invalidates_cached_authz_for_user() {
     let (mut h, cache, auth_cfg, sessions) = spawn_gateway_with_cache().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
@@ -1136,6 +1150,7 @@ async fn delete_invalidates_cached_authz_for_user() {
 /// warms cached authz for two distinct identities, mutates the database
 /// through both PATCH and DELETE, and proves both users' entries reload.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn database_mutations_flush_all_cached_authz_for_all_users() {
     let (mut h, cache, auth_cfg, sessions) = spawn_gateway_with_cache().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
@@ -1343,6 +1358,7 @@ async fn database_mutations_flush_all_cached_authz_for_all_users() {
 /// bounded window, defaulting to `Page::DEFAULT_LIMIT` and clamping an
 /// oversized ask rather than rejecting it.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn list_honours_limit_query_param() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let admin_sub = format!("admin-page-{}", Uuid::new_v4().simple());
@@ -1414,6 +1430,7 @@ async fn list_honours_limit_query_param() {
 /// A YAML service identity's authority is exactly its YAML group, so the
 /// admin API refuses to register one as a DB-grant-bearing user.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn create_rejects_service_subject() {
     let (h, auth_cfg, sessions) = spawn_gateway().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
@@ -1448,6 +1465,7 @@ async fn create_rejects_service_subject() {
 /// A re-POST of an existing subject is an upsert and must drop that
 /// subject's cached grant set like any other user mutation.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn repeat_create_invalidates_cached_authz_for_user() {
     let (mut h, cache, auth_cfg, sessions) = spawn_gateway_with_cache().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
@@ -1491,6 +1509,7 @@ async fn repeat_create_invalidates_cached_authz_for_user() {
 /// Deleting a user revokes every grant it holds in the same transaction,
 /// with a `delete` audit row per grant.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn delete_cascades_grant_revocation_with_audit_rows() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
@@ -1597,6 +1616,7 @@ async fn drop_seeded(pool: &PgPool, db_id: Uuid, grant_id: Uuid) {
 /// in flight (blocked on the admin's own row lock) and the next one is shed
 /// with `429 concurrency_limit_exceeded`, never queued.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn admin_routes_are_concurrency_capped_per_identity() {
     use db_mcp_gateway::config::DEFAULT_MAX_CONCURRENT_PER_IDENTITY as CAP;
 
@@ -1722,6 +1742,7 @@ async fn admin_routes_are_concurrency_capped_per_identity() {
 /// kills every live session of the subject — its bearer is 401 on the next
 /// call — and writes exactly one audit row, in the revoke's transaction.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn revoke_sessions_logs_the_subject_out_and_audits_once() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());

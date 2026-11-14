@@ -32,6 +32,7 @@ servers:
 }
 
 #[test]
+#[serial_test::parallel(world)]
 fn file_reference_resolves_at_boot() {
     let mut file = tempfile::NamedTempFile::new().expect("tempfile");
     writeln!(file, "hunter2").unwrap();
@@ -51,6 +52,7 @@ fn file_reference_resolves_at_boot() {
 }
 
 #[test]
+#[serial_test::parallel(world)]
 fn env_reference_resolves_when_var_set() {
     let name = format!("DB_MCP_SECRET_E2E_{}", uuid::Uuid::new_v4().simple());
     // SAFETY: unique env var name per test run; nothing else reads or writes it.
@@ -68,6 +70,7 @@ fn env_reference_resolves_when_var_set() {
 }
 
 #[test]
+#[serial_test::parallel(world)]
 fn missing_env_aborts_boot_with_typed_error() {
     // Use a UUID-suffixed name so we don't accidentally collide with a real
     // var on the runner.
@@ -82,6 +85,7 @@ fn missing_env_aborts_boot_with_typed_error() {
 }
 
 #[test]
+#[serial_test::parallel(world)]
 fn missing_file_aborts_boot_with_typed_error() {
     let cfg = ConfigFile::from_yaml_str(&yaml_with_password(
         "${FILE:/nonexistent/db-mcp/secret-15-test}",
@@ -98,6 +102,7 @@ fn missing_file_aborts_boot_with_typed_error() {
 }
 
 #[test]
+#[serial_test::parallel(world)]
 fn empty_file_aborts_boot() {
     // A zero-byte sealed-secret mount would otherwise auth-fail with an
     // empty password at first connect — a confusing operator signal.
@@ -118,6 +123,7 @@ fn empty_file_aborts_boot() {
 /// literal password, an upgraded gateway would bind the string
 /// `"${OLD_VAR}"` as the DB password and fail auth with a misleading error.
 #[test]
+#[serial_test::parallel(world)]
 fn legacy_braced_syntax_is_rejected_at_parse() {
     let err = ConfigFile::from_yaml_str(&yaml_with_password("${LEGACY_BARE_NAME}"))
         .expect_err("legacy ${VAR} must be rejected");
@@ -135,6 +141,7 @@ fn legacy_braced_syntax_is_rejected_at_parse() {
 /// yet, and silently passing the literal `vault:secret/...` as a password
 /// would be a surprising auth failure later.
 #[test]
+#[serial_test::parallel(world)]
 fn unimplemented_backend_aborts_boot() {
     let cfg = ConfigFile::from_yaml_str(&yaml_with_password("vault:secret/prod/app_ro"))
         .expect("YAML parse succeeds");
@@ -155,6 +162,7 @@ fn unimplemented_backend_aborts_boot() {
 /// `StateDbError` itself is already safe, so no accidental `.to_string()`
 /// call downstream can leak the credential.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn malformed_state_db_url_leaks_no_dsn() {
     // Port 59999 is almost certainly not listening; the connection is refused
     // immediately rather than timing out, keeping the test fast.
@@ -194,6 +202,7 @@ async fn malformed_state_db_url_leaks_no_dsn() {
 /// credential rejection goes stale and the registry re-opens it, resolving
 /// the file again. A dedicated role keeps the shared `app` role untouched.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn rotated_password_file_is_picked_up_without_restart() {
     use crate::common::pg_target;
 

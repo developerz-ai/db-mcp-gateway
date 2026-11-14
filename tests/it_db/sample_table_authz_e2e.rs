@@ -159,6 +159,7 @@ impl Fixture {
 /// Regression: a `schema_read` grant is metadata-only. `sample_table` returns
 /// rows, so it must deny — with an audited `forbidden` outcome.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn schema_read_grant_cannot_sample_rows() {
     let fixture = Fixture::create().await;
     let booted = boot_gateway("metadata-only").await;
@@ -189,6 +190,7 @@ async fn schema_read_grant_cannot_sample_rows() {
 /// The positive half of the same contract: `query_read` is the grant that
 /// actually authorizes row data, and it still works.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn query_read_grant_can_sample_rows() {
     let fixture = Fixture::create().await;
     let booted = boot_gateway("engineers").await;
@@ -223,6 +225,7 @@ async fn query_read_grant_can_sample_rows() {
 /// A table name that is not an identifier never reaches authz or the
 /// target: JSON-RPC `invalid_params` (spec 03 `invalid_arguments`), audited.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn non_identifier_table_is_an_audited_invalid_argument() {
     let booted = boot_gateway("engineers").await;
 
@@ -239,6 +242,7 @@ async fn non_identifier_table_is_an_audited_invalid_argument() {
 /// no reason → `reason_required` and no rows; with a reason → success, and
 /// the reason lands in the audit row.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn require_reason_grant_blocks_sample_without_reason() {
     let fixture = Fixture::create().await;
     let booted = boot_gateway("reason-required").await;
@@ -290,6 +294,7 @@ async fn require_reason_grant_blocks_sample_without_reason() {
 /// not exist. The row carries the `find` the adapter runs instead — never a
 /// credential. Denied before the target, so the header alone is under test.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn mongo_sample_audits_the_find_command() {
     let booted = boot_gateway("metadata-only").await;
 

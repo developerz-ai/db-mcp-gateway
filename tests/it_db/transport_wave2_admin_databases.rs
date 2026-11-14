@@ -116,6 +116,7 @@ impl Harness {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn create_on_an_undeclared_server_is_refused_without_a_trace() {
     let h = spawn().await;
     let db_name = format!("wave2-{}", Uuid::new_v4().simple());
@@ -137,6 +138,7 @@ async fn create_on_an_undeclared_server_is_refused_without_a_trace() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn rename_onto_an_undeclared_server_is_refused_and_row_unchanged() {
     let h = spawn().await;
     let db_name = format!("wave2-{}", Uuid::new_v4().simple());

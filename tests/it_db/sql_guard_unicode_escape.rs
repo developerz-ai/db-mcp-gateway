@@ -28,6 +28,7 @@ fn read_query(sql: &str) -> ExecQuery<'_> {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn unicode_escaped_terminate_kills_another_identitys_query_so_the_guard_refuses_it() {
     let attacker = writable_adapter().await;
 

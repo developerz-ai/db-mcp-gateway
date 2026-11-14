@@ -174,6 +174,7 @@ fn payload(response: &Value) -> Value {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn history_returns_only_callers_own_rows() {
     let booted = boot_gateway().await;
     let (url, bearer, pool, sub) = (
@@ -225,6 +226,7 @@ async fn history_returns_only_callers_own_rows() {
 /// would leave the door open for a future regression that adds a `user`
 /// field without realising it can override scoping).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn history_rejects_smuggled_user_field() {
     let booted = boot_gateway().await;
     let (url, bearer) = (booted.url.as_str(), booted.bearer.as_str());
@@ -272,6 +274,7 @@ async fn history_rejects_smuggled_user_field() {
 /// `effective_limit` covers the clamp logic. Here we just confirm the call
 /// succeeds and `truncated: true` is set.)
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn history_clamps_hostile_limit_to_ceiling() {
     let booted = boot_gateway().await;
     let (url, bearer) = (booted.url.as_str(), booted.bearer.as_str());
@@ -297,6 +300,7 @@ async fn history_clamps_hostile_limit_to_ceiling() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn history_forbidden_without_grant() {
     // A caller with `query_read` only — NOT `history_read`. Per #170 the
     // grant is standalone; `query_read` does not imply it.
@@ -343,6 +347,7 @@ permissions:
 /// §src/audit: "flag any code path that completes a tool call without an
 /// audit row".
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn history_rejects_zero_limit() {
     let booted = boot_gateway().await;
 
@@ -372,6 +377,7 @@ async fn history_rejects_zero_limit() {
 /// `invalid_arguments_outcome`, so this is defence-in-depth against a future
 /// change that specialises one path and forgets the audit hook.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn history_rejects_malformed_since_and_audits_it() {
     let booted = boot_gateway().await;
 
@@ -417,6 +423,7 @@ async fn seed_rows(pool: &sqlx::PgPool, user_sub: &str, database: &str, count: i
 /// A page is at most 1 000 entries however large `limit` is; the rest is
 /// reachable through `next_cursor`.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn history_page_is_capped_at_the_ceiling() {
     let booted = boot_gateway().await;
     seed_rows(&booted.state_db, &booted.user_sub, "app", 1005).await;
@@ -440,6 +447,7 @@ async fn history_page_is_capped_at_the_ceiling() {
 /// One huge statement must not make the response huge: `sql` is cut and
 /// flagged.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn history_truncates_oversized_sql() {
     let booted = boot_gateway().await;
     let long_sql = format!("SELECT '{}'", "x".repeat(10 * 1024));
@@ -464,6 +472,7 @@ async fn history_truncates_oversized_sql() {
 /// Walking `next_cursor` visits every entry once, newest first, and ends
 /// with a `null` cursor.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn history_keyset_pages_do_not_overlap() {
     let booted = boot_gateway().await;
     seed_rows(&booted.state_db, &booted.user_sub, "app", 5).await;
@@ -491,6 +500,7 @@ async fn history_keyset_pages_do_not_overlap() {
 
 /// A cursor the gateway did not mint is an argument error, audited.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn history_rejects_forged_cursor() {
     let booted = boot_gateway().await;
     let resp = call_history(
@@ -510,6 +520,7 @@ async fn history_rejects_forged_cursor() {
 /// `tests/it_db/permissions_indexes_mysql.rs`): a rewrite that stops matching the
 /// index shows up as a diff between the two.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn history_query_uses_the_history_index() {
     let booted = boot_gateway().await;
     let pool = &booted.state_db;
@@ -566,6 +577,7 @@ async fn history_query_uses_the_history_index() {
 /// none sees every row of the identity. A row stored with `sql_truncated`
 /// (cut at the audit cap, migration 0014) stays flagged in history.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn history_filters_by_claimed_run_id() {
     use db_mcp_gateway::audit::HistoryQuery;
     use db_mcp_gateway::state::audit::select_user_history;

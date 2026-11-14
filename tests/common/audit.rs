@@ -8,11 +8,6 @@ use db_mcp_gateway::config::StreamSinkConfig;
 use db_mcp_gateway::tools::audit_dispatch::AuditStore;
 use sqlx::PgPool;
 
-/// Reaper sweeps and pruner runs are table-wide: one test's sweep would
-/// settle, or its prune delete, another test's backdated rows mid-assertion.
-/// Every test that sweeps or prunes holds this for its whole body.
-pub static SWEEPS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// The caller's latest `tool` row, if any.
 pub async fn find_audit(pool: &PgPool, user_sub: &str, tool: &str) -> Option<AuditRow> {
     latest_for_user_tool(pool, user_sub, tool)

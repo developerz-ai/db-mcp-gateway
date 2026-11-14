@@ -147,6 +147,7 @@ async fn delete_sessions(pool: &PgPool, sub: &str) {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn grant_revoked_on_one_replica_is_dropped_by_the_other() {
     let pool = state_pool().await;
     let a = replica(&pool, true, RefreshTokens::default()).await;
@@ -226,6 +227,7 @@ async fn redeem(gw: &TestGateway, refresh_token: &str) -> (StatusCode, Value) {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn refresh_token_raced_on_two_replicas_has_one_winner() {
     let pool = state_pool().await;
     let store = || RefreshTokens::with_db(pool.clone(), Duration::from_secs(3600));
@@ -272,6 +274,7 @@ async fn refresh_token_raced_on_two_replicas_has_one_winner() {
 }
 
 #[tokio::test]
+#[serial_test::serial(world)]
 async fn pruners_on_two_replicas_never_fail_or_touch_retained_rows() {
     // Separate pools: two replicas, two sets of connections.
     let (replica_a, replica_b) = (state_pool().await, state_pool().await);
@@ -325,6 +328,7 @@ async fn ping_status(gw: &TestGateway, bearer: &str) -> StatusCode {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn logout_on_one_replica_rejects_the_subject_on_the_other() {
     let pool = state_pool().await;
     let a = replica(&pool, false, RefreshTokens::default()).await;

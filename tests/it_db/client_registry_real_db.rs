@@ -9,15 +9,14 @@
 //! No mocking — these run against the real dev state DB (`bin/dev up`), same as
 //! the session-cache real-DB tests.
 //!
-//! All tests are `#[serial]`: they share one global `oauth_clients` table, and
-//! the cap tests seed it to the 10k `CLIENT_CAP`. Run in parallel, that seed
-//! would evict or refuse a sibling test's registration — a nondeterministic
-//! flake where the victim changes per run. Serializing keeps the table
-//! consistent.
+//! All tests are `#[serial_test::serial(world)]`: they share one global
+//! `oauth_clients` table, and the cap tests seed it to the 10k `CLIENT_CAP`.
+//! Run beside any other test, that seed would evict or refuse its
+//! registration (the OAuth suites `/register` too) — a nondeterministic flake
+//! where the victim changes per run.
 
 use crate::common::env::state_pool;
 use db_mcp_gateway::auth::oauth::{ClientRegistry, StoreError};
-use serial_test::serial;
 use sqlx::PgPool;
 
 async fn cleanup(pool: &PgPool, client_id: &str) {
@@ -31,7 +30,7 @@ async fn cleanup(pool: &PgPool, client_id: &str) {
 /// A client registered against one registry instance is still resolvable from a
 /// *new* instance over the same pool — i.e. it survives a pod restart.
 #[tokio::test]
-#[serial]
+#[serial_test::serial(world)]
 async fn registration_survives_a_restart() {
     let pool = state_pool().await;
     let client_id = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
@@ -62,7 +61,7 @@ async fn registration_survives_a_restart() {
 /// Re-registering an existing `client_id` overwrites its redirect URIs (upsert),
 /// rather than erroring or duplicating the row.
 #[tokio::test]
-#[serial]
+#[serial_test::serial(world)]
 async fn re_register_updates_redirect_uris() {
     let pool = state_pool().await;
     let client_id = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
@@ -87,7 +86,7 @@ async fn re_register_updates_redirect_uris() {
 /// background GC (`DELETE ... WHERE expires_at <= now()`). We age the row
 /// directly rather than sleep out the TTL.
 #[tokio::test]
-#[serial]
+#[serial_test::serial(world)]
 async fn expired_registration_is_swept_and_not_returned() {
     let pool = state_pool().await;
     let stale = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
@@ -160,7 +159,7 @@ async fn delete_prefixed(pool: &PgPool, prefix: &str) {
 /// instead of failing: an unauthenticated `/register` flood only produces
 /// such rows, so it recycles its own junk rather than wedging registration.
 #[tokio::test]
-#[serial]
+#[serial_test::serial(world)]
 async fn at_cap_evicts_the_oldest_never_authorised_client_real_db() {
     let pool = state_pool().await;
     let prefix = format!("capjunk-{}-", uuid::Uuid::new_v4().simple());
@@ -186,7 +185,7 @@ async fn at_cap_evicts_the_oldest_never_authorised_client_real_db() {
 /// newcomer gets `StoreFull`, which `/register` surfaces as `503
 /// temporarily_unavailable`.
 #[tokio::test]
-#[serial]
+#[serial_test::serial(world)]
 async fn at_cap_of_authorised_clients_is_store_full_real_db() {
     let pool = state_pool().await;
     let prefix = format!("capauth-{}-", uuid::Uuid::new_v4().simple());

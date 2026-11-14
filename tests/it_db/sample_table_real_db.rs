@@ -23,6 +23,7 @@ fn fresh_schema_name() -> String {
 /// interpolation produce a query Postgres actually accepts and that the
 /// row-cap/truncation semantics carry through from the adapter.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn sample_returns_rows_with_truncation_flag() {
     let a = adapter().await;
     let schema = fresh_schema_name();
@@ -73,6 +74,7 @@ async fn sample_returns_rows_with_truncation_flag() {
 /// the same path `sample_table` takes when the regex accepts an uppercase
 /// table name.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn quoted_identifiers_are_case_sensitive() {
     let a = adapter().await;
     let schema = fresh_schema_name();

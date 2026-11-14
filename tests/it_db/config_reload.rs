@@ -121,6 +121,7 @@ fn offline_pool() -> PgPool {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn invalid_file_keeps_the_running_config() {
     let gw = Harness::new(offline_pool(), &yaml("h1", true, true));
 
@@ -145,6 +146,7 @@ async fn invalid_file_keeps_the_running_config() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn boot_fixed_settings_are_refused_whole() {
     let gw = Harness::new(offline_pool(), &yaml("h1", true, true));
     gw.rewrite(&format!(
@@ -159,6 +161,7 @@ async fn boot_fixed_settings_are_refused_whole() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn removed_service_account_gets_401_after_reload() {
     let gw = Harness::new(offline_pool(), &yaml("h1", true, true));
     let (before, _) = gw.list_databases().await;
@@ -172,6 +175,7 @@ async fn removed_service_account_gets_401_after_reload() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn changed_host_evicts_exactly_that_pool() {
     let gw = Harness::new(offline_pool(), &yaml("h1", true, true));
 
@@ -185,6 +189,7 @@ async fn changed_host_evicts_exactly_that_pool() {
 
 /// Real state DB: the call is audited before and after the reload.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn removed_grant_is_forbidden_after_reload() {
     let gw = Harness::new(state_pool().await, &yaml("h1", true, true));
     let (_, before) = gw.list_databases().await;

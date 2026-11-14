@@ -38,6 +38,7 @@ permissions:
 "#;
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn mcp_oauth_bridge_full_flow() {
     let user = MockUser {
         sub: format!("bridge-user-{}", uuid::Uuid::new_v4().simple()),
@@ -361,6 +362,7 @@ async fn acquire_auth_code(
 /// - loopback URI with a different path (port-flex carve-out ≠ path-flex)
 /// - external HTTPS host never registered by this client
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn attacker_redirect_uri_rejected() {
     let (gw, http) = spawn_authless_gateway().await;
     // CLIENT_REDIRECT = "http://127.0.0.1:54599/callback"
@@ -415,6 +417,7 @@ async fn attacker_redirect_uri_rejected() {
 /// redirect with that error and its `state` — never strand the loopback
 /// listener on a gateway error page.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn idp_denial_redirects_back_to_the_client() {
     let user = MockUser {
         sub: format!("denied-user-{}", uuid::Uuid::new_v4().simple()),
@@ -479,6 +482,7 @@ async fn idp_denial_redirects_back_to_the_client() {
 /// one leaves the callback with no value to bind against, defeating the
 /// CSRF protection that state provides.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn missing_state_rejected() {
     let (gw, http) = spawn_authless_gateway().await;
     let client_id = register_client(&http, &gw, CLIENT_REDIRECT).await;
@@ -529,6 +533,7 @@ async fn missing_state_rejected() {
 /// attacker supplies a loopback port that *would* match under the RFC 8252
 /// port-flex rule at `/authorize`.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn code_bound_to_client_redirect_challenge() {
     let user = MockUser {
         sub: format!("bound-user-{}", uuid::Uuid::new_v4().simple()),
@@ -672,6 +677,7 @@ async fn obtain_token_pair(http: &reqwest::Client, gateway_url: &str) -> (String
 /// revoke the current session row — otherwise a logged-out client could silently
 /// mint a fresh session via the refresh grant.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn logout_purges_refresh_tokens() {
     let user = MockUser {
         sub: format!("logout-user-{}", uuid::Uuid::new_v4().simple()),
@@ -712,6 +718,7 @@ async fn logout_purges_refresh_tokens() {
 /// unknown token still returns 200 (no validity probe), and a missing token is
 /// the lone 400.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn revoke_endpoint_invalidates_refresh_and_access_tokens() {
     let user = MockUser {
         sub: format!("revoke-user-{}", uuid::Uuid::new_v4().simple()),
@@ -826,6 +833,7 @@ async fn revoke_endpoint_invalidates_refresh_and_access_tokens() {
 /// in transit, or the client racing against the server) must yield
 /// `invalid_grant` with no new session minted.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn rotated_refresh_replay_is_invalid_grant() {
     let user = MockUser {
         sub: format!("replay-user-{}", uuid::Uuid::new_v4().simple()),
@@ -889,6 +897,7 @@ async fn rotated_refresh_replay_is_invalid_grant() {
 /// exercises the full HTTP path (`/token` → `RefreshTokens::take` → GC drop →
 /// `invalid_grant` response) without real-time waiting.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn refresh_chain_expires_past_absolute_ttl() {
     let user = MockUser {
         sub: format!("ttl-user-{}", uuid::Uuid::new_v4().simple()),
@@ -949,6 +958,7 @@ fn location(resp: &reqwest::Response) -> String {
 /// session the old refresh token was paired with — the pre-rotation access
 /// token stops working.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn refresh_revokes_the_previous_access_token() {
     let user = MockUser {
         sub: format!("rotate-access-{}", uuid::Uuid::new_v4().simple()),
@@ -983,6 +993,7 @@ async fn refresh_revokes_the_previous_access_token() {
 /// perform is not "unknown": it is a 503, never a 200 that leaves the bearer
 /// live.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn revoke_during_state_db_outage_is_503() {
     let user = MockUser {
         sub: format!("revoke-outage-{}", uuid::Uuid::new_v4().simple()),

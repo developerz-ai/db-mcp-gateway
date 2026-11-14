@@ -63,6 +63,7 @@ async fn cleanup_database(pool: &PgPool, server: &str) {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn upsert_user_creates_and_then_refreshes_email_and_groups() {
     let p = state_pool().await;
     let sub = fresh_sub("upsert");
@@ -88,6 +89,7 @@ async fn upsert_user_creates_and_then_refreshes_email_and_groups() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn get_user_by_sub_skips_soft_deleted() {
     let p = state_pool().await;
     let sub = fresh_sub("getsoft");
@@ -133,6 +135,7 @@ async fn get_user_by_sub_skips_soft_deleted() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn database_crud_and_list_filters_soft_deleted() {
     let p = state_pool().await;
     let server = fresh_sub("dbcrud-server");
@@ -168,6 +171,7 @@ async fn database_crud_and_list_filters_soft_deleted() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn create_specific_grant_round_trips() {
     let p = state_pool().await;
     let sub = fresh_sub("specific");
@@ -200,6 +204,7 @@ async fn create_specific_grant_round_trips() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn create_wildcard_grant_round_trips() {
     let p = state_pool().await;
     let sub = fresh_sub("wildcard");
@@ -232,6 +237,7 @@ async fn create_wildcard_grant_round_trips() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn revoked_grants_drop_from_user_listing() {
     let p = state_pool().await;
     let sub = fresh_sub("revoke");
@@ -271,6 +277,7 @@ async fn revoked_grants_drop_from_user_listing() {
 /// what protects us if someone bypasses the repo (manual migration, ad-hoc
 /// admin SQL).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn raw_insert_with_both_specific_and_wildcard_is_rejected_by_check() {
     let p = state_pool().await;
     let sub = fresh_sub("xorcheck");
@@ -319,6 +326,7 @@ async fn raw_insert_with_both_specific_and_wildcard_is_rejected_by_check() {
 /// is the query shape (LIMIT/OFFSET semantics against the `created_at, id`
 /// order), not the pool-vs-connection dispatch.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn list_users_honours_limit_and_offset() {
     let p = state_pool().await;
     let repo = PgPermissionsRepo::new(p.clone());
@@ -408,6 +416,7 @@ async fn list_users_honours_limit_and_offset() {
 /// contract under test is the query shape and its ORDER BY tiebreak, not the
 /// pool-vs-connection dispatch.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn paging_covers_every_row_without_duplicates() {
     let p = state_pool().await;
     let repo = PgPermissionsRepo::new(p.clone());

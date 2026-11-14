@@ -102,6 +102,7 @@ fn identity(user_sub: &str) -> Identity {
 /// business. The single claim is that no advertised name falls through to the
 /// catch-all.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn every_advertised_tool_has_a_dispatch_arm() {
     let fixture = Fixture::new().await;
 
@@ -133,6 +134,7 @@ async fn every_advertised_tool_has_a_dispatch_arm() {
 /// answer JSON-RPC `invalid_params` and leave an `invalid_arguments` row
 /// with no target.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn rejected_calls_leave_invalid_arguments_rows() {
     let fixture = Fixture::new().await;
     let user = fixture.identity.user_sub.clone();
@@ -173,6 +175,7 @@ async fn rejected_calls_leave_invalid_arguments_rows() {
 /// The new introspection tools reject malformed arguments like every other
 /// tool: JSON-RPC `invalid_params` plus an `invalid_arguments` row.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn introspection_tools_audit_malformed_arguments() {
     let fixture = Fixture::new().await;
     let user = fixture.identity.user_sub.clone();
@@ -196,6 +199,7 @@ async fn introspection_tools_audit_malformed_arguments() {
 /// tool: `invalid_params` on the wire, an `invalid_arguments` row naming the
 /// tool it asked for.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn rejected_upstream_claim_leaves_an_invalid_arguments_row() {
     let mut fixture = Fixture::new().await;
     fixture.request.upstream = Upstream::Rejected("upstream headers required");

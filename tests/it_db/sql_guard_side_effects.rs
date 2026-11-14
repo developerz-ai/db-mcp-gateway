@@ -60,6 +60,7 @@ fn channel() -> String {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn pg_notify_escapes_a_read_only_transaction_so_the_guard_denies_it() {
     let channel = channel();
     let sql = format!("SELECT current_user::text, pg_notify('{channel}', 'from a read')");
@@ -74,6 +75,7 @@ async fn pg_notify_escapes_a_read_only_transaction_so_the_guard_denies_it() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn sql_text_in_ts_stat_hides_a_denied_call_so_the_guard_denies_it() {
     let channel = channel();
     let sql = format!(

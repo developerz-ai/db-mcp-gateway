@@ -169,6 +169,7 @@ async fn admin_jwt(
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn admin_creates_database_and_audit_row_recorded() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -216,6 +217,7 @@ async fn admin_creates_database_and_audit_row_recorded() {
 /// parse layer. `#[serde(deny_unknown_fields)]` on `CreateDatabaseRequest`
 /// is what enforces this.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn post_with_dsn_field_is_rejected() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -261,6 +263,7 @@ async fn post_with_dsn_field_is_rejected() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn patch_with_dsn_field_is_rejected() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -318,6 +321,7 @@ async fn patch_with_dsn_field_is_rejected() {
 
 /// Mongo targets register like any other (migration 0013).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn mongo_db_type_is_accepted() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -340,6 +344,7 @@ async fn mongo_db_type_is_accepted() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn unknown_db_type_is_rejected() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -380,6 +385,7 @@ async fn unknown_db_type_is_rejected() {
 /// creating a database named `"*"` would not expect. Both `server` and
 /// `db_name` must be rejected at create; no row, no audit row either way.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn wildcard_sentinel_db_name_is_rejected() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -457,6 +463,7 @@ async fn wildcard_sentinel_db_name_is_rejected() {
 /// escalation than `db_name`, matching every server on the gateway rather
 /// than every database on one server.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn wildcard_sentinel_server_is_rejected() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -528,6 +535,7 @@ async fn wildcard_sentinel_server_is_rejected() {
 /// The sentinel check must also apply to PATCH — renaming an existing
 /// database to `"*"` is the same escalation as creating one with that name.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn patch_to_wildcard_sentinel_db_name_is_rejected() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -566,6 +574,7 @@ async fn patch_to_wildcard_sentinel_db_name_is_rejected() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn patch_updates_and_audits_before_and_after() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -618,6 +627,7 @@ async fn patch_updates_and_audits_before_and_after() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn delete_soft_deletes_and_audits() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -666,6 +676,7 @@ async fn delete_soft_deletes_and_audits() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn list_excludes_soft_deleted() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -733,6 +744,7 @@ async fn list_excludes_soft_deleted() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn non_admin_gets_403_and_no_writes() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let nonadmin_sub = format!("nonadmin-db-e2e-{}", Uuid::new_v4().simple());
@@ -786,6 +798,7 @@ async fn non_admin_gets_403_and_no_writes() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn anonymous_gets_401() {
     let (h, _, _) = spawn_gateway().await;
     let resp = client()
@@ -803,6 +816,7 @@ async fn anonymous_gets_401() {
 /// as `internal` (500) — #136. Spec 12 §"Error mapping" makes constraint
 /// violations `invalid_request` (400).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn duplicate_server_db_name_is_400_not_500() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -855,6 +869,7 @@ async fn duplicate_server_db_name_is_400_not_500() {
 /// pair must be re-registerable. Pins that the new 400 mapping doesn't turn a
 /// legitimate re-create into a rejection.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn soft_deleted_pair_can_be_registered_again() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -904,6 +919,7 @@ async fn soft_deleted_pair_can_be_registered_again() {
 /// Renaming one database onto another live pair trips the same index through
 /// the UPDATE path, so PATCH needs the same mapping as POST.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn patch_renaming_onto_an_existing_pair_is_400_not_500() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;

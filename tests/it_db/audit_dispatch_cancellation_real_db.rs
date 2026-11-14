@@ -135,6 +135,7 @@ fn identity(user_sub: &str) -> Identity {
 /// The headline #58 acceptance test for cancellation. A dispatch future
 /// that never reaches `outcome` MUST still land a `cancelled` audit row.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn dropped_dispatch_leaves_cancelled_audit_row() {
     let p = state_pool().await;
     let user = format!("cancel-test-{}", Uuid::new_v4().simple());
@@ -223,6 +224,7 @@ async fn dropped_dispatch_leaves_cancelled_audit_row() {
 /// guard for spec 07 — a cancellation must not silently skip SIEM export
 /// when the operator has wired stdout streaming.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn dropped_dispatch_streams_cancelled_row_when_stdout_configured() {
     let p = state_pool().await;
     let user = format!("cancel-test-stream-{}", Uuid::new_v4().simple());
@@ -315,6 +317,7 @@ async fn dropped_dispatch_streams_cancelled_row_when_stdout_configured() {
 /// `disarm` actually disarms (regression would be: cancelled row written
 /// every successful dispatch).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn completed_dispatch_does_not_leave_cancelled_row() {
     use db_mcp_gateway::mcp::jsonrpc::Response;
     use db_mcp_gateway::tools::audit_dispatch::{Outcome, Reply};
@@ -381,6 +384,7 @@ async fn completed_dispatch_does_not_leave_cancelled_row() {
 /// exact shape that used to leak `"` characters straight into the column
 /// via `id.to_string()`).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn audit_row_request_id_is_gateway_uuid_not_client_id() {
     use db_mcp_gateway::mcp::jsonrpc::Response;
     use db_mcp_gateway::tools::audit_dispatch::{Outcome, Reply};

@@ -67,6 +67,7 @@ async fn collection_exists(collection: &str) -> bool {
 /// MCP layer expects. Each row carries the matched doc as a JSON value
 /// under the `"document"` column.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn find_returns_documents_under_document_column() {
     let a = adapter(SERVER_NAME).await;
     let coll = unique_collection("mongoexec");
@@ -108,6 +109,7 @@ async fn find_returns_documents_under_document_column() {
 /// The cursor stops draining mid-stream; mongo's getMore loop never
 /// pulls the over-budget batch.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn find_respects_row_limit_with_truncation_flag() {
     let a = adapter(SERVER_NAME).await;
     let coll = unique_collection("mongoexec");
@@ -137,6 +139,7 @@ async fn find_respects_row_limit_with_truncation_flag() {
 /// shape as `find`. The $group stage proves pipeline execution actually
 /// runs server-side (not a pass-through of the input).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn aggregate_runs_pipeline_and_returns_groups() {
     let a = adapter(SERVER_NAME).await;
     let coll = unique_collection("mongoexec");
@@ -181,6 +184,7 @@ async fn aggregate_runs_pipeline_and_returns_groups() {
 /// response's `n` field is what mongo's wire protocol carries on the
 /// `count` command's reply.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn count_returns_scalar_under_count_column() {
     let a = adapter(SERVER_NAME).await;
     let coll = unique_collection("mongoexec");
@@ -211,6 +215,7 @@ async fn count_returns_scalar_under_count_column() {
 /// `distinct` returns one row per unique value. Two distinct roles in
 /// the seed → two rows.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn distinct_returns_unique_values_one_per_row() {
     let a = adapter(SERVER_NAME).await;
     let coll = unique_collection("mongoexec");
@@ -250,6 +255,7 @@ async fn distinct_returns_unique_values_one_per_row() {
 /// a tiny `maxTimeMS`. Use a `$sample` size that has to scan the whole
 /// collection. Either way the test pins the typed mapping.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn max_time_ms_surfaces_as_typed_timeout() {
     let a = adapter(SERVER_NAME).await;
     let coll = unique_collection("mongoexec");
@@ -313,6 +319,7 @@ async fn max_time_ms_surfaces_as_typed_timeout() {
 /// duplicate `$db` (`FailedToParse`, code 9 → `syntax_error`) — safe only by
 /// the server's grace. Now the gateway refuses it, whatever the server does.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn dollar_db_pointing_at_another_database_is_rejected() {
     let side = side_client();
     let coll = unique_collection("mongodollardb");
@@ -349,6 +356,7 @@ async fn dollar_db_pointing_at_another_database_is_rejected() {
 /// stops them in the gateway. Pins the contract claudetm shipped in #57's
 /// follow-up commit.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn rejected_write_command_does_not_reach_mongo() {
     let a = adapter(SERVER_NAME).await;
     let coll = unique_collection("mongoexec");
@@ -391,6 +399,7 @@ async fn rejected_write_command_does_not_reach_mongo() {
 /// Some("admin"), .. }` and queries against `app` succeed. Together the
 /// two arms pin both branches end-to-end.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn auth_database_none_falls_back_to_database_name() {
     let mut db = database();
     db.auth_database = None;
@@ -424,6 +433,7 @@ async fn auth_database_none_falls_back_to_database_name() {
 /// `listCollections` and `listIndexes` pass the rejector and return one
 /// document per collection / index.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn list_commands_return_documents() {
     let a = adapter(SERVER_NAME).await;
     let coll = unique_collection("mongolist");
@@ -470,6 +480,7 @@ async fn list_commands_return_documents() {
 /// `describe_schema` answers one `[database, collection, type, indexes]` row
 /// per collection.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn describe_schema_lists_collections_and_indexes() {
     let a = adapter(SERVER_NAME).await;
     let coll = unique_collection("mongoschema");
@@ -502,6 +513,7 @@ async fn describe_schema_lists_collections_and_indexes() {
 
 /// `sample` is a `find` capped at the row limit, truncation flagged.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn sample_returns_documents_up_to_the_limit() {
     let a = adapter(SERVER_NAME).await;
     let coll = unique_collection("mongosample");

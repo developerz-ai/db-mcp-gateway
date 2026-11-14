@@ -121,6 +121,7 @@ fn payload(response: &Value) -> Value {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn run_query_full_acceptance() {
     let booted = boot_gateway().await;
     let (url, bearer, pool, sub) = (
@@ -300,6 +301,7 @@ permissions:
 /// through the guard and the change actually commits — while schema mods stay
 /// blocked even with the write grant, and every dispatch leaves an audit row.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn run_query_write_grant_commits_data_but_not_schema() {
     common::pg_target::ensure_read_role().await;
     let booted = boot_gateway_with(WRITE_YAML, vec!["writers".to_string()]).await;
@@ -448,6 +450,7 @@ async fn run_query_write_grant_commits_data_but_not_schema() {
 /// A read-only (`query_read`) caller must NOT be able to write, even though the
 /// underlying dev role is write-capable — the guard is the gate.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn run_query_read_grant_cannot_write() {
     let booted = boot_gateway().await; // engineers → query_read only
     let (url, bearer, pool, sub) = (
@@ -482,6 +485,7 @@ async fn run_query_read_grant_cannot_write() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn run_query_cache_backed_db_grant() {
     // E2E test with cache enabled: verifies that DB-only grants (not in YAML)
     // are correctly loaded, cached, and used for authorization. Seeds a
@@ -600,6 +604,7 @@ async fn run_query_cache_backed_db_grant() {
 /// stack (`/mcp` POST → transport → `dispatch_call` → `run_query` →
 /// `audit_dispatch` → audit row) to pin the contract end-to-end.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn run_query_preserves_client_id_but_audit_row_carries_gateway_uuid() {
     let booted = boot_gateway().await;
     let (url, bearer, pool, sub) = (
@@ -670,6 +675,7 @@ async fn run_query_preserves_client_id_but_audit_row_carries_gateway_uuid() {
 /// find the row from what the agent pastes back. A denied call needs no
 /// target database, so this runs against the state DB alone.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn error_response_request_id_matches_the_audit_row() {
     let booted = boot_gateway().await;
     let resp = client()
@@ -720,6 +726,7 @@ async fn error_response_request_id_matches_the_audit_row() {
 /// Assert both halves: HTTP-level 202 with an empty body, AND no audit row
 /// was ever written for this user/tool.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn tools_call_as_notification_does_not_execute() {
     let booted = boot_gateway().await;
     let (url, bearer, pool, sub) = (
@@ -767,6 +774,7 @@ async fn tools_call_as_notification_does_not_execute() {
 /// deserialization, null-id `tools/call` would be silently accepted like
 /// the omitted-id case and still hit the DB.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn tools_call_with_null_id_is_invalid_request_and_does_not_execute() {
     let booted = boot_gateway().await;
     let (url, bearer, pool, sub) = (
@@ -888,6 +896,7 @@ async fn concurrency_test_server(
 /// a second request from the same identity must get HTTP 429 with the stable
 /// `concurrency_limit_exceeded` error code.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn per_identity_concurrency_cap_returns_429() {
     // 1 global slot, 1 per-identity slot — one request fills both caps.
     let (url, client) = concurrency_test_server(10, 1).await;
@@ -932,6 +941,7 @@ async fn per_identity_concurrency_cap_returns_429() {
 /// Global cap: once the single global slot is taken, any next request — even
 /// from a different identity — must get HTTP 503 with `service_overloaded`.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn global_concurrency_cap_returns_503() {
     // 1 global slot, many per-identity slots — one request fills the global cap.
     let (url, client) = concurrency_test_server(1, 100).await;

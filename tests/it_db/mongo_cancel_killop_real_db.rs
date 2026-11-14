@@ -105,6 +105,7 @@ async fn poll_until(client: &Client, collection: &str, want: bool, deadline: Dur
 /// is generous (30s) so `maxTimeMS` cannot be what stops it — only the
 /// cancel guard's `killOp` can.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn dropped_execute_future_kills_the_mongo_op() {
     let monitor = side_client();
     let coll = unique_collection("mongocancel");
@@ -199,6 +200,7 @@ async fn dropped_execute_future_kills_the_mongo_op() {
 /// nothing was left running AND nothing was killed (there was nothing to
 /// kill — this just confirms disarm doesn't false-trigger on the DB side).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn completed_command_leaves_nothing_in_current_op() {
     let monitor = side_client();
     let coll = unique_collection("mongocancel");

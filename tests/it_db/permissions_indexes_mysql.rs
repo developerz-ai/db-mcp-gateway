@@ -87,6 +87,7 @@ fn find_bool(value: &JsonValue, name: &str) -> Option<bool> {
 const SEED_ROWS: u32 = 900;
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn get_user_by_sub_uses_the_user_sub_index() {
     let p = mysql_pool().await;
     let tag = format!("planseed-{}", Uuid::new_v4().simple());
@@ -136,6 +137,7 @@ async fn get_user_by_sub_uses_the_user_sub_index() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn list_databases_uses_the_live_index_and_avoids_filesort() {
     let p = mysql_pool().await;
     let tag = format!("planseed-{}", Uuid::new_v4().simple());
@@ -189,6 +191,7 @@ async fn list_databases_uses_the_live_index_and_avoids_filesort() {
 /// `0001` (plain composite key, not a generated column) — pinned here so the
 /// third hot query can't regress the way the other two did.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn list_grants_for_user_uses_the_user_index() {
     let p = mysql_pool().await;
     let plan = explain(

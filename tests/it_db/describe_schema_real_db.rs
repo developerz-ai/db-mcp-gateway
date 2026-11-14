@@ -27,6 +27,7 @@ fn fresh_schema_name() -> String {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn catalog_query_returns_expected_columns_and_types() {
     let a = adapter().await;
     let schema = fresh_schema_name();
@@ -91,6 +92,7 @@ async fn catalog_query_returns_expected_columns_and_types() {
 /// Filtering by table_name returns only that table's columns. Crucial because
 /// `describe_schema { table: "users" }` is a common narrowing query.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn table_filter_narrows_results() {
     let a = adapter().await;
     let schema = fresh_schema_name();
@@ -149,6 +151,7 @@ permissions:
 /// The audit row of a catalog read records what was read — `schema.table` —
 /// and an intent row preceded it.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn describe_schema_audit_row_names_the_table_read() {
     let schema = fresh_schema_name();
     ddl(&format!("CREATE SCHEMA \"{schema}\""))

@@ -33,6 +33,7 @@ permissions:
 "#;
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn write_intent_records_the_calls_sql_and_reason() {
     ensure_read_role().await;
     let user = MockUser {

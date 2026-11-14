@@ -81,6 +81,7 @@ impl<'a> MakeWriter<'a> for FailingWriter {
 /// field names + AuditRow data) instead of substring-matching against the
 /// human-readable line, which any unrelated tracing line could satisfy.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn configured_stdout_sink_streams_and_still_writes_the_durable_row() {
     let p = state_pool().await;
     let user = format!("stream-test-{}", Uuid::new_v4().simple());
@@ -171,6 +172,7 @@ async fn configured_stdout_sink_streams_and_still_writes_the_durable_row() {
 /// non-negotiable #4 — audit write commits (and its response goes out) even
 /// when a stream sink is broken.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn failing_stdout_sink_does_not_block_response_or_durable_write() {
     let p = state_pool().await;
     let user = format!("stream-test-fail-{}", Uuid::new_v4().simple());
@@ -229,6 +231,7 @@ async fn failing_stdout_sink_does_not_block_response_or_durable_write() {
 /// empty sink list must exercise the primary `audit::log` path, not
 /// short-circuit past it.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn no_configured_sinks_streams_nothing() {
     let p = state_pool().await;
     let user = format!("stream-test-noop-{}", Uuid::new_v4().simple());
@@ -286,6 +289,7 @@ async fn no_configured_sinks_streams_nothing() {
 /// The RFC 5424 formatting itself is unit-tested in `audit::stream`; this
 /// test is only about `audit_dispatch` actually reaching the sink.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn configured_syslog_sink_delivers_udp_and_still_writes_the_durable_row() {
     let p = state_pool().await;
     let user = format!("stream-test-syslog-{}", Uuid::new_v4().simple());

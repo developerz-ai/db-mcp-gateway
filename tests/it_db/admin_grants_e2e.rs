@@ -212,6 +212,7 @@ async fn admin_jwt(sessions: &SessionStore, auth_cfg: &AuthConfig, h: &mut Harne
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn admin_creates_specific_grant_and_audit_recorded() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -250,6 +251,7 @@ async fn admin_creates_specific_grant_and_audit_recorded() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn admin_creates_wildcard_grant_and_audit_recorded() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -289,6 +291,7 @@ async fn admin_creates_wildcard_grant_and_audit_recorded() {
 /// flag. The DB CHECK is the safety net; this guarantees the handler never
 /// even reaches the storage layer on these inputs.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn xor_target_violations_are_rejected() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -343,6 +346,7 @@ async fn xor_target_violations_are_rejected() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn unknown_action_is_rejected() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -371,6 +375,7 @@ async fn unknown_action_is_rejected() {
 /// A reference to a missing user or database must surface as
 /// `invalid_request` (400) — client-correctable input, not a gateway fault.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn create_grant_with_unknown_user_or_database_is_400() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -426,6 +431,7 @@ async fn create_grant_with_unknown_user_or_database_is_400() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn patch_attempting_to_change_target_is_rejected() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -463,6 +469,7 @@ async fn patch_attempting_to_change_target_is_rejected() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn patch_updates_action_and_constraints_and_audits() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -513,6 +520,7 @@ async fn patch_updates_action_and_constraints_and_audits() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn delete_revokes_and_audits() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -562,6 +570,7 @@ async fn delete_revokes_and_audits() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn list_filter_by_user_id() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -618,6 +627,7 @@ async fn list_filter_by_user_id() {
 /// so `ListGrantsQuery` has to hold `limit`/`offset` inline for the unknown-
 /// field rejection to actually work.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn list_rejects_unknown_query_key() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -648,6 +658,7 @@ async fn list_rejects_unknown_query_key() {
 /// POST a grant, then read through the cache again — the new grant must
 /// appear. This is the cache-invalidation hook's only purpose.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn live_grant_change_invalidates_cache_for_user() {
     use db_mcp_gateway::auth::{Identity, SessionId};
 
@@ -715,6 +726,7 @@ async fn live_grant_change_invalidates_cache_for_user() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn non_admin_gets_403_and_no_writes() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (user_id, db_id, _) = seed_target_user_and_db(&mut h).await;
@@ -789,6 +801,7 @@ async fn non_admin_gets_403_and_no_writes() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn anonymous_gets_401() {
     let (h, _, _) = spawn_gateway().await;
     let resp = client()
@@ -840,6 +853,7 @@ async fn patch_grant(h: &Harness, jwt: &str, id: Uuid, body: Value) -> reqwest::
 /// `require_reason` and `statement_timeout_ms`; an explicit `null` clears
 /// exactly the key it names.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn patch_merges_per_key_and_never_drops_unnamed_constraints() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -864,6 +878,7 @@ async fn patch_merges_per_key_and_never_drops_unnamed_constraints() {
 
 /// A stale `expected_updated_at` is a 409 and changes nothing.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn patch_with_stale_precondition_is_409() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -886,6 +901,7 @@ async fn patch_with_stale_precondition_is_409() {
 /// Concurrent PATCHes serialise on the grant row: every request applies and
 /// the audit rows form an unbroken chain, `after[n] == before[n + 1]`.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn concurrent_patches_leave_a_continuous_audit_chain() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -922,6 +938,7 @@ async fn concurrent_patches_leave_a_continuous_audit_chain() {
 /// A wildcard must name a server the config declares: `*` and unknown
 /// names are 400 and write nothing.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn wildcard_on_star_or_undeclared_server_is_400() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -953,6 +970,7 @@ async fn wildcard_on_star_or_undeclared_server_is_400() {
 
 /// A grant cannot attach to a soft-deleted user or database.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn grant_on_soft_deleted_user_or_database_is_400() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;
@@ -981,6 +999,7 @@ async fn grant_on_soft_deleted_user_or_database_is_400() {
 /// POST and PATCH reject `row_limit: 0` / `statement_timeout_ms: 0` with 400
 /// and write nothing.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn zero_row_limit_or_timeout_is_400() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let jwt = admin_jwt(&sessions, &auth_cfg, &mut h).await;

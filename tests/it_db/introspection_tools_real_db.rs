@@ -127,6 +127,7 @@ fn payload(response: &Value) -> Value {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn table_stats_reports_a_table_and_is_audited() {
     let fx = Fixture::new("inspectors").await;
     let target = sqlx::PgPool::connect("postgres://app:app-dev-only@localhost:5434/app")
@@ -163,6 +164,7 @@ async fn table_stats_reports_a_table_and_is_audited() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn introspection_without_a_grant_is_forbidden_and_audited() {
     let fx = Fixture::new("historians").await;
     let id = uuid::Uuid::new_v4().to_string();
@@ -179,6 +181,7 @@ async fn introspection_without_a_grant_is_forbidden_and_audited() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn cancel_query_rejects_a_malformed_request_id() {
     let fx = Fixture::new("inspectors").await;
     let resp = fx
@@ -193,6 +196,7 @@ async fn cancel_query_rejects_a_malformed_request_id() {
 /// grants sees none of it and cannot cancel it; the owner's cancel stops it
 /// and the victim call writes its own `cancelled` row.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn activity_and_cancel_are_own_identity_only() {
     let fx = std::sync::Arc::new(Fixture::new("inspectors").await);
     let slow = {

@@ -92,6 +92,7 @@ const CLAIM: [(&str, &str); 2] = [
 ];
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn claimed_upstream_lands_in_the_audit_row() {
     let (gw, account) = boot().await;
     let subject = format!("service:{account}");
@@ -108,6 +109,7 @@ async fn claimed_upstream_lands_in_the_audit_row() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn malformed_upstream_header_is_refused_and_audited() {
     let (gw, account) = boot().await;
     let subject = format!("service:{account}");
@@ -123,6 +125,7 @@ async fn malformed_upstream_header_is_refused_and_audited() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn require_upstream_refuses_calls_without_both_headers() {
     let (gw, account) = boot().await;
     let subject = format!("service:{account}-strict");
@@ -141,6 +144,7 @@ async fn require_upstream_refuses_calls_without_both_headers() {
 /// An SSO session's identity is verified; claimed headers on it are ignored,
 /// never stored.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn sso_session_upstream_headers_are_ignored() {
     let (gw, _) = boot().await;
 
@@ -156,6 +160,7 @@ async fn sso_session_upstream_headers_are_ignored() {
 
 /// Agents sharing one token read only their own run's history.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn history_is_filtered_by_the_claimed_run() {
     let (gw, account) = boot().await;
     let subject = format!("service:{account}");

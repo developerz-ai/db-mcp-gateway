@@ -44,6 +44,7 @@ async fn columns(pool: &PgPool, table: &str) -> Vec<String> {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn migrations_apply_from_empty_and_rerun_as_a_no_op() {
     // A plain connection, not a gateway pool: the gateway pools set a request
     // statement_timeout, and DROP DATABASE (which checkpoints) can outlast it
@@ -130,6 +131,7 @@ async fn migrations_apply_from_empty_and_rerun_as_a_no_op() {
 /// already ran still refuses boot — the checksum guard is the one that
 /// protects the history.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn newer_schema_boots_and_an_edited_migration_still_refuses() {
     let mut admin = PgConnection::connect(&state_db_url())
         .await
@@ -183,6 +185,7 @@ async fn newer_schema_boots_and_an_edited_migration_still_refuses() {
 /// migration history is the shared dev store's, so the stand-in "newer"
 /// version is removed again before asserting.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn mysql_store_boots_on_a_newer_schema() {
     let pool = mysql_pool().await;
     let version = 99_990_000 + i64::from(Uuid::new_v4().as_fields().1);

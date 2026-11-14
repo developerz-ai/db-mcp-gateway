@@ -133,6 +133,7 @@ async fn assert_admitted(gw: &TestGateway, token: &str, subject: &str, label: &s
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn account_cap_below_the_default_sheds_only_that_account() {
     let (gw, account) = boot().await;
     let tight = format!("service:{account}-tight");
@@ -161,6 +162,7 @@ async fn account_cap_below_the_default_sheds_only_that_account() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn account_cap_above_the_default_admits_past_it() {
     let (gw, account) = boot().await;
     let fleet = format!("service:{account}-fleet");

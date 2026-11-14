@@ -63,6 +63,7 @@ async fn cleanup(pool: &PgPool, user_sub: &str, server: &str) -> Result<(), sqlx
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn loader_projects_specific_grant_into_config_grant_shape() {
     let p = state_pool().await;
     let sub = fresh("loader-spec");
@@ -96,6 +97,7 @@ async fn loader_projects_specific_grant_into_config_grant_shape() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn loader_drops_grants_whose_database_was_soft_deleted() {
     let p = state_pool().await;
     let sub = fresh("loader-drop");
@@ -133,6 +135,7 @@ async fn loader_drops_grants_whose_database_was_soft_deleted() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn loader_returns_empty_for_user_with_no_permissions_row() {
     let p = state_pool().await;
     let repo = PgPermissionsRepo::new(p.clone());
@@ -145,6 +148,7 @@ async fn loader_returns_empty_for_user_with_no_permissions_row() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn evaluate_effective_grants_via_db_with_no_yaml_match() {
     let p = state_pool().await;
     let sub = fresh("evdb");
@@ -179,6 +183,7 @@ async fn evaluate_effective_grants_via_db_with_no_yaml_match() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn evaluate_effective_merges_yaml_and_db_most_restrictive() {
     // YAML grants row_limit=10000; DB grant says row_limit=50. Symmetric
     // merge — the DB tightening must win without YAML being "primary".
@@ -243,6 +248,7 @@ permissions:
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn can_see_server_effective_includes_db_grants() {
     let p = state_pool().await;
     let sub = fresh("see");
@@ -290,6 +296,7 @@ servers:
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn cache_hits_avoid_db_round_trip_and_invalidate_busts_it() {
     let p = state_pool().await;
     let sub = fresh("cache");
@@ -371,6 +378,7 @@ where
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn spawn_invalidate_drops_the_targeted_users_entry() {
     let p = state_pool().await;
     let sub = fresh("spawn-inv");
@@ -430,6 +438,7 @@ async fn spawn_invalidate_drops_the_targeted_users_entry() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn spawn_invalidate_all_flushes_every_users_entry() {
     let p = state_pool().await;
     let sub_a = fresh("spawn-all-a");
@@ -562,6 +571,7 @@ impl PermissionsRepo for CountingRepo {
 /// A cache miss costs exactly one store round trip, however many grants and
 /// databases the subject has.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn cache_miss_is_one_store_query() {
     let p = state_pool().await;
     let sub = fresh("one-query");
@@ -598,6 +608,7 @@ async fn cache_miss_is_one_store_query() {
 /// Two caches stand in for two replicas. A revoke committed with its
 /// `NOTIFY` reaches the replica that did not make it, well inside the TTL.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn second_replica_converges_after_a_notified_revoke() {
     use db_mcp_gateway::state::permissions::pg::{grants, notify};
 

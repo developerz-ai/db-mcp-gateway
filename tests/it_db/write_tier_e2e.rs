@@ -120,6 +120,7 @@ fn payload(response: &Value) -> Value {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn reads_run_as_role_and_writes_as_write_role() {
     let fx = Fixture::new("writers").await;
 
@@ -143,6 +144,7 @@ async fn reads_run_as_role_and_writes_as_write_role() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn dry_run_reports_rows_affected_and_rolls_back() {
     let fx = Fixture::new("writers").await;
 
@@ -166,6 +168,7 @@ async fn dry_run_reports_rows_affected_and_rolls_back() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn read_tier_cannot_dry_run_a_write() {
     let fx = Fixture::new("readers").await;
 

@@ -104,6 +104,7 @@ The bar: idiomatic, boring, readable Rust. No spaghetti, no premature abstractio
 | Unit + property | Pure logic (authz evaluation, config validation, SQL rewriting), no real DB. Authz constraint-merge (`proptest`): most restrictive value wins, always. |
 | Integration | Gateway booted against real Postgres (CI service container). Real MCP requests over HTTP. |
 | Audit | Every integration test that hits a tool asserts an audit row exists. Tool failed authz → audit row with `outcome: forbidden`. |
+| Isolation | Every `tests/it_db/` test declares `#[serial_test::serial(world)]` (table-wide side effect: reaper/pruner/GC sweep, cap seeding, global counts) or `#[serial_test::parallel(world)]` — the suites share one process under `cargo test`. Enforced by `it_offline::isolation_guard`. |
 
 ## CI
 

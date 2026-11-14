@@ -69,6 +69,7 @@ async fn update_user(
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn update_user_changes_only_the_given_columns() {
     let pool = state_pool().await;
     let repo = PgPermissionsRepo::new(pool.clone());
@@ -96,6 +97,7 @@ async fn update_user_changes_only_the_given_columns() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn update_user_never_touches_a_missing_or_soft_deleted_user() {
     let pool = state_pool().await;
     let repo = PgPermissionsRepo::new(pool.clone());
@@ -118,6 +120,7 @@ async fn update_user_never_touches_a_missing_or_soft_deleted_user() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn rolled_back_user_update_leaves_the_row() {
     let pool = state_pool().await;
     let repo = PgPermissionsRepo::new(pool.clone());
@@ -151,6 +154,7 @@ async fn update_grant(
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn update_grant_keeps_action_when_none_and_replaces_constraints() {
     let pool = state_pool().await;
     let repo = PgPermissionsRepo::new(pool.clone());
@@ -179,6 +183,7 @@ async fn update_grant_keeps_action_when_none_and_replaces_constraints() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn update_grant_never_resurrects_a_revoked_grant() {
     let pool = state_pool().await;
     let repo = PgPermissionsRepo::new(pool.clone());

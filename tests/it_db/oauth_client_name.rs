@@ -54,6 +54,7 @@ fn location(resp: &reqwest::Response) -> String {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn registered_name_is_shown_escaped_and_unverified_on_consent() {
     let gw = spawn_gateway().await;
     let http = no_redirect_client();
@@ -101,6 +102,7 @@ async fn registered_name_is_shown_escaped_and_unverified_on_consent() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn invalid_names_are_invalid_client_metadata() {
     let gw = spawn_gateway().await;
     let http = no_redirect_client();
@@ -122,6 +124,7 @@ async fn invalid_names_are_invalid_client_metadata() {
 /// with its own SQL (copied verbatim); the new binary reads such a row with no
 /// name, and 2.1.0 still reads a row the new binary wrote with one.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn release_2_1_0_client_queries_run_on_the_0019_schema() {
     let pool = state_pool().await;
     let columns: Vec<String> = sqlx::query_scalar(

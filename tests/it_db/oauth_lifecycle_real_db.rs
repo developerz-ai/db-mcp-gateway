@@ -1,7 +1,7 @@
 //! Real-DB lifecycle tests for the OAuth bridge stores (issue #314 slice B).
 //!
-//! `#[serial]` and only ever touching its own uniquely-named rows, so it can't
-//! disturb `client_registry_real_db.rs`'s cap seeding.
+//! `#[serial_test::serial(world)]`: `gc_expired` sweeps the whole table, and
+//! the rest only touch their own uniquely-named rows.
 
 use std::time::Duration;
 
@@ -9,7 +9,6 @@ use crate::common::env::state_pool;
 use db_mcp_gateway::auth::oauth::{ClientRegistry, GrantIdentity, RefreshTokens};
 use db_mcp_gateway::auth::{AuthError, SessionCacheConfig, SessionStore};
 use db_mcp_gateway::state::oauth::{self as db, NewRefreshToken};
-use serial_test::serial;
 use sqlx::PgPool;
 
 const CHAIN_TTL: Duration = Duration::from_secs(24 * 3600);
@@ -28,7 +27,7 @@ async fn cleanup(pool: &PgPool, client_id: &str) {
 /// the fix the upsert kept the lapsed `expires_at`, the lookup filtered it
 /// out, and every retry 503'd until GC ran.
 #[tokio::test]
-#[serial]
+#[serial_test::serial(world)]
 async fn adopting_a_lapsed_unswept_client_revives_it() {
     let pool = state_pool().await;
     let client_id = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
@@ -65,7 +64,7 @@ async fn adopting_a_lapsed_unswept_client_revives_it() {
 
 /// Only a lapsed row is reset: re-registering a live client keeps its expiry.
 #[tokio::test]
-#[serial]
+#[serial_test::serial(world)]
 async fn re_registering_a_live_client_keeps_its_expiry() {
     let pool = state_pool().await;
     let client_id = format!("mcp-test-{}", uuid::Uuid::new_v4().simple());
@@ -160,7 +159,7 @@ async fn cleanup_sub(pool: &PgPool, sub: &str, chains: &[uuid::Uuid]) {
 /// legitimate client then presents the (now rotated-out) original, the whole
 /// chain dies — the thief's fresh token and its session included.
 #[tokio::test]
-#[serial]
+#[serial_test::serial(world)]
 async fn reusing_a_rotated_refresh_token_revokes_the_chain() {
     let pool = state_pool().await;
     let sub = format!("rt-reuse-{}", uuid::Uuid::new_v4().simple());
@@ -205,7 +204,7 @@ async fn reusing_a_rotated_refresh_token_revokes_the_chain() {
 /// rotation: just `invalid_grant`, and the winning call's new token and
 /// session stay live — no forced re-login.
 #[tokio::test]
-#[serial]
+#[serial_test::serial(world)]
 async fn replay_inside_the_grace_keeps_the_chain() {
     let pool = state_pool().await;
     let sub = format!("rt-grace-{}", uuid::Uuid::new_v4().simple());
@@ -246,7 +245,7 @@ async fn replay_inside_the_grace_keeps_the_chain() {
 /// Reuse detection must not reach across chains: one user's replay leaves a
 /// sibling chain (another device, same `sub`) alive.
 #[tokio::test]
-#[serial]
+#[serial_test::serial(world)]
 async fn reuse_revokes_only_its_own_chain() {
     let pool = state_pool().await;
     let sub = format!("rt-sibling-{}", uuid::Uuid::new_v4().simple());
@@ -285,7 +284,7 @@ async fn reuse_revokes_only_its_own_chain() {
 
 /// GC sweeps lapsed tombstones along with lapsed chains.
 #[tokio::test]
-#[serial]
+#[serial_test::serial(world)]
 async fn gc_sweeps_lapsed_tombstones() {
     let pool = state_pool().await;
     let chain = uuid::Uuid::new_v4();
@@ -318,7 +317,7 @@ async fn gc_sweeps_lapsed_tombstones() {
 /// READ COMMITTED a bare `DELETE … WHERE chain_id` waits on T2's row lock,
 /// re-checks only T2 (now gone) and never sees T3.
 #[tokio::test]
-#[serial]
+#[serial_test::serial(world)]
 async fn reuse_revocation_waits_for_an_in_flight_rotation() {
     let pool = state_pool().await;
     let sub = format!("rt-race-{}", uuid::Uuid::new_v4().simple());

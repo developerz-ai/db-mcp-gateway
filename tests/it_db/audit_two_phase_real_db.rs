@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::common::audit::{DispatchSinks, SWEEPS, calls_for_request, find_audit, find_intent};
+use crate::common::audit::{DispatchSinks, calls_for_request, find_audit, find_intent};
 use crate::common::cleanup::delete_audit_calls;
 use crate::common::env::{state_db_url, state_pool};
 use db_mcp_gateway::audit::reaper::ReapCursor;
@@ -68,8 +68,8 @@ fn intent<'a>(request_id: Uuid, user_sub: &'a str, access: Access) -> CallIntent
 /// the intent exists. The reaper must account for the call as `abandoned`,
 /// naming whether it could have written.
 #[tokio::test]
+#[serial_test::serial(world)]
 async fn intent_without_completion_is_reaped_as_abandoned() {
-    let _serial = SWEEPS.lock().await;
     let p = state_pool().await;
     let user = format!("two-phase-{}", Uuid::new_v4().simple());
     let orphan = Uuid::new_v4();
@@ -145,6 +145,7 @@ async fn intent_without_completion_is_reaped_as_abandoned() {
 /// `drain` returns. This is the shutdown contract — `main` drains instead of
 /// letting the runtime drop the fallback write.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn drain_completes_the_cancelled_row_of_an_aborted_dispatch() {
     let p = state_pool().await;
     let user = format!("two-phase-{}", Uuid::new_v4().simple());
@@ -197,6 +198,7 @@ async fn drain_completes_the_cancelled_row_of_an_aborted_dispatch() {
 /// the connection frees — records `audit_unavailable` with the tool's own
 /// outcome in `error_message`.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn failed_completion_write_records_the_code_the_client_saw() {
     let reader = state_pool().await;
     let narrow = PgPoolOptions::new()

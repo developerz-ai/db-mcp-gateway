@@ -10,6 +10,7 @@ use db_mcp_gateway::exec::{Access, DbAdapter, ExecQuery};
 /// can decode directly as a Value, OR as text-with-JSON-content depending on
 /// the version path; the tool's `extract_plan` handles both.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn explain_returns_parseable_json_plan() {
     let a = adapter().await;
     let result = a

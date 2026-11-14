@@ -153,6 +153,7 @@ impl Harness {
 /// burns the flow; a fresh flow with the rendered CSRF releases a working code;
 /// replaying that approval is rejected.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn https_redirect_requires_consent_with_valid_csrf() {
     let h = spawn().await;
     let client_id = h.register(HTTPS_REDIRECT).await;
@@ -209,6 +210,7 @@ async fn https_redirect_requires_consent_with_valid_csrf() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn deny_returns_access_denied_to_the_client() {
     let h = spawn().await;
     let client_id = h.register(HTTPS_REDIRECT).await;
@@ -237,6 +239,7 @@ async fn deny_returns_access_denied_to_the_client() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn loopback_redirect_skips_consent() {
     let h = spawn().await;
     let client_id = h.register(LOOPBACK_REDIRECT).await;
@@ -252,6 +255,7 @@ async fn loopback_redirect_skips_consent() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn consent_rejects_unknown_fields_and_unknown_flows() {
     let h = spawn().await;
     let unknown = h.submit("no-such-flow", "x", "approve").await;

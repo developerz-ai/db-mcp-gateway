@@ -1,10 +1,9 @@
 //! The intent row carries the statement and reason (migration 0018), so the
 //! reaper's `abandoned` row says what may have run. A reaper sweep is global,
-//! so the test holds `common::audit::SWEEPS` like every other sweeper.
+//! so the test is `#[serial_test::serial(world)]` (see `tests/it_db/main.rs`).
 
 use std::time::Duration;
 
-use crate::common::audit::SWEEPS;
 use crate::common::cleanup::delete_audit_calls;
 use crate::common::env::state_pool;
 use db_mcp_gateway::audit::reaper::{self, ReapCursor};
@@ -15,8 +14,8 @@ use uuid::Uuid;
 /// An intent carries the statement and reason, so the `abandoned` row of a
 /// write that may have committed still says what it was.
 #[tokio::test]
+#[serial_test::serial(world)]
 async fn abandoned_row_carries_the_intent_statement_and_reason() {
-    let _serial = SWEEPS.lock().await;
     let p = state_pool().await;
     let user = format!("integrity-stmt-{}", Uuid::new_v4().simple());
     let request_id = Uuid::new_v4();

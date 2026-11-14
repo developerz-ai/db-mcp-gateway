@@ -108,6 +108,7 @@ fn target<'a>(config: &'a ConfigFile, server: &str) -> (&'a Server, &'a Database
 
 /// Opening one database must not serialize behind another database's open.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn opens_for_different_databases_do_not_serialize() {
     let config = config_for(spawn_blackhole().await, spawn_blackhole().await);
     let registry = AdapterRegistry::new();
@@ -158,6 +159,7 @@ async fn opens_for_different_databases_do_not_serialize() {
 /// permit) on a target that just failed — and then retried. The slot is
 /// never wedged.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn a_failed_open_is_cached_briefly_then_retried() {
     let config = config_for(spawn_blackhole().await, spawn_blackhole().await);
     let registry = AdapterRegistry::new();
@@ -191,6 +193,7 @@ async fn a_failed_open_is_cached_briefly_then_retried() {
 /// fresh adapter. Mongo opens without a round trip, so this needs no
 /// reachable target.
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn evict_then_concurrent_reopen_converges_on_one_adapter() {
     let server = mongo_target::server("evict");
     let database = mongo_target::database();
@@ -234,6 +237,7 @@ async fn evict_then_concurrent_reopen_converges_on_one_adapter() {
 /// registry replaces it on the next lookup — the hook that lets a rotated
 /// password take effect. Runs against the dev Mongo (:27018).
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn adapter_rejected_on_credentials_is_replaced() {
     let server = mongo_target::server("stale");
     let database = Database {

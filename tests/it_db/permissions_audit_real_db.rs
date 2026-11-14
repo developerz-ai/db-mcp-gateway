@@ -51,6 +51,7 @@ fn create_row(actor_id: Uuid, target_id: Uuid, request_id: &str) -> PermissionsA
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn create_row_round_trips_through_writer_and_reader() {
     let p = state_pool().await;
     let actor = Uuid::new_v4();
@@ -80,6 +81,7 @@ async fn create_row_round_trips_through_writer_and_reader() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn delete_row_omits_after_payload() {
     let p = state_pool().await;
     let actor = Uuid::new_v4();
@@ -109,6 +111,7 @@ async fn delete_row_omits_after_payload() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn update_row_records_both_before_and_after() {
     // Mirrors the most common admin path: rename a database, change a grant's
     // constraints. Both halves of the diff must survive.
@@ -139,6 +142,7 @@ async fn update_row_records_both_before_and_after() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn ts_defaults_to_server_time_and_is_recent() {
     let p = state_pool().await;
     let actor = Uuid::new_v4();
@@ -162,6 +166,7 @@ async fn ts_defaults_to_server_time_and_is_recent() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn writer_returns_typed_error_when_pool_is_dead() {
     // The acceptance is "audit-write failure surfaces a 5xx and rolls back"
     // — the rollback half lives with the admin endpoint (#52). What's
@@ -185,6 +190,7 @@ async fn writer_returns_typed_error_when_pool_is_dead() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn check_constraint_rejects_unknown_action_via_raw_insert() {
     // The typed `PermissionsAuditAction` is the in-process guard, but the DB
     // CHECK is what protects us from raw-SQL bypasses (manual migrations,
@@ -208,6 +214,7 @@ async fn check_constraint_rejects_unknown_action_via_raw_insert() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn check_constraint_rejects_empty_actor_email() {
     // Empty actor_email bypasses the audit identity contract. The DB CHECK
     // prevents this even if the writer mistakenly passes an empty string.
@@ -230,6 +237,7 @@ async fn check_constraint_rejects_empty_actor_email() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn check_constraint_rejects_empty_request_id() {
     // Empty request_id breaks the per-request tracing contract. The DB CHECK
     // prevents this even if the writer mistakenly passes an empty string.
@@ -252,6 +260,7 @@ async fn check_constraint_rejects_empty_request_id() {
 }
 
 #[tokio::test]
+#[serial_test::parallel(world)]
 async fn log_accepts_transaction_executor_and_respects_rollback() {
     // Verifies the new Executor trait bound allows transactions.
     // A rolled-back transaction must not persist the audit row.
