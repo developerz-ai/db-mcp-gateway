@@ -70,7 +70,7 @@ def security_note(path):
     if path.startswith(SECURITY_PATHS):
         return (
             f"{path} is a security-review path (CLAUDE.md): the PR carries the `security review required` "
-            "label and is merged by a human. Check: no credential in errors/logs/responses, an audit row on "
+            "label and gets a mandatory security pass. Check: no credential in errors/logs/responses, an audit row on "
             "every outcome, no authz bypass via constraint merge, no timeout or row-cap bypass."
         )
     return None

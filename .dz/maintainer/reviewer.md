@@ -22,7 +22,7 @@ Rust + Cargo. The gate is `bin/check`, run from the repository root: `export PAT
 - Hard ceilings: 100,000 rows and 30 s per statement. A grant may tighten them; it may never loosen them.
 - Error codes are contract, not prose: `forbidden_sql`, `reason_required`, `timeout`, `rate_limited`, `forbidden`, `invalid_arguments`, `syntax_error`, `unavailable`, `service_overloaded`, `internal`. A changed code is a behaviour change.
 - Service accounts are the one exception to per-call SSO verification (spec 14): a `dbmcp_svc_` bearer mapped to exactly one `permissions:` group, audited as `service:<name>`, boot-gated off the admin group, no in-band mint or revoke.
-- A PR touching a CLAUDE.md security-review path (`src/auth/`, `src/authz/`, credential loading or storage — `src/config/secret*`, `src/state/` — the audit write path `src/audit/`, any MCP tool `src/tools/`, SQL execution `src/exec/`) must carry the label `security review required`, exact name. A missing label is a must-fix finding. Those PRs are merged by a human (`pr.human_merge.paths` in `maintainer.yml`), never by the bot.
+- A PR touching a CLAUDE.md security-review path (`src/auth/`, `src/authz/`, credential loading or storage — `src/config/secret*`, `src/state/` — the audit write path `src/audit/`, any MCP tool `src/tools/`, SQL execution `src/exec/`) must carry the label `security review required`, exact name. A missing label is a must-fix finding. The security pass on those PRs is the merge gate: any finding against a non-negotiable is must-fix, and the bot merges only once none is open.
 - A behaviour change updates `website/docs/initial-idea/` in the same PR. The spec is canonical; the reviewer's word is the spec's word.
 
 ## Gates that matter

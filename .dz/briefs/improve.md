@@ -32,7 +32,7 @@ repository setting is the owner's to fix: escalate once, never delete the check 
 
 ## Ship
 
-One small PR per improvement, its evidence in the body, `bin/ci` green first. A PR touching a CLAUDE.md security-review path (`src/auth/`, `src/authz/`, credential loading or storage, the audit write path, `src/tools/`, SQL execution) carries the `security review required` label and waits for a human merge (`pr.human_merge`). Never bump the version, and never touch release automation, audit semantics or grant handling from this checkup: open an issue instead. A breaking change is never merged by this lane (`escalate.ask_before_acting: [breaking_change]`): open the PR or issue and leave it for a maintainer.
+One small PR per improvement, its evidence in the body, `bin/ci` green first. A PR touching a CLAUDE.md security-review path (`src/auth/`, `src/authz/`, credential loading or storage, the audit write path, `src/tools/`, SQL execution) carries the `security review required` label and merges only once the review's security pass has nothing open. Never bump the version, and never touch release automation, audit semantics or grant handling from this checkup: open an issue instead. A breaking change is never merged by this lane (`escalate.ask_before_acting: [breaking_change]`): open the PR or issue and leave it for a maintainer.
 Check no open PR or issue already covers it. If nothing is worth changing, do nothing: no empty PRs, no churn.
 
 ## Rows

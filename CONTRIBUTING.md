@@ -293,9 +293,9 @@ What that means for you:
 - **Commit with an email linked to your GitHub account** (`git config user.email` matches an
   address on <https://github.com/settings/emails>). The ruleset requires an extra human approval
   for a commit not attributed to a GitHub account, so such a PR silently parks instead of merging.
-- **A human merges security-review paths.** A PR touching auth, authz, credential loading, the
-  audit write path, MCP tools, SQL execution or the state DB carries the `security review required`
-  label and is merged by a person after that review, never by the bot.
+- **Security-review paths get a mandatory security pass.** A PR touching auth, authz, credential
+  loading, the audit write path, MCP tools, SQL execution or the state DB carries the
+  `security review required` label; the agent merges it only once that pass has nothing open.
 - **A "no" comes early and with a reason.** A change the project will not take (the
   Non-negotiables and NEVER list in [`CLAUDE.md`](CLAUDE.md), the `non_goals` in the policy file)
   is closed with the rule it ran into, not left open.

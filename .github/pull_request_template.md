@@ -6,8 +6,8 @@
 
 <!--
 Tick any that apply. A ticked "security review" line means the PR carries the
-`security review required` label and is merged by a human after that review
-(CLAUDE.md "Security review required"; `pr.human_merge` in .dz/maintainer/maintainer.yml).
+`security review required` label and merges only once the review's mandatory
+security pass has nothing open (CLAUDE.md "Security review required").
 -->
 
 - [ ] `src/transport/`
