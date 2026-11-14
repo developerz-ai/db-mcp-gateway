@@ -36,6 +36,18 @@ impl From<SessionId> for Uuid {
     }
 }
 
+/// Subject prefix reserved for YAML service identities (`service:<name>`,
+/// spec 14). Only [`crate::auth::ServiceTokenStore`] mints it; an IdP subject
+/// carrying it would read that account's history and be audited as it.
+pub const SERVICE_SUBJECT_PREFIX: &str = "service:";
+
+/// Whether `sub` claims the reserved service namespace. Case-insensitive, so
+/// no look-alike can be built either.
+pub fn is_service_subject(sub: &str) -> bool {
+    sub.get(..SERVICE_SUBJECT_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(SERVICE_SUBJECT_PREFIX))
+}
+
 /// Per-request identity, cloned cheaply. `auth::middleware` attaches it to
 /// request extensions for handlers and the audit layer. Manual `Debug` redacts
 /// `user_email` (PII); the audit writer reads it directly, nothing else should.

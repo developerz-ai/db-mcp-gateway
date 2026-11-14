@@ -111,7 +111,7 @@ Response: the full `PermissionsUser` row. Upsert is idempotent on the *live* row
 { "server": "prod", "db_name": "billing", "db_type": "postgres" }
 ```
 
-`db_type` is `postgres` or `mysql` only — mongo is intentionally absent from the permissions store (spec 12 §"Storage backends"). Mongo *query* targets exist as a separate axis; see [`../usage/multi-db.md`](../usage/multi-db.md).
+`server` must name a server declared in the gateway config (the boot snapshot; a reload does not change the set), the same rule a wildcard grant obeys — a row on an undeclared server would sit dormant until a later config change silently armed it. `db_type` names the target engine: `postgres`, `mysql` or `mongo` (spec 12 §"Storage backends"; migrations `0013` / `migrations-mysql/0005`). Don't confuse it with the permissions *store* backend, which is postgres or mysql only — a mongo target is registered here like any other. Either violation is `400 invalid_request`, and a refused create or `PATCH` writes no row and no `permissions_audit` entry.
 
 This row carries only the routing key — **no DSN, no role, no password**. CLAUDE.md non-negotiable #1: connection details stay in YAML / secret backends, never in the admin API.
 
@@ -121,7 +121,7 @@ DSN field names (`connection_string`, `dsn`, `password`, `role`) are rejected wi
 
 `GET /admin/v1/databases/:id` — by id. 404 if missing.
 
-`PATCH /admin/v1/databases/:id` — partial update. Same DSN-rejection rules.
+`PATCH /admin/v1/databases/:id` — partial update. Same DSN-rejection and declared-server rules.
 
 `DELETE /admin/v1/databases/:id` — soft delete.
 

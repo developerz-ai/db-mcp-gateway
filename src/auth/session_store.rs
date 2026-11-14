@@ -15,7 +15,7 @@ use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::errors::AuthError;
-use super::session::{Identity, Session, SessionId};
+use super::session::{Identity, Session, SessionId, is_service_subject};
 use super::session_cache::{Cached, Inactive, SessionCache, SessionCacheConfig};
 use crate::state::sessions::{self, NewSession};
 
@@ -159,7 +159,13 @@ impl SessionStore {
             return Err(Inactive::Unknown.into());
         };
         let session = Session::from(row);
-        if let Some(reason) = session.inactive(Utc::now()) {
+        // A row minted for a reserved subject before IdP logins were checked.
+        let reason = if is_service_subject(&session.user_sub) {
+            Some(Inactive::Unknown)
+        } else {
+            session.inactive(Utc::now())
+        };
+        if let Some(reason) = reason {
             self.cache.tombstone(id, reason).await;
             return Err(reason.into());
         }

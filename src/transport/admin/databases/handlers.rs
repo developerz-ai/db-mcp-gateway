@@ -17,7 +17,8 @@ use super::super::middleware::AdminActor;
 use super::super::page_query::{PageQuery, invalid_query};
 use super::super::payload::{database_payload, grant_payload};
 use super::super::validation::{
-    check_unchanged, internal, invalid_body, invalid_id, not_found, routing_name, store_error,
+    check_unchanged, declared_server, internal, invalid_body, invalid_id, not_found, routing_name,
+    store_error,
 };
 use super::validation::{map_duplicate_database_error, parse_db_type};
 use super::{CreateDatabaseRequest, DatabaseResponse, DatabasesState, UpdateDatabaseRequest};
@@ -32,6 +33,7 @@ pub async fn create(
     let rid = actor.request_id.as_str();
     let Json(body) = body.map_err(|_| invalid_body(rid))?;
     let server = routing_name(&body.server, "server", rid)?;
+    let server = declared_server(server, &state.known_servers, rid)?;
     let db_name = routing_name(&body.db_name, "db_name", rid)?;
     let db_type = parse_db_type(&body.db_type, rid)?;
 
@@ -98,7 +100,10 @@ pub async fn patch(
     let server = body
         .server
         .as_deref()
-        .map(|s| routing_name(s, "server", rid))
+        .map(|s| {
+            let server = routing_name(s, "server", rid)?;
+            declared_server(server, &state.known_servers, rid)
+        })
         .transpose()?;
     let db_name = body
         .db_name

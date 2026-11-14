@@ -36,6 +36,8 @@ The gateway speaks **MCP over Streamable HTTP** (the 2025-03+ MCP transport), no
 - `POST` carries client→server JSON-RPC 2.0 messages; the gateway replies with a JSON-RPC response (`application/json`), or `202 Accepted` for notifications.
 - `GET` returns `405 Method Not Allowed` (`Allow: POST`), before authentication. The gateway never initiates server→client messages, so it offers no SSE stream; MCP 2025-06-18 lets a server answer `GET` with `405` instead. (An idle stream also pinned a socket per unauthenticated caller.)
 - One JSON-RPC message per `POST`. A batch array is refused with `invalid_request` (`-32600`, message `batch requests are not supported`) — MCP 2025-06-18 removed batching.
+- `POST` must carry `Content-Type: application/json` (case-insensitive; parameters such as `charset` allowed). Anything else, or no `Content-Type` at all, is `415 Unsupported Media Type` with a `-32600` body and `"id": null`. Every MCP SDK client transport sends it, and the reference SDK server enforces the same rule.
+- `MCP-Protocol-Version`: the gateway only negotiates `2025-06-18` (`initialize` always answers it). After `initialize`, a request that carries the header must name exactly that version, once. Any other value, or a repeated header, is `400 Bad Request` with a `-32600` body echoing the request `id` (MCP 2025-06-18 §Protocol Version Header). An **absent** header is accepted: the spec has the server assume its backwards-compatible default rather than refuse. `initialize` itself is exempt, because it is the request that negotiates the version.
 
 **Framing errors.** The body is parsed to JSON first, then to a request, so every failure has a JSON-RPC shape (HTTP 200 unless noted):
 
@@ -45,6 +47,7 @@ The gateway speaks **MCP over Streamable HTTP** (the 2025-03+ MCP transport), no
 | JSON array (batch) | `-32600` `batch requests are not supported`, `"id": null` |
 | JSON, but not a request object (`42`, `{}`, missing `method`, `jsonrpc` ≠ `"2.0"`) | `-32600` `Invalid request`, echoing `id` when it can be read from the object, else `null` |
 | Unreadable or over the size limit (1 MiB) | the HTTP status of the failure (e.g. `413`) with a `-32600` body |
+| Readable, but `Content-Type` is not `application/json` | `415` with a `-32600` body (checked after the body is read, so an oversized body is still `413`) |
 
 **Request `id` semantics.** The JSON-RPC `id` member is treated as a three-way distinction rather than a `null`/non-`null` flag, because JSON-RPC 2.0 and MCP disagree about what an explicit `"id": null` means and the gateway must not silently reinterpret one as the other:
 

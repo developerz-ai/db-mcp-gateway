@@ -1,5 +1,5 @@
-//! The DB half of a refresh-token write, shared by plain inserts and the
-//! transactional mint/rotate in [`super::grants`].
+//! The DB half of refresh-token writes and revocations, shared by plain
+//! inserts and the transactional mint/rotate in [`super::grants`].
 
 use std::time::Duration;
 
@@ -8,7 +8,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use super::GrantIdentity;
-use crate::auth::SessionId;
+use crate::auth::{AuthError, SessionId, SessionStore};
 use crate::state::oauth::{self as db, NewRefreshToken};
 
 /// Size cap on stored refresh tokens. Bounds resource exhaustion from tokens
@@ -55,4 +55,44 @@ pub(super) async fn store_db(
         REFRESH_TOKENS_MAX_SIZE as i64,
     )
     .await
+}
+
+/// A client firing parallel refreshes with one token (e.g. several MCP
+/// connections) replays it within moments; that is not theft, so no revoke.
+const REUSE_GRACE: chrono::Duration = chrono::Duration::seconds(10);
+
+/// A miss on a token rotated out more than [`REUSE_GRACE`] ago means it was
+/// replayed — by a thief or by the client it was stolen from,
+/// indistinguishably — so end its chain and the chain's live session. Returns
+/// the sessions this revoked.
+pub(super) async fn revoke_reused_chain(
+    conn: &mut sqlx::PgConnection,
+    presented_hash: &[u8],
+) -> Result<Vec<SessionId>, AuthError> {
+    let Some(chain_id) = db::rotated_chain(&mut *conn, presented_hash, REUSE_GRACE).await? else {
+        return Ok(Vec::new());
+    };
+    // Waits out an in-flight rotation; the delete below then sees its token.
+    db::lock_chain(&mut *conn, chain_id).await?;
+    let mut revoked = Vec::new();
+    for paired in db::delete_chain(&mut *conn, chain_id).await? {
+        revoked.extend(revoke_paired(conn, paired.map(SessionId::from)).await?);
+    }
+    tracing::warn!(%chain_id, "rotated refresh token replayed; chain revoked");
+    Ok(revoked)
+}
+
+/// Revoke the session paired with a consumed refresh token; returns it only if
+/// this call revoked it, so counters count real revocations.
+pub(super) async fn revoke_paired(
+    conn: &mut sqlx::PgConnection,
+    paired: Option<SessionId>,
+) -> Result<Vec<SessionId>, AuthError> {
+    let mut revoked = Vec::new();
+    if let Some(id) = paired
+        && SessionStore::revoke_in(conn, id).await?
+    {
+        revoked.push(id);
+    }
+    Ok(revoked)
 }

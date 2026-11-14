@@ -59,7 +59,7 @@ pub struct AdminDeps {
     /// (403) to bound admin-group staleness. `None` = no cap.
     pub max_session_age: Option<Duration>,
     /// Server names the gateway config declares — the only legal targets of
-    /// a wildcard grant.
+    /// a wildcard grant or a database registration.
     pub known_servers: Arc<[String]>,
 }
 
@@ -114,6 +114,7 @@ pub fn router(deps: AdminDeps) -> Router {
             repo: repo.clone(),
             state_db: state_db.clone(),
             cache: cache.clone(),
+            known_servers: known_servers.clone(),
         });
     let grants_routes = Router::new()
         .route("/admin/v1/grants", post(grants::create).get(grants::list))

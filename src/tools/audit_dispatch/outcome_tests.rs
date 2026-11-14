@@ -111,3 +111,25 @@ fn success_outcome_carries_row_metadata() {
     assert_eq!(outcome.truncated, Some(true));
     assert!(outcome.error_message.is_none());
 }
+
+/// A tool the engine does not offer is a stable, documented answer — never
+/// `internal`, which spec 03 reserves for bugs.
+#[test]
+fn not_implemented_maps_to_unsupported_backend() {
+    use crate::exec::AdapterKind;
+
+    let messages = ToolErrorMessages {
+        timeout: "t",
+        sql_rejected: "s",
+        forbidden_prefix: "query",
+    };
+    let outcome = outcome_from_exec_error(
+        ExecError::NotImplemented {
+            adapter: AdapterKind::Mongo,
+            op: "table_stats",
+        },
+        Instant::now(),
+        &messages,
+    );
+    assert_eq!(outcome.code, OutcomeCode::UnsupportedBackend);
+}

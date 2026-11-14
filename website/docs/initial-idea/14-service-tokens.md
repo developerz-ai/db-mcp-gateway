@@ -59,7 +59,11 @@ Every headless call attributes to the service identity, through the same
 `Identity` the audit layer already consumes:
 
 - `user_sub` = `service:<name>` — the `service:` scheme keeps service
-  principals unambiguous next to IdP subjects in `audit_calls`;
+  principals unambiguous next to IdP subjects in `audit_calls`. The prefix is
+  **reserved** (case-insensitively): an IdP login whose `sub` starts with it is
+  refused, and a session or refresh chain minted for one before that check
+  existed no longer authenticates or rotates. Otherwise an SSO user could read
+  the service account's query history and be audited as it;
 - `user_email` = `<name>@service-accounts.invalid` — the audit column is
   `NOT NULL`, and the `.invalid` TLD (RFC 2606) marks the address as
   synthesized;

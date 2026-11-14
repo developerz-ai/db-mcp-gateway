@@ -201,6 +201,8 @@ async fn cancelled_message_after_drop(access: Access) -> Option<String> {
             database: "app",
             db_type: Some("postgres"),
             access,
+            sql: Some("UPDATE t SET x = 1"),
+            reason: None,
             upstream_actor: None,
             upstream_run_id: None,
         },

@@ -2,6 +2,7 @@ use super::*;
 
 mod denied_families;
 mod denied_functions;
+mod lexical;
 mod read_only;
 mod write_access;
 

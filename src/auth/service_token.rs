@@ -32,7 +32,7 @@ fn is_well_formed_token(token: &str) -> bool {
 }
 
 use super::pkce::ct_eq;
-use super::session::{Identity, IdentityKind, SessionId};
+use super::session::{Identity, IdentityKind, SERVICE_SUBJECT_PREFIX, SessionId};
 use crate::config::ServiceAccount;
 use crate::config::secret::SecretError;
 
@@ -186,7 +186,7 @@ impl ResolvedServiceToken {
             // is per-request decoration for the debug log line only; audit
             // attribution runs through `user_sub` below.
             session_id: SessionId::new(),
-            user_sub: format!("service:{}", self.name),
+            user_sub: format!("{SERVICE_SUBJECT_PREFIX}{}", self.name),
             // Synthesized: `audit_calls.user_email` is NOT NULL and every
             // identity carries one. The `.invalid` TLD (RFC 2606) marks it
             // as non-routable on purpose.

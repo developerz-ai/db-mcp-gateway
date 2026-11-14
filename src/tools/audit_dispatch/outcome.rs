@@ -171,9 +171,12 @@ pub fn outcome_from_exec_error(
             OutcomeCode::Forbidden,
             "this database accepts no writes through the gateway",
         ),
-        ExecError::PasswordUnresolved { .. }
-        | ExecError::UnsupportedAdapter(_)
-        | ExecError::NotImplemented { .. } => {
+        // A tool the target's engine does not offer: a stable answer, not a bug.
+        ExecError::NotImplemented { .. } => (
+            OutcomeCode::UnsupportedBackend,
+            "this tool is not supported on this database's backend",
+        ),
+        ExecError::PasswordUnresolved { .. } | ExecError::UnsupportedAdapter(_) => {
             (OutcomeCode::Internal, "server-side configuration error")
         }
     };

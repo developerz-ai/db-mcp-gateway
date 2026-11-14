@@ -22,9 +22,10 @@
 //! Anything not explicitly recognised — a write hidden in a CTE or subquery,
 //! `SELECT ... FOR UPDATE/SHARE`, `SELECT ... INTO`, `EXPLAIN ANALYZE` in
 //! any spelling (`ANALYZE` keyword or `(ANALYZE)` / `(ANALYSE)` option — all
-//! execute)
-//! — is rejected with a typed error. Conservative on purpose: better
-//! to reject a legitimate exotic statement than quietly send an unintended one.
+//! execute) — is rejected with a typed error, as is text Postgres lexes
+//! differently from sqlparser (a Unicode-escaped identifier, `U&"…"`).
+//! Conservative on purpose: better to reject a legitimate exotic statement
+//! than quietly send an unintended one.
 //!
 //! ## Substructure walk
 //!
@@ -40,6 +41,7 @@
 //! were manually enumerated — that's the class of gap this module exists to
 //! close, and the reason the walk is now visitor-driven, not hand-recursion.
 
+mod lexical;
 mod shape;
 mod visitor;
 
@@ -53,6 +55,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
 use std::ops::ControlFlow;
 
+use lexical::check_lexical;
 use shape::check_statement_shape;
 use visitor::GuardVisitor;
 
@@ -72,7 +75,9 @@ pub enum GuardError {
     Parse,
     #[error("multiple statements are not allowed (got {0})")]
     MultiStatement(usize),
-    #[error("statement type `{0}` is not allowed; only SELECT and EXPLAIN")]
+    #[error(
+        "statement type `{0}` is not allowed; only SELECT, EXPLAIN and, with a write grant, INSERT/UPDATE/DELETE"
+    )]
     NotAllowed(&'static str),
     #[error("SELECT ... FOR UPDATE/SHARE is not allowed (acquires write locks)")]
     Locking,
@@ -133,6 +138,7 @@ pub fn check_sql(sql: &str, access: Access) -> Result<(), GuardError> {
 
 /// [`check_sql`], returning the access the admitted statement needs.
 fn guard(sql: &str, access: Access) -> Result<Access, GuardError> {
+    check_lexical(sql)?;
     let dialect = PostgreSqlDialect {};
     let statements = Parser::parse_sql(&dialect, sql).map_err(|e| match e {
         ParserError::ParserError(_)

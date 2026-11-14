@@ -13,11 +13,12 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{Action, Grant};
+use crate::config::{Action, Grant, ServerKind};
 use crate::exec::{Access, ExplainQuery, GuardedSql};
 use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
+use super::args::parse_arguments;
 use super::audit_dispatch::{
     AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, WriteEffect, error_outcome,
     outcome_from_exec_error, reject_arguments, run_audited, success_outcome,
@@ -31,6 +32,7 @@ const ERROR_MESSAGES: ToolErrorMessages = ToolErrorMessages {
     forbidden_prefix: "EXPLAIN",
 };
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Arguments {
     pub server: String,
     pub database: String,
@@ -54,17 +56,9 @@ struct SuccessPayload {
 }
 
 pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Response {
-    let args: Arguments = match arguments.map(serde_json::from_value::<Arguments>) {
-        Some(Ok(a)) => a,
-        _ => {
-            return reject_arguments(
-                ctx,
-                id,
-                TOOL_NAME,
-                "explain requires `server`, `database`, `sql` arguments",
-            )
-            .await;
-        }
+    let args: Arguments = match parse_arguments(arguments) {
+        Ok(args) => args,
+        Err(message) => return reject_arguments(ctx, id, TOOL_NAME, &message).await,
     };
 
     let header = AuditHeader {
@@ -79,7 +73,7 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
     };
     let args = &args;
     run_audited(ctx, id, header, |id, grants| async move {
-        compute_outcome(ctx, id, &grants, args).await
+        compute_outcome(ctx, id, &grants, &header, args).await
     })
     .await
 }
@@ -88,6 +82,7 @@ async fn compute_outcome(
     ctx: ToolCtx<'_>,
     id: Value,
     db_grants: &[Grant],
+    header: &AuditHeader<'_>,
     args: &Arguments,
 ) -> Outcome {
     let Some(target) = resolve_target(
@@ -104,6 +99,15 @@ async fn compute_outcome(
     // way the caller reaches the target DB, plan-only included.
     if let Err(rejected) = ensure_reason(&target.constraints, args.reason.as_deref()) {
         return *rejected;
+    }
+
+    // The plan comes from Postgres' EXPLAIN; a Mongo target has no SQL to
+    // parse, so it is answered before the parser can call it malformed.
+    if target.server.kind == ServerKind::Mongo {
+        return error_outcome(
+            OutcomeCode::UnsupportedBackend,
+            "explain is not supported on this database's backend",
+        );
     }
 
     // A data write may be planned only under a `query_write` grant.
@@ -134,7 +138,7 @@ async fn compute_outcome(
         return error_outcome(OutcomeCode::ForbiddenSql, ANALYZE_NEEDS_READ);
     }
 
-    if let Err(refused) = record_intent(ctx, TOOL_NAME, &target, access).await {
+    if let Err(refused) = record_intent(ctx, header, &target, access).await {
         return *refused;
     }
 

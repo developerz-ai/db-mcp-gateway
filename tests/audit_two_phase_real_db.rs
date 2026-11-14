@@ -59,6 +59,8 @@ fn intent<'a>(request_id: Uuid, user_sub: &'a str, access: Access) -> CallIntent
         database: "app",
         db_type: Some("postgres"),
         access,
+        sql: Some("UPDATE t SET x = 1"),
+        reason: None,
         upstream_actor: None,
         upstream_run_id: None,
     }

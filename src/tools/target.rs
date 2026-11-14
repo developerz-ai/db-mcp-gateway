@@ -7,7 +7,7 @@ use crate::config::{Action, Constraints, Database, Grant, Server};
 use crate::exec::sql_guard::Access;
 
 use super::ToolCtx;
-use super::audit_dispatch::{Outcome, OutcomeCode, error_outcome};
+use super::audit_dispatch::{AuditHeader, Outcome, OutcomeCode, error_outcome};
 
 /// A configured target the caller holds a grant on, with the merged
 /// constraints of every grant that applies (most restrictive wins).
@@ -59,10 +59,11 @@ pub(super) fn forbidden() -> Outcome {
 /// target call MUST NOT happen.
 pub(super) async fn record_intent(
     ctx: ToolCtx<'_>,
-    tool: &'static str,
+    header: &AuditHeader<'_>,
     target: &Target<'_>,
     access: Access,
 ) -> Result<(), Box<Outcome>> {
+    let tool = header.tool;
     let intent = CallIntent {
         request_id: ctx.request.request_id,
         user_sub: &ctx.identity.user_sub,
@@ -72,6 +73,8 @@ pub(super) async fn record_intent(
         database: &target.database.name,
         db_type: Some(super::db_type_label(target.server.kind)),
         access,
+        sql: header.sql,
+        reason: header.reason,
         upstream_actor: ctx.request.upstream.actor(),
         upstream_run_id: ctx.request.upstream.run_id(),
     };
@@ -93,13 +96,13 @@ pub(super) async fn record_intent(
 }
 
 /// `Err` with the `reason_required` outcome when the grant demands a reason
-/// and the caller gave none (or an empty one). Applies to every tool that
+/// and the caller gave none (or a blank one). Applies to every tool that
 /// reaches the target DB, so no tool is a reason-free side door.
 pub(super) fn ensure_reason(
     constraints: &Constraints,
     reason: Option<&str>,
 ) -> Result<(), Box<Outcome>> {
-    if constraints.require_reason && reason.is_none_or(str::is_empty) {
+    if constraints.require_reason && reason.is_none_or(|reason| reason.trim().is_empty()) {
         return Err(Box::new(error_outcome(
             OutcomeCode::ReasonRequired,
             "policy requires a `reason` for this server/database",
@@ -186,7 +189,7 @@ mod tests {
             require_reason: true,
             ..Constraints::default()
         };
-        for missing in [None, Some("")] {
+        for missing in [None, Some(""), Some("   "), Some("\n\t")] {
             let rejected = ensure_reason(&required, missing).expect_err("rejects");
             assert_eq!(rejected.code, OutcomeCode::ReasonRequired);
         }
