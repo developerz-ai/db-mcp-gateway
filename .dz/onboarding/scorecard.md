@@ -2,7 +2,6 @@
 
 > Written by the developerz.ai maintainer agent. Each onboarding run rewrites this file whole; the latest run wins, and the same card is stored on the platform.
 
-- Run: `run_68c92316ab2940838d24f0b18f66eca2`
 - Computed: 2026-11-02T04:22:52.930Z
 - Proof: **proved** — every command ran green at head.
 - Score: 13 of 15 items ok
