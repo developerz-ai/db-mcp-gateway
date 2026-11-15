@@ -6,6 +6,7 @@
 |---|---|
 | [`website/docs/initial-idea/`](../website/docs/initial-idea/) | Why this repository is shaped the way it is: the product idea, the architecture, the tools. |
 | [`CLAUDE.md`](../CLAUDE.md) | How work is done here: the rules a change follows. |
+| [`plans/`](plans/) | Execution plans for this repository's own changes; deployments are planned in their own repositories ([why](plans/README.md)). |
 
 The brain itself is the repo root's [`CLAUDE.md`](../CLAUDE.md); the
 commands are `bin/{setup,dev,check}`.
