@@ -375,8 +375,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # The private words come from a secret so the guard never publishes them
       # (tests/public_tree.rs, module docs); a fork's PR gets none and the scan
-      # says it skipped them.
-      - run: cargo test --profile ci --test public_tree
+      # says it skipped them. --show-output prints the scan's count line (files
+      # read, how many private words; never a word) so the log proves the
+      # secret reached it.
+      - run: cargo test --profile ci --test public_tree -- --show-output
         env:
           PUBLIC_TREE_PRIVATE_WORDS: ${{ secrets.PUBLIC_TREE_PRIVATE_WORDS }}
 
