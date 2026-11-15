@@ -154,8 +154,10 @@ servers:
   boot refuses it in any letter case. `password` is required, same secret-ref forms as any
   target.
 - **TLS** is `rediss://`-equivalent over rustls. `required` and
-  `verify_full` both verify chain and hostname, like Mongo; `tls_ca_file`
-  (with `verify_full` only) replaces the system roots. `insecure` is plain
+  `verify_full` both verify chain and hostname, like Mongo, against the system
+  roots. `tls_ca_file` is **refused at boot** on a `kind: redis` server: the
+  Redis driver has no per-server CA hook, so the bundle would be silently
+  ignored. `insecure` is plain
   TCP, with the usual boot warning. A wrong CA, a hostname mismatch or a CA
   outside the trusted roots is refused before `AUTH` is sent (`unavailable`;
   covered by tests). No client certificates (mTLS). The
@@ -179,6 +181,21 @@ servers:
   (rotation without restart); other connect failures → `unavailable`. The
   server's connect-time message is never passed through. `NOPERM` on a
   command → `permission_denied`.
+- **`run_query` takes argv, not SQL.** `sql` is a JSON array of strings — the
+  argv of exactly one command, `["HGETALL","user:1"]`. It is parsed and
+  checked against a deny-by-default read-only allowlist **before any socket
+  is opened**: a write (`SET`, `DEL`, `FLUSHALL`), administration (`CONFIG`,
+  `ACL`), scripting, pub/sub and `SELECT` (it would re-target the pooled
+  connection and escape the `database.name` scope) all answer `forbidden_sql`
+  with no target call; malformed argv is `invalid_arguments`. The admitted
+  set and each command's result shape are listed in
+  [multi-db.md](../usage/multi-db.md#allowed-redis-commands). `dry_run` is
+  `invalid_arguments` here — there is no write tier to dry-run.
+- **Six tools are not offered on Redis.** `describe_schema`, `sample_table`,
+  `explain`, `table_stats`, `db_activity` and `cancel_query` answer
+  `unsupported_backend` (501), answered and audited before any target call.
+  `run_query`, `list_servers`, `list_databases` and `get_query_history` work
+  as on any other target.
 
 **Provision a read-only ACL user.** The gateway does not create it. Key
 scoping is the ACL's job — there is no key filter on a grant

@@ -178,6 +178,7 @@ fn rejects_the_stock_superuser_role_per_backend() {
         ("postgres", ServerKind::Postgres, "postgres"),
         ("mongo", ServerKind::Mongo, "root"),
         ("mongo", ServerKind::Mongo, "admin"),
+        ("redis", ServerKind::Redis, "default"),
     ] {
         let yaml = format!(
             "servers:\n  - name: s\n    kind: {kind_str}\n    host: h\n    \
@@ -200,6 +201,52 @@ fn rejects_the_stock_superuser_role_per_backend() {
             other => panic!("expected StockSuperuserRole for {kind_str}/{role}, got {other:?}"),
         }
     }
+}
+
+/// Redis `databases[].name` is a logical DB index the adapter `SELECT`s on
+/// connect, and `auth_database` is mongo-only. Both wrong shapes are boot
+/// errors (spec 08); the numeric counterpart boots clean.
+#[test]
+fn redis_databases_validate_name_and_auth_source() {
+    let non_numeric = r#"
+servers:
+  - name: s
+    kind: redis
+    host: h
+    databases:
+      - { name: app, role: ro, password: x }
+"#;
+    match ConfigFile::from_yaml_str(non_numeric) {
+        Err(ConfigFileError::Invalid(msg)) => {
+            assert!(msg.contains("logical database index"), "{msg}");
+        }
+        other => panic!("expected Invalid for a redis database named `app`, got {other:?}"),
+    }
+
+    let with_auth_database = r#"
+servers:
+  - name: s
+    kind: redis
+    host: h
+    databases:
+      - { name: "0", role: ro, password: x, auth_database: admin }
+"#;
+    match ConfigFile::from_yaml_str(with_auth_database) {
+        Err(ConfigFileError::Invalid(msg)) => {
+            assert!(msg.contains("auth_database"), "{msg}");
+        }
+        other => panic!("expected Invalid for `auth_database` on redis, got {other:?}"),
+    }
+
+    let numeric = r#"
+servers:
+  - name: s
+    kind: redis
+    host: h
+    databases:
+      - { name: "0", role: ro, password: x }
+"#;
+    ConfigFile::from_yaml_str(numeric).expect("numeric DB index `0` boots");
 }
 
 /// Kinds without an adapter never reach the role check through config

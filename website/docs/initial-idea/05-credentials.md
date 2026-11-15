@@ -33,6 +33,17 @@ Every database gets its **own** Postgres role. Not one role per server. Not one 
 
 The repo will ship example SQL for provisioning these roles (see [09-deployment](09-deployment.md)).
 
+### Redis: the ACL user is the blast radius
+
+A `kind: redis` database has no SQL privilege model, so the per-database isolation that a Postgres `SELECT` grant provides comes from the target's ACL user instead:
+
+| Aspect | Choice |
+|---|---|
+| Privilege | `+@read` over `%R~app:*` patterns, `-@all` as the base, `-keys`, `resetchannels` — provisioned by the operator, never by the gateway |
+| Key scoping | The ACL `~` / `%R~` patterns. No grant field, no YAML key: there is nothing else to scope against, and a grant-side filter beside an ACL pattern would be two half-guarantees instead of one real one ([06-permissions](06-permissions.md)) |
+| Naming | `gateway_ro` or similar; never `default` — the stock user every Redis-protocol server starts with (`+@all ~* &*` unless restricted) is refused at boot in any letter case, as `postgres` is on Postgres (`src/config/yaml/roles.rs`) |
+| Connection | Built from structured parts — host, port, TLS, ACL user, password, DB index — per `src/exec/redis/mod.rs`: the gateway never assembles a `redis://` URL, so no connection string exists to leak into a log or an error |
+
 ### Row cap: cancel on truncate
 
 `row_limit` must bound **server-side** work, not just the client-visible row count. sqlx always issues the extended-protocol portal `Execute` with `limit: 0` (no server-side row cap — deliberate, to avoid parallel-worker pessimization), so breaking the Rust-side read loop at N does NOT stop Postgres from generating and queueing the rest of the result. The pooled connection cannot accept the next command (`COMMIT` included) until that queued traffic is fully read — `wait_until_ready` drains it silently on the next `.await`. That defeats the row cap on exactly the queries where it matters.
@@ -76,8 +87,7 @@ Per `(server, database)`:
 - Acquire timeout 5 s — fail fast so the agent gets `unavailable`. It is spent before the statement timeout starts, never counted against it
 - A separate cancel pool (2 connections, lazy) carries `pg_cancel_backend`, so cancels never queue behind the queries they are cancelling
 - Mongo: the same sizing, plus a 5 s server-selection and connect timeout
-- Redis: `max_connections` and `idle_timeout_s` as above; `min_connections` is ignored (nothing is opened ahead of use). One connection per in-flight command (no shared multiplexed connection). A connection returns to the pool only after a complete reply or a server error reply; one hit by a timeout, a client disconnect or an I/O error is closed, never reused — its reply may still be in flight. A connection the server closed while idle fails that one call with `unavailable`; there is no retry
-- YugabyteDB (as `kind: postgres`): the Postgres pool unchanged. On release a connection is reset with `RESET ALL; SELECT pg_advisory_unlock_all()`; a server without advisory locks rejects the unlock as `feature_not_supported`, and the gateway then repeats `RESET ALL` alone and keeps the connection (since 2.0.1)
+- Redis: `max_connections` and `idle_timeout_s` as above; `min_connections` is ignored (nothing is opened ahead of use). Each connection is a driver `MultiplexedConnection` leased to exactly one caller at a time by a permit, never shared between in-flight commands, so a slow command does not head-of-line-block another caller. A connection returns to the pool only after a complete reply or a server error reply; one hit by a timeout, a client disconnect or an I/O error is closed, never reused — its reply may still be in flight. A connection the server closed while idle fails that one call with `unavailable`; there is no retry
 - TLS required by default; reject non-TLS unless explicitly opted out for local dev
 
 ## Rotation

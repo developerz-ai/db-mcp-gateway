@@ -74,6 +74,17 @@ fn validate_servers(servers: &[Server]) -> Result<HashSet<&str>, ConfigFileError
                 server.name, server.kind
             )));
         }
+        // Redis TLS verifies against the system roots; the driver offers no
+        // per-server CA hook, so `tls_ca_file` would be silently ignored — an
+        // operator pointing at a private-CA redis would boot believing the
+        // bundle is in use. Reject rather than ignore (spec 08).
+        if server.kind == ServerKind::Redis && server.tls_ca_file.is_some() {
+            return Err(ConfigFileError::Invalid(format!(
+                "server `{}` sets `tls_ca_file`, which redis targets do not support; \
+                 redis TLS verifies against the system roots",
+                server.name
+            )));
+        }
         validate_databases(server)?;
     }
     Ok(server_names)
@@ -92,9 +103,6 @@ fn validate_databases(server: &Server) -> Result<(), ConfigFileError> {
         validate_role(&db.role).map_err(ConfigFileError::Invalid)?;
         reject_superuser_role(&db.role, server.kind, &db.name, &server.name)?;
         validate_write_role(db, server)?;
-        if server.kind == ServerKind::Redis {
-            validate_redis_database(db, &server.name)?;
-        }
         // `Some("")` would silently override the `None → name` fallback
         // and force mongo to authenticate against an empty `authSource`,
         // surfacing as a cryptic runtime auth failure instead of a boot
@@ -109,6 +117,11 @@ fn validate_databases(server: &Server) -> Result<(), ConfigFileError> {
                  omit the field to fall back to `name`, or set a non-blank value",
                 db.name, server.name
             )));
+        }
+        // Redis-specific shape checks run last so the earlier boot errors
+        // (role shape, stock superuser, write tier) win when several apply.
+        if server.kind == ServerKind::Redis {
+            validate_redis_database(db, &server.name)?;
         }
     }
     Ok(())

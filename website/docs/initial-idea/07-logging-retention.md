@@ -60,6 +60,8 @@ Every target call writes an intent — reads and writes alike (owner decision, p
 
 `sql` is stored verbatim up to the cap. There is no per-database `sql_capture` (redacted / metadata-only) policy; a database whose literals must not be stored should not be reachable through `run_query`.
 
+**Redis dispatches get the same row.** A `kind: redis` call writes `db_type = redis` (`DbType::Redis`) and puts the JSON argv it dispatched in `sql`, exactly as sent — there is no SQL to rewrite and no redaction policy for it either. The command is checked by the rejector at the tool edge before any socket opens, so a refused argv (a write, `CONFIG`, `SELECT`, a malformed array) is answered `forbidden_sql` and still produces its `audit_calls` row with `db_type = redis` — but no intent row, which is written only once a call is about to reach the target — the assertion in `tests/it_db/redis_run_query_e2e.rs`.
+
 ## Storage
 
 | Tier | Where | TTL | Purpose | Status |

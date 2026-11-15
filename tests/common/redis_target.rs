@@ -6,6 +6,9 @@
 //! refuses; [`ensure_read_user`] creates the least-privilege ACL user an
 //! operator would (`+@read -keys`, keys scoped to [`KEY_PATTERN`]) through
 //! the admin side connection.
+//!
+//! Ports and admin passwords come from [`env`], the one place their defaults
+//! live.
 
 use db_mcp_gateway::config::{Database, Password, Server, ServerKind, Tls};
 use db_mcp_gateway::exec::{
@@ -15,10 +18,13 @@ use redis::aio::MultiplexedConnection;
 use redis::{Client, ConnectionAddr, IntoConnectionInfo, RedisConnectionInfo};
 use uuid::Uuid;
 
+use super::env;
+
 pub const TARGET_HOST: &str = "localhost";
-/// The gateway's ACL user. Same name on both servers.
-pub const READ_USER: &str = "gateway_ro";
-pub const READ_PASSWORD: &str = "gateway-ro-dev-only";
+/// The gateway's ACL user and its password: same name on both servers, and
+/// what `bin/dev redis` connects as. Defined beside their neighbours in
+/// [`env`]; re-exported here because this is the ACL that sets them.
+pub use super::env::{REDIS_READ_PASSWORD as READ_PASSWORD, REDIS_READ_USER as READ_USER};
 /// Every key a test seeds lives under this prefix; the ACL user can read
 /// nothing else.
 pub const KEY_PREFIX: &str = "gw:";
@@ -43,22 +49,17 @@ impl Flavor {
     }
 
     pub fn port(self) -> u16 {
-        let (var, default) = match self {
-            Flavor::Redis => ("TARGET_REDIS_PORT", 6380),
-            Flavor::Dragonfly => ("TARGET_DRAGONFLY_PORT", 6381),
-        };
-        std::env::var(var)
-            .ok()
-            .and_then(|port| port.parse().ok())
-            .unwrap_or(default)
+        match self {
+            Flavor::Redis => env::redis_target_port(),
+            Flavor::Dragonfly => env::dragonfly_target_port(),
+        }
     }
 
     fn admin_password(self) -> String {
-        let (var, default) = match self {
-            Flavor::Redis => ("TARGET_REDIS_PASSWORD", "redis-dev-only"),
-            Flavor::Dragonfly => ("TARGET_DRAGONFLY_PASSWORD", "dragonfly-dev-only"),
-        };
-        std::env::var(var).unwrap_or_else(|_| default.to_string())
+        match self {
+            Flavor::Redis => env::redis_admin_password(),
+            Flavor::Dragonfly => env::dragonfly_admin_password(),
+        }
     }
 }
 

@@ -87,7 +87,7 @@ Rendering rules for the non-obvious types:
 
 **Malformed argv is `invalid_arguments`.** A `sql` that is not a JSON array, is empty, or holds an element that is not a string or number (object, array, boolean, `null`) — and a `SCAN`-family call missing its cursor or an option's value, or carrying a `COUNT` that is not a positive integer — is refused at the argument edge with `invalid_arguments` and the message ``"`sql`: <reason>"``, before the intent row and before any network call.
 
-**Deny by default.** The command name (first element, case-insensitive) must be on a read-only allowlist:
+**Deny by default.** The command name (first element, case-insensitive) must be on a read-only allowlist — the list is the `rejector` module (`src/exec/redis/rejector/mod.rs`), which validates the whole argv before the adapter opens a socket, so the word *allowlist* here names the data, never a separate `allowlist` module:
 
 | Type | Allowed |
 |---|---|
@@ -99,7 +99,7 @@ Rendering rules for the non-obvious types:
 | Streams | `XRANGE` `XREVRANGE` `XLEN` |
 | Keyspace | `SCAN` |
 
-Everything else is `forbidden_sql` before any network call — ``command rejected by gateway: redis command `<NAME>` is not in the read-only allowlist``. That covers every write, and on purpose also `KEYS` (unbounded, blocks the server), `SORT` (can `STORE`), `EVAL*` / `FCALL*` / `FUNCTION` (scripts can write), `MONITOR` and `(P)SUBSCRIBE` (unbounded streams), `CLIENT` / `CONFIG` / `DEBUG` / `INFO` / `OBJECT` / `MEMORY` (server administration and introspection), the blocking commands (`BLPOP` / `BRPOP` / `BLMOVE` / `BZPOPMIN` / …, `WAIT*`), connection state (`SELECT`, `AUTH`, `HELLO`, `MULTI` / `EXEC`) and module commands (`JSON.*`, `FT.*`, …). `ZRANGESTORE` is not on the list, so no allowed command can write. Rejection messages name the command or option, never an argument value.
+Everything else is `forbidden_sql` before any network call — ``command rejected by gateway: redis command `<NAME>` is not in the read-only allowlist``. That covers every write, and on purpose also `KEYS` (unbounded, blocks the server), `SORT` (can `STORE`), `EVAL*` / `FCALL*` / `FUNCTION` (scripts can write), `MONITOR` and `(P)SUBSCRIBE` (unbounded streams), `CLIENT` / `CONFIG` / `DEBUG` / `INFO` / `OBJECT` / `MEMORY` (server administration and introspection), the blocking commands (`BLPOP` / `BRPOP` / `BLMOVE` / `BZPOPMIN` / …, `WAIT*`), connection state (`SELECT` — it would re-target the pooled connection's DB index and escape the `database.name` scope the grant was checked against — `AUTH`, `HELLO`, `MULTI` / `EXEC`) and module commands (`JSON.*`, `FT.*`, …). `ZRANGESTORE` is not on the list, so no allowed command can write. Rejection messages name the command or option, never an argument value.
 
 **Every command is bounded before it is sent.** With *cap* = `row_limit + 1` (the extra one is how `truncated` is detected), the gateway rewrites or prechecks each command that could return an unbounded reply:
 
@@ -175,11 +175,11 @@ Requires the `history_read` grant, which is standalone (per [#170](https://githu
 
 ### `table_stats`
 
-Args: `server`, `database`, optional `schema` (default `public`), optional `table`, optional `reason`. Requires `schema_read` (statistics are metadata, never row data). Returns `{ "columns", "rows", "truncated", "elapsed_ms" }`, one row per table the read role may `SELECT`: `schema, table, total_bytes, table_bytes, index_bytes, row_estimate, live_rows, dead_rows, seq_scans, index_scans, last_vacuum, last_autovacuum, last_analyze, last_autoanalyze, indexes` — `indexes` a JSON array of `{ name, bytes, scans }`. From `pg_stat_user_tables`, `pg_stat_user_indexes` and `pg_total_relation_size`, read as the read role inside a read-only transaction and the statement timeout; capped at 10,000 tables (`truncated`).
+Args: `server`, `database`, optional `schema` (default `public`), optional `table`, optional `reason`. Requires `schema_read` (statistics are metadata, never row data). Returns `{ "columns", "rows", "truncated", "elapsed_ms" }`, one row per table the read role may `SELECT`: `schema, table, total_bytes, table_bytes, index_bytes, row_estimate, live_rows, dead_rows, seq_scans, index_scans, last_vacuum, last_autovacuum, last_analyze, last_autoanalyze, indexes` — `indexes` a JSON array of `{ name, bytes, scans }`. From `pg_stat_user_tables`, `pg_stat_user_indexes` and `pg_total_relation_size`, read as the read role inside a read-only transaction and the statement timeout; capped at 10,000 tables (`truncated`). Not offered on Mongo or Redis (`unsupported_backend`, answered before any target call).
 
 ### `db_activity`
 
-Args: `server`, `database`, optional `reason`. Requires `schema_read`. Returns `{ "columns", "rows", "truncated", "elapsed_ms" }` with `pid, request_id, pool, state, wait_event_type, wait_event, running_ms` for each statement the gateway is running on that database **for the caller** — `request_id` is the gateway request the backend serves (the gateway tags its backends via `application_name`), `pool` is `read` / `write`. The adapter only sees the gateway's own roles; the tool then keeps only requests whose intent row ([07-logging-retention](07-logging-retention.md)) carries the caller's identity, so one identity never sees another's activity. No query text: the caller's statements are in `get_query_history`.
+Args: `server`, `database`, optional `reason`. Requires `schema_read`. Returns `{ "columns", "rows", "truncated", "elapsed_ms" }` with `pid, request_id, pool, state, wait_event_type, wait_event, running_ms` for each statement the gateway is running on that database **for the caller** — `request_id` is the gateway request the backend serves (the gateway tags its backends via `application_name`), `pool` is `read` / `write`. The adapter only sees the gateway's own roles; the tool then keeps only requests whose intent row ([07-logging-retention](07-logging-retention.md)) carries the caller's identity, so one identity never sees another's activity. No query text: the caller's statements are in `get_query_history`. Not offered on Mongo or Redis (`unsupported_backend`, answered before any target call).
 
 ### `cancel_query`
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # bin/dev — local dev stack control.
-#   bin/dev up           start state-db + target-db + target-mongo + permissions-mysql (waits for health)
+#   bin/dev up           start state-db + target-db + target-mongo + permissions-mysql + target-redis + target-dragonfly (waits for health)
 #   bin/dev down         stop and remove containers
 #   bin/dev reset        down + remove volumes (fresh DBs)
 #   bin/dev logs [svc]   follow logs
@@ -10,6 +10,7 @@
 #                        or `docker compose -f docker-compose.dev.yml --profile yugabyte up -d --wait target-yugabyte`)
 #   bin/dev mongosh      mongosh into target-mongo
 #   bin/dev mysql        mysql into permissions-mysql
+#   bin/dev redis        redis-cli into target-redis as the gateway's ACL user
 #   bin/dev ps           compose ps
 set -euo pipefail
 
@@ -57,5 +58,16 @@ case "${1:-up}" in
       -p"${PERMISSIONS_MYSQL_PASSWORD:-permissions-dev-only}" \
       "${PERMISSIONS_MYSQL_DB:-permissions}"
     ;;
-  *) echo "usage: bin/dev {up|down|reset|logs [svc]|ps|psql state|psql target|ysqlsh|mongosh|mysql}" >&2; exit 2 ;;
+  redis)
+    # The gateway's own least-privilege ACL user, provisioned by the suite
+    # (`ACL SETUSER` in tests/common/redis_target.rs:ensure_read_user) — the
+    # defaults are tests/common/env.rs::REDIS_READ_{USER,PASSWORD}. On the
+    # logical DB the YAML `databases[].name` selects.
+    exec "${COMPOSE[@]}" exec target-redis redis-cli \
+      --user gateway_ro \
+      -a "gateway-ro-dev-only" \
+      --no-auth-warning \
+      -n 3
+    ;;
+  *) echo "usage: bin/dev {up|down|reset|logs [svc]|ps|psql state|psql target|ysqlsh|mongosh|mysql|redis}" >&2; exit 2 ;;
 esac

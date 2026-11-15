@@ -1,11 +1,12 @@
 //! `DbAdapter` trait — the contract every storage backend implements, plus
 //! the timeout policy every impl must apply.
 //!
-//! [`super::pg::PgAdapter`] and [`super::mongo::MongoAdapter`] implement this
-//! today; mysql (#59) slots in here without touching the tools layer: every
-//! per-DB tool drives the registry and the registry returns the right
-//! adapter. Engine-specific SQL (catalog lookups, sampling, `EXPLAIN`) lives
-//! behind the trait, never in a tool.
+//! [`super::pg::PgAdapter`], [`super::mongo::MongoAdapter`] and
+//! [`super::redis::RedisAdapter`] implement this today; mysql (#59) slots in
+//! here without touching the tools layer: every per-DB tool drives the
+//! registry and the registry returns the right adapter. Engine-specific
+//! queries (catalog lookups, sampling, `EXPLAIN`, argv dispatch) live behind
+//! the trait, never in a tool.
 //!
 //! [`effective_timeout_ms`] lives here rather than in one impl because the
 //! ceiling is a *gateway* policy, not a backend detail — an adapter that

@@ -87,7 +87,9 @@ services:
 
   # Redis target (kind: redis). `requirepass` sets the `default` superuser,
   # which the gateway refuses as a role; tests create a least-privilege ACL
-  # user (`+@read`, key-scoped) through it, as an operator would.
+  # user (`+@read`, key-scoped) through it, as an operator would — so no
+  # aclfile here and no users declared in this file. `bin/dev redis` connects
+  # as that same ACL user (`tests/common/env.rs::REDIS_READ_USER`).
   target-redis:
     image: redis:8.4-alpine
     command: ["redis-server", "--requirepass", "${TARGET_REDIS_PASSWORD:-redis-dev-only}", "--save", "", "--appendonly", "no"]
@@ -175,4 +177,6 @@ volumes:
   state-db-data:
   target-db-data:
   target-mongo-data:
+  target-redis-data:
+  target-dragonfly-data:
   permissions-mysql-data:

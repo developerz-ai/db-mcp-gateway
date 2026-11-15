@@ -68,7 +68,7 @@ If `store` is absent, the gateway runs YAML-only and the admin API is disabled. 
 
 **The MySQL store is read-only-provisioned.** The gateway only reads it; the operator fills it with their own tooling. Boot rejects `driver: mysql` together with `admin.enabled: true`, so there is no audited write path to MySQL and none is planned — the `permissions_audit` table its `0002` migration created stays unwritten. With no admin commit there is no cross-replica notification either: a change made in MySQL is honoured within `PERMISSIONS_CACHE_TTL_SECONDS` (clamped to ≤ 300 s). Identity and routing columns (`user_sub`, `server`, `db_name`) use the case- and accent-sensitive `utf8mb4_0900_as_cs` collation (`migrations-mysql/0004`), so `Alice` and `alice` are two subjects, as they are in Postgres.
 
-**`db_type` names the target engine** a `permissions_databases` row registers — `postgres`, `mysql`, `mongo` or `redis` (`mongo` added by `migrations/0013` / `migrations-mysql/0005`, `redis` by `migrations/0021_permissions_db_type_redis.sql` / `migrations-mysql/0006_db_type_redis.sql`) — not the store the row lives in. A YugabyteDB target registers as `postgres`.
+**`db_type` names the target engine** a `permissions_databases` row registers — `postgres`, `mysql`, `mongo` or `redis` (`mongo` added by `migrations/0013` / `migrations-mysql/0005`, `redis` by `migrations/0021_permissions_db_type_redis.sql` / `migrations-mysql/0006_db_type_redis.sql`) — not the store the row lives in. A YugabyteDB target registers as `postgres`. `DbType::ALLOWED` (`src/state/permissions/types.rs`) is the same four values, and the admin API rejects anything outside them with `invalid_request` before the row reaches the CHECK. The *stores* stay postgres-or-mysql only: `redis` is a target kind here, never a permissions backend.
 
 ## `permissions_audit` table
 
@@ -303,7 +303,7 @@ Audit row shape matches pg's: same `audit_calls` columns, with `db_type = 'mongo
 
 ### Redis adapter
 
-`kind: redis` covers every RESP server — Redis, Dragonfly, Valkey, KeyDB; Redis and Dragonfly are CI-tested. The database is the logical DB index (`name: "0"`), the `role` is an ACL username, and the stock `default` user is refused at boot like `postgres` / `root` ([08-config](08-config.md)). The client (`redis` 1.8.1, `tokio-rustls-comp` only) is built from the structured config fields, never from a URL, so no connection string exists to leak. `tls: required` and `verify_full` both verify chain and hostname over rustls; `insecure` is plain TCP.
+`kind: redis` covers every RESP server — Redis, Dragonfly, Valkey, KeyDB; Redis and Dragonfly are CI-tested. The database is the logical DB index (`name: "0"`), the `role` is an ACL username, and the stock `default` user is refused at boot like `postgres` / `root` ([08-config](08-config.md)). The client (`redis` 1.8.1, `tokio-rustls-comp` only) is built from the structured config fields, never from a URL, so no connection string exists to leak. `tls: required` and `verify_full` both verify chain and hostname over rustls, against the system roots — `tls_ca_file` on a redis server is refused at boot, because the driver offers no per-server CA hook; `insecure` is plain TCP.
 
 Read-only is enforced twice, as on Mongo:
 
@@ -332,7 +332,7 @@ Audit: `db_type = 'redis'`, and `sql` holds the JSON argv exactly as the agent s
 | Audit | #51 | `permissions_audit` table + sync writer |
 | Admin API | #52, #53, #54 | CRUD endpoints, SSO-gated, audited |
 | Wildcard | #55 | `db_name = "*"` |
-| Multi-DB | #56, #57, #58 | `DbAdapter` trait, mongo adapter, mongo queries; redis adapter followed |
+| Multi-DB | #56, #57, #58 | `DbAdapter` trait, mongo adapter, mongo queries; redis adapter followed ✅ shipped for the RESP family ([03](03-mcp-tools.md#redis-payload), [11](11-roadmap.md)) |
 | Backends | #59 | MySQL permission store |
 | Docs | #60 | Operator + developer docs |
 
@@ -343,7 +343,7 @@ Each phase is independently shippable. The gateway stays YAML-only and pg-only u
 1. **Admin bootstrap.** How does the first admin get created when `admin.enabled: true` is first turned on and no users exist? Proposal: a one-shot CLI subcommand (`gateway admin bootstrap <sso-email>`) inserts the first user with the admin group, runs against the state DB directly, audits to `permissions_audit` with `actor_id = NULL` and `request_id = "bootstrap"`.
 2. **API versioning.** `/admin/v1/*` — bake `v1` into the URL now to avoid future churn. Confirmed default.
 3. **YAML ↔ DB import/export.** Out of scope for this milestone. Operators can write a one-off script against the public CRUD if they need to migrate. Revisit if the ask is real.
-4. **Mongo and Redis write grants.** Out of scope; Redis writes would need a write-capable ACL user and a write allowlist. `query_write` for mongo would mean lifting the rejector for `$out`/`$merge` etc; that's a future spec doc, not this one.
+4. **Mongo and Redis write grants.** Out of scope permanently for the shipped targets, not pending: a Redis write would need a write-capable ACL user and a write allowlist, and the gateway provisions neither (CLAUDE.md non-negotiable 3); `query_write` for mongo would mean lifting the rejector for `$out`/`$merge`. A future write tier would be its own spec doc, not this one, and it changes no grant field today.
 
 ## See also
 

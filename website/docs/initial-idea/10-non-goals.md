@@ -28,7 +28,7 @@ Writes are possible (see [06-permissions](06-permissions.md)): a `query_write` g
 
 - **DDL / migrations** — schema changes belong in your migration tool and CI/CD, reviewed and versioned.
 - **Multi-statement or explicit transactions** — one call is one statement; `BEGIN`/`COMMIT` across calls would pin a connection to an agent.
-- **Writes on non-SQL targets** — Mongo and Redis targets are read-only whatever the grant: no `write_role`, and their allowlists hold read commands only. A cache is not a place for an agent to write, and a Redis write cannot be dry-run or rolled back.
+- **Writes on non-SQL targets; no per-table tools there either** — Mongo and Redis (Redis, Dragonfly, Valkey, KeyDB) are read-only query targets whatever the grant: no `write_role`, no write tier, and the gateway provisions no write privileges target-side (CLAUDE.md non-negotiable 3) — a cache is not a place for an agent to write, and a Redis write cannot be dry-run or rolled back. Redis reads are the argv of one allowlisted read command ([03](03-mcp-tools.md)); key scoping is the target ACL user's `~` patterns, not a new grant field ([06](06-permissions.md)). The per-table and SQL-planning tools — `describe_schema`, `sample_table`, `explain`, `table_stats`, `db_activity`, `cancel_query` — answer `unsupported_backend` on a Redis target, and the Mongo subset does the same.
 - **In-band approval UI** — no "queue this write for someone to approve" screen (MUST #5: permissions are YAML or the audited admin API).
 - **In-band token minting** — service tokens are config edits plus a rollout ([14](14-service-tokens.md)).
 

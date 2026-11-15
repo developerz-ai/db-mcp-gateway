@@ -331,7 +331,9 @@ carried in `postgres-quiet.json`'s `mysql_rejection` field; invocation 6 in
 | Runtime backstop maps to the stable `internal` code | **ok** |
 | Overall verdict | **PASS** |
 
-The rejection message:
+The rejection message, quoted verbatim from that artifact — the quiet-host
+run predates the redis adapter, and the same rejection today lists
+`supported kinds: postgres, mongo, redis`:
 
 ```text
 invalid config: server `mysql-target` has kind `Mysql`, which has no query adapter yet (supported kinds: postgres, mongo)
@@ -363,6 +365,11 @@ Deliberately absent, because one host cannot answer them honestly:
   not a capacity figure.
 - **A scaling law.** See above: the instances curve is contention on one host.
 - **Real MySQL query behaviour.** Only the boot-time rejection is verified.
+- **Any Redis number at all.** The harness has no `--backend redis`; every
+  figure here is Postgres or Mongo. The Redis adapter is not benched, and its
+  pool is its own (`src/exec/redis/pool.rs`): per `(server, database)`, at most
+  `max_connections` driver connections each leased to one caller at a time —
+  not a third-party pool, and nothing on this page was measured through it.
 - **Multi-host, multi-region, TLS termination cost.** One host; the bench
   gateway runs with TLS disabled, and network round trips between agent,
   gateway, state database and target are all loopback.
