@@ -25,9 +25,10 @@
 //! guard buys is that the tree stops carrying them again.
 //!
 //! Git is the oracle for "tracked": a real `git ls-files`, after checking that
-//! git answers for this checkout and not for an outer repository. `.dz/` is
-//! excluded: the platform rewrites those files whole, so a rule there would
-//! fail the platform's commits rather than a change made here.
+//! git answers for this checkout and not for an outer repository. `.dz/` and
+//! `.mcp.json` are excluded: the platform's setup template rewrites those
+//! files whole and its merge proof accepts only its own bytes, so a rule there
+//! would fail the platform's commits rather than a change made here.
 //!
 //! The rules are plain functions; the `fires_on_*` tests prove each one can
 //! fail. A guard that cannot fail is not a guard.
@@ -46,8 +47,9 @@ const SELF: &str = "tests/public_tree.rs";
 /// that reads fewer read the wrong tree or a sparse one.
 const MIN_TRACKED: usize = 300;
 
-/// Rewritten whole by the platform on every run; see the module docs.
-const PLATFORM_OWNED: &[&str] = &[".dz/"];
+/// Rewritten whole by the platform; see the module docs. An entry ending in
+/// `/` is a directory prefix, any other entry one exact path.
+const PLATFORM_OWNED: &[&str] = &[".dz/", ".mcp.json"];
 
 /// The organisation's repositories a tracked file may name: public ones.
 const PUBLIC_REPOS: &[&str] = &["db-mcp-gateway", "wurk"];
@@ -119,6 +121,16 @@ fn violations(path: &str, content: &str) -> Vec<&'static str> {
     broken
 }
 
+fn platform_owned(path: &str) -> bool {
+    PLATFORM_OWNED.iter().any(|owned| {
+        if owned.ends_with('/') {
+            path.starts_with(owned)
+        } else {
+            path == *owned
+        }
+    })
+}
+
 fn carries_preamble(path: &str) -> bool {
     let agent = path.starts_with(".claude/agents/") && path.ends_with(".md");
     let skill = path.starts_with(".claude/skills/") && path.ends_with("/SKILL.md");
@@ -178,7 +190,7 @@ fn no_tracked_file_carries_internal_infrastructure() {
     let mut read = 0;
     let mut failures = Vec::new();
     for path in &tracked {
-        if PLATFORM_OWNED.iter().any(|dir| path.starts_with(dir)) {
+        if platform_owned(path) {
             continue;
         }
         let full = root.join(path);
@@ -217,6 +229,15 @@ fn passes_public_references() {
                    pull ghcr.io/developerz-ai/db-mcp-gateway, clone \
                    developerz-ai/db-mcp-gateway.git, cache under ~/.cargo/registry.";
     assert_eq!(violations("README.md", content), Vec::<&str>::new());
+}
+
+#[test]
+fn skips_only_platform_owned_paths() {
+    assert!(platform_owned(".dz/maintainer/maintainer.yml"));
+    assert!(platform_owned(".mcp.json"));
+    for path in [".mcp.json.bak", "config/.mcp.json", ".dzz/x", "README.md"] {
+        assert!(!platform_owned(path), "{path} must be scanned");
+    }
 }
 
 #[test]
