@@ -373,7 +373,12 @@ jobs:
         with:
           key: public-tree
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The private words come from a secret so the guard never publishes them
+      # (tests/public_tree.rs, module docs); a fork's PR gets none and the scan
+      # says it skipped them.
       - run: cargo test --profile ci --test public_tree
+        env:
+          PUBLIC_TREE_PRIVATE_WORDS: ${{ secrets.PUBLIC_TREE_PRIVATE_WORDS }}
 
   # Publish a multi-arch image on push to main, tagged with the short commit
   # SHA (what Argo Image Updater pins to, #17) + a moving `main` tag.

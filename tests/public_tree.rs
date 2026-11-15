@@ -6,11 +6,13 @@
 //!
 //! - **No internal host on our own domain.** Only the public site may be
 //!   named; any other subdomain is a service that serves our infrastructure.
-//! - **No production deployment's tenant or host.** The plans refer to the
-//!   two production clusters as D1 and D2.
 //! - **No name of the setup mode that wrote the agent files.**
-//! - **No CI provider of the organisation's private repositories.** Naming it
-//!   publishes how CI is routed between providers.
+//! - **No private word.** The CI provider of the organisation's private
+//!   repositories, and a production deployment's tenant and host (the plans
+//!   call the two production clusters D1 and D2). A committed list publishes
+//!   what it guards, even assembled from parts — anyone can join two strings —
+//!   so these come from the `PUBLIC_TREE_PRIVATE_WORDS` CI secret. A run
+//!   without it (a fork's pull request, a local run) says it skipped them.
 //! - **No private repository.** A reference to a `developerz-ai/` repository
 //!   names one on the public allowlist below.
 //! - **No one's machine.** A path under a home directory names a person and
@@ -19,16 +21,17 @@
 //!   the setup mode was replaced with a marker; a file copied back from a
 //!   sibling repository would not carry it.
 //!
-//! Every forbidden value is assembled from parts, so this file never carries
-//! one, and a failure names the file and the rule — never the matched text,
-//! because CI logs are public. The values are in the history already; what the
-//! guard buys is that the tree stops carrying them again.
+//! The one forbidden value this file knows itself, the setup mode's name, is
+//! assembled from parts so the guard does not trip over itself; it is in the
+//! history already. A failure names the file and the rule — never the matched
+//! text, because CI logs are public.
 //!
 //! Git is the oracle for "tracked": a real `git ls-files`, after checking that
-//! git answers for this checkout and not for an outer repository. `.dz/` and
-//! `.mcp.json` are excluded: the platform's setup template rewrites those
-//! files whole and its merge proof accepts only its own bytes, so a rule there
-//! would fail the platform's commits rather than a change made here.
+//! git answers for this checkout and not for an outer repository. `.dz/` is
+//! excluded: the platform's setup template rewrites it whole. `.mcp.json` is
+//! scanned: the platform's onboarding merges its managed servers into it, our
+//! own MCP service among them, which a user of this repository cannot use, so
+//! a commit that adds one back fails here on purpose.
 //!
 //! The rules are plain functions; the `fires_on_*` tests prove each one can
 //! fail. A guard that cannot fail is not a guard.
@@ -49,7 +52,10 @@ const MIN_TRACKED: usize = 300;
 
 /// Rewritten whole by the platform; see the module docs. An entry ending in
 /// `/` is a directory prefix, any other entry one exact path.
-const PLATFORM_OWNED: &[&str] = &[".dz/", ".mcp.json"];
+const PLATFORM_OWNED: &[&str] = &[".dz/"];
+
+/// The CI secret holding the private words, comma- or newline-separated.
+const PRIVATE_WORDS_ENV: &str = "PUBLIC_TREE_PRIVATE_WORDS";
 
 /// The organisation's repositories a tracked file may name: public ones.
 const PUBLIC_REPOS: &[&str] = &["db-mcp-gateway", "wurk"];
@@ -70,18 +76,30 @@ static HOME_PATH: LazyLock<Regex> =
     LazyLock::new(|| compiled(r"(?:^|[^\w.-])/(?:home|Users)/[\w.-]+"));
 
 /// Words that must not appear anywhere, case-insensitively, each built from
-/// parts: the setup mode, the private CI provider, D2's tenant and its host.
+/// parts: the setup mode. Everything else private comes from the secret.
 static FORBIDDEN_WORDS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
-    [
-        ("setup-mode name", ["dz", "runner"].join("-")),
-        ("private CI provider", ["ubi", "cloud"].join("")),
-        ("production tenant", ["te", "sote"].join("")),
-        ("production host", ["miami", "beach", "start"].join("")),
-    ]
-    .into_iter()
-    .map(|(rule, word)| (rule, compiled(&format!("(?i){}", regex::escape(&word)))))
-    .collect()
+    [("setup-mode name", ["dz", "runner"].join("-"))]
+        .into_iter()
+        .map(|(rule, word)| (rule, compiled(&format!("(?i){}", regex::escape(&word)))))
+        .collect()
 });
+
+/// The private words, parsed from the secret's value: comma- or
+/// newline-separated, trimmed, empty entries dropped, each matched as a
+/// literal, case-insensitively. Unset or blank is none.
+fn private_words(raw: Option<&str>) -> Vec<Regex> {
+    raw.unwrap_or_default()
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|word| !word.is_empty())
+        .map(|word| compiled(&format!("(?i){}", regex::escape(word))))
+        .collect()
+}
+
+/// Whether `content` carries any of the private words. Never which one.
+fn names_private_word(content: &str, words: &[Regex]) -> bool {
+    words.iter().any(|word| word.is_match(content))
+}
 
 fn compiled(pattern: &str) -> Regex {
     Regex::new(pattern).unwrap_or_else(|err| panic!("guard pattern must compile: {err}"))
@@ -187,6 +205,11 @@ fn no_tracked_file_carries_internal_infrastructure() {
         "git ls-files does not list {SELF}: the scan is not reading this tree"
     );
 
+    let private = private_words(std::env::var(PRIVATE_WORDS_ENV).ok().as_deref());
+    if private.is_empty() {
+        eprintln!("public-tree guard: {PRIVATE_WORDS_ENV} is unset, private words not checked");
+    }
+
     let mut read = 0;
     let mut failures = Vec::new();
     for path in &tracked {
@@ -201,16 +224,17 @@ fn no_tracked_file_carries_internal_infrastructure() {
             std::fs::read(&full).unwrap_or_else(|err| panic!("tracked {path} must read: {err}"));
         read += 1;
         let content = String::from_utf8_lossy(&bytes);
-        failures.extend(
-            violations(path, &content)
-                .into_iter()
-                .map(|rule| format!("{path}: {rule}")),
-        );
+        let mut rules = violations(path, &content);
+        if names_private_word(&content, &private) {
+            rules.push("private word (from the secret)");
+        }
+        failures.extend(rules.into_iter().map(|rule| format!("{path}: {rule}")));
     }
 
     eprintln!(
-        "public-tree guard read {read} of {} tracked files",
-        tracked.len()
+        "public-tree guard read {read} of {} tracked files, {} private words",
+        tracked.len(),
+        private.len()
     );
     assert!(
         read >= MIN_TRACKED,
@@ -234,8 +258,13 @@ fn passes_public_references() {
 #[test]
 fn skips_only_platform_owned_paths() {
     assert!(platform_owned(".dz/maintainer/maintainer.yml"));
-    assert!(platform_owned(".mcp.json"));
-    for path in [".mcp.json.bak", "config/.mcp.json", ".dzz/x", "README.md"] {
+    for path in [
+        ".mcp.json",
+        ".mcp.json.bak",
+        "config/.mcp.json",
+        ".dzz/x",
+        "README.md",
+    ] {
         assert!(!platform_owned(path), "{path} must be scanned");
     }
 }
@@ -250,15 +279,35 @@ fn fires_on_internal_host() {
 }
 
 #[test]
-fn fires_on_each_forbidden_word() {
-    for (rule, word) in [
-        ("setup-mode name", ["DZ", "RUNNER"].join("-")),
-        ("private CI provider", ["Ubi", "cloud"].join("")),
-        ("production tenant", ["te", "sote"].join("")),
-        ("production host", ["miami", "beach", "start"].join("")),
-    ] {
-        assert_eq!(violations("a.md", &format!("x {word} y")), [rule]);
-    }
+fn fires_on_the_setup_mode_name() {
+    let word = ["DZ", "RUNNER"].join("-");
+    assert_eq!(
+        violations("a.md", &format!("x {word} y")),
+        ["setup-mode name"]
+    );
+}
+
+#[test]
+fn fires_on_a_private_word_from_the_secret() {
+    let words = private_words(Some(" Quimtel ,\n\nzorblax.io\n"));
+    assert_eq!(words.len(), 2);
+    assert!(names_private_word("x QUIMTEL y", &words));
+    assert!(names_private_word("see zorblax.io.", &words));
+    assert!(!names_private_word("zorblax-io and quim", &words));
+    assert!(private_words(None).is_empty());
+    assert!(private_words(Some(" , \n ")).is_empty());
+}
+
+#[test]
+fn fires_on_our_own_mcp_service_in_the_tracked_config() {
+    let host = ["mcp", "developerz", "ai"].join(".");
+    let config =
+        format!(r#"{{"mcpServers":{{"x":{{"type":"http","url":"https://{host}/v1/mcp"}}}}}}"#);
+    assert!(!platform_owned(".mcp.json"));
+    assert_eq!(
+        violations(".mcp.json", &config),
+        ["internal host on our own domain"]
+    );
 }
 
 #[test]
