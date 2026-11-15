@@ -12,7 +12,9 @@
 //!   call the two production clusters D1 and D2). A committed list publishes
 //!   what it guards, even assembled from parts — anyone can join two strings —
 //!   so these come from the `PUBLIC_TREE_PRIVATE_WORDS` CI secret. A run
-//!   without it (a fork's pull request, a local run) says it skipped them.
+//!   without it (a fork's pull request, a local run) says it skipped them;
+//!   this repository's own CI runs set `PUBLIC_TREE_PRIVATE_WORDS_REQUIRED=1`,
+//!   where an empty secret fails instead of skipping.
 //! - **No private repository.** A reference to a `developerz-ai/` repository
 //!   names one on the public allowlist below.
 //! - **No one's machine.** A path under a home directory names a person and
@@ -57,6 +59,10 @@ const PLATFORM_OWNED: &[&str] = &[".dz/"];
 /// The CI secret holding the private words, comma- or newline-separated.
 const PRIVATE_WORDS_ENV: &str = "PUBLIC_TREE_PRIVATE_WORDS";
 
+/// Set to `1` where the secret must be there (this repository's own CI runs):
+/// an empty secret there is a failure, never a skip.
+const PRIVATE_WORDS_REQUIRED_ENV: &str = "PUBLIC_TREE_PRIVATE_WORDS_REQUIRED";
+
 /// The organisation's repositories a tracked file may name: public ones.
 const PUBLIC_REPOS: &[&str] = &["db-mcp-gateway", "wurk"];
 
@@ -94,6 +100,18 @@ fn private_words(raw: Option<&str>) -> Vec<Regex> {
         .filter(|word| !word.is_empty())
         .map(|word| compiled(&format!("(?i){}", regex::escape(word))))
         .collect()
+}
+
+/// The private words for this run, or why the run must fail: required, and
+/// the secret gave none.
+fn private_words_for_run(raw: Option<&str>, required: bool) -> Result<Vec<Regex>, String> {
+    let words = private_words(raw);
+    if words.is_empty() && required {
+        return Err(format!(
+            "{PRIVATE_WORDS_ENV} is empty, and {PRIVATE_WORDS_REQUIRED_ENV}=1 says this run must check the private words"
+        ));
+    }
+    Ok(words)
 }
 
 /// Whether `content` carries any of the private words. Never which one.
@@ -205,7 +223,9 @@ fn no_tracked_file_carries_internal_infrastructure() {
         "git ls-files does not list {SELF}: the scan is not reading this tree"
     );
 
-    let private = private_words(std::env::var(PRIVATE_WORDS_ENV).ok().as_deref());
+    let required = std::env::var(PRIVATE_WORDS_REQUIRED_ENV).is_ok_and(|v| v == "1");
+    let private = private_words_for_run(std::env::var(PRIVATE_WORDS_ENV).ok().as_deref(), required)
+        .unwrap_or_else(|why| panic!("{why}"));
     if private.is_empty() {
         eprintln!("public-tree guard: {PRIVATE_WORDS_ENV} is unset, private words not checked");
     }
@@ -296,6 +316,14 @@ fn fires_on_a_private_word_from_the_secret() {
     assert!(!names_private_word("zorblax-io and quim", &words));
     assert!(private_words(None).is_empty());
     assert!(private_words(Some(" , \n ")).is_empty());
+}
+
+#[test]
+fn a_required_run_without_the_secret_fails() {
+    assert!(private_words_for_run(None, true).is_err());
+    assert!(private_words_for_run(Some(" , \n"), true).is_err());
+    assert!(matches!(private_words_for_run(None, false), Ok(words) if words.is_empty()));
+    assert!(matches!(private_words_for_run(Some("quimtel"), true), Ok(words) if words.len() == 1));
 }
 
 #[test]

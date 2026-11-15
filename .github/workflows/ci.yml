@@ -381,6 +381,10 @@ jobs:
       - run: cargo test --profile ci --test public_tree -- --show-output
         env:
           PUBLIC_TREE_PRIVATE_WORDS: ${{ secrets.PUBLIC_TREE_PRIVATE_WORDS }}
+          # Required on this repository's own runs (a push to main, a PR from a
+          # branch here), where the secret exists: empty there is red. A fork's
+          # PR and Dependabot's get no Actions secrets, so they skip.
+          PUBLIC_TREE_PRIVATE_WORDS_REQUIRED: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && github.actor != 'dependabot[bot]' && '1' || '' }}
 
   # Publish a multi-arch image on push to main, tagged with the short commit
   # SHA (what Argo Image Updater pins to, #17) + a moving `main` tag.
