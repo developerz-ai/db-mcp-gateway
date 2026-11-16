@@ -174,11 +174,11 @@ bin/test
 echo '→ cargo audit'
 job_reached 'cargo audit'
 if command -v cargo-audit >/dev/null 2>&1; then
-  # CI's exact command (.github/workflows/ci.yml, audit job). The single
-  # ignore is the one .cargo/audit.toml already justifies; stating it on the
-  # command line keeps the local gate identical to CI instead of leaning on
-  # cargo-audit's config discovery.
-  cargo audit --ignore RUSTSEC-2023-0071
+  # CI's exact command (.github/workflows/ci.yml, audit job): a bare
+  # `cargo audit`. The command line carries no ignore so the local gate
+  # matches CI exactly; .cargo/audit.toml holds the config cargo-audit
+  # discovers on its own, and it ignores nothing.
+  cargo audit
 else
   not_run 'cargo audit' 'cargo-audit is not on PATH' \
     'install: cargo install cargo-audit'

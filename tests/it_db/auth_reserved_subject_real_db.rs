@@ -8,6 +8,7 @@ use crate::common::env::state_pool;
 use db_mcp_gateway::auth::oauth::{GrantIdentity, RefreshTokens};
 use db_mcp_gateway::auth::{AuthError, SessionCacheConfig, SessionStore};
 use sqlx::PgPool;
+use sqlx::AssertSqlSafe;
 
 const HOUR: Duration = Duration::from_secs(3600);
 
@@ -17,7 +18,7 @@ fn unique_service_sub() -> String {
 
 async fn cleanup(pool: &PgPool, sub: &str) {
     for table in ["oauth_refresh_tokens", "sessions"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE user_sub = $1"))
+        sqlx::query(AssertSqlSafe(&format!("DELETE FROM {table} WHERE user_sub = $1")))
             .bind(sub)
             .execute(pool)
             .await

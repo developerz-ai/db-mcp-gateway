@@ -8,6 +8,7 @@ use db_mcp_gateway::audit::drain::DetachedTasks;
 use db_mcp_gateway::config::{Database, Password, Server, ServerKind, Tls};
 use db_mcp_gateway::exec::{PgAdapter, PoolSizing};
 use sqlx::postgres::PgPoolOptions;
+use sqlx::AssertSqlSafe;
 use tokio::sync::OnceCell;
 
 pub const TARGET_HOST: &str = "localhost";
@@ -158,7 +159,7 @@ pub async fn ensure_read_role() {
                      GRANT SELECT ON TABLES TO {READ_ROLE}"
                 ),
             ]) {
-                sqlx::query(&sql)
+                sqlx::query(AssertSqlSafe(&sql))
                     .execute(&mut *tx)
                     .await
                     .unwrap_or_else(|err| panic!("provision {READ_ROLE}: {err}"));

@@ -10,6 +10,7 @@ use db_mcp_gateway::auth::oauth::{ClientRegistry, GrantIdentity, RefreshTokens};
 use db_mcp_gateway::auth::{AuthError, SessionCacheConfig, SessionStore};
 use db_mcp_gateway::state::oauth::{self as db, NewRefreshToken};
 use sqlx::PgPool;
+use sqlx::AssertSqlSafe;
 
 const CHAIN_TTL: Duration = Duration::from_secs(24 * 3600);
 const SESSION_TTL: Duration = Duration::from_secs(3600);
@@ -147,7 +148,7 @@ async fn cleanup_sub(pool: &PgPool, sub: &str, chains: &[uuid::Uuid]) {
         .await
         .expect("cleanup tombstones");
     for table in ["oauth_refresh_tokens", "sessions"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE user_sub = $1"))
+        sqlx::query(AssertSqlSafe(&format!("DELETE FROM {table} WHERE user_sub = $1")))
             .bind(sub)
             .execute(pool)
             .await

@@ -15,7 +15,7 @@
 
 use std::time::Instant;
 
-use sqlx::{Row, postgres::PgPoolOptions};
+use sqlx::{AssertSqlSafe, Row, postgres::PgPoolOptions};
 
 use crate::workload::Shape;
 
@@ -96,7 +96,7 @@ impl DirectClient {
         // `execute` on a multi-statement string runs it as one implicit
         // transaction, which is what we want: a half-seeded table would make
         // every subsequent number meaningless.
-        sqlx::raw_sql(ddl).execute(&self.pool).await?;
+        sqlx::raw_sql(AssertSqlSafe(ddl)).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -110,7 +110,7 @@ impl DirectClient {
         let sql = shape.sql(iteration);
 
         let started = Instant::now();
-        let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(AssertSqlSafe(&sql)).fetch_all(&self.pool).await?;
         let mut touched = 0usize;
         for row in &rows {
             touched += row.columns().len();

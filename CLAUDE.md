@@ -23,9 +23,9 @@ Self-hosted MCP gateway. AI agents get audited, SSO-gated, read-only DB access. 
 
 | Concern | Choice |
 |---|---|
-| Lang | Rust 2024 — toolchain channel `1.96.0` (`rust-toolchain.toml`: rustfmt + clippy), MSRV `1.88` (`Cargo.toml`); deps pinned to latest stable at implementation time |
+| Lang | Rust 2024 — toolchain channel `1.96.0` (`rust-toolchain.toml`: rustfmt + clippy), MSRV `1.94` (`Cargo.toml`); deps pinned to latest stable at implementation time |
 | Runtime / HTTP | tokio; axum (+ axum-server, rustls) |
-| DB driver | sqlx 0.8 — Postgres + MySQL (YugabyteDB YSQL rides the Postgres path, CI-tested); mongodb 3.7 for the Mongo target; redis 1.8 for the Redis/Dragonfly target |
+| DB driver | sqlx 0.9 — Postgres + MySQL (YugabyteDB YSQL rides the Postgres path, CI-tested); mongodb 3.7 for the Mongo target; redis 1.8 for the Redis/Dragonfly target |
 | MCP | hand-rolled JSON-RPC over Streamable HTTP (POST; `GET /mcp` → 405) → swap for SDK when one stabilizes |
 | Config | serde + serde-saphyr (not serde_yaml), validated at boot |
 | State store | Postgres (co-deployed): sessions, audit log, denylist. Permissions store `pg` (`src/state/permissions/pg.rs`) or `mysql` (`src/state/permissions/mysql/`) |
@@ -95,9 +95,9 @@ The bar: idiomatic, boring, readable Rust. No spaghetti, no premature abstractio
 ### Dependency graph
 
 - **An optional dependency enters `Cargo.lock` as soon as an enabled feature references it — even weakly (`dep?/feat`).** sqlx's `migrate`/`json`/`chrono`/`uuid` features each reference `sqlx-sqlite?/…`, so the SQLite driver landed in the lock with `libsqlite3-sys` 0.30.1 (RUSTSEC-2026-0459) while never being compiled: `cargo tree -i libsqlite3-sys` was empty before the fix, only the lock entry was vulnerable. `cargo audit` reads the lock, so it flags crates this project never builds.
-- **`third_party/sqlx-sqlite-noop` stands in for that driver** — a no-op crate named `sqlx-sqlite`, patched in via `[patch.crates-io]` in the root `Cargo.toml` and declared as a workspace member, because `cargo chef` restores only workspace members into the Docker builder stage. Bump its version in lockstep with sqlx: a version that no longer satisfies sqlx's requirement makes cargo warn `patch not used`, the real driver returns to the lock, and the advisory returns with it. The root manifest pins `sqlx = "=0.8.6"` exactly for that reason — `cargo update` cannot move sqlx off the version the stub satisfies, so the two are bumped together in one commit, never apart.
+- **`third_party/sqlx-sqlite-noop` stands in for that driver** — a no-op crate named `sqlx-sqlite`, patched in via `[patch.crates-io]` in the root `Cargo.toml` and declared as a workspace member, because `cargo chef` restores only workspace members into the Docker builder stage. Bump its version in lockstep with sqlx: a version that no longer satisfies sqlx's requirement makes cargo warn `patch not used`, the real driver returns to the lock, and the advisory returns with it. The root manifest pins `sqlx = "=0.9.0"` exactly for that reason — `cargo update` cannot move sqlx off the version the stub satisfies (`sqlx-sqlite = "=0.9.0"`), so the two are bumped together in one commit, never apart.
 - **The repo is a two-crate workspace** — the root package plus that stub — but the stub is a workspace member, **not** a default member. With a root package present and no `default-members`, Cargo's default members are the root package alone (Cargo Book, §"The default-members field": "When unspecified, the root package will be used"), so a plain `cargo build` from the root never compiles the stub. Only a workspace-wide package selection (`cargo build --workspace`, or its `--all` alias) builds it, and no gate passes either — `bin/lint`, `bin/ci` and `ci.yml` all run root-package-only commands (`cargo clippy --all-targets --all-features`, `cargo test --all-targets --all-features`; `--all-targets`/`--all-features` select targets and features, not workspace members). `bin/lint`'s `cargo fmt --all` formats the stub but never compiles it. The stub's whole job is to exist: in the lock, and in the Docker builder stage, where `cargo chef` restores it.
-- **Re-resolve narrowly.** `cargo update -p sqlx --precise 0.8.6` is not the narrowest way to re-resolve here — it collapses windows-sys 0.48.0/0.59.0 into 0.61.2, whereas a plain re-resolve (`cargo metadata`) produced a lock diff with zero version changes to unrelated crates.
+- **Re-resolve narrowly.** `cargo update -p sqlx --precise 0.9.0` is not the narrowest way to re-resolve here — it collapses windows-sys 0.48.0/0.59.0 into 0.61.2, whereas a plain re-resolve (`cargo metadata`) produced a lock diff with zero version changes to unrelated crates.
 
 ## Testing
 
@@ -119,7 +119,7 @@ GitHub Actions on GitHub-hosted runners — `ubuntu-latest` default (`ubuntu-24.
 | `clippy` | `clippy -D warnings` (all-targets + release cfg, `--profile ci`) + `bin/check-scrub-features` |
 | `test` | `cargo nextest run --profile ci --cargo-profile ci --all-targets --all-features` (`--no-run` first, then after the dev stack is healthy); JUnit uploaded (`.config/nextest.toml`) |
 | `yugabyte` | `bin/test-yugabyte` against `yugabytedb/yugabyte:2.25.2.0-b359` (the version a production deployment runs; compose profile `yugabyte`, YSQL on 5435); the Postgres query-path `it_db` modules minus the NOTIFY tests YB ignores (excluded with reasons in `.config/nextest.toml`) |
-| `audit` | `cargo audit --ignore RUSTSEC-2023-0071` |
+| `audit` | `cargo audit` (no `--ignore`; rsa 0.10.0 in the lock via sqlx 0.9's `mysql-rsa` clears RUSTSEC-2023-0071) |
 | `secret-scan` | advisory — `git grep -nE` over every tracked file for `dbmcp_svc_[0-9a-f]{64}`; exempt paths: `tests/**`, `website/**`, `config/example.yaml`, `.github/**`, `src/config/yaml/**` |
 | `public-tree` | `cargo test --test public_tree` on every PR, docs-only included (no `changes` gate): no internal host, private repo, private CI provider, setup-mode name or home path in any tracked file |
 | `weekly` (`weekly.yml`) | Mondays: `cargo audit` on `main` + `cargo update --dry-run` report |

@@ -178,7 +178,7 @@ for call in \
   'cargo tree -e features -i regex-syntax -e no-dev' \
   'docker compose -f docker-compose.dev.yml up -d --wait' \
   'cargo test --all-targets --all-features' \
-  'cargo audit --ignore RUSTSEC-2023-0071' \
+  'cargo audit' \
   'git grep -nE dbmcp_svc_[0-9a-f]{64} -- :!tests/** :!website/** :!config/example.yaml :!.github/** :!src/config/yaml/**' \
   'npm run typecheck' 'npm run build' 'orchestration'; do
   called "$call"
@@ -252,7 +252,7 @@ assert_output 'git grep tooling failure (rc=128) — secret-scan cannot read as 
 fixture
 run_gate 75 FAIL_AT='docker compose -f docker-compose.dev.yml up -d --wait'
 not_called 'cargo test --all-targets --all-features'
-not_called 'cargo audit --ignore RUSTSEC-2023-0071'
+not_called 'cargo audit'
 # The 75 names the unreachable resource instead of one generic message.
 assert_output 'Required prerequisite unavailable: dev stack'
 # The per-service diagnostics are part of the report: the unhealthy service is
@@ -294,7 +294,7 @@ for stage in 'cargo fmt --all -- --check' \
   'cargo clippy --release --all-features -- -D warnings' \
   'cargo tree -e features -i regex-syntax -e no-dev' \
   'cargo test --all-targets --all-features' \
-  'cargo audit --ignore RUSTSEC-2023-0071' 'npm run typecheck' 'npm run build'; do
+  'cargo audit' 'npm run typecheck' 'npm run build'; do
   fixture
   run_gate 42 FAIL_AT="$stage"
   if [[ $stage != 'npm run build' ]]; then not_called 'npm run build'; fi
@@ -316,7 +316,7 @@ for missing in cargo rustc cc make docker grep; do
   fixture
   rm "$work/tools/$missing"
   run_gate 75
-  not_called 'cargo audit --ignore RUSTSEC-2023-0071'
+  not_called 'cargo audit'
 done
 for prerequisite in 'cargo fmt --version' 'cargo clippy --version' \
   'docker compose version' 'docker info'; do
@@ -328,7 +328,7 @@ done
 fixture
 rm "$work/tools/cargo-audit"
 run_gate 0
-not_called 'cargo audit --ignore RUSTSEC-2023-0071'
+not_called 'cargo audit'
 assert_output 'NOT RUN: cargo audit - cargo-audit is not on PATH (install: cargo install cargo-audit)'
 assert_output 'Jobs not run'
 assert_summary 'NOT RUN: cargo audit - cargo-audit is not on PATH (install: cargo install cargo-audit)'
@@ -356,7 +356,7 @@ not_called 'npm run typecheck'
 not_called 'npm run build'
 assert_output 'NOT RUN: pages typecheck/build/artifact guard - npm is not on PATH'
 assert_summary 'NOT RUN: pages typecheck/build/artifact guard - npm is not on PATH'
-called 'cargo audit --ignore RUSTSEC-2023-0071'
+called 'cargo audit'
 
 for dependency in tsc docusaurus; do
   fixture

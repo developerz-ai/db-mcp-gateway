@@ -12,12 +12,13 @@ use crate::common::idp::MockUser;
 use crate::common::pg_target::adapter;
 use db_mcp_gateway::exec::{Access, DbAdapter, ExecQuery};
 use serde_json::json;
+use sqlx::AssertSqlSafe;
 
 /// Fixture DDL/DML over a plain owner connection — never through the
 /// adapter, which only reads on a database without a `write_role`.
 async fn ddl(sql: &str) -> Result<(), sqlx::Error> {
     let pool = sqlx::PgPool::connect(&target_db_url()).await?;
-    sqlx::query(sql).execute(&pool).await.map(|_| ())
+    sqlx::query(AssertSqlSafe(sql)).execute(&pool).await.map(|_| ())
 }
 
 /// Generates a unique schema name per test run so concurrent runs (and any

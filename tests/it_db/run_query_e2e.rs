@@ -24,6 +24,7 @@ use axum::routing::post;
 use db_mcp_gateway::auth::{Identity, SessionId};
 use db_mcp_gateway::transport::limit;
 use serde_json::{Value, json};
+use sqlx::AssertSqlSafe;
 
 /// Config pointing the `target` server at the live `target-db` from
 /// `docker-compose.dev.yml`. The `engineers` group gets a fast 200ms
@@ -318,9 +319,9 @@ async fn run_query_write_grant_commits_data_but_not_schema() {
         .await
         .expect("target-db reachable; run `bin/dev up`");
     let table = format!("write_e2e_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(&format!(
         "CREATE TABLE \"{table}\" (id bigint PRIMARY KEY, note text)"
-    ))
+    )))
     .execute(&target)
     .await
     .expect("create scratch table");
@@ -441,7 +442,7 @@ async fn run_query_write_grant_commits_data_but_not_schema() {
     }
 
     // Cleanup.
-    sqlx::query(&format!("DROP TABLE IF EXISTS \"{table}\""))
+    sqlx::query(AssertSqlSafe(&format!("DROP TABLE IF EXISTS \"{table}\"")))
         .execute(&target)
         .await
         .expect("drop scratch table");

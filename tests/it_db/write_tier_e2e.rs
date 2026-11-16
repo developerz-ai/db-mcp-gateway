@@ -10,6 +10,7 @@ use crate::common::gateway::{LoggedInGateway, spawn_logged_in};
 use crate::common::idp::MockUser;
 use crate::common::pg_target::{READ_ROLE, TARGET_USER, ensure_read_role};
 use serde_json::{Value, json};
+use sqlx::AssertSqlSafe;
 
 const WRITE_YAML: &str = r#"
 servers:
@@ -59,7 +60,7 @@ impl Fixture {
             format!("CREATE TABLE \"{table}\" (id bigint PRIMARY KEY, note text)"),
             format!("INSERT INTO \"{table}\" VALUES (1, 'one'), (2, 'two')"),
         ] {
-            sqlx::query(&sql)
+            sqlx::query(AssertSqlSafe(&sql))
                 .execute(&target)
                 .await
                 .expect("scratch table");
@@ -90,10 +91,10 @@ impl Fixture {
     }
 
     async fn note(&self, id: i64) -> String {
-        sqlx::query_scalar(&format!(
+        sqlx::query_scalar(AssertSqlSafe(&format!(
             "SELECT note FROM \"{}\" WHERE id = $1",
             self.table
-        ))
+        )))
         .bind(id)
         .fetch_one(&self.target)
         .await
@@ -105,7 +106,7 @@ impl Fixture {
     }
 
     async fn drop_table(self) {
-        sqlx::query(&format!("DROP TABLE \"{}\"", self.table))
+        sqlx::query(AssertSqlSafe(&format!("DROP TABLE \"{}\"", self.table)))
             .execute(&self.target)
             .await
             .expect("drop scratch table");

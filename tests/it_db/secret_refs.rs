@@ -13,6 +13,7 @@
 use db_mcp_gateway::config::{ConfigFile, ConfigFileError, Password, SecretError};
 use db_mcp_gateway::exec::{Access, AdapterRegistry, ExecError, ExecQuery};
 use db_mcp_gateway::state;
+use sqlx::AssertSqlSafe;
 use std::io::Write;
 
 fn yaml_with_password(reference: &str) -> String {
@@ -220,7 +221,7 @@ async fn rotated_password_file_is_picked_up_without_restart() {
         .expect("target-db reachable; run `bin/dev up`");
     let role = format!("rot_{}", uuid::Uuid::new_v4().simple());
     let set_password = |pw: &str| format!("ALTER ROLE \"{role}\" PASSWORD '{pw}'");
-    sqlx::query(&format!("CREATE ROLE \"{role}\" LOGIN PASSWORD 'first-pw'"))
+    sqlx::query(AssertSqlSafe(&format!("CREATE ROLE \"{role}\" LOGIN PASSWORD 'first-pw'")))
         .execute(&probe)
         .await
         .expect("create rotation role");
@@ -253,7 +254,7 @@ async fn rotated_password_file_is_picked_up_without_restart() {
 
     run(registry.clone()).await.expect("first password works");
 
-    sqlx::query(&set_password("second-pw"))
+    sqlx::query(AssertSqlSafe(&set_password("second-pw")))
         .execute(&probe)
         .await
         .expect("rotate password");
@@ -268,7 +269,7 @@ async fn rotated_password_file_is_picked_up_without_restart() {
     // connection; it marks the adapter stale. The next one must succeed.
     let first = run(registry.clone()).await;
     let second = run(registry.clone()).await;
-    let _ = sqlx::query(&format!("DROP ROLE IF EXISTS \"{role}\""))
+    let _ = sqlx::query(AssertSqlSafe(&format!("DROP ROLE IF EXISTS \"{role}\"")))
         .execute(&probe)
         .await;
     if let Err(err) = &first {

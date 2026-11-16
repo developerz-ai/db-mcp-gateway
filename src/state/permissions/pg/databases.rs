@@ -1,7 +1,7 @@
 //! `permissions_databases` SQL: pool reads plus the transactional writes the
 //! admin API audits.
 
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{AssertSqlSafe, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use super::super::{DbType, Page, PermissionsDatabase, RepoError};
@@ -15,7 +15,7 @@ pub(super) async fn get_database(
         "SELECT {DATABASE_COLUMNS} FROM permissions_databases \
          WHERE id = $1 AND deleted_at IS NULL"
     );
-    let row = sqlx::query(&sql).bind(id).fetch_optional(pool).await?;
+    let row = sqlx::query(AssertSqlSafe(&sql)).bind(id).fetch_optional(pool).await?;
     row.as_ref().map(database_from_row).transpose()
 }
 
@@ -28,7 +28,7 @@ pub(super) async fn list_databases(
         "SELECT {DATABASE_COLUMNS} FROM permissions_databases WHERE deleted_at IS NULL \
          ORDER BY server, db_name LIMIT $1 OFFSET $2"
     );
-    let rows = sqlx::query(&sql)
+    let rows = sqlx::query(AssertSqlSafe(&sql))
         .bind(page.limit())
         .bind(page.offset())
         .fetch_all(pool)
@@ -46,7 +46,7 @@ pub async fn tx_create_database(
         "INSERT INTO permissions_databases (server, db_name, db_type) VALUES ($1, $2, $3) \
          RETURNING {DATABASE_COLUMNS}"
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(AssertSqlSafe(&sql))
         .bind(server)
         .bind(db_name)
         .bind(db_type.as_db_str())
@@ -64,7 +64,7 @@ pub async fn tx_lock_database(
         "SELECT {DATABASE_COLUMNS} FROM permissions_databases \
          WHERE id = $1 AND deleted_at IS NULL FOR UPDATE"
     );
-    let row = sqlx::query(&sql).bind(id).fetch_optional(&mut **tx).await?;
+    let row = sqlx::query(AssertSqlSafe(&sql)).bind(id).fetch_optional(&mut **tx).await?;
     row.as_ref().map(database_from_row).transpose()
 }
 
@@ -83,7 +83,7 @@ pub async fn tx_update_database(
              db_type = COALESCE($4, db_type), updated_at = now() \
          WHERE id = $1 AND deleted_at IS NULL RETURNING {DATABASE_COLUMNS}"
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(AssertSqlSafe(&sql))
         .bind(id)
         .bind(server)
         .bind(db_name)

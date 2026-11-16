@@ -20,7 +20,7 @@
 
 use crate::common::env::mysql_pool;
 use serde_json::Value as JsonValue;
-use sqlx::{MySqlPool, Row};
+use sqlx::{AssertSqlSafe, MySqlPool, Row};
 use uuid::Uuid;
 
 /// The chosen plan for one table, reduced to the fields these tests assert on.
@@ -38,7 +38,7 @@ struct Plan {
 /// column, and gives `using_filesort` as a field instead of substring-matching
 /// the `Extra` blob.
 async fn explain(pool: &MySqlPool, query: &str) -> Plan {
-    let json: String = sqlx::query(&format!("EXPLAIN FORMAT=JSON {query}"))
+    let json: String = sqlx::query(AssertSqlSafe(&format!("EXPLAIN FORMAT=JSON {query}")))
         .fetch_one(pool)
         .await
         .expect("explain runs")

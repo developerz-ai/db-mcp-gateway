@@ -12,7 +12,7 @@
 [![CI](https://github.com/developerz-ai/db-mcp-gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/developerz-ai/db-mcp-gateway/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/developerz-ai/db-mcp-gateway?sort=semver)](https://github.com/developerz-ai/db-mcp-gateway/releases/latest)
 [![Image](https://img.shields.io/badge/image-ghcr.io-2496ED?logo=docker&logoColor=white)](https://github.com/developerz-ai/db-mcp-gateway/pkgs/container/db-mcp-gateway)
-[![Rust](https://img.shields.io/badge/rust-%E2%89%A5%201.88-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-%E2%89%A5%201.94-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![GitHub stars](https://img.shields.io/github/stars/developerz-ai/db-mcp-gateway?style=flat&logo=github)](https://github.com/developerz-ai/db-mcp-gateway/stargazers)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 

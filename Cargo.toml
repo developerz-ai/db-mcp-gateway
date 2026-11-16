@@ -10,7 +10,7 @@ members = ["third_party/sqlx-sqlite-noop"]
 name = "db-mcp-gateway"
 version = "2.3.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.94"
 description = "Self-hosted MCP gateway for credentialled, audited, policy-scoped database access by AI agents — read-only by default, writes opt-in per grant"
 license = "MIT"
 repository = "https://github.com/developerz-ai/db-mcp-gateway"
@@ -71,6 +71,17 @@ clap = { version = "4", features = ["derive", "env"] }
 # `#[derive(sqlx::FromRow)]` uses need them, and `sqlx::migrate!` expands to
 # `::sqlx::migrate::…`, so the umbrella's `migrate` feature cannot be dropped.
 #
+# TLS is named as `tls-rustls-ring`: sqlx 0.9 dropped the combined
+# `runtime-tokio-rustls` feature and split runtime from TLS, so the runtime
+# (`runtime-tokio`) and the ring-backed rustls provider are named separately.
+#
+# `mysql-rsa` is load-bearing on MySQL 8: sqlx 0.9's `mysql` feature no longer
+# pulls `rsa`, and without the opt-in `sqlx-mysql::connection::encrypt_rsa`
+# returns `Error::Configuration` when `caching_sha2_password` needs full auth
+# over a non-TLS connection — which is exactly the dev DSN
+# (`docker-compose.dev.yml` runs `mysql:8` on 127.0.0.1:3307, no TLS). It also
+# keeps `rsa` 0.10.0 in the lock, which is what clears RUSTSEC-2023-0071.
+#
 # The optional SQLite driver is a separate matter: sqlx keeps `sqlx-sqlite` as
 # an optional dependency, and Cargo.lock materialises an optional dependency as
 # soon as an enabled feature references it — even by a weak `dep?/feat`
@@ -78,16 +89,16 @@ clap = { version = "4", features = ["derive", "env"] }
 # `sqlx-sqlite?/…`, so the driver lands in the lock (with `libsqlite3-sys`
 # 0.30.1, flagged by RUSTSEC-2026-0459) even though the `sqlite` feature is
 # off and the driver is never compiled. No sqlx release can carry a fixed
-# `libsqlite3-sys` — sqlx-sqlite 0.8.6 requires `^0.30.1` and the fix landed
-# in 0.39.0 — so the driver is stood in for by a no-op stub; see
+# `libsqlite3-sys` — sqlx-sqlite 0.9.0 requires `>=0.30.1, <0.38.0` and the
+# fix landed in 0.39.0 — so the driver is stood in for by a no-op stub; see
 # `[patch.crates-io]` below.
 #
 # The version is pinned exactly, not to a range: the stub satisfies only
-# sqlx's `sqlx-sqlite = "=0.8.6"` requirement, so a `cargo update` that moved
-# sqlx to 0.8.7 would leave the patch unused — the real driver, and
+# sqlx's `sqlx-sqlite = "=0.9.0"` requirement, so a `cargo update` that moved
+# sqlx to 0.9.1 would leave the patch unused — the real driver, and
 # `libsqlite3-sys` with it, would return to the lock and RUSTSEC-2026-0459
 # with them. Bump sqlx and the stub's version in the same commit.
-sqlx = { version = "=0.8.6", default-features = false, features = ["runtime-tokio-rustls", "macros", "migrate", "json", "postgres", "mysql", "uuid", "chrono", "bigdecimal"] }
+sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "macros", "migrate", "json", "postgres", "mysql", "mysql-rsa", "uuid", "chrono", "bigdecimal"] }
 sqlparser = { version = "0.63", features = ["visitor"] }
 async-trait = "0.1"
 # Mongo target adapter (#57 scaffold + #58 exec). Disable default features so
@@ -213,9 +224,8 @@ strip = "debuginfo"
 # features each reference the optional SQLite driver, so it lands in the lock
 # with `libsqlite3-sys` 0.30.1 and RUSTSEC-2026-0459 fires — even though the
 # `sqlite` feature is never enabled and the driver is never compiled.
-# No sqlx release can carry a fixed `libsqlite3-sys`: sqlx-sqlite 0.8.6 requires
-# `^0.30.1`, sqlx-sqlite 0.9.0 still caps at `<0.38.0`, and the fix landed in
-# 0.39.0. The stub below stands in for the driver so the vulnerable crate
+# No sqlx release can carry a fixed `libsqlite3-sys`: sqlx-sqlite 0.9.0 still
+# caps at `<0.38.0`, and the fix landed in 0.39.0. The stub below stands in for the driver so the vulnerable crate
 # leaves the lock; no gate compiles it, because the `sqlite` feature is off and
 # the stub is not a default workspace member (CLAUDE.md §"Dependency graph").
 [patch.crates-io]

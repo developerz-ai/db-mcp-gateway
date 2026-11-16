@@ -10,6 +10,7 @@ use crate::common::gateway::spawn_logged_in;
 use crate::common::idp::MockUser;
 use crate::common::pg_target::ensure_read_role;
 use serde_json::json;
+use sqlx::AssertSqlSafe;
 
 const YAML: &str = r#"
 servers:
@@ -46,7 +47,7 @@ async fn write_intent_records_the_calls_sql_and_reason() {
         .await
         .expect("target-db reachable; run `bin/dev up`");
     let table = format!("intent_e2e_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE TABLE \"{table}\" (v text)"))
+    sqlx::query(AssertSqlSafe(&format!("CREATE TABLE \"{table}\" (v text)")))
         .execute(&target)
         .await
         .expect("scratch table");
@@ -89,7 +90,7 @@ async fn write_intent_records_the_calls_sql_and_reason() {
         "intent and completion agree on reason"
     );
 
-    sqlx::query(&format!("DROP TABLE \"{table}\""))
+    sqlx::query(AssertSqlSafe(&format!("DROP TABLE \"{table}\"")))
         .execute(&target)
         .await
         .expect("drop scratch table");

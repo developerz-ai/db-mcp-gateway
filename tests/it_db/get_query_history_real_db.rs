@@ -16,6 +16,7 @@ use crate::common::gateway::{LoggedInGateway, spawn_logged_in};
 use crate::common::idp::MockUser;
 use db_mcp_gateway::audit::{AuditRow, HISTORY_SQL_MAX_BYTES, OutcomeCode, log};
 use serde_json::{Value, json};
+use sqlx::AssertSqlSafe;
 use uuid::Uuid;
 
 const E2E_YAML: &str = r#"
@@ -548,7 +549,7 @@ async fn history_query_uses_the_history_index() {
         .execute(&mut *tx)
         .await
         .expect("disable incremental sort");
-    let plan: Value = sqlx::query_scalar(&format!(
+    let plan: Value = sqlx::query_scalar(AssertSqlSafe(&format!(
         "EXPLAIN (FORMAT JSON) \
          SELECT id, request_id, sql, reason, outcome, elapsed_ms, row_count, occurred_at \
          FROM audit_calls \

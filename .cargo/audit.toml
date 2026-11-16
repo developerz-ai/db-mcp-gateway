@@ -1,24 +1,13 @@
 # cargo-audit configuration.
 #
-# RUSTSEC-2023-0071 — "Marvin Attack" timing side-channel in the `rsa` crate,
-# reached through sqlx-mysql.
+# RUSTSEC-2023-0071 — "Marvin Attack" timing side-channel in the `rsa` crate —
+# is CLEAR as of the sqlx 0.9 upgrade: sqlx 0.9's `mysql` feature no longer
+# pulls `rsa`, and the new opt-in `mysql-rsa` feature (which Cargo.toml enables
+# because the non-TLS `mysql:8` dev DSN needs caching_sha2_password full auth)
+# requires `^0.10.0-rc.18`, resolved to rsa 0.10.0. The advisory declares
+# `patched = [">= 0.10.0"]`, so there is nothing left to ignore here.
 #
-# The previous justification here claimed this gateway is "Postgres-only" and
-# that the MySQL auth handshake never executes. That is no longer true:
-# Cargo.toml enables sqlx's `mysql` feature deliberately, MySQL is a supported
-# `permissions_store.driver`, and tests/it_db/permissions_repo_mysql.rs exercises it
-# against a live server in CI.
-#
-# Accurate status: `rsa` is used by sqlx-mysql only to encrypt the password
-# during the `caching_sha2_password` / `sha256_password` handshake, and only
-# when the connection is not already TLS-wrapped. An operator who sets
-# `ssl-mode=REQUIRED` in PERMISSIONS_DB_DSN never reaches it. We do not yet
-# force that, so the path stays reachable under misconfiguration.
-#
-# `rsa` 0.10 is published, but it requires the sqlx 0.9 upgrade path. sqlx 0.9
-# requires Rust 1.94 while this project declares MSRV 1.88, so the current
-# sqlx 0.8 dependency retains rsa 0.9.10. Keep this advisory ignored until the
-# project raises its MSRV to at least Rust 1.94 and upgrades sqlx; then remove
-# the ignore and re-resolve the dependency.
-[advisories]
-ignore = ["RUSTSEC-2023-0071"]
+# The `rsa` path is still reached only by the caching_sha2_password /
+# sha256_password handshake on a connection that is not already TLS-wrapped —
+# a PERMISSIONS_DB_DSN with `ssl-mode=REQUIRED` avoids it. That is a hardening
+# note, not an advisory: no `[advisories] ignore` entry covers it.

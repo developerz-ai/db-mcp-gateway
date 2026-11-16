@@ -5,7 +5,7 @@
 //! N-1 (which knows nothing of it) still inserts and reads on this schema.
 
 use sqlx::types::Json;
-use sqlx::{PgExecutor, PgPool};
+use sqlx::{AssertSqlSafe, PgExecutor, PgPool};
 
 /// A live registration as read back by [`touch_client`].
 #[derive(Debug, sqlx::FromRow)]
@@ -61,7 +61,7 @@ pub async fn insert_client_capped(
            expires_at = CASE WHEN oauth_clients.expires_at <= now() \
              THEN EXCLUDED.expires_at ELSE oauth_clients.expires_at END"
     );
-    let result = sqlx::query(&sql)
+    let result = sqlx::query(AssertSqlSafe(&sql))
         .bind(client_id)
         .bind(Json(redirect_uris))
         .bind(cap)

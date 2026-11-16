@@ -5,6 +5,7 @@
 
 use crate::common::env::state_pool;
 use db_mcp_gateway::audit;
+use sqlx::AssertSqlSafe;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -54,9 +55,9 @@ async fn grant(
 }
 
 async fn exists(p: &PgPool, table: &str, id: Uuid) -> bool {
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(AssertSqlSafe(&format!(
         "SELECT EXISTS (SELECT 1 FROM {table} WHERE id = $1)"
-    ))
+    )))
     .bind(id)
     .fetch_one(p)
     .await

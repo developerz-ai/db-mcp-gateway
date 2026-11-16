@@ -10,6 +10,7 @@ use crate::common::audit::assert_audit_outcome;
 use crate::common::gateway::{LoggedInGateway, spawn_logged_in};
 use crate::common::idp::MockUser;
 use serde_json::{Value, json};
+use sqlx::AssertSqlSafe;
 
 /// Same `target` server as the run_query e2e but no constraints — `explain`
 /// shouldn't need a row cap and we want any timeout out of the way.
@@ -225,11 +226,11 @@ async fn explain_plans_dml_under_a_write_grant() {
         .await
         .expect("target-db reachable; run `bin/dev up`");
     let table = format!("explain_dml_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE TABLE \"{table}\" (id bigint PRIMARY KEY)"))
+    sqlx::query(AssertSqlSafe(&format!("CREATE TABLE \"{table}\" (id bigint PRIMARY KEY)")))
         .execute(&target)
         .await
         .expect("create scratch table");
-    sqlx::query(&format!("INSERT INTO \"{table}\" VALUES (1)"))
+    sqlx::query(AssertSqlSafe(&format!("INSERT INTO \"{table}\" VALUES (1)")))
         .execute(&target)
         .await
         .expect("seed scratch row");
@@ -247,12 +248,12 @@ async fn explain_plans_dml_under_a_write_grant() {
     )
     .await;
 
-    let left: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{table}\""))
+    let left: i64 = sqlx::query_scalar(AssertSqlSafe(&format!("SELECT count(*) FROM \"{table}\"")))
         .fetch_one(&target)
         .await
         .unwrap();
     assert_eq!(left, 1, "plain EXPLAIN must not execute the DELETE");
-    sqlx::query(&format!("DROP TABLE \"{table}\""))
+    sqlx::query(AssertSqlSafe(&format!("DROP TABLE \"{table}\"")))
         .execute(&target)
         .await
         .expect("drop scratch table");

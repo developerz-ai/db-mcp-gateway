@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use serde_json::Value;
-use sqlx::{Column, Connection, Either, Executor, PgConnection, PgPool, Postgres, Transaction};
+use sqlx::{
+    AssertSqlSafe, Column, Connection, Either, Executor, PgConnection, PgPool, Postgres, Transaction,
+};
 
 use crate::audit::drain::DetachedTasks;
 
@@ -152,8 +154,9 @@ async fn stream_rows(
     let mut decoders_for_rows = Vec::new();
 
     // Unnamed statement: ad-hoc SQL must not accumulate in the connection's
-    // prepared-statement cache.
-    let mut sqlx_query = sqlx::query(query.sql).persistent(false);
+    // prepared-statement cache. The SQL is client-supplied by design, so the
+    // `SqlSafeStr` assertion is explicit here — this path is the gateway's job.
+    let mut sqlx_query = sqlx::query(AssertSqlSafe(query.sql)).persistent(false);
     for bind in query.binds {
         sqlx_query = sqlx_query.bind(*bind);
     }

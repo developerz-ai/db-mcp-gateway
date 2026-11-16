@@ -15,6 +15,7 @@ use crate::common::audit::latest_audit;
 use crate::common::gateway::{LoggedInGateway, spawn_logged_in};
 use crate::common::idp::MockUser;
 use serde_json::{Value, json};
+use sqlx::AssertSqlSafe;
 
 const PEER_TOKEN: &str =
     "dbmcp_svc_5555555555555555555555555555555555555555555555555555555555555555";
@@ -135,7 +136,7 @@ async fn table_stats_reports_a_table_and_is_audited() {
         .await
         .expect("target-db reachable; run `bin/dev up`");
     let table = format!("stats_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE TABLE \"{table}\" (id bigint PRIMARY KEY)"))
+    sqlx::query(AssertSqlSafe(&format!("CREATE TABLE \"{table}\" (id bigint PRIMARY KEY)")))
         .execute(&target)
         .await
         .expect("create scratch table");
@@ -158,7 +159,7 @@ async fn table_stats_reports_a_table_and_is_audited() {
     assert_eq!(row.outcome, "success");
     assert_eq!(row.sql.as_deref(), Some(format!("public.{table}").as_str()));
 
-    sqlx::query(&format!("DROP TABLE \"{table}\""))
+    sqlx::query(AssertSqlSafe(&format!("DROP TABLE \"{table}\"")))
         .execute(&target)
         .await
         .expect("drop scratch table");

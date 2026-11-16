@@ -10,6 +10,7 @@ use crate::common::gateway::{LoggedInGateway, spawn_logged_in};
 use crate::common::idp::MockUser;
 use crate::common::pg_target::ensure_read_role;
 use serde_json::{Value, json};
+use sqlx::AssertSqlSafe;
 
 const YAML: &str = r#"
 servers:
@@ -58,7 +59,7 @@ impl Fixture {
             .await
             .expect("target-db reachable; run `bin/dev up`");
         let table = format!("args_edge_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE TABLE \"{table}\" (v text)"))
+        sqlx::query(AssertSqlSafe(&format!("CREATE TABLE \"{table}\" (v text)")))
             .execute(&target)
             .await
             .expect("scratch table");
@@ -84,7 +85,7 @@ impl Fixture {
     }
 
     async fn rows(&self) -> i64 {
-        sqlx::query_scalar(&format!("SELECT count(*) FROM \"{}\"", self.table))
+        sqlx::query_scalar(AssertSqlSafe(&format!("SELECT count(*) FROM \"{}\"", self.table)))
             .fetch_one(&self.target)
             .await
             .unwrap()
@@ -103,7 +104,7 @@ impl Fixture {
     }
 
     async fn finish(self) {
-        sqlx::query(&format!("DROP TABLE \"{}\"", self.table))
+        sqlx::query(AssertSqlSafe(&format!("DROP TABLE \"{}\"", self.table)))
             .execute(&self.target)
             .await
             .expect("drop scratch table");

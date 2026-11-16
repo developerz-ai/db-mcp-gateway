@@ -9,6 +9,7 @@
 use std::time::{Duration, Instant};
 
 use sqlx::postgres::PgPoolOptions;
+use sqlx::AssertSqlSafe;
 use uuid::Uuid;
 
 use crate::common::pg_target::{
@@ -516,9 +517,9 @@ async fn zero_row_bound_query_still_reports_column_names() {
 /// pool (the adapter under test never runs DDL).
 async fn scratch_table(probe: &sqlx::PgPool) -> String {
     let table = format!("exec_safety_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(&format!(
         "CREATE TABLE \"{table}\" (id int PRIMARY KEY, v int NOT NULL DEFAULT 0)"
-    ))
+    )))
     .execute(probe)
     .await
     .expect("create scratch table");
@@ -526,7 +527,7 @@ async fn scratch_table(probe: &sqlx::PgPool) -> String {
 }
 
 async fn drop_table(probe: &sqlx::PgPool, table: &str) {
-    let _ = sqlx::query(&format!("DROP TABLE IF EXISTS \"{table}\""))
+    let _ = sqlx::query(AssertSqlSafe(&format!("DROP TABLE IF EXISTS \"{table}\"")))
         .execute(probe)
         .await;
 }
@@ -541,7 +542,7 @@ async fn read_access_cannot_write_on_a_write_capable_role() {
     let a = adapter().await;
     let probe = probe_pool().await;
     let seq = format!("exec_safety_seq_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE SEQUENCE \"{seq}\""))
+    sqlx::query(AssertSqlSafe(&format!("CREATE SEQUENCE \"{seq}\"")))
         .execute(&probe)
         .await
         .expect("create sequence");
@@ -571,7 +572,7 @@ async fn read_access_cannot_write_on_a_write_capable_role() {
         );
     }
 
-    let called: bool = sqlx::query_scalar(&format!("SELECT is_called FROM \"{seq}\""))
+    let called: bool = sqlx::query_scalar(AssertSqlSafe(&format!("SELECT is_called FROM \"{seq}\"")))
         .fetch_one(&probe)
         .await
         .expect("read sequence");
@@ -579,7 +580,7 @@ async fn read_access_cannot_write_on_a_write_capable_role() {
         .fetch_one(&probe)
         .await
         .expect("count large objects");
-    let _ = sqlx::query(&format!("DROP SEQUENCE \"{seq}\""))
+    let _ = sqlx::query(AssertSqlSafe(&format!("DROP SEQUENCE \"{seq}\"")))
         .execute(&probe)
         .await;
     assert!(!called, "nextval advanced the sequence under read access");
@@ -612,9 +613,9 @@ async fn truncated_write_commits_and_reports_rows_affected() {
         ))
         .await
         .expect("update runs");
-    let (rows, ones): (i64, i64) = sqlx::query_as(&format!(
+    let (rows, ones): (i64, i64) = sqlx::query_as(AssertSqlSafe(&format!(
         "SELECT count(*), count(*) FILTER (WHERE v = 1) FROM \"{table}\""
-    ))
+    )))
     .fetch_one(&probe)
     .await
     .expect("count rows");
@@ -857,14 +858,14 @@ async fn enum_values_decode_as_their_label() {
     let a = adapter().await;
     let probe = probe_pool().await;
     let ty = format!("exec_mood_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE TYPE \"{ty}\" AS ENUM ('happy', 'sad')"))
+    sqlx::query(AssertSqlSafe(&format!("CREATE TYPE \"{ty}\" AS ENUM ('happy', 'sad')")))
         .execute(&probe)
         .await
         .expect("create enum");
     let r = a
         .execute(query(&format!("SELECT 'sad'::\"{ty}\" AS mood"), None, 10))
         .await;
-    let _ = sqlx::query(&format!("DROP TYPE \"{ty}\""))
+    let _ = sqlx::query(AssertSqlSafe(&format!("DROP TYPE \"{ty}\"")))
         .execute(&probe)
         .await;
     assert_eq!(r.expect("query runs").rows[0][0], "sad");
@@ -924,7 +925,7 @@ async fn dry_run_reports_rows_affected_and_rolls_back() {
         })
         .await
         .expect("dry run executes");
-    let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{table}\""))
+    let rows: i64 = sqlx::query_scalar(AssertSqlSafe(&format!("SELECT count(*) FROM \"{table}\"")))
         .fetch_one(&probe)
         .await
         .expect("count rows");
@@ -976,7 +977,7 @@ async fn explain_analyzes_reads_and_only_plans_writes() {
         ))
         .await
         .expect_err("analyze of a write");
-    let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{table}\""))
+    let rows: i64 = sqlx::query_scalar(AssertSqlSafe(&format!("SELECT count(*) FROM \"{table}\"")))
         .fetch_one(&probe)
         .await
         .expect("count rows");
