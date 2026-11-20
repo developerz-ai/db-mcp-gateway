@@ -31,6 +31,9 @@
     "@types/react": "^19.3.0",
     "typescript": "~7.0.2"
   },
+  "overrides": {
+    "tinypool": "2.1.2"
+  },
   "browserslist": {
     "production": [
       ">0.5%",

@@ -36,6 +36,16 @@ pub async fn state_pool() -> PgPool {
         .expect("state DB up (run `bin/dev up`)")
 }
 
+/// Background-pool state DB: the connection class the pruner and the reaper
+/// run on in production (`state::connect_background`), so a batched sweep here
+/// gets the same 60 s statement ceiling it gets in the gateway. `state_pool`
+/// has already migrated by the time a test needs this.
+pub async fn background_state_pool() -> PgPool {
+    state::connect_background(&state_db_url())
+        .await
+        .expect("state DB up (run `bin/dev up`)")
+}
+
 /// Migrated MySQL permissions-store pool, five connections.
 pub async fn mysql_pool() -> MySqlPool {
     state::connect_permissions_mysql(&mysql_dsn(), TEST_POOL_SIZE)

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::common::audit::{DispatchSinks, calls_for_request, find_audit};
 use crate::common::cleanup::delete_audit_calls;
-use crate::common::env::state_pool;
+use crate::common::env::{background_state_pool, state_pool};
 use db_mcp_gateway::audit::intent::WRITE_MAY_HAVE_COMMITTED;
 use db_mcp_gateway::audit::reaper::{self, ReapCursor};
 use db_mcp_gateway::audit::{self, CallIntent, pruner};
@@ -203,7 +203,13 @@ async fn reaper_records_abandons_across_batch_boundaries() {
     let done_a = backdated_call(&p, &user, 2.0 * 3600.0, Some(0.5)).await;
     let done_b = backdated_call(&p, &user, 2.0 * 3600.0, Some(0.5)).await;
 
-    let reaped = reaper::run_once(&p, grace, &mut ReapCursor::default())
+    // The sweep runs on the background pool, as `startup::background` spawns it
+    // in the gateway: `REAP_BATCH_ROWS` is sized against that pool's 60 s
+    // statement ceiling (`state::connect_background`), not the request pool's
+    // 10 s one. Driving it on `p` here made a two-batch volume sweep race a
+    // ceiling production never applies to it.
+    let background = background_state_pool().await;
+    let reaped = reaper::run_once(&background, grace, &mut ReapCursor::default())
         .await
         .expect("bounded sweep runs")
         .expect("a lone replica holds the reaper lock and sweeps");
