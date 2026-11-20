@@ -32,6 +32,7 @@
     "typescript": "~7.0.2"
   },
   "overrides": {
+    "joi": "17.13.7",
     "tinypool": "2.1.2"
   },
   "browserslist": {
