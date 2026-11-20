@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::common::audit::{DispatchSinks, calls_for_request, find_audit};
 use crate::common::cleanup::delete_audit_calls;
-use crate::common::env::state_pool;
+use crate::common::env::{state_db_url, state_pool};
 use db_mcp_gateway::audit::intent::WRITE_MAY_HAVE_COMMITTED;
 use db_mcp_gateway::audit::reaper::{self, ReapCursor};
 use db_mcp_gateway::audit::{self, CallIntent, pruner};
@@ -175,7 +175,12 @@ async fn reaper_cursor_resumes_without_rescanning_or_skipping() {
 #[tokio::test]
 #[serial_test::serial(world)]
 async fn reaper_records_abandons_across_batch_boundaries() {
-    let p = state_pool().await;
+    // Production runs the reaper on the background pool, whose 60 s statement
+    // timeout covers a 10,000-row batch. The request pool's 10 s ceiling does
+    // not; use the same pool the reaper runs on in deployment.
+    let p = db_mcp_gateway::state::connect_background(&state_db_url())
+        .await
+        .expect("state DB up (run `bin/dev up`)");
     let user = format!("integrity-batch-{}", Uuid::new_v4().simple());
     let token = Uuid::new_v4().simple().to_string();
     let grace = Duration::from_secs(3600);
