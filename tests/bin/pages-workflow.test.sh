@@ -75,10 +75,14 @@ check_contract() {
     assert_has "$label denylist" "$file" "$pattern"
   done
   assert_has "$label" "$file" '-iname'
-  # The find status must be captured directly. Process substitution runs find
-  # in a subshell, so its status is lost and an unreadable build passes.
-  assert_has "$label" "$file" 'status=$?'
+  # Run from website so `build` always means `website/build`. `find` must run
+  # in a conditional: process substitution loses its status and turns a scan
+  # error into an empty result.
+  assert_has "$label" "$file" 'working-directory: website'
+  assert_has "$label" "$file" 'if ! findings=$(find build'
   assert_lacks "$label" "$file" '< <('
+  assert_lacks "$label" "$file" 'status=$?'
+  assert_has "$label" "$file" 'Unable to scan Pages artifact'
   assert_has "$label" "$file" 'exit 1'
   # -print -quit bounds the guard's own output to one path, and the failure
   # branch prints a fixed message rather than the offending asset's contents.
@@ -93,6 +97,67 @@ check_contract() {
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+
+guard_body=$(cat <<'SH'
+set -euo pipefail
+if ! findings=$(find build -type f \
+  \( -iname '*.yaml' -o -iname '*.yml' \
+     -o -iname '*.env' -o -iname '.env.*' \
+     -o -iname '*.pem' -o -iname '*.key' \
+     -o -iname '*.toml' -o -iname '*.sql' \) -print -quit 2>/dev/null); then
+  printf '%s\n' 'Unable to scan Pages artifact'
+  exit 1
+fi
+if [[ -n $findings ]]; then
+  printf '%s\n' 'Refusing to publish sensitive/config assets'
+  exit 1
+fi
+SH
+)
+
+run_guard() {
+  local label=$1 expected=$2 directory=$3 guard=$4
+  local output="$work/$label.output" rc=0
+  shift 4
+  (cd "$directory" && "$@" bash "$guard") > "$output" 2>&1 || rc=$?
+  if [[ $rc == "$expected" ]]; then ok; else bad "$label: expected exit $expected, got $rc"; fi
+}
+
+assert_guard_output() {
+  local label=$1 expected=$2 unexpected=$3
+  local output="$work/$label.output"
+  assert_has "$label" "$output" "$expected"
+  assert_lacks "$label" "$output" "$unexpected"
+}
+
+exercise_guard() {
+  local kind=$1
+  local root="$work/$kind" guard="$work/$kind-guard.sh"
+  mkdir -p "$root/build" "$root/website/build"
+  printf '%s\n' "$guard_body" > "$guard"
+  touch "$root/build/root-only.sql" "$root/website/build/index.html"
+
+  # A root-level denylisted file must not affect the clean website artifact.
+  run_guard "$kind clean" 0 "$root/website" "$guard" env
+  assert_lacks "$kind clean" "$work/$kind clean.output" 'root-only.sql'
+
+  touch "$root/website/build/secret.env"
+  run_guard "$kind denylisted" 1 "$root/website" "$guard" env
+  assert_guard_output "$kind denylisted" 'Refusing to publish sensitive/config assets' 'secret.env'
+  rm "$root/website/build/secret.env"
+
+  rm -rf "$root/website/build"
+  run_guard "$kind missing directory" 1 "$root/website" "$guard" env
+  assert_guard_output "$kind missing directory" 'Unable to scan Pages artifact' 'No such file'
+
+  mkdir "$root/website/build"
+  mkdir -p "$work/scanner-error"
+  printf '#!/usr/bin/env bash\nexit 42\n' > "$work/scanner-error/find"
+  chmod +x "$work/scanner-error/find"
+  run_guard "$kind scanner error" 1 "$root/website" "$guard" \
+    env "PATH=$work/scanner-error:$PATH"
+  assert_guard_output "$kind scanner error" 'Unable to scan Pages artifact' 'index.html'
+}
 
 # The broken fixture is run 44838727519: upload and deploy in one job, no
 # needs, no explicit artifact name on the consuming side.
@@ -118,12 +183,14 @@ jobs:
       - run: npm run build
         working-directory: website
       - name: Guard Pages artifact against sensitive assets
+        working-directory: website
         run: |
-          set +e
-          findings=$(find build -type f \( -iname '*.yaml' -o -iname '*.yml' -o -iname '*.env' -o -iname '.env.*' -o -iname '*.pem' -o -iname '*.key' -o -iname '*.toml' -o -iname '*.sql' \) -print -quit)
-          status=$?
-          if [[ $status -eq 0 && -n $findings ]]; then
-            echo "Refusing to publish sensitive/config assets"
+          if ! findings=$(find build -type f \( -iname '*.yaml' -o -iname '*.yml' -o -iname '*.env' -o -iname '.env.*' -o -iname '*.pem' -o -iname '*.key' -o -iname '*.toml' -o -iname '*.sql' \) -print -quit 2>/dev/null); then
+            printf '%s\n' 'Unable to scan Pages artifact'
+            exit 1
+          fi
+          if [[ -n $findings ]]; then
+            printf '%s\n' 'Refusing to publish sensitive/config assets'
             exit 1
           fi
       - uses: actions/configure-pages@1234567890abcdef1234567890abcdef12345678
@@ -156,12 +223,14 @@ jobs:
       - run: npm run build
         working-directory: website
       - name: Guard Pages artifact against sensitive assets
+        working-directory: website
         run: |
-          set +e
-          findings=$(find build -type f \( -iname '*.yaml' -o -iname '*.yml' -o -iname '*.env' -o -iname '.env.*' -o -iname '*.pem' -o -iname '*.key' -o -iname '*.toml' -o -iname '*.sql' \) -print -quit)
-          status=$?
-          if [[ $status -eq 0 && -n $findings ]]; then
-            echo "Refusing to publish sensitive/config assets"
+          if ! findings=$(find build -type f \( -iname '*.yaml' -o -iname '*.yml' -o -iname '*.env' -o -iname '.env.*' -o -iname '*.pem' -o -iname '*.key' -o -iname '*.toml' -o -iname '*.sql' \) -print -quit 2>/dev/null); then
+            printf '%s\n' 'Unable to scan Pages artifact'
+            exit 1
+          fi
+          if [[ -n $findings ]]; then
+            printf '%s\n' 'Refusing to publish sensitive/config assets'
             exit 1
           fi
       - uses: actions/configure-pages@1234567890abcdef1234567890abcdef12345678
@@ -204,9 +273,17 @@ fi
 # failure.
 check_contract 'fixed' "$work/fixed.yml"
 check_contract 'broken' "$work/broken.yml"
+exercise_guard broken
+exercise_guard fixed
 
-# No real-workflow grading here: the protected workflow is repaired by an
-# owner as a separate handoff, and this gate must stay green until then.
+# Fixtures prove the guard. The deployed workflow remains the contract, so it
+# must retain both the artifact handoff and the fail-closed guard.
+if fixed_layout .github/workflows/pages.yml; then
+  ok
+else
+  bad 'pages workflow: expected build/deploy artifact handoff'
+fi
+check_contract 'pages workflow' .github/workflows/pages.yml
 
 printf 'pages artifact-handoff: %s passed, %s failed\n' "$pass" "$failed"
 if (( failed > 0 )); then exit 1; fi

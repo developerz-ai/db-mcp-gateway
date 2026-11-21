@@ -125,9 +125,9 @@ github-pages`. Both sides name the artifact explicitly and the upload finishes
 before deployment starts.
 
 `tests/bin/pages-workflow.test.sh` pins this handoff locally with broken and
-fixed fixtures. `bin/ci` runs it after the doc-anchor guard. The workflow file
-is a protected merge-gate file; the repair to it is tracked separately from
-this regression.
+fixed fixtures, exercises the guard against clean, denylisted and scanner-error
+artifacts, then checks the deployed workflow itself. `bin/ci` runs it after the
+doc-anchor guard.
 
 ```bash
 NOT RUN: pages typecheck/build/artifact guard - website dependencies are absent (prepare: cd website && npm ci)
@@ -146,9 +146,10 @@ health failure, so the platform blames the change and not the box.
 
 The gate performs no installation: `bin/setup` does not install website
 dependencies or cargo-audit; prepare both separately. The artifact scanner must
-preserve its own failure status rather than hiding it behind process
-substitution or treating errors as an empty result. Diagnostics must not
-disclose sensitive file contents or token-scanner output.
+fail on its own error rather than hiding it behind process substitution or
+treating errors as an empty result. The guard runs with `website/` as its
+working directory, so its `build` path is always `website/build/`. Diagnostics
+must not disclose sensitive file contents or token-scanner output.
 
 The SHA-pin scan checks each grep's status on its own, so its stages are not
 one pipeline: as a pipeline, a read error (grep exits 2) in the first stage
