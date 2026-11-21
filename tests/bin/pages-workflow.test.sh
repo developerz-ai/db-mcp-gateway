@@ -349,9 +349,16 @@ PY
   fi
 fi
 
-# The workflow is a protected merge-gate file. The fixed fixture is the exact
-# owner handoff, while the broken fixture prevents this test from accepting the
-# former single-job layout. Both fixtures' extracted guards are executed above.
+# Fixtures prove that these assertions distinguish the former single-job layout
+# from the repaired handoff. Apply them unconditionally to the checked-in
+# workflow too, so a regression in the Pages handoff or asset guard fails this
+# gate rather than being hidden by the fixtures.
+if fixed_layout .github/workflows/pages.yml; then
+  ok
+else
+  bad 'workflow: must use the two-job Pages artifact handoff'
+fi
+check_contract 'workflow' .github/workflows/pages.yml
 
 printf 'pages artifact-handoff: %s passed, %s failed\n' "$pass" "$failed"
 if (( failed > 0 )); then exit 1; fi
