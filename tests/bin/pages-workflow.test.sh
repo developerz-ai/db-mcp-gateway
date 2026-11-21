@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# Pin the Pages build/deploy artifact-handoff contract with local fixtures:
+# .github/workflows/pages.yml is a protected merge-gate file, so the repair is
+# a handoff for an owner. These fixtures stay self-contained and green on the
+# unrepaired checkout; the owner's workflow edit is gated by its own checks.
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+
+pass=0
+failed=0
+
+ok() {
+  pass=$((pass + 1))
+}
+
+bad() {
+  printf 'FAIL: %s\n' "$1"
+  failed=$((failed + 1))
+}
+
+assert_has() {
+  local label=$1 file=$2 needle=$3
+  if grep -qF -- "$needle" "$file"; then ok; else bad "$label: missing '$needle'"; fi
+}
+
+assert_lacks() {
+  local label=$1 file=$2 needle=$3
+  if grep -qF -- "$needle" "$file"; then bad "$label: unexpected '$needle'"; else ok; fi
+}
+
+assert_file_equals() {
+  local label=$1 file=$2 expected=$3 actual
+  actual=$(<"$file")
+  if [[ $actual == "$expected" ]]; then
+    ok
+  else
+    bad "$label: expected only '$expected', got '$actual'"
+  fi
+}
+
+# Order matters: the guard has to run on the same tree that gets uploaded.
+guard_precedes_upload() {
+  local file=$1 guard upload
+  guard=$(grep -nF 'Guard Pages artifact against sensitive assets' "$file" | head -n 1 | cut -d: -f1)
+  upload=$(grep -nF 'actions/upload-pages-artifact@' "$file" | head -n 1 | cut -d: -f1)
+  [[ -n $guard && -n $upload && $guard -lt $upload ]]
+}
+
+# deploy must be a separate job that waits for the upload to finish; the
+# v5.0.1 deploy-pages client lists artifacts once, with no retry.
+fixed_layout() {
+  local file=$1
+  grep -qF 'needs: build' "$file" &&
+    grep -qF 'build:' "$file" &&
+    grep -qF 'deploy:' "$file" &&
+    grep -qF 'actions/upload-pages-artifact@' "$file" &&
+    grep -qF 'actions/deploy-pages@' "$file" &&
+    guard_precedes_upload "$file" &&
+    grep -qF 'name: github-pages' "$file" &&
+    grep -qF 'artifact_name: github-pages' "$file" &&
+    grep -qF 'path: website/build' "$file"
+}
+
+check_contract() {
+  local label=$1 file=$2
+  assert_has "$label" "$file" 'actions/checkout@'
+  assert_has "$label" "$file" 'npm ci'
+  assert_has "$label" "$file" 'npm run typecheck'
+  assert_has "$label" "$file" 'npm run build'
+  assert_has "$label" "$file" 'Guard Pages artifact against sensitive assets'
+  assert_has "$label" "$file" 'actions/configure-pages@'
+  assert_has "$label" "$file" 'actions/upload-pages-artifact@'
+  assert_has "$label" "$file" 'actions/deploy-pages@'
+  assert_has "$label" "$file" 'github.event_name != '"'"'pull_request'"'"''
+  assert_has "$label" "$file" 'permissions:'
+  assert_has "$label" "$file" 'id-token: write'
+  assert_has "$label" "$file" 'name: github-pages'
+  assert_has "$label" "$file" 'path: website/build'
+  if guard_precedes_upload "$file"; then ok; else bad "$label: guard must precede upload"; fi
+
+  # The eight case-insensitive denylist extensions are the whole guard. Drop
+  # any one and a sensitive asset could be published.
+  local pattern
+  for pattern in '*.yaml' '*.yml' '*.env' '.env.*' '*.pem' '*.key' '*.toml' '*.sql'; do
+    assert_has "$label denylist" "$file" "$pattern"
+  done
+  assert_has "$label" "$file" '-iname'
+  # Run from website so `build` always means `website/build`. `find` must run
+  # in a conditional: process substitution loses its status and turns a scan
+  # error into an empty result.
+  assert_has "$label" "$file" 'working-directory: website'
+  assert_has "$label" "$file" 'if ! findings=$(find build'
+  assert_lacks "$label" "$file" '< <('
+  assert_has "$label" "$file" 'Unable to scan Pages artifact'
+  assert_has "$label" "$file" 'exit 1'
+  # -print -quit bounds the guard's own output to one path, and the failure
+  # branch prints a fixed message rather than the offending asset's contents.
+  assert_has "$label" "$file" '-print -quit'
+  assert_has "$label" "$file" 'Refusing to publish sensitive/config assets'
+  # The broken single-job fixture intentionally omits the consumer-side name;
+  # only the repaired handoff is required to pin it.
+  if [[ $label == fixed ]]; then
+    assert_has "$label" "$file" 'artifact_name: github-pages'
+  fi
+}
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+# Exercise the YAML that the static assertions inspect. Keeping a second copy of
+# the shell guard here let broken fixtures pass while this unrelated copy kept
+# failing closed.
+extract_guard() {
+  local file=$1 destination=$2
+  awk '
+    function indentation(line) {
+      match(line, /[^[:space:]]/)
+      return RSTART ? RSTART - 1 : length(line)
+    }
+    /^[[:space:]]*-[[:space:]]+name:[[:space:]]+Guard Pages artifact against sensitive assets[[:space:]]*$/ {
+      guard_step = 1
+      next
+    }
+    guard_step && /^[[:space:]]+run:[[:space:]]*\|[[:space:]]*$/ {
+      run_indentation = indentation($0)
+      in_run_block = 1
+      next
+    }
+    in_run_block {
+      if ($0 !~ /^[[:space:]]*$/ && indentation($0) <= run_indentation) {
+        exit
+      }
+      print substr($0, run_indentation + 3)
+    }
+  ' "$file" > "$destination"
+  if [[ ! -s $destination ]]; then
+    bad "$file: could not extract Pages artifact guard"
+  fi
+}
+
+guard_working_directory() {
+  local file=$1
+  awk '
+    /^[[:space:]]*-[[:space:]]+name:[[:space:]]+Guard Pages artifact against sensitive assets[[:space:]]*$/ {
+      guard_step = 1
+      next
+    }
+    guard_step && /^[[:space:]]+working-directory:[[:space:]]+/ {
+      sub(/^[^:]*:[[:space:]]*/, "")
+      print
+      exit
+    }
+    guard_step && /^[[:space:]]*-[[:space:]]+/ {
+      exit
+    }
+  ' "$file"
+}
+
+run_guard() {
+  local label=$1 expected=$2 directory=$3 guard=$4
+  local output="$work/$label.output" rc=0
+  shift 4
+  (cd "$directory" && "$@" bash "$guard") > "$output" 2>&1 || rc=$?
+  if [[ $rc == "$expected" ]]; then ok; else bad "$label: expected exit $expected, got $rc"; fi
+}
+
+assert_guard_output() {
+  local label=$1 expected=$2
+  local output="$work/$label.output"
+  assert_file_equals "$label" "$output" "$expected"
+}
+
+exercise_guard() {
+  local kind=$1 fixture=$2
+  local root="$work/$kind" guard="$work/$kind-guard.sh" working_directory
+  extract_guard "$fixture" "$guard"
+  working_directory=$(guard_working_directory "$fixture")
+  if [[ -z $working_directory ]]; then
+    bad "$kind: guard must configure its working directory"
+    return
+  fi
+  mkdir -p "$root/build" "$root/website/build"
+  touch "$root/build/root-only.sql" "$root/website/build/index.html"
+
+  # A root-level denylisted file must not affect the clean website artifact.
+  run_guard "$kind clean" 0 "$root/$working_directory" "$guard" env
+  assert_file_equals "$kind clean" "$work/$kind clean.output" ''
+
+  touch "$root/website/build/secret.env"
+  run_guard "$kind denylisted" 1 "$root/$working_directory" "$guard" env
+  assert_guard_output "$kind denylisted" 'Refusing to publish sensitive/config assets'
+  rm "$root/website/build/secret.env"
+
+  rm -rf "$root/website/build"
+  run_guard "$kind missing directory" 1 "$root/$working_directory" "$guard" env
+  assert_guard_output "$kind missing directory" 'Unable to scan Pages artifact'
+
+  mkdir "$root/website/build"
+  mkdir -p "$work/scanner-error"
+  printf '#!/usr/bin/env bash\nexit 42\n' > "$work/scanner-error/find"
+  chmod +x "$work/scanner-error/find"
+  run_guard "$kind scanner error" 1 "$root/$working_directory" "$guard" \
+    env "PATH=$work/scanner-error:$PATH"
+  assert_guard_output "$kind scanner error" 'Unable to scan Pages artifact'
+}
+
+# The broken fixture is run 44838727519: upload and deploy in one job, no
+# needs, no explicit artifact name on the consuming side.
+cat > "$work/broken.yml" <<'YAML'
+on: push
+jobs:
+  deploy:
+    if: github.event_name != 'pull_request'
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+    steps:
+      - uses: actions/checkout@1234567890abcdef1234567890abcdef12345678
+      - uses: actions/setup-node@1234567890abcdef1234567890abcdef12345678
+        with:
+          node-version: '20'
+      - run: npm ci
+        working-directory: website
+      - run: npm run typecheck
+        working-directory: website
+      - run: npm run build
+        working-directory: website
+      - name: Guard Pages artifact against sensitive assets
+        working-directory: website
+        run: |
+          if ! findings=$(find build -type f \( -iname '*.yaml' -o -iname '*.yml' -o -iname '*.env' -o -iname '.env.*' -o -iname '*.pem' -o -iname '*.key' -o -iname '*.toml' -o -iname '*.sql' \) -print -quit 2>/dev/null); then
+            printf '%s\n' 'Unable to scan Pages artifact'
+            exit 1
+          fi
+          if [[ -n $findings ]]; then
+            printf '%s\n' 'Refusing to publish sensitive/config assets'
+            exit 1
+          fi
+      - uses: actions/configure-pages@1234567890abcdef1234567890abcdef12345678
+      - uses: actions/upload-pages-artifact@1234567890abcdef1234567890abcdef12345678
+        with:
+          name: github-pages
+          path: website/build
+      - uses: actions/deploy-pages@1234567890abcdef1234567890abcdef12345678
+YAML
+
+# The fixed fixture is the repair owners must apply to the protected workflow:
+# a build job that owns the guard and upload, and a deploy job that waits.
+cat > "$work/fixed.yml" <<'YAML'
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@1234567890abcdef1234567890abcdef12345678
+      - uses: actions/setup-node@1234567890abcdef1234567890abcdef12345678
+        with:
+          node-version: '20'
+      - run: npm ci
+        working-directory: website
+      - run: npm run typecheck
+        working-directory: website
+      - run: npm run build
+        working-directory: website
+      - name: Guard Pages artifact against sensitive assets
+        working-directory: website
+        run: |
+          if ! findings=$(find build -type f \( -iname '*.yaml' -o -iname '*.yml' -o -iname '*.env' -o -iname '.env.*' -o -iname '*.pem' -o -iname '*.key' -o -iname '*.toml' -o -iname '*.sql' \) -print -quit 2>/dev/null); then
+            printf '%s\n' 'Unable to scan Pages artifact'
+            exit 1
+          fi
+          if [[ -n $findings ]]; then
+            printf '%s\n' 'Refusing to publish sensitive/config assets'
+            exit 1
+          fi
+      - uses: actions/configure-pages@1234567890abcdef1234567890abcdef12345678
+      - uses: actions/upload-pages-artifact@1234567890abcdef1234567890abcdef12345678
+        with:
+          name: github-pages
+          path: website/build
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request'
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/configure-pages@1234567890abcdef1234567890abcdef12345678
+      - id: deployment
+        uses: actions/deploy-pages@1234567890abcdef1234567890abcdef12345678
+        with:
+          artifact_name: github-pages
+YAML
+
+if fixed_layout "$work/broken.yml"; then
+  bad 'broken fixture: single-job upload/deploy must be rejected'
+else
+  ok
+fi
+if fixed_layout "$work/fixed.yml"; then
+  ok
+else
+  bad 'fixed fixture: two-job handoff must be accepted'
+fi
+
+# The fixed fixture is the full contract. The broken one fails the handoff but
+# still has to keep every guard, so check_contract is applied to it too: a
+# change that weakens the denylist cannot hide behind an already-known layout
+# failure.
+check_contract 'fixed' "$work/fixed.yml"
+check_contract 'broken' "$work/broken.yml"
+exercise_guard broken "$work/broken.yml"
+exercise_guard fixed "$work/fixed.yml"
+
+# Mutation-test the scanner-error branch itself. Static checks can still find an
+# unrelated `exit 1`, so run a copy whose fixed fixture fails open and require
+# this test to reject it through the extracted YAML guard.
+if [[ ${PAGES_WORKFLOW_SKIP_MUTATION_TEST:-} != 1 ]]; then
+  mutant="$work/pages-workflow-scanner-error-exit-zero.test.sh"
+  python3 - "$0" "$mutant" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text()
+fixed_fixture = "# The fixed fixture is the repair owners must apply"
+prefix, suffix = source.split(fixed_fixture, 1)
+old = "            exit 1\n          fi\n          if [[ -n $findings ]]"
+new = "            exit 0\n          fi\n          if [[ -n $findings ]]"
+if old not in suffix:
+    raise SystemExit("could not mutate the fixed fixture scanner-error branch")
+Path(sys.argv[2]).write_text(prefix + fixed_fixture + suffix.replace(old, new, 1))
+PY
+  mutation_output="$work/scanner-error-exit-zero-mutation.output"
+  if PAGES_WORKFLOW_SKIP_MUTATION_TEST=1 bash "$mutant" > "$mutation_output" 2>&1; then
+    bad 'scanner-error exit-zero mutation: test must reject a fail-open guard'
+  elif grep -qF 'fixed scanner error: expected exit 1, got 0' "$mutation_output"; then
+    ok
+  else
+    bad 'scanner-error exit-zero mutation: test failed for the wrong reason'
+  fi
+fi
+
+# Fixtures prove that these assertions distinguish the former single-job layout
+# from the repaired handoff. Apply them unconditionally to the checked-in
+# workflow too, so a regression in the Pages handoff or asset guard fails this
+# gate rather than being hidden by the fixtures.
+if fixed_layout .github/workflows/pages.yml; then
+  ok
+else
+  bad 'workflow: must use the two-job Pages artifact handoff'
+fi
+check_contract 'workflow' .github/workflows/pages.yml
+
+printf 'pages artifact-handoff: %s passed, %s failed\n' "$pass" "$failed"
+if (( failed > 0 )); then exit 1; fi

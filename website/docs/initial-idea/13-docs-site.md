@@ -69,8 +69,8 @@ files under `website/static/` get copied verbatim.
 
 ## Guardrails
 
-`.github/workflows/pages.yml` enforces the contract in one post-build step
-before `actions/upload-pages-artifact`:
+`.github/workflows/pages.yml` enforces the contract in a post-build step inside
+the `build` job, before `actions/upload-pages-artifact`:
 
 **Fail on unexpected sensitive/config assets** — scan `website/build/` for
 files with extensions in a denylist (`.yaml`, `.yml`, `.env`, `.env.*`,
@@ -103,6 +103,32 @@ environment blocker: it reports a `NOT RUN:` notice naming the job, the reason
 and the command that enables it, and every other job is still graded, so the
 gate reaches a verdict on a box without Node dependencies:
 
+### Build/deploy artifact handoff
+
+Run 44838727519 on `d7e489d7` built the site and uploaded the `github-pages`
+artifact (id 14680230199, 1,079,030 bytes), but `deploy-pages` failed in the
+same second with `No artifacts named "github-pages" were found for this
+workflow run`. The guard step succeeded; the printf in its failure branch was
+never reached. The workflow was unchanged from the previous successful push.
+The cause is a visibility race: `actions/deploy-pages@fc324d3` lists artifacts
+once with no retry, so a deploy step immediately after the upload step cannot
+rely on the artifact being visible yet.
+
+The repaired workflow uses two jobs. A `build` job runs on every event and owns
+checkout, `setup-node` 20, `npm ci`, `npm run typecheck`, `npm run build`, the
+sensitive/config-asset guard below, `configure-pages`, and
+`upload-pages-artifact` with `name: github-pages` and `path: website/build`.
+The `deploy` job declares `needs: build`, keeps `if: github.event_name !=
+'pull_request'`, the `pages: write` and `id-token: write` permissions and the
+`github-pages` environment/url, and calls `deploy-pages` with `artifact_name:
+github-pages`. Both sides name the artifact explicitly and the upload finishes
+before deployment starts.
+
+`tests/bin/pages-workflow.test.sh` pins this handoff locally with broken and
+fixed fixtures, exercises the guard against clean, denylisted and scanner-error
+artifacts, then checks the deployed workflow itself. `bin/ci` runs it after the
+doc-anchor guard.
+
 ```bash
 NOT RUN: pages typecheck/build/artifact guard - website dependencies are absent (prepare: cd website && npm ci)
 ```
@@ -120,9 +146,10 @@ health failure, so the platform blames the change and not the box.
 
 The gate performs no installation: `bin/setup` does not install website
 dependencies or cargo-audit; prepare both separately. The artifact scanner must
-preserve its own failure status rather than hiding it behind process
-substitution or treating errors as an empty result. Diagnostics must not
-disclose sensitive file contents or token-scanner output.
+fail on its own error rather than hiding it behind process substitution or
+treating errors as an empty result. The guard runs with `website/` as its
+working directory, so its `build` path is always `website/build/`. Diagnostics
+must not disclose sensitive file contents or token-scanner output.
 
 The SHA-pin scan checks each grep's status on its own, so its stages are not
 one pipeline: as a pipeline, a read error (grep exits 2) in the first stage

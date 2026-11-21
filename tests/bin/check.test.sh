@@ -24,6 +24,11 @@ fixture() {
   # website/docs tree, and the guard passes on a missing tree — which is
   # what lets the happy path below reach a verdict.
   cp tests/bin/doc-anchors.test.sh "$work/repo/tests/bin/"
+  # The Pages artifact-handoff regression is invoked by the gate, so the
+  # fixture logs the call instead of running the real workflow checker. It
+  # only sees the fixture's minimal ci.yml, not the real pages.yml.
+  printf 'echo "pages workflow artifact-handoff regression" >> "$CALLS"\n' \
+    > "$work/repo/tests/bin/pages-workflow.test.sh"
   # One pinned ref and one local action: both halves of the SHA-pin scan's
   # filtering must accept them, or the clean run below fails.
   cat > "$work/repo/.github/workflows/ci.yml" <<'WORKFLOW'
@@ -194,6 +199,8 @@ assert_output 'passed, 0 failed'
 # The doc-anchor guard ran too: the gate invokes it, so the fixture must
 # prove the wiring, not just that the script was copied.
 assert_output 'no website/docs tree — nothing to check (pass)'
+# The artifact-handoff regression ran too: the gate's own stage must invoke it.
+called 'pages workflow artifact-handoff regression'
 # Every job ran: the summary must claim no skip.
 assert_output '✓ Local quality checks passed (no publishing or deployment)'
 not_called 'ps --status running'
@@ -304,7 +311,7 @@ done
 fixture
 run_gate 42 FAIL_AT='cargo fmt --all -- --check'
 assert_output 'Jobs not reached'
-for job in 'test' 'cargo audit' 'secret-scan' 'doc-anchor guard' 'pages typecheck/build/artifact guard'; do
+for job in 'test' 'cargo audit' 'secret-scan' 'doc-anchor guard' 'pages artifact-handoff regression' 'pages typecheck/build/artifact guard'; do
   assert_not_run "NOT RUN: $job - the gate stopped before this job"
 done
 
@@ -393,7 +400,7 @@ fixture
 printf 'exit 44\n' > "$work/repo/tests/bin/check.test.sh"
 run_gate 44
 # Stopping at the FIRST job names every job the gate never reached.
-for job in 'fmt + clippy' 'test' 'cargo audit' 'secret-scan' 'doc-anchor guard' 'pages typecheck/build/artifact guard'; do
+for job in 'fmt + clippy' 'test' 'cargo audit' 'secret-scan' 'doc-anchor guard' 'pages artifact-handoff regression' 'pages typecheck/build/artifact guard'; do
   assert_not_run "NOT RUN: $job - the gate stopped before this job"
 done
 # A VALID fragment resolves and the gate passes. The double-hyphen target is
