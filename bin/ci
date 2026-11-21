@@ -39,6 +39,7 @@ pending_jobs=(
   'cargo audit'
   'secret-scan'
   'doc-anchor guard'
+  'pages artifact-handoff regression'
   'pages typecheck/build/artifact guard'
 )
 
@@ -225,6 +226,12 @@ job_reached 'doc-anchor guard'
 # build renders (spec 13) and fails when one matches nothing. Path links
 # stay with onBrokenLinks / onBrokenMarkdownLinks.
 bash tests/bin/doc-anchors.test.sh
+
+echo '→ pages artifact-handoff regression'
+job_reached 'pages artifact-handoff regression'
+# Pins the Pages upload/deploy contract: deploy waits for a separate build job
+# that runs the sensitive-asset guard before uploading a named artifact.
+bash tests/bin/pages-workflow.test.sh
 
 echo '→ website typecheck, build and Pages artifact guard'
 job_reached 'pages typecheck/build/artifact guard'
