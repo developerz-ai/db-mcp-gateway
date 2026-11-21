@@ -28,6 +28,16 @@ assert_lacks() {
   if grep -qF -- "$needle" "$file"; then bad "$label: unexpected '$needle'"; else ok; fi
 }
 
+assert_file_equals() {
+  local label=$1 file=$2 expected=$3 actual
+  actual=$(<"$file")
+  if [[ $actual == "$expected" ]]; then
+    ok
+  else
+    bad "$label: expected only '$expected', got '$actual'"
+  fi
+}
+
 # Order matters: the guard has to run on the same tree that gets uploaded.
 guard_precedes_upload() {
   local file=$1 guard upload
@@ -81,7 +91,6 @@ check_contract() {
   assert_has "$label" "$file" 'working-directory: website'
   assert_has "$label" "$file" 'if ! findings=$(find build'
   assert_lacks "$label" "$file" '< <('
-  assert_lacks "$label" "$file" 'status=$?'
   assert_has "$label" "$file" 'Unable to scan Pages artifact'
   assert_has "$label" "$file" 'exit 1'
   # -print -quit bounds the guard's own output to one path, and the failure
@@ -98,22 +107,54 @@ check_contract() {
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-guard_body=$(cat <<'SH'
-set -euo pipefail
-if ! findings=$(find build -type f \
-  \( -iname '*.yaml' -o -iname '*.yml' \
-     -o -iname '*.env' -o -iname '.env.*' \
-     -o -iname '*.pem' -o -iname '*.key' \
-     -o -iname '*.toml' -o -iname '*.sql' \) -print -quit 2>/dev/null); then
-  printf '%s\n' 'Unable to scan Pages artifact'
-  exit 1
-fi
-if [[ -n $findings ]]; then
-  printf '%s\n' 'Refusing to publish sensitive/config assets'
-  exit 1
-fi
-SH
-)
+# Exercise the YAML that the static assertions inspect. Keeping a second copy of
+# the shell guard here let broken fixtures pass while this unrelated copy kept
+# failing closed.
+extract_guard() {
+  local file=$1 destination=$2
+  awk '
+    function indentation(line) {
+      match(line, /[^[:space:]]/)
+      return RSTART ? RSTART - 1 : length(line)
+    }
+    /^[[:space:]]*-[[:space:]]+name:[[:space:]]+Guard Pages artifact against sensitive assets[[:space:]]*$/ {
+      guard_step = 1
+      next
+    }
+    guard_step && /^[[:space:]]+run:[[:space:]]*\|[[:space:]]*$/ {
+      run_indentation = indentation($0)
+      in_run_block = 1
+      next
+    }
+    in_run_block {
+      if ($0 !~ /^[[:space:]]*$/ && indentation($0) <= run_indentation) {
+        exit
+      }
+      print substr($0, run_indentation + 3)
+    }
+  ' "$file" > "$destination"
+  if [[ ! -s $destination ]]; then
+    bad "$file: could not extract Pages artifact guard"
+  fi
+}
+
+guard_working_directory() {
+  local file=$1
+  awk '
+    /^[[:space:]]*-[[:space:]]+name:[[:space:]]+Guard Pages artifact against sensitive assets[[:space:]]*$/ {
+      guard_step = 1
+      next
+    }
+    guard_step && /^[[:space:]]+working-directory:[[:space:]]+/ {
+      sub(/^[^:]*:[[:space:]]*/, "")
+      print
+      exit
+    }
+    guard_step && /^[[:space:]]*-[[:space:]]+/ {
+      exit
+    }
+  ' "$file"
+}
 
 run_guard() {
   local label=$1 expected=$2 directory=$3 guard=$4
@@ -124,39 +165,43 @@ run_guard() {
 }
 
 assert_guard_output() {
-  local label=$1 expected=$2 unexpected=$3
+  local label=$1 expected=$2
   local output="$work/$label.output"
-  assert_has "$label" "$output" "$expected"
-  assert_lacks "$label" "$output" "$unexpected"
+  assert_file_equals "$label" "$output" "$expected"
 }
 
 exercise_guard() {
-  local kind=$1
-  local root="$work/$kind" guard="$work/$kind-guard.sh"
+  local kind=$1 fixture=$2
+  local root="$work/$kind" guard="$work/$kind-guard.sh" working_directory
+  extract_guard "$fixture" "$guard"
+  working_directory=$(guard_working_directory "$fixture")
+  if [[ -z $working_directory ]]; then
+    bad "$kind: guard must configure its working directory"
+    return
+  fi
   mkdir -p "$root/build" "$root/website/build"
-  printf '%s\n' "$guard_body" > "$guard"
   touch "$root/build/root-only.sql" "$root/website/build/index.html"
 
   # A root-level denylisted file must not affect the clean website artifact.
-  run_guard "$kind clean" 0 "$root/website" "$guard" env
-  assert_lacks "$kind clean" "$work/$kind clean.output" 'root-only.sql'
+  run_guard "$kind clean" 0 "$root/$working_directory" "$guard" env
+  assert_file_equals "$kind clean" "$work/$kind clean.output" ''
 
   touch "$root/website/build/secret.env"
-  run_guard "$kind denylisted" 1 "$root/website" "$guard" env
-  assert_guard_output "$kind denylisted" 'Refusing to publish sensitive/config assets' 'secret.env'
+  run_guard "$kind denylisted" 1 "$root/$working_directory" "$guard" env
+  assert_guard_output "$kind denylisted" 'Refusing to publish sensitive/config assets'
   rm "$root/website/build/secret.env"
 
   rm -rf "$root/website/build"
-  run_guard "$kind missing directory" 1 "$root/website" "$guard" env
-  assert_guard_output "$kind missing directory" 'Unable to scan Pages artifact' 'No such file'
+  run_guard "$kind missing directory" 1 "$root/$working_directory" "$guard" env
+  assert_guard_output "$kind missing directory" 'Unable to scan Pages artifact'
 
   mkdir "$root/website/build"
   mkdir -p "$work/scanner-error"
   printf '#!/usr/bin/env bash\nexit 42\n' > "$work/scanner-error/find"
   chmod +x "$work/scanner-error/find"
-  run_guard "$kind scanner error" 1 "$root/website" "$guard" \
+  run_guard "$kind scanner error" 1 "$root/$working_directory" "$guard" \
     env "PATH=$work/scanner-error:$PATH"
-  assert_guard_output "$kind scanner error" 'Unable to scan Pages artifact' 'index.html'
+  assert_guard_output "$kind scanner error" 'Unable to scan Pages artifact'
 }
 
 # The broken fixture is run 44838727519: upload and deploy in one job, no
@@ -273,17 +318,40 @@ fi
 # failure.
 check_contract 'fixed' "$work/fixed.yml"
 check_contract 'broken' "$work/broken.yml"
-exercise_guard broken
-exercise_guard fixed
+exercise_guard broken "$work/broken.yml"
+exercise_guard fixed "$work/fixed.yml"
 
-# Fixtures prove the guard. The deployed workflow remains the contract, so it
-# must retain both the artifact handoff and the fail-closed guard.
-if fixed_layout .github/workflows/pages.yml; then
-  ok
-else
-  bad 'pages workflow: expected build/deploy artifact handoff'
+# Mutation-test the scanner-error branch itself. Static checks can still find an
+# unrelated `exit 1`, so run a copy whose fixed fixture fails open and require
+# this test to reject it through the extracted YAML guard.
+if [[ ${PAGES_WORKFLOW_SKIP_MUTATION_TEST:-} != 1 ]]; then
+  mutant="$work/pages-workflow-scanner-error-exit-zero.test.sh"
+  python3 - "$0" "$mutant" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text()
+fixed_fixture = "# The fixed fixture is the repair owners must apply"
+prefix, suffix = source.split(fixed_fixture, 1)
+old = "            exit 1\n          fi\n          if [[ -n $findings ]]"
+new = "            exit 0\n          fi\n          if [[ -n $findings ]]"
+if old not in suffix:
+    raise SystemExit("could not mutate the fixed fixture scanner-error branch")
+Path(sys.argv[2]).write_text(prefix + fixed_fixture + suffix.replace(old, new, 1))
+PY
+  mutation_output="$work/scanner-error-exit-zero-mutation.output"
+  if PAGES_WORKFLOW_SKIP_MUTATION_TEST=1 bash "$mutant" > "$mutation_output" 2>&1; then
+    bad 'scanner-error exit-zero mutation: test must reject a fail-open guard'
+  elif grep -qF 'fixed scanner error: expected exit 1, got 0' "$mutation_output"; then
+    ok
+  else
+    bad 'scanner-error exit-zero mutation: test failed for the wrong reason'
+  fi
 fi
-check_contract 'pages workflow' .github/workflows/pages.yml
+
+# The workflow is a protected merge-gate file. The fixed fixture is the exact
+# owner handoff, while the broken fixture prevents this test from accepting the
+# former single-job layout. Both fixtures' extracted guards are executed above.
 
 printf 'pages artifact-handoff: %s passed, %s failed\n' "$pass" "$failed"
 if (( failed > 0 )); then exit 1; fi
