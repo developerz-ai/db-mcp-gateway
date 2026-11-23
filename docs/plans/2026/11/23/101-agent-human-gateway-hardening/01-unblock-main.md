@@ -1,6 +1,7 @@
 # 01 — Unblock main
 
 > Part of [`overview.md`](overview.md). Depends on: none.
+> Done in #376 except the owner's ruleset change (step 5). Instead of a `gate` job, a failed `changes` now runs the Rust jobs; `form_urlencoded` 1.2.3 moves with `url` 2.5.9.
 
 ## Files to change
 - `Cargo.lock:4713` — `url` 2.5.8 → 2.5.9 (RUSTSEC-2026-0592). `audit` is red on every PR and gates `merge`, so no image ships. **V**

@@ -3,7 +3,7 @@
 Root `CLAUDE.md` §CI has the job table. These are the rules for editing anything here.
 
 - **The gate.** The `main-protection` ruleset gates the merge, and its live required-check list is the single authority: `gh api repos/developerz-ai/db-mcp-gateway/rulesets`. Never re-declare the list as fact in a doc; `.dz/maintainer/maintainer.yml` names it only so the agent knows whose red check it is.
-- **Skipped means passed.** GitHub counts a skipped required job as passing. `ci.yml` relies on that for docs-only PRs (`changes` skips `clippy`/`test` through a per-job `if:`), so a job-level `if:` on a required job is a decision, not a convenience: a new skip condition is a merge that ran nothing.
+- **Skipped means passed.** GitHub counts a skipped required job as passing. `ci.yml` relies on that for docs-only PRs (`changes` skips `clippy`/`test`/`yugabyte` through a per-job `if:` that needs an explicit `code=false`, so a failed `changes` runs them), so a job-level `if:` on a required job is a decision, not a convenience: a new skip condition is a merge that ran nothing.
 - **Runners.** GitHub-hosted only (public repo): `ubuntu-latest`, `ubuntu-24.04-arm` for native arm64. No self-hosted runners, so a fork PR never reaches persistent hardware.
 - **Pins.** Every `uses:` is a 40-hex SHA with the version in a trailing comment; `ci.yml`'s `fmt` job and `bin/lint` both fail an unpinned ref. Copy a pin already used in another workflow before adding a new one; Dependabot keeps them fresh (`dependabot.yml`, 14-day cooldown). Docker images run by a step are pinned by digest.
 - **Least privilege.** Top-level `permissions: contents: read`; a job that needs more asks for it itself. `persist-credentials: false` on every checkout.

@@ -1,13 +1,13 @@
 plan: 101-agent-human-gateway-hardening
 title: Gateway hardening + agent/human UX
-status: not_started
+status: in_progress
 created_by: sebi
 worked_by: ""
 owner: sebi
-percent: 0
-current_focus: "01: url bump (audit red on every PR), then pages.yml + gate"
+percent: 5
+current_focus: "01: #376; owner rulesets left. Next: 02"
 slices:
-  - {file: 01-unblock-main.md, status: not_started, percent: 0}
+  - {file: 01-unblock-main.md, status: in_progress, percent: 90}
   - {file: 02-security-patch.md, status: not_started, percent: 0}
   - {file: 03-exec-correctness.md, status: not_started, percent: 0}
   - {file: 04-auth-transport.md, status: not_started, percent: 0}
@@ -19,6 +19,6 @@ slices:
   - {file: 10-dev-experience.md, status: not_started, percent: 0}
   - {file: 11-repo-cleanup.md, status: not_started, percent: 0}
   - {file: 12-tests.md, status: not_started, percent: 0}
-evidence: []
+evidence: ["#376"]
 notes: "Human rows H1-H12 in overview.md. Slice 02 and SET detail: owner's private notes."
 last_updated: 2026-11-23
