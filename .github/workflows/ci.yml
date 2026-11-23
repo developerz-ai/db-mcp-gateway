@@ -25,7 +25,8 @@ jobs:
   # Docs-only PRs skip the Rust jobs. The skip is per job, not a workflow-level
   # `paths-ignore`: `clippy` and `test` are required checks, and a workflow that
   # never starts leaves them pending forever, while a job skipped by `if:`
-  # reports as passed. Pushes to `main` always run everything — `merge` needs
+  # reports as passed. So the skip needs an explicit `code=false`: if
+  # `changes` itself fails, its output is empty and the Rust jobs run. Pushes to `main` always run everything — `merge` needs
   # them. Docs guards (pages.yml) run on their own path filter.
   #
   # Docs = `website/`, `docs/`, `.claude/` (agent config; its hooks are tested
@@ -50,7 +51,9 @@ jobs:
             echo "code=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          changed=$(git diff --name-only HEAD^1 HEAD)
+          # --no-renames: a rename would list only its destination, so moving a
+          # source file to a docs path would read as docs-only.
+          changed=$(git diff --name-only --no-renames HEAD^1 HEAD)
           code=false
           if printf '%s\n' "$changed" | grep -qE '^\.dz/' \
             || printf '%s\n' "$changed" \
@@ -112,7 +115,7 @@ jobs:
   # commit with `main`, which carried the test file the PR branch lacked.
   clippy:
     needs: [changes]
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     # ~2x the measured p95 (cold, Cargo.lock-changing run: 344 s; warm ~60 s).
     timeout-minutes: 15
@@ -148,7 +151,7 @@ jobs:
 
   test:
     needs: [changes]
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     # ~2x the measured p95 (cold, Cargo.lock-changing run: 471 s).
     timeout-minutes: 20
@@ -220,7 +223,7 @@ jobs:
   # locally. Same shape as `test`: the stack boots while the suite compiles.
   yugabyte:
     needs: [changes]
-    if: needs.changes.outputs.code == 'true'
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     # ~2x a cold run: `test`'s cold compile (471 s p95) bounds it; the
     # Yugabyte pull and boot (~25 s) overlap the compile.
@@ -348,6 +351,20 @@ jobs:
         # Pins the guard regex intent (#190) so a future loosening is caught.
         # Wired into CI so it actually runs (was dead code otherwise).
         run: bash tests/bin/secret-scan-regex.test.sh
+
+  # The gate's own regression scripts. `bin/ci` runs them too, but nothing in CI
+  # did, which let a red pages guard merge to main. secret-scan runs the fifth.
+  scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bash tests/bin/check.test.sh
+      - run: bash tests/bin/doc-anchors.test.sh
+      - run: bash tests/bin/mint-service-token.test.sh
+      - run: bash tests/bin/pages-workflow.test.sh
 
   # The public-tree guard (tests/public_tree.rs) runs on every PR, docs-only
   # included: the leaks it catches live mostly in markdown, which the
@@ -489,7 +506,7 @@ jobs:
   # so the short-SHA + main tags are pullable from whichever Image Updater (or
   # any external client) is configured to read.
   merge:
-    needs: [build, fmt, clippy, test, yugabyte, audit]
+    needs: [build, fmt, clippy, test, yugabyte, audit, secret-scan, public-tree, scripts]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

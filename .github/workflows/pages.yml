@@ -33,15 +33,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # PR gate: typecheck + build, no deploy. Same steps as `deploy` up to the
-  # artifact upload.
+  # Typecheck + build on every event; outside PRs it also uploads the artifact
+  # `deploy` publishes. Upload and deploy are separate jobs because deploy-pages
+  # lists the run's artifacts once, with no retry: in one job the listing raced
+  # the upload and lost deploys. tests/bin/pages-workflow.test.sh pins this.
   build:
-    if: github.event_name == 'pull_request'
     # GitHub-hosted runner: this repository is public.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
+      # configure-pages reads the Pages site.
+      pages: read
     defaults:
       run:
         working-directory: website
@@ -57,54 +60,46 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build
+      # Belt-and-braces: the same denylist as the mdBook workflow. Refuse to
+      # publish if a sensitive/config asset lands in the artifact. Contract
+      # lives in website/docs/initial-idea/13-docs-site.md. `find` runs inside
+      # the condition so a scan error fails the step; no path is printed.
+      - name: Guard Pages artifact against sensitive assets
+        working-directory: website
+        run: |
+          if ! findings=$(find build -type f \
+            \( -iname '*.yaml' -o -iname '*.yml' \
+               -o -iname '*.env' -o -iname '.env.*' \
+               -o -iname '*.pem' -o -iname '*.key' \
+               -o -iname '*.toml' -o -iname '*.sql' \) -print -quit 2>/dev/null); then
+            printf '%s\n' 'Unable to scan Pages artifact'
+            exit 1
+          fi
+          if [[ -n $findings ]]; then
+            printf '%s\n' 'Refusing to publish sensitive/config assets'
+            exit 1
+          fi
+      - if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          name: github-pages
+          path: website/build
 
   deploy:
+    needs: build
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Job-level permissions replace workflow-level (they do not merge), so
-    # contents: read must be repeated here for actions/checkout to keep repo
-    # read access alongside the Pages-deploy scopes.
     permissions:
-      contents: read
       pages: write
       id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
-    defaults:
-      run:
-        working-directory: website
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: website/package-lock.json
-      - run: npm ci
-      - run: npm run build
-      # Belt-and-braces: the same denylist as the mdBook workflow. Refuse to
-      # publish if a sensitive/config asset lands in the artifact. Contract
-      # lives in website/docs/initial-idea/13-docs-site.md.
-      - name: Guard Pages artifact against sensitive assets
-        run: |
-          set -euo pipefail
-          mapfile -t offenders < <(find build -type f \
-            \( -iname '*.yaml' -o -iname '*.yml' \
-               -o -iname '*.env' -o -iname '.env.*' \
-               -o -iname '*.pem' -o -iname '*.key' \
-               -o -iname '*.toml' -o -iname '*.sql' \))
-          if (( ${#offenders[@]} > 0 )); then
-            printf '::error::Refusing to publish Pages artifact — sensitive/config asset(s) present:\n'
-            printf '  %s\n' "${offenders[@]}"
-            exit 1
-          fi
-      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
-      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
-        with:
-          path: website/build
       - id: deploy
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+        with:
+          artifact_name: github-pages
