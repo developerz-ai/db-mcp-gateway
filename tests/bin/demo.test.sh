@@ -26,7 +26,9 @@ if [[ -z "${GATEWAY_IMAGE:-}" ]]; then
   if [[ -n "$pinned" && -n "$version" && "${pinned##*:}" == "$version" ]] &&
     ! git -C ../.. rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
     remote=0
-    timeout 20 git -C ../.. ls-remote --exit-code --tags origin "v$version" >/dev/null 2>&1 || remote=$?
+    # git's own low-speed abort (portable; no coreutils `timeout` on macOS).
+    GIT_HTTP_LOW_SPEED_LIMIT=1 GIT_HTTP_LOW_SPEED_TIME=20 \
+      git -C ../.. ls-remote --exit-code --tags origin "v$version" >/dev/null 2>&1 || remote=$?
     if [[ $remote -eq 2 ]]; then
       export GATEWAY_IMAGE=${pinned%:*}:main
       printf 'note: release v%s is not cut yet; testing %s\n' "$version" "$GATEWAY_IMAGE" >&2
