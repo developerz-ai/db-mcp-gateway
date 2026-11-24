@@ -12,14 +12,19 @@ cd "$(dirname "$0")/../../examples/demo"
 
 port=${DEMO_PORT:-18443}
 
-# A release PR bumps the pinned tag before that image is published (the tag
-# is cut after merge): test the same code through `:main`, which a release
-# PR does not change, and say so.
+# A release PR bumps the pinned tag to the crate's next version before that
+# image exists (the tag is cut after merge). Only that case — the pin is the
+# crate's own version and no `v<version>` tag exists yet — tests the same
+# code through `:main`, which a release PR does not change. Any other
+# unpullable pin (a typo, a registry error) fails the test.
 if [[ -z "${GATEWAY_IMAGE:-}" ]]; then
   pinned=$(sed -n 's/.*image: \${GATEWAY_IMAGE:-\([^}]*\)}.*/\1/p' docker-compose.yml | head -1)
-  if [[ -n "$pinned" ]] && ! docker manifest inspect "$pinned" >/dev/null 2>&1; then
+  version=$(sed -n 's/^version = "\(.*\)"/\1/p' ../../Cargo.toml | head -1)
+  if [[ -n "$pinned" && -n "$version" && "${pinned##*:}" == "$version" ]] &&
+    ! git -C ../.. rev-parse -q --verify "refs/tags/v$version" >/dev/null &&
+    ! git -C ../.. ls-remote --exit-code --tags origin "v$version" >/dev/null 2>&1; then
     export GATEWAY_IMAGE=${pinned%:*}:main
-    printf 'note: %s is not published yet; testing %s\n' "$pinned" "$GATEWAY_IMAGE" >&2
+    printf 'note: release v%s is not cut yet; testing %s\n' "$version" "$GATEWAY_IMAGE" >&2
   fi
 fi
 compose=(docker compose -p "db-mcp-gateway-demo-test-$$")
