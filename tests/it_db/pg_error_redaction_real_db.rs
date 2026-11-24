@@ -1,7 +1,8 @@
 //! What a Postgres error may say, over HTTP: the response body and the audit
-//! row keep the SQLSTATE and the gateway's own wording, plus names the
-//! statement itself spelled — never a value read from a row. And a refused
-//! login says nothing at all.
+//! row keep the SQLSTATE and the gateway's own wording, plus the name the
+//! parser pointed at in the statement — never a value read from a row, not
+//! even one the statement also spells. And a refused login says nothing at
+//! all.
 //! Target: `target-db` (`bin/dev up`).
 
 use std::time::Duration;
@@ -170,6 +171,9 @@ const LEAKY: &[(&str, &str)] = &[
     ("{raise}(v)", "P0001"),
 ];
 
+/// Each expression runs twice: as is, and with the row's value spelled in
+/// the statement as an alias. Naming the server's words that the statement
+/// also spells would confirm to the caller that a row holds that word.
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn a_target_error_never_carries_a_row_value() {
@@ -178,12 +182,14 @@ async fn a_target_error_never_carries_a_row_value() {
     let mut leaks = Vec::new();
     for (expression, sqlstate) in LEAKY {
         let expression = expression.replace("{raise}", &fixture.raise);
-        let sql = format!("SELECT {expression} FROM {}", fixture.table);
-        let (body, audited) = body_and_audit(&gateway, &sql, sqlstate).await;
-        for (place, text) in [("response", &body), ("audit row", &audited)] {
-            // `0xe9` is how Postgres prints the first byte of `b`.
-            if text.contains(&fixture.secret) || text.contains("0xe9") {
-                leaks.push(format!("{place} of `{expression}`: {text}"));
+        for alias in ["v", &fixture.secret] {
+            let sql = format!("SELECT {expression} AS {alias} FROM {}", fixture.table);
+            let (body, audited) = body_and_audit(&gateway, &sql, sqlstate).await;
+            for (place, text) in [("response", &body), ("audit row", &audited)] {
+                // `0xe9` is how Postgres prints the first byte of `b`.
+                if text.contains(&fixture.secret) || text.contains("0xe9") {
+                    leaks.push(format!("{place} of `{sql}`: {text}"));
+                }
             }
         }
     }
@@ -192,7 +198,8 @@ async fn a_target_error_never_carries_a_row_value() {
 }
 
 /// The redaction must not cost the agent the one thing it can fix: a name
-/// it typed wrong is still named, in the response and in the audit row.
+/// it typed wrong is still named — as it typed it, not as the server folded
+/// it — in the response and in the audit row.
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn a_name_the_caller_typed_is_still_named() {
@@ -217,6 +224,16 @@ async fn a_name_the_caller_typed_is_still_named() {
             "SELECT * FROM dbmcp_no_such_schema.t",
             "42P01",
             "dbmcp_no_such_schema.t",
+        ),
+        (
+            "SELECT * FROM Dbmcp_No_Such_Table",
+            "42P01",
+            ": Dbmcp_No_Such_Table",
+        ),
+        (
+            r#"SELECT * FROM "Dbmcp No Such Table""#,
+            "42P01",
+            "Dbmcp No Such Table",
         ),
     ] {
         let (body, audited) = body_and_audit(&gateway, sql, sqlstate).await;

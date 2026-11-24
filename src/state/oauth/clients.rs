@@ -39,7 +39,19 @@ pub enum LiveClient {
     Keep,
 }
 
-/// Register a client with the never-authorised TTL, in one statement.
+/// Serialise every capped registry write — insert, adoption, promotion —
+/// until the transaction ends. The capped insert decides on one snapshot, so
+/// two of them overlapping each see a table the other is about to change:
+/// one evicts a row to make room for an id the other has just made live.
+pub async fn lock_client_registry(conn: impl PgExecutor<'_>) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('oauth_client_registry', 0))")
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Register a client with the never-authorised TTL: one statement, in a
+/// transaction holding [`lock_client_registry`].
 ///
 /// A row that already holds `client_id` is resolved first, on the same
 /// snapshot as everything else: lapsed and not yet GC'd, it is reset as if
@@ -49,9 +61,11 @@ pub enum LiveClient {
 /// written in place or not at all.
 ///
 /// Only a new `client_id` needs room: at `cap` rows it evicts the oldest
-/// evictable row, and is refused (`false`) when none is evictable.
+/// evictable row, and is refused (`false`) when none is evictable. The
+/// eviction re-tests the row it deletes, so a victim whose promotion
+/// committed after the snapshot is kept.
 pub async fn insert_client_capped(
-    conn: impl PgExecutor<'_>,
+    pool: &PgPool,
     client_id: &str,
     redirect_uris: &[String],
     client_name: Option<&str>,
@@ -72,6 +86,7 @@ pub async fn insert_client_capped(
            SELECT expires_at > now() AS live FROM oauth_clients WHERE client_id = $1), \
          evicted AS ( \
            DELETE FROM oauth_clients WHERE NOT EXISTS (SELECT 1 FROM target) \
+             AND ({EVICTABLE_CLIENT}) \
              AND client_id IN ( \
                SELECT client_id FROM oauth_clients WHERE {EVICTABLE_CLIENT} \
                ORDER BY created_at \
@@ -90,14 +105,17 @@ pub async fn insert_client_capped(
              THEN EXCLUDED.expires_at ELSE oauth_clients.expires_at END\
          {only_lapsed}"
     );
+    let mut tx = pool.begin().await?;
+    lock_client_registry(&mut *tx).await?;
     let result = sqlx::query(&sql)
         .bind(client_id)
         .bind(Json(redirect_uris))
         .bind(cap)
         .bind(unused_ttl)
         .bind(client_name)
-        .execute(conn)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -114,19 +132,23 @@ pub async fn find_client(pool: &PgPool, client_id: &str) -> Result<Option<Client
 }
 
 /// Slide a live client's `expires_at` to `now() + ttl`. `false` when absent
-/// or expired.
+/// or expired. Under [`lock_client_registry`], so a capped insert never
+/// picks its victim on a snapshot this promotion is about to outdate.
 pub async fn promote_client(
     pool: &PgPool,
     client_id: &str,
     ttl: chrono::Duration,
 ) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    lock_client_registry(&mut *tx).await?;
     let result = sqlx::query(
         "UPDATE oauth_clients SET expires_at = now() + $2 \
          WHERE client_id = $1 AND expires_at > now()",
     )
     .bind(client_id)
     .bind(ttl)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }

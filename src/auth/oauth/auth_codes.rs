@@ -94,9 +94,9 @@ impl AuthCodes {
     }
 
     /// Put back a code [`Self::take`] removed, with its original deadline.
-    /// Only for a redemption that failed on the gateway's side before
+    /// Only for a redemption that failed on the gateway's side provably before
     /// anything was issued: the client is told to retry, so the retry must
-    /// find the code.
+    /// find the code. Never after a mint whose COMMIT was sent.
     pub async fn restore(&self, code: &str, entry: AuthCode) {
         self.inner.lock().await.insert(hash_secret(code), entry);
     }

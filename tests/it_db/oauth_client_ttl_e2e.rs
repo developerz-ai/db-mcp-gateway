@@ -3,15 +3,19 @@
 //! the row on the short unused TTL (evictable at the cap); only a code
 //! redeemed at `/token` — proof of a verified IdP login — promotes it.
 //!
+//! Also the one redemption `/token` must not offer again: a mint whose
+//! COMMIT errored may have minted, so its code stays spent.
+//!
 //! The cap test is `#[serial_test::serial(world)]` (it fills the shared
-//! `oauth_clients` table); the rest touch only their own rows.
+//! `oauth_clients` table), as is the commit-failure test (it adds a trigger
+//! to `oauth_refresh_tokens`); the rest touch only their own rows.
 
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use db_mcp_gateway::auth::jwt::SessionJwt;
 use db_mcp_gateway::auth::oauth::{
-    AuthCodes, AuthFacade, ClientRegistry, PendingFlows, RefreshTokens,
+    AuthCodes, AuthFacade, ClientRegistry, GrantIdentity, PendingFlows, RefreshTokens,
 };
 use db_mcp_gateway::auth::{AuthConfig, OidcClient, ServiceTokenStore, SessionStore};
 use db_mcp_gateway::config::Config;
@@ -33,6 +37,17 @@ const CLIENT_REDIRECT: &str = "http://127.0.0.1:54601/callback";
 /// A gateway whose client registry is `registry` (the shared harness wires an
 /// in-memory one), logging users in through a fresh mock IdP.
 pub(crate) async fn spawn_gateway(pool: &PgPool, registry: ClientRegistry) -> String {
+    let (codes, refresh) = (AuthCodes::default(), RefreshTokens::default());
+    spawn_gateway_with(pool, registry, codes, refresh).await
+}
+
+/// [`spawn_gateway`] over the caller's code and refresh-token stores.
+async fn spawn_gateway_with(
+    pool: &PgPool,
+    registry: ClientRegistry,
+    codes: AuthCodes,
+    refresh: RefreshTokens,
+) -> String {
     let sub = format!("ttl-e2e-{}", Uuid::new_v4().simple());
     let user = MockUser {
         email: format!("{sub}@example.com"),
@@ -58,8 +73,8 @@ pub(crate) async fn spawn_gateway(pool: &PgPool, registry: ClientRegistry) -> St
         sessions: SessionStore::new(pool.clone()),
         oidc: OidcClient::new(auth_config).expect("oidc client"),
         flows: PendingFlows::default(),
-        codes: AuthCodes::default(),
-        refresh: RefreshTokens::default(),
+        codes,
+        refresh,
         service_tokens: Arc::new(ArcSwap::from_pointee(tokens)),
     };
     let mut state = AppState::for_tests(config, pool.clone(), auth);
@@ -275,4 +290,85 @@ async fn resolving_every_unused_client_does_not_block_registration() {
         .execute(&pool)
         .await
         .expect("cleanup seeded rows");
+}
+
+/// Make every COMMIT that inserted a refresh token of `sub` fail: the
+/// statements succeed, and the caller learns of the failure only from the
+/// COMMIT's reply — all it ever knows of a commit whose reply was lost.
+async fn fail_commits_minting_for(pool: &PgPool, trigger: &str, sub: &str) {
+    for ddl in [
+        format!(
+            "CREATE FUNCTION {trigger}() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE EXCEPTION 'commit refused by test'; END $$"
+        ),
+        format!(
+            "CREATE CONSTRAINT TRIGGER {trigger} AFTER INSERT ON oauth_refresh_tokens \
+             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (NEW.user_sub = '{sub}') \
+             EXECUTE FUNCTION {trigger}()"
+        ),
+    ] {
+        sqlx::query(&ddl).execute(pool).await.expect("install");
+    }
+}
+
+/// `/token` cannot tell a COMMIT that failed from one whose reply was lost,
+/// so after either it must not hand the code back: a retry would mint a
+/// second grant for one authorization. The client is told to start over.
+#[tokio::test]
+#[serial_test::serial(world)]
+async fn a_mint_whose_commit_errored_keeps_the_code_spent() {
+    let pool = state_pool().await;
+    let sub = format!("commit-lost-{}", Uuid::new_v4().simple());
+    let codes = AuthCodes::default();
+    let refresh = RefreshTokens::with_db(pool.clone(), std::time::Duration::from_secs(3600));
+    let gateway =
+        spawn_gateway_with(&pool, ClientRegistry::default(), codes.clone(), refresh).await;
+    let identity = GrantIdentity {
+        sub: sub.clone(),
+        email: format!("{sub}@example.com"),
+        groups: vec!["engineers".into()],
+    };
+    let (challenge, redirect) = (PKCE_CHALLENGE.to_string(), CLIENT_REDIRECT.to_string());
+    codes
+        .insert(
+            "lost-commit-code",
+            identity,
+            challenge,
+            redirect,
+            "c1".into(),
+        )
+        .await
+        .expect("code stored");
+    let trigger = format!("fail_commit_{}", Uuid::new_v4().simple());
+    fail_commits_minting_for(&pool, &trigger, &sub).await;
+
+    let resp = no_redirect_client()
+        .post(format!("{gateway}/token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", "lost-commit-code"),
+            ("redirect_uri", CLIENT_REDIRECT),
+            ("code_verifier", PKCE_VERIFIER),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap();
+    let code_left = codes.take("lost-commit-code").await;
+
+    for ddl in [
+        format!("DROP TRIGGER {trigger} ON oauth_refresh_tokens"),
+        format!("DROP FUNCTION {trigger}()"),
+    ] {
+        sqlx::query(&ddl).execute(&pool).await.expect("uninstall");
+    }
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_grant", "{body}");
+    let description = body["error_description"].as_str().unwrap_or_default();
+    assert!(description.contains("restart authorization"), "{body}");
+    assert!(
+        code_left.is_none(),
+        "a mint that may have committed left its code redeemable"
+    );
 }

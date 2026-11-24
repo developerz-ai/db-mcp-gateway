@@ -155,9 +155,14 @@ fn check_write_target(stmt: &Statement) -> Result<(), GuardError> {
     else {
         return Ok(());
     };
+    let relation = name.0.last().and_then(|part| part.as_ident());
     // sqlparser reads `UPDATE ONLY t` as table `ONLY` aliased `t`, and
-    // `UPDATE ONLY (t)` as a call of `ONLY`: every name written in the
-    // target is a candidate.
+    // `UPDATE ONLY (t)` as a call of `ONLY`: only then is the relation in
+    // the alias or the arguments. Otherwise the alias is just a name.
+    let misparsed_only = name.0.len() == 1
+        && relation.is_some_and(|ident| {
+            ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("only")
+        });
     let arg_names = args
         .iter()
         .flat_map(|a| &a.args)
@@ -168,13 +173,15 @@ fn check_write_target(stmt: &Statement) -> Result<(), GuardError> {
             }
             _ => None,
         });
-    let mut names = name
-        .0
+    let names: Vec<&Ident> = if misparsed_only {
+        alias.iter().map(|a| &a.name).chain(arg_names).collect()
+    } else {
+        relation.into_iter().collect()
+    };
+    if names
         .iter()
-        .filter_map(|part| part.as_ident())
-        .chain(alias.iter().map(|a| &a.name))
-        .chain(arg_names);
-    if names.any(|ident| ident.value.eq_ignore_ascii_case("pg_settings")) {
+        .any(|ident| ident.value.eq_ignore_ascii_case("pg_settings"))
+    {
         return Err(GuardError::DeniedFunction("set_config"));
     }
     Ok(())

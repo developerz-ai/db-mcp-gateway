@@ -80,11 +80,27 @@ fn extension_statement_views_rejected() {
 fn cron_schema_relations_rejected() {
     for sql in [
         "SELECT command FROM cron.job",
-        "SELECT * FROM CRON.job_run_details",
+        "SELECT jobid FROM CRON.JOB",
         r#"SELECT * FROM "cron"."job""#,
     ] {
         denied_as(sql, "cron.*");
     }
+}
+
+/// With `cron` on the role's `search_path`, pg_cron's run log is readable
+/// unqualified; its name is distinctive enough to refuse as a word. `job` is
+/// too common to refuse — the operator revokes the schema instead.
+#[test]
+fn unqualified_cron_run_log_rejected() {
+    for sql in [
+        "SELECT command FROM job_run_details",
+        "SELECT * FROM JOB_RUN_DETAILS d WHERE d.status = 'failed'",
+        "SELECT * FROM cron.job_run_details",
+    ] {
+        denied_as(sql, "job_run_details");
+    }
+    ok("SELECT * FROM job");
+    ok("SELECT * FROM job_runs");
 }
 
 #[test]

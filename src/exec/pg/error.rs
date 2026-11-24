@@ -36,7 +36,7 @@ pub(super) fn classify(err: sqlx::Error, role: &str, sql: &str) -> ExecError {
             // it got here.
             c if c.starts_with("28") => ExecError::Connection,
             c => {
-                let message = rejection_message(c, db.message(), error_position(db.as_ref()), sql);
+                let message = rejection_message(c, error_position(db.as_ref()), sql);
                 ExecError::Rejected(DbRejection::new(c, &message, role))
             }
         };

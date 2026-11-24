@@ -16,7 +16,7 @@ mod clients;
 
 pub use clients::{
     ClientRow, LiveClient, delete_expired_clients, find_client, insert_client_capped,
-    promote_client,
+    lock_client_registry, promote_client,
 };
 
 /// A refresh-token row to upsert. `token_hash` is the SHA-256 of the bearer
@@ -194,20 +194,21 @@ pub async fn rotate_out_refresh_token(
 }
 
 /// The subject and chain a tombstoned (already rotated-out) `token_hash`
-/// belongs to, if it was rotated out at least `grace` ago. `None` for an
-/// unknown hash, a chain with no token left, or a rotation still inside
-/// `grace`. Read before [`lock_subject`] and [`lock_chain`], like
-/// [`live_chain`].
+/// belongs to. `None` for an unknown hash, a chain with no token left, or —
+/// with a `grace` — a rotation younger than it. No `grace` means no age
+/// test at all: a zero one would still compare against this transaction's
+/// start, and miss a rotation that committed after it. Read before
+/// [`lock_subject`] and [`lock_chain`], like [`live_chain`].
 pub async fn rotated_chain(
     conn: impl PgExecutor<'_>,
     token_hash: &[u8],
-    grace: chrono::Duration,
+    grace: Option<chrono::Duration>,
 ) -> Result<Option<(String, Uuid)>, sqlx::Error> {
     sqlx::query_as(
         "SELECT live.user_sub, rotated.chain_id FROM oauth_refresh_rotated rotated \
          JOIN oauth_refresh_tokens live ON live.chain_id = rotated.chain_id \
          WHERE rotated.token_hash = $1 AND rotated.expires_at > now() \
-           AND rotated.rotated_at <= now() - $2 \
+           AND ($2::interval IS NULL OR rotated.rotated_at <= now() - $2) \
          LIMIT 1",
     )
     .bind(token_hash)

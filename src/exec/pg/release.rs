@@ -12,7 +12,9 @@ use super::error::{is_feature_not_supported, log_discarded};
 /// false)` but, by design, neither `role` nor `session_authorization`, so
 /// both are reset by name. `DEALLOCATE ALL` drops whatever is still
 /// prepared. `DISCARD SEQUENCES` forgets `lastval()` / `currval()`, which
-/// would hand the next caller a key the previous one generated;
+/// would hand the next caller a key the previous one generated — at the
+/// price of the values a `CACHE n` sequence preallocated for the session,
+/// which live in the same state and go with it (spec 05);
 /// `DISCARD TEMP` drops temporary tables and with them their rows. Not
 /// `DISCARD ALL`, which does all of this: it refuses to run inside a batch.
 /// The lexing pin goes last because `RESET ALL` would restore the server

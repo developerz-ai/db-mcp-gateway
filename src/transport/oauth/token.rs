@@ -12,7 +12,7 @@ use crate::auth::{AuthError, pkce};
 use super::super::app_state::OAuthState;
 use super::helpers::{form_rejected, oauth_error, random_token};
 use super::urls::MCP_SCOPE;
-use crate::auth::oauth::{AuthFacade, IssuedTokens};
+use crate::auth::oauth::{AuthFacade, IssuedTokens, MintError};
 
 #[derive(Debug, Deserialize)]
 pub struct TokenForm {
@@ -136,15 +136,28 @@ async fn token_authorization_code(state: &OAuthState, form: TokenForm) -> Respon
 
     // Fresh authorization → fresh session + refresh-token chain. The identity
     // is cloned so a failed mint can hand the code back.
-    let issued = auth
+    match auth
         .issue_tokens(entry.identity.clone(), random_token())
-        .await;
-    if issued.is_err() {
-        // Both failures answer a retryable 503 with nothing issued, so the
-        // code — proven by PKCE to be this client's — is put back for it.
-        auth.codes.restore(code, entry).await;
+        .await
+    {
+        Ok(issued) => token_response(Ok(issued)),
+        Err(MintError::NotMinted(err)) => {
+            // A retryable 503 with provably nothing issued, so the code —
+            // proven by PKCE to be this client's — is put back for it.
+            auth.codes.restore(code, entry).await;
+            token_response(Err(err))
+        }
+        Err(MintError::Unconfirmed) => {
+            // The grant may exist: handing the code back would let the retry
+            // mint a second one. The code stays spent; the client starts over.
+            tracing::warn!("token issuance unconfirmed; authorization code not restored");
+            oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "token issuance could not be confirmed; restart authorization",
+            )
+        }
     }
-    token_response(issued)
 }
 
 async fn token_refresh(auth: &AuthFacade, form: TokenForm) -> Response {

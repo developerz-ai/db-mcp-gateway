@@ -5,16 +5,19 @@
 //!   become the adapter later requests on the new config are served from,
 //!   nor replace the one they are already served from;
 //! - callers queued on one open of a dead target must share that failure,
-//!   not each run their own open back to back.
+//!   not each run their own open back to back;
+//! - a slot a reload superseded (a straggler's, or a removed database's)
+//!   must close once released, with no further lookup for its key.
 //!
 //! Audit assertion intentionally skipped: these drive the exec layer's
 //! registry directly, never the tool-dispatch path that writes audit rows.
 
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use crate::adapter_registry_concurrency::spawn_blackhole;
 use crate::common::pg_target::{self, READ_ROLE, READ_ROLE_PASSWORD, TARGET_USER};
-use db_mcp_gateway::config::{Database, Password, Server};
+use db_mcp_gateway::config::{ConfigFile, Database, Password, Server};
 use db_mcp_gateway::exec::{AdapterRegistry, DbAdapter, ExecError, ExecQuery};
 use uuid::Uuid;
 
@@ -117,6 +120,78 @@ async fn interleaved_old_and_new_snapshots_never_replace_each_others_adapter() {
         );
     }
     assert_eq!(current_user(next.as_ref()).await, READ_ROLE);
+}
+
+const SWEEP_EVERY: Duration = Duration::from_millis(50);
+
+fn config_with(server: &Server, databases: Vec<Database>) -> ConfigFile {
+    let mut config = ConfigFile::from_yaml_str("permissions: []\n").expect("empty config");
+    config.servers = vec![Server {
+        databases,
+        ..server.clone()
+    }];
+    config
+}
+
+/// Polls until the registry let go of `adapter`, i.e. its pools closed.
+async fn assert_released(adapter: Weak<dyn DbAdapter>, what: &str) {
+    let deadline = Instant::now() + SWEEP_EVERY * 40;
+    while adapter.upgrade().is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the registry kept its pool"
+        );
+        tokio::time::sleep(SWEEP_EVERY / 2).await;
+    }
+}
+
+/// The straggler's slot is reinstalled after the reload; once it is released
+/// and traffic stops, the sweep alone closes its pool.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_superseded_pool_closes_after_reload_without_further_traffic() {
+    pg_target::ensure_read_role().await;
+    let server: Server = pg_target::server();
+    let before = pg_target::database();
+    let after = narrowed(&before);
+    let registry = AdapterRegistry::with_sweep_interval(SWEEP_EVERY);
+    registry.get_or_open(&server, &before).await.expect("opens");
+
+    registry
+        .retire_superseded(&config_with(&server, vec![after.clone()]))
+        .await;
+    let straggler = registry.get_or_open(&server, &before).await.expect("opens");
+    let next = registry.get_or_open(&server, &after).await.expect("opens");
+    assert_eq!(current_user(straggler.as_ref()).await, TARGET_USER);
+    let old = Arc::downgrade(&straggler);
+    drop(straggler);
+
+    assert_released(old, "superseded snapshot").await;
+    let again = registry.get_or_open(&server, &after).await.expect("cached");
+    assert!(Arc::ptr_eq(&next, &again), "the live adapter is kept");
+}
+
+/// A request holding a snapshot from before its database was removed opens
+/// a slot no lookup will ever reach again; the sweep still closes it.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_removed_databases_late_lookup_leaves_no_slot_behind() {
+    let server: Server = pg_target::server();
+    let removed = pg_target::database();
+    let registry = AdapterRegistry::with_sweep_interval(SWEEP_EVERY);
+
+    registry
+        .retire_superseded(&config_with(&server, Vec::new()))
+        .await;
+    let late = registry
+        .get_or_open(&server, &removed)
+        .await
+        .expect("opens");
+    assert_eq!(current_user(late.as_ref()).await, TARGET_USER);
+    let weak = Arc::downgrade(&late);
+    drop(late);
+
+    assert_released(weak, "removed database").await;
 }
 
 #[tokio::test]

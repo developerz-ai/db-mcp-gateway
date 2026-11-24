@@ -1,5 +1,4 @@
-//! [`Slot`]: one lazily-opened adapter, and the sibling slots of a
-//! `(server, database)` that a config reload leaves behind.
+//! [`Slot`]: one lazily-opened adapter.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,23 +60,8 @@ impl Slot {
         self.last_lookup_ms.store(now, Ordering::Relaxed);
     }
 
-    fn idle_for(&self) -> Duration {
+    pub(super) fn idle_for(&self) -> Duration {
         let last = Duration::from_millis(self.last_lookup_ms.load(Ordering::Relaxed));
         self.born.elapsed().saturating_sub(last)
     }
-}
-
-/// Whether `slots` holds a slot other than `live`'s that no lookup has
-/// reached for `lifetime` — one [`retire`] would drop.
-pub(super) fn has_retired(slots: &[Arc<Slot>], live: Fingerprint, lifetime: Duration) -> bool {
-    slots
-        .iter()
-        .any(|slot| slot.fingerprint != live && slot.idle_for() >= lifetime)
-}
-
-/// Drop every slot other than `live`'s that no lookup has reached for
-/// `lifetime`. Callers already holding its adapter finish on it; its pools
-/// close when the last of them lets go.
-pub(super) fn retire(slots: &mut Vec<Arc<Slot>>, live: Fingerprint, lifetime: Duration) {
-    slots.retain(|slot| slot.fingerprint == live || slot.idle_for() < lifetime);
 }

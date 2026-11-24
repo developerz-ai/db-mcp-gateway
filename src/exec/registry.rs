@@ -4,10 +4,10 @@
 
 mod fingerprint;
 mod slot;
+mod sweep;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
 use std::hash::RandomState;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +15,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 use crate::audit::drain::DetachedTasks;
-use crate::config::{Database, Server, ServerKind};
+use crate::config::{ConfigFile, Database, Server, ServerKind};
 
 use super::adapter::{DbAdapter, ExecError};
 use super::mongo::MongoAdapter;
@@ -24,22 +24,25 @@ use super::pool_sizing::PoolSizing;
 use super::redis::RedisAdapter;
 use fingerprint::Fingerprint;
 use slot::Slot;
+use sweep::Slots;
 
 /// How long a failed open is remembered. Opening a dead target costs up to
 /// the pool acquire timeout; without this every request to it would pay that
 /// again while holding a global request permit.
 const FAILED_OPEN_TTL: Duration = Duration::from_secs(5);
 
-/// How long a slot opened from other settings outlives its last lookup. A
-/// request carries its config snapshot for at most `transport::MCP_TIMEOUT`,
-/// so past this no straggler from before a reload can still ask for it.
+/// How long a superseded slot a request still holds outlives its last
+/// lookup. A request carries its config snapshot for at most
+/// `transport::MCP_TIMEOUT`, so past this no straggler from before a reload
+/// can still ask for it.
 const SNAPSHOT_LIFETIME: Duration = Duration::from_secs(300);
+
+/// How often superseded slots are re-checked after a reload, until none is
+/// left.
+const SWEEP_EVERY: Duration = Duration::from_secs(10);
 
 /// Composite key for the registry: `(server.name, database.name)`.
 type AdapterKey = (String, String);
-/// One slot per config fingerprint seen for the key. Normally one; a reload
-/// briefly leaves the pre-reload snapshot's slot beside the new one.
-type AdapterMap = HashMap<AdapterKey, Vec<Arc<Slot>>>;
 
 /// Per-`(server, database)` adapter registry. Hands out `Arc<dyn DbAdapter>`
 /// keyed on `(server.name, database.name)` so a slow query on DB A can never
@@ -50,13 +53,25 @@ type AdapterMap = HashMap<AdapterKey, Vec<Arc<Slot>>>;
 /// `ServerKind::has_adapter` is the shared source of truth — config
 /// validation rejects unwired kinds at boot, so that arm is a backstop a
 /// validated config never reaches.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AdapterRegistry {
-    inner: Arc<RwLock<AdapterMap>>,
+    inner: Arc<RwLock<Slots>>,
     /// Handed to every adapter for its detached cancels.
     detached: DetachedTasks,
     /// Keys every slot's [`Fingerprint`]; shared by clones.
     fingerprint_keys: RandomState,
+    sweep_every: Duration,
+}
+
+impl Default for AdapterRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+            detached: DetachedTasks::default(),
+            fingerprint_keys: RandomState::new(),
+            sweep_every: SWEEP_EVERY,
+        }
+    }
 }
 
 impl std::fmt::Debug for AdapterRegistry {
@@ -81,6 +96,15 @@ impl AdapterRegistry {
     pub fn with_detached(detached: DetachedTasks) -> Self {
         Self {
             detached,
+            ..Self::default()
+        }
+    }
+
+    /// A registry that re-checks superseded slots every `sweep_every` rather
+    /// than [`SWEEP_EVERY`] — for tests that watch a retired pool close.
+    pub fn with_sweep_interval(sweep_every: Duration) -> Self {
+        Self {
+            sweep_every,
             ..Self::default()
         }
     }
@@ -141,36 +165,64 @@ impl AdapterRegistry {
         self.inner
             .write()
             .await
+            .map
             .remove(&(server.to_string(), database.to_string()));
+    }
+
+    /// Make `config` the current one: every slot opened from other settings
+    /// — a changed or removed database — is superseded. Those no request
+    /// holds close now; the rest are re-checked every sweep interval until
+    /// released or [`SNAPSHOT_LIFETIME`] passes without a lookup.
+    pub async fn retire_superseded(&self, config: &ConfigFile) {
+        let current = config
+            .servers
+            .iter()
+            .flat_map(|server| {
+                server.databases.iter().map(move |database| {
+                    let key = (server.name.clone(), database.name.clone());
+                    (
+                        key,
+                        Fingerprint::of(&self.fingerprint_keys, server, database),
+                    )
+                })
+            })
+            .collect();
+        let mut state = self.inner.write().await;
+        state.current = Some(current);
+        if state.sweep(SNAPSHOT_LIFETIME) > 0 {
+            self.ensure_sweeper(&mut state);
+        }
     }
 
     /// The slot for `key` opened from `fingerprint`, created if absent.
     /// Read first — the steady-state hit — and take the write lock only to
-    /// create a slot or retire a sibling. Neither guard outlives this call.
+    /// create a slot. Neither guard outlives this call.
     ///
     /// Each fingerprint keeps its own slot, so requests on either side of a
     /// reload never replace each other's adapter (which would open a pool per
-    /// switch and split each caller's share across them). The side no request
-    /// asks for any more retires after [`SNAPSHOT_LIFETIME`].
+    /// switch and split each caller's share across them). A slot created for
+    /// a superseded snapshot (a straggler, or a removed database) starts the
+    /// sweeper, so it never outlives its last holder.
     async fn slot(&self, key: &AdapterKey, fingerprint: Fingerprint) -> Arc<Slot> {
-        if let Some(slots) = self.inner.read().await.get(key)
-            && let Some(slot) = slots.iter().find(|s| s.fingerprint == fingerprint)
-        {
+        if let Some(slot) = self.inner.read().await.find(key, fingerprint) {
             slot.touch();
-            if !slot::has_retired(slots, fingerprint, SNAPSHOT_LIFETIME) {
-                return Arc::clone(slot);
-            }
+            return slot;
         }
         // Another task may have inserted a matching slot while we waited for
         // the write lock; keep it rather than adding a second.
-        let mut map = self.inner.write().await;
-        let slots = map.entry(key.clone()).or_default();
-        slot::retire(slots, fingerprint, SNAPSHOT_LIFETIME);
-        let slot = match slots.iter().find(|s| s.fingerprint == fingerprint) {
-            Some(slot) => Arc::clone(slot),
+        let mut state = self.inner.write().await;
+        let slot = match state.find(key, fingerprint) {
+            Some(slot) => slot,
             None => {
                 let slot = Arc::new(Slot::new(fingerprint));
-                slots.push(Arc::clone(&slot));
+                state
+                    .map
+                    .entry(key.clone())
+                    .or_default()
+                    .push(Arc::clone(&slot));
+                if state.is_superseded(key, fingerprint) {
+                    self.ensure_sweeper(&mut state);
+                }
                 slot
             }
         };
@@ -178,11 +230,35 @@ impl AdapterRegistry {
         slot
     }
 
+    /// Start the sweeper unless one is running. Called and cleared under the
+    /// write lock, so a superseded slot is never added after the sweeper
+    /// decided to stop.
+    fn ensure_sweeper(&self, state: &mut Slots) {
+        if state.sweeping {
+            return;
+        }
+        state.sweeping = true;
+        let registry = self.clone();
+        tokio::spawn(async move { registry.sweep_until_settled().await });
+    }
+
+    async fn sweep_until_settled(&self) {
+        loop {
+            tokio::time::sleep(self.sweep_every).await;
+            let mut state = self.inner.write().await;
+            if state.sweep(SNAPSHOT_LIFETIME) == 0 {
+                state.sweeping = false;
+                return;
+            }
+        }
+    }
+
     /// Remove `slot` only if it is still the one there, so two callers that
     /// both saw the stale adapter evict it once, not the fresh replacement
     /// the first of them opened.
     async fn evict_slot(&self, key: &AdapterKey, slot: &Arc<Slot>) {
-        let mut map = self.inner.write().await;
+        let mut state = self.inner.write().await;
+        let map = &mut state.map;
         if let Some(slots) = map.get_mut(key) {
             slots.retain(|current| !Arc::ptr_eq(current, slot));
             if slots.is_empty() {

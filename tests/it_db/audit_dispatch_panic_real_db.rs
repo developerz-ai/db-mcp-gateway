@@ -126,7 +126,7 @@ async fn panicking_write_work_keeps_the_may_have_committed_flag() {
     };
 
     let sinks = DispatchSinks::new(&[]);
-    audit_dispatch(
+    let response = audit_dispatch(
         Value::from(1),
         &identity(&user),
         &ctx,
@@ -135,6 +135,21 @@ async fn panicking_write_work_keeps_the_may_have_committed_flag() {
         work,
     )
     .await;
+
+    // The caller decides whether to retry the write, so it is told too.
+    let body = serde_json::to_value(&response).expect("response serialises");
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tool error carries a text payload: {body}"));
+    let payload: Value = serde_json::from_str(text).expect("payload is JSON");
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    assert_eq!(payload["code"], "internal", "{payload}");
+    let told = payload["message"].as_str().unwrap_or_default();
+    assert!(
+        told.contains(WRITE_MAY_HAVE_COMMITTED),
+        "the client was not told its write may have committed: {payload}"
+    );
+    assert!(!text.contains("decoder hit"), "panic text leaked: {text}");
 
     let row = latest_audit(&pool, &user, "run_query", "panicking write").await;
     assert_eq!(row.outcome, OutcomeCode::Internal);

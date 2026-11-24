@@ -138,8 +138,8 @@ pub fn outcome_from_exec_error(
         }
         ExecError::Sql => (OutcomeCode::SyntaxError, messages.sql_rejected),
         // Every DB rejection carries the SQLSTATE and gateway wording (exec
-        // names only identifiers the caller's SQL spelled) so the agent can
-        // act on it; two SQLSTATEs get their own codes.
+        // names at most the identifier at the parser's error position) so the
+        // agent can act on it; two SQLSTATEs get their own codes.
         ExecError::Rejected(rejection) => match rejection.kind() {
             RejectionKind::PermissionDenied => {
                 owned = rejection.to_string();

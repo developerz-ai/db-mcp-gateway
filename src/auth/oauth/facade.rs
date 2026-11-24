@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use super::{AuthCodes, GrantIdentity, Minted, PendingFlows, RefreshTokens};
+use super::{AuthCodes, GrantIdentity, MintError, Minted, PendingFlows, RefreshTokens};
 use crate::auth::{
     AuthConfig, AuthError, Identity, OidcClient, ServiceTokenStore, SessionId, SessionStore,
     jwt::SessionJwt,
@@ -58,7 +58,7 @@ impl AuthFacade {
         &self,
         identity: GrantIdentity,
         refresh_token: String,
-    ) -> Result<IssuedTokens, AuthError> {
+    ) -> Result<IssuedTokens, MintError> {
         let minted = self
             .refresh
             .mint(
@@ -68,7 +68,9 @@ impl AuthFacade {
                 self.config.session_ttl,
             )
             .await?;
-        self.bearer_pair(minted)
+        // The grant is committed: failing to sign its bearer is not a
+        // failure a retry of the same authorization may repeat the mint for.
+        self.bearer_pair(minted).map_err(|_| MintError::Unconfirmed)
     }
 
     /// Refresh grant: rotate `presented` into `refresh_token`, revoking the

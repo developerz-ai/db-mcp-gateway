@@ -226,6 +226,70 @@ async fn revoke_during_an_in_flight_rotation_ends_the_new_pair() {
     cleanup_sub(&pool, &sub, &chains).await;
 }
 
+/// A token rotated out a moment ago and revoked at once: `/revoke` asks for
+/// the end, so the replay grace that spares a parallel refresh at `/token`
+/// must not spare this chain.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn revoking_a_just_rotated_token_ends_its_chain() {
+    let chain = Chain::mint("revoke-fresh", false).await;
+    let sessions = session_store(&chain.pool);
+    chain
+        .store
+        .rotate(&sessions, &chain.first, token(), SESSION_TTL)
+        .await
+        .expect("rotate")
+        .expect("first token is live");
+
+    assert!(
+        chain
+            .store
+            .revoke(&sessions, &chain.first)
+            .await
+            .expect("revoke"),
+        "a token rotated out inside the replay grace was not revoked"
+    );
+    chain.assert_nothing_live_and_cleanup("revoke").await;
+}
+
+/// A revoke whose transaction began before the rotation did: the tombstone
+/// is younger than that transaction's `now()`, and must still be found.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_revoke_begun_before_the_rotation_still_finds_the_tombstone() {
+    let chain = Chain::mint("revoke-early", false).await;
+    let mut revoke = chain.pool.begin().await.expect("begin");
+    sqlx::query("SELECT now()")
+        .execute(&mut *revoke)
+        .await
+        .expect("open the transaction");
+    // `now()` is frozen at the BEGIN above; let the rotation's exceed it.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    chain
+        .store
+        .rotate(
+            &session_store(&chain.pool),
+            &chain.first,
+            token(),
+            SESSION_TTL,
+        )
+        .await
+        .expect("rotate")
+        .expect("first token is live");
+
+    let hash: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(chain.first.as_bytes()).into();
+    let found = db::rotated_chain(&mut *revoke, &hash, None)
+        .await
+        .expect("tombstone lookup");
+    revoke.rollback().await.expect("rollback");
+    assert_eq!(
+        found.map(|(sub, _)| sub),
+        Some(chain.sub.clone()),
+        "a rotation committed after the revoke began was missed"
+    );
+    cleanup_sub(&chain.pool, &chain.sub, &chain.chains).await;
+}
+
 /// The same race lost the other way: the rotation committed first, so the
 /// presented token is only a tombstone. Revoking it still ends its chain.
 #[tokio::test]

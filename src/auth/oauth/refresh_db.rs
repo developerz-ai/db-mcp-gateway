@@ -69,7 +69,8 @@ pub(super) async fn revoke_reused_chain(
     conn: &mut sqlx::PgConnection,
     presented_hash: &[u8],
 ) -> Result<Vec<SessionId>, AuthError> {
-    let Some((sub, chain_id)) = db::rotated_chain(&mut *conn, presented_hash, REUSE_GRACE).await?
+    let Some((sub, chain_id)) =
+        db::rotated_chain(&mut *conn, presented_hash, Some(REUSE_GRACE)).await?
     else {
         return Ok(Vec::new());
     };

@@ -41,7 +41,8 @@ pub enum ReloadError {
 }
 
 /// Reload from `targets.path`. On success every handle holds the new config;
-/// on error none changed. Returns the number of target pools evicted.
+/// on error none changed. Returns the number of databases whose pools were
+/// retired.
 pub async fn reload(targets: &ReloadTargets) -> Result<usize, ReloadError> {
     let result = apply(targets).await;
     let outcome = if result.is_ok() { "ok" } else { "error" };
@@ -62,16 +63,15 @@ async fn apply(targets: &ReloadTargets) -> Result<usize, ReloadError> {
     // Point of no return: nothing below can fail. Tokens go first: a request
     // that sees the new config must not still authenticate a service account
     // the new config removed.
+    let new = Arc::new(new);
     targets.service_tokens.store(Arc::new(tokens));
-    targets.config.store(Arc::new(new));
+    targets.config.store(Arc::clone(&new));
     targets.audit_sinks.store(Arc::new(sinks));
     targets
         .permissions_cache
         .apply(&PermissionsChange::All)
         .await;
-    for (server, database) in &changed {
-        targets.adapter_registry.evict(server, database).await;
-    }
+    targets.adapter_registry.retire_superseded(&new).await;
     Ok(changed.len())
 }
 

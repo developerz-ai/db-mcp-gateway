@@ -32,7 +32,7 @@ pub use auth_codes::{AuthCode, AuthCodes};
 pub use client_name::{ClientName, InvalidClientName, MAX_CLIENT_NAME_CHARS};
 pub use client_registry::{ClientRecord, ClientRegistry};
 pub use facade::{AuthFacade, IssuedTokens};
-pub use grants::Minted;
+pub use grants::{MintError, Minted};
 pub use pending_flows::{OAuthBridge, PendingFlow, PendingFlows};
 pub use refresh_chain::DEFAULT_REFRESH_TTL;
 pub use refresh_tokens::{RefreshToken, RefreshTokens};

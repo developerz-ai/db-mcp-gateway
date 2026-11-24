@@ -34,6 +34,11 @@ impl<'b> RowWeight<'b> {
         self.fits()
     }
 
+    /// Give back what a value that was dropped again had claimed.
+    fn refund(&mut self, bytes: usize) {
+        self.used = self.used.saturating_sub(bytes);
+    }
+
     fn fits(&self) -> bool {
         self.budget.fits_wire(self.used)
     }
@@ -136,11 +141,32 @@ impl<'de> Visitor<'de> for Budgeted<'_, '_> {
         self.node(0)?;
         let mut map = Map::new();
         while let Some(key) = entries.next_key::<String>()? {
-            self.claim(size_of::<String>().saturating_add(key.len()))?;
+            let entry = size_of::<String>().saturating_add(key.len());
+            self.claim(entry)?;
             let value = entries.next_value_seed(Budgeted(&mut *self.0))?;
-            map.insert(key, value);
+            // `json` keeps duplicate keys and the map only the last value:
+            // what the replaced entry claimed is no longer held.
+            if let Some(replaced) = map.insert(key, value) {
+                self.0.refund(entry.saturating_add(claimed_by(&replaced)));
+            }
         }
         Ok(Value::Object(map))
+    }
+}
+
+/// What parsing `value` claimed: the weights [`Budgeted`] charges, summed.
+fn claimed_by(value: &Value) -> usize {
+    let node = size_of::<Value>();
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => node,
+        Value::String(text) => node + text.len(),
+        Value::Array(items) => node + items.iter().map(claimed_by).sum::<usize>(),
+        Value::Object(map) => {
+            let entries = map
+                .iter()
+                .map(|(key, value)| size_of::<String>() + key.len() + claimed_by(value));
+            node + entries.sum::<usize>()
+        }
     }
 }
 
@@ -183,6 +209,24 @@ mod tests {
             "parsed on past the budget: {} bytes",
             weight.used
         );
+    }
+
+    /// `json` (not `jsonb`) stores duplicate keys as written. 4 MB of one
+    /// repeated key decodes to a single entry, so it is not over budget.
+    #[test]
+    fn a_replaced_duplicate_key_is_not_charged() {
+        let repeats = MAX_RESULT_BYTES / 16;
+        let text = format!(r#"{{{}"k":[2,"last"]}}"#, r#""k":[1,"x"],"#.repeat(repeats));
+        assert!(text.len() < MAX_RESULT_BYTES);
+        let budget = ResultBudget::new(10);
+        let mut weight = RowWeight::new(&budget);
+        let JsonCell::Value(parsed) = parse(text.as_bytes(), &mut weight) else {
+            panic!("only the last entry is held");
+        };
+        assert_eq!(parsed, json!({"k": [2, "last"]}));
+        let nodes = 4 * size_of::<Value>();
+        let key = size_of::<String>() + 1;
+        assert_eq!(weight.used, nodes + key + "last".len());
     }
 
     #[test]

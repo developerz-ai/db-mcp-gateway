@@ -3,8 +3,9 @@
 //! An agent can only fix a query it was told what is wrong with: 11 % of
 //! measured `run_query` calls were syntax errors that all surfaced as one
 //! opaque code. So a statement-level database error keeps its SQLSTATE and a
-//! gateway-worded message keyed by it, naming only identifiers the caller's
-//! own SQL spelled (`pg/redact.rs`) — the server's text can carry row data.
+//! gateway-worded message keyed by it, naming at most the identifier at the
+//! parser's error position in the caller's SQL (`pg/redact.rs`): the server's
+//! text can carry row data.
 //! Connect-phase errors never become a [`DbRejection`]: they can name the
 //! role, host or authentication method.
 

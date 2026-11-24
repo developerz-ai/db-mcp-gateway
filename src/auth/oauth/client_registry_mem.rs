@@ -21,7 +21,9 @@ impl RegisteredClient {
     }
 }
 
-/// Memory twin of `db::insert_client_capped`.
+/// Memory twin of `db::insert_client_capped`. The caller's map lock stands in
+/// for the registry advisory lock: promotion takes it too, and the victim is
+/// tested and removed under it.
 pub(super) fn insert_mem(
     map: &mut HashMap<String, RegisteredClient>,
     client_id: String,

@@ -119,6 +119,9 @@ const DENIED_FUNCTIONS: &[Denied] = &[
 /// answers the operational question without the text. Refused wherever the
 /// name is written — table, function (`pg_stat_statements(true)`) or alias.
 /// `pg_stat_statements_info` (eviction count, reset time) stays readable.
+/// pg_cron's `job_run_details` is here too, so a role with `cron` on its
+/// `search_path` cannot read it unqualified; its `job` table is not — the
+/// name is too common — and is the operator's to revoke (spec 03 §guard).
 const DENIED_RELATIONS: &[Denied] = &[
     Denied::Exact("pg_stat_activity"),
     Denied::Exact("pg_stat_statements"),
@@ -133,6 +136,7 @@ const DENIED_RELATIONS: &[Denied] = &[
     Denied::Exact("pg_show_plans"),
     Denied::Exact("pg_store_plans"),
     Denied::Prefix("pg_qualstats", "pg_qualstats*"),
+    Denied::Exact("job_run_details"),
 ];
 
 /// Schemas whose every function and relation is refused, reported as

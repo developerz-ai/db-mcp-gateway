@@ -177,6 +177,14 @@ fn write_mode_rejects_updating_pg_settings() {
     ok_write("UPDATE t SET v = s.setting FROM pg_settings s WHERE s.name = t.name");
     ok_write("UPDATE my_pg_settings SET setting = 'x'");
     ok_write("UPDATE ONLY t SET v = 1");
+    ok_write("UPDATE orders AS pg_settings SET status = 'closed'");
+    ok_write("UPDATE orders pg_settings SET status = 'closed'");
+    ok_write("UPDATE pg_settings.orders SET status = 'closed'");
+    ok_write(r#"UPDATE "ONLY" pg_settings SET v = 1"#);
+    rejected_write_denied(
+        "UPDATE pg_settings AS orders SET setting = 'x'",
+        "set_config",
+    );
 }
 
 #[test]
