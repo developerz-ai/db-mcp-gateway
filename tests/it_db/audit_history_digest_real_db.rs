@@ -96,6 +96,26 @@ async fn every_row_carries_its_digest_and_the_lookup_seeks_it() {
             .all(|e| e.sql_sha256.as_deref() == Some(hash.as_str()))
     );
 
+    // Give the planner a realistic history to cost against: on an empty
+    // table every index is equally cheap and the choice is a coin toss. A
+    // caller with hundreds of distinct statements is the case the digest
+    // index exists for.
+    sqlx::query(
+        "INSERT INTO audit_calls (id, request_id, user_sub, user_email, groups, tool, \
+           server_name, database_name, sql, outcome) \
+         SELECT gen_random_uuid(), gen_random_uuid()::text, $1, 'digest@example.com', \
+           '[]', 'run_query', 'prod', 'app', 'SELECT ' || n, 'success' \
+         FROM generate_series(10, 409) AS n",
+    )
+    .bind(&sub)
+    .execute(&p)
+    .await
+    .expect("seed a realistic history");
+    sqlx::query("ANALYZE audit_calls")
+        .execute(&p)
+        .await
+        .expect("analyze");
+
     let mut tx = p.begin().await.expect("tx");
     sqlx::query("SET LOCAL enable_seqscan = off")
         .execute(&mut *tx)
