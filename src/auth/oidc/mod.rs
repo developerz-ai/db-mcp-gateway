@@ -5,33 +5,36 @@
 //! risky bits — and validate `iss` / `aud` / `nonce` / `kid` ourselves.
 
 mod discovery;
+mod groups;
 mod helpers;
 mod jwks;
+mod options;
 mod types;
+mod verify;
 
-use discovery::get_json;
-use helpers::*;
-use jwks::{JwksCache, Probe};
-use types::*;
+use jwks::JwksCache;
+use types::TokenResponse;
 
 pub(crate) use helpers::is_loopback;
+pub use options::{
+    GroupsPrefix, LoginOptions, LoginOptionsError, Scopes, SupportContact, TokenAuthMethod,
+};
 pub use types::{DiscoveryDocument, VerifiedIdentity};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use jsonwebtoken::Validation;
 use secrecy::ExposeSecret;
 use tokio::sync::{Mutex, RwLock};
 
 use super::config::AuthConfig;
 use super::errors::AuthError;
-use super::session::is_service_subject;
 
 /// OIDC Relying Party client. Cheap to clone; shares the inner cache.
 #[derive(Clone, Debug)]
 pub struct OidcClient {
     config: Arc<AuthConfig>,
+    options: Arc<LoginOptions>,
     /// `config.issuer` without a trailing slash: the one form used to build
     /// the discovery URL and to compare against the discovery document.
     issuer: Arc<str>,
@@ -63,8 +66,20 @@ const DEFAULT_IDP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// Still bounded, so a genuinely hung IdP can't pin the task open (T3).
 const TOKEN_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// Cap on everything `/auth/callback` waits on at the IdP for one login:
+/// discovery, the code exchange and a JWKS fetch. Each has its own timeout
+/// above, but back to back on cold caches they add up to 65 s — past the
+/// router's deadline, which answers a bare `504` with no redirect back to the
+/// client. `transport::bounds` sizes that deadline from this constant.
+pub const LOGIN_IDP_BUDGET: Duration = Duration::from_secs(50);
+
 impl OidcClient {
+    /// A client with default [`LoginOptions`].
     pub fn new(config: AuthConfig) -> Result<Self, AuthError> {
+        Self::with_options(config, LoginOptions::default())
+    }
+
+    pub fn with_options(config: AuthConfig, options: LoginOptions) -> Result<Self, AuthError> {
         // Token exchange must not follow redirects (SSRF guard). Fall back to
         // `Client::new()` is NOT acceptable — that uses the default redirect
         // policy (up to 10 hops in reqwest 0.12) and would silently re-open
@@ -82,6 +97,7 @@ impl OidcClient {
         Ok(Self {
             issuer: Arc::from(config.issuer.trim_end_matches('/')),
             config: Arc::new(config),
+            options: Arc::new(options),
             http,
             discovery: Arc::new(RwLock::new(None)),
             discovery_refresh: Arc::new(Mutex::new(())),
@@ -92,6 +108,10 @@ impl OidcClient {
 
     pub fn config(&self) -> &AuthConfig {
         &self.config
+    }
+
+    pub fn options(&self) -> &LoginOptions {
+        &self.options
     }
 
     /// Build the IdP authorization URL the agent should send the user to.
@@ -110,7 +130,7 @@ impl OidcClient {
             .append_pair("response_type", "code")
             .append_pair("client_id", &self.config.client_id)
             .append_pair("redirect_uri", &self.config.redirect_url)
-            .append_pair("scope", SCOPES)
+            .append_pair("scope", self.options.scopes.as_str())
             .append_pair("state", state)
             .append_pair("nonce", nonce)
             .append_pair("code_challenge", code_challenge)
@@ -121,26 +141,53 @@ impl OidcClient {
     /// Exchange an authorization code for an ID token, verify it, and pluck
     /// the subject, email, and groups claim. `code_verifier` proves the PKCE
     /// challenge sent at `authorize_url` (RFC 7636) — IdPs that mandate PKCE
-    /// reject the exchange without it.
+    /// reject the exchange without it. Gives up after [`LOGIN_IDP_BUDGET`].
     pub async fn exchange_and_verify(
         &self,
         code: &str,
         expected_nonce: &str,
         code_verifier: &str,
     ) -> Result<VerifiedIdentity, AuthError> {
-        let discovery = self.discover().await?;
+        let login = self.exchange_then_verify(code, expected_nonce, code_verifier);
+        match tokio::time::timeout(LOGIN_IDP_BUDGET, login).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!("IdP did not complete the login within the budget");
+                Err(AuthError::CodeExchange)
+            }
+        }
+    }
 
-        let response = self
-            .http
-            .post(&discovery.token_endpoint)
-            .form(&[
-                ("grant_type", "authorization_code"),
-                ("code", code),
-                ("redirect_uri", &self.config.redirect_url),
-                ("client_id", &self.config.client_id),
-                ("client_secret", self.config.client_secret.expose_secret()),
-                ("code_verifier", code_verifier),
-            ])
+    async fn exchange_then_verify(
+        &self,
+        code: &str,
+        expected_nonce: &str,
+        code_verifier: &str,
+    ) -> Result<VerifiedIdentity, AuthError> {
+        let discovery = self.discover().await?;
+        let mut form = vec![
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", self.config.redirect_url.as_str()),
+            ("code_verifier", code_verifier),
+        ];
+        let client_id = self.config.client_id.as_str();
+        let client_secret = self.config.client_secret.expose_secret();
+        let request = self.http.post(&discovery.token_endpoint);
+        let request = match self.options.token_auth_method {
+            TokenAuthMethod::ClientSecretPost => {
+                form.extend([("client_id", client_id), ("client_secret", client_secret)]);
+                request
+            }
+            // RFC 6749 §2.3.1: both halves are form-urlencoded before Basic
+            // encoding, so a `:` or non-ASCII byte in either survives.
+            TokenAuthMethod::ClientSecretBasic => request.basic_auth(
+                form_urlencode(client_id),
+                Some(form_urlencode(client_secret)),
+            ),
+        };
+        let response = request
+            .form(&form)
             .timeout(TOKEN_EXCHANGE_TIMEOUT)
             .send()
             .await
@@ -151,88 +198,6 @@ impl OidcClient {
         }
         let token: TokenResponse = response.json().await.map_err(|_| AuthError::CodeExchange)?;
         self.verify_id_token(&token.id_token, expected_nonce).await
-    }
-
-    async fn verify_id_token(
-        &self,
-        id_token: &str,
-        expected_nonce: &str,
-    ) -> Result<VerifiedIdentity, AuthError> {
-        let header = jsonwebtoken::decode_header(id_token).map_err(|_| AuthError::IdToken)?;
-        let kid = header.kid.ok_or(AuthError::IdToken)?;
-        // The JWKS decides which algorithms each key may verify; a header alg
-        // outside that set (HS256, `none`, RSA-vs-EC confusion) never decodes.
-        let verify_key = self.verify_key(&kid).await?;
-        let key = verify_key.for_alg(header.alg).ok_or(AuthError::IdToken)?;
-        // OIDC Core 3.1.3.7 step 2: `iss` must exactly match the discovery
-        // document's issuer — compare against that, not the configured string,
-        // so a trailing-slash difference in config can't reject valid tokens.
-        let issuer = self.discover().await?.issuer;
-
-        let mut validation = Validation::new(header.alg);
-        // `set_issuer` / `set_audience` only constrain a claim that is *present*:
-        // in `jsonwebtoken` 9.3 an absent `iss`/`aud` falls through the match to
-        // `_ => {}`. `required_spec_claims` defaults to `{exp}` alone, and our
-        // claims deserialize into `serde_json::Value`, so nothing else forces
-        // them to exist — a token from the IdP's JWKS with no `aud` would verify.
-        // Demanding them here is OIDC Core 3.1.3.7 step 3.
-        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
-        validation.set_issuer(&[&issuer]);
-        validation.set_audience(&[&self.config.audience]);
-        validation.validate_exp = true;
-        // `jsonwebtoken` leaves `nbf` off by default; without this a future-dated
-        // ID token (not-yet-valid) would be accepted.
-        validation.validate_nbf = true;
-
-        let data = jsonwebtoken::decode::<serde_json::Value>(id_token, key, &validation)
-            .map_err(|_| AuthError::IdToken)?;
-        let claims = data.claims;
-
-        let nonce = claims.get("nonce").and_then(|v| v.as_str()).unwrap_or("");
-        // Constant-time nonce check would be ideal; this string is short and
-        // not secret-extractable via timing, so eq is fine here.
-        if nonce != expected_nonce {
-            return Err(AuthError::IdToken);
-        }
-
-        let sub = claims
-            .get("sub")
-            .and_then(|v| v.as_str())
-            .ok_or(AuthError::IdToken)?
-            .to_string();
-        if is_service_subject(&sub) {
-            // The subject itself stays out of the log: it is IdP-controlled.
-            tracing::warn!(
-                "ID token subject uses the reserved service-account prefix; login refused"
-            );
-            return Err(AuthError::IdToken);
-        }
-        // Email is the audit/admin identity: persisted to `permissions_users`
-        // and stamped on every audit row. Many IdPs let a user set an arbitrary
-        // address that stays `email_verified: false`, so trusting an unverified
-        // value would feed a spoofable identity into the audit trail (A6).
-        // Require the claim present AND `email_verified == true` before minting
-        // an identity from it.
-        let email = claims
-            .get("email")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or(AuthError::EmailUnverified)?
-            .to_string();
-        if !claim_is_true(claims.get("email_verified")) {
-            return Err(AuthError::EmailUnverified);
-        }
-        let groups = claims
-            .get(self.config.groups_claim.as_str())
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|g| g.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Ok(VerifiedIdentity { sub, email, groups })
     }
 
     async fn discover(&self) -> Result<DiscoveryDocument, AuthError> {
@@ -256,31 +221,24 @@ impl OidcClient {
             .filter(|(_, fetched_at)| fetched_at.elapsed() < DISCOVERY_TTL)
             .map(|(doc, _)| doc.clone())
     }
+}
 
-    /// The key for `kid`. An unknown `kid` refetches the JWKS (the IdP rotated
-    /// keys) at most once per [`jwks::UNKNOWN_KID_REFETCH`], and concurrent
-    /// misses share one fetch.
-    async fn verify_key(&self, kid: &str) -> Result<jwks::VerifyKey, AuthError> {
-        if let Some(key) = self.probe_jwks(kid).await? {
-            return Ok(key);
-        }
-        let _refresh = self.jwks_refresh.lock().await;
-        if let Some(key) = self.probe_jwks(kid).await? {
-            return Ok(key);
-        }
-        let discovery = self.discover().await?;
-        let cache = JwksCache::new(get_json(&self.http, &discovery.jwks_uri).await?);
-        let key = cache.get(kid);
-        *self.jwks.write().await = Some(cache);
-        key.ok_or(AuthError::IdToken)
+fn form_urlencode(raw: &str) -> String {
+    url::form_urlencoded::byte_serialize(raw.as_bytes()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_code_exchange_fits_inside_the_login_budget() {
+        assert!(TOKEN_EXCHANGE_TIMEOUT <= LOGIN_IDP_BUDGET);
     }
 
-    /// `Ok(Some)` hit, `Ok(None)` fetch needed, `Err` known-unknown `kid`.
-    async fn probe_jwks(&self, kid: &str) -> Result<Option<jwks::VerifyKey>, AuthError> {
-        match jwks::probe(self.jwks.read().await.as_ref(), kid) {
-            Probe::Hit(key) => Ok(Some(key)),
-            Probe::Fetch => Ok(None),
-            Probe::Unknown => Err(AuthError::IdToken),
-        }
+    #[test]
+    fn basic_credentials_are_form_urlencoded() {
+        assert_eq!(form_urlencode("id:with space"), "id%3Awith+space");
+        assert_eq!(form_urlencode("s3cr/t+é"), "s3cr%2Ft%2B%C3%A9");
     }
 }

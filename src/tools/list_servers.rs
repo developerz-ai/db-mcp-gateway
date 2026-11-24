@@ -9,6 +9,8 @@
 //! writes one row"). The audit row has `server`/`database`/`sql` all `None`
 //! because `list_servers` doesn't address a target.
 
+use std::time::Instant;
+
 use serde::Serialize;
 use serde_json::Value;
 
@@ -19,7 +21,8 @@ use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
 use super::audit_dispatch::{
-    AuditHeader, Outcome, OutcomeCode, error_outcome, run_audited, success_outcome,
+    AuditHeader, Outcome, OutcomeCode, elapsed_ms_since, error_outcome, run_audited,
+    success_outcome,
 };
 
 const TOOL_NAME: &str = "list_servers";
@@ -59,6 +62,7 @@ fn compute_outcome(
     config: &ConfigFile,
     db_grants: &[Grant],
 ) -> Outcome {
+    let started = Instant::now();
     let servers: Vec<SafeServerView> = config
         .servers
         .iter()
@@ -80,7 +84,8 @@ fn compute_outcome(
         }
     };
 
-    success_outcome(id, payload, None, Some(row_count), Some(false))
+    let elapsed = Some(elapsed_ms_since(started));
+    success_outcome(id, payload, elapsed, Some(row_count), Some(false))
 }
 
 impl From<&crate::config::Server> for SafeServerView {

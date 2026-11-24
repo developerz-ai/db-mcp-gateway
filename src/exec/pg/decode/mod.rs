@@ -13,16 +13,21 @@
 
 mod datetime;
 mod json;
+mod numeral;
+mod numeric;
 mod render;
+mod wire;
 
 use serde_json::Value;
 use sqlx::postgres::{PgRow, PgTypeInfo, PgTypeKind, PgValueFormat, PgValueRef, Postgres};
-use sqlx::types::{BigDecimal, Json, Uuid, chrono};
 use sqlx::{Row, Type, TypeInfo, ValueRef};
 
 use json::JsonCell;
 pub(super) use json::RowWeight;
-use render::{float, hex, inet, interval, unsupported};
+use render::unsupported;
+use wire::{Refused, Scalar};
+
+const MONEY: u32 = 790;
 
 /// A row whose decoded form cannot fit what the result budget has left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,103 +40,34 @@ pub(super) enum ColumnDecoder {
     Json,
     /// Sent as a version byte, then the same text as `json`.
     Jsonb,
-    Int8,
-    Int4,
-    Int2,
-    Float8,
-    Float4,
-    Bool,
-    /// Text-like columns and enum labels.
-    Text,
-    /// `numeric` as a JSON *string*: arbitrary precision is what money
-    /// columns are made of, and `f64` would silently round it.
-    Numeric,
-    Uuid,
-    /// RFC 3339, normalised to UTC. Like every date/time decoder below:
-    /// `infinity` / `-infinity` for Postgres' infinities, and a signed year
-    /// outside `0000..=9999` (see [`datetime`]).
-    TimestampTz,
-    /// ISO-8601 with the `T` separator and no zone — Postgres stores none.
-    Timestamp,
-    Date,
-    Time,
-    /// Postgres' own `\x`-prefixed hex, unmistakably not text.
-    Bytea,
-    /// ISO-8601 duration (`P1Y2M3DT4H5M6S`).
-    Interval,
-    /// `inet` / `cidr` in Postgres' text form.
-    Inet,
-    TextArray,
-    Int8Array,
-    Int4Array,
-    Int2Array,
-    UuidArray,
-    /// Arrays of other types, ranges, PostGIS, composites …: the marker names
-    /// the type so the caller can cast it (`SELECT my_col::text`).
+    Scalar(Scalar),
+    /// A one-dimensional array: a JSON array whose items may be `null`.
+    Array(Scalar),
+    /// Ranges, PostGIS, composites …: the marker names the type so
+    /// the caller can cast it (`SELECT my_col::text`).
     Unsupported(String),
 }
 
 impl ColumnDecoder {
-    pub(super) fn for_type(ty: &PgTypeInfo) -> Self {
-        // Compatibility, not name, decides: `Json` covers `json` and `jsonb`,
-        // `String` covers every text-like type sqlx knows. sqlx enforces
-        // width per OID, so each integer and float width is its own variant.
-        if is::<Json<Value>>(ty) {
-            if ty.name() == "JSONB" {
-                Self::Jsonb
-            } else {
-                Self::Json
-            }
-        } else if is::<i64>(ty) {
-            Self::Int8
-        } else if is::<i32>(ty) {
-            Self::Int4
-        } else if is::<i16>(ty) {
-            Self::Int2
-        } else if is::<f64>(ty) {
-            Self::Float8
-        } else if is::<f32>(ty) {
-            Self::Float4
-        } else if is::<bool>(ty) {
-            Self::Bool
-        } else if is::<String>(ty) {
-            Self::Text
-        } else if is::<BigDecimal>(ty) {
-            Self::Numeric
-        } else if is::<Uuid>(ty) {
-            Self::Uuid
-        } else if is::<chrono::DateTime<chrono::Utc>>(ty) {
-            Self::TimestampTz
-        } else if is::<chrono::NaiveDateTime>(ty) {
-            Self::Timestamp
-        } else if is::<chrono::NaiveDate>(ty) {
-            Self::Date
-        } else if is::<chrono::NaiveTime>(ty) {
-            Self::Time
-        } else if is::<Vec<u8>>(ty) {
-            Self::Bytea
-        } else if is::<sqlx::postgres::types::PgInterval>(ty) {
-            Self::Interval
-        } else if matches!(ty.name(), "INET" | "CIDR") {
-            Self::Inet
-        } else if is::<Vec<Option<String>>>(ty) {
-            Self::TextArray
-        } else if is::<Vec<Option<i64>>>(ty) {
-            Self::Int8Array
-        } else if is::<Vec<Option<i32>>>(ty) {
-            Self::Int4Array
-        } else if is::<Vec<Option<i16>>>(ty) {
-            Self::Int2Array
-        } else if is::<Vec<Option<Uuid>>>(ty) {
-            Self::UuidArray
-        } else {
-            match ty.kind() {
-                // An enum's binary form is its label's UTF-8 bytes.
-                PgTypeKind::Enum(_) => Self::Text,
-                // A domain is sent in its base type's format.
-                PgTypeKind::Domain(base) => Self::for_type(base),
-                _ => Self::Unsupported(ty.name().to_string()),
-            }
+    /// `money_digits`: how many digits of a `money` value are its fraction,
+    /// in the session that sent it.
+    pub(super) fn for_type(ty: &PgTypeInfo, money_digits: u8) -> Self {
+        match ty.oid().map(|oid| oid.0) {
+            Some(114) => return Self::Json,
+            Some(3802) => return Self::Jsonb,
+            _ => {}
+        }
+        if let Some(scalar) = scalar_for(ty, money_digits) {
+            return Self::Scalar(scalar);
+        }
+        match ty.kind() {
+            // A domain is sent in its base type's format.
+            PgTypeKind::Domain(base) => Self::for_type(base, money_digits),
+            PgTypeKind::Array(element) => match scalar_for(element, money_digits) {
+                Some(scalar) => Self::Array(scalar),
+                None => Self::Unsupported(ty.name().to_string()),
+            },
+            _ => Self::Unsupported(ty.name().to_string()),
         }
     }
 
@@ -141,67 +77,76 @@ impl ColumnDecoder {
         idx: usize,
         weight: &mut RowWeight<'_>,
     ) -> Result<Value, OverBudget> {
-        // Type-agnostic NULL check first: decoding is unchecked below (the
-        // decoder already matched the column type, and a domain's OID would
-        // fail the checked path), so NULL must never reach it.
         let Ok(raw) = row.try_get_raw(idx) else {
             // Unreachable: `idx` comes from this row's own column list.
             return Ok(unsupported("unknown"));
         };
+        // Type-agnostic NULL check first: NULL has no bytes to decode.
         if raw.is_null() {
             return Ok(Value::Null);
         }
-        let decoded = match self {
-            Self::Json | Self::Jsonb => match json_text(self, &raw).map(|t| json::parse(t, weight))
-            {
-                Some(JsonCell::Value(value)) => Ok(value),
-                Some(JsonCell::OverBudget) => return Err(OverBudget),
-                Some(JsonCell::Invalid) | None => Err(()),
+        let decoded = match (self, wire_bytes(&raw)) {
+            (Self::Unsupported(name), _) => return Ok(unsupported(name)),
+            (_, None) => Err(Refused::Undecodable),
+            (Self::Json, Some(text)) => json_cell(text, weight),
+            // Version 1 is the only `jsonb` wire version there is.
+            (Self::Jsonb, Some(wire)) => match wire.strip_prefix(&[1]) {
+                Some(text) => json_cell(text, weight),
+                None => Err(Refused::Undecodable),
             },
-            Self::Int8 => get::<i64>(row, idx).map(Value::from),
-            Self::Int4 => get::<i32>(row, idx).map(Value::from),
-            Self::Int2 => get::<i16>(row, idx).map(Value::from),
-            Self::Float8 => get::<f64>(row, idx).map(float),
-            Self::Float4 => get::<f32>(row, idx).map(|v| float(f64::from(v))),
-            Self::Bool => get::<bool>(row, idx).map(Value::from),
-            Self::Text => get::<String>(row, idx).map(Value::from),
-            Self::Numeric => get::<BigDecimal>(row, idx).map(|v| Value::from(v.to_string())),
-            Self::Uuid => get::<Uuid>(row, idx).map(|v| Value::from(v.to_string())),
-            Self::TimestampTz => datetime::timestamptz(&raw).map(Value::from).ok_or(()),
-            Self::Timestamp => datetime::timestamp(&raw).map(Value::from).ok_or(()),
-            Self::Date => datetime::date(&raw).map(Value::from).ok_or(()),
-            Self::Time => datetime::time(&raw).map(Value::from).ok_or(()),
-            Self::Bytea => get::<Vec<u8>>(row, idx).map(|v| Value::from(hex(&v))),
-            Self::Interval => get::<sqlx::postgres::types::PgInterval>(row, idx)
-                .map(|v| Value::from(interval(&v))),
-            Self::Inet => inet(&raw).map(Value::from).ok_or(()),
-            Self::TextArray => get::<Vec<Option<String>>>(row, idx).map(Value::from),
-            Self::Int8Array => get::<Vec<Option<i64>>>(row, idx).map(Value::from),
-            Self::Int4Array => get::<Vec<Option<i32>>>(row, idx).map(Value::from),
-            Self::Int2Array => get::<Vec<Option<i16>>>(row, idx).map(Value::from),
-            Self::UuidArray => get::<Vec<Option<Uuid>>>(row, idx)
-                .map(|v| Value::from_iter(v.into_iter().map(|u| u.map(|u| u.to_string())))),
-            Self::Unsupported(name) => return Ok(unsupported(name)),
+            (Self::Scalar(scalar), Some(wire)) => scalar.decode(wire, weight),
+            (Self::Array(element), Some(wire)) => wire::array(*element, wire, weight),
         };
-        Ok(decoded.unwrap_or_else(|()| unsupported(raw.type_info().name())))
+        match decoded {
+            Ok(value) => Ok(value),
+            Err(Refused::OverBudget) => Err(OverBudget),
+            Err(Refused::Undecodable) => Ok(unsupported(raw.type_info().name())),
+        }
     }
 }
 
-/// The JSON text of a `json` / `jsonb` cell: binary `jsonb` leads with its
-/// format version, and version 1 is the only one there is.
-fn json_text<'r>(decoder: &ColumnDecoder, raw: &PgValueRef<'r>) -> Option<&'r [u8]> {
-    let bytes = raw.as_bytes().ok()?;
-    if *decoder == ColumnDecoder::Jsonb && raw.format() == PgValueFormat::Binary {
-        return bytes.strip_prefix(&[1]);
+/// The decoder for a type sent as one value: a built-in by its OID, an enum
+/// or a text-like extension type (`citext`) as text, a domain as its base.
+fn scalar_for(ty: &PgTypeInfo, money_digits: u8) -> Option<Scalar> {
+    match ty.oid().map(|oid| oid.0) {
+        Some(MONEY) => return Some(Scalar::Money(money_digits)),
+        Some(oid) => {
+            if let Some(scalar) = Scalar::for_oid(oid) {
+                return Some(scalar);
+            }
+        }
+        None => {}
     }
-    Some(bytes)
+    match ty.kind() {
+        // An enum's binary form is its label's UTF-8 bytes.
+        PgTypeKind::Enum(_) => Some(Scalar::Text),
+        PgTypeKind::Domain(base) => scalar_for(base, money_digits),
+        _ => <String as Type<Postgres>>::compatible(ty).then_some(Scalar::Text),
+    }
+}
+
+/// The cell's bytes when it was sent in binary, which is how the driver asks
+/// for every result. A text-format cell is not decoded as if it were.
+fn wire_bytes<'r>(raw: &PgValueRef<'r>) -> Option<&'r [u8]> {
+    match raw.format() {
+        PgValueFormat::Binary => raw.as_bytes().ok(),
+        PgValueFormat::Text => None,
+    }
+}
+
+fn json_cell(text: &[u8], weight: &mut RowWeight<'_>) -> Result<Value, Refused> {
+    match json::parse(text, weight) {
+        JsonCell::Value(value) => Ok(value),
+        JsonCell::OverBudget => Err(Refused::OverBudget),
+        JsonCell::Invalid => Err(Refused::Undecodable),
+    }
 }
 
 /// One decoder per column of `row`, in column order.
-pub(super) fn decoders(row: &PgRow) -> Vec<ColumnDecoder> {
+pub(super) fn decoders(row: &PgRow, money_digits: u8) -> Vec<ColumnDecoder> {
     row.columns()
         .iter()
-        .map(|c| ColumnDecoder::for_type(sqlx::Column::type_info(c)))
+        .map(|c| ColumnDecoder::for_type(sqlx::Column::type_info(c), money_digits))
         .collect()
 }
 
@@ -218,22 +163,11 @@ pub(super) fn decode_row(
         .collect()
 }
 
-fn is<T: Type<Postgres>>(ty: &PgTypeInfo) -> bool {
-    T::compatible(ty)
-}
-
-/// Unchecked decode: the column's decoder was chosen by compatibility, so
-/// sqlx's per-cell type check would only repeat it (and reject domains). A
-/// failure is still caught and rendered as the unsupported marker.
-fn get<'r, T>(row: &'r PgRow, idx: usize) -> Result<T, ()>
-where
-    T: sqlx::Decode<'r, Postgres>,
-{
-    row.try_get_unchecked::<T, _>(idx).map_err(|_| ())
-}
-
 #[cfg(test)]
 mod tests {
+    use sqlx::postgres::types::PgInterval;
+    use sqlx::types::{BigDecimal, Json, Uuid};
+
     use super::*;
 
     #[test]
@@ -241,26 +175,39 @@ mod tests {
         fn ty<T: Type<Postgres>>() -> PgTypeInfo {
             T::type_info()
         }
+        let scalar = ColumnDecoder::Scalar;
         let cases = [
-            (ty::<i64>(), ColumnDecoder::Int8),
-            (ty::<f32>(), ColumnDecoder::Float4),
+            (ty::<i64>(), scalar(Scalar::Int8)),
+            (ty::<f32>(), scalar(Scalar::Float4)),
             (ty::<Json<Value>>(), ColumnDecoder::Jsonb),
-            (ty::<String>(), ColumnDecoder::Text),
-            (ty::<BigDecimal>(), ColumnDecoder::Numeric),
+            (ty::<String>(), scalar(Scalar::Text)),
+            (ty::<BigDecimal>(), scalar(Scalar::Numeric)),
+            (ty::<PgInterval>(), scalar(Scalar::Interval)),
+            (ty::<sqlx::postgres::types::Oid>(), scalar(Scalar::Oid)),
+            (ty::<Vec<String>>(), ColumnDecoder::Array(Scalar::Text)),
+            (ty::<Vec<i32>>(), ColumnDecoder::Array(Scalar::Int4)),
+            (ty::<Vec<Uuid>>(), ColumnDecoder::Array(Scalar::Uuid)),
+            (ty::<Vec<f64>>(), ColumnDecoder::Array(Scalar::Float8)),
+            (ty::<Vec<bool>>(), ColumnDecoder::Array(Scalar::Bool)),
             (
-                ty::<sqlx::postgres::types::PgInterval>(),
-                ColumnDecoder::Interval,
+                ty::<Vec<BigDecimal>>(),
+                ColumnDecoder::Array(Scalar::Numeric),
             ),
-            (ty::<Vec<String>>(), ColumnDecoder::TextArray),
-            (ty::<Vec<i32>>(), ColumnDecoder::Int4Array),
-            (ty::<Vec<Uuid>>(), ColumnDecoder::UuidArray),
             (
-                ty::<Vec<f64>>(),
-                ColumnDecoder::Unsupported("FLOAT8[]".into()),
+                ty::<sqlx::postgres::types::PgMoney>(),
+                scalar(Scalar::Money(2)),
+            ),
+            (
+                ty::<Vec<sqlx::postgres::types::PgMoney>>(),
+                ColumnDecoder::Array(Scalar::Money(2)),
+            ),
+            (
+                ty::<Vec<Json<Value>>>(),
+                ColumnDecoder::Unsupported("JSONB[]".into()),
             ),
         ];
         for (ty, want) in cases {
-            assert_eq!(ColumnDecoder::for_type(&ty), want, "{ty:?}");
+            assert_eq!(ColumnDecoder::for_type(&ty, 2), want, "{ty:?}");
         }
     }
 }

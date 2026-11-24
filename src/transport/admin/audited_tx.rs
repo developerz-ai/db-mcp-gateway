@@ -43,8 +43,9 @@ impl<'a> AuditedTx<'a> {
         })
     }
 
-    /// Begin and upsert the actor's row before anything else, so every admin
-    /// write locks its actor row before its target rows — one lock order.
+    /// Begin and lock the actor's row (inserted if absent) before anything
+    /// else, so every admin write locks its actor row before its target rows
+    /// — one lock order.
     pub(super) async fn begin_locked(
         pool: &PgPool,
         actor: &'a AdminActor,
@@ -56,16 +57,17 @@ impl<'a> AuditedTx<'a> {
 
     pub(super) async fn lock_actor(&mut self) -> Result<(), AdminError> {
         let a = self.actor;
-        let id = users::tx_upsert_actor(&mut self.tx, &a.sub, &a.email, &a.groups)
+        let id = users::tx_lock_actor(&mut self.tx, &a.sub, &a.email, &a.groups)
             .await
-            .map_err(|err| store_error("upsert_actor", err, &a.request_id))?;
+            .map_err(|err| store_error("lock_actor", err, &a.request_id))?;
         self.actor_id = Some(id);
         Ok(())
     }
 
-    /// The mutation targets the actor's own user row. Upserting the actor
-    /// would overwrite (or resurrect) that row with the session snapshot, so
-    /// the target row stands in as the actor.
+    /// The mutation targets the actor's own user row. Locking the actor first
+    /// would insert that row from the session snapshot when absent — an
+    /// unaudited create ahead of the audited one — so the target row stands
+    /// in as the actor.
     pub(super) fn actor_is(&mut self, id: Uuid) {
         self.actor_id = Some(id);
     }

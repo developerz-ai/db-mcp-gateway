@@ -17,10 +17,11 @@ use crate::exec::{Access, ExecQuery, ExecResult, GuardedSql};
 use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
-use super::args::parse_arguments;
+use super::args::{LIMIT_AT_LEAST_ONE, parse_arguments};
 use super::audit_dispatch::{
-    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, WriteEffect, error_outcome,
-    invalid_arguments, outcome_from_exec_error, reject_arguments, run_audited, success_outcome,
+    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, WriteEffect, audit_outcome,
+    error_outcome, invalid_arguments, outcome_from_exec_error, reject_arguments, run_audited,
+    success_outcome, write_state,
 };
 use super::target::{effective_row_limit, ensure_reason, forbidden, record_intent, resolve_target};
 
@@ -81,6 +82,10 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
         reason: args.reason.as_deref(),
         db_type: super::db_type_for_server(ctx.config, &args.server),
     };
+    if args.limit == Some(0) {
+        let outcome = invalid_arguments(id.clone(), LIMIT_AT_LEAST_ONE);
+        return audit_outcome(ctx, id, header, outcome).await;
+    }
     let args = &args;
     run_audited(ctx, id, header, |id, grants| async move {
         compute_outcome(ctx, id, &grants, &header, args).await
@@ -175,11 +180,6 @@ async fn compute_outcome(
     // unavailable, syntax_error) still surface `duration_ms` in the audit
     // row — spec 07 requires it for every tool invocation.
     let started = Instant::now();
-    let adapter = match ctx.registry.get_or_open(server, database).await {
-        Ok(a) => a,
-        Err(err) => return outcome_from_exec_error(err, started, &ERROR_MESSAGES),
-    };
-
     let query = ExecQuery {
         sql: &args.sql,
         binds: &[],
@@ -189,7 +189,12 @@ async fn compute_outcome(
         dry_run: args.dry_run,
         request_id: ctx.request.request_id,
     };
-    let (mut outcome, rows_affected) = match adapter.execute(query).await {
+    let executed = match ctx.registry.get_or_open(server, database).await {
+        Ok(adapter) => adapter.execute(query).await,
+        Err(err) => Err(err),
+    };
+    let state = write_state(&executed, args.dry_run);
+    let (mut outcome, rows_affected) = match executed {
         Ok(result) => (
             result_outcome(id, &result, args.dry_run),
             result.rows_affected,
@@ -199,6 +204,7 @@ async fn compute_outcome(
     if access == Access::ReadWrite {
         outcome.write = Some(WriteEffect {
             rows_affected: rows_affected.map(|rows| i64::try_from(rows).unwrap_or(i64::MAX)),
+            state,
         });
         note_indeterminate_write(&mut outcome, args.dry_run);
     }

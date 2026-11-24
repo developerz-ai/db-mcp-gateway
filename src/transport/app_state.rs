@@ -95,9 +95,9 @@ impl AppState {
             Duration::from_secs(crate::config::Config::default().permissions_cache_ttl_seconds);
         let detached = DetachedTasks::new();
         let mcp = McpState {
-            audit_sinks: Arc::new(ArcSwap::from_pointee(StreamSinks::from_config(
-                &config.logging.stream,
-            ))),
+            audit_sinks: Arc::new(ArcSwap::from_pointee(
+                StreamSinks::from_config(&config.logging.stream).expect("test sinks build"),
+            )),
             config: Arc::new(ArcSwap::from_pointee(config)),
             adapter_registry: AdapterRegistry::with_detached(detached.clone()),
             state_db,

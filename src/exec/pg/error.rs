@@ -2,23 +2,37 @@
 //!
 //! Nothing here renders an error with `Display`: connect-phase sqlx errors
 //! can quote the DSN (`Configuration`) or name the role and host, and the
-//! request path never leaks credentials. Logs carry the variant name and the
-//! SQLSTATE only; the agent gets the SQLSTATE and the gateway's wording for
+//! request path never leaks credentials. Logs carry the variant name, the
+//! SQLSTATE and the [`Origin`] only; the agent gets the SQLSTATE and the gateway's wording for
 //! a statement-level error (see [`super::redact`]) and an opaque code for
 //! everything else.
 
 use sqlx::error::DatabaseError;
 use sqlx::postgres::{PgDatabaseError, PgErrorPosition};
+use uuid::Uuid;
 
 use super::super::adapter::ExecError;
 use super::super::rejection::DbRejection;
 use super::super::sql_guard::Access;
 use super::redact::rejection_message;
 
+/// Where a target error came from. The names go on its log line as event
+/// fields — the operator's log shows no span, so a line without them cannot
+/// be tied to a request or a database. `role` is never logged: it is what
+/// gets redacted from a server message.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Origin<'a> {
+    pub(super) server: &'a str,
+    pub(super) database: &'a str,
+    pub(super) role: &'a str,
+    /// `None` for work no request asked for (a pool opening).
+    pub(super) request_id: Option<Uuid>,
+}
+
 /// Classify an error raised while `sql` ran — the caller's statement, or
-/// `""` for one of the gateway's own. `role` is redacted from the message.
-pub(super) fn classify(err: sqlx::Error, role: &str, sql: &str) -> ExecError {
-    log_discarded(&err, "target statement failed");
+/// `""` for one of the gateway's own.
+pub(super) fn classify(err: sqlx::Error, origin: &Origin<'_>, sql: &str) -> ExecError {
+    log_discarded(&err, Some(origin), "target statement failed");
     if let sqlx::Error::Database(db) = &err
         && let Some(code) = db.code()
     {
@@ -31,13 +45,16 @@ pub(super) fn classify(err: sqlx::Error, role: &str, sql: &str) -> ExecError {
             c if c.starts_with("08") || c.starts_with("57P") || c.starts_with("53") => {
                 ExecError::Unavailable
             }
+            // The statement was sound and the target could not finish it
+            // this time; nothing in the SQL is there to fix.
+            c if rolled_back_by_the_target(c) => ExecError::Unavailable,
             // Invalid authorization: a login refusal, whose text names the
             // role and can name the client address. Never passed on, however
             // it got here.
             c if c.starts_with("28") => ExecError::Connection,
             c => {
                 let message = rejection_message(c, error_position(db.as_ref()), sql);
-                ExecError::Rejected(DbRejection::new(c, &message, role))
+                ExecError::Rejected(DbRejection::new(c, &message, origin.role))
             }
         };
     }
@@ -45,6 +62,15 @@ pub(super) fn classify(err: sqlx::Error, role: &str, sql: &str) -> ExecError {
         return ExecError::Unavailable;
     }
     ExecError::Sql
+}
+
+/// SQLSTATEs with which the target itself rolled the transaction back, for
+/// a reason a retry can clear: `40001` (serialization failure — routine on
+/// YugabyteDB, reads included), `40P01` (deadlock victim), and the session
+/// ended for sitting in a transaction (`25P03`) or running one too long
+/// (`25P04`).
+fn rolled_back_by_the_target(sqlstate: &str) -> bool {
+    matches!(sqlstate, "40001" | "40P01" | "25P03" | "25P04")
 }
 
 /// Where in the submitted statement the server located the error: a 1-based
@@ -65,14 +91,22 @@ fn error_position(db: &dyn DatabaseError) -> Option<usize> {
 pub(super) fn classify_commit(
     err: sqlx::Error,
     access: Access,
-    role: &str,
+    origin: &Origin<'_>,
     sql: &str,
 ) -> ExecError {
-    match classify(err, role, sql) {
-        ExecError::Unavailable | ExecError::Sql if access == Access::ReadWrite => {
+    let rolled_back = sqlstate(&err).is_some_and(|code| rolled_back_by_the_target(&code));
+    match classify(err, origin, sql) {
+        ExecError::Unavailable | ExecError::Sql if access == Access::ReadWrite && !rolled_back => {
             ExecError::CommitIndeterminate
         }
         other => other,
+    }
+}
+
+fn sqlstate(err: &sqlx::Error) -> Option<String> {
+    match err {
+        sqlx::Error::Database(db) => db.code().map(|code| code.into_owned()),
+        _ => None,
     }
 }
 
@@ -87,8 +121,8 @@ pub(super) enum AcquireFailure {
 }
 
 impl AcquireFailure {
-    pub(super) fn of(err: &sqlx::Error) -> Self {
-        log_discarded(err, "target connection failed");
+    pub(super) fn of(err: &sqlx::Error, origin: &Origin<'_>) -> Self {
+        log_discarded(err, Some(origin), "target connection failed");
         match err {
             sqlx::Error::Database(db) if db.code().is_some_and(|c| c.starts_with("28")) => {
                 Self::Auth
@@ -112,16 +146,18 @@ fn sqlstate_is_feature_not_supported(code: Option<&str>) -> bool {
     code == Some(FEATURE_NOT_SUPPORTED)
 }
 
-/// The variant and SQLSTATE of a discarded error, for the operator. Never
-/// the error's `Display` (see module docs).
-pub(super) fn log_discarded(err: &sqlx::Error, what: &'static str) {
-    let sqlstate = match err {
-        sqlx::Error::Database(db) => db.code().map(|c| c.into_owned()),
-        _ => None,
-    };
+/// The variant and SQLSTATE of a discarded error, for the operator, with
+/// where it came from when that is known. Never the error's `Display` (see
+/// module docs). The field names are the tool-dispatch span's.
+pub(super) fn log_discarded(err: &sqlx::Error, origin: Option<&Origin<'_>>, what: &'static str) {
     tracing::warn!(
         error_kind = error_kind(err),
-        sqlstate = sqlstate.as_deref().unwrap_or(""),
+        sqlstate = sqlstate(err).as_deref().unwrap_or(""),
+        request_id = origin
+            .and_then(|origin| origin.request_id)
+            .map(tracing::field::display),
+        server = origin.map(|origin| origin.server),
+        db = origin.map(|origin| origin.database),
         "{what}"
     );
 }
@@ -148,68 +184,4 @@ pub(super) fn error_kind(err: &sqlx::Error) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pool_and_io_errors_are_unavailable() {
-        assert!(matches!(
-            classify(sqlx::Error::PoolTimedOut, "app", ""),
-            ExecError::Unavailable
-        ));
-        let io = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
-        assert!(matches!(
-            classify(sqlx::Error::Io(io), "app", ""),
-            ExecError::Unavailable
-        ));
-    }
-
-    #[test]
-    fn opaque_errors_stay_opaque() {
-        assert!(matches!(
-            classify(sqlx::Error::RowNotFound, "app", ""),
-            ExecError::Sql
-        ));
-        assert_eq!(
-            AcquireFailure::of(&sqlx::Error::PoolTimedOut),
-            AcquireFailure::Other
-        );
-    }
-
-    fn io_reset() -> sqlx::Error {
-        sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
-    }
-
-    #[test]
-    fn lost_connection_at_write_commit_is_indeterminate() {
-        assert!(matches!(
-            classify_commit(io_reset(), Access::ReadWrite, "app", ""),
-            ExecError::CommitIndeterminate
-        ));
-        assert!(matches!(
-            classify_commit(
-                sqlx::Error::Protocol("eof".into()),
-                Access::ReadWrite,
-                "app",
-                ""
-            ),
-            ExecError::CommitIndeterminate
-        ));
-    }
-
-    #[test]
-    fn lost_connection_at_read_commit_stays_unavailable() {
-        assert!(matches!(
-            classify_commit(io_reset(), Access::ReadOnly, "app", ""),
-            ExecError::Unavailable
-        ));
-    }
-
-    #[test]
-    fn only_sqlstate_0a000_is_feature_not_supported() {
-        assert!(sqlstate_is_feature_not_supported(Some("0A000")));
-        assert!(!sqlstate_is_feature_not_supported(Some("42501")));
-        assert!(!sqlstate_is_feature_not_supported(None));
-        assert!(!is_feature_not_supported(&sqlx::Error::PoolTimedOut));
-    }
-}
+mod tests;

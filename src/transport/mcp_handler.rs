@@ -5,11 +5,10 @@
 //! transport never evaluates a grant or runs SQL.
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{ConnectInfo, FromRequestParts, State};
+use axum::extract::{FromRequestParts, State};
 use axum::http::header::{ALLOW, USER_AGENT};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, StatusCode};
@@ -18,6 +17,7 @@ use axum::{Extension, Json};
 use serde_json::Value;
 
 use super::app_state::McpState;
+use super::client_ip::ClientIp;
 use super::dispatch;
 use super::mcp_headers;
 use super::request_id::{ClientRequestId, GatewayRequestId};
@@ -57,7 +57,7 @@ pub(super) async fn post_handler(
     Extension(request_id): Extension<GatewayRequestId>,
     client_request_id: Option<Extension<ClientRequestId>>,
     caller: Caller,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    ClientIp(ip): ClientIp,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
@@ -148,7 +148,7 @@ pub(super) async fn post_handler(
         .into_response();
     };
     let request_ctx = tools::RequestContext {
-        ip: connect_info.map(|ConnectInfo(addr)| addr.ip()),
+        ip,
         agent_client: agent_client(&headers),
         request_id: request_id.as_uuid(),
         upstream: upstream::from_headers(&headers, &identity, policy.as_ref()),

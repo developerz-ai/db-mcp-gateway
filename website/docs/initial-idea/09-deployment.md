@@ -100,6 +100,10 @@ Two paths must be open:
 | Gateway | State DB | Sessions, audit, permissions |
 | Gateway | Syslog receiver (optional) | `logging.stream` syslog sink |
 
+`POST /mcp` validates `Origin` (MCP Streamable HTTP, against DNS rebinding): a request without one passes (non-browser agents), one whose `Origin` is not in `MCP_ALLOWED_ORIGINS` — or, on a loopback bind, not a loopback origin — gets `403` before authentication, with no audit row and a `WARN` log line.
+
+Behind a reverse proxy, set `TRUSTED_PROXIES` to the proxies' addresses: when the TCP peer is one of them, the audit row's `ip` is the right-most `X-Forwarded-For` hop that is not itself a trusted proxy. Unset, `ip` is the TCP peer and `X-Forwarded-For` is ignored.
+
 No secrets-backend or object-storage path is needed today: secrets arrive as env vars or mounted files (`vault:` / `aws-sm:` / `gcp-sm:` refs abort boot), and there is no archive exporter ([11-roadmap](11-roadmap.md) phase 4).
 
 Run the gateway in the network segment that already reaches the DBs. Most installs put it next to existing internal tools.
@@ -130,11 +134,12 @@ Login state for the OAuth bridge (pending `/authorize` flows and authorization c
 
 - `/healthz` (liveness) — always returns 200 if the binary is up.
 - `/readyz` (readiness) — 200 only when the state DB is reachable (and the gateway is not shutting down).
+- Boot retries an unreachable state DB with backoff for `STATE_DB_CONNECT_TIMEOUT_SECONDS` (default 60 s), then exits. The listener binds only after the state DB is up, so neither probe answers during that window: give the `startupProbe` at least that budget.
 - `/metrics` (Prometheus) on its own listener, `METRICS_BIND` (default `127.0.0.1:9090`) — not on the public listener, whose hostname returns 404 for it. Catalogue: [deployment quickstart](../deployment/quickstart.md#metric-catalogue).
 - Structured JSON logs to stdout; `RUST_LOG` defaults to `info`, and the `audit_stream` target is always at INFO.
 
 ## Shutdown
 
-`SIGTERM` flips `/healthz` and `/readyz` to 503, stops background loops, and gives in-flight requests an 80 s drain window: the 75 s `/mcp` request timeout (caller pool-share wait 5 s + target pool acquire 5 s + statement ceiling 30 s + two audit writes of 15 s + 5 s slack) plus 5 s, so a call that times out still writes its outcome row. The permissions `LISTEN`/`NOTIFY` listener stays up through the drain, so a revoke announced during shutdown still reaches this replica's cache. Detached audit writes then get up to 20 s, and the two state-DB pools close (≤ 10 s each). Worst case 80 + 20 + 2 × 10 = 120 s: `terminationGracePeriodSeconds` must be ≥ 120 (plus any preStop sleep). `SIGHUP` never terminates the process — the handler is installed whether TLS is on or off.
+`SIGTERM` flips `/healthz` and `/readyz` to 503, stops background loops, and gives in-flight requests an 80 s drain window: the 75 s `/mcp` request timeout (caller pool-share wait 5 s + target pool acquire 5 s + statement ceiling 30 s + two audit writes of 15 s + 5 s slack) plus 5 s, so a call that times out still writes its outcome row. The permissions `LISTEN`/`NOTIFY` listener stays up through the drain, so a revoke announced during shutdown still reaches this replica's cache. Detached audit writes then get up to 20 s, and the request and background state-DB pools close (≤ 10 s each; the listener's pool ends with the drain). Worst case 80 + 20 + 2 × 10 = 120 s: `terminationGracePeriodSeconds` must be ≥ 120 (plus any preStop sleep). `SIGHUP` never terminates the process — the handler is installed whether TLS is on or off.
 
 See [11-roadmap](11-roadmap.md) for what's deferred (k8s operator, multi-replica leader election, etc.).

@@ -17,7 +17,7 @@ use crate::exec::{IDENTIFIER_PATTERN, Identifier, SampleQuery};
 use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
-use super::args::parse_arguments;
+use super::args::{LIMIT_AT_LEAST_ONE, parse_arguments};
 use super::audit_dispatch::{
     AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, audit_outcome, error_outcome,
     invalid_arguments, outcome_from_exec_error, reject_arguments, run_audited, success_outcome,
@@ -72,6 +72,10 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
         reason: args.reason.as_deref(),
         db_type: super::db_type_for_server(ctx.config, &args.server),
     };
+    if args.limit == Some(0) {
+        let outcome = invalid_arguments(id.clone(), LIMIT_AT_LEAST_ONE);
+        return audit_outcome(ctx, id, header, outcome).await;
+    }
     // Validated at the edge: the adapter interpolates both as identifiers,
     // and the audit row names the table they make up.
     let table = match parse_table(args.schema.as_deref(), &args.table) {

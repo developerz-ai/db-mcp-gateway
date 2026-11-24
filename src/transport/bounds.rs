@@ -21,6 +21,7 @@ use serde_json::json;
 use tower_http::timeout::{RequestBodyDeadlineLayer, TimeoutLayer};
 
 use crate::audit::AUDIT_WRITE_TIMEOUT;
+use crate::auth::oidc::LOGIN_IDP_BUDGET;
 use crate::exec::DEFAULT_STATEMENT_TIMEOUT_MS;
 
 /// Time for a client to deliver a whole request body.
@@ -45,9 +46,15 @@ const POOL_ACQUIRE_ALLOWANCE: Duration = Duration::from_secs(5);
 /// Covers the exec layer's 0.5 s timer slack past the statement ceiling.
 const SLACK: Duration = Duration::from_secs(5);
 
-/// OAuth / login routes: `/auth/callback` waits on the IdP code exchange,
-/// which `auth::oidc` bounds at 45 s.
-const OAUTH_TIMEOUT: Duration = Duration::from_secs(60);
+/// OAuth / login routes: `/auth/callback` waits on the IdP — discovery, the
+/// code exchange, a JWKS fetch — which `auth::oidc` bounds as a whole, then
+/// writes the session. The handler has to give up first: it still redirects
+/// the browser back to the client, where this deadline answers a bare `504`.
+/// 60 s.
+const OAUTH_TIMEOUT: Duration =
+    Duration::from_secs(LOGIN_IDP_BUDGET.as_secs() + AFTER_IDP_ALLOWANCE.as_secs());
+/// State-DB writes and the response after the IdP has answered.
+const AFTER_IDP_ALLOWANCE: Duration = Duration::from_secs(10);
 /// Admin API: a handful of state-DB statements in one transaction.
 const ADMIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Probes and discovery documents: in-memory, or `/readyz`'s 2 s DB probe.
@@ -151,5 +158,14 @@ mod tests {
     #[test]
     fn mcp_timeout_is_the_documented_75_seconds() {
         assert_eq!(MCP_TIMEOUT, Duration::from_secs(75));
+    }
+
+    /// The login handler's own IdP budget must run out first, with room for
+    /// the session write, or the router answers the callback with a raw 504.
+    #[test]
+    fn oauth_timeout_outlasts_the_idp_login_budget() {
+        let floor = LOGIN_IDP_BUDGET + Duration::from_secs(5);
+        assert!(OAUTH_TIMEOUT >= floor, "{OAUTH_TIMEOUT:?} < {floor:?}");
+        assert_eq!(OAUTH_TIMEOUT, Duration::from_secs(60));
     }
 }

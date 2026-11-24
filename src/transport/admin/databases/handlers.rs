@@ -17,8 +17,8 @@ use super::super::middleware::AdminActor;
 use super::super::page_query::{PageQuery, invalid_query};
 use super::super::payload::{database_payload, grant_payload};
 use super::super::validation::{
-    check_unchanged, declared_server, internal, invalid_body, invalid_id, not_found, routing_name,
-    store_error,
+    check_unchanged, declared_database, declared_server, internal, invalid_body, invalid_id,
+    not_found, routing_name, store_error,
 };
 use super::validation::{map_duplicate_database_error, parse_db_type};
 use super::{CreateDatabaseRequest, DatabaseResponse, DatabasesState, UpdateDatabaseRequest};
@@ -35,6 +35,7 @@ pub async fn create(
     let server = routing_name(&body.server, "server", rid)?;
     let server = declared_server(server, &state.known_servers, rid)?;
     let db_name = routing_name(&body.db_name, "db_name", rid)?;
+    declared_database(&state.config.load(), &server, &db_name, rid)?;
     let db_type = parse_db_type(&body.db_type, rid)?;
 
     let mut atx = AuditedTx::begin_locked(&state.state_db, &actor).await?;
@@ -122,6 +123,11 @@ pub async fn patch(
         .map_err(|err| store_error("lock_database", err, rid))?
         .ok_or_else(|| not_found(rid))?;
     check_unchanged(body.expected_updated_at, before.updated_at, rid)?;
+    if server.is_some() || db_name.is_some() {
+        let server = server.as_deref().unwrap_or(&before.server);
+        let db_name = db_name.as_deref().unwrap_or(&before.db_name);
+        declared_database(&state.config.load(), server, db_name, rid)?;
+    }
     let after =
         databases::tx_update_database(atx.tx(), id, server.as_deref(), db_name.as_deref(), db_type)
             .await

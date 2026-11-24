@@ -17,7 +17,8 @@
 //! coexist with each other and with dev rows.
 
 use crate::common;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use crate::common::cleanup::{delete_permissions_audit, delete_permissions_user};
@@ -42,8 +43,8 @@ use sqlx::PgPool;
 use sqlx::Row;
 use uuid::Uuid;
 
-/// Databases may only be registered on a config-declared server, so declare
-/// every server these tests register on.
+/// Databases may only be registered when the config declares them, so declare
+/// every server these tests register on; [`admin_yaml`] adds the databases.
 const ADMIN_YAML: &str = "servers:
   - name: prod
     kind: postgres
@@ -61,6 +62,38 @@ permissions: []
 ";
 
 const ADMIN_GROUP: &str = "db-mcp-gateway-admins";
+
+/// Unique per process, so database names never collide with a concurrent run
+/// on the live `(server, db_name)` index.
+static RUN: LazyLock<String> = LazyLock::new(|| Uuid::new_v4().simple().to_string());
+
+/// Databases the concurrency-cap test registers on `cap`: the cap plus the
+/// first and the shed request, with headroom.
+const CAP_DBS: usize = 24;
+
+fn flush_db(stage: &str) -> String {
+    format!("flush-{stage}-{}", *RUN)
+}
+
+fn cap_db(n: usize) -> String {
+    format!("cap-{}-{n}", *RUN)
+}
+
+/// [`ADMIN_YAML`] declaring every database these tests register.
+fn admin_yaml() -> String {
+    let declare =
+        |name: String| format!("      - {{ name: {name}, role: ro, password: hunter2 }}\n");
+    let prod: String = ["app", "renamed"]
+        .map(flush_db)
+        .into_iter()
+        .map(declare)
+        .collect();
+    let cap: String = (0..CAP_DBS).map(cap_db).map(declare).collect();
+    let host = |server: &str| format!("    host: {server}.example.invalid\n    databases:\n");
+    ADMIN_YAML
+        .replace(&host("prod"), &format!("{}{prod}", host("prod")))
+        .replace(&host("cap"), &format!("{}{cap}", host("cap")))
+}
 
 /// Insert a session row, mint a JWT for it, and return both.
 async fn mint_session(
@@ -118,7 +151,7 @@ async fn spawn_gateway_inner(
 ) -> (Harness, AuthConfig, SessionStore) {
     let pool = state_pool().await;
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
-    let mut builder = GatewayBuilder::new(ADMIN_YAML)
+    let mut builder = GatewayBuilder::new(&admin_yaml())
         .admin(ADMIN_GROUP, true)
         .repo(repo);
     if let Some(cache) = cache {
@@ -1213,7 +1246,7 @@ async fn database_mutations_flush_all_cached_authz_for_all_users() {
         .bearer_auth(&jwt)
         .json(&json!({
             "server": "prod",
-            "db_name": format!("flush-app-{}", Uuid::new_v4().simple()),
+            "db_name": flush_db("app"),
             "db_type": "postgres",
         }))
         .send()
@@ -1277,7 +1310,7 @@ async fn database_mutations_flush_all_cached_authz_for_all_users() {
     let resp = client()
         .patch(format!("{}/admin/v1/databases/{}", h.base_url, db_id))
         .bearer_auth(&jwt)
-        .json(&json!({ "db_name": format!("flush-renamed-{}", Uuid::new_v4().simple()) }))
+        .json(&json!({ "db_name": flush_db("renamed") }))
         .send()
         .await
         .unwrap();
@@ -1627,7 +1660,7 @@ async fn admin_routes_are_concurrency_capped_per_identity() {
         .await
         .expect("state DB up");
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
-    let gw = GatewayBuilder::new(ADMIN_YAML)
+    let gw = GatewayBuilder::new(&admin_yaml())
         .admin(ADMIN_GROUP, true)
         .repo(repo)
         .spawn(pool.clone())
@@ -1648,13 +1681,14 @@ async fn admin_routes_are_concurrency_capped_per_identity() {
         .timeout(Duration::from_secs(60))
         .build()
         .unwrap();
+    let next_db = AtomicUsize::new(0);
     let post_db = || {
         patient
             .post(format!("{}/admin/v1/databases", gw.url))
             .bearer_auth(&jwt)
             .json(&json!({
                 "server": "cap",
-                "db_name": format!("cap-{}", Uuid::new_v4().simple()),
+                "db_name": cap_db(next_db.fetch_add(1, Ordering::Relaxed)),
                 "db_type": "postgres",
             }))
             .send()

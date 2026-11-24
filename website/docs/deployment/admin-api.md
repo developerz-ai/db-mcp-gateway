@@ -42,7 +42,9 @@ Every admin request needs:
 2. **Membership in `admin.group`** in the session's groups. `403 forbidden` without it. Groups are a snapshot taken from the ID token **at login** and stored with the session; they are not re-read from the IdP. Adding someone to the admin group takes effect at their next login; removing them takes effect when their session ends or is revoked ([revoke-sessions](#revoke-a-users-sessions)).
 3. **A fresh enough session**, when `admin.session_max_age_secs` is set. A session issued longer ago than that (or with an `issued_at` in the future) gets `403 session_too_old`; sign in again. This bounds how long a removed admin keeps admin access.
 
-On a successful **mutating** call the gateway upserts the caller into `permissions_users` inside the same transaction and stamps the write with their `user_id` + `user_email` in `permissions_audit`. A `GET` writes nothing.
+On a successful **mutating** call the gateway locks the caller's `permissions_users` row inside the same transaction — inserting it from the session's `sub`, email and groups only if absent — and stamps the write with their `user_id` + `user_email` in `permissions_audit`. An existing row is never rewritten by the caller's own admin calls: its email and groups change only through an audited users write, so its `before`/`after` chain stays continuous and its `updated_at` never moves under another admin's `expected_updated_at`. A `GET` writes nothing.
+
+Every admin response, success or error, carries `Cache-Control: no-store`: the bodies name subjects, emails and grant sets.
 
 ## Errors
 
@@ -134,6 +136,8 @@ Response: the user row (`id`, `user_sub`, `user_email`, `groups`, `created_at`, 
 
 At least one of `user_email` / `groups` must be set.
 
+Bounds on `POST` and `PATCH` (trimmed; violations are `400 invalid_request`): `user_sub` at most 255 bytes (the OIDC `sub` limit), `user_email` at most 254 bytes, `groups` at most 256 entries of at most 255 bytes each. A `user_sub` starting with `service:` — in any letter case — is refused: that namespace belongs to YAML service accounts.
+
 `POST /admin/v1/users/:id/revoke-sessions` — see [below](#revoke-a-users-sessions).
 
 `DELETE /admin/v1/users/:id` — soft delete, `204`. Sets `deleted_at` and revokes the user's grants; subsequent live lookups return 404. The row is hard-deleted `AUDIT_RETENTION_DAYS` (default 90) after `deleted_at`; `permissions_audit` keeps the change on the same horizon.
@@ -146,7 +150,7 @@ At least one of `user_email` / `groups` must be set.
 { "server": "prod", "db_name": "billing", "db_type": "postgres" }
 ```
 
-`server` must name a server declared in the gateway config (the boot snapshot; a reload does not change the set), the same rule a wildcard grant obeys — a row on an undeclared server would sit dormant until a later config change silently armed it. `db_type` names the target engine: `postgres`, `mysql` or `mongo` (spec 12 §"Storage backends"; migrations `0013` / `migrations-mysql/0005`). Don't confuse it with the permissions *store* backend, which is postgres or mysql only — a mongo target is registered here like any other. Either violation is `400 invalid_request`, and a refused create or `PATCH` writes no row and no `permissions_audit` entry.
+`server` must name a server declared in the gateway config (the boot snapshot; a reload does not change the set), the same rule a wildcard grant obeys — a row on an undeclared server would sit dormant until a later config change silently armed it. For the same reason `db_name` must name a database the **live** config declares on that server: a reload that adds a database makes it registrable at once, and one that drops it refuses new registrations of it. `db_type` names the target engine: `postgres`, `mysql` or `mongo` (spec 12 §"Storage backends"; migrations `0013` / `migrations-mysql/0005`). Don't confuse it with the permissions *store* backend, which is postgres or mysql only — a mongo target is registered here like any other. Either violation is `400 invalid_request`, and a refused create or `PATCH` writes no row and no `permissions_audit` entry.
 
 This row carries only the routing key — **no DSN, no role, no password**. CLAUDE.md non-negotiable #1: connection details stay in YAML / secret backends, never in the admin API.
 
@@ -156,7 +160,7 @@ DSN field names (`connection_string`, `dsn`, `password`, `role`) are rejected wi
 
 `GET /admin/v1/databases/:id` — by id. 404 if missing.
 
-`PATCH /admin/v1/databases/:id` — partial update. Same DSN-rejection and declared-server rules.
+`PATCH /admin/v1/databases/:id` — partial update. Same DSN-rejection and declared-server rules, and the resulting `(server, db_name)` pair must be declared in the live config.
 
 `DELETE /admin/v1/databases/:id` — soft delete.
 
@@ -263,9 +267,13 @@ permissions_store:
   driver: pg     # default; same DB as state DB
   # OR
   driver: mysql  # opens a separate pool via PERMISSIONS_DB_DSN env at startup
+  # OR
+  driver: none   # YAML-only: no permissions store at all
 ```
 
 DSN is **not** in YAML — read from the `PERMISSIONS_DB_DSN` env var at boot. Same pattern as `STATE_DB_URL`. Keeping connection strings out of YAML keeps them out of the committed config and out of boot-trace logs.
+
+`driver: none` runs YAML-only: grants come from `permissions:` alone and no store is ever read. It also refuses `admin.enabled: true` at boot — the admin API edits a store that install does not have.
 
 > **Mysql + admin is rejected at boot.** The admin handlers use pg's `RETURNING` + `JSONB` via `sqlx::Transaction<'_, Postgres>` and haven't been ported. A `permissions_store.driver: mysql` + `admin.enabled: true` combo aborts startup with a message pointing at the deferred follow-up. Use `driver: pg` to enable the admin API, or run mysql with YAML grants only.
 

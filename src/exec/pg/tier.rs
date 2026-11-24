@@ -1,18 +1,23 @@
 //! One role's pools on a database. Every Postgres database has a read tier
 //! (its `role`); one with a `write_role` also has a write tier. The tiers
-//! never share a connection, so a read can never run as the write role.
+//! never share a connection, so a read can never run as the write role —
+//! and never share a fate: a write credential that does not resolve, or that
+//! the target rejects, fails writes and leaves the read tier alone.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use metrics::gauge;
-use secrecy::SecretString;
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use tokio::sync::Mutex;
 
 use crate::config::{Database, Password, Server};
 
 use super::super::adapter::ExecError;
 use super::super::pool_sizing::{CallerSlots, PoolSizing};
-use super::config::{build_connect_options, resolve_password};
-use super::error::log_discarded;
+use super::config::{connect_options, resolve_password, with_password};
+use super::error::{Origin, log_discarded};
 use super::release::{pin_lexing, reset_on_release};
 use super::{CANCEL_POOL_MAX_CONNECTIONS, POOL_ACQUIRE_TIMEOUT};
 
@@ -43,6 +48,9 @@ pub(super) struct Tier {
     pub(super) callers: CallerSlots,
     /// Redacted from server messages before they reach the agent.
     pub(super) role: String,
+    /// Set when the target rejected this tier's credentials: the password
+    /// may have rotated, so the tier must be opened again.
+    stale: AtomicBool,
 }
 
 impl Tier {
@@ -55,12 +63,18 @@ impl Tier {
         db_label: &str,
     ) -> Result<Self, ExecError> {
         let password = resolve_password(&database.password).await?;
-        let opts = build_connect_options(server, database, &database.role, &password);
+        let opts = with_password(connect_options(server, database, &database.role), &password);
         let pool = query_pool_options(sizing)
             .connect_with(opts.clone())
             .await
             .map_err(|err| {
-                log_discarded(&err, "target pool open failed");
+                let origin = Origin {
+                    server: &server.name,
+                    database: &database.name,
+                    role: &database.role,
+                    request_id: None,
+                };
+                log_discarded(&err, Some(&origin), "target pool open failed");
                 ExecError::Connection
             })?;
         Ok(Self::assemble(
@@ -68,29 +82,6 @@ impl Tier {
             pool,
             opts,
             &database.role,
-            sizing,
-            db_label,
-        ))
-    }
-
-    /// The write tier connects on its first write: most callers of a
-    /// database never write, and a write role that fails to connect should
-    /// fail writes, not reads.
-    pub(super) async fn open_write(
-        server: &Server,
-        database: &Database,
-        (role, password): (&str, &Password),
-        sizing: PoolSizing,
-        db_label: &str,
-    ) -> Result<Self, ExecError> {
-        let password: SecretString = resolve_password(password).await?;
-        let opts = build_connect_options(server, database, role, &password);
-        let pool = query_pool_options(sizing).connect_lazy_with(opts.clone());
-        Ok(Self::assemble(
-            TierKind::Write,
-            pool,
-            opts,
-            role,
             sizing,
             db_label,
         ))
@@ -126,13 +117,80 @@ impl Tier {
             cancel_pool,
             callers: CallerSlots::new(sizing),
             role: role.to_string(),
+            stale: AtomicBool::new(false),
         }
     }
 
-    /// Whether the tier holds any connection. A write tier that never
-    /// connected is running nothing, so there is nothing to list or cancel.
-    pub(super) fn is_connected(&self) -> bool {
-        self.pool.size() > 0
+    pub(super) fn mark_stale(&self) {
+        self.stale.store(true, Ordering::Relaxed);
+    }
+
+    pub(super) fn is_stale(&self) -> bool {
+        self.stale.load(Ordering::Relaxed)
+    }
+}
+
+/// The write tier of a database with a `write_role`, opened by the first
+/// call that needs it: most callers of a database never write, and a write
+/// password that does not resolve must fail writes, not reads. Its pools
+/// connect lazily too, so a write role the target refuses is found by the
+/// first write.
+///
+/// It is also what another replica's writes are reached through — a cancel
+/// or an activity listing asks the target, not this process's pool — so a
+/// replica that never wrote still opens it for those.
+pub(super) struct WriteTier {
+    /// Everything but the password.
+    options: PgConnectOptions,
+    password: Password,
+    role: String,
+    sizing: PoolSizing,
+    db_label: String,
+    /// Replaced once the target rejects its credentials, so the password
+    /// reference is resolved again — rotation without touching the read tier.
+    current: Mutex<Option<Arc<Tier>>>,
+}
+
+impl WriteTier {
+    pub(super) fn new(
+        server: &Server,
+        database: &Database,
+        (role, password): (&str, &Password),
+        sizing: PoolSizing,
+        db_label: &str,
+    ) -> Self {
+        Self {
+            options: connect_options(server, database, role),
+            // The reference (`${ENV:…}`), kept to resolve at each open.
+            password: password.clone(),
+            role: role.to_string(),
+            sizing,
+            db_label: db_label.to_string(),
+            current: Mutex::new(None),
+        }
+    }
+
+    /// The tier, opened now when this is its first use or the target has
+    /// rejected its credentials since. A password that does not resolve is
+    /// this call's error and is tried again by the next.
+    pub(super) async fn get(&self) -> Result<Arc<Tier>, ExecError> {
+        let mut current = self.current.lock().await;
+        if let Some(tier) = current.as_ref().filter(|tier| !tier.is_stale()) {
+            return Ok(Arc::clone(tier));
+        }
+        let password = resolve_password(&self.password).await?;
+        let opts = with_password(self.options.clone(), &password);
+        let pool = query_pool_options(self.sizing).connect_lazy_with(opts.clone());
+        let tier = Arc::new(Tier::assemble(
+            TierKind::Write,
+            pool,
+            opts,
+            &self.role,
+            self.sizing,
+            &self.db_label,
+        ));
+        *current = Some(Arc::clone(&tier));
+        Ok(tier)
     }
 }
 

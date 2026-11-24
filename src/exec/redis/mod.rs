@@ -41,7 +41,7 @@ use super::query::{
     ActivityQuery, ExecQuery, ExplainQuery, SampleQuery, SchemaQuery, TableStatsQuery,
 };
 use bounded::{BoundError, Fetched};
-use error::connection_survives;
+use error::{connection_lost, connection_survives};
 use pool::{ConnPool, Lease};
 use rejector::Command;
 use shape::{Shaped, shape_reply};
@@ -152,7 +152,9 @@ impl RedisAdapter {
     }
 
     /// Run one accepted command bounded to `row_limit` and shape the reply.
-    /// The connection goes back to the pool only after complete replies; if
+    /// A pooled connection found closed is replaced once and the command run
+    /// again on the new one. The connection goes back to the pool only after
+    /// complete replies; if
     /// this future is dropped mid-command (timeout, agent disconnect) the
     /// lease drops with it and the connection is closed, never reused.
     async fn run(
@@ -162,7 +164,21 @@ impl RedisAdapter {
         row_limit: u32,
     ) -> Result<ExecResult, ExecError> {
         let started = Instant::now();
-        let fetched = match bounded::fetch(lease.conn(), &command, row_limit).await {
+        let mut outcome = bounded::fetch(lease.conn(), &command, row_limit).await;
+        if let Err(BoundError::Redis(err)) = &outcome
+            && lease.reused()
+            && connection_lost(err)
+        {
+            // The pooled connection was closed while idle. Every command the
+            // rejector admits is a read, so running it again is safe.
+            tracing::debug!(db = %self.db_label, "idle redis connection was closed; reconnecting");
+            lease
+                .reconnect()
+                .await
+                .map_err(|err| self.classify_connect(err))?;
+            outcome = bounded::fetch(lease.conn(), &command, row_limit).await;
+        }
+        let fetched = match outcome {
             Ok(fetched) => {
                 lease.release().await;
                 fetched

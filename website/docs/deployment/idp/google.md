@@ -3,7 +3,7 @@
 Google Workspace accounts can sign in to the gateway, but **not by pointing the gateway at Google directly**. Read [what the gateway needs from any IdP](okta.md#what-the-gateway-needs-from-any-idp) for the reasons:
 
 - Google's ID token carries `email` and `email_verified`, but **no groups claim**. Every user would sign in with no groups and see nothing.
-- The gateway always requests the `groups` scope, which Google does not define; Google's authorization endpoint can refuse an unknown scope (`invalid_scope`).
+- The gateway requests the `groups` scope by default, which Google does not define; Google's authorization endpoint can refuse an unknown scope (`invalid_scope`). `OIDC_SCOPES=openid email profile` removes it — but that alone still leaves every user with no groups.
 
 ## Use a broker
 

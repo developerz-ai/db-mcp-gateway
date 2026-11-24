@@ -108,6 +108,7 @@ async fn run() -> anyhow::Result<()> {
 
     let config = Config::from_env()?;
     let auth_config = AuthConfig::from_env()?;
+    auth_config.check_bind(config.bind)?;
 
     // One token stops everything that is not the request path: background
     // loops, metrics upkeep and listener, the SIGHUP loop. Cancelled by the
@@ -153,7 +154,12 @@ async fn run() -> anyhow::Result<()> {
         config.audit_retention_days,
         stop.clone(),
     );
-    spawn_audit_reaper(background_db.clone(), stop.clone());
+    spawn_audit_reaper(
+        background_db.clone(),
+        app_state.mcp.audit_sinks.clone(),
+        app_state.mcp.detached.clone(),
+        stop.clone(),
+    );
     let auth = &app_state.oauth.auth;
     spawn_auth_state_gc(
         AuthGcTargets {

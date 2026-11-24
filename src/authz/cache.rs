@@ -10,6 +10,9 @@
 //! nothing announces — a lost listener connection, or a MySQL store filled
 //! by external tooling.
 //!
+//! YAML-only mode ([`PermissionsCache::yaml_only`]) has no store behind it:
+//! every lookup is empty and nothing is cached.
+//!
 //! Concurrency: `tokio::sync` only. The map lock is held for map edits,
 //! never across a load; the per-subject flight lock is held across exactly
 //! one load.
@@ -49,7 +52,8 @@ struct CacheEntry {
 
 #[derive(Clone)]
 pub struct PermissionsCache {
-    repo: Arc<dyn PermissionsRepo>,
+    /// `None` in YAML-only mode: there is no store to consult.
+    repo: Option<Arc<dyn PermissionsRepo>>,
     ttl: Duration,
     slots: Arc<RwLock<HashMap<String, Slot>>>,
     detached: DetachedTasks,
@@ -67,8 +71,20 @@ impl std::fmt::Debug for PermissionsCache {
 impl PermissionsCache {
     pub fn new(repo: Arc<dyn PermissionsRepo>, ttl: Duration) -> Self {
         Self {
-            repo,
+            repo: Some(repo),
             ttl,
+            slots: Arc::new(RwLock::new(HashMap::new())),
+            detached: DetachedTasks::new(),
+        }
+    }
+
+    /// The cache for the explicit YAML-only permissions mode (spec 12): YAML
+    /// is the only grant source, so [`Self::get_for`] answers empty for every
+    /// identity and never reaches a store — not even a failing one.
+    pub fn yaml_only() -> Self {
+        Self {
+            repo: None,
+            ttl: Duration::ZERO,
             slots: Arc::new(RwLock::new(HashMap::new())),
             detached: DetachedTasks::new(),
         }
@@ -91,6 +107,9 @@ impl PermissionsCache {
         if identity.kind == IdentityKind::Service {
             return Ok(Arc::new(Vec::new()));
         }
+        let Some(repo) = self.repo.as_deref() else {
+            return Ok(Arc::new(Vec::new()));
+        };
         let sub = identity.user_sub.as_str();
         if let Some(hit) = self.fresh(sub).await {
             return Ok(hit);
@@ -104,7 +123,7 @@ impl PermissionsCache {
         let mut attempt = 1;
         loop {
             let revision = self.revision(sub).await;
-            let grants = Arc::new(load_db_grants_for(self.repo.as_ref(), sub).await?);
+            let grants = Arc::new(load_db_grants_for(repo, sub).await?);
             // Out of attempts: the load ran concurrently with the writes that
             // kept invalidating it, so serving it uncached is as current as
             // this request can be ordered — caching it would not be.

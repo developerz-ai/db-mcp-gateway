@@ -159,3 +159,28 @@ fn refresh_ttl_allows_a_year_and_rejects_past_it() {
         Err(AuthConfigError::Ttl { .. })
     ));
 }
+
+/// A17: the public dev key on a reachable listener lets anyone mint bearers,
+/// whatever the issuer is.
+#[test]
+fn insecure_key_waiver_refused_on_non_loopback_bind() {
+    let waived = AuthConfig {
+        allow_insecure_signing_key: true,
+        ..AuthConfig::default()
+    };
+    for bind in ["0.0.0.0:8443", "[::]:8443", "10.0.0.5:8443"] {
+        let bind: SocketAddr = bind.parse().unwrap();
+        assert!(
+            matches!(
+                waived.check_bind(bind),
+                Err(AuthConfigError::InsecureKeyWithPublicBind(b)) if b == bind
+            ),
+            "{bind}"
+        );
+    }
+    for bind in ["127.0.0.1:8443", "[::1]:8443"] {
+        assert!(waived.check_bind(bind.parse().unwrap()).is_ok(), "{bind}");
+    }
+    let strict = AuthConfig::default();
+    assert!(strict.check_bind("0.0.0.0:8443".parse().unwrap()).is_ok());
+}

@@ -150,6 +150,7 @@ Mongo-specific types render via the **relaxed extended JSON** form — matches w
 | `ObjectId(…)` | `{"$oid":"507f…"}` |
 | `Date(…)` | `{"$date":"2026-06-18T12:00:00Z"}` |
 | `Decimal128(…)` | `{"$numberDecimal":"123.45"}` |
+| `Double` NaN, ±Infinity | `{"$numberDouble":"NaN"}`, `{"$numberDouble":"Infinity"}`, `{"$numberDouble":"-Infinity"}` — JSON has no number for them; never `null` |
 
 ## Declaring a redis target
 

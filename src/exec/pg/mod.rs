@@ -28,7 +28,8 @@
 //! `sqlx::Error` → `ExecError`, `config` owns password resolution and
 //! `PgConnectOptions` construction, `release` owns the session reset between
 //! callers, `run` owns the per-query transaction,
-//! `stream` owns row collection against the result budget.
+//! `stream` owns row collection against the result budget, `recast` owns the
+//! second attempt at a read whose columns have no binary form.
 //! `catalog`, `sample`, `explain` and `introspect` build the Postgres SQL
 //! behind the matching `DbAdapter` methods.
 
@@ -40,6 +41,7 @@ mod error;
 mod explain;
 mod introspect;
 mod methods;
+mod recast;
 mod redact;
 mod release;
 mod run;
@@ -48,12 +50,12 @@ mod stream;
 mod tier;
 mod truncate;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::PgPool;
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::Postgres;
+use sqlx::{PgConnection, PgPool};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
@@ -62,13 +64,13 @@ use crate::config::{Database, Server};
 
 use super::adapter::{ExecError, ExecResult, TOKIO_TIMEOUT_SLACK_MS, effective_timeout_ms};
 use super::pool_sizing::PoolSizing;
-use super::query::{ActivityQuery, ExecQuery};
+use super::query::ExecQuery;
 use super::sql_guard::Access;
 
-use error::AcquireFailure;
-use run::{RunCtx, run_query_inner};
+use error::{AcquireFailure, Origin};
+use run::{RunCtx, run_query};
 use stream::LARGE_ROW_DECODES;
-use tier::Tier;
+use tier::{Tier, WriteTier};
 
 // Re-exported so `super::pg::resolve_password` keeps working for sibling
 // adapters (mongo::MongoAdapter::open) without exposing the config submodule.
@@ -92,16 +94,19 @@ pub(super) const CANCEL_POOL_MAX_CONNECTIONS: u32 = 2;
 /// tier when the database has a `write_role`. One instance per logical DB so
 /// a slow query on DB A can never block DB B.
 pub struct PgAdapter {
-    read: Tier,
-    write: Option<Tier>,
-    /// Set when the target rejected the credentials; the registry then
-    /// replaces this adapter so the passwords are resolved again.
-    stale: AtomicBool,
+    /// Its staleness is the adapter's: when the target rejects the read
+    /// credentials the registry replaces the adapter. The write tier is
+    /// replaced on its own (see [`WriteTier`]).
+    read: Arc<Tier>,
+    write: Option<WriteTier>,
     /// Tracks drop-guard cancels so a shutdown drain waits for them.
     detached: DetachedTasks,
     /// Bounds how many large rows are being decoded at once, across both
     /// tiers (see `stream`).
     large_rows: Semaphore,
+    /// Named on the log line of every target error.
+    server: String,
+    database: String,
     /// Composite label for metrics tagging — bounded cardinality, supplied
     /// from YAML config rather than user input.
     db_label: String,
@@ -119,10 +124,11 @@ impl std::fmt::Debug for PgAdapter {
 }
 
 impl PgAdapter {
-    /// Open the tiers for `(server, database)`. The read pool connects once
-    /// so a misconfigured DB errors here (the registry calls this on first
-    /// request to that DB, not at boot); the write and cancel pools connect
-    /// on first use. Drop-guard cancels run on `detached`.
+    /// Open the adapter for `(server, database)`. The read pool connects
+    /// once so a misconfigured DB errors here (the registry calls this on
+    /// first request to that DB, not at boot); the write tier resolves its
+    /// password and connects on first use, and every cancel pool connects on
+    /// first use. Drop-guard cancels run on `detached`.
     pub async fn open(
         server: &Server,
         database: &Database,
@@ -131,71 +137,97 @@ impl PgAdapter {
     ) -> Result<Self, ExecError> {
         let db_label = format!("{}/{}", server.name, database.name);
         let read = Tier::open_read(server, database, sizing, &db_label).await?;
-        let write = match database.write_credentials() {
-            Some(credentials) => {
-                Some(Tier::open_write(server, database, credentials, sizing, &db_label).await?)
-            }
-            None => None,
-        };
+        let write = database
+            .write_credentials()
+            .map(|credentials| WriteTier::new(server, database, credentials, sizing, &db_label));
         Ok(Self {
-            read,
+            read: Arc::new(read),
             write,
-            stale: AtomicBool::new(false),
             detached,
             large_rows: Semaphore::new(LARGE_ROW_DECODES),
+            server: server.name.clone(),
+            database: database.name.clone(),
             db_label,
         })
     }
 
     /// The tier a statement needing `access` runs on.
-    fn tier(&self, access: Access) -> Result<&Tier, ExecError> {
+    async fn tier(&self, access: Access) -> Result<Arc<Tier>, ExecError> {
         match access {
-            Access::ReadOnly => Ok(&self.read),
-            Access::ReadWrite => self.write.as_ref().ok_or(ExecError::WriteNotConfigured),
+            Access::ReadOnly => Ok(Arc::clone(&self.read)),
+            Access::ReadWrite => self.write_tier().await,
         }
     }
 
-    /// The read tier, then the write tier if it ever connected.
-    fn connected_tiers(&self) -> impl Iterator<Item = &Tier> {
-        std::iter::once(&self.read).chain(self.write.iter().filter(|t| t.is_connected()))
+    async fn write_tier(&self) -> Result<Arc<Tier>, ExecError> {
+        match &self.write {
+            Some(write) => write.get().await,
+            None => Err(ExecError::WriteNotConfigured),
+        }
     }
 
-    /// A connection from one of a tier's pools, bounded by
+    fn origin<'a>(&'a self, tier: &'a Tier, request_id: Uuid) -> Origin<'a> {
+        Origin {
+            server: &self.server,
+            database: &self.database,
+            role: &tier.role,
+            request_id: Some(request_id),
+        }
+    }
+
+    /// A connection from one of `tier`'s pools, bounded by
     /// [`POOL_ACQUIRE_TIMEOUT`]. The one place a connect-phase error is
     /// handled: it is never rendered (it can name the role and the client
-    /// address), and a credential rejection marks the adapter stale.
-    async fn acquire(&self, pool: &PgPool) -> Result<PoolConnection<Postgres>, ExecError> {
-        pool.acquire()
-            .await
-            .map_err(|err| match AcquireFailure::of(&err) {
+    /// address), and a credential rejection marks that tier — only that
+    /// tier — stale.
+    async fn acquire(
+        &self,
+        tier: &Tier,
+        pool: &PgPool,
+        request_id: Uuid,
+    ) -> Result<PoolConnection<Postgres>, ExecError> {
+        pool.acquire().await.map_err(|err| {
+            match AcquireFailure::of(&err, &self.origin(tier, request_id)) {
                 AcquireFailure::Auth => {
-                    self.stale.store(true, Ordering::Relaxed);
+                    tier.mark_stale();
                     ExecError::Connection
                 }
                 AcquireFailure::Other => ExecError::Unavailable,
-            })
+            }
+        })
     }
 
-    /// Run `query` on `tier` under the Tokio-side deadline. The transaction
-    /// mode comes from `query.access`, not from the tier: `explain` of a
-    /// write runs on the write tier in a read-only transaction.
+    /// Run `query` on `tier`'s query pool. The transaction mode comes from
+    /// `query.access`, not from the tier: `explain` of a write runs on the
+    /// write tier in a read-only transaction.
     async fn run(&self, tier: &Tier, query: &ExecQuery<'_>) -> Result<ExecResult, ExecError> {
         // The caller's share of the pool first, so a caller at its share
         // waits on itself rather than taking the connection others need.
         let _slot = tier.callers.take(POOL_ACQUIRE_TIMEOUT).await?;
-        let mut conn = self.acquire(&tier.pool).await?;
+        let mut conn = self.acquire(tier, &tier.pool, query.request_id).await?;
+        self.run_on(&mut conn, tier, query).await
+    }
+
+    /// Run `query` on `conn`, a connection of `tier`, under the Tokio-side
+    /// deadline.
+    async fn run_on(
+        &self,
+        conn: &mut PgConnection,
+        tier: &Tier,
+        query: &ExecQuery<'_>,
+    ) -> Result<ExecResult, ExecError> {
         // Belt-and-suspenders: a Tokio-side deadline so even a misapplied
         // SET LOCAL (or a DB that ignores it) still bounds the call. Same
-        // effective value as the DB-side cap set inside `run_query_inner`.
+        // effective value as the DB-side cap set inside `run_query`.
         let effective_ms = effective_timeout_ms(query.statement_timeout_ms);
         let budget = Duration::from_millis(u64::from(effective_ms) + TOKIO_TIMEOUT_SLACK_MS);
         let ctx = RunCtx {
             cancel_pool: &tier.cancel_pool,
-            role: &tier.role,
+            origin: self.origin(tier, query.request_id),
             detached: &self.detached,
             large_rows: &self.large_rows,
         };
-        match tokio::time::timeout(budget, run_query_inner(&mut conn, &ctx, query)).await {
+        match tokio::time::timeout(budget, run_query(conn, &ctx, query)).await {
             Ok(result) => result,
             Err(_elapsed) => Err(ExecError::Timeout),
         }
@@ -220,25 +252,6 @@ impl PgAdapter {
             request_id,
         };
         self.run(&self.read, &query).await
-    }
-
-    /// `db_activity` for one tier: each role sees its own backends.
-    async fn activity_on(
-        &self,
-        tier: &Tier,
-        query: &ActivityQuery,
-    ) -> Result<ExecResult, ExecError> {
-        let sql = introspect::activity_sql(tier.kind);
-        let exec = ExecQuery {
-            sql: &sql,
-            binds: &[],
-            statement_timeout_ms: query.statement_timeout_ms,
-            row_limit: query.row_limit,
-            access: Access::ReadOnly,
-            dry_run: false,
-            request_id: query.request_id,
-        };
-        self.run(tier, &exec).await
     }
 }
 

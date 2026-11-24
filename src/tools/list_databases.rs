@@ -7,6 +7,8 @@
 //! empty list would tell the caller "the server exists, you just can't see
 //! any of its databases", which is itself a leak.
 
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -18,8 +20,8 @@ use crate::mcp::jsonrpc::Response;
 use super::ToolCtx;
 use super::args::parse_arguments;
 use super::audit_dispatch::{
-    AuditHeader, Outcome, OutcomeCode, error_outcome, reject_arguments, run_audited,
-    success_outcome,
+    AuditHeader, Outcome, OutcomeCode, elapsed_ms_since, error_outcome, reject_arguments,
+    run_audited, success_outcome,
 };
 
 const TOOL_NAME: &str = "list_databases";
@@ -71,6 +73,7 @@ async fn compute_outcome(
     db_grants: &[Grant],
     args: &Arguments,
 ) -> Outcome {
+    let started = Instant::now();
     let Some(server) = config.servers.iter().find(|s| s.name == args.server) else {
         return error_outcome(OutcomeCode::Forbidden, "no grants for this server");
     };
@@ -113,7 +116,8 @@ async fn compute_outcome(
         }
     };
 
-    success_outcome(id, text, None, Some(row_count), Some(false))
+    let elapsed = Some(elapsed_ms_since(started));
+    success_outcome(id, text, elapsed, Some(row_count), Some(false))
 }
 
 #[cfg(test)]

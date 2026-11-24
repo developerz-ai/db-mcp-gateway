@@ -241,9 +241,9 @@ Check it with `ACL GETUSER gateway_ro` and, logged in as that user,
 
 | Key | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `driver` | `pg` \| `mysql` | **yes** | — | `pg` (default if the block is absent) shares the state DB. `mysql` opens a separate pool via `PERMISSIONS_DB_DSN` env at boot. |
+| `driver` | `pg` \| `mysql` \| `none` | **yes** | — | `pg` (default if the block is absent) shares the state DB. `mysql` opens a separate pool via `PERMISSIONS_DB_DSN` env at boot. `none` is YAML-only: grants come from `permissions:` alone and no store is ever read — no grant query, no `LISTEN` connection. |
 
-> **Boot-gate**: `driver: mysql` + `admin.enabled: true` is rejected — admin handlers haven't been ported to mysql. Use pg for the admin path, or mysql with YAML grants only.
+> **Boot-gate**: `admin.enabled: true` needs `driver: pg` (or no block). With `driver: mysql` it is rejected — admin handlers haven't been ported to mysql — and with `driver: none` too, since the admin API edits a store a YAML-only install does not have. The driver is boot-fixed: a reload that changes it (absent → `pg` included) is refused.
 
 ## ServiceAccount
 
@@ -253,7 +253,8 @@ Check it with `ACL GETUSER gateway_ro` and, logged in as that user,
 |---|---|---|---|---|
 | `name` | string | **yes** | — | Stable service identity; becomes the audit identity `service:<name>`. Must match `^[a-z0-9][a-z0-9-]{0,62}$`, unique across the list. |
 | `group` | string | **yes** | — | The single permissions group the token acts as. Must be declared in `permissions:` (an empty `grants:` list recognizes a group that grants nothing) and must not equal `admin.group` when the admin surface is enabled — both abort boot. |
-| `token` | [secret ref](#secret-references) | **yes** | — | `${ENV:…}` or `${FILE:…}` (spec 14 — YAML carries the secret reference, never the bearer value). An inline literal token is accepted under the default `gateway.env: development` (dev/test parity with `password:`) and **rejected at boot under `gateway.env: production`**. Committed config is also checked in CI by the advisory `secret-scan` job, which fails on any literal `dbmcp_svc_<64hex>` in a tracked file outside its exempt paths. Resolved value must match `dbmcp_svc_` followed by exactly 64 lowercase hexadecimal characters (`0-9a-f`) — mint with `bin/mint-service-token <name>`. Short, overlong, non-hex, or mixed-case bodies abort boot with `ServiceTokenError::WeakToken`. Two accounts resolving to the same value abort boot (audit attribution would be ambiguous). |
+| `token` | [secret ref](#secret-references) | one of `token` / `tokens` | — | `${ENV:…}` or `${FILE:…}` (spec 14 — YAML carries the secret reference, never the bearer value). An inline literal token is accepted under the default `gateway.env: development` (dev/test parity with `password:`) and **rejected at boot under `gateway.env: production`**. Committed config is also checked in CI by the advisory `secret-scan` job, which fails on any literal `dbmcp_svc_<64hex>` in a tracked file outside its exempt paths. Resolved value must match `dbmcp_svc_` followed by exactly 64 lowercase hexadecimal characters (`0-9a-f`) — mint with `bin/mint-service-token <name>`. Short, overlong, non-hex, or mixed-case bodies abort boot with `ServiceTokenError::WeakToken`. Two accounts resolving to the same value abort boot (audit attribution would be ambiguous). |
+| `tokens` | list of [secret ref](#secret-references) | one of `token` / `tokens` | — | Several tokens for one account — the same-name rotation window ([spec 14 §Rotate](../initial-idea/14-service-tokens.md#mint--rotate--revoke)). Every entry obeys the `token` rules and authenticates as the same `service:<name>`, group and limits. Setting both `token` and `tokens`, neither, or an empty list aborts boot; a value repeated within the list or shared with another account aborts boot too. |
 | `max_concurrent_requests` | u32 > 0 | no | `MAX_CONCURRENT_PER_IDENTITY` (16) | In-flight request cap for this token, replacing the per-identity cap so a fleet of agents behind one token is not throttled as one user. The global `MAX_CONCURRENT_REQUESTS` cap still applies. `0` aborts boot. |
 | `require_upstream` | bool | no | `false` | Reject calls that lack the `x-dbmcp-run-id` and `x-dbmcp-on-behalf-of` headers (`invalid_arguments`). The headers are **claimed** by the caller: stored on the audit row, never verified, never used for authorization. The audit identity stays `service:<name>`. |
 
@@ -279,7 +280,7 @@ Tagged by `kind`; unknown keys and unshipped kinds (`otlp`, `kafka`) abort boot.
 | `kind` | Other keys | Notes |
 |---|---|---|
 | `stdout` | none | Emits the full audit row as a tracing event with `target: "audit_stream"` on the JSON stdout log. That target always logs at INFO, whatever `RUST_LOG` says. Lines dropped by a full log queue count in `log_lines_dropped_total` — see [logging.md](logging.md). |
-| `syslog` | `host` (string, non-blank), `port` (u16, non-zero) | RFC 5424 over UDP. Blank `host` or `port: 0` aborts boot. |
+| `syslog` | `host` (string, non-blank), `port` (u16, non-zero), `transport` (`udp` \| `tcp` \| `tls`, default `udp`), `ca_file` (path) | RFC 5424 over the chosen transport. `tls` verifies the receiver's certificate against the PEM CA bundle in `ca_file` only — never system roots — so `ca_file` is required with `tls` and rejected with `udp`/`tcp` (either mistake aborts boot, as do a blank `host` or `port: 0`). An unreadable or certificate-less `ca_file` fails boot, or keeps the running config on reload. |
 
 ## Grant
 

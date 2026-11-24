@@ -86,6 +86,16 @@ pub enum ConfigFileError {
          delivery time"
     )]
     SyslogSinkZeroPort { index: usize },
+    #[error(
+        "logging.stream[{index}] syslog `transport: tls` needs `ca_file` — the \
+         receiver's certificate is checked against that CA only, never system roots"
+    )]
+    SyslogSinkTlsNeedsCaFile { index: usize },
+    #[error(
+        "logging.stream[{index}] syslog `ca_file` is set but `transport` is not \
+         `tls`; the CA would be silently unused — set `transport: tls` or drop `ca_file`"
+    )]
+    SyslogSinkCaFileWithoutTls { index: usize },
 }
 
 impl ConfigFileError {

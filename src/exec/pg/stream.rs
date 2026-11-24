@@ -12,7 +12,7 @@ use super::super::budget::ResultBudget;
 use super::super::query::ExecQuery;
 use super::super::sql_guard::Access;
 use super::decode::{RowWeight, decode_row, decoders};
-use super::error::classify;
+use super::error::{Origin, classify};
 
 /// A row at least this big on the wire decodes under the adapter's
 /// large-row gate. Decoding copies the row, and an array can decode to
@@ -33,11 +33,13 @@ pub(super) struct Collected {
 /// Stream the statement, collecting rows until the budget runs out. A read
 /// stops there (the caller cancels the rest); a write keeps draining so the
 /// statement runs to completion and its `rows_affected` is exact.
+/// `money_digits` is the session's `money` scale (see `decode`).
 pub(super) async fn stream_rows(
     tx: &mut Transaction<'_, Postgres>,
     query: &ExecQuery<'_>,
-    role: &str,
+    origin: &Origin<'_>,
     large_rows: &Semaphore,
+    money_digits: u8,
 ) -> Result<Collected, ExecError> {
     let mut budget = ResultBudget::new(query.row_limit);
     let mut collected = Collected {
@@ -60,7 +62,7 @@ pub(super) async fn stream_rows(
     // `rows_affected` — alongside its rows.
     let mut stream = (&mut **tx).fetch_many(sqlx_query);
     while let Some(item) = stream.next().await {
-        let row = match item.map_err(|e| classify(e, role, query.sql))? {
+        let row = match item.map_err(|e| classify(e, origin, query.sql))? {
             Either::Left(done) => {
                 collected.rows_affected += done.rows_affected();
                 continue;
@@ -72,7 +74,7 @@ pub(super) async fn stream_rows(
         }
         if collected.columns.is_empty() {
             collected.columns = row.columns().iter().map(|c| c.name().to_string()).collect();
-            decoders_for_rows = decoders(&row);
+            decoders_for_rows = decoders(&row, money_digits);
         }
         // Cheapest check first, and nothing is decoded that cannot be kept:
         // not the row past the row cap, not a row whose wire form alone is

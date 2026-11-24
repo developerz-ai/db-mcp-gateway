@@ -26,11 +26,11 @@ The gateway is stable (2.x) and in production use; [../initial-idea/11-roadmap.m
 
 ```bash
 git clone https://github.com/developerz-ai/db-mcp-gateway && cd db-mcp-gateway/examples/demo
-docker compose up -d
-docker compose logs ready     # prints the `claude mcp add …` line to paste
+docker compose up -d --wait
+docker compose wait ready && docker compose logs ready   # waits for `ready` to finish, then prints the `claude mcp add …` line
 ```
 
-`docker compose --profile sso up -d` adds a local Dex IdP for the browser-login path. Loopback and plain HTTP only — a demo, never a deployment. The walkthrough below builds the same thing by hand against the dev stack.
+`docker compose --profile sso up -d --wait` adds a local Dex IdP for the browser-login path. Loopback and plain HTTP only — a demo, never a deployment. The walkthrough below builds the same thing by hand against the dev stack.
 
 The fastest way to see a working gateway. Brings up two throwaway Postgres containers (gateway state DB + an example target DB) with the bundled `docker-compose.dev.yml`, then runs the gateway image against them.
 
@@ -114,29 +114,37 @@ The env→YAML unification is still pending, so these come from the environment,
 | `STATE_DB_URL` | `postgres://gateway:gateway-dev-only@localhost:5433/gateway` | Gateway's own Postgres (sessions + audit) |
 | `PERMISSIONS_DB_DSN` | — | DSN of the MySQL 8 permissions store; required only with `permissions_store.driver: mysql` |
 | `GATEWAY_BIND` | `127.0.0.1:8443` (image: `0.0.0.0:8443`) | Listen address |
+| `MCP_ALLOWED_ORIGINS` | unset (none) | Comma-separated browser origins (`https://host[:port]`, no path or wildcard) allowed to call `POST /mcp` (MCP spec: servers MUST validate `Origin` against DNS rebinding). A request **without** `Origin` (every non-browser agent) always passes; one **with** an `Origin` not listed gets `403` before authentication — no tool runs, no audit row is written, a `WARN` `rejected a request from a disallowed Origin` line is logged. With `GATEWAY_BIND` on loopback, loopback origins (`localhost`, `127.0.0.0/8`, `[::1]`, any port) are also allowed. A malformed entry aborts boot |
+| `TRUSTED_PROXIES` | unset (none) | Comma-separated IPs/CIDRs (`10.0.0.0/8,fd00::/8`) of reverse proxies in front of the gateway. When the TCP peer is one of them, the audit row's `ip` is the right-most `X-Forwarded-For` hop not itself a trusted proxy; otherwise `ip` is the TCP peer and `X-Forwarded-For` is ignored. List only proxies that overwrite or append to `X-Forwarded-For` — a listed address can claim any client IP. A malformed entry aborts boot |
 | `MCP_PATH` | `/mcp` | Absolute path the MCP endpoint mounts at. A path the gateway already serves (`/healthz`, `/auth/…`, `/admin…`, `/.well-known…`, …) aborts boot |
 | `METRICS_BIND` | `127.0.0.1:9090` | Prometheus `/metrics` listener — separate from `GATEWAY_BIND`, which no longer serves `/metrics`. Set `0.0.0.0:9090` for an in-cluster scrape and fence the port with a NetworkPolicy; must differ from `GATEWAY_BIND` |
 | `MAX_CONCURRENT_REQUESTS` / `MAX_CONCURRENT_PER_IDENTITY` | `512` / `16` | In-flight ceilings (global → 503, per caller → 429). `0` aborts boot |
-| `STATE_DB_POOL_SIZE` | `10` | Request-path state-DB pool. `0`, or more than the concurrent-request ceiling (512), aborts boot. Pruner/GC use a separate fixed pool of 2 |
+| `STATE_DB_POOL_SIZE` | `10` | Request-path state-DB pool. `0`, or more than the concurrent-request ceiling (512), aborts boot. `1` works: pruner/GC/reaper use a separate fixed pool of 2, and the permissions `LISTEN` connection (plus its liveness ping) another fixed pool of 2 |
+| `STATE_DB_CONNECT_TIMEOUT_SECONDS` | `60` | How long boot keeps retrying the state DB (backoff 0.5 s doubling to 8 s; each attempt waits up to 5 s) before exiting. `0` = one attempt. Whole seconds, `0`–`3600`; anything else aborts boot. A malformed `STATE_DB_URL` or a failed migration is not retried. The HTTP listener binds only once the state DB is up, so `/healthz` and `/readyz` do not answer while boot retries — give a Kubernetes `startupProbe` at least this budget, or liveness restarts the pod mid-retry |
 | `OIDC_ISSUER` | — (required) | IdP issuer URL (OIDC discovery base). A trailing slash is ignored |
 | `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | — (client id required) | Gateway's OIDC client credentials |
 | `OIDC_AUDIENCE` | `OIDC_CLIENT_ID` | Expected `aud` of IdP ID tokens |
 | `OIDC_REDIRECT_URL` | `http://localhost:8443/auth/callback` | Must match the IdP app's redirect URI |
 | `OIDC_GROUPS_CLAIM` | `groups` | ID-token claim carrying group membership |
+| `OIDC_SCOPES` | `openid email profile groups` | Space-separated scopes requested at the IdP. Must include `openid`; RFC 6749 scope characters only, anything else aborts boot. Google: `openid email profile` (it rejects an unknown `groups` scope) |
+| `OIDC_GROUPS_PREFIX` | unset | Only groups starting with this prefix count, matched against `permissions[].group` / `admin.group` with the prefix removed (`dbmcp-oncall` → `oncall`). ≤128 characters, no whitespace; empty = unset |
+| `OIDC_TOKEN_AUTH_METHOD` | `client_secret_post` | How the gateway authenticates at the IdP's token endpoint: `client_secret_post` (secret in the form body) or `client_secret_basic` (HTTP Basic, for IdP apps that accept only that, e.g. some Okta apps). Anything else aborts boot |
+| `GROUPS_MAX_AGE` | unset | Longest a session may run on the groups read at its login, e.g. `12h` (`s`/`m`/`h`/`d`, `1m`–`366d`; anything else aborts boot). Caps each session's lifetime, and a refresh past it is refused with `invalid_grant` + `"code": "relogin_required"`, so the next login reads the user's current IdP groups. Unset = groups refresh only when the refresh chain (`REFRESH_TTL_DAYS`) ends. See [auth & SSO](../initial-idea/04-auth-sso.md#token-endpoint--post-token) |
+| `GATEWAY_SUPPORT_CONTACT` | unset | One line (≤200 characters) shown on the gateway's login error pages next to the request id — an address, a channel, a URL. Empty = unset |
 | `SESSION_SIGNING_KEY` | dev-only default | HMAC key for gateway-issued session JWTs — **set this in any real deploy**. Minimum 32 bytes; empty, shorter or the dev default are refused at boot |
-| `ALLOW_INSECURE_SIGNING_KEY` | `false` | Local dev only: accept a short or dev-default `SESSION_SIGNING_KEY`. Refused at boot unless `OIDC_ISSUER` is a loopback URL; logs a `WARN` when set |
+| `ALLOW_INSECURE_SIGNING_KEY` | `false` | Local dev only: accept a short or dev-default `SESSION_SIGNING_KEY`. Refused at boot unless `OIDC_ISSUER` is a loopback URL **and** `GATEWAY_BIND` is a loopback address (the dev key is public: on a reachable listener anyone could mint bearers); logs a `WARN` when set. Strict boolean: `true`/`false`/`1`/`0`, anything else aborts boot |
 | `SESSION_TTL_HOURS` | `8` | Session (access token) lifetime, `1`–`168` |
 | `REFRESH_TTL_DAYS` | `1` | Absolute refresh-chain lifetime, `1`–`366`; see [auth & SSO](../initial-idea/04-auth-sso.md#token-endpoint--post-token) |
 | `TLS_CERT_PATH` | — | PEM-encoded leaf cert (+ intermediates). Required unless `TLS_DISABLED=true` |
 | `TLS_KEY_PATH` | — | PEM-encoded private key. Required unless `TLS_DISABLED=true` |
-| `TLS_DISABLED` | `false` | Dev-only escape. `true` serves plain HTTP and emits a `WARN` log on startup |
+| `TLS_DISABLED` | `false` | Dev-only escape. `true` serves plain HTTP and emits a `WARN` log on startup. Strict boolean: `true`/`false`, `1`/`0` or `yes`/`no` (case-insensitive; empty = `false`); anything else aborts boot |
 | `AUDIT_RETENTION_DAYS` | `90` | Hot-retention window for `audit_calls`, `audit_call_intents` and `permissions_audit`; the hourly pruner deletes older rows. State-DB backups and log stores (Loki etc.) keep their own retention — set them to match ([spec 07](../initial-idea/07-logging-retention.md#retention-surfaces-outside-the-gateway)) |
 | `PERMISSIONS_CACHE_TTL_SECONDS` | `60` | Per-user DB-grant cache TTL; bounds how long a revoked grant is honoured on a replica that missed the invalidation. Above `300` aborts boot |
-| `SESSION_CACHE_TTL_SECONDS` | `30` | Freshness window for the in-memory session cache. Bounds how long a revoked session stays honored on *other* HA replicas; `0` re-validates every request. See [auth & SSO](../initial-idea/04-auth-sso.md#session-tokens) |
+| `SESSION_CACHE_TTL_SECONDS` | `30` | Freshness window for the in-memory session cache. Bounds how long a revoked session stays honored on *other* HA replicas; `0` re-validates every request. Values above `300` are clamped to `300` with a `WARN`. See [auth & SSO](../initial-idea/04-auth-sso.md#session-tokens) |
 | `SENTRY_DSN` / `SENTRY_ENVIRONMENT` | unset (disabled) / `development` | GlitchTip/Sentry error tracking; every event passes a credential scrubber |
 | `RUST_LOG` | `info,sqlx::query=warn` | Log filter. Invalid directives are skipped. The `audit_stream` target always logs at INFO regardless |
 
-> **Shutdown.** On `SIGTERM` the gateway stops accepting work, gives in-flight requests up to 80 s (the 75 s `/mcp` request timeout + 5 s), waits up to 20 s for detached audit writes, then closes its two state-DB pools (≤ 10 s each). Set `terminationGracePeriodSeconds: 120` or more, or Kubernetes `SIGKILL`s a pod mid-drain.
+> **Shutdown.** On `SIGTERM` the gateway stops accepting work, gives in-flight requests up to 80 s (the 75 s `/mcp` request timeout + 5 s), waits up to 20 s for detached audit writes, then closes its request and background state-DB pools (≤ 10 s each). Set `terminationGracePeriodSeconds: 120` or more, or Kubernetes `SIGKILL`s a pod mid-drain.
 
 > **Cert rotation.** A `SIGHUP` re-reads `TLS_CERT_PATH` + `TLS_KEY_PATH` in place. The `SIGHUP` handler is installed with TLS off too, so the signal never kills the process. Send it from outside the container — the image is distroless, with no shell and no `kill`: `docker kill --signal=HUP <container>` under Docker; under Kubernetes a reload sidecar in a pod with `shareProcessNamespace: true`, or a rolling restart. In-flight connections keep their old cert until they close; new handshakes pick up the new one. Kubernetes does not send `SIGHUP` on its own — `terminationGracePeriodSeconds` only governs `SIGTERM` at shutdown — so operators must wire the reload signal explicitly. Cert-manager integration can automate this once #17 lands the infra stack.
 
@@ -260,11 +268,11 @@ In your IdP, create an OIDC app for the gateway:
 | Redirect URI | `https://<your-gateway>/auth/callback` |
 | Grant types | Authorization code + refresh token |
 | Scopes | `openid email profile groups` |
-| Group claim | A `groups` claim (array of strings) in the **ID token**; another claim name works with `OIDC_GROUPS_CLAIM` |
+| Group claim | A `groups` claim (array of strings, or an object keyed by group name as Zitadel emits) in the **ID token**; another claim name works with `OIDC_GROUPS_CLAIM` |
 | Email | The ID token must carry `email` and `email_verified: true`, or the login is refused |
-| Client authentication | Client secret, sent in the token request body (`client_secret_post`) |
+| Client authentication | Client secret, sent in the token request body (`client_secret_post`), or in a Basic header with `OIDC_TOKEN_AUTH_METHOD=client_secret_basic` |
 
-Note the `client_id` and `client_secret`. The gateway always requests `openid email profile groups` and uses PKCE (S256). Per-IdP walkthroughs: [Okta](idp/okta.md), [Microsoft Entra ID](idp/entra.md), [Google Workspace](idp/google.md), [Keycloak](idp/keycloak.md). There is no SCIM sync: groups come from the ID token at login.
+Note the `client_id` and `client_secret`. The gateway requests `openid email profile groups` (change with `OIDC_SCOPES`) and uses PKCE (S256). Per-IdP walkthroughs: [Okta](idp/okta.md), [Microsoft Entra ID](idp/entra.md), [Google Workspace](idp/google.md), [Keycloak](idp/keycloak.md), [Zitadel](idp/zitadel.md). There is no SCIM sync: groups come from the ID token at login.
 
 > **MCP OAuth — what a reverse proxy / WAF must allow.** The gateway speaks the
 > MCP Authorization spec (OAuth 2.1 + PKCE) so clients like Claude Code
@@ -365,7 +373,8 @@ services:
       POSTGRES_USER: gateway
       POSTGRES_PASSWORD: ${STATE_DB_PW}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      # TCP, not the unix socket: first-boot init runs a socket-only temporary server.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U gateway -d gateway"]
       interval: 5s
       retries: 10
     volumes:

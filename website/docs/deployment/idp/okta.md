@@ -8,15 +8,15 @@ The gateway is a generic OIDC client (`src/auth/oidc/`). For every IdP:
 
 | Requirement | Why |
 |---|---|
-| Authorization-code flow with PKCE (S256), a client secret sent in the token request **body** (`client_secret_post`) | That is the only flow the gateway runs |
+| Authorization-code flow with PKCE (S256) and a client secret, sent in the token request body (`client_secret_post`, default) or an HTTP Basic header (`OIDC_TOKEN_AUTH_METHOD=client_secret_basic`) | That is the only flow the gateway runs |
 | Redirect URI `https://<gateway>/auth/callback`, equal to `OIDC_REDIRECT_URL` | Both the browser login and the MCP OAuth bridge land there |
-| The gateway asks for scopes `openid email profile groups` | Fixed; not configurable |
+| The gateway asks for scopes `OIDC_SCOPES` (default `openid email profile groups`; must include `openid`) | Drop `groups` for an IdP that rejects or does not define it |
 | ID token signed with a key that has a `kid`, published in the JWKS | Tokens without `kid` are refused |
-| `email` claim **and** `email_verified: true` in the ID token | Email is the audit identity; an unverified one is refused (`oidc_email_unverified`, HTTP 502) |
-| A groups claim that is a JSON **array of strings** in the ID token (name set by `OIDC_GROUPS_CLAIM`, default `groups`) | Group names are matched verbatim against `permissions[].group`. A missing claim, or one that is not an array, means no groups: the user signs in and sees nothing |
+| `email` claim **and** `email_verified: true` in the ID token | Email is the audit identity; an unverified one is refused (`oidc_email_unverified`; the MCP login flow shows the user a page saying so) |
+| A groups claim in the ID token (name set by `OIDC_GROUPS_CLAIM`, default `groups`): a JSON **array of strings**, or an **object** whose keys are the group names (Zitadel) | Group names are matched verbatim against `permissions[].group` (after `OIDC_GROUPS_PREFIX` is stripped, when set). A missing claim, or any other shape, means no groups: the user signs in and sees nothing, the gateway logs a warning naming the claim and its shape, and the consent page tells the user |
 | An `https` issuer (plain `http` only for `localhost`) | Discovery refuses anything else |
 
-Groups are read once, at login, and stored with the session. A group change takes effect at the user's next login (or after [revoke-sessions](../admin-api.md#revoke-a-users-sessions)).
+Groups are read once, at login, and stored with the session. A group change takes effect at the user's next login (or after [revoke-sessions](../admin-api.md#revoke-a-users-sessions)). Set `GROUPS_MAX_AGE` (e.g. `12h`) to force that next login within a bound even for a client that keeps refreshing.
 
 ## Create the app
 
@@ -25,7 +25,7 @@ Groups are read once, at login, and stored with the session. A group change take
 3. **Sign-in redirect URI:** `https://db.internal.acme.com/auth/callback`.
 4. **Assignments:** the groups whose members may sign in.
 5. Save; note the **Client ID** and **Client secret**.
-6. **Client authentication:** client secret. If the token exchange fails with `invalid_client`, the app is registered for `client_secret_basic` only; set its `token_endpoint_auth_method` to `client_secret_post` (Apps API or the app's *Client Credentials* settings).
+6. **Client authentication:** client secret. Some Okta apps accept only `client_secret_basic`: if the token exchange fails with `invalid_client`, set `OIDC_TOKEN_AUTH_METHOD=client_secret_basic` on the gateway (or switch the app's `token_endpoint_auth_method` to `client_secret_post`).
 
 ## Groups claim
 
@@ -43,6 +43,8 @@ OIDC_CLIENT_ID=0oa…
 OIDC_CLIENT_SECRET=…
 OIDC_REDIRECT_URL=https://db.internal.acme.com/auth/callback
 # OIDC_GROUPS_CLAIM=groups                 # default
+# OIDC_TOKEN_AUTH_METHOD=client_secret_basic  # if the app accepts only Basic
+# OIDC_GROUPS_PREFIX=db-                   # optional: only db-* groups count, matched without the prefix
 ```
 
 ```yaml

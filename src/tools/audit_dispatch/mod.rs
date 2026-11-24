@@ -19,9 +19,12 @@ pub use outcome::{ToolErrorMessages, outcome_from_exec_error, success_outcome, t
 // their per-tool wording; callers outside `src/tools/` must go through the
 // sanitized `outcome_from_exec_error` boundary instead.
 use outcome::tool_error;
-pub(in crate::tools) use outcome::{error_outcome, invalid_arguments};
+pub(in crate::tools) use outcome::{
+    elapsed_ms_since, error_outcome, invalid_arguments, write_state,
+};
 pub use types::{
     AuditHeader, AuditStore, Outcome, Reply, RequestContext, Upstream, UpstreamClaim, WriteEffect,
+    WriteState,
 };
 
 use std::future::Future;
@@ -32,6 +35,7 @@ use metrics::{counter, histogram};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::audit::intent::WRITE_MAY_HAVE_COMMITTED;
 use crate::audit::{self, AuditRow};
 use crate::auth::Identity;
 use crate::config::Grant;
@@ -159,7 +163,8 @@ where
         );
         // The guard stays armed: its fallback retries the row on the
         // detached set, now carrying the code the client is about to see.
-        guard.record_audit_failure();
+        let write = outcome.write.map(|w| w.state);
+        guard.record_audit_failure(write);
         record_dispatch(
             identity,
             request_ctx,
@@ -171,7 +176,8 @@ where
             id,
             request_ctx.request_id,
             OutcomeCode::AuditUnavailable,
-            "audit write failed; request rejected",
+            &audit_failure_message(write),
+            write,
         );
     }
 
@@ -187,7 +193,22 @@ where
             request_ctx.request_id,
             outcome.code,
             outcome.error_message.as_deref().unwrap_or_default(),
+            outcome.write.map(|w| w.state),
         ),
+    }
+}
+
+/// What the client is told when the completion row failed. "Rejected" is
+/// the call's answer, not the target's state: a write that may already be
+/// in the target says so, or the agent's retry writes it twice.
+fn audit_failure_message(write: Option<WriteState>) -> String {
+    const REJECTED: &str = "audit write failed; request rejected";
+    match write {
+        Some(WriteState::Applied | WriteState::Unknown) => format!(
+            "{REJECTED}, but the write may already be in the target: check before retrying \
+             ({WRITE_MAY_HAVE_COMMITTED})"
+        ),
+        Some(WriteState::NotApplied) | None => REJECTED.to_string(),
     }
 }
 

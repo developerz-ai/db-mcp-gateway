@@ -21,12 +21,12 @@ const CODE_TTL: Duration = Duration::from_secs(60);
 /// verified identity plus the PKCE challenge to verify at `/token`. The session
 /// and tokens are minted only when the code is redeemed, so an abandoned login
 /// leaves no orphan session.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default)]
 pub struct AuthCodes {
     inner: Arc<Mutex<HashMap<[u8; 32], AuthCode>>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthCode {
     /// Verified IdP identity to mint the session from at redemption.
     pub identity: GrantIdentity,

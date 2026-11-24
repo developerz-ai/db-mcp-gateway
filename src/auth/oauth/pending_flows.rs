@@ -32,7 +32,7 @@ const FLOW_TTL: Duration = Duration::from_secs(15 * 60);
 /// round-trip. Recovered at `/auth/callback` (keyed by the OIDC `state`) so the
 /// gateway can mint an authorization code and 302 back to the *client's* own
 /// redirect URI — the loopback Claude Code listens on.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OAuthBridge {
     /// The client_id from `/register` — carried through so `/token` can verify
     /// the presenter matches the registrant.
@@ -45,7 +45,8 @@ pub struct OAuthBridge {
     pub client_state: String,
     /// PKCE challenge (S256). Verified against `code_verifier` at `/token`.
     pub code_challenge: String,
-    /// RFC 8707 `resource` the client bound the request to (audit/diagnostics).
+    /// RFC 8707 `resource` the client sent; `/authorize` has already checked
+    /// that it names this gateway.
     pub resource: Option<String>,
 }
 
@@ -62,7 +63,7 @@ const PENDING_CONSENTS_MAX_SIZE: usize = 1_000;
 /// displaces only their own oldest consent; the global cap is a backstop.
 const PENDING_CONSENTS_PER_SUBJECT: usize = 5;
 
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default)]
 pub struct PendingFlows {
     inner: Arc<Mutex<Flows>>,
     consents: Arc<Mutex<HashMap<String, PendingConsent>>>,
@@ -71,7 +72,6 @@ pub struct PendingFlows {
 /// A verified login whose authorization code is held back until the user
 /// approves the client on the gateway's consent page (the MCP "confused
 /// deputy" mitigation for dynamically registered, non-loopback clients).
-#[derive(Debug)]
 pub struct PendingConsent {
     pub identity: GrantIdentity,
     pub bridge: OAuthBridge,
@@ -86,7 +86,7 @@ impl PendingConsent {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default)]
 struct Flows {
     by_state: HashMap<String, PendingFlow>,
     /// Insertion order. Every flow has the same TTL, so the front is both the
@@ -106,7 +106,7 @@ impl Flows {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PendingFlow {
     pub nonce: String,
     /// PKCE `code_verifier` the gateway (as an OAuth *client*) sends to the

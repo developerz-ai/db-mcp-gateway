@@ -19,11 +19,16 @@ pub(super) fn build_redirect(base: &str, params: &[(&str, &str)]) -> Option<Stri
     Some(url.to_string())
 }
 
-pub(in crate::transport) fn redirect_with_error(bridge: &OAuthBridge, error: &str) -> Response {
-    match build_redirect(
+/// The client's redirect URI carrying `error` and its own `state`.
+pub(super) fn error_redirect(bridge: &OAuthBridge, error: &str) -> Option<String> {
+    build_redirect(
         &bridge.client_redirect_uri,
         &[("error", error), ("state", bridge.client_state.as_str())],
-    ) {
+    )
+}
+
+pub(in crate::transport) fn redirect_with_error(bridge: &OAuthBridge, error: &str) -> Response {
+    match error_redirect(bridge, error) {
         Some(url) => Redirect::to(&url).into_response(),
         None => oauth_error(StatusCode::BAD_GATEWAY, error, "login failed"),
     }

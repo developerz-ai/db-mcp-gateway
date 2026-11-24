@@ -15,14 +15,17 @@
 //! is ever skipped. It lives in process memory; a restarted replica starts
 //! from the oldest intent and catches up batch by batch.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use sqlx::PgPool;
 
 use crate::exec::DEFAULT_STATEMENT_TIMEOUT_MS;
 use crate::state::audit::{IntentKey, reap_abandoned_batch};
 
-use super::drain::DRAIN_TIMEOUT;
+use super::drain::{DRAIN_TIMEOUT, DetachedTasks};
+use super::stream::StreamSinks;
 use super::{AUDIT_WRITE_TIMEOUT, AuditError};
 
 /// Advisory-lock key for the sweep — arbitrary, fixed, unique to the reaper.
@@ -60,14 +63,35 @@ pub const REAPER_GRACE: Duration = Duration::from_secs(
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReapCursor(Option<IntentKey>);
 
-/// One sweep from `cursor`, batch by batch until the aged intents run out.
-/// `Ok(None)` when another replica held the lock before any batch ran;
-/// otherwise the number of `abandoned` rows written. `grace` is
-/// [`REAPER_GRACE`] in production; tests pass zero.
+/// [`sweep`] with no stream sinks: the abandoned rows land in `audit_calls`
+/// only. For callers that check the durable rows alone.
 pub async fn run_once(
     pool: &PgPool,
     grace: Duration,
     cursor: &mut ReapCursor,
+) -> Result<Option<u64>, AuditError> {
+    sweep(
+        pool,
+        grace,
+        cursor,
+        &StreamSinks::default(),
+        &DetachedTasks::new(),
+    )
+    .await
+}
+
+/// One sweep from `cursor`, batch by batch until the aged intents run out.
+/// Each committed batch's `abandoned` rows go to `sinks` like any other
+/// audit row — after the commit, never before. `Ok(None)` when another
+/// replica held the lock before any batch ran; otherwise the number of
+/// `abandoned` rows written. `grace` is [`REAPER_GRACE`] in production;
+/// tests pass zero.
+pub async fn sweep(
+    pool: &PgPool,
+    grace: Duration,
+    cursor: &mut ReapCursor,
+    sinks: &StreamSinks,
+    tasks: &DetachedTasks,
 ) -> Result<Option<u64>, AuditError> {
     let mut reaped: Option<u64> = None;
     loop {
@@ -83,7 +107,11 @@ pub async fn run_once(
         let Some(batch) = batch else {
             return Ok(reaped);
         };
-        reaped = Some(reaped.unwrap_or(0) + batch.reaped);
+        for row in &batch.reaped {
+            sinks.send(row, tasks);
+        }
+        let written = u64::try_from(batch.reaped.len()).unwrap_or(u64::MAX);
+        reaped = Some(reaped.unwrap_or(0) + written);
         if let Some(last) = batch.last {
             cursor.0 = Some(last);
         }
@@ -93,15 +121,24 @@ pub async fn run_once(
     }
 }
 
-/// Sweep every [`REAP_INTERVAL`] forever. Spawned once at boot beside the
-/// retention pruner; a failed sweep is logged and retried next tick.
+/// [`run_streaming`] with no stream sinks.
 pub async fn run(pool: PgPool) {
+    let no_sinks = Arc::new(ArcSwap::from_pointee(StreamSinks::default()));
+    run_streaming(pool, no_sinks, DetachedTasks::new()).await;
+}
+
+/// Sweep every [`REAP_INTERVAL`] forever, streaming abandoned rows to the
+/// sinks current at each sweep (a SIGHUP swaps them). Spawned once at boot
+/// beside the retention pruner; a failed sweep is logged and retried next
+/// tick.
+pub async fn run_streaming(pool: PgPool, sinks: Arc<ArcSwap<StreamSinks>>, tasks: DetachedTasks) {
     let mut ticker = tokio::time::interval(REAP_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut cursor = ReapCursor::default();
     loop {
         ticker.tick().await;
-        match run_once(&pool, REAPER_GRACE, &mut cursor).await {
+        let current = sinks.load_full();
+        match sweep(&pool, REAPER_GRACE, &mut cursor, &current, &tasks).await {
             Ok(Some(0) | None) => {}
             Ok(Some(n)) => {
                 // Only the lock holder writes rows, so summing across replicas

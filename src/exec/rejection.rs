@@ -26,7 +26,7 @@ pub enum RejectionKind {
     /// tier's read-only transaction — e.g. by a function the guard cannot
     /// see into — is a missing write privilege, not a syntax error. Also a
     /// Redis `NOPERM` reply: the ACL user may not run that command or touch
-    /// that key.
+    /// that key. Also Mongo's `Unauthorized` (code `13`).
     PermissionDenied,
     /// SQLSTATE `42P01` (`undefined_table`) or `42703` (`undefined_column`).
     UndefinedObject,
@@ -36,7 +36,7 @@ pub enum RejectionKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbRejection {
-    /// A Postgres SQLSTATE, or a Redis error code (`NOPERM`, `WRONGTYPE`).
+    /// A Postgres SQLSTATE, a Redis error code, or a Mongo code (`13`).
     sqlstate: String,
     message: String,
 }
@@ -66,7 +66,9 @@ impl DbRejection {
         match self.sqlstate.as_str() {
             // Redis error codes are upper-case words, never five-character
             // SQLSTATEs, so the two code spaces cannot collide.
-            "42501" | "25006" | "NOPERM" => RejectionKind::PermissionDenied,
+            // `13`: Mongo's `Unauthorized`. Numeric, so it collides with
+            // neither five-character SQLSTATEs nor upper-case Redis codes.
+            "42501" | "25006" | "NOPERM" | "13" => RejectionKind::PermissionDenied,
             "42P01" | "42703" => RejectionKind::UndefinedObject,
             _ => RejectionKind::Other,
         }

@@ -15,11 +15,18 @@ Wiring the gateway's SSO to Keycloak. Read [what the gateway needs from any IdP]
 1. **Client scopes → Create client scope** named `groups` (type *Default*, include in token scope). Requesting it is what the gateway does.
 2. In that scope, **Mappers → By configuration → Group Membership**:
    - Token claim name: `groups`
-   - **Full group path: Off** — otherwise values are `/db-oncall`, with a leading slash, and must be written that way in `permissions[].group`
+   - **Full group path: On** — values are the full path, such as `/engineering/db-oncall`. Keep it on: with it off, `/engineering/db-oncall` and `/contractors/db-oncall` both become `db-oncall` and grant the same access. Write the full path, leading slash included, in `permissions[].group` and `admin.group`
    - Add to ID token: **On**
 3. **Clients → db-mcp-gateway → Client scopes → Add client scope →** `groups`, as *Default*.
 
 Realm roles work too: a *User Realm Role* mapper with claim name `roles`, multivalued, in the ID token, and `OIDC_GROUPS_CLAIM=roles`.
+
+```yaml
+permissions:
+  - group: /engineering/db-oncall   # the full group path, verbatim
+    grants:
+      - { server: prod, database: "*", action: query_read }
+```
 
 ## Verified email
 

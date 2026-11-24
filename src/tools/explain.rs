@@ -20,7 +20,7 @@ use crate::mcp::jsonrpc::Response;
 use super::ToolCtx;
 use super::args::parse_arguments;
 use super::audit_dispatch::{
-    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, WriteEffect, error_outcome,
+    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, WriteEffect, WriteState, error_outcome,
     outcome_from_exec_error, reject_arguments, run_audited, success_outcome,
 };
 use super::target::{ensure_reason, forbidden, record_intent, resolve_target};
@@ -165,6 +165,7 @@ async fn compute_outcome(
         // Planned as the write role; plain EXPLAIN changes nothing.
         outcome.write = Some(WriteEffect {
             rows_affected: None,
+            state: WriteState::NotApplied,
         });
     }
     outcome

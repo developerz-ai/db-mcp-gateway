@@ -167,6 +167,17 @@ async fn service_identity_never_reads_the_store() {
     assert_eq!(repo.loads.load(Ordering::SeqCst), 0);
 }
 
+/// YAML-only mode has no store to reach: every subject's DB-grant set is
+/// empty, nothing is cached, and an invalidation is a no-op.
+#[tokio::test]
+async fn yaml_only_cache_answers_empty_without_a_store() {
+    let cache = PermissionsCache::yaml_only();
+    assert!(cache.get_for(&identity("alice")).await.unwrap().is_empty());
+    cache.apply(&PermissionsChange::All).await;
+    assert!(cache.get_for(&identity("alice")).await.unwrap().is_empty());
+    assert_eq!(cache.slot_count().await, 0);
+}
+
 #[tokio::test]
 async fn insert_sweeps_expired_idle_slots() {
     let repo = Arc::new(CountingRepo::default());

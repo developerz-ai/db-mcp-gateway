@@ -9,24 +9,28 @@
 //! sections and a richer validator. For #3 we only model what `list_servers`
 //! needs plus the authz inputs.
 
+use std::path::PathBuf;
+
 use serde::Deserialize;
 
 use super::secret::Password;
 
+mod service_account;
 mod target;
+
+pub(crate) use service_account::ServiceAccountSpec;
 
 pub use target::{Database, Server, ServerKind, Tls};
 
-/// A headless (non-interactive) caller: a named service identity carrying a
-/// static bearer token, one permissions group, and nothing else. Design:
+/// A headless (non-interactive) caller: a named service identity carrying
+/// static bearer tokens, one permissions group, and nothing else. Design:
 /// website/docs/initial-idea/14-service-tokens.md.
 ///
-/// The token is a secret reference — never an inline literal in production —
+/// Tokens are secret references — never inline literals in production —
 /// resolved once at boot into `auth::ServiceTokenStore`. There is no in-band
 /// mint/revoke API: issuance and revocation are GitOps edits to this list
 /// plus a secret-store update, so every change is reviewed by PR.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct ServiceAccount {
     /// Stable service identity (`ci-bot`). Becomes the audit identity
     /// `service:<name>`; charset/length rules are enforced at boot so audit
@@ -38,19 +42,19 @@ pub struct ServiceAccount {
     /// at boot, which is what keeps service tokens off the `/admin/*` surface
     /// without touching the admin middleware.
     pub group: String,
-    /// `${ENV:…}` / `${FILE:…}` reference (inline literal tolerated for
+    /// Every token that authenticates as this account, never empty: YAML
+    /// `token:` (one) or `tokens:` (several, for same-name rotation). Each is
+    /// a `${ENV:…}` / `${FILE:…}` reference (inline literal tolerated for
     /// dev/test, same rule as `Database.password`).
-    pub token: Password,
+    pub tokens: Vec<Password>,
     /// In-flight request cap for this identity, replacing the gateway-wide
     /// per-identity cap (`MAX_CONCURRENT_PER_IDENTITY`, default 16) so a fleet
     /// of agents behind one token is not throttled as one user. The global
     /// cap still applies. Absent → the per-identity default.
-    #[serde(default)]
     pub max_concurrent_requests: Option<u32>,
     /// Reject calls that do not carry the upstream attribution headers
     /// (`x-dbmcp-run-id`, `x-dbmcp-on-behalf-of`). The headers are claimed by
     /// the caller, never verified, and never used for authz.
-    #[serde(default)]
     pub require_upstream: bool,
 }
 
@@ -143,11 +147,32 @@ pub enum StreamSinkConfig {
     /// stdout log — no new transport, just a distinct, filterable target
     /// operators can route to Splunk/Datadog alongside application logs.
     Stdout,
-    /// Send an RFC 5424 message over UDP to a syslog receiver. `host`/`port`
-    /// mirror `Server`'s shape rather than a combined `"host:port"` string —
+    /// Send an RFC 5424 message to a syslog receiver. `host`/`port` mirror
+    /// `Server`'s shape rather than a combined `"host:port"` string —
     /// consistent with the rest of this schema, and it sidesteps parsing a
     /// address format at deserialize time.
-    Syslog { host: String, port: u16 },
+    Syslog {
+        host: String,
+        port: u16,
+        /// Absent → UDP, the pre-TLS behaviour.
+        #[serde(default)]
+        transport: SyslogTransportKind,
+        /// CA bundle (PEM) the receiver's certificate must chain to. Required
+        /// with `transport: tls`, rejected otherwise — checked at boot.
+        #[serde(default)]
+        ca_file: Option<PathBuf>,
+    },
+}
+
+/// Wire transport of a syslog stream sink.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyslogTransportKind {
+    #[default]
+    Udp,
+    Tcp,
+    /// TCP + TLS, trusting only `ca_file`.
+    Tls,
 }
 
 #[cfg(test)]

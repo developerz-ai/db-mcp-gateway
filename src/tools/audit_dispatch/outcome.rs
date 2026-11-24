@@ -4,28 +4,34 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::audit::intent::WRITE_MAY_HAVE_COMMITTED;
-use crate::exec::{ExecError, RejectionKind};
+use crate::exec::{ExecError, ExecResult, RejectionKind};
 use crate::mcp::jsonrpc::{ErrorObject, Response};
 use crate::mcp::protocol::{CallToolResult, TextContent};
 
-use super::{Outcome, OutcomeCode, Reply};
+use super::{Outcome, OutcomeCode, Reply, WriteState};
 
 /// Build a structured tool error response per spec 03 §Errors. The body's
 /// `request_id` is the gateway UUID — the value in `audit_calls.request_id`
 /// and the `x-request-id` header — so the id an agent pastes back to ops
 /// finds the row. `id` is the client's JSON-RPC id, echoed in the envelope
 /// only. Called only by the chokepoint, the one place that knows both.
+/// `write` is set for a call that ran with write access, and only then
+/// appears in the body.
 pub(super) fn tool_error(
     id: Value,
     request_id: Uuid,
     code: OutcomeCode,
     message: &str,
+    write: Option<WriteState>,
 ) -> Response {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "request_id": request_id.to_string(),
         "code": code.as_str(),
         "message": message,
     });
+    if let Some(write) = write {
+        body["write"] = serde_json::json!(write);
+    }
     Response::result(
         id,
         &CallToolResult {
@@ -181,8 +187,30 @@ pub fn outcome_from_exec_error(
         }
     };
     let mut outcome = error_outcome(code, message);
-    outcome.elapsed_ms = Some(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
+    outcome.elapsed_ms = Some(elapsed_ms_since(started));
     outcome
+}
+
+/// Milliseconds since `started`, as the audit row's `elapsed_ms` stores them.
+pub(in crate::tools) fn elapsed_ms_since(started: Instant) -> i64 {
+    i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+/// Whether a write's change is in the target, from how its execution ended.
+/// Only a statement cut off at or after the commit can have landed unseen:
+/// every other failure is raised before the commit and rolls back.
+pub(in crate::tools) fn write_state(
+    executed: &Result<ExecResult, ExecError>,
+    dry_run: bool,
+) -> WriteState {
+    match executed {
+        _ if dry_run => WriteState::NotApplied,
+        Ok(_) => WriteState::Applied,
+        Err(ExecError::Timeout | ExecError::Cancelled | ExecError::CommitIndeterminate) => {
+            WriteState::Unknown
+        }
+        Err(_) => WriteState::NotApplied,
+    }
 }
 
 /// Shortcut for the success shape with row/truncation metadata.

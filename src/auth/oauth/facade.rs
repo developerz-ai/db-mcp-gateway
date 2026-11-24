@@ -2,10 +2,11 @@
 //! and the session/token operations that span more than one of them.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 
-use super::{AuthCodes, GrantIdentity, MintError, Minted, PendingFlows, RefreshTokens};
+use super::{AuthCodes, GrantIdentity, MintError, Minted, PendingFlows, RefreshTokens, Rotation};
 use crate::auth::{
     AuthConfig, AuthError, Identity, OidcClient, ServiceTokenStore, SessionId, SessionStore,
     jwt::SessionJwt,
@@ -34,6 +35,16 @@ pub struct AuthFacade {
     /// config declares none — `bearer_auth` then falls straight through to the
     /// session-JWT path.
     pub service_tokens: Arc<ArcSwap<ServiceTokenStore>>,
+}
+
+/// What a refresh grant came to; the HTTP layer picks the OAuth error.
+#[derive(Debug)]
+pub enum Refreshed {
+    Issued(IssuedTokens),
+    /// Unknown, replayed or lapsed refresh token.
+    Refused,
+    /// The login is older than `GROUPS_MAX_AGE`; the user signs in again.
+    ReloginRequired,
 }
 
 /// The bearer pair a `/token` response carries. `Debug` redacts both tokens.
@@ -65,7 +76,7 @@ impl AuthFacade {
                 &self.sessions,
                 identity,
                 refresh_token,
-                self.config.session_ttl,
+                self.login_session_ttl(),
             )
             .await?;
         // The grant is committed: failing to sign its bearer is not a
@@ -74,22 +85,37 @@ impl AuthFacade {
     }
 
     /// Refresh grant: rotate `presented` into `refresh_token`, revoking the
-    /// session the old token was paired with. `Ok(None)` → `invalid_grant`.
+    /// session the old token was paired with.
     pub async fn rotate_tokens(
         &self,
         presented: &str,
         refresh_token: String,
-    ) -> Result<Option<IssuedTokens>, AuthError> {
-        self.refresh
-            .rotate(
+    ) -> Result<Refreshed, AuthError> {
+        let rotation = self
+            .refresh
+            .rotate_within(
                 &self.sessions,
                 presented,
                 refresh_token,
                 self.config.session_ttl,
+                self.oidc.options().groups_max_age,
             )
-            .await?
-            .map(|minted| self.bearer_pair(minted))
-            .transpose()
+            .await?;
+        Ok(match rotation {
+            Rotation::Rotated(minted) => Refreshed::Issued(self.bearer_pair(minted)?),
+            Rotation::Refused => Refreshed::Refused,
+            Rotation::ReloginRequired => Refreshed::ReloginRequired,
+        })
+    }
+
+    /// Lifetime of a session minted by a login happening now: the configured
+    /// TTL, cut short so it never outlives `GROUPS_MAX_AGE`.
+    pub fn login_session_ttl(&self) -> Duration {
+        let session_ttl = self.config.session_ttl;
+        match self.oidc.options().groups_max_age {
+            Some(max_age) => session_ttl.min(max_age),
+            None => session_ttl,
+        }
     }
 
     /// RFC 7009 revocation of either token kind. `Ok` for an unknown, expired or
@@ -117,12 +143,12 @@ impl AuthFacade {
         let access_token = self.jwt.issue(
             minted.session.id,
             &minted.session.user_sub,
-            self.config.session_ttl,
+            minted.session_ttl,
         )?;
         Ok(IssuedTokens {
             access_token,
             refresh_token: minted.refresh_token,
-            expires_in_secs: self.config.session_ttl.as_secs(),
+            expires_in_secs: minted.session_ttl.as_secs(),
         })
     }
 }

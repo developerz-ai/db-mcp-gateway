@@ -49,7 +49,7 @@ pub struct DispatchSinks {
 impl DispatchSinks {
     pub fn new(config: &[StreamSinkConfig]) -> Self {
         Self {
-            sinks: StreamSinks::from_config(config),
+            sinks: StreamSinks::from_config(config).expect("test sinks build"),
             tasks: DetachedTasks::new(),
         }
     }

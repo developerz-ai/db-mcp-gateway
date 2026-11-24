@@ -11,6 +11,7 @@ use super::helpers::{oauth_error, query_rejected, random_token};
 use super::register::{
     is_loopback_redirect_uri, redirect_uri_matches, redirect_uris_acceptable, registry_error,
 };
+use super::resource;
 use crate::auth::oauth::{ClientRecord, OAuthBridge};
 
 /// Upper bound on a `client_id` the gateway will *adopt* at `/authorize` (as
@@ -190,6 +191,9 @@ pub async fn authorize(
     if let Some(violation) = bounds_violation(&code_challenge, &client_state, p.resource.as_deref())
     {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", violation);
+    }
+    if let Some(refusal) = resource::refusal(&state, p.resource.as_deref()) {
+        return refusal;
     }
     let client = match registered {
         Some(client) => client,

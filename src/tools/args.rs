@@ -27,6 +27,10 @@ const KEY_MAX_BYTES: usize = 64;
 /// and client message short.
 const PARSE_ERROR_MAX_BYTES: usize = 256;
 
+/// A row `limit` of 0 would answer an empty result that reads as "no data";
+/// every tool taking one refuses it (spec 03 §Errors `invalid_arguments`).
+pub(super) const LIMIT_AT_LEAST_ONE: &str = "`limit` must be at least 1";
+
 const IDENTIFIER_KEYS: [&str; 5] = ["server", "database", "schema", "table", "request_id"];
 
 /// What may appear in a string: identifiers take no control character at

@@ -35,6 +35,7 @@ use async_trait::async_trait;
 use mongodb::Client;
 use mongodb::options::{ClientOptions, Credential, ServerAddress, Tls as MongoTls, TlsOptions};
 use secrecy::ExposeSecret;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::audit::drain::DetachedTasks;
 use crate::config::{Database, Server, Tls};
@@ -74,6 +75,11 @@ pub struct MongoAdapter {
     detached: DetachedTasks,
     /// Each caller's share of the driver's connection pool.
     callers: CallerSlots,
+    /// One permit per connection of the driver's pool. The driver's own
+    /// checkout waits with no bound of its own, inside the statement budget;
+    /// waiting here instead keeps a saturated pool from reading as a
+    /// `timeout`.
+    connections: Semaphore,
 }
 
 impl std::fmt::Debug for MongoAdapter {
@@ -158,7 +164,23 @@ impl MongoAdapter {
             stale: AtomicBool::new(false),
             detached,
             callers: CallerSlots::new(sizing),
+            connections: Semaphore::new(
+                usize::try_from(sizing.max_connections).unwrap_or(usize::MAX),
+            ),
         })
+    }
+
+    /// A connection of the pool reserved for one command, waited for at most
+    /// [`CONNECT_TIMEOUT`] outside the statement budget, as on Postgres.
+    async fn reserve_connection(&self) -> Result<SemaphorePermit<'_>, ExecError> {
+        match tokio::time::timeout(CONNECT_TIMEOUT, self.connections.acquire()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            // Timed out; the semaphore is never closed.
+            Ok(Err(_)) | Err(_) => {
+                tracing::warn!(db = %self.db_label, "mongo pool acquire timed out");
+                Err(ExecError::Unavailable)
+            }
+        }
     }
 }
 
@@ -212,9 +234,10 @@ impl DbAdapter for MongoAdapter {
         rejector::validate_command(query.sql)
             .map_err(|err| ExecError::Forbidden(err.to_string()))?;
 
-        // The caller's share of the pool, taken outside the time budget as
-        // the pg adapter's acquire is.
+        // The caller's share of the pool, then a connection of it, both
+        // taken outside the time budget as the pg adapter's acquire is.
         let _slot = self.callers.take(CONNECT_TIMEOUT).await?;
+        let _connection = self.reserve_connection().await?;
         let effective_ms = effective_timeout_ms(query.statement_timeout_ms);
         let budget = Duration::from_millis(u64::from(effective_ms) + TOKIO_TIMEOUT_SLACK_MS);
         match tokio::time::timeout(budget, self.dispatch(&query, effective_ms)).await {

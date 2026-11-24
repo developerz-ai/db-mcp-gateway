@@ -13,24 +13,87 @@ Backup, restore, upgrade and rollback. The gateway itself is stateless: everythi
 | Config repo | `config.yml` | Rebuild from git |
 | Your secret manager | DB passwords, `SESSION_SIGNING_KEY`, `OIDC_CLIENT_SECRET`, service tokens | Re-issue them |
 
+## State DB roles
+
+The audit tables are append-only by convention: the gateway never issues an `UPDATE` against `audit_calls`, `audit_call_intents` or `permissions_audit`. To have Postgres enforce that, run the gateway under a role that does not own the schema:
+
+| Role | Used by | Audit tables |
+|---|---|---|
+| `gateway_owner` | Migrations only — owns the database, the schema and every table | everything (owner) |
+| `gateway_app` | `STATE_DB_URL` at runtime | `SELECT`, `INSERT`, `DELETE` (no `UPDATE`, no `TRUNCATE`) |
+
+1. Create both roles (`CREATE ROLE … LOGIN PASSWORD …`), and the database with `OWNER gateway_owner`.
+2. Apply the migrations as `gateway_owner`: boot the gateway once with `STATE_DB_URL` pointing at `gateway_owner` and stop it once `/readyz` answers, or run `sqlx migrate run --source migrations` from the release tag's checkout. For `sqlx`, put the password in the libpq password file (see [Credentials for the tools below](#credentials-for-the-tools-below)) and pass a URL without one: `--database-url postgres://gateway_owner@state-db.internal:5432/gateway`.
+3. Run the grants below as `gateway_owner`, then point `STATE_DB_URL` at `gateway_app`.
+
+{/* state-db-role-grants:start */}
+```sql
+-- CREATE: the migrator runs `CREATE TABLE IF NOT EXISTS _sqlx_migrations` at
+-- every boot, even with nothing to apply.
+GRANT USAGE, CREATE ON SCHEMA public TO gateway_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO gateway_app;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO gateway_app;
+-- Audit trail: append and read. DELETE stays for the built-in retention pruner.
+REVOKE UPDATE ON audit_calls, audit_call_intents, permissions_audit FROM gateway_app;
+-- Migration history is read-only, so only gateway_owner can migrate.
+REVOKE INSERT, UPDATE, DELETE ON _sqlx_migrations FROM gateway_app;
+```
+{/* state-db-role-grants:end */}
+
+`tests/it_db/audit_role_split_real_db.rs` runs this block against a fresh database and checks that `gateway_app` boots, writes audit rows, and runs the pruner and the reaper, and that an `UPDATE` or `TRUNCATE` on `audit_calls` is refused.
+
+**On every upgrade**, apply the new migrations as `gateway_owner` before rolling replicas, then re-run the block: a migration's new tables get no grants until you do. A replica that finds a pending migration under `gateway_app` refuses to boot, because the migration's DDL needs ownership; nothing is half-applied.
+
+**What this does not cover.** `gateway_app` keeps `DELETE` on the audit tables, because the retention pruner runs inside the gateway on the same `STATE_DB_URL`. Revoking it fails every hourly prune (`audit_pruner_runs_total{result="error"}`) and nothing ages the rows out. A separate pruner credential, so the runtime role can be insert-only, is not supported yet. Neither is a tamper-evident hash chain over the rows: a role holding `DELETE`, or `gateway_owner`, can still remove rows, so keep `gateway_owner`'s credential out of the gateway's environment and stream rows to an external store (`logging.stream`) if you need a copy the gateway cannot touch.
+
+## Credentials for the tools below
+
+Never put a password on a command line: a `postgres://user:password@…` URL or `mysql -pSECRET` is readable by every local user through `ps` and `/proc`, and lands in shell history. `$STATE_DB_URL` carries the gateway's password, so do not pass it to `pg_dump` either. Give each client a protected password file and pass only non-secret connection arguments:
+
+- **Postgres (libpq: `pg_dump`, `pg_restore`, `psql`, `sqlx`).** One line per credential in `~/.pgpass`, or in the file `PGPASSFILE` names (a mounted secret, for a job), as `host:port:database:user:password`. libpq ignores the file unless it is mode `0600`:
+
+  ```bash
+  umask 077
+  "$EDITOR" ~/.pgpass                 # state-db.internal:5432:gateway:gateway_owner:<password>
+  chmod 600 ~/.pgpass
+  ```
+
+- **MySQL (`mysqldump`, `mysql`).** An option file with a `[client]` section (`user=`, `password=`), mode `0600`, passed first as `--defaults-extra-file=/path/backup.cnf`.
+
 ## Backup
 
-Back up the state DB like any production Postgres: continuous archiving / PITR if you have it, otherwise a scheduled `pg_dump`:
+Back up the state DB like any production Postgres: continuous archiving / PITR if you have it, otherwise a scheduled `pg_dump`, authenticated through the password file above:
 
 ```bash
 pg_dump --format=custom --no-owner \
-  --dbname="$STATE_DB_URL" --file="gateway-$(date -u +%Y%m%dT%H%M%SZ).dump"
+  --host=state-db.internal --port=5432 --username=gateway_owner --dbname=gateway \
+  --file="gateway-$(date -u +%Y%m%dT%H%M%SZ).dump"
 ```
 
 - **Retention matches the audit policy.** The gateway prunes rows past `AUDIT_RETENTION_DAYS` (default 90) hourly, but your backups keep whatever they contain for as long as you keep the backups. Set backup retention to the same window, or deliberately longer if compliance wants it ([spec 07](../initial-idea/07-logging-retention.md#retention-surfaces-outside-the-gateway)).
 - **Treat dumps as sensitive.** They hold SQL text, reasons and emails, plus session and refresh-token rows. They never hold target DB credentials.
-- MySQL permissions store: `mysqldump --single-transaction` on its schema, on the same schedule.
-- Take one right before every upgrade.
+- Take one right before every upgrade — of the state DB **and**, with `permissions_store.driver: mysql`, of the permissions store (below).
+
+### MySQL permissions store
+
+On the same schedule as the state DB, and right before every upgrade (the gateway applies the store's migrations at boot, like the state DB's):
+
+```bash
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+mysqldump --defaults-extra-file=/secure/backup.cnf --single-transaction \
+  --host=perm-db.internal --port=3306 --databases permissions \
+  --result-file="permissions-$stamp.sql"
+# Accounts are not in a schema dump: record the gateway user's grants beside it.
+mysql --defaults-extra-file=/secure/backup.cnf --host=perm-db.internal --port=3306 \
+  --batch --skip-column-names -e "SHOW GRANTS FOR 'gateway'@'%'" > "permissions-$stamp.grants"
+```
+
+Replace `permissions` and `'gateway'@'%'` with the schema and account in your `PERMISSIONS_DB_DSN`. The dump holds grants and their audit history (`permissions_audit`): treat it like the state DB dump.
 
 ## Restore
 
 1. Stop every gateway replica (or scale to 0).
-2. Restore into an empty database: `pg_restore --no-owner --dbname="$STATE_DB_URL" gateway-….dump`.
+2. Restore into an empty database, credentials from the password file: `pg_restore --no-owner --host=state-db.internal --port=5432 --username=gateway_owner --dbname=gateway gateway-….dump`.
 3. **Invalidate what the restore brought back.** A backup predates later logouts and `revoke-sessions` calls; restored, those sessions and refresh tokens are live again. Before starting the gateway:
 
    ```sql
@@ -40,14 +103,19 @@ pg_dump --format=custom --no-owner \
 
    Rotating `SESSION_SIGNING_KEY` at the same time also invalidates every outstanding session JWT. Everyone signs in again; that is the point.
 4. **Re-check admin-API grants.** Grants revoked after the backup are back. Compare `permissions_audit` in the backup with your incident timeline, or with the live database if it survived, and revoke again.
-5. Start the gateway with the image version that last ran on this schema or a newer one (see [Rollback](#rollback)). Boot re-applies nothing that is already recorded in `_sqlx_migrations`.
+5. **MySQL permissions store** (`permissions_store.driver: mysql`), if it was lost too:
+   1. Restore the schema into an empty server: `mysql --defaults-extra-file=/secure/admin.cnf --host=perm-db.internal < permissions-….sql` (the dump carries its `CREATE DATABASE`).
+   2. Recreate the gateway's account if the server is new, and re-apply every statement in `permissions-….grants`.
+   3. Verify before booting: `SHOW GRANTS FOR 'gateway'@'%'` matches `permissions-….grants` line for line; logged in **as the gateway's account** (its own option file), `SELECT MAX(version) FROM permissions._sqlx_migrations` answers and is no newer than the image you are about to start knows; and `SELECT COUNT(*) FROM permissions.permissions_grants` is plausible against your records. A missing privilege otherwise surfaces only at boot (a refused migration) or at the first grant lookup; catch it here instead.
+   4. Re-check its grants as in step 4: grants revoked after this backup are back.
+6. Start the gateway with the image version that last ran on this schema or a newer one (see [Rollback](#rollback)). Boot re-applies nothing that is already recorded in `_sqlx_migrations` (state DB and MySQL store alike).
 
 The audit rows written between the backup and the failure are gone; if you stream audit rows to a log pipeline (`logging.stream`), that copy is the only record of them.
 
 ## Upgrade
 
 1. Read the release notes and, across a major version, the upgrade guide ([2.0](upgrading-to-2.md)). Config keys are never silently ignored: an unknown or renamed key aborts boot with a `line:column` pointer, so a bad config fails the first replica, not production traffic.
-2. Back up the state DB.
+2. Back up the state DB, and the MySQL permissions store with its grants if you run one ([Backup](#backup)).
 3. Bump the pinned image tag (`ghcr.io/developerz-ai/db-mcp-gateway:X.Y.Z`; avoid `:latest` and `:main` in production) and roll replicas one at a time. The first new replica applies the migrations at boot; migrations are expand/contract, so old replicas keep working on the new schema while the rollout runs.
 4. Give each old replica a full drain: `terminationGracePeriodSeconds` ≥ 120 (80 s request drain + 20 s detached audit writes + pool close).
 5. Watch `/readyz`, `tool_calls{outcome="audit_unavailable"}` and `config_reloads_total{result="error"}` after the rollout.

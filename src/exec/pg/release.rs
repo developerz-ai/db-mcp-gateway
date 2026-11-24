@@ -71,7 +71,7 @@ pub(super) fn reset_on_release(
         match reset {
             Ok(_) => Ok(true),
             Err(err) => {
-                log_discarded(&err, "connection reset failed; discarding");
+                log_discarded(&err, None, "connection reset failed; discarding");
                 Ok(false)
             }
         }

@@ -4,7 +4,9 @@
 //! answer. `evaluate(action, server, database)` is the canonical per-call
 //! check — used by every action-gated tool from #4 onward. It returns either
 //! `Decision::Allow { constraints }` (merged most-restrictively across every
-//! matching grant) or `Decision::Deny`.
+//! matching grant) or `Decision::Deny`. "Matching" is scoped to the requested
+//! action: a grant whose action does not include it neither allows the call
+//! nor contributes constraints (`action_scope_proptests`).
 //!
 //! `evaluate_effective` / `can_see_server_effective` (since #49) fold a
 //! per-identity slice of DB-loaded grants into the same merge engine. The
@@ -16,6 +18,8 @@
 //! upgrade from group membership alone (spec 06 §Evaluation). Most-restrictive
 //! merging means being in two groups never *upgrades* your access.
 
+#[cfg(test)]
+mod action_scope_proptests;
 pub mod cache;
 #[cfg(test)]
 mod decision_proptests;

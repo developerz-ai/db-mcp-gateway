@@ -68,20 +68,22 @@ impl ConnPool {
             .acquire_owned()
             .await
             .map_err(|_| RedisError::from(std::io::Error::other("redis pool closed")))?;
-        let reused = self.take_fresh_idle().await;
-        let conn = match reused {
-            Some(conn) => conn,
-            None => {
-                self.client
-                    .get_multiplexed_async_connection_with_config(&self.config)
-                    .await?
-            }
+        let (conn, reused) = match self.take_fresh_idle().await {
+            Some(conn) => (conn, true),
+            None => (self.connect().await?, false),
         };
         Ok(Lease {
             pool: Arc::clone(self),
             conn,
+            reused,
             _permit: permit,
         })
+    }
+
+    async fn connect(&self) -> Result<MultiplexedConnection, RedisError> {
+        self.client
+            .get_multiplexed_async_connection_with_config(&self.config)
+            .await
     }
 
     async fn take_fresh_idle(&self) -> Option<MultiplexedConnection> {
@@ -121,12 +123,27 @@ async fn sweep_idle(pool: Weak<ConnPool>, every: Duration) {
 pub(super) struct Lease {
     pool: Arc<ConnPool>,
     conn: MultiplexedConnection,
+    /// Taken from the idle list rather than opened for this lease.
+    reused: bool,
     _permit: OwnedSemaphorePermit,
 }
 
 impl Lease {
     pub(super) fn conn(&mut self) -> &mut MultiplexedConnection {
         &mut self.conn
+    }
+
+    /// Whether the connection sat idle in the pool before this lease — the
+    /// only kind the server (or a proxy, a NAT) can have closed unseen.
+    pub(super) fn reused(&self) -> bool {
+        self.reused
+    }
+
+    /// Replace the connection with a freshly opened one, keeping the permit.
+    pub(super) async fn reconnect(&mut self) -> Result<(), RedisError> {
+        self.conn = self.pool.connect().await?;
+        self.reused = false;
+        Ok(())
     }
 
     /// Return the connection: call only after a complete reply was read.

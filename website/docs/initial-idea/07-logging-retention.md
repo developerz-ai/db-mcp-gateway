@@ -55,10 +55,35 @@ Every target call writes an intent — reads and writes alike (owner decision, p
 | `upstream_actor`, `upstream_run_id` | `x-dbmcp-on-behalf-of` / `x-dbmcp-run-id` a **service-token** caller claimed ([14-service-tokens](14-service-tokens.md)). Unverified — stored for attribution, never used for authz; `user_sub` stays `service:<name>`. NULL for SSO sessions |
 | `truncated` | Whether the row cap cut the result |
 | `elapsed_ms` | Wall-clock of the tool's work |
-| `outcome` | The spec [03](03-mcp-tools.md) code the client saw: `success`, `dry_run`, `forbidden`, `forbidden_sql`, `invalid_arguments`, `reason_required`, `timeout`, `syntax_error`, `unavailable`, `audit_unavailable`, `internal`, …; plus `cancelled` and `abandoned`, which only the audit log carries |
+| `outcome` | One of the closed set in [Outcomes](#outcomes) |
 | `error_message` | The sanitized message the client got — no credentials or raw connection details |
 
-`sql` is stored verbatim up to the cap. There is no per-database `sql_capture` (redacted / metadata-only) policy; a database whose literals must not be stored should not be reachable through `run_query`.
+`sql` is stored verbatim up to the cap, literals included, and every stream sink carries it the same way. The `sql_capture` policy (redacted / metadata-only per database) proposed with the stream sinks (#218) was never built: there is no setting that keeps literals out of `audit_calls` or the export. A database whose literals must not be stored should not be reachable through `run_query`.
+
+### Outcomes
+
+`audit_calls.outcome` holds exactly one of these 16 values (`src/audit/outcome.rs`; spec [03](03-mcp-tools.md) §Errors for the client-facing ones):
+
+| Outcome | Written by | Meaning |
+|---|---|---|
+| `success` | tool | The call did its work |
+| `dry_run` | tool | A write ran and was rolled back on request |
+| `forbidden` | tool | No grant allows the call |
+| `forbidden_sql` | tool | The statement guard refused the SQL |
+| `permission_denied` | tool | The target role lacks a privilege the statement needs |
+| `undefined_object` | tool | The statement names a table or column that does not exist |
+| `invalid_arguments` | tool / dispatch | Arguments failed validation, or the tool name is unknown |
+| `reason_required` | tool | The grant requires a `reason` and none was given |
+| `timeout` | tool | Statement timeout or wall-clock budget hit |
+| `syntax_error` | tool | The target rejected the statement |
+| `unavailable` | tool | Target unreachable, credentials rejected, or no pooled connection in time |
+| `unsupported_backend` | tool | The tool does not support that server kind |
+| `internal` | tool | Gateway bug; details in the operational log only |
+| `cancelled` | drop guard / tool | Client disconnected, or another call's `cancel_query` stopped it |
+| `audit_unavailable` | dispatch | The audit store refused a write; the drop-guard retry records it |
+| `abandoned` | reaper | An intent never got a completion row |
+
+`rate_limited` and `service_overloaded` are HTTP rejections before dispatch and never reach this column (see the carve-out above).
 
 ## Storage
 
@@ -66,11 +91,23 @@ Every target call writes an intent — reads and writes alike (owner decision, p
 |---|---|---|---|---|
 | **Hot** | Gateway's state Postgres | 90 days (configurable) | Fast operator queries, dashboards | Shipped |
 | **Archive** | S3 / GCS / Azure Blob, optional | 1y / 7y / forever | Compliance retention | Not shipped — [roadmap Phase 4](11-roadmap.md) |
-| **Stream** | Optional sink: `stdout`, `syslog` (config: `logging.stream: [{kind: stdout}, {kind: syslog, host: ..., port: ...}]`), OTLP, Kafka | live | Plug into existing SIEM/Splunk/Datadog | `stdout` + `syslog` shipped (#218); OTLP/Kafka not shipped |
+| **Stream** | Optional sink: `stdout`, `syslog` (config: `logging.stream: [{kind: stdout}, {kind: syslog, host: ..., port: ..., transport: udp\|tcp\|tls, ca_file: ...}]`), OTLP, Kafka | live | Plug into existing SIEM/Splunk/Datadog | `stdout` + `syslog` shipped (#218); OTLP/Kafka not shipped |
 
-Hot and stream are independent — you can send everything to Splunk *and* keep 90 days in Postgres. A row is streamed only after its durable write commits.
+Hot and stream are independent — you can send everything to Splunk *and* keep 90 days in Postgres. A row is streamed only after its durable write commits. Every `audit_calls` row is streamed: tool completions, fallback rows, and the reaper's `abandoned` rows (sent once their batch commits). Every sink carries every `audit_calls` field (pinned by a parity test against the row type).
 
-**Syslog sink.** RFC 5424 over UDP, MSG body = the row as JSON. The receiver address is resolved and the socket bound once, then reused; a failed send forgets both so the next row re-resolves. A datagram is at most 8 KiB: an oversized row has its `sql` cut and suffixed `...[truncated]` (the body stays valid JSON); if that cannot make it fit, the message itself is cut with the same suffix. A row a sink cannot deliver increments `audit_stream_dropped_total{sink}`; the error log is rate-limited to one line a minute carrying the count dropped since the last one.
+**Sinks are best-effort copies.** The state-DB row is the authority; a sink that cannot keep up drops rows and counts them, and never slows or fails the request. Both sinks drop rather than apply backpressure, because backpressure would put a slow log consumer on the request path.
+
+**Stdout sink.** One `target: "audit_stream"` event per row on the gateway's JSON-per-line stdout, every row field top-level (`id` as `audit_id`, `groups` as a JSON array string, absent optionals as `""` / `0` / `false` — except `rows_affected`, which is left out for a read because `0` is a real write count). Lines pass through the same bounded non-blocking queue as every log line; a full queue drops the line and counts it in `log_lines_dropped_total` (the queue cannot tell an audit line from another, so it is not in `audit_stream_dropped_total`).
+
+**Syslog sink.** RFC 5424, MSG body = the row as JSON. `transport` picks the wire (default `udp`):
+
+| `transport` | Wire | Framing | Notes |
+|---|---|---|---|
+| `udp` | RFC 5426 datagram | one row per datagram | Loss on a down receiver is silent |
+| `tcp` | RFC 6587 | octet counting (`LEN SP MSG`) | A refused or reset connection is a counted drop |
+| `tls` | RFC 5425 | octet counting | Receiver verified against `ca_file` (PEM, required); system roots are not trusted; the receiver's certificate must name `host` |
+
+Octet counting, not newline framing: `sql` can carry a newline. The connection is opened once and reused; a failed send forgets it, and a stream transport reconnects and resends once. A message is at most 8 KiB on every transport (rsyslog's default `maxMessageSize`): an oversized row has its `sql` cut and suffixed `...[truncated]` (the body stays valid JSON); if that cannot make it fit, the message itself is cut with the same suffix. Each delivery step (DNS, connect, TLS handshake, send) has a 5 s ceiling, a row waits at most 10 s for the connection a previous row holds, and at most 1,024 rows per sink are queued or in delivery — past that, new rows are dropped. A CA file that cannot be read or holds no certificate fails boot (or the reload). A row a sink cannot deliver increments `audit_stream_dropped_total{sink="syslog"}`; the error log is rate-limited to one line a minute carrying the count dropped since the last one and the transport.
 
 ## Retention pruning
 

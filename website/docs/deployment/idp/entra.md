@@ -29,4 +29,4 @@ OIDC_REDIRECT_URL=https://db.internal.acme.com/auth/callback
 # OIDC_GROUPS_CLAIM=groups    # or roles, with app roles
 ```
 
-The gateway requests the `groups` scope along with `openid email profile`; if Entra rejects the authorize request over it (`AADSTS…` invalid scope), that is the limitation to report — the scope list is not configurable today.
+The gateway requests the `groups` scope along with `openid email profile`; if Entra rejects the authorize request over it (`AADSTS…` invalid scope), set `OIDC_SCOPES=openid email profile` — Entra's `groups` claim comes from the app's token configuration, not from a scope.

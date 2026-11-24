@@ -4,7 +4,9 @@
 
 use std::collections::HashSet;
 
-use crate::config::schema::{Database, Permission, Server, ServerKind, StreamSinkConfig};
+use crate::config::schema::{
+    Database, Permission, Server, ServerKind, StreamSinkConfig, SyslogTransportKind,
+};
 use crate::exec::RedisDbIndex;
 
 use super::limits::{validate_constraint_values, validate_server_values};
@@ -28,25 +30,35 @@ impl ConfigFile {
     }
 }
 
-/// #59 scope: mysql is wired for the resolver hot path only. The admin
-/// handlers use raw pg `RETURNING` + `JSONB` operations that haven't been
-/// ported. Boot fails fast rather than running with a half-wired admin surface.
+/// The admin API writes the store, so it needs one it can write: #59 wires
+/// mysql for the resolver hot path only (the admin handlers use raw pg
+/// `RETURNING` + `JSONB`), and a YAML-only install has no store at all. Boot
+/// fails fast rather than running with a half-wired admin surface.
 fn validate_permissions_store(
     store: Option<&PermissionsStoreBlock>,
     admin: &AdminConfig,
 ) -> Result<(), ConfigFileError> {
-    if let Some(store) = store
-        && store.driver == PermissionsStoreDriver::Mysql
-        && matches!(admin, AdminConfig::Enabled { .. })
-    {
-        return Err(ConfigFileError::Invalid(
+    let Some(store) = store else {
+        return Ok(());
+    };
+    if !matches!(admin, AdminConfig::Enabled { .. }) {
+        return Ok(());
+    }
+    match store.driver {
+        PermissionsStoreDriver::Pg => Ok(()),
+        PermissionsStoreDriver::Mysql => Err(ConfigFileError::Invalid(
             "permissions_store.driver = mysql is not supported with admin.enabled = true. \
              #59 wires mysql for the resolver hot path only; full admin parity is tracked \
              in a future issue. Either set admin.enabled = false or use driver = pg."
                 .to_string(),
-        ));
+        )),
+        PermissionsStoreDriver::YamlOnly => Err(ConfigFileError::Invalid(
+            "permissions_store.driver = none (YAML-only) is not supported with \
+             admin.enabled = true: the admin API edits the permissions store, which a \
+             YAML-only install does not have. Set admin.enabled = false or use driver = pg."
+                .to_string(),
+        )),
     }
-    Ok(())
 }
 
 /// Returns the declared server names for the grant cross-checks.
@@ -224,12 +236,26 @@ fn validate_stream_sinks(sinks: &[StreamSinkConfig]) -> Result<(), ConfigFileErr
     for (index, sink) in sinks.iter().enumerate() {
         match sink {
             StreamSinkConfig::Stdout => {}
-            StreamSinkConfig::Syslog { host, port } => {
+            StreamSinkConfig::Syslog {
+                host,
+                port,
+                transport,
+                ca_file,
+            } => {
                 if host.trim().is_empty() {
                     return Err(ConfigFileError::SyslogSinkBlankHost { index });
                 }
                 if *port == 0 {
                     return Err(ConfigFileError::SyslogSinkZeroPort { index });
+                }
+                match (transport, ca_file) {
+                    (SyslogTransportKind::Tls, None) => {
+                        return Err(ConfigFileError::SyslogSinkTlsNeedsCaFile { index });
+                    }
+                    (SyslogTransportKind::Udp | SyslogTransportKind::Tcp, Some(_)) => {
+                        return Err(ConfigFileError::SyslogSinkCaFileWithoutTls { index });
+                    }
+                    _ => {}
                 }
             }
         }

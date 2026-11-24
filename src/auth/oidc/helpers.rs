@@ -2,8 +2,6 @@ use url::{Host, Url};
 
 use super::super::errors::AuthError;
 
-pub(super) const SCOPES: &str = "openid email profile groups";
-
 /// Require an OIDC URL to use `https`, permitting `http` only for loopback
 /// hosts (localhost / 127.0.0.0/8 / ::1) so dev and mock IdPs keep working.
 /// Surfaced as `Discovery` since it gates the discovery / token-exchange URLs.

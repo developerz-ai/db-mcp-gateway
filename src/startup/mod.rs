@@ -11,14 +11,16 @@ mod boot;
 mod logging;
 mod metrics;
 mod serve;
+mod state_db;
 
 pub(crate) use background::{
     AuthGcTargets, spawn_audit_pruner, spawn_audit_reaper, spawn_auth_state_gc,
 };
-pub(crate) use boot::{build_app_state, connect_state_db};
+pub(crate) use boot::build_app_state;
 pub(crate) use logging::{init_logging, spawn_dropped_lines_exporter};
 pub(crate) use metrics::{install_recorder, spawn_listener as spawn_metrics_listener};
 pub(crate) use serve::serve;
+pub(crate) use state_db::connect_state_db;
 
 /// Install the shutdown signal handlers and return a future that resolves on
 /// the first Ctrl-C or (on Unix) SIGTERM, so containers drain cleanly on

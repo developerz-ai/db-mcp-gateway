@@ -21,20 +21,28 @@ pub(super) fn connection_survives(err: &RedisError) -> bool {
     matches!(err.kind(), ErrorKind::Server(_) | ErrorKind::Extension)
 }
 
+/// Whether `err` says the connection itself is gone — closed by the server
+/// or the network — rather than that a command failed on it.
+pub(super) fn connection_lost(err: &RedisError) -> bool {
+    !connection_survives(err)
+        && (err.kind() == ErrorKind::Io || err.is_io_error() || err.is_connection_dropped())
+}
+
 impl RedisAdapter {
     /// A command's failure. A server error reply is passed to the agent as a
     /// [`DbRejection`] (code + message, ACL username redacted) — `NOPERM`
     /// maps to `permission_denied`, anything else to `syntax_error`.
     ///
-    /// A cluster reply about the topology is the exception: `MOVED` / `ASK`
-    /// carry another node's address, and none of them is anything the agent
-    /// can fix in its command. They are `unavailable`, text dropped.
+    /// A reply about the server's state rather than the command is the
+    /// exception: a cluster redirect (`MOVED` / `ASK` carry another node's
+    /// address), a cluster or replica that cannot serve, a dataset still
+    /// loading, a script holding the server busy. None of them is anything
+    /// the agent can fix in its command. They are `unavailable`, text
+    /// dropped.
     pub(super) fn classify_command(&self, err: RedisError) -> ExecError {
-        if let ErrorKind::Server(kind) = err.kind()
-            && is_topology_reply(kind)
-        {
+        if is_unavailable_reply(&err) {
             tracing::warn!(
-                error_kind = "topology",
+                error_kind = "server_state",
                 code = err.code().unwrap_or("ERR"),
                 "target command failed"
             );
@@ -95,17 +103,24 @@ impl RedisAdapter {
     }
 }
 
-/// The server answered about where the data lives or whether the cluster can
-/// serve at all, not about the command.
-fn is_topology_reply(kind: ServerErrorKind) -> bool {
-    matches!(
-        kind,
-        ServerErrorKind::Moved
-            | ServerErrorKind::Ask
-            | ServerErrorKind::TryAgain
-            | ServerErrorKind::ClusterDown
-            | ServerErrorKind::MasterDown
-    )
+/// The server answered about its own state — where the data lives, whether
+/// it can serve at all — not about the command.
+fn is_unavailable_reply(err: &RedisError) -> bool {
+    match err.kind() {
+        ErrorKind::Server(kind) => matches!(
+            kind,
+            ServerErrorKind::Moved
+                | ServerErrorKind::Ask
+                | ServerErrorKind::TryAgain
+                | ServerErrorKind::ClusterDown
+                | ServerErrorKind::MasterDown
+                | ServerErrorKind::BusyLoading
+        ),
+        // The driver has no kind for `BUSY` (a script or function running
+        // past `busy-reply-threshold`).
+        ErrorKind::Extension => err.code() == Some("BUSY"),
+        _ => false,
+    }
 }
 
 /// Replace every whole-word occurrence of `role` — bounded by characters an
@@ -189,15 +204,19 @@ mod tests {
     }
 
     /// A redirect names another node's address; the agent gets neither the
-    /// address nor a "fix your command" code.
+    /// address nor a "fix your command" code. A server that cannot serve
+    /// right now is likewise not the command's fault.
     #[tokio::test]
-    async fn cluster_replies_are_unavailable_without_their_text() {
+    async fn server_state_replies_are_unavailable_without_their_text() {
         let adapter = adapter().await;
         for reply in [
             &b"-MOVED 3999 10.0.0.5:6381\r\n"[..],
             b"-ASK 3999 10.0.0.5:6381\r\n",
             b"-TRYAGAIN Multiple keys request during rehashing of slot\r\n",
             b"-CLUSTERDOWN The cluster is down\r\n",
+            b"-MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'.\r\n",
+            b"-LOADING Redis is loading the dataset in memory\r\n",
+            b"-BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSCRIPT.\r\n",
         ] {
             let mapped = adapter.classify_command(server_error(reply));
             assert!(matches!(mapped, ExecError::Unavailable), "{mapped:?}");
@@ -207,6 +226,11 @@ mod tests {
             matches!(wrong_type, ExecError::Rejected(_)),
             "{wrong_type:?}"
         );
+        // Another extension code stays the command's rejection.
+        let busy_key = adapter.classify_command(server_error(
+            b"-BUSYKEY Target key name already exists.\r\n",
+        ));
+        assert!(matches!(busy_key, ExecError::Rejected(_)), "{busy_key:?}");
     }
 
     #[test]

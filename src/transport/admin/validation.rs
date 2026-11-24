@@ -3,6 +3,7 @@
 
 use chrono::{DateTime, Utc};
 
+use crate::config::ConfigFile;
 use crate::state::permissions::RepoError;
 
 use super::error::AdminError;
@@ -69,6 +70,30 @@ pub(super) fn declared_server(
         AdminError::invalid("server must name a server declared in the gateway config")
             .with_request_id(request_id),
     )
+}
+
+/// A `(server, db_name)` pair the live gateway config declares. A row naming
+/// any other database would grant nothing today and silently start granting
+/// when a later reload added that database.
+pub(super) fn declared_database(
+    config: &ConfigFile,
+    server: &str,
+    db_name: &str,
+    request_id: &str,
+) -> Result<(), AdminError> {
+    let declared = config
+        .servers
+        .iter()
+        .filter(|s| s.name == server)
+        .flat_map(|s| &s.databases)
+        .any(|db| db.name == db_name);
+    if declared {
+        return Ok(());
+    }
+    Err(AdminError::invalid(format!(
+        "db_name `{db_name}` is not a database the gateway config declares on server `{server}`"
+    ))
+    .with_request_id(request_id))
 }
 
 /// Optimistic-concurrency precondition: when the caller names the

@@ -122,38 +122,26 @@ impl ServiceTokenStore {
     pub fn from_config(accounts: &[ServiceAccount]) -> Result<Self, ServiceTokenError> {
         let mut tokens: Vec<ResolvedServiceToken> = Vec::with_capacity(accounts.len());
         for account in accounts {
-            let token = account
-                .token
-                .resolve()
-                .map_err(|source| ServiceTokenError::Resolve(account.name.clone(), source))?;
-            let exposed = token.expose_secret();
-            if !is_well_formed_token(exposed) {
-                return Err(ServiceTokenError::WeakToken(account.name.clone()));
+            let policy = ServicePolicy {
+                require_upstream: account.require_upstream,
+                max_concurrent_requests: account
+                    .max_concurrent_requests
+                    .map(|cap| usize::try_from(cap).unwrap_or(usize::MAX)),
+            };
+            // Every token of one account maps to the same name, group and
+            // policy, so rotating under one name keeps the audit identity.
+            for reference in &account.tokens {
+                let token = reference
+                    .resolve()
+                    .map_err(|source| ServiceTokenError::Resolve(account.name.clone(), source))?;
+                reject_unusable(&tokens, &account.name, token.expose_secret())?;
+                tokens.push(ResolvedServiceToken {
+                    name: account.name.clone(),
+                    group: account.group.clone(),
+                    policy,
+                    token,
+                });
             }
-            // Reject shared values now so `authenticate` never has to pick
-            // between two identities for one presented token.
-            for existing in &tokens {
-                if ct_eq(
-                    existing.token.expose_secret().as_bytes(),
-                    exposed.as_bytes(),
-                ) {
-                    return Err(ServiceTokenError::DuplicateToken(
-                        existing.name.clone(),
-                        account.name.clone(),
-                    ));
-                }
-            }
-            tokens.push(ResolvedServiceToken {
-                name: account.name.clone(),
-                group: account.group.clone(),
-                policy: ServicePolicy {
-                    require_upstream: account.require_upstream,
-                    max_concurrent_requests: account
-                        .max_concurrent_requests
-                        .map(|cap| usize::try_from(cap).unwrap_or(usize::MAX)),
-                },
-                token,
-            });
         }
         Ok(Self {
             tokens: tokens.into(),
@@ -175,6 +163,28 @@ impl ServiceTokenStore {
             .iter()
             .find(|entry| ct_eq(entry.token.expose_secret().as_bytes(), presented.as_bytes()))
             .map(|entry| (entry.identity(now), entry.policy))
+    }
+}
+
+/// Refuse a malformed token, or one already resolved — for another account or
+/// this one — so `authenticate` never has to pick between two entries.
+fn reject_unusable(
+    resolved: &[ResolvedServiceToken],
+    name: &str,
+    token: &str,
+) -> Result<(), ServiceTokenError> {
+    if !is_well_formed_token(token) {
+        return Err(ServiceTokenError::WeakToken(name.to_string()));
+    }
+    match resolved
+        .iter()
+        .find(|existing| ct_eq(existing.token.expose_secret().as_bytes(), token.as_bytes()))
+    {
+        Some(existing) => Err(ServiceTokenError::DuplicateToken(
+            existing.name.clone(),
+            name.to_string(),
+        )),
+        None => Ok(()),
     }
 }
 

@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use super::super::adapter::{ExecError, ExecResult};
 use super::cancel::BackendTag;
-use super::error::classify;
+use super::error::{Origin, classify};
 use super::tier::TierKind;
 
 /// Bound on the cancel's one round trip, on a connection already acquired.
@@ -91,16 +91,16 @@ const CANCEL_BY_TAG_SQL: &str = "SELECT count(*) FILTER (WHERE pg_cancel_backend
 
 pub(super) async fn cancel_request(
     conn: &mut PgConnection,
-    role: &str,
+    origin: &Origin<'_>,
     request_id: Uuid,
 ) -> Result<bool, ExecError> {
     let pattern = format!("{}%", BackendTag::request_prefix(request_id));
     let cancel = sqlx::query(CANCEL_BY_TAG_SQL).bind(pattern).fetch_one(conn);
     let row = match tokio::time::timeout(CANCEL_TIMEOUT, cancel).await {
-        Ok(row) => row.map_err(|err| classify(err, role, ""))?,
+        Ok(row) => row.map_err(|err| classify(err, origin, ""))?,
         Err(_elapsed) => return Err(ExecError::Timeout),
     };
-    let signalled: i64 = row.try_get(0).map_err(|err| classify(err, role, ""))?;
+    let signalled: i64 = row.try_get(0).map_err(|err| classify(err, origin, ""))?;
     Ok(signalled > 0)
 }
 

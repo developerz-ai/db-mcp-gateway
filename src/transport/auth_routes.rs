@@ -8,14 +8,16 @@
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::http::header::{CACHE_CONTROL, PRAGMA};
+use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{AuthError, Identity, pkce};
 
 use super::app_state::OAuthState;
-use super::oauth::{self, random_token};
+use super::oauth::{self, PageContext, random_token};
+use super::request_id::GatewayRequestId;
 
 #[derive(Debug, Serialize)]
 pub struct LoginResponse {
@@ -23,7 +25,8 @@ pub struct LoginResponse {
     pub state: String,
 }
 
-pub async fn login(State(state): State<OAuthState>) -> Result<Json<LoginResponse>, AuthError> {
+/// `no-store`: the body carries the CSRF `state` of a login in progress.
+pub async fn login(State(state): State<OAuthState>) -> Result<Response, AuthError> {
     let auth = &state.auth;
     let csrf_state = random_token();
     let nonce = random_token();
@@ -33,15 +36,15 @@ pub async fn login(State(state): State<OAuthState>) -> Result<Json<LoginResponse
         .authorize_url(&csrf_state, &nonce, &challenge)
         .await?;
     auth.flows.insert(csrf_state.clone(), nonce, verifier).await;
-    Ok(Json(LoginResponse {
+    Ok(no_store(Json(LoginResponse {
         login_url: url.to_string(),
         state: csrf_state,
-    }))
+    })))
 }
 
 /// The IdP's redirect back: `code` on success, `error` (RFC 6749 §4.1.2.1)
 /// when the user declined or the IdP failed; `state` either way.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct CallbackParams {
     pub code: Option<String>,
     pub state: Option<String>,
@@ -49,14 +52,33 @@ pub struct CallbackParams {
     pub error_description: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+/// `code` and `state` are single-use bearer values; the description is the
+/// IdP's free text about a user.
+impl std::fmt::Debug for CallbackParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallbackParams")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Serialize)]
 pub struct CallbackResponse {
     pub session_token: String,
     pub expires_in_seconds: u64,
 }
 
+impl std::fmt::Debug for CallbackResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallbackResponse")
+            .field("expires_in_seconds", &self.expires_in_seconds)
+            .finish_non_exhaustive()
+    }
+}
+
 pub async fn callback(
     State(state): State<OAuthState>,
+    Extension(request_id): Extension<GatewayRequestId>,
     params: Result<Query<CallbackParams>, QueryRejection>,
 ) -> Response {
     let Query(params) = match params {
@@ -64,6 +86,7 @@ pub async fn callback(
         Err(rejection) => return oauth::query_rejected(&rejection),
     };
     let auth = &state.auth;
+    let page = PageContext::new(auth, request_id);
     // No live flow for this `state`: it expired (login took longer than
     // FLOW_TTL), was already consumed (double submit / reload), or the pod
     // restarted mid-login. Recoverable on OUR side — never a 502, which reads
@@ -73,7 +96,7 @@ pub async fn callback(
         None => None,
     };
     let Some(flow) = flow else {
-        return login_expired_response();
+        return oauth::login_expired(&page);
     };
 
     let code = match (params.code, params.error.as_deref()) {
@@ -89,7 +112,7 @@ pub async fn callback(
             );
             return match flow.bridge {
                 Some(bridge) => oauth::redirect_with_error(&bridge, error),
-                None => login_not_completed_response(),
+                None => oauth::login_not_completed(&page),
             };
         }
     };
@@ -98,8 +121,15 @@ pub async fn callback(
     // gateway mints an authorization code and 302s back to the client's
     // loopback redirect instead of returning the token as JSON.
     if let Some(bridge) = flow.bridge {
-        return oauth::complete_bridge_login(auth, bridge, &code, &flow.nonce, &flow.idp_verifier)
-            .await;
+        return oauth::complete_bridge_login(
+            auth,
+            bridge,
+            &code,
+            &flow.nonce,
+            &flow.idp_verifier,
+            &page,
+        )
+        .await;
     }
 
     // Bespoke flow: the agent POSTed `/auth/login` and polls here for the
@@ -112,13 +142,17 @@ pub async fn callback(
         Ok(v) => v,
         Err(err) => return err.into_response(),
     };
+    if verified.groups.is_empty() {
+        tracing::warn!(%request_id, "login carries no groups; group grants will not apply to it");
+    }
+    let session_ttl = auth.login_session_ttl();
     let session = match auth
         .sessions
         .create(
             &verified.sub,
             &verified.email,
             &verified.groups,
-            auth.config.session_ttl,
+            session_ttl,
             None, // fresh login: stamp issued_at now
         )
         .await
@@ -126,18 +160,20 @@ pub async fn callback(
         Ok(s) => s,
         Err(err) => return err.into_response(),
     };
-    let token = match auth
-        .jwt
-        .issue(session.id, &verified.sub, auth.config.session_ttl)
-    {
+    let token = match auth.jwt.issue(session.id, &verified.sub, session_ttl) {
         Ok(t) => t,
         Err(err) => return err.into_response(),
     };
-    Json(CallbackResponse {
+    no_store(Json(CallbackResponse {
         session_token: token,
-        expires_in_seconds: auth.config.session_ttl.as_secs(),
-    })
-    .into_response()
+        expires_in_seconds: session_ttl.as_secs(),
+    }))
+}
+
+/// A bearer or a login secret in the body: no cache may keep it (RFC 6749
+/// §5.1, as `/token` answers).
+fn no_store(body: impl IntoResponse) -> Response {
+    ([(CACHE_CONTROL, "no-store"), (PRAGMA, "no-cache")], body).into_response()
 }
 
 pub async fn logout(
@@ -216,59 +252,9 @@ fn client_facing_idp_error(idp_error: Option<&str>) -> &'static str {
     }
 }
 
-/// The page shown at `/auth/callback` when the pending flow for the returned
-/// `state` is gone (expired / already consumed / pod restarted mid-login). A
-/// 400 with a short human-readable body — never a 502 — so the user learns to
-/// simply restart the login rather than reading it as a gateway outage.
-fn login_expired_response() -> Response {
-    browser_page(
-        "Login session expired",
-        "This sign-in took too long to complete, or was already used. Nothing is \
-         wrong with the service. Please start the connection again from your client \
-         (e.g. re-run the MCP authorization) and complete the sign-in without long pauses.",
-    )
-}
-
-/// The page shown when the IdP sent the browser back without a code (the
-/// user declined, or the IdP failed) on the bespoke `/auth/login` flow.
-fn login_not_completed_response() -> Response {
-    browser_page(
-        "Sign-in not completed",
-        "The identity provider did not complete the sign-in. Please start the \
-         connection again from your client.",
-    )
-}
-
-fn browser_page(heading: &str, message: &str) -> Response {
-    let body = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-<title>{heading}</title></head>\
-<body style=\"font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;line-height:1.5\">\
-<h1>{heading}</h1><p>{message}</p></body></html>"
-    );
-    (StatusCode::BAD_REQUEST, Html(body)).into_response()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Regression: a callback whose in-memory flow has expired/been consumed
-    // must render a client-recoverable 400 HTML page — never a 502 Bad Gateway,
-    // which reads as an origin outage and hid the real "just restart" fix.
-    #[test]
-    fn login_expired_is_400_html_not_502() {
-        let resp = login_expired_response();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert_ne!(resp.status(), StatusCode::BAD_GATEWAY);
-        let ct = resp
-            .headers()
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        assert!(ct.starts_with("text/html"), "content-type was {ct}");
-    }
 
     #[test]
     fn only_retry_signals_pass_through_from_the_idp() {

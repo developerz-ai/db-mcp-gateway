@@ -22,20 +22,23 @@ mod client_registry_mem;
 mod facade;
 mod grants;
 mod pending_flows;
+mod redaction;
 mod refresh_chain;
 mod refresh_db;
 mod refresh_tokens;
+mod rotation;
 
 use sha2::{Digest, Sha256};
 
 pub use auth_codes::{AuthCode, AuthCodes};
 pub use client_name::{ClientName, InvalidClientName, MAX_CLIENT_NAME_CHARS};
 pub use client_registry::{ClientRecord, ClientRegistry};
-pub use facade::{AuthFacade, IssuedTokens};
+pub use facade::{AuthFacade, IssuedTokens, Refreshed};
 pub use grants::{MintError, Minted};
 pub use pending_flows::{OAuthBridge, PendingFlow, PendingFlows};
 pub use refresh_chain::DEFAULT_REFRESH_TTL;
 pub use refresh_tokens::{RefreshToken, RefreshTokens};
+pub use rotation::Rotation;
 
 /// Error type for store operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -51,7 +54,7 @@ pub enum StoreError {
 
 /// The verified IdP identity carried by a pending auth code or refresh token —
 /// enough to mint a fresh gateway session at redemption time.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GrantIdentity {
     pub sub: String,
     pub email: String,

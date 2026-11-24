@@ -16,20 +16,17 @@ use crate::config::{Database, Password, Server, Tls};
 use super::super::adapter::ExecError;
 
 /// Options for connecting to `database` as `role` — the database's read
-/// role or its write role; the two tiers differ in nothing else.
-pub(super) fn build_connect_options(
+/// role or its write role; the two tiers differ in nothing else. Without a
+/// password: that is resolved each time a tier opens ([`with_password`]).
+pub(super) fn connect_options(
     server: &Server,
     database: &Database,
     role: &str,
-    password: &SecretString,
 ) -> PgConnectOptions {
     let opts = PgConnectOptions::new()
         .host(&server.host)
         .port(server.port)
         .username(role)
-        // The sqlx boundary: the plaintext `&str` exists only for this builder
-        // call, then lives inside `PgConnectOptions` (fed to the pool, dropped).
-        .password(password.expose_secret())
         .database(&database.name)
         .ssl_mode(ssl_mode(server.tls))
         // sqlx logs every statement it runs at `info` by default; on the
@@ -41,6 +38,15 @@ pub(super) fn build_connect_options(
         Some(ca) => opts.ssl_root_cert(ca),
         None => opts,
     }
+}
+
+/// The sqlx boundary: the plaintext `&str` exists only for this builder
+/// call, then lives inside `PgConnectOptions` (fed to the pool, dropped).
+pub(super) fn with_password(
+    options: PgConnectOptions,
+    password: &SecretString,
+) -> PgConnectOptions {
+    options.password(password.expose_secret())
 }
 
 /// `required` encrypts without verifying (`sslmode=require`); only

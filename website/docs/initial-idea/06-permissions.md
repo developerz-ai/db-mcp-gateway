@@ -89,12 +89,14 @@ The same holds for keys on a Redis target: there is no `allowed_keys` constraint
 For a request `(user, groups, server, db, action)`:
 
 1. Resolve groups from the session.
-2. Collect every grant matching one of the user's groups and the target `(server, db)`, plus the subject's DB-backed grants ([12](12-dynamic-permissions.md)) — none for a `service:<name>` identity, whose authority is exactly its YAML group. A `database: "*"` grant matches every database the config declares on that server.
-3. If no grant has an action that includes the requested one → `forbidden`. `history_read` is outside the `query_write ⊇ query_read ⊇ schema_read` chain: it neither grants nor is granted by any of them.
-4. Merge constraints across matching grants: take the **most restrictive** value for each (lowest `row_limit`, lowest `statement_timeout_ms`, `require_reason` = true wins). Zero is a bound, the tightest one — never "unset".
+2. Collect every grant the caller holds on the target `(server, db)`: the YAML grants of each of the user's groups, plus the subject's DB-backed grants ([12](12-dynamic-permissions.md)) — none for a `service:<name>` identity, whose authority is exactly its YAML group. A `database: "*"` grant matches every database the config declares on that server.
+3. Keep only the grants whose action **includes the requested action** (`query_write ⊇ query_read ⊇ schema_read`; a grant includes its own action). These are the *matching* grants. None left → `forbidden`. `history_read` is outside the chain: it neither grants nor is granted by any of them.
+4. Merge constraints across the matching grants, and only those: take the **most restrictive** value for each (lowest `row_limit`, lowest `statement_timeout_ms`, `require_reason` = true wins). Zero is a bound, the tightest one — never "unset". The merge scope is therefore the requested action, not the caller's whole grant set:
+   - a grant that does not include the requested action contributes nothing. A `query_read` grant's `row_limit` or `require_reason` never binds a `query_write` call — cap the write grant itself;
+   - the inclusion runs one way. A `query_write` grant includes `query_read`, so it is a matching grant for a read and its constraints do merge into that read (and into a `schema_read` call).
 5. Apply constraints to the call.
 
-Most-restrictive merging means you can't accidentally upgrade your access by being in two groups. The decision depends only on the *set* of matching grants, never their order (`src/authz/resolver_proptests.rs`).
+Most-restrictive merging means you can't accidentally upgrade your access by being in two groups. The decision depends only on the *set* of matching grants, never their order (`src/authz/resolver_proptests.rs`); the action scope of the merge is pinned by `src/authz/action_scope_proptests.rs`.
 
 ## Hot reload
 
@@ -102,7 +104,7 @@ Permission changes land via PR → merge → operator runs `kill -HUP` on the ga
 
 ## Admin operations
 
-There is no in-band admin UI. Operator actions are CLI subcommands of the gateway binary, run inside the container, against the state DB:
+There is no in-band admin UI. **Planned, not built:** the CLI below is scheduled in plan 101 slice 08 (operator tooling); the binary ships no subcommands today. Until it lands, revoke sessions with the audited admin API (`POST /admin/v1/users/:id/revoke-sessions`, [admin-api.md](../deployment/admin-api.md)) or SQL against the state DB, and read audit history from `audit_calls` directly. The planned operator actions are CLI subcommands of the gateway binary, run inside the container, against the state DB:
 
 - `gateway admin revoke-session <user_email>`
 - `gateway admin list-active-sessions`

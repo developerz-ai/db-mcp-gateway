@@ -37,6 +37,7 @@ async fn redeem(state: &OAuthState) -> (StatusCode, Value) {
         code_verifier: Some(VERIFIER.into()),
         refresh_token: None,
         client_id: Some("client-1".into()),
+        resource: None,
     };
     let response = token(State(state.clone()), Ok(Form(form))).await;
     let status = response.status();
@@ -90,6 +91,7 @@ async fn a_failed_pkce_check_still_consumes_the_code() {
         code_verifier: Some("wrong-verifier".into()),
         refresh_token: None,
         client_id: None,
+        resource: None,
     };
     let response = token(State(state.clone()), Ok(Form(form))).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);

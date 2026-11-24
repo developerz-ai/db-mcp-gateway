@@ -54,17 +54,20 @@ The same logic justifies *not* having a `priority` field on grants. A grant eith
 
 Postgres first. MySQL is a second backend behind the same `PermissionsRepo` trait. **No MongoDB** for the permissions store — it'd add a third schema dialect for no gain (we already have pg, are adding mysql, and mongo's flexible schema is a liability for an authz store where the schema is the contract).
 
-Config switch:
+Config switch — a top-level `permissions_store:` block beside `permissions:` (the YAML grants, which always apply):
 
 ```yaml
-permissions:
-  yaml: config/permissions.yml      # optional, can be empty/absent
-  store:
-    driver: pg                       # pg | mysql
-    dsn: env:PERMISSIONS_DB_DSN
+permissions_store:
+  driver: pg                         # pg | mysql | none
 ```
 
-If `store` is absent, the gateway runs YAML-only and the admin API is disabled. This is the path the dogfood install keeps using.
+| `driver` | Grants come from | Admin API |
+|---|---|---|
+| absent / `pg` | YAML **and** the `permissions_*` tables in the state DB (the default — an absent block still reads the store) | allowed |
+| `mysql` | YAML **and** a MySQL store; DSN from the `PERMISSIONS_DB_DSN` env var, never YAML | refused at boot |
+| `none` | YAML only — the store is never read: no grant query, no `LISTEN` connection, the resolver cache answers empty | refused at boot (nothing to edit) |
+
+The driver is fixed at boot; a reload that changes it is refused. `driver: none` is the explicit YAML-only mode the dogfood install uses.
 
 **The MySQL store is read-only-provisioned.** The gateway only reads it; the operator fills it with their own tooling. Boot rejects `driver: mysql` together with `admin.enabled: true`, so there is no audited write path to MySQL and none is planned — the `permissions_audit` table its `0002` migration created stays unwritten. With no admin commit there is no cross-replica notification either: a change made in MySQL is honoured within `PERMISSIONS_CACHE_TTL_SECONDS` (clamped to ≤ 300 s). Identity and routing columns (`user_sub`, `server`, `db_name`) use the case- and accent-sensitive `utf8mb4_0900_as_cs` collation (`migrations-mysql/0004`), so `Alice` and `alice` are two subjects, as they are in Postgres.
 
@@ -182,7 +185,7 @@ The `(server, db_name)` UNIQUE index is partial (`WHERE deleted_at IS NULL`), so
 
 ### Locked writes
 
-Every admin mutation runs one shape (`src/transport/admin/audited_tx.rs`): begin → upsert the acting admin's `permissions_users` row → lock the target row (`SELECT … FOR UPDATE`) → mutate → write `permissions_audit` → queue `NOTIFY` → commit → invalidate this replica's cache. Locking the actor row first gives every admin write one lock order; a mutation of the actor's own user row skips the actor upsert (that row plays both parts). Because the target is locked before `before` is read, concurrent writes serialise and the audit chain is continuous: `after[n] == before[n+1]`. PATCH bodies may carry `expected_updated_at` (the value last read); a mismatch is 409.
+Every admin mutation runs one shape (`src/transport/admin/audited_tx.rs`): begin → lock the acting admin's `permissions_users` row, inserting it from the session snapshot only if absent (`ON CONFLICT DO NOTHING`, then `SELECT … FOR UPDATE`) → lock the target row (`SELECT … FOR UPDATE`) → mutate → write `permissions_audit` → queue `NOTIFY` → commit → invalidate this replica's cache. Locking the actor row first gives every admin write one lock order; a mutation of the actor's own user row skips the actor step (that row plays both parts). The actor step never rewrites an existing row: an unaudited email/groups refresh there would break that row's audit chain and bump its `updated_at` under another admin's precondition (a spurious 409). Because the target is locked before `before` is read, concurrent writes serialise and the audit chain is continuous: `after[n] == before[n+1]`. PATCH bodies may carry `expected_updated_at` (the value last read); a mismatch is 409.
 
 ### PATCH merges per key
 
@@ -196,7 +199,7 @@ Every admin mutation runs one shape (`src/transport/admin/audited_tx.rs`): begin
 
 The resolver caches each subject's DB grant set (`PermissionsCache`, keyed on `user_sub`). A cold miss is one store query; concurrent misses for one subject share it (single flight); a load overtaken by an invalidation of that subject is not cached (per-subject revision) and is retried at most three times; expired idle entries are swept on insert.
 
-An admin commit both drops this replica's affected entries and, inside the same transaction, `NOTIFY`s channel `dbmcp_permissions`; every replica's listener applies it on commit and never on rollback. The listener keeps running through the shutdown drain, so requests still in flight on a stopping replica see revokes until they finish. A listener that loses its connection reconnects with backoff and flushes everything on reconnect, since notifications sent meanwhile are lost. The bound on a revoke reaching every replica is therefore the notification latency, or the reconnect delay after a dropped listener — the TTL (`PERMISSIONS_CACHE_TTL_SECONDS`, default 60 s, clamped ≤ 300 s) bounds only what nothing announces, such as a MySQL store edited outside the gateway.
+An admin commit both drops this replica's affected entries and, inside the same transaction, `NOTIFY`s channel `dbmcp_permissions`; every replica's listener applies it on commit and never on rollback. The listener keeps running through the shutdown drain, so requests still in flight on a stopping replica see revokes until they finish. A listener that loses its connection reconnects with backoff and flushes everything on reconnect, since notifications sent meanwhile are lost; the recovery is logged (`permissions listener recovered; grant cache flushed`). A connection can also die without an error — a NAT or firewall dropping an idle flow — so the listener proves liveness: every 5 s it `NOTIFY`s a second channel, `dbmcp_permissions_ping`, that the same connection listens on, and 15 s without hearing anything counts as a lost connection (same reconnect + flush). The bound on a revoke reaching every replica is therefore the notification latency, the reconnect delay after an announced drop, or 15 s plus that delay after a silent one — the TTL (`PERMISSIONS_CACHE_TTL_SECONDS`, default 60 s, clamped ≤ 300 s) bounds only what nothing announces, such as a MySQL store edited outside the gateway.
 
 | Surface | Scope | Why |
 |---|---|---|
@@ -211,7 +214,7 @@ An admin commit both drops this replica's affected entries and, inside the same 
 | Detached from the request | Local invalidation runs on a `tokio::spawn`ed task (`PermissionsCache::spawn_apply`), so a client disconnect between commit and invalidate cannot strand a stale entry. |
 | `user_sub`-keyed | Grants reference users by row id; the handler resolves `user_sub` inside the transaction. |
 | Service identities | A `service:<name>` identity never reads the store — its authority is exactly its YAML group, so a DB grant seeded for it is inert. |
-| YAML-only installs | No resolver cache → invalidation is a no-op. |
+| YAML-only installs (`driver: none`) | No store, no admin API → nothing to invalidate. |
 
 ## Wildcard grants
 
@@ -242,7 +245,7 @@ The rejection runs before any INSERT/UPDATE against `permissions_databases`, so 
 
 ### Declared servers only on `/admin/v1/databases`
 
-`POST` and `PATCH` on `/admin/v1/databases` (a `PATCH` only when it sets `server`) require the trimmed `server` to name a server declared in the gateway's **boot** config — the same set a wildcard grant's `server` is checked against; a SIGHUP reload does not change it. An undeclared server is `400 invalid_request` (`server must name a server declared in the gateway config`). A row on an undeclared server would otherwise sit dormant until a later config change silently armed every specific grant on it. Like the sentinel check, the refusal happens before the transaction opens, so no `permissions_databases` row and no `permissions_audit` entry is written (verified in `tests/it_db/transport_wave2_admin_databases.rs`).
+`POST` and `PATCH` on `/admin/v1/databases` (a `PATCH` only when it sets `server`) require the trimmed `server` to name a server declared in the gateway's **boot** config — the same set a wildcard grant's `server` is checked against; a SIGHUP reload does not change it. An undeclared server is `400 invalid_request` (`server must name a server declared in the gateway config`). A row on an undeclared server would otherwise sit dormant until a later config change silently armed every specific grant on it. The same holds for the database: the resulting `(server, db_name)` must be a database the **live** config declares on that server (checked against the current config, so a reload that adds one makes it registrable at once); otherwise `400 invalid_request` (``db_name `x` is not a database the gateway config declares on server `y` ``); a `PATCH` checks the pair it would produce after locking the row and before writing anything. Like the sentinel check, the refusal happens before the transaction opens, so no `permissions_databases` row and no `permissions_audit` entry is written (verified in `tests/it_db/transport_wave2_admin_databases.rs`).
 
 The supported way to grant access to every database on a server is `db_name_wildcard: true` + `database_id: null` on `POST /admin/v1/grants` (see [Request shapes](#request-shapes) above), *not* a `permissions_databases` row literally named `"*"`.
 
@@ -297,7 +300,7 @@ The connection still uses a least-privilege mongo role (read-only on the target 
 
 `describe_schema` and `sample_table` work on Mongo too: `describe_schema` is `listCollections` + `listIndexes` (collections with their indexes; `schema` is ignored, `table` names one collection) and `sample_table` is a `find` with the sample limit. Mongo writes stay out of scope ([10](10-non-goals.md)); `write_role` on a Mongo database fails boot.
 
-Timeouts via `maxTimeMS`. Row caps via a server-side limit of `row_limit + 1` (`find` `limit`/`batchSize`, a trailing `$limit` stage on `aggregate`) plus the gateway's row and byte budget at the adapter. A reply missing its documented field, or a document that cannot be rendered, is a typed error — never a fabricated `null`. Cancellation: `killOp` on client disconnect, best-effort and requires an opt-in privilege — see [config-reference.md §Mongo](../deployment/config-reference.md#mongo) for the full contract (`statement_timeout_ms` is the guaranteed bound either way, same as pg's belt-and-suspenders `tokio::time::timeout`).
+Timeouts via `maxTimeMS`. Row caps via a server-side limit of `row_limit + 1` (`find` `limit`/`batchSize`, a trailing `$limit` stage on `aggregate`) plus the gateway's row and byte budget at the adapter. A reply missing its documented field, or a document that cannot be rendered, is a typed error — never a fabricated `null`. A NaN or infinite double, which JSON has no number for, renders as Extended JSON `{"$numberDouble":"NaN"}` (`"Infinity"`, `"-Infinity"`). Cancellation: `killOp` on client disconnect, best-effort and requires an opt-in privilege — see [config-reference.md §Mongo](../deployment/config-reference.md#mongo) for the full contract (`statement_timeout_ms` is the guaranteed bound either way, same as pg's belt-and-suspenders `tokio::time::timeout`).
 
 Audit row shape matches pg's: same `audit_calls` columns, with `db_type = 'mongo'` and the command document in `sql` exactly as sent — stored verbatim like SQL; there is no redaction policy ([07-logging-retention](07-logging-retention.md)).
 

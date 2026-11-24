@@ -89,7 +89,7 @@ fn audit_failure_records_the_client_code_and_keeps_the_tool_outcome() {
         OutcomeCode::ForbiddenSql,
         Some("statement type `INSERT` is not allowed"),
     ));
-    guard.record_audit_failure();
+    guard.record_audit_failure(None);
     assert_eq!(guard.row.outcome, OutcomeCode::AuditUnavailable);
     assert_eq!(
         guard.row.error_message.as_deref(),
@@ -98,10 +98,42 @@ fn audit_failure_records_the_client_code_and_keeps_the_tool_outcome() {
 
     let mut guard = unarmed_guard();
     guard.record_outcome(&outcome(OutcomeCode::Success, None));
-    guard.record_audit_failure();
+    guard.record_audit_failure(None);
     assert_eq!(
         guard.row.error_message.as_deref(),
         Some("tool outcome success")
+    );
+}
+
+/// A write that committed — or may have — before the completion row failed:
+/// the fallback row says so once. A write that never applied stays unflagged.
+#[test]
+fn audit_failure_after_a_write_flags_it_once() {
+    let mut guard = unarmed_guard();
+    guard.record_outcome(&outcome(OutcomeCode::Success, None));
+    guard.record_audit_failure(Some(WriteState::Applied));
+    assert_eq!(
+        guard.row.error_message.as_deref(),
+        Some(format!("tool outcome success ({WRITE_MAY_HAVE_COMMITTED})").as_str())
+    );
+
+    let timed_out = format!("query exceeded the statement_timeout ({WRITE_MAY_HAVE_COMMITTED})");
+    let mut guard = unarmed_guard();
+    guard.record_outcome(&outcome(OutcomeCode::Timeout, Some(&timed_out)));
+    guard.record_audit_failure(Some(WriteState::Unknown));
+    let message = guard.row.error_message.clone().unwrap_or_default();
+    assert_eq!(
+        message.matches(WRITE_MAY_HAVE_COMMITTED).count(),
+        1,
+        "{message}"
+    );
+
+    let mut guard = unarmed_guard();
+    guard.record_outcome(&outcome(OutcomeCode::SyntaxError, Some("rejected")));
+    guard.record_audit_failure(Some(WriteState::NotApplied));
+    assert_eq!(
+        guard.row.error_message.as_deref(),
+        Some("tool outcome syntax_error: rejected")
     );
 }
 

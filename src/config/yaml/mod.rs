@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::schema::{LoggingBlock, Permission, Server, ServiceAccount};
+use super::schema::{LoggingBlock, Permission, Server, ServiceAccount, ServiceAccountSpec};
 use super::secret::SecretError;
 use admin::AdminBlock;
 
@@ -36,8 +36,9 @@ pub struct ConfigFile {
     /// Spec 12 §"Storage backends" (#59). Absent → use the state DB
     /// (Postgres) as the permissions store too — the default. Present
     /// with `driver: mysql` connects to a separate mysql pool via
-    /// `PERMISSIONS_DB_DSN` env. The state DB itself (sessions, audit
-    /// rows) stays Postgres regardless.
+    /// `PERMISSIONS_DB_DSN` env; `driver: none` runs YAML-only. The state
+    /// DB itself (sessions, audit rows) stays Postgres regardless. Read it
+    /// through [`ConfigFile::permissions_store_driver`].
     pub permissions_store: Option<PermissionsStoreBlock>,
     /// Headless service identities (spec 14). Absent → no static bearer
     /// token is accepted; the OIDC session path is the only way in.
@@ -62,7 +63,7 @@ struct RawConfigFile {
     #[serde(default)]
     permissions_store: Option<PermissionsStoreBlock>,
     #[serde(default)]
-    service_accounts: Vec<ServiceAccount>,
+    service_accounts: Vec<ServiceAccountSpec>,
     #[serde(default)]
     logging: LoggingBlock,
 }
@@ -75,7 +76,12 @@ impl RawConfigFile {
             permissions: self.permissions,
             admin: AdminConfig::from_block(self.admin)?,
             permissions_store: self.permissions_store,
-            service_accounts: self.service_accounts,
+            service_accounts: self
+                .service_accounts
+                .into_iter()
+                .map(ServiceAccountSpec::into_account)
+                .collect::<Result<_, _>>()
+                .map_err(ConfigFileError::Invalid)?,
             logging: self.logging,
         })
     }
@@ -91,14 +97,17 @@ pub struct PermissionsStoreBlock {
     pub driver: PermissionsStoreDriver,
 }
 
-/// The two supported permissions-store backends. Spec 12 §"Storage
-/// backends" explicitly excludes mongo (flexible schema is a liability
-/// for an authz store).
+/// Where DB grants come from. Spec 12 §"Storage backends" explicitly
+/// excludes mongo (flexible schema is a liability for an authz store).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionsStoreDriver {
     Pg,
     Mysql,
+    /// YAML-only: grants come from `permissions:` alone and no store is ever
+    /// read. YAML `driver: none`.
+    #[serde(rename = "none")]
+    YamlOnly,
 }
 
 /// Parser options for every config parse in this module.
@@ -134,6 +143,14 @@ pub enum ConfigLoadError {
 }
 
 impl ConfigFile {
+    /// The permissions store this config selects; an absent block is the
+    /// state DB (`Pg`), the default since #59.
+    pub fn permissions_store_driver(&self) -> PermissionsStoreDriver {
+        self.permissions_store
+            .as_ref()
+            .map_or(PermissionsStoreDriver::Pg, |store| store.driver)
+    }
+
     /// Canonical "load and fully validate" entry point — parses, validates,
     /// and resolves every secret reference. The boot path (`main`) and any
     /// future `SIGHUP` reload MUST use this so it's impossible to start with
@@ -227,7 +244,9 @@ impl ConfigFile {
             // Same fail-fast contract as DB passwords: an unresolvable
             // service-token ref aborts boot here. The request path reads the
             // value back out of `ServiceTokenStore`, built at startup.
-            let _ = account.token.resolve()?;
+            for token in &account.tokens {
+                let _ = token.resolve()?;
+            }
         }
         Ok(())
     }

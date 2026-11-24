@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use crate::audit::stream::StreamSinks;
+use crate::audit::stream::{StreamSinks, SyslogTlsError};
 use crate::auth::{ServiceTokenError, ServiceTokenStore};
 use crate::authz::PermissionsCache;
 use crate::exec::AdapterRegistry;
@@ -34,6 +34,9 @@ pub enum ReloadError {
     Load(#[from] ConfigLoadError),
     #[error(transparent)]
     ServiceTokens(#[from] ServiceTokenError),
+    /// A TLS syslog sink's `ca_file` is unreadable or holds no usable CA.
+    #[error(transparent)]
+    StreamSinks(#[from] SyslogTlsError),
     #[error("`{0}` is fixed at boot; restart the gateway to change it")]
     BootFixed(&'static str),
     #[error("config load task failed")]
@@ -57,7 +60,7 @@ async fn apply(targets: &ReloadTargets) -> Result<usize, ReloadError> {
         return Err(ReloadError::BootFixed(setting));
     }
     let tokens = ServiceTokenStore::from_config(&new.service_accounts)?;
-    let sinks = StreamSinks::from_config(&new.logging.stream);
+    let sinks = StreamSinks::from_config(&new.logging.stream)?;
     let changed = current.changed_databases(&new);
 
     // Point of no return: nothing below can fail. Tokens go first: a request

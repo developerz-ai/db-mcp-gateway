@@ -325,6 +325,8 @@ async fn configured_syslog_sink_delivers_udp_and_still_writes_the_durable_row() 
         DispatchSinks::new(&[StreamSinkConfig::Syslog {
             host: "127.0.0.1".to_string(),
             port,
+            transport: Default::default(),
+            ca_file: None,
         }])
         .store(&p),
         std::future::ready(outcome),

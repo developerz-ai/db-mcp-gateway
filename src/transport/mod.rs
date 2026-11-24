@@ -9,8 +9,10 @@
 
 pub mod admin;
 pub mod app_state;
+pub mod client_ip;
 pub mod errors;
 pub mod limit;
+pub mod origin;
 pub mod probes;
 pub mod request_id;
 pub mod tls;
@@ -42,6 +44,10 @@ use limit::ConcurrencyLimiter;
 /// Build the axum router: the bearer-gated `/mcp` + logout, the OAuth bridge,
 /// probes + discovery, and — when `admin.enabled` — `/admin/v1/*`.
 ///
+/// The network policy rides as request extensions the caller layers on top:
+/// [`origin::AllowedOrigins`] and [`client_ip::TrustedProxies`]. Absent, each
+/// falls back to its strictest form (no `Origin` allowed, no proxy trusted).
+///
 /// Refuses a zero concurrency cap: a gateway that sheds every request is a
 /// misconfiguration, not a mode.
 pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError> {
@@ -67,7 +73,10 @@ pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError
         .route_layer(middleware::from_fn_with_state(
             state.oauth.clone(),
             auth_middleware::bearer_auth,
-        ));
+        ))
+        // Applied last, so it runs first: a disallowed `Origin` is refused
+        // before auth, a budget permit or any audit row.
+        .route_layer(middleware::from_fn(origin::check));
 
     // RFC 9728 §3.1: clients may key the protected-resource metadata by the
     // resource's path, so serve it at both the bare well-known and the
@@ -147,6 +156,7 @@ pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError
                 .iter()
                 .map(|server| server.name.clone())
                 .collect(),
+            config: state.mcp.config.clone(),
         })
         .route_layer(middleware::from_fn_with_state(
             gated_limiter,

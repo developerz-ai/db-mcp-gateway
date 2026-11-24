@@ -125,7 +125,7 @@ All parameters below are **required**. Missing or invalid → `invalid_request` 
 | `code_challenge` | base64url-no-pad SHA-256 hash of the verifier (PKCE S256): exactly 43 characters of `A-Z a-z 0-9 - _` |
 | `code_challenge_method` | must be `S256` — `plain` is never accepted |
 | `state` | non-empty string of at most 512 bytes; echoed back verbatim on the `302` as the client's CSRF token |
-| `resource` | optional, at most 512 bytes; forwarded as-is to the token response (RFC 8707) |
+| `resource` | optional, at most 512 bytes (RFC 8707). When sent it must name this gateway's MCP endpoint — the origin of `OIDC_REDIRECT_URL` plus the MCP path, as advertised in the protected-resource metadata; compared as parsed URLs, so host case, a default port and a trailing slash do not matter, and a fragment never matches. Anything else → `400 invalid_target` (RFC 8707 §2): this gateway issues tokens for exactly one resource |
 
 `/authorize` is unauthenticated and parks these values in the pending-flow store (≤10,000 flows, 15-minute TTL) across the IdP leg, so each one is bounded; a value outside its bound is `400 invalid_request`.
 
@@ -144,6 +144,11 @@ After `/auth/callback` verifies the login, a bridge flow whose redirect is **not
 - Consent is never remembered: each non-loopback authorization asks again.
 
 Loopback redirects (`localhost`, `127.0.0.0/8`, `::1`) skip consent: the code can only reach the user's own machine (RFC 8252 §7.3), the same reasoning as the adopt rule above.
+
+**Login pages.** Every HTML page the gateway itself shows during login — "login session expired", "sign-in not completed", "authorization not completed", "email not verified", and the consent page — ends with a footer naming the gateway (`db-mcp-gateway at <host of OIDC_REDIRECT_URL>` — never the request's `Host` header), the request id (`x-request-id`, the same id in the server log), and whom to ask: `GATEWAY_SUPPORT_CONTACT` when set (one line, ≤200 characters, no control characters — an address, a channel, a URL; HTML-escaped), else "give the request ID to whoever runs this gateway". All of them carry the consent page's security headers (no framing, `no-store`, no scripts).
+
+- **Email not verified.** A bridge login whose ID token has no `email` or `email_verified != true` shows a `403` page saying exactly that (and why: every call is audited under the email), with a link that returns `error=access_denied&state=…` to the client so its loopback handler still completes. Every other IdP-side failure keeps the plain `302` with `access_denied`.
+- **No groups.** A login whose groups claim yields no group is not refused (a grant may name the user, and the admin API can add one), but it is logged as a warning with the request id, and the consent page tells the user before they approve that they signed in with **no groups** and will likely see no databases.
 
 **`/auth/callback` without a code.** The IdP may send the browser back with `error` (RFC 6749 §4.1.2.1 — the user declined, or the IdP failed) and no `code`. The gateway takes the pending flow by `state` either way. For an OAuth-bridge login it 302s to the client's redirect with `error=temporarily_unavailable` or `server_error` when the IdP said so, else `access_denied`; the IdP's `error_description` is logged server-side only. For the bespoke `/auth/login` flow it shows a `400` "sign-in not completed" page. A missing or unknown `state` shows the "login session expired" page, as before.
 
@@ -165,6 +170,7 @@ Accepts `application/x-www-form-urlencoded`.
 | `code_verifier` | the raw PKCE verifier; gateway checks `BASE64URL(SHA256(verifier)) == stored_challenge` |
 | `client_id` | optional but recommended; if sent, must match the registrant |
 | `redirect_uri` | required; must exactly match the `redirect_uri` used at `/authorize` (OAuth 2.1 §4.1.3). Missing → `invalid_request`; mismatch → `invalid_grant` |
+| `resource` | optional; same rule as at `/authorize` — anything but this gateway's MCP endpoint → `400 invalid_target`, checked **before** the code is consumed, so the client can retry the same code with the right resource |
 
 The code is consumed on first use (replay → `invalid_grant`), and a redemption refused for what the client sent (wrong `client_id`, `redirect_uri` or PKCE verifier) leaves it consumed. The one exception is a failure on the gateway's side after those checks passed — the client registry or the state DB could not be written, so no session or token was issued: `/token` answers a retryable `503 server_error` and puts the code back with its original 60-second deadline, so the retry it asks for can succeed. That holds only while nothing can have been issued — the failure came before the mint transaction's `COMMIT` was sent. Once it was sent and its reply was an error or never arrived, the grant may exist, and a retry of the same code would mint a second one: the code stays consumed and `/token` answers `400 invalid_grant` ("token issuance could not be confirmed; restart authorization"). A grant that did commit this way is unreachable — its tokens were never delivered — and lapses on its own TTL.
 
@@ -173,10 +179,19 @@ The code is consumed on first use (replay → `invalid_grant`), and a redemption
 | Field | Requirement |
 |---|---|
 | `refresh_token` | the token from a previous `/token` response |
+| `resource` | optional; same rule as above, checked before the token is consumed |
 
 Refresh tokens rotate: presenting one consumes it and a new pair is returned. A replayed (already-rotated) token → `invalid_grant`, and it **revokes the whole chain** — its live refresh token and paired access session — because the server can't tell the thief from the legitimate client (OAuth 2.1 §4.3.1, RFC 9700 §4.14.2). Rotated-out token hashes are kept as tombstones (`oauth_refresh_rotated`, migration 0017, SHA-256 digests only) until the chain's absolute expiry; each chain carries a stable `chain_id`, and the reuse is logged as a warning with that id, never the token. A replay within 10 s of the rotation (`REUSE_GRACE`) is only `invalid_grant` and leaves the chain alive, so a client firing parallel refreshes from several connections isn't signed out; a replay after that revokes the chain. (The in-memory test backend doesn't track chains.) Each refresh token is paired with the access session minted alongside it (`oauth_refresh_tokens.session_id`, migration 0012); rotation revokes that previous session, so after a refresh the old access token is rejected. Consuming the old token, revoking its session, and storing the new session and token are one state-DB transaction: a failure part-way commits nothing, the response is a 5xx, and the presented refresh token stays redeemable — a transient error is never a sign-out.
 
 Rotation does **not** extend the token's lifetime. A chain has an **absolute TTL** measured from the *first* token's mint; the original `issued_at` is carried verbatim through every rotation, so a continuously refreshed chain still expires on schedule and forces a fresh `/authorize` login. The TTL is set by `REFRESH_TTL_DAYS` (**default 1 day**); an operator who wants a longer "stay signed in" window — up to 366 days (a year) — raises it there. The default is deliberately short because a refresh re-mints the session from the IdP identity — **groups included** — that was frozen at the original login; until the chain dies, a group change at the IdP (off-boarding, role downgrade) can't reach the gateway. So the TTL is directly a group-staleness window: one day keeps it within a normal deprovisioning cadence while still spanning a working day of silent renewals, and a long setting (months, a year) trades that freshness for convenience — pair it with prompt out-of-band revocation (`POST /revoke`, logout) for off-boarding. (Re-validating the identity against the IdP on each refresh would decouple lifetime from staleness but needs an IdP refresh token / `offline_access` the bridge doesn't yet hold — deferred.) Refresh tokens (and the short-lived authorization codes) are stored **hashed** (SHA-256) — the store holds only digests, so neither a memory dump nor a dump of `oauth_refresh_tokens` can be replayed as a live token. Lowering `REFRESH_TTL_DAYS` applies to chains already minted under the old, longer window: redemption re-checks the chain's birth against the *currently configured* TTL rather than honoring the deadline stamped at mint time.
+
+**`GROUPS_MAX_AGE` — bounding group staleness without shortening the chain.** Optional (unset = the behaviour above). A whole number with a unit, `s`/`m`/`h`/`d` (e.g. `12h`), between `1m` and `366d`; anything else refuses boot. It caps how long a session may run on the groups read at its login, measured from the chain's birth (the original IdP login, carried through every rotation):
+
+- A login mints a session of `min(SESSION_TTL_HOURS, GROUPS_MAX_AGE)`; the bearer's `expires_in` says so.
+- A refresh inside the bound rotates as usual, but the new session ends no later than `chain birth + GROUPS_MAX_AGE`.
+- A refresh at or past the bound is refused with `400` and the body `{"error": "invalid_grant", "error_description": "…sign in again", "code": "relogin_required"}`. `invalid_grant` is what makes an OAuth client run `/authorize` again; `code: "relogin_required"` (stable) tells this refusal apart from a spent or unknown token. The refused token is consumed and its paired session revoked in the same transaction, so nothing of the old login outlives the bound; the next `/authorize` reads the user's **current** groups from the IdP.
+
+So `REFRESH_TTL_DAYS` can stay long for convenience while `GROUPS_MAX_AGE` (e.g. `12h`) keeps an IdP group removal from taking longer than that to land.
 
 **Token response** (both grant types, `Cache-Control: no-store`):
 
@@ -235,7 +250,7 @@ State that is *meant* to outlive the process is in the state DB: **dynamic clien
 - Signed JWT (HS256), gateway-issued — not the IdP's ID token directly; we re-sign so we can revoke.
 - Short TTL (default 8 hours; `expires_in` in the token response reflects the actual value).
 - **Bespoke flow:** refresh by re-running SSO. No long-lived refresh token on the developer's machine.
-- **OAuth bridge flow:** a rotating opaque refresh token is returned at `/token`. Presenting it issues a new access+refresh pair and consumes the old refresh token (replay → `invalid_grant`). Rotation never extends the chain: an absolute TTL (`REFRESH_TTL_DAYS`, default 1 day, raise up to 90 for a longer "stay signed in" window) runs from the first token's mint, after which the client must re-authenticate via `/authorize`. The TTL doubles as the staleness bound for a revoked group — refresh re-uses the groups frozen at login — so a longer window trades group freshness for convenience (see the `/token` section above). Refresh tokens are stored hashed (SHA-256) in the state DB, so a chain survives a restart or redeploy — the configured window is the real one.
+- **OAuth bridge flow:** a rotating opaque refresh token is returned at `/token`. Presenting it issues a new access+refresh pair and consumes the old refresh token (replay → `invalid_grant`). Rotation never extends the chain: an absolute TTL (`REFRESH_TTL_DAYS`, default 1 day, raise up to 366 for a longer "stay signed in" window) runs from the first token's mint, after which the client must re-authenticate via `/authorize`. The TTL doubles as the staleness bound for a revoked group — refresh re-uses the groups frozen at login — so a longer window trades group freshness for convenience (see the `/token` section above). Refresh tokens are stored hashed (SHA-256) in the state DB, so a chain survives a restart or redeploy — the configured window is the real one.
 - Revocation: server-side, in the state DB. Logout (`POST /auth/logout`) signs the identity out **everywhere**: it revokes every live session of that `sub` (every device) **and** deletes every refresh-token chain for it, in one transaction — otherwise a logged-out client could silently mint a fresh session via the refresh grant. Every grant change of one subject — code redemption, refresh rotation, reuse revocation of a replayed token, `POST /revoke` of a refresh token, logout, the admin `revoke-sessions` kill switch — first takes the same per-subject transaction-scoped advisory lock (then the per-chain lock, then rows: one order everywhere, so a replayed token racing a logout cannot deadlock), so a logout or admin revoke that overlaps a refresh rotation waits for it and then revokes the rotation's new session and token too, instead of missing a pair that was not yet committed. If the state DB cannot record that, logout answers 5xx instead of a `204` that would leave bearers live. Clients may also revoke a single token out-of-band via `POST /revoke` (RFC 7009). Every `/mcp` request resolves the session through a small in-memory cache fronting the state DB: a cache hit newer than `SESSION_CACHE_TTL_SECONDS` (default 30s) is served without a DB read; an older hit re-reads and re-validates against `revoked_at`. Concurrent requests that miss the cache for the same session share one DB read. The replica that processes the revoke leaves a **tombstone** for the session (kept at least `max(SESSION_CACHE_TTL_SECONDS, 60s)`): the next call there is rejected without a DB read, and a lookup that read the row just before the revoke committed cannot re-cache it. A session found revoked, expired or missing is tombstoned the same way.
 - **Credential vs. gateway failure.** A missing, malformed, expired or revoked bearer is a `401` with `WWW-Authenticate` — the client should re-run login. A state-DB or other gateway-side failure while checking the bearer is a `5xx` with no `WWW-Authenticate`: re-login would not fix it, so a state-DB blip never signs a working user out.
 - **Garbage collection.** A background task deletes session rows that expired more than one hour ago (`sessions_expires_at_idx`). Revoked rows are kept until they expire — until then they are the denylist entry for a JWT that still verifies — so the table holds at most the live sessions plus one hour of expired ones. The session JWT allows 30 s of clock skew on `exp`, well inside that hour.
@@ -253,7 +268,11 @@ Full design and operator runbook: [14 — Service tokens](14-service-tokens.md).
 
 Group membership comes from one of:
 
-- OIDC `groups` claim (preferred — set IdP to include it)
+- OIDC groups claim (preferred — set IdP to include it). Its name is `OIDC_GROUPS_CLAIM` (default `groups`); the gateway asks for the scopes in `OIDC_SCOPES` (default `openid email profile groups`; must include `openid` — set `openid email profile` for IdPs such as Google that reject an unknown `groups` scope). Two claim shapes are read:
+  - an **array of strings** (Okta, Keycloak, Entra, most custom IdPs) — non-string entries are ignored with a warning;
+  - an **object**, whose **keys** are the group names — Zitadel's `urn:zitadel:iam:org:project:<projectId>:roles` (`{"<role>": {"<orgId>": "<domain>"}}`).
+
+  Any other shape (a string, number, boolean) gives the login **zero groups** and logs a warning naming the claim and the shape — never the value. With `OIDC_GROUPS_PREFIX` set (e.g. `dbmcp-`), only groups starting with it count, and they are matched against `permissions[].group` / `admin.group` with the prefix removed (`dbmcp-oncall` → `oncall`); a group that is just the prefix is dropped. The token endpoint is called with the client secret in the form body (`OIDC_TOKEN_AUTH_METHOD=client_secret_post`, default) or in an HTTP Basic header (`client_secret_basic`, both halves form-urlencoded first per RFC 6749 §2.3.1) for IdP apps that accept only that.
 - SCIM sync to the state DB (for IdPs that don't expose groups in tokens)
 - Directory API lookup at token-issue time (Google Workspace fallback)
 
@@ -261,7 +280,7 @@ Groups are **snapshotted at login** into the session row. Cached for the session
 gateway-side DB re-read (e.g. bypassing the 30 s session cache) still returns the same
 frozen snapshot — the session row is the source of truth, not the IdP.
 
-Group changes in the IdP take effect at the next login (session expiry or explicit revocation).
+Group changes in the IdP take effect at the next login (session expiry or explicit revocation). A refresh re-uses the login's snapshot; `GROUPS_MAX_AGE` (see the token endpoint) bounds how long that may go on.
 
 ### Admin group propagation
 
@@ -307,7 +326,7 @@ Recommended values by risk tolerance:
 
 | Failure | Behavior |
 |---|---|
-| IdP unreachable during login | Surface clearly; do not fall back to local auth |
+| IdP unreachable during login | Surface clearly; do not fall back to local auth. Everything `/auth/callback` waits on at the IdP (discovery, code exchange, JWKS) is bounded at 50 s as a whole, under the 60 s route deadline, so a slow IdP still gets the bridge's `302 … error=access_denied` back to the client instead of a bare `504` |
 | IdP unreachable mid-session | Existing valid tokens keep working (we don't introspect every request) |
 | State DB unreachable | Bearer checks that miss the session cache, logout, `/token` and `/revoke` answer 5xx (no `WWW-Authenticate`); clients retry rather than re-login |
 | IdP rotates its signing keys | An ID token naming an unknown `kid` refetches the JWKS — at most once per 60 s, and concurrent misses share one fetch — so a rotation is picked up without a restart and a bogus `kid` can't turn into a flood of IdP requests. The JWKS is otherwise cached for an hour and the discovery document for an hour. RSA keys verify `RS256`/`PS256`, P-256 keys `ES256`; a JWK that declares its `alg` verifies only that one, and `none`/HMAC are never accepted |

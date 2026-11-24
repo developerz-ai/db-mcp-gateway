@@ -13,6 +13,7 @@ use serde_json::Value;
 use super::super::adapter::{ExecError, ExecResult};
 use super::super::budget::ResultBudget;
 use super::super::query::ExecQuery;
+use super::super::rejection::DbRejection;
 use super::MongoAdapter;
 use super::bson_json::{bson_to_json, doc_to_json};
 use super::cancel;
@@ -158,6 +159,10 @@ impl MongoAdapter {
     /// Map a driver error to [`ExecError`], same semantics as the pg side:
     ///
     /// - `maxTimeMS` exhaustion (code 50, `MaxTimeMSExpired`) → `Timeout`.
+    /// - The role lacks a privilege the command needs (code 13,
+    ///   `Unauthorized`) → a `13` rejection, `permission_denied` to the
+    ///   agent. Gateway wording only: the server's message echoes the
+    ///   command, filter values included.
     /// - Rejected credentials → `Connection`, and the adapter goes stale so
     ///   the registry re-opens it with a freshly resolved password.
     /// - Connection / IO / selection failures → `Unavailable`.
@@ -166,7 +171,13 @@ impl MongoAdapter {
     /// Never renders the driver error: only its kind is logged.
     fn classify(&self, err: MongoError) -> ExecError {
         let (kind, mapped) = match err.kind.as_ref() {
-            ErrorKind::Command(cmd_err) if cmd_err.code == 50 => ("command", ExecError::Timeout),
+            ErrorKind::Command(cmd_err) if cmd_err.code == MAX_TIME_MS_EXPIRED => {
+                ("command", ExecError::Timeout)
+            }
+            ErrorKind::Command(cmd_err) if cmd_err.code == UNAUTHORIZED => (
+                "unauthorized",
+                ExecError::Rejected(DbRejection::new("13", "not authorized", "")),
+            ),
             ErrorKind::Authentication { .. } => {
                 self.stale.store(true, Ordering::Relaxed);
                 ("authentication", ExecError::Connection)
@@ -186,6 +197,11 @@ impl MongoAdapter {
         mapped
     }
 }
+
+/// Server error codes ([`mongodb::error::CommandError::code`]) with a
+/// mapping of their own.
+const MAX_TIME_MS_EXPIRED: i32 = 50;
+const UNAUTHORIZED: i32 = 13;
 
 /// Collected rows and whether the budget cut them short.
 struct Rows {

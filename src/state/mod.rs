@@ -25,7 +25,7 @@ pub enum StateDbError {
     /// — and therefore the password — in its `Display` on a malformed-URL or
     /// auth failure. NEVER render this variant's source into a log, response, or
     /// process-exit message; log its *type* and emit a generic error instead
-    /// (see `boot_db_error` in `main.rs`). CLAUDE.md non-negotiable #1.
+    /// (see `boot_db_error` in `startup/boot.rs`). CLAUDE.md non-negotiable #1.
     #[error("failed to connect to state DB")]
     Connect(#[source] sqlx::Error),
     #[error("failed to run state DB migrations")]
@@ -45,6 +45,9 @@ const BACKGROUND_SESSION_SQL: &str =
 /// Background work (pruner, GC, reaper) is sequential and low-rate; two
 /// connections keep it off the request pool without competing with it.
 const BACKGROUND_POOL_SIZE: u32 = 2;
+/// The permissions listener pins one connection for `LISTEN` and briefly
+/// takes a second for its liveness ping.
+const LISTENER_POOL_SIZE: u32 = 2;
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connect the **request** pool to the state DB and run pending migrations.
@@ -65,6 +68,15 @@ pub async fn connect(url: &str, pool_size: NonZeroU32) -> Result<PgPool, StateDb
 /// Call after [`connect`]: it does not migrate.
 pub async fn connect_background(url: &str) -> Result<PgPool, StateDbError> {
     open_pg(url, BACKGROUND_POOL_SIZE, BACKGROUND_SESSION_SQL).await
+}
+
+/// Connect the **listener** pool: the permissions `LISTEN` connection and its
+/// liveness ping. Its own pool because the listener holds its connection for
+/// the life of the process — taken from the request pool, it deadlocked every
+/// request at `STATE_DB_POOL_SIZE=1`. Call after [`connect`]: it does not
+/// migrate.
+pub async fn connect_listener(url: &str) -> Result<PgPool, StateDbError> {
+    open_pg(url, LISTENER_POOL_SIZE, BACKGROUND_SESSION_SQL).await
 }
 
 /// The timeouts are `SET` per connection in `after_connect`, not sent as the

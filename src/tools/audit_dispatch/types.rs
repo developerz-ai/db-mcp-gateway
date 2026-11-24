@@ -2,6 +2,7 @@
 
 use std::net::IpAddr;
 
+use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -52,6 +53,23 @@ pub struct WriteEffect {
     /// Rows the statement changed (rolled back again under `dry_run`).
     /// `None` when the statement never completed.
     pub rows_affected: Option<i64>,
+    pub state: WriteState,
+}
+
+/// Whether a write-access call's change is in the target: the `write` field
+/// of its error body (spec 03 §Errors), so an agent knows whether a retry
+/// would write twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteState {
+    /// Nothing committed: refused, failed before commit, rolled back, or
+    /// never a change (`dry_run`, plain `EXPLAIN`).
+    NotApplied,
+    /// Cut off where the commit may have landed (timeout, cancel, lost
+    /// commit reply, panic).
+    Unknown,
+    /// The commit succeeded.
+    Applied,
 }
 
 /// Audit context known up-front from the tool's arguments — before any work

@@ -10,8 +10,8 @@ use crate::audit::stream::StreamSinks;
 use crate::audit::{self, AuditRow, OutcomeCode};
 use crate::exec::Access;
 
-use super::Outcome;
 use super::metric_names::{ACCESS_UNKNOWN, AUDIT_FALLBACK_FAILURES, TOOL_CALLS};
+use super::{Outcome, WriteState};
 
 const DISCONNECTED: &str = "client disconnected before completion";
 
@@ -90,13 +90,18 @@ impl CancelledAuditGuard {
 
     /// The primary write failed, so the client is told `audit_unavailable`.
     /// The fallback row records that — the code the client saw — and keeps
-    /// the tool's own outcome in `error_message`.
-    pub(super) fn record_audit_failure(&mut self) {
+    /// the tool's own outcome in `error_message`, flagged when a write may
+    /// be in the target (a timed-out write's message already is).
+    pub(super) fn record_audit_failure(&mut self, write: Option<WriteState>) {
         let row = &mut self.row;
-        let tool_outcome = match row.error_message.take() {
+        let mut tool_outcome = match row.error_message.take() {
             Some(message) => format!("tool outcome {}: {message}", row.outcome),
             None => format!("tool outcome {}", row.outcome),
         };
+        let may_have_written = matches!(write, Some(WriteState::Applied | WriteState::Unknown));
+        if may_have_written && !tool_outcome.contains(WRITE_MAY_HAVE_COMMITTED) {
+            tool_outcome.push_str(&format!(" ({WRITE_MAY_HAVE_COMMITTED})"));
+        }
         row.outcome = OutcomeCode::AuditUnavailable;
         row.error_message = Some(tool_outcome);
     }
@@ -156,12 +161,21 @@ async fn note_write_access(pool: &PgPool, row: &mut AuditRow) {
 
 /// `message`, flagged as possibly committed when the intent of `request_id`
 /// recorded write access — for work that ended without saying how far it
-/// got. A failed lookup returns `message` unflagged; the row is still
-/// written.
-pub(super) async fn flag_if_write(pool: &PgPool, request_id: &str, message: &str) -> String {
+/// got.
+async fn flag_if_write(pool: &PgPool, request_id: &str, message: &str) -> String {
+    if intent_wrote(pool, request_id).await {
+        format!("{message} ({WRITE_MAY_HAVE_COMMITTED})")
+    } else {
+        message.to_string()
+    }
+}
+
+/// Whether the intent of `request_id` recorded write access. A failed
+/// lookup answers `false`; the row is still written, without the access.
+pub(super) async fn intent_wrote(pool: &PgPool, request_id: &str) -> bool {
     match audit::intent::access_of(pool, request_id).await {
-        Ok(Some(Access::ReadWrite)) => format!("{message} ({WRITE_MAY_HAVE_COMMITTED})"),
-        Ok(Some(Access::ReadOnly) | None) => message.to_string(),
+        Ok(Some(Access::ReadWrite)) => true,
+        Ok(Some(Access::ReadOnly) | None) => false,
         Err(err) => {
             tracing::warn!(
                 %err,
@@ -169,7 +183,7 @@ pub(super) async fn flag_if_write(pool: &PgPool, request_id: &str, message: &str
                 request_id,
                 "intent access lookup failed; row carries no access"
             );
-            message.to_string()
+            false
         }
     }
 }

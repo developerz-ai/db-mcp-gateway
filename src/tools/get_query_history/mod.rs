@@ -21,6 +21,8 @@
 
 mod args;
 
+use std::time::Instant;
+
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
@@ -32,10 +34,10 @@ use crate::config::{Action, ConfigFile, Grant};
 use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
-use super::args::parse_arguments;
+use super::args::{LIMIT_AT_LEAST_ONE, parse_arguments};
 use super::audit_dispatch::{
-    AuditHeader, Outcome, OutcomeCode, audit_outcome, error_outcome, invalid_arguments,
-    reject_arguments, run_audited, success_outcome,
+    AuditHeader, Outcome, OutcomeCode, audit_outcome, elapsed_ms_since, error_outcome,
+    invalid_arguments, reject_arguments, run_audited, success_outcome,
 };
 use super::target::{ensure_reason, forbidden};
 pub use args::Arguments;
@@ -102,7 +104,7 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
     // error. Validated once, at the edge, like `since`, and audited the same
     // way so a `limit: 0` sweep leaves a trail.
     if args.limit == Some(0) {
-        let outcome = invalid_arguments(id.clone(), "`limit` must be at least 1");
+        let outcome = invalid_arguments(id.clone(), LIMIT_AT_LEAST_ONE);
         return audit_outcome(ctx, id, header, outcome).await;
     }
     let before = match args.cursor.as_deref().map(HistoryCursor::parse).transpose() {
@@ -165,6 +167,7 @@ async fn compute_outcome(
     args: &Arguments,
     window: Window,
 ) -> Outcome {
+    let started = Instant::now();
     if let Err(rejected) = authorize(ctx.identity, ctx.config, db_grants, args) {
         return *rejected;
     }
@@ -199,7 +202,8 @@ async fn compute_outcome(
         Ok(t) => t,
         Err(_) => return error_outcome(OutcomeCode::Internal, "failed to serialize result"),
     };
-    success_outcome(id, text, None, None, Some(truncated))
+    let elapsed = Some(elapsed_ms_since(started));
+    success_outcome(id, text, elapsed, None, Some(truncated))
 }
 
 #[cfg(test)]

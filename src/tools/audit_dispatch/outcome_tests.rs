@@ -5,7 +5,13 @@ use super::*;
 #[test]
 fn tool_error_payload_shape() {
     let request_id = Uuid::new_v4();
-    let response = tool_error(Value::from(7), request_id, OutcomeCode::Forbidden, "nope");
+    let response = tool_error(
+        Value::from(7),
+        request_id,
+        OutcomeCode::Forbidden,
+        "nope",
+        None,
+    );
     let value = serde_json::to_value(&response).unwrap();
     // The client's JSON-RPC id stays in the envelope only…
     assert_eq!(value["id"], 7);
@@ -16,6 +22,33 @@ fn tool_error_payload_shape() {
     assert_eq!(body["message"], "nope");
     // …the body carries the gateway id that keys the audit row.
     assert_eq!(body["request_id"], request_id.to_string());
+    // A read's body has no `write` field: it is added only for writes.
+    assert!(body.get("write").is_none(), "{body}");
+}
+
+/// A write-access call's error body says whether the change is in the
+/// target, next to the unchanged `request_id` / `code` / `message`.
+#[test]
+fn tool_error_of_a_write_carries_its_state() {
+    for (state, wire) in [
+        (WriteState::NotApplied, "not_applied"),
+        (WriteState::Unknown, "unknown"),
+        (WriteState::Applied, "applied"),
+    ] {
+        let response = tool_error(
+            Value::from(1),
+            Uuid::new_v4(),
+            OutcomeCode::AuditUnavailable,
+            "m",
+            Some(state),
+        );
+        let value = serde_json::to_value(&response).unwrap();
+        let text = value["result"]["content"][0]["text"].as_str().unwrap();
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["write"], wire);
+        assert_eq!(body["code"], "audit_unavailable");
+        assert_eq!(body["message"], "m");
+    }
 }
 
 #[test]
@@ -132,4 +165,31 @@ fn not_implemented_maps_to_unsupported_backend() {
         &messages,
     );
     assert_eq!(outcome.code, OutcomeCode::UnsupportedBackend);
+}
+
+#[test]
+fn a_write_is_applied_only_when_it_committed() {
+    let committed = Ok(ExecResult {
+        columns: vec![],
+        rows: vec![],
+        truncated: false,
+        elapsed_ms: 1,
+        rows_affected: Some(1),
+    });
+    assert_eq!(write_state(&committed, false), WriteState::Applied);
+    assert_eq!(write_state(&committed, true), WriteState::NotApplied);
+    for err in [
+        ExecError::Timeout,
+        ExecError::Cancelled,
+        ExecError::CommitIndeterminate,
+    ] {
+        assert_eq!(write_state(&Err(err), false), WriteState::Unknown);
+    }
+    assert_eq!(
+        write_state(&Err(ExecError::CommitIndeterminate), true),
+        WriteState::NotApplied
+    );
+    for err in [ExecError::Sql, ExecError::Connection, ExecError::Decode] {
+        assert_eq!(write_state(&Err(err), false), WriteState::NotApplied);
+    }
 }
