@@ -37,9 +37,19 @@ fn answer_once(listener: TcpListener) -> mpsc::Receiver<bool> {
 
 #[test]
 fn a_loopback_http_gateway_bypasses_the_environment_proxy() {
+    assert_proxy_bypassed("http");
+}
+
+/// URL schemes are case-insensitive: `HTTP://` parses as plain `http`.
+#[test]
+fn an_uppercase_http_scheme_bypasses_the_environment_proxy() {
+    assert_proxy_bypassed("HTTP");
+}
+
+fn assert_proxy_bypassed(scheme: &str) {
     let gw = TcpListener::bind("127.0.0.1:0").expect("gateway listener");
     let proxy = TcpListener::bind("127.0.0.1:0").expect("proxy listener");
-    let gw_url = format!("http://127.0.0.1:{}", gw.local_addr().unwrap().port());
+    let gw_url = format!("{scheme}://127.0.0.1:{}", gw.local_addr().unwrap().port());
     let proxy_url = format!("http://127.0.0.1:{}", proxy.local_addr().unwrap().port());
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -66,10 +76,10 @@ fn a_loopback_http_gateway_bypasses_the_environment_proxy() {
 
     assert!(
         gw_hit.recv().expect("gateway result"),
-        "the CLI never reached the loopback gateway"
+        "the CLI never reached the loopback gateway at {gw_url}"
     );
     assert!(
         !proxy_hit.recv().expect("proxy result"),
-        "the admin request went through the environment proxy"
+        "the admin request to {gw_url} went through the environment proxy"
     );
 }

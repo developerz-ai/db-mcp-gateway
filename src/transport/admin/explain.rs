@@ -4,10 +4,11 @@
 //! ([`authz::matching_grants`] + [`authz::decide`]), so the answer is the
 //! decision a real call would get — for the groups it assumed. It never
 //! reads a live session, so `groups_source` says where the groups came from:
-//! `stored` (the user's last-login snapshot), `none` (no snapshot: the user
-//! has no `permissions_users` row, so no groups) and `assumed` (from the
-//! body) are simulations, which a session holding other claims can
-//! contradict.
+//! `stored` (the groups on the user's `permissions_users` row, as the users
+//! API or an admin's first audited write last set them — not necessarily
+//! the user's current SSO claims), `none` (no `permissions_users` row, so no
+//! groups) and `assumed` (from the body) are simulations, which a session
+//! holding other claims can contradict.
 //! Read-only; audited as `admin.explain`.
 
 use axum::Json;

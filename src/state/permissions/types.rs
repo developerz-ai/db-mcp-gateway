@@ -118,9 +118,9 @@ pub struct PermissionsUser {
     pub id: Uuid,
     pub user_sub: String,
     pub user_email: String,
-    /// Group snapshot cached from the last login. JWT is the live source of
-    /// truth; this is here so the admin API can list users without minting
-    /// tokens for them.
+    /// Groups as the users API (or an admin's first audited write, from its
+    /// session) last stored them. The JWT is the live source of truth; this
+    /// is here so the admin API can list users without minting tokens.
     pub groups: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

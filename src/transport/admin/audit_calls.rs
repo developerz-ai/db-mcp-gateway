@@ -6,11 +6,12 @@
 //! The statement text and its bound `params` stay out unless the caller asks
 //! with `include_sql=true`. The read is audited (`admin.audit_calls`, the
 //! filters and `include_sql` in its `params`) before the first byte streams.
-//! Rows are read in keyset batches bounded by rows and by bytes, and no
-//! state-DB connection is held while a batch waits for the reader, so a
-//! stalled client pins nothing the audit write path needs and holds at most a
-//! few [`BATCH_BYTES`] of encoded lines however large `include_sql` rows are. A failure after streaming started ends the body
-//! with one `{"error": …}` line instead of a row.
+//! Keyset batches are bounded by rows and bytes in the query itself, so
+//! Postgres sends only rows a batch emits, and no state-DB connection is held
+//! while a batch waits for the reader: a stalled client pins nothing the audit
+//! write path needs and holds about a few [`BATCH_BYTES`] of lines however
+//! large `include_sql` rows are. A failure after streaming started ends the
+//! body with one `{"error": …}` line instead of a row.
 
 use axum::body::Body;
 use axum::extract::rejection::QueryRejection;
@@ -37,30 +38,23 @@ pub const DEFAULT_LIMIT: u32 = 1_000;
 pub const MAX_LIMIT: u32 = 10_000;
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct AuditCallsQuery {
     /// Matches `user_sub` or `user_email`.
-    #[serde(default)]
     pub user: Option<String>,
-    #[serde(default)]
     pub server: Option<String>,
-    #[serde(default)]
     pub db: Option<String>,
-    #[serde(default)]
     pub tool: Option<String>,
-    #[serde(default)]
     pub outcome: Option<String>,
-    #[serde(default)]
     pub since: Option<DateTime<Utc>>,
-    #[serde(default)]
     pub until: Option<DateTime<Utc>>,
-    #[serde(default)]
     pub limit: Option<u32>,
-    #[serde(default)]
     pub include_sql: bool,
 }
 
-const SELECT: &str = "SELECT id, request_id, occurred_at, user_sub, user_email, groups, tool, \
+/// The keyset `page`, kept up to and including the row whose JSON width
+/// crosses `$12` bytes (the first row always); `page_rows` says if it was cut.
+const SELECT: &str = "WITH page AS (SELECT id, request_id, occurred_at, user_sub, user_email, groups, tool, \
         server_name, database_name, \
         CASE WHEN $9::bool THEN sql END AS sql, \
         CASE WHEN $9::bool THEN sql_truncated END AS sql_truncated, \
@@ -76,7 +70,11 @@ const SELECT: &str = "SELECT id, request_id, occurred_at, user_sub, user_email, 
        AND ($6::timestamptz IS NULL OR occurred_at >= $6) \
        AND ($7::timestamptz IS NULL OR occurred_at < $7) \
        AND ($10::timestamptz IS NULL OR (occurred_at, id) < ($10, $11)) \
-     ORDER BY occurred_at DESC, id DESC LIMIT $8";
+     ORDER BY occurred_at DESC, id DESC LIMIT $8), \
+     framed AS (SELECT page.*, count(*) OVER () AS page_rows, \
+        coalesce(sum(octet_length(row_to_json(page)::text)) OVER (ORDER BY occurred_at DESC, id DESC \
+          ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS before FROM page) \
+     SELECT * FROM framed WHERE before < $12 ORDER BY occurred_at DESC, id DESC";
 
 /// Batches buffered between the query task and the response body.
 const BATCH_BUFFER: usize = 2;
@@ -84,9 +82,10 @@ const BATCH_BUFFER: usize = 2;
 /// Rows one query reads before its connection goes back to the pool.
 const BATCH_ROWS: i64 = 200;
 
-/// Encoded bytes a batch stops at: with `include_sql`, 200 rows of 64 KiB
-/// statements and params would otherwise be ~25 MiB per export.
-const BATCH_BYTES: usize = 1 << 20;
+/// Row bytes (as Postgres renders the row in JSON) a batch stops at: with
+/// `include_sql`, 200 rows of 64 KiB statements and params would otherwise be
+/// ~25 MiB per export.
+const BATCH_BYTES: i64 = 1 << 20;
 
 pub async fn stream(
     State(state): State<ReadState>,
@@ -168,9 +167,8 @@ async fn produce(
                 return;
             }
         };
-        let rows = i64::try_from(batch.rows).unwrap_or(i64::MAX);
-        let more = batch.full || rows == asked;
-        remaining -= rows;
+        let more = batch.more(asked);
+        remaining -= batch.rows;
         if !batch.text.is_empty() && tx.send(batch.text).await.is_err() {
             return;
         }
@@ -185,27 +183,30 @@ async fn produce(
 struct Batch {
     /// One NDJSON line per row.
     text: String,
-    rows: usize,
+    rows: i64,
+    /// Rows the keyset page held before [`BATCH_BYTES`] cut it.
+    page_rows: i64,
     /// Keyset position of the batch's last row.
     last: Option<(DateTime<Utc>, uuid::Uuid)>,
-    /// Stopped at [`BATCH_BYTES`], before the query ran out of rows.
-    full: bool,
 }
 
 impl Batch {
-    /// Append one row's line; `true` once the batch holds [`BATCH_BYTES`].
-    fn push(&mut self, line: &JsonValue, at: (DateTime<Utc>, uuid::Uuid)) -> bool {
+    fn push(&mut self, line: &JsonValue, at: (DateTime<Utc>, uuid::Uuid)) {
         self.text.push_str(&line.to_string());
         self.text.push('\n');
         self.rows += 1;
         self.last = Some(at);
-        self.full = self.text.len() >= BATCH_BYTES;
-        self.full
+    }
+
+    /// Rows may follow: the byte bound cut the page, or the page was full.
+    fn more(&self, asked: i64) -> bool {
+        self.rows < self.page_rows || self.page_rows == asked
     }
 }
 
-/// One page, read until `limit` rows or [`BATCH_BYTES`]: its connection is
-/// back in the pool before any line is sent.
+/// One page of at most `limit` rows and about [`BATCH_BYTES`], read to the
+/// end — the next batch's keyset starts after its last row — with its
+/// connection back in the pool before any line is sent.
 async fn fetch_batch(
     pool: &sqlx::PgPool,
     q: &AuditCallsQuery,
@@ -224,17 +225,16 @@ async fn fetch_batch(
         .bind(q.include_sql)
         .bind(after.map(|(at, _)| at))
         .bind(after.map(|(_, id)| id))
+        .bind(BATCH_BYTES)
         .fetch(pool);
     let mut batch = Batch::default();
-    // Rows past the byte bound are left to the next batch's keyset.
     while let Some(row) = rows.try_next().await.map_err(|_| ())? {
         let at = (
             row.try_get("occurred_at").map_err(|_| ())?,
             row.try_get("id").map_err(|_| ())?,
         );
-        if batch.push(&row_json(&row).map_err(|_| ())?, at) {
-            break;
-        }
+        batch.page_rows = row.try_get("page_rows").map_err(|_| ())?;
+        batch.push(&row_json(&row).map_err(|_| ())?, at);
     }
     Ok(batch)
 }

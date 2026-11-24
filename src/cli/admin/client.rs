@@ -109,16 +109,14 @@ pub fn origin(url: &str) -> String {
 /// `None` → the default request timeout; streaming reads pass their own.
 /// A plain-`http` gateway (loopback only, see [`gateway_url`]) is reached
 /// directly: an `HTTP_PROXY` in the environment would otherwise carry the
-/// bearer off the host in plaintext.
+/// bearer off the host in plaintext. The scheme is read from the parsed URL —
+/// `HTTP://` is plain `http` too — and only `https` may use a proxy.
 pub fn http_client(timeout: Option<Duration>, gateway: &str) -> Result<reqwest::Client, CliError> {
     let builder = reqwest::Client::builder()
         .timeout(timeout.unwrap_or(REQUEST_TIMEOUT))
         .redirect(reqwest::redirect::Policy::none());
-    let builder = if gateway.starts_with("http://") {
-        builder.no_proxy()
-    } else {
-        builder
-    };
+    let tls = Url::parse(gateway).is_ok_and(|url| url.scheme() == "https");
+    let builder = if tls { builder } else { builder.no_proxy() };
     builder
         .build()
         .map_err(|err| CliError::unreachable("the HTTP client", &err))

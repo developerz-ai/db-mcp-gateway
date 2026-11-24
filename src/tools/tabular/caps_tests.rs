@@ -148,6 +148,25 @@ fn rows_past_the_byte_cap_are_never_shaped() {
     assert!(json_len(&kept) <= 4096);
 }
 
+/// Fitting stops at the first row that does not fit: that row is shaped to
+/// be measured, every later one is never touched.
+#[test]
+fn fitting_never_visits_rows_after_the_first_rejected_one() {
+    let wide = || (0..50).map(|_| json!("x".repeat(64))).collect::<Vec<_>>();
+    let mut rows: Vec<_> = (0..1000).map(|_| wide()).collect();
+    let (keep, replaced) = fit_rows(&mut rows, cap(1), 4096);
+    assert!(keep > 0 && keep < 999, "{keep} rows kept");
+    assert_eq!(replaced, keep * 50);
+    assert!(
+        rows[keep][0].get(CELL_MARKER).is_some(),
+        "the rejected row was measured"
+    );
+    assert!(
+        rows[keep + 1..].iter().all(|row| *row == wide()),
+        "a row past the rejected one was shaped"
+    );
+}
+
 /// Three rows of 12 MiB each: 36 MiB of JSON, past the 32 MiB ceiling.
 fn oversized_rows() -> Vec<Vec<Value>> {
     let cell = "x".repeat(12 * 1024 * 1024);

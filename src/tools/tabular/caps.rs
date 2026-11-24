@@ -109,7 +109,9 @@ pub(in crate::tools) fn shape(
             usize::try_from(cap.0).unwrap_or(usize::MAX)
         })
         .min(MAX_RESULT_BYTES);
-    let (cells_truncated, byte_capped) = shape_rows(&mut rows, caps.max_cell_bytes, byte_cap);
+    let (keep, cells_truncated) = fit_rows(&mut rows, caps.max_cell_bytes, byte_cap);
+    let byte_capped = keep < rows.len();
+    rows.truncate(keep);
     // Rows run out at the row limit only when every row was kept; otherwise
     // a byte budget cut first (the gateway's when the adapter stopped short).
     let truncated_by = match (byte_capped, exec_truncated) {
@@ -154,13 +156,8 @@ fn hint(by: TruncatedBy, kind: ServerKind) -> String {
 /// JSON array still fits in `cap` bytes. Stops at the first row that does
 /// not fit, so no row past the cut is ever shaped — a wide result with a
 /// tiny `max_cell_bytes` builds markers for the rows it returns, not for all
-/// of them. The cells replaced in the kept rows, and `true` when a row was
-/// dropped.
-fn shape_rows(
-    rows: &mut Vec<Vec<Value>>,
-    cell_cap: Option<NonZeroU32>,
-    cap: usize,
-) -> (usize, bool) {
+/// of them. How many leading rows fit, and the cells replaced in them.
+fn fit_rows(rows: &mut [Vec<Value>], cell_cap: Option<NonZeroU32>, cap: usize) -> (usize, usize) {
     // `[` and `]`, then each row plus its separating comma.
     let mut used: usize = 2;
     let mut replaced = 0;
@@ -174,9 +171,7 @@ fn shape_rows(
         }
         replaced += row_replaced;
     }
-    let dropped = keep < rows.len();
-    rows.truncate(keep);
-    (replaced, dropped)
+    (keep, replaced)
 }
 
 /// Replace every cell of `row` whose JSON is longer than `cap` bytes with

@@ -46,7 +46,7 @@ printf 'a: 1\ntoken: %s\nb: 2\nagain: %s\n' "$token_a" "$token_b" > "$repo/confi
 git -C "$repo" add config/leak.yaml
 expect_rc 1
 grep -qxF 'config/leak.yaml:2,4' "$work/output" || fail "content hit not located: $(<"$work/output")"
-git -C "$repo" rm -q --cached config/leak.yaml
+git -C "$repo" rm -qf config/leak.yaml
 
 # A tracked file NAME holding two different tokens: both masked.
 : > "$repo/config/${token_a}_and_${token_b}.yaml"
@@ -54,7 +54,7 @@ git -C "$repo" add config
 expect_rc 1
 grep -qxF 'config/dbmcp_svc_<redacted>_and_dbmcp_svc_<redacted>.yaml' "$work/output" \
   || fail "file-name hit not masked: $(<"$work/output")"
-git -C "$repo" rm -q --cached "config/${token_a}_and_${token_b}.yaml"
+git -C "$repo" rm -qf "config/${token_a}_and_${token_b}.yaml"
 
 # A SYMLINK TARGET: git grep never reads it, the index blob does.
 ln -s "/run/secrets/$token_b" "$repo/config/link"
@@ -75,5 +75,34 @@ STUB
   expect_rc 2 "$work/badgit:"
   grep -qF 'secret scan could not run' "$work/output" || fail "$broken failure not reported: $(<"$work/output")"
 done
+
+# A broken or missing grep fails closed, even where nothing matched: exit 1
+# ("no match") is the only clean grep result. The symlink target staged here
+# holds a token, so a grep failure read as clean would let it through.
+mkdir -p "$work/badgrep"
+for rc in 2 127; do
+  printf '#!/usr/bin/env bash\nexit %s\n' "$rc" > "$work/badgrep/grep"
+  chmod +x "$work/badgrep/grep"
+  expect_rc 2 "$work/badgrep:"
+  grep -qF 'secret scan could not run' "$work/output" || fail "grep exit $rc not reported: $(<"$work/output")"
+done
+git -C "$repo" rm -qf config/link
+expect_rc 0
+
+# An index whose path list alone exceeds the OS argument limit: the scan
+# never puts the whole list on one command line. Index-only entries (no
+# files on disk) keep this fast.
+arg_max=$(getconf ARG_MAX)
+empty=$(git -C "$repo" hash-object -w --stdin < /dev/null)
+leak=$(printf 'token: %s\n' "$token_a" | git -C "$repo" hash-object -w --stdin)
+long=$(printf 'p%.0s' {1..200})
+count=$(( arg_max / 200 + 1000 ))
+for (( i = 0; i < count; i++ )); do
+  printf '100644 %s\tbulk/%06d-%s\n' "$empty" "$i" "$long"
+done | git -C "$repo" update-index --index-info
+expect_rc 0
+printf '100644 %s\tzz/leak.yaml\n' "$leak" | git -C "$repo" update-index --index-info
+expect_rc 1
+grep -qxF 'zz/leak.yaml:1' "$work/output" || fail "token in the last batch not found: $(<"$work/output")"
 
 echo 'ok: bin/secret-scan'

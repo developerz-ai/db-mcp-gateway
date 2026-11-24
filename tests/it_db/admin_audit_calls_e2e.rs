@@ -2,11 +2,15 @@
 //! opt-in, the limit, and the `admin.audit_calls` row the read itself writes.
 
 use db_mcp_gateway::audit::{self, AuditRow, OutcomeCode};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use reqwest::StatusCode;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
 
 use crate::admin_o10_support::{O10, unique};
@@ -182,6 +186,104 @@ async fn a_stalled_export_does_not_hold_the_state_connection() {
 
     let all = stalled.text().await.expect("stalled body completes");
     assert_eq!(all.lines().count(), 300);
+    delete_audit_calls(&seed_pool, &caller).await;
+    h.cleanup().await;
+}
+
+/// A TCP relay in front of the state DB that counts the bytes Postgres sends.
+async fn counting_relay() -> (String, Arc<AtomicU64>) {
+    let mut url = url::Url::parse(&state_db_url()).expect("state DB URL");
+    let upstream = format!(
+        "{}:{}",
+        url.host_str().expect("host"),
+        url.port().unwrap_or(5432)
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("relay");
+    let port = listener.local_addr().expect("relay addr").port();
+    let from_db = Arc::new(AtomicU64::new(0));
+    let counter = from_db.clone();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let server = TcpStream::connect(&upstream).await.expect("state DB");
+            let (mut client_rx, mut client_tx) = client.into_split();
+            let (mut server_rx, mut server_tx) = server.into_split();
+            tokio::spawn(async move { tokio::io::copy(&mut client_rx, &mut server_tx).await });
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                while let Ok(n @ 1..) = server_rx.read(&mut buf).await {
+                    counter.fetch_add(n as u64, Ordering::Relaxed);
+                    if client_tx.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    url.set_host(Some("127.0.0.1")).expect("host");
+    url.set_port(Some(port)).expect("port");
+    (url.to_string(), from_db)
+}
+
+/// Wide rows span many byte-bounded pages: every row arrives exactly once,
+/// newest first, and Postgres sends about what the body carries — a page is
+/// bounded in the query itself, not cut short after the rows already came.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn wide_rows_page_by_bytes_without_refetching() {
+    let seed_pool = state_pool().await;
+    let caller = unique("o10-wide");
+    let mut wide = row(&caller, "run_query", OutcomeCode::Success);
+    for i in 0..240 {
+        wide.id = Uuid::new_v4();
+        wide.request_id = unique("req");
+        wide.sql = Some(format!("SELECT '{}'", "x".repeat(20_000 + (i % 7) * 6_000)));
+        audit::log(&seed_pool, &wide).await.expect("seed");
+    }
+    let expected: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM audit_calls WHERE user_sub = $1 ORDER BY occurred_at DESC, id DESC",
+    )
+    .bind(&caller)
+    .fetch_all(&seed_pool)
+    .await
+    .expect("seeded ids");
+
+    let (relay_url, from_db) = counting_relay().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&relay_url)
+        .await
+        .expect("state DB through the relay");
+    let h = O10::spawn_with(pool).await;
+    let before = from_db.load(Ordering::Relaxed);
+    let body = h
+        .http()
+        .get(format!(
+            "{}/admin/v1/audit/calls?user={caller}&include_sql=true",
+            h.url
+        ))
+        .bearer_auth(&h.admin)
+        .send()
+        .await
+        .expect("get")
+        .text()
+        .await
+        .expect("body");
+    let sent = from_db.load(Ordering::Relaxed) - before;
+
+    let ids: Vec<Uuid> = body
+        .lines()
+        .map(|l| {
+            let line: Value = serde_json::from_str(l).expect("each line is JSON");
+            line["id"].as_str().expect("id").parse().expect("uuid")
+        })
+        .collect();
+    assert_eq!(ids, expected, "every row exactly once, newest first");
+    let body_len = body.len() as u64;
+    assert!(
+        sent < body_len + body_len / 2,
+        "Postgres sent {sent} bytes for a {body_len}-byte body"
+    );
     delete_audit_calls(&seed_pool, &caller).await;
     h.cleanup().await;
 }

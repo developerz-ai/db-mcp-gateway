@@ -1801,7 +1801,7 @@
               "assumed",
               "group"
             ],
-            "description": "Where `groups` came from: `stored` (the user's last-login snapshot), `none` (no snapshot: the user has no `permissions_users` row, so no groups) or `assumed` (the request body) make the answer a simulation, which a live session holding other claims can contradict; `group` for a group question."
+            "description": "Where `groups` came from: `stored` (the groups on the user's `permissions_users` row, as the users API or an admin's first audited write last set them — not necessarily the user's current SSO claims), `none` (the user has no `permissions_users` row, so no groups) or `assumed` (the request body) make the answer a simulation, which a live session holding other claims can contradict; `group` for a group question."
           },
           "server": {
             "type": "string"
