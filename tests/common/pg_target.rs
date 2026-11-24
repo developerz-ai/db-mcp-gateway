@@ -148,6 +148,13 @@ pub async fn ensure_read_role() {
             // tables other tests create and drop meanwhile ("tuple
             // concurrently deleted"); the advisory lock cannot cover those.
             // Such a catalog race is retried, anything else fails the test.
+            // nextest runs each test in its own process, so this "once" is
+            // once per test: provisioning that is already in place must not
+            // touch the catalog again, or every test's GRANT races every
+            // other test's fixture DDL ("tuple concurrently updated").
+            if read_role_provisioned(&owner).await {
+                return;
+            }
             let mut attempt = 0;
             while let Err(err) = provision_read_role(&owner).await {
                 attempt += 1;
@@ -158,6 +165,29 @@ pub async fn ensure_read_role() {
             }
         })
         .await;
+}
+
+/// Read-only: the role exists, can connect and use `public`, and the owner's
+/// default privileges already grant it `SELECT` on every table the owner
+/// creates — so nothing is left for [`provision_read_role`] to write.
+async fn read_role_provisioned(owner: &sqlx::PgPool) -> bool {
+    let sql = format!(
+        "SELECT EXISTS (SELECT FROM pg_roles WHERE rolname = '{READ_ROLE}') \
+           AND has_database_privilege('{READ_ROLE}', '{TARGET_DB}', 'CONNECT') \
+           AND has_schema_privilege('{READ_ROLE}', 'public', 'USAGE') \
+           AND EXISTS (SELECT FROM pg_default_acl d \
+             JOIN pg_namespace n ON n.oid = d.defaclnamespace \
+             JOIN pg_roles o ON o.oid = d.defaclrole \
+             WHERE n.nspname = 'public' AND o.rolname = '{TARGET_USER}' \
+               AND d.defaclobjtype = 'r' \
+               AND array_to_string(d.defaclacl, ',') LIKE '%{READ_ROLE}=r/%')"
+    );
+    // A role that does not exist yet makes has_*_privilege raise: that, like
+    // any other failure here, means "provision".
+    sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(sql))
+        .fetch_one(owner)
+        .await
+        .unwrap_or(false)
 }
 
 async fn provision_read_role(owner: &sqlx::PgPool) -> Result<(), sqlx::Error> {

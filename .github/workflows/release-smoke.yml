@@ -102,7 +102,7 @@ jobs:
     steps:
       - name: log in to docr
         if: matrix.registry == 'docr' && env.SMOKE == 'true'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: registry.digitalocean.com
           username: ${{ secrets.DOCR_TOKEN }}
@@ -172,8 +172,10 @@ jobs:
                 - { server: smoke, database: gateway, action: query_read }
           YAML
           chmod 644 "$config"
+          # A random per-run key: the dev-only ALLOW_INSECURE_SIGNING_KEY is
+          # refused off loopback, and the container binds 0.0.0.0.
           docker run -d --name gateway --network smoke -p 127.0.0.1:8443:8443 \
-            -e TLS_DISABLED=true -e ALLOW_INSECURE_SIGNING_KEY=true \
+            -e TLS_DISABLED=true -e "SESSION_SIGNING_KEY=$(openssl rand -hex 32)" \
             -e OIDC_ISSUER=http://localhost:5556 -e OIDC_CLIENT_ID=smoke \
             -e STATE_DB_URL=postgres://gateway:smoke-only@state:5432/gateway \
             -e TARGET_DB_PASSWORD=smoke-only \
