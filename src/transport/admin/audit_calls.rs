@@ -62,10 +62,11 @@ const BATCH_BUFFER: usize = 2;
 /// Rows one query reads before its connection goes back to the pool.
 const BATCH_ROWS: i64 = 200;
 
-/// The smallest candidate window: after a batch the byte bound cut short,
-/// the next query reads twice what fit (at least this many) instead of the
-/// full [`BATCH_ROWS`], so a wide export does not make the state DB size
-/// rows it will only hold back.
+/// The first query's candidate window, and the smallest: each later query
+/// reads twice what the previous batch sent (up to [`BATCH_ROWS`]), so the
+/// state DB never sizes many more rows than it returns — a narrow export
+/// reaches full batches within a few queries, a wide one never renders
+/// more than about twice what it sends.
 const MIN_WINDOW: i64 = 16;
 
 /// Line bytes (bounded per row by [`SELECT`]'s `width`) a batch stops at: with
@@ -142,7 +143,7 @@ async fn produce(
 ) {
     let mut remaining = i64::from(q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT));
     let mut after: Option<(DateTime<Utc>, uuid::Uuid)> = None;
-    let mut window = BATCH_ROWS;
+    let mut window = MIN_WINDOW;
     while remaining > 0 {
         let asked = remaining.min(window);
         let batch = match fetch_batch(&pool, &q, after, asked).await {
