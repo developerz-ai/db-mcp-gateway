@@ -117,7 +117,10 @@ async fn every_row_carries_its_digest_and_the_lookup_seeks_it() {
     // filter costs the same); what must hold is an index seek, never a scan
     // of the caller's whole history, and that the digest index exists.
     assert!(
-        plan.contains("Index Scan") && !plan.contains("Seq Scan"),
+        ["Index Scan", "Index Only Scan", "Bitmap Index Scan"]
+            .iter()
+            .any(|scan| plan.contains(scan))
+            && !plan.contains("Seq Scan"),
         "{plan}"
     );
     let indexed: bool = sqlx::query_scalar(
