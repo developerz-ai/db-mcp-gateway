@@ -186,7 +186,7 @@ services:
   # `bin/test` never start it (the tests run their own mock IdP). examples/demo
   # profile `sso` uses the same config and port: run one at a time.
   dex:
-    image: ghcr.io/dexidp/dex:v2.45.1@sha256:8499afd690c437f52301efd2b05b2455da5bd2dfc20332cd697dc9937f808462
+    image: ghcr.io/dexidp/dex:v2.46.1@sha256:65b72ca0f4b0bf6d4ada84ec21da8851782563404ac7b8f926923d27ceced9ab
     profiles: ["idp"]
     command: ["dex", "serve", "/etc/dex/config.yaml"]
     ports:
