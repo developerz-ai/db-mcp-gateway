@@ -11,10 +11,14 @@ use super::error::{is_feature_not_supported, log_discarded};
 /// does not undo. `RESET ALL` undoes session `SET`s / `set_config(…,
 /// false)` but, by design, neither `role` nor `session_authorization`, so
 /// both are reset by name. `DEALLOCATE ALL` drops whatever is still
-/// prepared. Not `DISCARD ALL`: it refuses to run inside a batch. The
-/// lexing pin goes last because `RESET ALL` would restore the server default.
+/// prepared. `DISCARD SEQUENCES` forgets `lastval()` / `currval()`, which
+/// would hand the next caller a key the previous one generated;
+/// `DISCARD TEMP` drops temporary tables and with them their rows. Not
+/// `DISCARD ALL`, which does all of this: it refuses to run inside a batch.
+/// The lexing pin goes last because `RESET ALL` would restore the server
+/// default.
 const RESET_SESSION: &str = "RESET ALL; RESET SESSION AUTHORIZATION; RESET ROLE; DEALLOCATE ALL; \
-     SET standard_conforming_strings = on";
+     DISCARD SEQUENCES; DISCARD TEMP; SET standard_conforming_strings = on";
 
 /// The SQL guard reads `'\'` the way Postgres does only while backslashes in
 /// plain literals are literal; a server configured otherwise would execute a

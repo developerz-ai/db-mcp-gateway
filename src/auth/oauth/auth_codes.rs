@@ -93,6 +93,14 @@ impl AuthCodes {
         }
     }
 
+    /// Put back a code [`Self::take`] removed, with its original deadline.
+    /// Only for a redemption that failed on the gateway's side before
+    /// anything was issued: the client is told to retry, so the retry must
+    /// find the code.
+    pub async fn restore(&self, code: &str, entry: AuthCode) {
+        self.inner.lock().await.insert(hash_secret(code), entry);
+    }
+
     /// Remove all expired codes; returns how many. Called periodically by a
     /// background task.
     pub async fn gc_expired(&self) -> u64 {

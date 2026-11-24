@@ -22,10 +22,6 @@ fn session_statement_views_rejected() {
         ("SELECT * FROM ONLY pg_stat_activity", "pg_stat_activity"),
         ("SELECT * FROM pg_stat_statements", "pg_stat_statements"),
         (
-            "SELECT * FROM public.pg_stat_statements_info",
-            "pg_stat_statements_info",
-        ),
-        (
             "SELECT statement FROM pg_prepared_statements",
             "pg_prepared_statements",
         ),
@@ -46,6 +42,48 @@ fn session_statement_views_rejected() {
         ),
     ] {
         denied_as(sql, want);
+    }
+}
+
+/// Extensions' views and functions that show other sessions' statements or
+/// plans — cluster-wide (Citus), Aurora, plan and predicate collectors.
+#[test]
+fn extension_statement_views_rejected() {
+    for (sql, want) in [
+        ("SELECT * FROM citus_stat_activity", "citus_stat_activity"),
+        (
+            "SELECT * FROM pg_catalog.citus_dist_stat_activity",
+            "citus_dist_stat_activity",
+        ),
+        ("SELECT * FROM citus_lock_waits", "citus_lock_waits"),
+        (
+            "SELECT * FROM citus_stat_statements",
+            "citus_stat_statements",
+        ),
+        (
+            "SELECT * FROM aurora_stat_activity()",
+            "aurora_stat_activity",
+        ),
+        ("SELECT * FROM pg_show_plans", "pg_show_plans"),
+        ("SELECT * FROM pg_show_plans()", "pg_show_plans"),
+        ("SELECT plan FROM pg_store_plans", "pg_store_plans"),
+        ("SELECT * FROM pg_qualstats", "pg_qualstats*"),
+        ("SELECT * FROM pg_qualstats_all", "pg_qualstats*"),
+        ("SELECT pg_qualstats_example_query(1)", "pg_qualstats*"),
+    ] {
+        denied_as(sql, want);
+    }
+}
+
+/// pg_cron's tables hold every scheduled command the shared role owns.
+#[test]
+fn cron_schema_relations_rejected() {
+    for sql in [
+        "SELECT command FROM cron.job",
+        "SELECT * FROM CRON.job_run_details",
+        r#"SELECT * FROM "cron"."job""#,
+    ] {
+        denied_as(sql, "cron.*");
     }
 }
 
@@ -86,6 +124,11 @@ fn other_statistics_views_still_allowed() {
     ok("SELECT * FROM pg_stat_user_tables");
     ok("SELECT * FROM pg_stat_database");
     ok("SELECT * FROM pg_locks");
+    // Eviction count and last reset time: no statement text.
+    ok("SELECT dealloc, stats_reset FROM pg_stat_statements_info");
+    ok("SELECT * FROM public.pg_stat_statements_info");
+    ok("SELECT cron FROM t");
+    ok("SELECT t.cron, job.cron FROM t JOIN job ON true");
     ok("SELECT * FROM my_pg_stat_activity");
     ok("SELECT * FROM pg_views WHERE viewname = 'pg_stat_activity'");
 }

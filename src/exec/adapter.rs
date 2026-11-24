@@ -171,7 +171,7 @@ pub enum ExecError {
     Sql,
 
     /// The DB refused the statement with a SQLSTATE the agent can act on:
-    /// the code plus the server's primary message, role name redacted.
+    /// the code plus gateway wording keyed by it (no server text).
     /// Tools map it by [`DbRejection::kind`].
     #[error("SQL rejected by the DB: {0}")]
     Rejected(DbRejection),

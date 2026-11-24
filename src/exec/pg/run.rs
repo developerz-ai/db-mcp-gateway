@@ -38,13 +38,15 @@ pub(super) async fn run_query_inner(
 ) -> Result<ExecResult, ExecError> {
     let started = Instant::now();
     let role = ctx.role;
-    let mut tx = conn.begin().await.map_err(|e| classify(e, role))?;
+    let mut tx = conn.begin().await.map_err(|e| classify(e, role, ""))?;
 
     // One round trip, before any other statement: `SET TRANSACTION` must
     // precede the transaction's first query. The read-only transaction is the
     // database's own enforcement of a read grant — the SQL guard is the
     // second layer, not the only one. Every interpolated value is a number
-    // or a `BackendTag`, which contains no quote.
+    // or a `BackendTag`, which contains no quote. The lexing pin is repeated
+    // here because behind a transaction-mode pooler the session-level pin
+    // may have landed on a different server connection than this one.
     let tag = BackendTag::for_request(query.request_id);
     let ms = effective_timeout_ms(query.statement_timeout_ms);
     let mode = match query.access {
@@ -53,12 +55,13 @@ pub(super) async fn run_query_inner(
     };
     let setup = format!(
         "SET TRANSACTION {mode}; SET LOCAL statement_timeout = {ms}; \
-         SET LOCAL application_name = '{}'",
+         SET LOCAL application_name = '{}'; \
+         SET LOCAL standard_conforming_strings = on",
         tag.as_str()
     );
     tx.execute(setup.as_str())
         .await
-        .map_err(|e| classify(e, role))?;
+        .map_err(|e| classify(e, role, ""))?;
 
     // Capture this connection's backend so a drop (agent disconnect) can
     // cancel the exact backend running our query — dropping `tx` alone won't
@@ -70,7 +73,7 @@ pub(super) async fn run_query_inner(
         .persistent(false)
         .fetch_one(&mut *tx)
         .await
-        .map_err(|e| classify(e, role))?;
+        .map_err(|e| classify(e, role, ""))?;
     let backend = Backend { pid, tag };
     let mut cancel = CancelOnDrop::armed(
         ctx.cancel_pool.clone(),
@@ -109,7 +112,9 @@ pub(super) async fn run_query_inner(
             // The statement ran to completion; its effect is discarded. A
             // failed rollback is an error: the change must not be reported
             // as undone unless it was.
-            tx.rollback().await.map_err(|e| classify(e, role))?;
+            tx.rollback()
+                .await
+                .map_err(|e| classify(e, role, query.sql))?;
         } else {
             // A write is never cut short: the stream was drained, so the
             // statement completed, and it commits whether or not the
@@ -117,7 +122,7 @@ pub(super) async fn run_query_inner(
             // never success after a rollback.
             tx.commit()
                 .await
-                .map_err(|e| classify_commit(e, query.access, role))?;
+                .map_err(|e| classify_commit(e, query.access, role, query.sql))?;
         }
         let rows_affected = (query.access == Access::ReadWrite).then_some(collected.rows_affected);
         Ok(ExecResult {

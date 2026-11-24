@@ -3,20 +3,21 @@
 //! Nothing here renders an error with `Display`: connect-phase sqlx errors
 //! can quote the DSN (`Configuration`) or name the role and host, and the
 //! request path never leaks credentials. Logs carry the variant name and the
-//! SQLSTATE only; the agent gets SQLSTATE + server message for a
-//! statement-level error and an opaque code for everything else.
-//!
-//! The message is also what the audit row and its sinks keep, so it must not
-//! carry row data: outside the classes whose quoted text is a name the
-//! statement itself spelled, quoted text is cut (see [`redact_values`]).
+//! SQLSTATE only; the agent gets the SQLSTATE and the gateway's wording for
+//! a statement-level error (see [`super::redact`]) and an opaque code for
+//! everything else.
+
+use sqlx::error::DatabaseError;
+use sqlx::postgres::{PgDatabaseError, PgErrorPosition};
 
 use super::super::adapter::ExecError;
 use super::super::rejection::DbRejection;
 use super::super::sql_guard::Access;
+use super::redact::rejection_message;
 
-/// Classify an error raised while a statement ran. `role` is redacted from
-/// any server message passed through.
-pub(super) fn classify(err: sqlx::Error, role: &str) -> ExecError {
+/// Classify an error raised while `sql` ran — the caller's statement, or
+/// `""` for one of the gateway's own. `role` is redacted from the message.
+pub(super) fn classify(err: sqlx::Error, role: &str, sql: &str) -> ExecError {
     log_discarded(&err, "target statement failed");
     if let sqlx::Error::Database(db) = &err
         && let Some(code) = db.code()
@@ -34,7 +35,10 @@ pub(super) fn classify(err: sqlx::Error, role: &str) -> ExecError {
             // role and can name the client address. Never passed on, however
             // it got here.
             c if c.starts_with("28") => ExecError::Connection,
-            c => ExecError::Rejected(DbRejection::new(c, &redact_values(c, db.message()), role)),
+            c => {
+                let message = rejection_message(c, db.message(), error_position(db.as_ref()), sql);
+                ExecError::Rejected(DbRejection::new(c, &message, role))
+            }
         };
     }
     if matches!(err, sqlx::Error::PoolTimedOut | sqlx::Error::Io(_)) {
@@ -43,40 +47,13 @@ pub(super) fn classify(err: sqlx::Error, role: &str) -> ExecError {
     ExecError::Sql
 }
 
-/// Stand-in for the quoted text cut from a server message.
-const VALUE_PLACEHOLDER: &str = "\"<value>\"";
-
-/// SQLSTATE classes whose messages quote only names from the statement:
-/// `42` (syntax error or access rule violation — the token, column, table
-/// or function the caller wrote), `23` (the violated constraint, its table
-/// and column; the offending row is in `DETAIL`, which is never read) and
-/// `3D` / `3F` (an unknown database or schema).
-const NAME_QUOTING_CLASSES: [&str; 4] = ["42", "23", "3D", "3F"];
-
-/// `message` without the values it quotes. Everywhere but
-/// [`NAME_QUOTING_CLASSES`], what Postgres puts in double quotes is data —
-/// `invalid input syntax for type integer: "alice@example.com"` — and data
-/// read from a table must not outlive the call in an audit row. Postgres
-/// does not escape a quote inside the value, so everything from the first
-/// quote to the last goes, not each pair.
-fn redact_values(sqlstate: &str, message: &str) -> String {
-    if NAME_QUOTING_CLASSES
-        .iter()
-        .any(|class| sqlstate.starts_with(class))
-    {
-        return message.to_string();
-    }
-    match (message.find('"'), message.rfind('"')) {
-        (Some(first), Some(last)) => format!(
-            "{}{VALUE_PLACEHOLDER}{}",
-            &message[..first],
-            if first == last {
-                ""
-            } else {
-                &message[last + 1..]
-            }
-        ),
-        _ => message.to_string(),
+/// Where in the submitted statement the server located the error: a 1-based
+/// character offset. An offset into a query the server generated itself
+/// (inside a function body) is not one.
+fn error_position(db: &dyn DatabaseError) -> Option<usize> {
+    match db.try_downcast_ref::<PgDatabaseError>()?.position()? {
+        PgErrorPosition::Original(at) => Some(at),
+        PgErrorPosition::Internal { .. } => None,
     }
 }
 
@@ -85,8 +62,13 @@ fn redact_values(sqlstate: &str, message: &str) -> String {
 /// it keeps its statement-level classification. Anything else on a write —
 /// the link dropped, the reply was unreadable — leaves the commit's fate
 /// unknown, which the caller must not report as "nothing happened".
-pub(super) fn classify_commit(err: sqlx::Error, access: Access, role: &str) -> ExecError {
-    match classify(err, role) {
+pub(super) fn classify_commit(
+    err: sqlx::Error,
+    access: Access,
+    role: &str,
+    sql: &str,
+) -> ExecError {
+    match classify(err, role, sql) {
         ExecError::Unavailable | ExecError::Sql if access == Access::ReadWrite => {
             ExecError::CommitIndeterminate
         }
@@ -172,12 +154,12 @@ mod tests {
     #[test]
     fn pool_and_io_errors_are_unavailable() {
         assert!(matches!(
-            classify(sqlx::Error::PoolTimedOut, "app"),
+            classify(sqlx::Error::PoolTimedOut, "app", ""),
             ExecError::Unavailable
         ));
         let io = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
         assert!(matches!(
-            classify(sqlx::Error::Io(io), "app"),
+            classify(sqlx::Error::Io(io), "app", ""),
             ExecError::Unavailable
         ));
     }
@@ -185,59 +167,13 @@ mod tests {
     #[test]
     fn opaque_errors_stay_opaque() {
         assert!(matches!(
-            classify(sqlx::Error::RowNotFound, "app"),
+            classify(sqlx::Error::RowNotFound, "app", ""),
             ExecError::Sql
         ));
         assert_eq!(
             AcquireFailure::of(&sqlx::Error::PoolTimedOut),
             AcquireFailure::Other
         );
-    }
-
-    #[test]
-    fn quoted_values_are_cut_outside_the_name_quoting_classes() {
-        assert_eq!(
-            redact_values(
-                "22P02",
-                r#"invalid input syntax for type integer: "alice@example.com""#
-            ),
-            r#"invalid input syntax for type integer: "<value>""#
-        );
-        assert_eq!(
-            redact_values(
-                "22003",
-                r#"value "99999999999" is out of range for type integer"#
-            ),
-            r#"value "<value>" is out of range for type integer"#
-        );
-        // A quote inside the value does not end the cut early.
-        assert_eq!(
-            redact_values("22P02", r#"invalid input syntax for type uuid: "a" b "c""#),
-            r#"invalid input syntax for type uuid: "<value>""#
-        );
-        assert_eq!(
-            redact_values("22P02", r#"bad: "unterminated"#),
-            r#"bad: "<value>""#
-        );
-        assert_eq!(
-            redact_values("22012", "division by zero"),
-            "division by zero"
-        );
-    }
-
-    #[test]
-    fn names_the_statement_spelled_are_kept() {
-        for (sqlstate, message) in [
-            ("42703", r#"column "nope" does not exist"#),
-            ("42601", r#"syntax error at or near "FORM""#),
-            (
-                "23505",
-                r#"duplicate key value violates unique constraint "users_pkey""#,
-            ),
-            ("3F000", r#"schema "nope" does not exist"#),
-        ] {
-            assert_eq!(redact_values(sqlstate, message), message);
-        }
     }
 
     fn io_reset() -> sqlx::Error {
@@ -247,14 +183,15 @@ mod tests {
     #[test]
     fn lost_connection_at_write_commit_is_indeterminate() {
         assert!(matches!(
-            classify_commit(io_reset(), Access::ReadWrite, "app"),
+            classify_commit(io_reset(), Access::ReadWrite, "app", ""),
             ExecError::CommitIndeterminate
         ));
         assert!(matches!(
             classify_commit(
                 sqlx::Error::Protocol("eof".into()),
                 Access::ReadWrite,
-                "app"
+                "app",
+                ""
             ),
             ExecError::CommitIndeterminate
         ));
@@ -263,7 +200,7 @@ mod tests {
     #[test]
     fn lost_connection_at_read_commit_stays_unavailable() {
         assert!(matches!(
-            classify_commit(io_reset(), Access::ReadOnly, "app"),
+            classify_commit(io_reset(), Access::ReadOnly, "app", ""),
             ExecError::Unavailable
         ));
     }

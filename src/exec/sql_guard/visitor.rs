@@ -2,12 +2,13 @@
 //! `SELECT ... INTO`, driven by sqlparser's `Visit` derive.
 
 use sqlparser::ast::{
-    AccessExpr, Expr, Ident, ObjectName, Query, SetExpr, Statement, TableFactor, Visitor,
+    AccessExpr, Expr, FunctionArg, FunctionArgExpr, Ident, ObjectName, Query, SelectItem, SetExpr,
+    Statement, TableFactor, Visitor,
 };
 use std::ops::ControlFlow;
 
 use super::GuardError;
-use super::denylist::denied_function;
+use super::denylist::{denied_function, denied_schema, denied_whole_row_call};
 
 /// Substructure guard, run once the top-level [`check_statement_shape`] has
 /// admitted the statement. Enforces four things via sqlparser's `Visit`
@@ -19,6 +20,9 @@ use super::denylist::denied_function;
 ///    `row.f` to `f(x)` / `f(row)` when no such column exists.
 /// 2. `SELECT ... FOR UPDATE / FOR SHARE` — [`GuardError::Locking`].
 /// 3. `SELECT ... INTO new_table` — [`GuardError::SelectInto`].
+///
+/// Also: a relation in a denied schema (`cron.job`), and an `UPDATE` of
+/// `pg_settings`, whose rule calls `set_config`.
 /// 4. Nested `Statement` — sqlparser encodes a writable CTE as a Query whose
 ///    body is `SetExpr::Insert(Statement)`, so any `pre_visit_statement`
 ///    firing *after* the top level is a write hiding in a read path.
@@ -42,7 +46,7 @@ impl Visitor for GuardVisitor {
     fn pre_visit_statement(&mut self, stmt: &Statement) -> ControlFlow<GuardError> {
         if !self.top_seen {
             self.top_seen = true;
-            return ControlFlow::Continue(());
+            return break_on(check_write_target(stmt));
         }
         let kind = match stmt {
             Statement::Insert(_) => "INSERT",
@@ -75,11 +79,18 @@ impl Visitor for GuardVisitor {
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<GuardError> {
         break_on(match expr {
             Expr::Function(f) => check_denied_name(&f.name),
-            Expr::CompoundIdentifier(parts) => parts.last().map_or(Ok(()), check_attribute),
+            Expr::CompoundIdentifier(parts) => check_compound_identifier(parts),
             Expr::CompoundFieldAccess { access_chain, .. } => {
                 access_chain.iter().try_for_each(check_access)
             }
             _ => Ok(()),
+        })
+    }
+
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<GuardError> {
+        break_on(match schema_label(relation) {
+            Some(label) => Err(GuardError::DeniedRelation(label)),
+            None => Ok(()),
         })
     }
 
@@ -108,11 +119,80 @@ impl Visitor for GuardVisitor {
 /// `SetExpr::Query` is walked by the outer visitor instead.
 fn body_has_select_into(body: &SetExpr) -> bool {
     match body {
-        SetExpr::Select(s) => s.into.is_some(),
+        SetExpr::Select(s) => s.into.is_some() || s.projection.iter().any(is_bare_into),
         SetExpr::SetOperation { left, right, .. } => {
             body_has_select_into(left) || body_has_select_into(right)
         }
         _ => false,
+    }
+}
+
+/// `SELECT INTO t FROM x` — an empty target list — reaches sqlparser as a
+/// column named `INTO` aliased `t`. Unquoted, `INTO` is reserved in
+/// Postgres, so no real column is spelled that way.
+fn is_bare_into(item: &SelectItem) -> bool {
+    let ident = match item {
+        SelectItem::UnnamedExpr(Expr::Identifier(ident))
+        | SelectItem::ExprWithAlias {
+            expr: Expr::Identifier(ident),
+            ..
+        } => ident,
+        _ => return false,
+    };
+    ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("into")
+}
+
+/// The top-level statement's write target. `pg_settings` has an `UPDATE`
+/// rule that calls `set_config`, a session change that would outlive the
+/// statement on a pooled connection.
+fn check_write_target(stmt: &Statement) -> Result<(), GuardError> {
+    let Statement::Update(update) = stmt else {
+        return Ok(());
+    };
+    let TableFactor::Table {
+        name, alias, args, ..
+    } = &update.table.relation
+    else {
+        return Ok(());
+    };
+    // sqlparser reads `UPDATE ONLY t` as table `ONLY` aliased `t`, and
+    // `UPDATE ONLY (t)` as a call of `ONLY`: every name written in the
+    // target is a candidate.
+    let arg_names = args
+        .iter()
+        .flat_map(|a| &a.args)
+        .filter_map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(ident))) => Some(ident),
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts))) => {
+                parts.last()
+            }
+            _ => None,
+        });
+    let mut names = name
+        .0
+        .iter()
+        .filter_map(|part| part.as_ident())
+        .chain(alias.iter().map(|a| &a.name))
+        .chain(arg_names);
+    if names.any(|ident| ident.value.eq_ignore_ascii_case("pg_settings")) {
+        return Err(GuardError::DeniedFunction("set_config"));
+    }
+    Ok(())
+}
+
+/// `alias.name` passes the alias's whole row to `name`; with more parts,
+/// `t.col.name` passes a column's value — any one-argument call.
+fn check_compound_identifier(parts: &[Ident]) -> Result<(), GuardError> {
+    let Some(last) = parts.last() else {
+        return Ok(());
+    };
+    let denied = match parts.len() {
+        2 => denied_whole_row_call(&last.value),
+        _ => denied_function(&last.value),
+    };
+    match denied {
+        Some(denied) => Err(GuardError::DeniedFunction(denied)),
+        None => Ok(()),
     }
 }
 
@@ -145,6 +225,9 @@ fn break_on(result: Result<(), GuardError>) -> ControlFlow<GuardError> {
 /// component so schema-qualified calls (`pg_catalog.pg_read_file(...)`) are
 /// caught too. Case-insensitive to match SQL identifier semantics.
 fn check_denied_name(name: &ObjectName) -> Result<(), GuardError> {
+    if let Some(label) = schema_label(name) {
+        return Err(GuardError::DeniedFunction(label));
+    }
     // A non-identifier name part (a dialect's `IDENTIFIER(...)`-style computed
     // name) cannot be matched against the denylist, so it is refused outright.
     let fn_name = match name.0.last() {
@@ -158,4 +241,13 @@ fn check_denied_name(name: &ObjectName) -> Result<(), GuardError> {
         Some(denied) => Err(GuardError::DeniedFunction(denied)),
         None => Ok(()),
     }
+}
+
+/// The label of a denied schema among `name`'s qualifiers.
+fn schema_label(name: &ObjectName) -> Option<&'static str> {
+    let qualifiers = name.0.split_last().map_or(&[][..], |(_, q)| q);
+    qualifiers
+        .iter()
+        .filter_map(|part| part.as_ident())
+        .find_map(|ident| denied_schema(&ident.value))
 }

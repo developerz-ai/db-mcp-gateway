@@ -110,6 +110,31 @@ fn select_into_rejected() {
     rejected("SELECT * INTO new_table FROM t", GuardError::SelectInto);
 }
 
+/// An empty target list is Postgres syntax (`SELECT INTO t FROM x` creates
+/// a zero-column table); sqlparser reads `INTO` as a column aliased `t`.
+#[test]
+fn select_into_with_empty_target_list_rejected() {
+    for sql in [
+        "SELECT INTO t FROM x",
+        "SELECT INTO t",
+        "select into t from x",
+        "SELECT ALL INTO t FROM x",
+        "SELECT DISTINCT INTO t FROM x",
+        "WITH a AS (SELECT 1) SELECT INTO t FROM a",
+        "SELECT 1 UNION SELECT INTO t FROM x",
+        "SELECT * FROM (SELECT INTO t FROM x) s",
+    ] {
+        rejected(sql, GuardError::SelectInto);
+        assert_eq!(
+            check_sql(sql, Access::ReadWrite),
+            Err(GuardError::SelectInto),
+            "write mode: `{sql}`"
+        );
+    }
+    ok(r#"SELECT "into" FROM t"#);
+    ok(r#"SELECT t."into", "INTO" AS i FROM t"#);
+}
+
 #[test]
 fn write_nested_in_body_rejected() {
     // Write buried in a parenthesised subquery used as the outer body,

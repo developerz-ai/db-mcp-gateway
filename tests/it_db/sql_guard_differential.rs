@@ -10,7 +10,7 @@ use std::ops::ControlFlow;
 
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
-use sqlparser::ast::{Expr, visit_expressions};
+use sqlparser::ast::{Expr, ObjectName, TableFactor, Visit, Visitor};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
@@ -42,20 +42,51 @@ async fn as_postgres_reads(conn: &mut PgConnection, sql: &str) -> Option<String>
     reading
 }
 
-/// Every function Postgres's printed statement calls, lower-cased.
+/// Every function Postgres's printed statement calls, lower-cased — in an
+/// expression or as a table source (`FROM generate_series(1, 3)`).
 fn calls(reading: &str) -> BTreeSet<String> {
     let statements = Parser::parse_sql(&PostgreSqlDialect {}, reading)
         .unwrap_or_else(|err| panic!("Postgres's own spelling parses: {err}\n{reading}"));
-    let mut names = BTreeSet::new();
-    let _ = visit_expressions(&statements, |expr| {
-        if let Expr::Function(f) = expr
-            && let Some(name) = f.name.0.last().and_then(|part| part.as_ident())
-        {
-            names.insert(name.value.to_ascii_lowercase());
+    let mut collector = CallCollector::default();
+    let _ = statements.visit(&mut collector);
+    collector.names
+}
+
+#[derive(Default)]
+struct CallCollector {
+    names: BTreeSet<String>,
+}
+
+impl CallCollector {
+    fn insert(&mut self, name: &ObjectName) {
+        if let Some(ident) = name.0.last().and_then(|part| part.as_ident()) {
+            self.names.insert(ident.value.to_ascii_lowercase());
         }
-        ControlFlow::<()>::Continue(())
-    });
-    names
+    }
+}
+
+impl Visitor for CallCollector {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        if let Expr::Function(f) = expr {
+            self.insert(&f.name);
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<()> {
+        match tf {
+            TableFactor::Table {
+                name,
+                args: Some(_),
+                ..
+            }
+            | TableFactor::Function { name, .. } => self.insert(name),
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 /// Every word the guard's lexer saw in `sql`, lower-cased: the names it
@@ -150,6 +181,8 @@ const ADMITTED: &[&str] = &[
     "SELECT 1 - -1, 1e5, 1.5e-3, .5, 2 * 3 / 4",
     "SELECT '{\"a\":1}'::jsonb ->> 'a', '{}'::jsonb @> '{}'::jsonb",
     "SELECT \"relname\", c.\"oid\" FROM pg_catalog.\"pg_class\" c WHERE relname = 'pg_stat_activity'",
+    "SELECT * FROM generate_series(1, 3)",
+    "SELECT g FROM generate_series(1, 3) AS g, LATERAL unnest(ARRAY[g]) u",
 ];
 
 #[tokio::test]
@@ -163,6 +196,45 @@ async fn admitted_statements_read_the_same_to_postgres() {
             .unwrap_or_else(|| panic!("the target accepts {sql:?}"));
         assert_same_reading(sql, &reading);
     }
+}
+
+/// A set-returning call in FROM is a table factor, not an expression: the
+/// comparison must see it, or a denied one there would never be compared.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn from_clause_calls_enter_the_comparison() {
+    let mut conn = connect().await;
+    let reading = as_postgres_reads(&mut conn, "SELECT * FROM generate_series(1, 3)")
+        .await
+        .expect("the target accepts it");
+    assert!(
+        calls(&reading).contains("generate_series"),
+        "FROM-clause call missed:\n{reading}"
+    );
+}
+
+/// `alias.name` calls `name` with the alias's whole row — but only a
+/// function that takes a row: the guard admits these qualified columns
+/// because Postgres finds no call in them (`row_to_json` is the control).
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn whole_row_notation_reaches_only_row_arguments() {
+    let mut conn = connect().await;
+    for sql in [
+        "SELECT t.setseed FROM (SELECT 0.5::float8) t",
+        "SELECT t.pg_notify FROM (SELECT 'c'::text, 'p'::text) t",
+        "SELECT t.pg_read_file FROM (SELECT 'f'::text) t",
+        "SELECT t.set_config FROM (SELECT 'a'::text, 'b'::text, false) t",
+    ] {
+        assert_eq!(is_read_only(sql), Ok(()), "must stay admitted: {sql:?}");
+        let reading = as_postgres_reads(&mut conn, sql).await;
+        assert_eq!(reading, None, "Postgres resolved a call in {sql:?}");
+    }
+    let control = "SELECT t.row_to_json FROM (SELECT 1 AS a) t";
+    let reading = as_postgres_reads(&mut conn, control)
+        .await
+        .expect("the target accepts the control");
+    assert!(calls(&reading).contains("row_to_json"), "{reading}");
 }
 
 /// The pieces `sql_guard::proptests` mutates with: where two lexers are

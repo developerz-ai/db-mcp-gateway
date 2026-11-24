@@ -39,13 +39,17 @@ pub enum LiveClient {
     Keep,
 }
 
-/// Register a client with the never-authorised TTL, in one statement. At
-/// `cap` rows it first evicts the oldest evictable row; if none is evictable
-/// the insert is refused (`false`). A lapsed, not-yet-GC'd row with the same
-/// `client_id` is reset as if new, so `/authorize` adoption of a cached id
-/// can revive it. A live one keeps its expiry and, per `live`, either takes
-/// the new URIs and name or is left untouched (`false`). At the cap a
-/// re-registration needs the same room as a new client.
+/// Register a client with the never-authorised TTL, in one statement.
+///
+/// A row that already holds `client_id` is resolved first, on the same
+/// snapshot as everything else: lapsed and not yet GC'd, it is reset as if
+/// new (so `/authorize` adoption of a cached id can revive it); live, it
+/// keeps its expiry and, per `live`, either takes the new URIs and name or
+/// is left untouched (`false`). Either way nothing is evicted — the row is
+/// written in place or not at all.
+///
+/// Only a new `client_id` needs room: at `cap` rows it evicts the oldest
+/// evictable row, and is refused (`false`) when none is evictable.
 pub async fn insert_client_capped(
     conn: impl PgExecutor<'_>,
     client_id: &str,
@@ -55,20 +59,28 @@ pub async fn insert_client_capped(
     unused_ttl: chrono::Duration,
     live: LiveClient,
 ) -> Result<bool, sqlx::Error> {
-    let only_lapsed = match live {
-        LiveClient::Replace => "",
-        LiveClient::Keep => " WHERE oauth_clients.expires_at <= now()",
+    let (unless_live, only_lapsed) = match live {
+        LiveClient::Replace => ("", ""),
+        LiveClient::Keep => (
+            "NOT EXISTS (SELECT 1 FROM target WHERE live) AND ",
+            // A row a concurrent insert committed after this snapshot.
+            " WHERE oauth_clients.expires_at <= now()",
+        ),
     };
     let sql = format!(
-        "WITH evicted AS ( \
-           DELETE FROM oauth_clients WHERE client_id IN ( \
-             SELECT client_id FROM oauth_clients WHERE {EVICTABLE_CLIENT} \
-             ORDER BY created_at \
-             LIMIT GREATEST((SELECT count(*) FROM oauth_clients) - $3 + 1, 0)) \
+        "WITH target AS ( \
+           SELECT expires_at > now() AS live FROM oauth_clients WHERE client_id = $1), \
+         evicted AS ( \
+           DELETE FROM oauth_clients WHERE NOT EXISTS (SELECT 1 FROM target) \
+             AND client_id IN ( \
+               SELECT client_id FROM oauth_clients WHERE {EVICTABLE_CLIENT} \
+               ORDER BY created_at \
+               LIMIT GREATEST((SELECT count(*) FROM oauth_clients) - $3 + 1, 0)) \
            RETURNING 1) \
          INSERT INTO oauth_clients (client_id, redirect_uris, client_name, expires_at) \
          SELECT $1, $2, $5, now() + $4 \
-         WHERE (SELECT count(*) FROM oauth_clients) - (SELECT count(*) FROM evicted) < $3 \
+         WHERE {unless_live}(EXISTS (SELECT 1 FROM target) \
+           OR (SELECT count(*) FROM oauth_clients) - (SELECT count(*) FROM evicted) < $3) \
          ON CONFLICT (client_id) DO UPDATE SET \
            redirect_uris = EXCLUDED.redirect_uris, \
            client_name = EXCLUDED.client_name, \

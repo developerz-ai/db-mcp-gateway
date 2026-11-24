@@ -223,8 +223,10 @@ impl DbAdapter for MongoAdapter {
         }
     }
 
+    /// No caller slot here: each catalog command goes through `execute`,
+    /// which takes its own; holding one across them would leave a caller
+    /// with a share of one waiting on itself.
     async fn describe_schema(&self, query: SchemaQuery<'_>) -> Result<ExecResult, ExecError> {
-        let _slot = self.callers.take(CONNECT_TIMEOUT).await?;
         self.describe(query).await
     }
 

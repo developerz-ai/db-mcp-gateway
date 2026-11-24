@@ -193,17 +193,22 @@ pub async fn rotate_out_refresh_token(
     .await
 }
 
-/// The live chain a tombstoned (already rotated-out) `token_hash` belongs to,
-/// if it was rotated out more than `grace` ago. `None` for an unknown hash, a
-/// lapsed chain, or a rotation still inside `grace`.
+/// The subject and chain a tombstoned (already rotated-out) `token_hash`
+/// belongs to, if it was rotated out at least `grace` ago. `None` for an
+/// unknown hash, a chain with no token left, or a rotation still inside
+/// `grace`. Read before [`lock_subject`] and [`lock_chain`], like
+/// [`live_chain`].
 pub async fn rotated_chain(
     conn: impl PgExecutor<'_>,
     token_hash: &[u8],
     grace: chrono::Duration,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT chain_id FROM oauth_refresh_rotated \
-         WHERE token_hash = $1 AND expires_at > now() AND rotated_at <= now() - $2",
+) -> Result<Option<(String, Uuid)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT live.user_sub, rotated.chain_id FROM oauth_refresh_rotated rotated \
+         JOIN oauth_refresh_tokens live ON live.chain_id = rotated.chain_id \
+         WHERE rotated.token_hash = $1 AND rotated.expires_at > now() \
+           AND rotated.rotated_at <= now() - $2 \
+         LIMIT 1",
     )
     .bind(token_hash)
     .bind(grace)

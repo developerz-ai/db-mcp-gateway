@@ -10,10 +10,10 @@
 /// guard never sees:
 ///
 /// - filesystem: `pg_read_file`, `pg_read_binary_file`, `pg_stat_file`,
-///   `pg_ls_*` (every directory listing), `pg_current_logfile`, and the
-///   large-object family `lo_*` / `lowrite` (`lo_export` writes a server
-///   file; `lo_from_bytea` creates an object — no side effect is allowed
-///   from a read).
+///   `pg_ls_*` (every directory listing), `pg_current_logfile`, adminpack's
+///   `pg_file_*` and `pg_logdir_ls`, and the large-object family `lo_*` /
+///   `loread` / `lowrite` (`lo_export` writes a server file; `lo_from_bytea`
+///   creates an object — no side effect is allowed from a read).
 /// - session state: `set_config` (a session-level change would outlive the
 ///   query on a pooled connection) and every advisory lock function (a
 ///   session lock blocks other users until the connection is reset).
@@ -38,6 +38,12 @@
 ///   `aws_lambda.invoke`, `aws_s3.query_export_to_s3` (which also runs SQL
 ///   text) and `table_import_from_s3`. Exact names, not an `http*` family:
 ///   a column named `http_status` is ordinary.
+///
+/// `alias.name` is a call of `name` with the alias's whole row when no such
+/// column exists, so a two-part column reference is checked too — against
+/// the families and the [`Denied::WholeRow`] names only. An exact name whose
+/// signature cannot take one row (`pg_notify(text, text)`,
+/// `pg_read_file(text)`) is an ordinary column there.
 /// - messages to other sessions: `pg_notify` and `pg_logical_emit_message`
 ///   run in a read-only transaction and, on its commit, reach every
 ///   `LISTEN`er or logical-decoding consumer (job queues, CDC pipelines).
@@ -48,9 +54,12 @@ const DENIED_FUNCTIONS: &[Denied] = &[
     Denied::Exact("pg_current_logfile"),
     Denied::Exact("pg_ls_dir"),
     Denied::Prefix("pg_ls_", "pg_ls_*"),
+    Denied::Prefix("pg_file_", "pg_file_*"),
+    Denied::Exact("pg_logdir_ls"),
     Denied::Exact("lo_export"),
     Denied::Exact("lo_import"),
     Denied::Prefix("lo_", "lo_*"),
+    Denied::Exact("loread"),
     Denied::Exact("lowrite"),
     Denied::Exact("set_config"),
     Denied::Prefix("pg_advisory_", "pg_advisory_*"),
@@ -70,10 +79,17 @@ const DENIED_FUNCTIONS: &[Denied] = &[
     Denied::Prefix("crosstab", "crosstab*"),
     Denied::Exact("connectby"),
     Denied::Exact("xpath_table"),
+    Denied::Prefix("pgr_", "pgr_*"),
+    Denied::Prefix("pg_background_", "pg_background_*"),
+    Denied::Exact("schedule"),
+    Denied::Exact("schedule_in_database"),
+    Denied::Exact("alter_job"),
+    Denied::Exact("unschedule"),
     Denied::Exact("query_export_to_s3"),
     Denied::Exact("table_import_from_s3"),
     Denied::Exact("invoke"),
-    Denied::Exact("http"),
+    // `http(http_request)`: a subquery row coerces to the request type.
+    Denied::WholeRow("http"),
     Denied::Exact("http_get"),
     Denied::Exact("http_post"),
     Denied::Exact("http_put"),
@@ -98,46 +114,77 @@ const DENIED_FUNCTIONS: &[Denied] = &[
 ];
 
 /// Relations the gateway never reads for a caller: each row is another
-/// session's statement text, and every identity on a `(server, database)`
-/// shares one role, so Postgres shows them all. `db_activity` answers the
-/// operational question without the text. Refused wherever the name is
-/// written — table, function (`pg_stat_statements(true)`) or alias.
-const DENIED_RELATIONS: &[&str] = &[
-    "pg_stat_activity",
-    "pg_stat_statements",
-    "pg_stat_statements_info",
-    "pg_prepared_statements",
-    "pg_stat_monitor",
-    "yb_terminated_queries",
+/// session's statement text or plan, and every identity on a `(server,
+/// database)` shares one role, so Postgres shows them all. `db_activity`
+/// answers the operational question without the text. Refused wherever the
+/// name is written — table, function (`pg_stat_statements(true)`) or alias.
+/// `pg_stat_statements_info` (eviction count, reset time) stays readable.
+const DENIED_RELATIONS: &[Denied] = &[
+    Denied::Exact("pg_stat_activity"),
+    Denied::Exact("pg_stat_statements"),
+    Denied::Exact("pg_prepared_statements"),
+    Denied::Exact("pg_stat_monitor"),
+    Denied::Exact("yb_terminated_queries"),
+    Denied::Exact("citus_stat_activity"),
+    Denied::Exact("citus_dist_stat_activity"),
+    Denied::Exact("citus_lock_waits"),
+    Denied::Exact("citus_stat_statements"),
+    Denied::Exact("aurora_stat_activity"),
+    Denied::Exact("pg_show_plans"),
+    Denied::Exact("pg_store_plans"),
+    Denied::Prefix("pg_qualstats", "pg_qualstats*"),
 ];
+
+/// Schemas whose every function and relation is refused, reported as
+/// `<schema>.*`: pg_cron's functions schedule SQL text and its tables hold
+/// every scheduled command the shared role owns.
+const DENIED_SCHEMAS: &[(&str, &str)] = &[("cron", "cron.*")];
 
 /// One denylist entry. Exact names come first in [`DENIED_FUNCTIONS`] so a
 /// well-known name is reported as itself rather than as its family.
 #[derive(Debug, Clone, Copy)]
 enum Denied {
     Exact(&'static str),
+    /// An exact name whose function takes a single row, so `alias.name`
+    /// calls it with the alias's whole row.
+    WholeRow(&'static str),
     /// `(prefix, label)` — the label is what the error reports.
     Prefix(&'static str, &'static str),
 }
 
-/// The denylist entry `name` falls under, as the error reports it.
+/// The denylist entry a call of `name` falls under, as the error reports it.
 pub(super) fn denied_function(name: &str) -> Option<&'static str> {
     DENIED_FUNCTIONS.iter().find_map(|d| d.matches(name))
 }
 
-pub(super) fn denied_relation(name: &str) -> Option<&'static str> {
-    DENIED_RELATIONS
+/// The denylist entry `alias.name` falls under: the families and the
+/// [`Denied::WholeRow`] names — the calls a whole row can reach.
+pub(super) fn denied_whole_row_call(name: &str) -> Option<&'static str> {
+    DENIED_FUNCTIONS
         .iter()
-        .copied()
-        .find(|denied| denied.eq_ignore_ascii_case(name))
+        .filter(|d| !matches!(d, Denied::Exact(_)))
+        .find_map(|d| d.matches(name))
+}
+
+pub(super) fn denied_relation(name: &str) -> Option<&'static str> {
+    DENIED_RELATIONS.iter().find_map(|d| d.matches(name))
+}
+
+/// The label of the denied schema `name` is, if any.
+pub(super) fn denied_schema(name: &str) -> Option<&'static str> {
+    DENIED_SCHEMAS
+        .iter()
+        .find_map(|(schema, label)| schema.eq_ignore_ascii_case(name).then_some(*label))
 }
 
 impl Denied {
-    /// The name to report if `fn_name` matches this entry.
-    fn matches(self, fn_name: &str) -> Option<&'static str> {
+    /// The name to report if `name` matches this entry.
+    fn matches(self, name: &str) -> Option<&'static str> {
         match self {
-            Self::Exact(name) => name.eq_ignore_ascii_case(fn_name).then_some(name),
-            Self::Prefix(prefix, label) => fn_name
+            Self::Exact(exact) | Self::WholeRow(exact) => {
+                exact.eq_ignore_ascii_case(name).then_some(exact)
+            }
+            Self::Prefix(prefix, label) => name
                 .get(..prefix.len())
                 .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
                 .then_some(label),

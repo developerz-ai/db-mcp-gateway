@@ -69,16 +69,30 @@ pub(super) async fn revoke_reused_chain(
     conn: &mut sqlx::PgConnection,
     presented_hash: &[u8],
 ) -> Result<Vec<SessionId>, AuthError> {
-    let Some(chain_id) = db::rotated_chain(&mut *conn, presented_hash, REUSE_GRACE).await? else {
+    let Some((sub, chain_id)) = db::rotated_chain(&mut *conn, presented_hash, REUSE_GRACE).await?
+    else {
         return Ok(Vec::new());
     };
-    // Waits out an in-flight rotation; the delete below then sees its token.
+    let revoked = end_chain(conn, &sub, chain_id).await?;
+    tracing::warn!(%chain_id, "rotated refresh token replayed; chain revoked");
+    Ok(revoked)
+}
+
+/// Delete `chain_id`'s live token and revoke its paired session; returns the
+/// sessions this revoked. Locks as every grant change does — subject, then
+/// chain, then rows — so it waits out an in-flight rotation and then sees
+/// that rotation's token, and cannot deadlock with a logout of `sub`.
+pub(super) async fn end_chain(
+    conn: &mut sqlx::PgConnection,
+    sub: &str,
+    chain_id: Uuid,
+) -> Result<Vec<SessionId>, AuthError> {
+    db::lock_subject(&mut *conn, sub).await?;
     db::lock_chain(&mut *conn, chain_id).await?;
     let mut revoked = Vec::new();
     for paired in db::delete_chain(&mut *conn, chain_id).await? {
         revoked.extend(revoke_paired(conn, paired.map(SessionId::from)).await?);
     }
-    tracing::warn!(%chain_id, "rotated refresh token replayed; chain revoked");
     Ok(revoked)
 }
 

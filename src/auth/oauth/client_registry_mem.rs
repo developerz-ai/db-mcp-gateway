@@ -29,7 +29,17 @@ pub(super) fn insert_mem(
     live: LiveClient,
 ) -> bool {
     let now = Utc::now();
-    if map.len() >= CLIENT_CAP as usize {
+    // The existing row is resolved first: it is written in place or kept, so
+    // it needs no room and must never be the row evicted to make some.
+    if let Some(existing) = map.get_mut(&client_id) {
+        if existing.expires_at > now {
+            match live {
+                LiveClient::Replace => existing.record = record,
+                LiveClient::Keep => return false,
+            }
+            return true;
+        }
+    } else if map.len() >= CLIENT_CAP as usize {
         let oldest = map
             .iter()
             .filter(|(_, c)| c.evictable(now))
@@ -40,22 +50,14 @@ pub(super) fn insert_mem(
         };
         map.remove(&oldest);
     }
-    match map.get_mut(&client_id) {
-        Some(existing) if existing.expires_at > now => match live {
-            LiveClient::Replace => existing.record = record,
-            LiveClient::Keep => return false,
+    // Absent, or lapsed but not yet GC'd: (re)start as never-used.
+    map.insert(
+        client_id,
+        RegisteredClient {
+            record,
+            created_at: now,
+            expires_at: now + UNAUTHORISED_CLIENT_TTL,
         },
-        // Absent, or lapsed but not yet GC'd: (re)start as never-used.
-        _ => {
-            map.insert(
-                client_id,
-                RegisteredClient {
-                    record,
-                    created_at: now,
-                    expires_at: now + UNAUTHORISED_CLIENT_TTL,
-                },
-            );
-        }
-    }
+    );
     true
 }

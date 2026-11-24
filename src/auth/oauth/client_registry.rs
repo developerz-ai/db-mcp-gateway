@@ -122,8 +122,8 @@ impl ClientRegistry {
     /// never-used client first; `StoreFull` only when every row belongs to a
     /// used client. A DB error is `Backend` — fail closed, the client retries.
     /// Re-registering an existing `client_id` replaces its URIs and name (a
-    /// lapsed, unswept one restarts as new) and needs the same room as a new
-    /// one.
+    /// lapsed, unswept one restarts as new) in place: it needs no room and
+    /// evicts nothing.
     pub async fn register(
         &self,
         client_id: String,
@@ -144,7 +144,8 @@ impl ClientRegistry {
     /// redirect) and return the live registration. Adoption is as
     /// unauthenticated as `/register`, so the row starts on the never-used
     /// TTL, and a registration that is already live is returned untouched —
-    /// the caller must match the redirect against what comes back.
+    /// the caller must match the redirect against what comes back. Only an
+    /// adoption that creates a row makes room for it at the cap.
     pub async fn adopt(
         &self,
         client_id: String,

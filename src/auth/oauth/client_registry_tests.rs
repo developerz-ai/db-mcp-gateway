@@ -174,6 +174,25 @@ async fn adopting_a_live_client_keeps_its_redirect_uris() {
     assert_eq!(reg.redirect_uris("c1").await, Ok(Some(vec![URI.into()])));
 }
 
+/// At the cap, with the live target the oldest evictable row: adoption must
+/// resolve "already live" before it makes room, or it evicts the target and
+/// re-creates it pointing at the caller's redirect.
+#[tokio::test]
+async fn adopting_a_live_client_at_the_cap_evicts_nothing() {
+    let reg = ClientRegistry::default();
+    fill(&reg, false).await;
+    let adoptions =
+        (0..8).map(|port| reg.adopt("c0".into(), format!("http://127.0.0.1:{port}/cb")));
+    for adopted in futures::future::join_all(adoptions).await {
+        assert_eq!(adopted.unwrap().redirect_uris, vec![URI.to_string()]);
+    }
+    assert_eq!(reg.redirect_uris("c0").await, Ok(Some(vec![URI.into()])));
+    assert!(
+        reg.redirect_uris("c1").await.unwrap().is_some(),
+        "no bystander evicted for an adoption that wrote nothing"
+    );
+}
+
 /// Re-registering a still-live client keeps its expiry: only a lapsed row
 /// is reset.
 #[tokio::test]

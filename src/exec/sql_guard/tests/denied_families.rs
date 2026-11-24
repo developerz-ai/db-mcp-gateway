@@ -87,6 +87,26 @@ const FAMILIES: &[(&str, &str)] = &[
     ("pg_stat_get_activity(NULL)", "pg_stat_get_activity"),
     ("pg_stat_get_backend_activity(1)", "pg_stat_get_backend_*"),
     ("pg_prepared_statement()", "pg_prepared_statement"),
+    ("loread(0, 10)", "loread"),
+    ("pg_logdir_ls()", "pg_logdir_ls"),
+    ("pg_file_write('f', 'x', false)", "pg_file_*"),
+    ("pg_file_unlink('f')", "pg_file_*"),
+    (
+        "pgr_dijkstra('SELECT id, source, target, cost FROM e', 1, 2)",
+        "pgr_*",
+    ),
+    ("pg_background_launch('DELETE FROM t')", "pg_background_*"),
+    ("pg_background_result(1)", "pg_background_*"),
+    ("cron.schedule('* * * * *', 'DELETE FROM t')", "cron.*"),
+    ("CRON.unschedule(1)", "cron.*"),
+    ("cron.job_cache_invalidate()", "cron.*"),
+    ("schedule('* * * * *', 'DELETE FROM t')", "schedule"),
+    (
+        "schedule_in_database('j', '* * * * *', 'DELETE FROM t', 'd')",
+        "schedule_in_database",
+    ),
+    ("alter_job(1, '* * * * *')", "alter_job"),
+    ("unschedule(1)", "unschedule"),
 ];
 
 fn denied_as(sql: &str, want: &str) {
@@ -152,6 +172,8 @@ fn prefixes_do_not_match_relations_or_near_misses() {
     // `ts_stat` / `ts_rewrite` are exact: other text-search functions read.
     ok("SELECT to_tsvector('a b'), ts_rank(v, q), ts_headline('x', q) FROM t");
     ok("SELECT * FROM ts_stats");
+    ok("SELECT schedule, alter_job, pgr, cron FROM jobs");
+    ok("SELECT * FROM schedule JOIN pg_file_settings f ON true");
 }
 
 /// `DESCRIBE t` parses as `ExplainTable`; it is not Postgres and is denied.

@@ -12,20 +12,29 @@
 //! `timestamptz`, or a money `numeric` (#136).
 
 mod datetime;
+mod json;
 mod render;
 
 use serde_json::Value;
-use sqlx::postgres::{PgRow, PgTypeInfo, PgTypeKind, Postgres};
+use sqlx::postgres::{PgRow, PgTypeInfo, PgTypeKind, PgValueFormat, PgValueRef, Postgres};
 use sqlx::types::{BigDecimal, Json, Uuid, chrono};
 use sqlx::{Row, Type, TypeInfo, ValueRef};
 
+use json::JsonCell;
+pub(super) use json::RowWeight;
 use render::{float, hex, inet, interval, unsupported};
+
+/// A row whose decoded form cannot fit what the result budget has left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct OverBudget;
 
 /// How to turn one column's cells into JSON. Variants follow the rendering
 /// contract in `website/docs/initial-idea/03-mcp-tools.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ColumnDecoder {
     Json,
+    /// Sent as a version byte, then the same text as `json`.
+    Jsonb,
     Int8,
     Int4,
     Int2,
@@ -68,7 +77,11 @@ impl ColumnDecoder {
         // `String` covers every text-like type sqlx knows. sqlx enforces
         // width per OID, so each integer and float width is its own variant.
         if is::<Json<Value>>(ty) {
-            Self::Json
+            if ty.name() == "JSONB" {
+                Self::Jsonb
+            } else {
+                Self::Json
+            }
         } else if is::<i64>(ty) {
             Self::Int8
         } else if is::<i32>(ty) {
@@ -122,19 +135,29 @@ impl ColumnDecoder {
         }
     }
 
-    fn decode(&self, row: &PgRow, idx: usize) -> Value {
+    fn decode(
+        &self,
+        row: &PgRow,
+        idx: usize,
+        weight: &mut RowWeight<'_>,
+    ) -> Result<Value, OverBudget> {
         // Type-agnostic NULL check first: decoding is unchecked below (the
         // decoder already matched the column type, and a domain's OID would
         // fail the checked path), so NULL must never reach it.
         let Ok(raw) = row.try_get_raw(idx) else {
             // Unreachable: `idx` comes from this row's own column list.
-            return unsupported("unknown");
+            return Ok(unsupported("unknown"));
         };
         if raw.is_null() {
-            return Value::Null;
+            return Ok(Value::Null);
         }
         let decoded = match self {
-            Self::Json => get::<Json<Value>>(row, idx).map(|j| j.0),
+            Self::Json | Self::Jsonb => match json_text(self, &raw).map(|t| json::parse(t, weight))
+            {
+                Some(JsonCell::Value(value)) => Ok(value),
+                Some(JsonCell::OverBudget) => return Err(OverBudget),
+                Some(JsonCell::Invalid) | None => Err(()),
+            },
             Self::Int8 => get::<i64>(row, idx).map(Value::from),
             Self::Int4 => get::<i32>(row, idx).map(Value::from),
             Self::Int2 => get::<i16>(row, idx).map(Value::from),
@@ -158,10 +181,20 @@ impl ColumnDecoder {
             Self::Int2Array => get::<Vec<Option<i16>>>(row, idx).map(Value::from),
             Self::UuidArray => get::<Vec<Option<Uuid>>>(row, idx)
                 .map(|v| Value::from_iter(v.into_iter().map(|u| u.map(|u| u.to_string())))),
-            Self::Unsupported(name) => return unsupported(name),
+            Self::Unsupported(name) => return Ok(unsupported(name)),
         };
-        decoded.unwrap_or_else(|()| unsupported(raw.type_info().name()))
+        Ok(decoded.unwrap_or_else(|()| unsupported(raw.type_info().name())))
     }
+}
+
+/// The JSON text of a `json` / `jsonb` cell: binary `jsonb` leads with its
+/// format version, and version 1 is the only one there is.
+fn json_text<'r>(decoder: &ColumnDecoder, raw: &PgValueRef<'r>) -> Option<&'r [u8]> {
+    let bytes = raw.as_bytes().ok()?;
+    if *decoder == ColumnDecoder::Jsonb && raw.format() == PgValueFormat::Binary {
+        return bytes.strip_prefix(&[1]);
+    }
+    Some(bytes)
 }
 
 /// One decoder per column of `row`, in column order.
@@ -172,11 +205,16 @@ pub(super) fn decoders(row: &PgRow) -> Vec<ColumnDecoder> {
         .collect()
 }
 
-pub(super) fn decode_row(row: &PgRow, decoders: &[ColumnDecoder]) -> Vec<Value> {
+/// Decode `row`, or stop as soon as its JSON cells outgrow `weight`.
+pub(super) fn decode_row(
+    row: &PgRow,
+    decoders: &[ColumnDecoder],
+    mut weight: RowWeight<'_>,
+) -> Result<Vec<Value>, OverBudget> {
     decoders
         .iter()
         .enumerate()
-        .map(|(idx, d)| d.decode(row, idx))
+        .map(|(idx, d)| d.decode(row, idx, &mut weight))
         .collect()
 }
 
@@ -206,7 +244,7 @@ mod tests {
         let cases = [
             (ty::<i64>(), ColumnDecoder::Int8),
             (ty::<f32>(), ColumnDecoder::Float4),
-            (ty::<Json<Value>>(), ColumnDecoder::Json),
+            (ty::<Json<Value>>(), ColumnDecoder::Jsonb),
             (ty::<String>(), ColumnDecoder::Text),
             (ty::<BigDecimal>(), ColumnDecoder::Numeric),
             (

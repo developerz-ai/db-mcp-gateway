@@ -29,16 +29,21 @@ const BODY_READ_DEADLINE: Duration = Duration::from_secs(10);
 /// is not a real client.
 const OAUTH_BODY_DEADLINE: Duration = Duration::from_secs(5);
 
-/// `/mcp`: the statement ceiling, one pool acquire, the intent and outcome
-/// audit writes, plus slack for authz and serialisation.
+/// `/mcp`: the waits one call can stack in sequence — the caller's pool
+/// share, then a pool connection (both bounded at 5 s by the adapters), the
+/// statement ceiling, the intent and outcome audit writes — plus slack for
+/// the adapters' 0.5 s past the ceiling, authz and serialisation. 75 s.
 pub const MCP_TIMEOUT: Duration = Duration::from_millis(
     DEFAULT_STATEMENT_TIMEOUT_MS as u64
+        + CALLER_SLOT_ALLOWANCE.as_millis() as u64
         + POOL_ACQUIRE_ALLOWANCE.as_millis() as u64
         + 2 * AUDIT_WRITE_TIMEOUT.as_millis() as u64
         + SLACK.as_millis() as u64,
 );
+const CALLER_SLOT_ALLOWANCE: Duration = Duration::from_secs(5);
 const POOL_ACQUIRE_ALLOWANCE: Duration = Duration::from_secs(5);
-const SLACK: Duration = Duration::from_secs(10);
+/// Covers the exec layer's 0.5 s timer slack past the statement ceiling.
+const SLACK: Duration = Duration::from_secs(5);
 
 /// OAuth / login routes: `/auth/callback` waits on the IdP code exchange,
 /// which `auth::oidc` bounds at 45 s.
@@ -135,9 +140,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mcp_timeout_outlasts_the_statement_ceiling_and_both_audit_writes() {
-        let floor = Duration::from_millis(u64::from(DEFAULT_STATEMENT_TIMEOUT_MS))
-            + 2 * AUDIT_WRITE_TIMEOUT;
+    fn mcp_timeout_outlasts_every_wait_a_call_stacks() {
+        let statement = Duration::from_millis(u64::from(DEFAULT_STATEMENT_TIMEOUT_MS) + 500);
+        let floor =
+            CALLER_SLOT_ALLOWANCE + POOL_ACQUIRE_ALLOWANCE + statement + 2 * AUDIT_WRITE_TIMEOUT;
         assert!(MCP_TIMEOUT > floor, "{MCP_TIMEOUT:?} <= {floor:?}");
+    }
+
+    /// Operator docs quote 75 s (and an 80 s drain built on it).
+    #[test]
+    fn mcp_timeout_is_the_documented_75_seconds() {
+        assert_eq!(MCP_TIMEOUT, Duration::from_secs(75));
     }
 }

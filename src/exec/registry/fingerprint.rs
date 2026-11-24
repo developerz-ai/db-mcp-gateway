@@ -33,6 +33,12 @@ impl Fingerprint {
         hash_password(database.write_password.as_ref(), &mut hasher);
         Self(hasher.finish())
     }
+
+    /// A fingerprint for registry tests that never open an adapter.
+    #[cfg(test)]
+    pub(super) fn of_test(value: u64) -> Self {
+        Self(value)
+    }
 }
 
 /// A literal is hashed by value: `Password`'s `Debug` redacts it, so two

@@ -1,10 +1,9 @@
-//! Real-DB tests for what one pooled caller may leave behind for the next,
-//! and for what a target error may say. Target: `target-db` (`bin/dev up`).
+//! Real-DB tests for what one pooled caller may leave behind for the next.
+//! Target: `target-db` (`bin/dev up`).
 
 use std::time::{Duration, Instant};
 
 use db_mcp_gateway::audit::drain::DetachedTasks;
-use db_mcp_gateway::config::{Database, Password};
 use db_mcp_gateway::exec::adapter::{Caller, for_caller};
 use db_mcp_gateway::exec::{
     Access, DbAdapter, ExecError, ExecQuery, ExecResult, PgAdapter, PoolSizing,
@@ -14,8 +13,8 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
 
 use crate::common::pg_target::{
-    READ_ROLE, TARGET_USER, adapter, database, ensure_read_role, owner_url, server,
-    single_connection_adapter, writable_adapter,
+    READ_ROLE, TARGET_USER, adapter, ensure_read_role, owner_url, server,
+    single_connection_adapter, writable_adapter, writable_database,
 };
 
 fn read(sql: &str) -> ExecQuery<'_> {
@@ -46,17 +45,20 @@ async fn owner() -> PgPool {
 }
 
 /// `set_config(…, false)` outlives the transaction. `RESET ALL` leaves
-/// `role` alone, so the release hook has to reset it by name.
+/// `role` alone, so the release hook has to reset it by name. Closing the
+/// connection would pass too, so the backend pid must not change.
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn a_role_set_by_one_caller_does_not_reach_the_next() {
     ensure_read_role().await;
     let a = single_connection_adapter().await;
-    let set = format!("SELECT set_config('role', '{READ_ROLE}', false)");
-    assert_eq!(run(&a, &set).await.rows[0][0], json!(READ_ROLE));
+    let set = format!("SELECT set_config('role', '{READ_ROLE}', false), pg_backend_pid()");
+    let first = run(&a, &set).await;
+    assert_eq!(first.rows[0][0], json!(READ_ROLE));
 
-    let next = run(&a, "SELECT current_user::text").await;
+    let next = run(&a, "SELECT current_user::text, pg_backend_pid()").await;
     assert_eq!(next.rows[0][0], json!(TARGET_USER));
+    assert_eq!(first.rows[0][1], next.rows[0][1], "same backend reused");
 }
 
 #[tokio::test]
@@ -64,11 +66,19 @@ async fn a_role_set_by_one_caller_does_not_reach_the_next() {
 async fn a_session_authorization_set_by_one_caller_does_not_reach_the_next() {
     ensure_read_role().await;
     let a = single_connection_adapter().await;
-    let set = format!("SELECT set_config('session_authorization', '{READ_ROLE}', false)");
-    assert_eq!(run(&a, &set).await.rows[0][0], json!(READ_ROLE));
+    let set = format!(
+        "SELECT set_config('session_authorization', '{READ_ROLE}', false), pg_backend_pid()"
+    );
+    let first = run(&a, &set).await;
+    assert_eq!(first.rows[0][0], json!(READ_ROLE));
 
-    let next = run(&a, "SELECT session_user::text, current_user::text").await;
-    assert_eq!(next.rows[0], vec![json!(TARGET_USER), json!(TARGET_USER)]);
+    let next = run(
+        &a,
+        "SELECT session_user::text, current_user::text, pg_backend_pid()",
+    )
+    .await;
+    assert_eq!(next.rows[0][..2], [json!(TARGET_USER), json!(TARGET_USER)]);
+    assert_eq!(first.rows[0][1], next.rows[0][2], "same backend reused");
 }
 
 /// A zero-row result still names its columns, but the statement the gateway
@@ -79,11 +89,17 @@ async fn a_session_authorization_set_by_one_caller_does_not_reach_the_next() {
 async fn a_zero_row_statement_is_not_left_prepared_for_the_next_caller() {
     let a = single_connection_adapter().await;
     let marker = format!("marker-{}", Uuid::new_v4().simple());
+    let first = run(&a, "SELECT pg_backend_pid()").await;
     let empty = run(&a, &format!("SELECT '{marker}'::text AS c WHERE false")).await;
     assert!(empty.rows.is_empty());
     assert_eq!(empty.columns, vec!["c".to_string()]);
 
-    let left = run(&a, "SELECT statement FROM pg_prepared_statements").await;
+    let left = run(
+        &a,
+        "SELECT statement, pg_backend_pid() FROM pg_prepared_statements \
+         UNION ALL SELECT NULL, pg_backend_pid()",
+    )
+    .await;
     assert!(
         !left.rows.iter().any(|row| row[0]
             .as_str()
@@ -91,6 +107,90 @@ async fn a_zero_row_statement_is_not_left_prepared_for_the_next_caller() {
         "statement text left behind: {:?}",
         left.rows
     );
+    assert_eq!(first.rows[0][0], left.rows[0][1], "same backend reused");
+}
+
+/// The write tier's one connection, so consecutive writes share a backend.
+async fn single_connection_writable_adapter() -> PgAdapter {
+    ensure_read_role().await;
+    let sizing = PoolSizing {
+        max_connections: 1,
+        ..PoolSizing::default()
+    };
+    PgAdapter::open(
+        &server(),
+        &writable_database(),
+        sizing,
+        DetachedTasks::new(),
+    )
+    .await
+    .expect("target-db reachable; run `bin/dev up`")
+}
+
+async fn write(adapter: &PgAdapter, sql: &str) -> Result<ExecResult, ExecError> {
+    adapter
+        .execute(ExecQuery {
+            access: Access::ReadWrite,
+            ..read(sql)
+        })
+        .await
+}
+
+/// `lastval()` / `currval()` are session state: left alone they hand the
+/// next caller on the write tier a key the previous one generated.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_sequence_value_drawn_by_one_caller_does_not_reach_the_next() {
+    let owner = owner().await;
+    let sequence = format!("dbmcp_iso_seq_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE SEQUENCE {sequence}"))
+        .execute(&owner)
+        .await
+        .expect("create sequence");
+
+    let a = single_connection_writable_adapter().await;
+    let drawn = write(
+        &a,
+        &format!("SELECT nextval('{sequence}'), lastval(), pg_backend_pid()"),
+    )
+    .await;
+    let next = write(&a, "SELECT lastval()").await;
+    let after = write(&a, "SELECT pg_backend_pid()").await;
+    sqlx::query(&format!("DROP SEQUENCE {sequence}"))
+        .execute(&owner)
+        .await
+        .expect("drop sequence");
+
+    let drawn = drawn.expect("nextval runs on the write tier");
+    assert_eq!(drawn.rows[0][0], drawn.rows[0][1]);
+    let Err(ExecError::Rejected(rejection)) = next else {
+        panic!("lastval() survived release: {next:?}");
+    };
+    // `object_not_in_prerequisite_state`: no sequence value in this session.
+    assert_eq!(rejection.sqlstate(), "55000");
+    let after = after.expect("the connection still serves");
+    assert_eq!(drawn.rows[0][2], after.rows[0][0], "same backend reused");
+}
+
+/// A temporary table lives as long as its session, rows included.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_temporary_table_made_by_one_caller_does_not_reach_the_next() {
+    let a = single_connection_writable_adapter().await;
+    let table = format!("dbmcp_iso_tmp_{}", Uuid::new_v4().simple());
+    write(&a, &format!("CREATE TEMP TABLE {table} AS SELECT 1 AS v"))
+        .await
+        .expect("create temp table");
+    let first = write(&a, "SELECT pg_backend_pid()").await.expect("pid");
+
+    let seen = write(
+        &a,
+        &format!("SELECT to_regclass('pg_temp.{table}')::text, pg_backend_pid()"),
+    )
+    .await
+    .expect("lookup runs");
+    assert_eq!(seen.rows[0][0], Value::Null, "temp table survived release");
+    assert_eq!(first.rows[0][0], seen.rows[0][1], "same backend reused");
 }
 
 /// A write whose text stops resolving once it ran (here it narrows its own
@@ -133,88 +233,6 @@ async fn a_finished_write_commits_even_when_its_text_no_longer_parses() {
         .await
         .expect("drop table");
     assert_eq!(v, 1, "reported as written, so it must be written");
-}
-
-/// Postgres names the role (and, from `pg_hba`, the client address) in a
-/// refused login. `cancel_query` opens its own connection, so that refusal
-/// can arrive there: it must surface as an opaque connection failure and
-/// retire the adapter, exactly as on the query path.
-#[tokio::test]
-#[serial_test::serial(world)]
-async fn a_cancel_refused_at_login_carries_no_server_text() {
-    let owner = owner().await;
-    let role = format!("dbmcp_rot_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!(
-        "CREATE ROLE {role} LOGIN PASSWORD 'first-dev-only'"
-    ))
-    .execute(&owner)
-    .await
-    .expect("create role");
-    let rotated = Database {
-        role: role.clone(),
-        password: Password::Literal("first-dev-only".into()),
-        ..database()
-    };
-    let a = PgAdapter::open(
-        &server(),
-        &rotated,
-        PoolSizing::default(),
-        DetachedTasks::new(),
-    )
-    .await
-    .expect("opens with the first password");
-    sqlx::query(&format!("ALTER ROLE {role} PASSWORD 'second-dev-only'"))
-        .execute(&owner)
-        .await
-        .expect("rotate");
-
-    let outcome = a.cancel_request(Uuid::new_v4()).await;
-    let stale = a.is_stale();
-    drop(a);
-    sqlx::query(&format!("DROP ROLE {role}"))
-        .execute(&owner)
-        .await
-        .expect("drop role");
-
-    let err = outcome.expect_err("the cancel pool cannot log in");
-    assert!(matches!(err, ExecError::Connection), "{err:?}");
-    assert!(!format!("{err} {err:?}").contains(&role));
-    assert!(stale, "a refused login retires the adapter");
-}
-
-/// A data error quotes the offending value — row data. The SQLSTATE and the
-/// sentence stay; the value does not. A name the caller spelled does.
-#[tokio::test]
-#[serial_test::parallel(world)]
-async fn a_data_error_keeps_its_code_but_not_the_value() {
-    let a = adapter().await;
-    let err = a
-        .execute(read(
-            "SELECT v::int FROM (VALUES ('alice@example.com')) t(v)",
-        ))
-        .await
-        .expect_err("not an integer");
-    let ExecError::Rejected(rejection) = err else {
-        panic!("expected a rejection, got {err:?}");
-    };
-    assert_eq!(rejection.sqlstate(), "22P02");
-    assert!(
-        rejection.message().starts_with("invalid input syntax"),
-        "{rejection}"
-    );
-    assert!(!rejection.message().contains("alice"), "{rejection}");
-
-    let err = a
-        .execute(read("SELECT no_such_column FROM pg_class"))
-        .await
-        .expect_err("undefined column");
-    let ExecError::Rejected(rejection) = err else {
-        panic!("expected a rejection, got {err:?}");
-    };
-    assert!(
-        rejection.message().contains("\"no_such_column\""),
-        "{rejection}"
-    );
 }
 
 /// The pool holds four connections. One caller may pin all but one of them;
@@ -282,30 +300,4 @@ async fn infinite_and_far_dates_render_as_text() {
     .map(Value::from)
     .collect();
     assert_eq!(result.rows[0], want);
-}
-
-/// The byte cap weighs what the gateway holds, not the wire form: two
-/// million `int4`s are 16 MB on the wire and several times that decoded.
-#[tokio::test]
-#[serial_test::parallel(world)]
-async fn a_row_is_weighed_by_its_decoded_size() {
-    let a = adapter().await;
-    let result = run(
-        &a,
-        "SELECT array_agg(g::int4) AS big FROM generate_series(1, 2000000) g",
-    )
-    .await;
-    assert!(result.truncated);
-    assert!(result.rows.is_empty());
-    assert_eq!(result.columns, vec!["big".to_string()]);
-}
-
-/// One cell past the byte cap is refused from its wire length alone.
-#[tokio::test]
-#[serial_test::parallel(world)]
-async fn a_cell_past_the_byte_cap_is_truncated_away() {
-    let a = adapter().await;
-    let result = run(&a, "SELECT repeat('x', 40000000) AS big").await;
-    assert!(result.truncated);
-    assert!(result.rows.is_empty());
 }

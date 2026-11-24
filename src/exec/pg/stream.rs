@@ -11,12 +11,12 @@ use super::super::adapter::ExecError;
 use super::super::budget::ResultBudget;
 use super::super::query::ExecQuery;
 use super::super::sql_guard::Access;
-use super::decode::{decode_row, decoders};
+use super::decode::{RowWeight, decode_row, decoders};
 use super::error::classify;
 
 /// A row at least this big on the wire decodes under the adapter's
-/// large-row gate. Decoding copies the row, and a JSON cell can decode to
-/// many times its wire size before the byte cap sees it.
+/// large-row gate. Decoding copies the row, and an array can decode to
+/// several times its wire size before the byte cap sees it.
 const LARGE_ROW_BYTES: usize = 1024 * 1024;
 
 /// How many large rows one adapter decodes at a time.
@@ -59,7 +59,7 @@ pub(super) async fn stream_rows(
     // `rows_affected` — alongside its rows.
     let mut stream = (&mut **tx).fetch_many(sqlx_query);
     while let Some(item) = stream.next().await {
-        let row = match item.map_err(|e| classify(e, role))? {
+        let row = match item.map_err(|e| classify(e, role, query.sql))? {
             Either::Left(done) => {
                 collected.rows_affected += done.rows_affected();
                 continue;
@@ -90,12 +90,15 @@ pub(super) async fn stream_rows(
             } else {
                 None
             };
-            let decoded = decode_row(&row, &decoders_for_rows);
-            let fits = budget.admit(&decoded);
-            if fits {
-                collected.rows.push(decoded);
+            // A JSON cell is weighed while it is parsed; every other type is
+            // bounded by its wire size and weighed once decoded.
+            match decode_row(&row, &decoders_for_rows, RowWeight::new(&budget)) {
+                Ok(decoded) if budget.admit(&decoded) => {
+                    collected.rows.push(decoded);
+                    true
+                }
+                _ => false,
             }
-            fits
         };
         if !admitted {
             collected.truncated = true;

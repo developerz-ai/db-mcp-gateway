@@ -16,8 +16,8 @@ use db_mcp_gateway::state::oauth::{self as db, NewRefreshToken};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-const CHAIN_TTL: Duration = Duration::from_secs(24 * 3600);
-const SESSION_TTL: Duration = Duration::from_secs(3600);
+pub(crate) const CHAIN_TTL: Duration = Duration::from_secs(24 * 3600);
+pub(crate) const SESSION_TTL: Duration = Duration::from_secs(3600);
 
 pub(crate) fn identity(sub: &str) -> GrantIdentity {
     GrantIdentity {
@@ -27,12 +27,12 @@ pub(crate) fn identity(sub: &str) -> GrantIdentity {
     }
 }
 
-fn token() -> String {
+pub(crate) fn token() -> String {
     format!("tok-{}", Uuid::new_v4().simple())
 }
 
 /// Zero cache TTL: every lookup re-reads the DB, so asserts see committed state.
-fn session_store(pool: &PgPool) -> SessionStore {
+pub(crate) fn session_store(pool: &PgPool) -> SessionStore {
     SessionStore::with_cache_config(
         pool.clone(),
         SessionCacheConfig {
@@ -96,7 +96,9 @@ pub(crate) async fn cleanup_sub(pool: &PgPool, sub: &str, chains: &[Uuid]) {
 
 /// A refresh rotation of `sub`'s chain run statement for statement as
 /// `RefreshTokens::rotate` runs it, but held open before its commit so a
-/// test can start a revocation in the middle of it.
+/// test can start a revocation in the middle of it. That the production
+/// rotation takes these locks itself is pinned in
+/// `oauth_grant_locks_real_db`, which blocks the real call on a held lock.
 pub(crate) struct InFlightRotation {
     tx: Transaction<'static, Postgres>,
     pid: i32,

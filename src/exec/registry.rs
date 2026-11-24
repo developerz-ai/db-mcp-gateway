@@ -1,14 +1,18 @@
-//! [`AdapterRegistry`]: one lazily-opened adapter per `(server, database)`,
-//! replaced when it goes stale and not re-opened while its target is down.
+//! [`AdapterRegistry`]: one lazily-opened adapter per `(server, database)`
+//! and config snapshot, replaced when it goes stale and not re-opened while
+//! its target is down.
 
 mod fingerprint;
+mod slot;
+#[cfg(test)]
+mod tests;
 
 use std::collections::HashMap;
 use std::hash::RandomState;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use tokio::sync::{Mutex, OnceCell, RwLock};
+use tokio::sync::RwLock;
 
 use crate::audit::drain::DetachedTasks;
 use crate::config::{Database, Server, ServerKind};
@@ -19,53 +23,23 @@ use super::pg::PgAdapter;
 use super::pool_sizing::PoolSizing;
 use super::redis::RedisAdapter;
 use fingerprint::Fingerprint;
+use slot::Slot;
 
 /// How long a failed open is remembered. Opening a dead target costs up to
 /// the pool acquire timeout; without this every request to it would pay that
 /// again while holding a global request permit.
 const FAILED_OPEN_TTL: Duration = Duration::from_secs(5);
 
+/// How long a slot opened from other settings outlives its last lookup. A
+/// request carries its config snapshot for at most `transport::MCP_TIMEOUT`,
+/// so past this no straggler from before a reload can still ask for it.
+const SNAPSHOT_LIFETIME: Duration = Duration::from_secs(300);
+
 /// Composite key for the registry: `(server.name, database.name)`.
 type AdapterKey = (String, String);
-type AdapterMap = HashMap<AdapterKey, Arc<Slot>>;
-
-/// One lazily-opened adapter slot.
-///
-/// The map stores a `OnceCell` rather than a ready adapter so the connect
-/// happens *outside* the map lock: callers take the lock only long enough to
-/// hand out the slot, then race to initialize it. `OnceCell` gives
-/// single-flight semantics — concurrent callers for the same key share one
-/// open attempt instead of stampeding the DB — and a failed attempt leaves
-/// the cell empty, so a later caller retries once [`FAILED_OPEN_TTL`] has
-/// passed (matching the lazy "misconfigured DB errors on use, not at boot"
-/// contract).
-///
-/// `fingerprint` is the config the slot opens from. A caller whose config
-/// differs gets a fresh slot instead, so an open started from a config
-/// snapshot taken before a reload can never become the adapter later callers
-/// on the new config are served from.
-struct Slot {
-    fingerprint: Fingerprint,
-    adapter: OnceCell<Arc<dyn DbAdapter>>,
-    failed_at: Mutex<Option<Instant>>,
-}
-
-impl Slot {
-    fn new(fingerprint: Fingerprint) -> Self {
-        Self {
-            fingerprint,
-            adapter: OnceCell::new(),
-            failed_at: Mutex::new(None),
-        }
-    }
-
-    async fn recently_failed(&self) -> bool {
-        self.failed_at
-            .lock()
-            .await
-            .is_some_and(|at| at.elapsed() < FAILED_OPEN_TTL)
-    }
-}
+/// One slot per config fingerprint seen for the key. Normally one; a reload
+/// briefly leaves the pre-reload snapshot's slot beside the new one.
+type AdapterMap = HashMap<AdapterKey, Vec<Arc<Slot>>>;
 
 /// Per-`(server, database)` adapter registry. Hands out `Arc<dyn DbAdapter>`
 /// keyed on `(server.name, database.name)` so a slow query on DB A can never
@@ -90,7 +64,7 @@ impl std::fmt::Debug for AdapterRegistry {
         // Adapter `Debug` impls already redact connection strings; print
         // structural info only in case a future impl regresses.
         f.debug_struct("AdapterRegistry")
-            .field("adapters", &"<RwLock<HashMap<(server, db), Slot>>>")
+            .field("adapters", &"<RwLock<HashMap<(server, db), Vec<Slot>>>>")
             .finish()
     }
 }
@@ -150,7 +124,7 @@ impl AdapterRegistry {
                     }
                     let opened = open(server, database, &self.detached).await;
                     if opened.is_err() {
-                        *slot.failed_at.lock().await = Some(Instant::now());
+                        slot.record_failure().await;
                     }
                     opened
                 })
@@ -159,7 +133,7 @@ impl AdapterRegistry {
         }
     }
 
-    /// Drop the adapter for `(server, database)`. The next lookup opens a
+    /// Drop every adapter for `(server, database)`. The next lookup opens a
     /// fresh one; callers already holding the old adapter finish their work
     /// on it, and its pools close when the last of them lets go. Used by
     /// config reload and stale-credential replacement.
@@ -170,42 +144,50 @@ impl AdapterRegistry {
             .remove(&(server.to_string(), database.to_string()));
     }
 
-    /// The slot for `key` opened from `fingerprint`, created if absent or
-    /// replaced if it was opened from other settings. Read first — the
-    /// steady-state hit — and take the write lock only to create or replace
-    /// a slot. Neither guard outlives this call.
+    /// The slot for `key` opened from `fingerprint`, created if absent.
+    /// Read first — the steady-state hit — and take the write lock only to
+    /// create a slot or retire a sibling. Neither guard outlives this call.
     ///
-    /// A caller on the other side of a reload replaces the slot back; callers
-    /// already holding either adapter finish on it. The swaps stop once no
-    /// request carries the old snapshot.
+    /// Each fingerprint keeps its own slot, so requests on either side of a
+    /// reload never replace each other's adapter (which would open a pool per
+    /// switch and split each caller's share across them). The side no request
+    /// asks for any more retires after [`SNAPSHOT_LIFETIME`].
     async fn slot(&self, key: &AdapterKey, fingerprint: Fingerprint) -> Arc<Slot> {
-        if let Some(slot) = self.inner.read().await.get(key)
-            && slot.fingerprint == fingerprint
+        if let Some(slots) = self.inner.read().await.get(key)
+            && let Some(slot) = slots.iter().find(|s| s.fingerprint == fingerprint)
         {
-            return Arc::clone(slot);
+            slot.touch();
+            if !slot::has_retired(slots, fingerprint, SNAPSHOT_LIFETIME) {
+                return Arc::clone(slot);
+            }
         }
         // Another task may have inserted a matching slot while we waited for
-        // the write lock; keep it rather than replacing it.
+        // the write lock; keep it rather than adding a second.
         let mut map = self.inner.write().await;
-        let slot = map
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(Slot::new(fingerprint)));
-        if slot.fingerprint != fingerprint {
-            *slot = Arc::new(Slot::new(fingerprint));
-        }
-        Arc::clone(slot)
+        let slots = map.entry(key.clone()).or_default();
+        slot::retire(slots, fingerprint, SNAPSHOT_LIFETIME);
+        let slot = match slots.iter().find(|s| s.fingerprint == fingerprint) {
+            Some(slot) => Arc::clone(slot),
+            None => {
+                let slot = Arc::new(Slot::new(fingerprint));
+                slots.push(Arc::clone(&slot));
+                slot
+            }
+        };
+        slot.touch();
+        slot
     }
 
-    /// Remove `slot` from the map only if it is still the one there, so two
-    /// callers that both saw the stale adapter evict it once, not the fresh
-    /// replacement the first of them opened.
+    /// Remove `slot` only if it is still the one there, so two callers that
+    /// both saw the stale adapter evict it once, not the fresh replacement
+    /// the first of them opened.
     async fn evict_slot(&self, key: &AdapterKey, slot: &Arc<Slot>) {
         let mut map = self.inner.write().await;
-        if map
-            .get(key)
-            .is_some_and(|current| Arc::ptr_eq(current, slot))
-        {
-            map.remove(key);
+        if let Some(slots) = map.get_mut(key) {
+            slots.retain(|current| !Arc::ptr_eq(current, slot));
+            if slots.is_empty() {
+                map.remove(key);
+            }
         }
     }
 }

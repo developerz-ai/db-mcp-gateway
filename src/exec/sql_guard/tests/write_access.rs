@@ -160,6 +160,25 @@ fn write_mode_still_blocks_denied_functions() {
     );
 }
 
+/// `pg_settings` carries an `UPDATE` rule that calls `set_config` — a
+/// session change that outlives the statement on a pooled connection.
+#[test]
+fn write_mode_rejects_updating_pg_settings() {
+    for sql in [
+        "UPDATE pg_settings SET setting = 'x' WHERE name = 'role'",
+        "UPDATE pg_catalog.pg_settings s SET setting = 'off' WHERE s.name = 'jit'",
+        "UPDATE ONLY PG_SETTINGS SET setting = 'x'",
+        "UPDATE ONLY (pg_catalog.pg_settings) SET setting = 'x'",
+        r#"UPDATE "pg_settings" SET setting = 'x'"#,
+        "EXPLAIN UPDATE pg_settings SET setting = 'x'",
+    ] {
+        rejected_write_denied(sql, "set_config");
+    }
+    ok_write("UPDATE t SET v = s.setting FROM pg_settings s WHERE s.name = t.name");
+    ok_write("UPDATE my_pg_settings SET setting = 'x'");
+    ok_write("UPDATE ONLY t SET v = 1");
+}
+
 #[test]
 fn write_mode_rejects_write_hidden_in_select_body() {
     // Write mode widens to a *top-level* INSERT/UPDATE/DELETE only. A write

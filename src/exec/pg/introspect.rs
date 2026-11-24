@@ -97,10 +97,10 @@ pub(super) async fn cancel_request(
     let pattern = format!("{}%", BackendTag::request_prefix(request_id));
     let cancel = sqlx::query(CANCEL_BY_TAG_SQL).bind(pattern).fetch_one(conn);
     let row = match tokio::time::timeout(CANCEL_TIMEOUT, cancel).await {
-        Ok(row) => row.map_err(|err| classify(err, role))?,
+        Ok(row) => row.map_err(|err| classify(err, role, ""))?,
         Err(_elapsed) => return Err(ExecError::Timeout),
     };
-    let signalled: i64 = row.try_get(0).map_err(|err| classify(err, role))?;
+    let signalled: i64 = row.try_get(0).map_err(|err| classify(err, role, ""))?;
     Ok(signalled > 0)
 }
 

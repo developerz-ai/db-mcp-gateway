@@ -36,13 +36,17 @@ fn denied_function_in_attribute_notation_rejected() {
         ),
         ("SELECT ('http://x'::text).http_get", "http_get"),
         ("SELECT ((1).lo_creat)", "lo_*"),
+        ("SELECT (r).invoke FROM r", "invoke"),
+        ("SELECT (t.v).pg_notify FROM t", "pg_notify"),
     ] {
         denied_as(sql, want);
     }
 }
 
 /// `row.f` passes the whole row: a subquery shaped like the argument's
-/// composite type is enough to call a one-argument function.
+/// composite type is enough to call a one-argument function. Exact names
+/// are refused here only when the function takes one row (`http`); a family
+/// is refused whatever it takes, since it also stands for names not listed.
 #[test]
 fn denied_function_as_qualified_column_rejected() {
     for (sql, want) in [
@@ -50,15 +54,38 @@ fn denied_function_as_qualified_column_rejected() {
             "SELECT r.http FROM (SELECT 'GET', 'http://x', NULL, NULL, NULL) r",
             "http",
         ),
-        ("SELECT t.pg_notify FROM t", "pg_notify"),
-        ("SELECT s.t.set_config FROM s.t", "set_config"),
+        ("SELECT t.HTTP FROM t", "http"),
         (
             "SELECT 1 FROM t ORDER BY t.pg_advisory_lock",
             "pg_advisory_*",
         ),
+        ("SELECT t.pgr_dijkstra FROM t", "pgr_*"),
     ] {
         denied_as(sql, want);
     }
+}
+
+/// Three or more parts: `t.col.f` is `f(t.col)` — a call with the
+/// column's value, which any one-argument function accepts.
+#[test]
+fn denied_function_after_a_column_rejected() {
+    for (sql, want) in [
+        ("SELECT s.t.set_config FROM s.t", "set_config"),
+        ("SELECT t.x.pg_ls_dir FROM t", "pg_ls_dir"),
+        ("SELECT t.url.http_get FROM t", "http_get"),
+        ("SELECT t.fn.invoke FROM t", "invoke"),
+    ] {
+        denied_as(sql, want);
+    }
+}
+
+/// `alias.name` can only call `name` with the alias's whole row; an exact
+/// entry no single row can be passed to is an ordinary column there.
+#[test]
+fn qualified_column_named_like_a_multi_argument_function_allowed() {
+    ok("SELECT r.invoke, t.pg_notify, t.set_config FROM r JOIN t ON true");
+    ok("SELECT t.pg_read_file, t.http_get, t.schedule FROM t");
+    ok("SELECT 1 FROM t WHERE t.setseed > 0 ORDER BY t.ts_stat");
 }
 
 #[test]

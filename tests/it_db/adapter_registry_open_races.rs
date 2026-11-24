@@ -2,7 +2,8 @@
 //!
 //! - a request still holding the pre-reload config snapshot reaches the
 //!   registry after the reload evicted the slot. Its open (old role) must not
-//!   become the adapter later requests on the new config are served from;
+//!   become the adapter later requests on the new config are served from,
+//!   nor replace the one they are already served from;
 //! - callers queued on one open of a dead target must share that failure,
 //!   not each run their own open back to back.
 //!
@@ -79,6 +80,43 @@ async fn adapter_opened_from_a_pre_reload_snapshot_is_not_served_after_it() {
         std::sync::Arc::ptr_eq(&next, &again),
         "the new-config adapter is reused once open"
     );
+}
+
+/// Old and new snapshots interleaving after a reload each keep one adapter:
+/// the straggler never replaces the new config's pool (which would open a
+/// second pool and split every caller's share across the two), and neither
+/// side opens a pool per lookup.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn interleaved_old_and_new_snapshots_never_replace_each_others_adapter() {
+    pg_target::ensure_read_role().await;
+    let server: Server = pg_target::server();
+    let before = pg_target::database();
+    let after = narrowed(&before);
+    let registry = AdapterRegistry::new();
+
+    registry.get_or_open(&server, &before).await.expect("opens");
+    registry.evict(&server.name, &before.name).await;
+    let next = registry.get_or_open(&server, &after).await.expect("opens");
+    let straggler = registry.get_or_open(&server, &before).await.expect("opens");
+    assert_eq!(current_user(straggler.as_ref()).await, TARGET_USER);
+
+    for round in 0..3 {
+        let new_side = registry.get_or_open(&server, &after).await.expect("cached");
+        assert!(
+            std::sync::Arc::ptr_eq(&next, &new_side),
+            "round {round}: an old-snapshot lookup replaced the new config's adapter"
+        );
+        let old_side = registry
+            .get_or_open(&server, &before)
+            .await
+            .expect("cached");
+        assert!(
+            std::sync::Arc::ptr_eq(&straggler, &old_side),
+            "round {round}: the old snapshot opened another pool"
+        );
+    }
+    assert_eq!(current_user(next.as_ref()).await, READ_ROLE);
 }
 
 #[tokio::test]

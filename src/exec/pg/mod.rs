@@ -40,6 +40,7 @@ mod error;
 mod explain;
 mod introspect;
 mod methods;
+mod redact;
 mod release;
 mod run;
 mod sample;

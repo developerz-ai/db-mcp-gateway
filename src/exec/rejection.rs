@@ -2,11 +2,11 @@
 //!
 //! An agent can only fix a query it was told what is wrong with: 11 % of
 //! measured `run_query` calls were syntax errors that all surfaced as one
-//! opaque code (plan 101, 01 finding 6). So a statement-level database error
-//! keeps its SQLSTATE and the server's primary message. Connect-phase errors
-//! never become a [`DbRejection`] — they can name the role, host or
-//! authentication method — and the message has the configured role name
-//! redacted before it leaves the adapter.
+//! opaque code. So a statement-level database error keeps its SQLSTATE and a
+//! gateway-worded message keyed by it, naming only identifiers the caller's
+//! own SQL spelled (`pg/redact.rs`) — the server's text can carry row data.
+//! Connect-phase errors never become a [`DbRejection`]: they can name the
+//! role, host or authentication method.
 
 use std::fmt;
 

@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use super::refresh_chain::chain_expired;
-use super::refresh_db::{NewDbToken, revoke_paired, revoke_reused_chain, store_db};
+use super::refresh_db::{NewDbToken, end_chain, revoke_paired, revoke_reused_chain, store_db};
 use super::refresh_tokens::RefreshBackend;
 use super::{GrantIdentity, RefreshToken, RefreshTokens, hash_secret};
 use crate::auth::session::is_service_subject;
@@ -124,8 +124,11 @@ impl RefreshTokens {
         }))
     }
 
-    /// RFC 7009 for a refresh token: end the chain and revoke the paired
-    /// session. `Ok(false)` when `presented` is not a live refresh token.
+    /// RFC 7009 for a refresh token: end its chain and revoke the paired
+    /// session. A token a rotation has already consumed still names its
+    /// chain, so a revoke that loses the race to a rotation ends the pair
+    /// that rotation minted. `Ok(false)` when `presented` was never a refresh
+    /// token of a chain that is still live.
     pub async fn revoke(
         &self,
         sessions: &SessionStore,
@@ -141,10 +144,16 @@ impl RefreshTokens {
             return Ok(true);
         };
         let mut tx = pool.begin().await?;
-        let Some(row) = db::take_refresh_token(&mut *tx, &hash_secret(presented)).await? else {
+        let presented_hash = hash_secret(presented);
+        let chain = match db::live_chain(&mut *tx, &presented_hash).await? {
+            Some(chain) => Some(chain),
+            // No grace: unlike a replay at `/token`, this asks for the end.
+            None => db::rotated_chain(&mut *tx, &presented_hash, chrono::Duration::zero()).await?,
+        };
+        let Some((sub, chain_id)) = chain else {
             return Ok(false);
         };
-        let revoked = revoke_paired(&mut tx, row.session_id.map(SessionId::from)).await?;
+        let revoked = end_chain(&mut tx, &sub, chain_id).await?;
         tx.commit().await?;
         sessions.committed(None, &revoked).await;
         Ok(true)

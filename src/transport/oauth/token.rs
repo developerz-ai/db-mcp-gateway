@@ -67,7 +67,8 @@ async fn token_authorization_code(state: &OAuthState, form: TokenForm) -> Respon
         );
     };
 
-    // One-time: take() removes the code so a replay finds nothing.
+    // One-time: take() removes the code so a replay finds nothing, and every
+    // refusal below for what the client sent leaves it consumed.
     let Some(entry) = auth.codes.take(code).await else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -125,6 +126,7 @@ async fn token_authorization_code(state: &OAuthState, form: TokenForm) -> Respon
         .await
         .is_err()
     {
+        auth.codes.restore(code, entry).await;
         return oauth_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "server_error",
@@ -132,8 +134,17 @@ async fn token_authorization_code(state: &OAuthState, form: TokenForm) -> Respon
         );
     }
 
-    // Fresh authorization → fresh session + refresh-token chain.
-    token_response(auth.issue_tokens(entry.identity, random_token()).await)
+    // Fresh authorization → fresh session + refresh-token chain. The identity
+    // is cloned so a failed mint can hand the code back.
+    let issued = auth
+        .issue_tokens(entry.identity.clone(), random_token())
+        .await;
+    if issued.is_err() {
+        // Both failures answer a retryable 503 with nothing issued, so the
+        // code — proven by PKCE to be this client's — is put back for it.
+        auth.codes.restore(code, entry).await;
+    }
+    token_response(issued)
 }
 
 async fn token_refresh(auth: &AuthFacade, form: TokenForm) -> Response {
@@ -195,3 +206,7 @@ fn token_response(issued: Result<IssuedTokens, AuthError>) -> Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+#[path = "token_tests.rs"]
+mod tests;
