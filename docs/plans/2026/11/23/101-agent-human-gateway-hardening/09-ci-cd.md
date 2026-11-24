@@ -23,7 +23,7 @@ Measured (110 runs): PR p50/p95 159/424 s; `test` 147 warm (run ~87, compile ~28
 | C13 | b | `release-smoke`: boot with a state DB, `/healthz` 200, `/mcp` 401; both registries | |
 | C14 | b | `load-gate` out of `weekly`, 2-of-3; digest-pin compose images; docs-only main pushes skip Rust | ~700 runner-s |
 | C15 | a | Dependabot security group for `/website` (`applies-to: security-updates`); website gate = `npm ci && build`, not `bin/check` | ends 1-PR-per-package |
-| C16 | owner | SET-1..SET-5 | |
+| C16 | owner | repository settings (private notes) | |
 
 Not now: sccache, nextest archive, single build job (warm compile is 28 s).
 

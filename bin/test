@@ -132,4 +132,15 @@ if (( up_rc != 0 )); then
   exit "$up_rc"
 fi
 
-run_tests --all-targets --all-features "$@"
+# `--all-targets` wins over a target selector, so `--test smoke` would run
+# everything: pass it only when the caller selected no target.
+targets=(--all-targets)
+for arg in "$@"; do
+  case "$arg" in
+    --) break ;;
+    --lib|--bins|--bin|--bin=*|--tests|--test|--test=*|--examples|--example|--example=*|--benches|--bench|--bench=*|--doc)
+      targets=() ;;
+  esac
+done
+
+run_tests "${targets[@]}" --all-features "$@"

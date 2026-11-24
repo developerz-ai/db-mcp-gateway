@@ -18,7 +18,7 @@ Every agent-facing error carries a `request_id`; it matches `audit_calls.request
 
 ### GatewayAuditUnavailable
 
-**Means.** Tool calls were answered `audit_unavailable`: the state DB refused the intent row or the completion row. Audit is synchronous (MUST #4), so agents are getting no answers. Severity critical. It keeps firing for 15m after the last refusal: it reads `audit_last_failure_timestamp{kind="write"}`, which the gateway stamps on every refusal, so a refusal before Prometheus first saw the pod (which `increase()` cannot see) still fires, however late that first scrape. A resolve means no refusal for 15m.
+**Means.** Tool calls were answered `audit_unavailable`: the state DB refused the intent row or the completion row. Audit is synchronous (MUST #4), so agents are getting no answers. Severity critical. It keeps firing for 15m after the last refusal: it reads `audit_last_failure_timestamp{kind="write"}`, which the gateway stamps on every refusal, so a refusal before Prometheus first saw the pod (which `increase()` cannot see) still fires, as long as that scrape comes within the 15m. A stamp from a fast gateway clock never extends that: over 60 s in the future it is ignored, and one already visible 15m ago is dropped; a clock more than 15m off leaves only the 5m `increase()` clause. Covers MCP tool calls only: an admin API request refused because its `permissions_audit` write failed (also `audit_unavailable`, HTTP 503) neither counts nor stamps here.
 
 **First checks.**
 - `/readyz` on each replica (`503` = the state DB does not answer `SELECT 1` in 2 s).

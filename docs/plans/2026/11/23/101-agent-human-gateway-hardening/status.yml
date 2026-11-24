@@ -18,7 +18,7 @@ slices:
   - {file: 09-ci-cd.md, status: in_progress, percent: 90, note: "#381 incl. wave b (C10-C14); owner: repo settings (private notes)"}
   - {file: 10-dev-experience.md, status: in_progress, percent: 95, note: "X8 done in the final wave: root CLAUDE.md under 10 KB, scoped files, drift tests"}
   - {file: 11-repo-cleanup.md, status: in_progress, percent: 95, note: "dead-API row done in the final wave except is_read_only, which rides with H2; authz::evaluate and insert_rotated have integration-test callers and stay, TlsConfig::is_enabled gained a production caller"}
-  - {file: 12-tests.md, status: in_progress, percent: 95, note: "#381 + final wave: sentry_scrub/redact_role proptests, injectable Redis acquire timeout, one mock IdP and config builder"}
+  - {file: 12-tests.md, status: in_progress, percent: 95, note: "#381 + final wave: sentry_scrub/redact_role proptests, injectable Redis acquire timeout, one mock IdP; config builder partial: ha_login_e2e, oauth_client_ttl_e2e and oauth_refresh_bounds_e2e still build AuthConfig/Config by hand"}
 decisions:
   - {date: 2026-11-23, by: sebi, rows: [H3, H4, H6], decision: "accept recommendations"}
   - {date: 2026-11-23, by: sebi, rows: [H7], decision: "MSRV 1.94.1 yes"}

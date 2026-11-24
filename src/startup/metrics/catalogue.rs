@@ -79,7 +79,7 @@ pub(crate) const CATALOGUE: &[Metric] = &[
         "audit_last_failure_timestamp",
         Gauge,
         &["kind"],
-        "Unix seconds of the last failed audit write (write: answered audit_unavailable; fallback: the disconnect-path retry).",
+        "Unix seconds of the last failed audit write of an MCP tool call (write: answered audit_unavailable; fallback: the disconnect-path retry).",
     ),
     metric(
         "audit_abandoned_total",

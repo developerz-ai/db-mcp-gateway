@@ -53,6 +53,7 @@ service_accounts:
 struct Fixture {
     gw: LoggedInGateway,
     account: String,
+    target: sqlx::PgPool,
 }
 
 impl Fixture {
@@ -64,7 +65,14 @@ impl Fixture {
             groups: vec!["inspectors".into()],
         };
         let gw = spawn_logged_in(&yaml(&account), user).await;
-        Self { gw, account }
+        let target = sqlx::PgPool::connect(&crate::common::env::target_db_url())
+            .await
+            .expect("target db reachable");
+        Self {
+            gw,
+            account,
+            target,
+        }
     }
 
     fn service_sub(&self) -> String {
@@ -93,7 +101,8 @@ impl Fixture {
     }
 
     /// The request id of `user_sub`'s in-flight `run_query` under `run`
-    /// (`None` = no run claimed), from its intent row.
+    /// (`None` = no run claimed), once its statement is active on the target:
+    /// the intent row commits before the pool opens.
     async fn running_request_id(&self, user_sub: &str, run: Option<&str>) -> String {
         for _ in 0..50 {
             let found: Option<String> = sqlx::query_scalar(
@@ -107,12 +116,29 @@ impl Fixture {
             .fetch_optional(&self.gw.state_db)
             .await
             .unwrap();
-            if let Some(id) = found {
+            if let Some(id) = found
+                && self.active_on_target(&id).await
+            {
                 return id;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        panic!("the slow query never recorded its intent");
+        panic!("the slow query never ran on the target");
+    }
+
+    /// Whether a target backend tagged with `request_id` is running
+    /// [`SLOW_SQL`].
+    async fn active_on_target(&self, request_id: &str) -> bool {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT FROM pg_stat_activity \
+             WHERE state = 'active' AND query = $1 \
+               AND starts_with(application_name, 'dbmcp-' || replace($2, '-', '')))",
+        )
+        .bind(SLOW_SQL)
+        .bind(request_id)
+        .fetch_one(&self.target)
+        .await
+        .unwrap()
     }
 
     /// The outcome and claimed run of the completion row for `request_id`.

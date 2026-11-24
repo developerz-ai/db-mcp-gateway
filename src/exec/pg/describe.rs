@@ -49,13 +49,16 @@ pub(super) async fn describe_read(
             if !matches!(refused, ExecError::Sql) {
                 return Err(refused);
             }
-            let wrapper = match recast::row_description(tx, query, params).await {
-                Ok(columns) => recast::text_cast_sql(tx, query, params, &columns).await,
-                Err(err) => Err(err),
-            };
-            return match wrapper {
+            return match fallback_wrapper(tx, query, params).await {
                 Ok(Some(wrapper)) => described_recast(tx, wrapper, &types, origin).await,
-                _ => Err(refused),
+                Ok(None) => Err(refused),
+                // The fallback's own timeout, cancel, lost connection or
+                // refusal of the caller's statement says more than the
+                // driver's opaque lookup failure.
+                Err(err) => match unpositioned(classify(err, origin, "")) {
+                    ExecError::Sql => Err(refused),
+                    own => Err(own),
+                },
             };
         }
     };
@@ -85,6 +88,17 @@ pub(super) async fn describe_read(
         Ok(Some(wrapper)) => described_recast(tx, wrapper, &types, origin).await,
         Err(err) => Err(unpositioned(classify(err, origin, ""))),
     }
+}
+
+/// The text-cast wrapper of a read the driver cannot describe, or `None`
+/// when no column of it needs the cast.
+async fn fallback_wrapper(
+    tx: &mut Transaction<'_, Postgres>,
+    query: &ExecQuery<'_>,
+    params: &[QueryParam],
+) -> Result<Option<String>, sqlx::Error> {
+    let columns = recast::row_description(tx, query, params).await?;
+    recast::text_cast_sql(tx, query, params, &columns).await
 }
 
 async fn described_recast(

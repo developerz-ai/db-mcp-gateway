@@ -448,7 +448,7 @@ Names are fixed — dashboards and alerts are written against them. No label car
 | `query_duration_seconds` | histogram (fixed buckets 5 ms – 60 s) | `tool`, `db` (empty when the call named no configured database) |
 | `audit_write_duration_seconds` | histogram (fixed buckets 1 ms – 5 s) | — |
 | `audit_fallback_failures_total` | counter | — (a disconnect-path audit write failed; the row exists only once the reaper records it) |
-| `audit_last_failure_timestamp` | gauge (unix seconds) | `kind` (`write`: a call answered `audit_unavailable`; `fallback`: a disconnect-path write failed) — absent until that kind's first failure since boot, and an hour after its last; the audit alerts read how recent it is, which a pod first scraped after the failure still shows |
+| `audit_last_failure_timestamp` | gauge (unix seconds) | `kind` (`write`: an MCP tool call answered `audit_unavailable`; `fallback`: its disconnect-path write failed) — not stamped by admin API (`permissions_audit`) failures; absent until that kind's first failure since boot, and an hour after its last; the audit alerts read how recent it is, which a pod first scraped after the failure still shows |
 | `audit_abandoned_total` | counter | — (intents the reaper recorded as `abandoned`; only the lock-holding replica increments it, so `sum()` across replicas is exact) |
 | `audit_reaper_last_success_timestamp` | gauge | — (Unix seconds of the last completed reaper sweep; alert when it falls behind) |
 | `audit_pruner_runs_total` | counter | `result` (`ok`/`error`) |

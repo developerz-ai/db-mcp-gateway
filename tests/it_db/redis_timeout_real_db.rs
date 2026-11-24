@@ -144,7 +144,11 @@ async fn a_saturated_pool_is_unavailable_not_timeout() {
             flavor.name()
         );
         let started = Instant::now();
-        let waiting = a.execute(query(r#"["DBSIZE"]"#, Some(200))).await;
+        // The holder is not polled meanwhile, so an unbounded wait would hang.
+        let waiting =
+            tokio::time::timeout(ACQUIRE * 4, a.execute(query(r#"["DBSIZE"]"#, Some(200))))
+                .await
+                .expect("the acquire wait is bounded");
         let waited = started.elapsed();
         assert!(
             matches!(waiting, Err(ExecError::Unavailable)),

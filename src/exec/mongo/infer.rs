@@ -19,40 +19,81 @@ use serde_json::{Value, json};
 const MAX_DEPTH: usize = 3;
 /// Distinct field paths reported per collection, in name order.
 const MAX_FIELDS: usize = 200;
+/// Fields read per level of one document: one past what is reported, enough
+/// to know the sample was cut.
+const LEVEL_FIELDS: usize = MAX_FIELDS + 1;
+/// Longest field name reported, in bytes.
+const MAX_NAME_BYTES: usize = 1024;
 
 /// The aggregation expression that turns a sampled document into its field
-/// tree, `[{k: name, t: BSON type, c: [children]}]`, sub-documents followed
-/// to [`MAX_DEPTH`]: a `$project` of it reads no value back. One field past
-/// [`MAX_FIELDS`] per object: enough to report `truncated`, and a document
-/// of very many fields does not outgrow the server's document limit.
+/// names and BSON types, one list per nesting level: `{k, t}` of the top
+/// level, `{p, k, t}` below it, `p` the parent's index in the list before.
+/// A `$project` of it reads no value back. Its size is bounded whatever the
+/// document: at most [`LEVEL_FIELDS`] entries a level, each name at most
+/// [`MAX_NAME_BYTES`] (a longer one is `null`) — a document of many small
+/// nested fields would otherwise outgrow the server's document limit and
+/// fail the listing.
 pub(super) fn field_types() -> Value {
-    level("$$ROOT", 1)
+    let levels: Vec<Value> = (1..=MAX_DEPTH).map(entries_of).collect();
+    (1..=MAX_DEPTH).rev().fold(json!(levels), |inner, depth| {
+        let fields = if depth == 1 {
+            json!({ "$slice": [{ "$objectToArray": "$$ROOT" }, LEVEL_FIELDS] })
+        } else {
+            children_of(&format!("$$l{}", depth - 1))
+        };
+        json!({ "$let": { "vars": { (format!("l{depth}")): fields }, "in": inner } })
+    })
 }
 
-fn level(document: &str, depth: usize) -> Value {
-    let field = format!("f{depth}");
-    let value = format!("$${field}.v");
-    let mut entry = json!({ "k": format!("$${field}.k"), "t": { "$type": value } });
-    if depth < MAX_DEPTH {
-        entry["c"] = json!({ "$cond": [
-            { "$eq": [{ "$type": value }, "object"] },
-            level(&value, depth + 1),
-            { "$literal": [] },
-        ] });
+/// The names and types of level `depth`'s fields, their values dropped.
+fn entries_of(depth: usize) -> Value {
+    let name = json!({ "$cond": [
+        { "$gt": [{ "$strLenBytes": "$$f.k" }, MAX_NAME_BYTES] }, null, "$$f.k",
+    ] });
+    let mut entry = json!({ "k": name, "t": { "$type": "$$f.v" } });
+    if depth > 1 {
+        entry["p"] = json!("$$f.p");
     }
-    let fields = json!({ "$slice": [{ "$objectToArray": document }, MAX_FIELDS + 1] });
-    json!({ "$map": { "input": fields, "as": field, "in": entry } })
+    json!({ "$map": { "input": format!("$$l{depth}"), "as": "f", "in": entry } })
+}
+
+/// The first [`LEVEL_FIELDS`] fields of the sub-documents among `parents`,
+/// in order: no more is collected once that many are.
+fn children_of(parents: &str) -> Value {
+    let fields = json!({ "$map": {
+        "input": { "$objectToArray": "$$parent.v" },
+        "as": "child",
+        "in": { "p": "$$this", "k": "$$child.k", "v": "$$child.v" },
+    } });
+    let collects = json!({ "$and": [
+        { "$lt": [{ "$size": "$$value" }, LEVEL_FIELDS] },
+        { "$eq": [{ "$type": "$$parent.v" }, "object"] },
+    ] });
+    let collected = json!({ "$reduce": {
+        "input": { "$range": [0, { "$size": parents }] },
+        "initialValue": [],
+        "in": { "$let": {
+            "vars": { "parent": { "$arrayElemAt": [parents, "$$this"] } },
+            "in": { "$cond": [collects, { "$concatArrays": ["$$value", fields] }, "$$value"] },
+        } },
+    } });
+    json!({ "$slice": [collected, LEVEL_FIELDS] })
 }
 
 /// `{sampled, fields: [{name, types, count}], truncated}` over the field
-/// trees of the sampled documents (see [`field_types`]).
-pub(super) fn infer_fields(documents: &[Value]) -> Value {
-    let mut fields: BTreeMap<String, Seen> = BTreeMap::new();
+/// lists of the sampled documents (see [`field_types`]). `cut`: the sample
+/// itself was cut short.
+pub(super) fn infer_fields(documents: &[Value], cut: bool) -> Value {
+    let mut inferred = Inferred {
+        fields: BTreeMap::new(),
+        truncated: cut,
+    };
     for document in documents {
-        walk(document, "", &mut fields);
+        inferred.add(document);
     }
-    let truncated = fields.len() > MAX_FIELDS;
-    let fields: Vec<Value> = fields
+    let truncated = inferred.truncated || inferred.fields.len() > MAX_FIELDS;
+    let fields: Vec<Value> = inferred
+        .fields
         .into_iter()
         .take(MAX_FIELDS)
         .map(|(name, seen)| json!({ "name": name, "types": seen.types, "count": seen.count }))
@@ -67,24 +108,51 @@ struct Seen {
     count: usize,
 }
 
-fn walk(tree: &Value, prefix: &str, fields: &mut BTreeMap<String, Seen>) {
-    for entry in tree.as_array().into_iter().flatten() {
-        let (Some(key), Some(kind)) = (entry["k"].as_str(), entry["t"].as_str()) else {
-            continue;
-        };
-        let path = if prefix.is_empty() {
-            key.to_string()
-        } else {
-            format!("{prefix}.{key}")
+struct Inferred {
+    fields: BTreeMap<String, Seen>,
+    truncated: bool,
+}
+
+impl Inferred {
+    /// Add one document's levels. A full level was cut, and a name left out
+    /// takes its children with it; both leave the sample `truncated`.
+    fn add(&mut self, levels: &Value) {
+        let mut parents: Vec<Option<String>> = Vec::new();
+        for level in levels.as_array().into_iter().flatten() {
+            let entries = level.as_array().map_or(&[][..], Vec::as_slice);
+            self.truncated |= entries.len() >= LEVEL_FIELDS;
+            parents = entries
+                .iter()
+                .map(|entry| self.add_entry(entry, &parents))
+                .collect();
+        }
+    }
+
+    /// The entry's path, or `None` when it is left out.
+    fn add_entry(&mut self, entry: &Value, parents: &[Option<String>]) -> Option<String> {
+        let path = path_of(entry, parents);
+        let (Some(path), Some(kind)) = (path, entry["t"].as_str()) else {
+            self.truncated = true;
+            return None;
         };
         let kind = type_name(kind);
-        let seen = fields.entry(path.clone()).or_default();
+        let seen = self.fields.entry(path.clone()).or_default();
         seen.count += 1;
         if !seen.types.iter().any(|known| known == kind) {
             seen.types.push(kind.to_string());
         }
-        walk(&entry["c"], &path, fields);
+        Some(path)
     }
+}
+
+fn path_of(entry: &Value, parents: &[Option<String>]) -> Option<String> {
+    let key = entry["k"].as_str()?;
+    if entry["p"].is_null() {
+        return Some(key.to_string());
+    }
+    let parent = usize::try_from(entry["p"].as_u64()?).ok()?;
+    let prefix = parents.get(parent)?.as_ref()?;
+    Some(format!("{prefix}.{key}"))
 }
 
 /// The server's BSON type name, but `binData` spelled `binary` as it was
@@ -112,19 +180,22 @@ mod tests {
     fn paths_types_and_counts_are_merged_over_the_documents() {
         let documents = vec![
             json!([
-                { "k": "_id", "t": "objectId", "c": [] },
-                { "k": "email", "t": "string", "c": [] },
-                { "k": "blob", "t": "binData", "c": [] },
-                { "k": "address", "t": "object", "c": [
-                    { "k": "geo", "t": "object", "c": [{ "k": "lat", "t": "double" }] },
-                ] },
+                [
+                    { "k": "_id", "t": "objectId" },
+                    { "k": "email", "t": "string" },
+                    { "k": "blob", "t": "binData" },
+                    { "k": "address", "t": "object" },
+                ],
+                [{ "p": 3, "k": "geo", "t": "object" }],
+                [{ "p": 0, "k": "lat", "t": "double" }],
             ]),
             json!([
-                { "k": "_id", "t": "objectId", "c": [] },
-                { "k": "email", "t": "null", "c": [] },
+                [{ "k": "_id", "t": "objectId" }, { "k": "email", "t": "null" }],
+                [],
+                [],
             ]),
         ];
-        let inferred = infer_fields(&documents);
+        let inferred = infer_fields(&documents, false);
         assert_eq!(inferred["sampled"], 2);
         assert_eq!(
             inferred["fields"][0],
@@ -133,16 +204,36 @@ mod tests {
         assert_eq!(types(&inferred, "email"), json!(["string", "null"]));
         assert_eq!(types(&inferred, "blob"), json!(["binary"]));
         assert_eq!(types(&inferred, "address"), json!(["object"]));
+        assert_eq!(types(&inferred, "address.geo"), json!(["object"]));
         assert_eq!(types(&inferred, "address.geo.lat"), json!(["double"]));
         assert_eq!(inferred["truncated"], false);
+        assert_eq!(infer_fields(&documents, true)["truncated"], true);
     }
 
     #[test]
-    fn the_field_count_is_bounded() {
-        let wide: Vec<Value> = (0..MAX_FIELDS + 1)
-            .map(|i| json!({ "k": format!("f{i:04}"), "t": "int", "c": [] }))
+    fn a_full_level_and_a_left_out_name_truncate_the_sample() {
+        let wide: Vec<Value> = (0..LEVEL_FIELDS)
+            .map(|_| json!({ "k": "same", "t": "int" }))
             .collect();
-        let inferred = infer_fields(&[Value::Array(wide)]);
+        let inferred = infer_fields(&[json!([wide])], false);
+        assert_eq!(inferred["truncated"], true);
+
+        let unnamed = json!([
+            [{ "k": null, "t": "object" }, { "k": "kept", "t": "int" }],
+            [{ "p": 0, "k": "child", "t": "int" }],
+        ]);
+        let inferred = infer_fields(&[unnamed], false);
+        assert_eq!(inferred["fields"].as_array().map(Vec::len), Some(1));
+        assert_eq!(inferred["fields"][0]["name"], "kept");
+        assert_eq!(inferred["truncated"], true);
+    }
+
+    #[test]
+    fn the_reported_fields_are_bounded() {
+        let documents: Vec<Value> = (0..MAX_FIELDS + 1)
+            .map(|i| json!([[{ "k": format!("f{i:04}"), "t": "int" }]]))
+            .collect();
+        let inferred = infer_fields(&documents, false);
         assert_eq!(
             inferred["fields"].as_array().map(Vec::len),
             Some(MAX_FIELDS)
@@ -151,12 +242,12 @@ mod tests {
     }
 
     /// The expression is an ordinary read: the rejector takes it, and it
-    /// nests exactly [`MAX_DEPTH`] levels.
+    /// opens exactly [`MAX_DEPTH`] levels.
     #[test]
     fn the_expression_passes_the_rejector_and_stops_at_the_depth_cap() {
         let expression = field_types();
         let command = json!({ "aggregate": "c", "pipeline": [
-            { "$project": { "_id": 0, "fields": expression } },
+            { "$project": { "_id": 0, "levels": expression } },
         ], "cursor": {} });
         assert!(super::super::rejector::validate_command(&command.to_string()).is_ok());
         assert_eq!(

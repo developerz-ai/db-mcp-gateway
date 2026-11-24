@@ -69,4 +69,4 @@ Docs-only PRs of slice 07 (P0 first) may land any time after wave 0, between wav
 | H9 | Compatibility call in slice 02 | Owner; private |
 | H10 | #218 archive/capture policies; `glama.json`; `.coderabbit.yaml`; `.devin/` | Roadmap "not planned"; do glama sign-in; delete the other two if uninstalled |
 | H11 | MySQL query target; masking; JIT expiring grants; image signing | Next-plan candidates, in that order of evaluator impact: signing (S), expiry (M), MySQL (L), masking (L) |
-| H12 | `SET-n` repository settings | Owner applies; needs admin scope |
+| H12 | Repository settings | Owner applies; needs admin scope |

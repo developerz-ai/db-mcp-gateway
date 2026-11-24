@@ -14,10 +14,10 @@ Scoped rules load with their directory and bind like this file: [`src/CLAUDE.md`
 
 ## Response Rules
 
-- **Execute.** No preamble, no restating the task. Lead with the action or answer; reasoning after, only if non-obvious. Close with a 1–2 sentence summary.
+- **Execute.** No preamble, no "I'll start by…", no restating the task. Lead with the action or answer; reasoning after, only if non-obvious. Close with a 1–2 sentence summary, nothing else.
 - **Parallel / read first.** Batch independent tool calls. Never speculate about a file you have not read.
 - **Disagree.** Say when the requester is wrong; state the correction.
-- **Terse.** Fragments OK. Code, commands and paths verbatim — only prose gets compressed.
+- **Terse.** Fragments OK. Drop articles, filler, hedging. Code, commands and paths verbatim — only prose gets compressed.
 
 ## Stack
 

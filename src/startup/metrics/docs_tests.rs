@@ -12,8 +12,11 @@ use super::*;
 const QUICKSTART: &str = "website/docs/deployment/quickstart.md";
 const TABLE: &str = "### Metric catalogue";
 
-/// Series name → documented label names, from every `| \`name\` | type | labels |` row.
-fn documented() -> BTreeMap<String, BTreeSet<String>> {
+/// A series' Prometheus type and label names.
+type Shape = (String, BTreeSet<String>);
+
+/// Series name → documented shape, from every `| \`name\` | type | labels |` row.
+fn documented() -> BTreeMap<String, Shape> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(QUICKSTART);
     let doc = std::fs::read_to_string(&path).expect("read the quickstart");
     let start = doc.find(TABLE).expect("metric table heading") + TABLE.len();
@@ -22,10 +25,12 @@ fn documented() -> BTreeMap<String, BTreeSet<String>> {
     let mut table = BTreeMap::new();
     for row in section.lines().filter(|l| l.starts_with("| `")) {
         let cells: Vec<&str> = row.split('|').collect();
-        let labels = label_names(cells[3]);
+        // The type is the cell's first word; buckets and units follow it.
+        let kind = cells[2].split_whitespace().next().unwrap_or_default();
+        let shape = (kind.to_owned(), label_names(cells[3]));
         for name in backticked(cells[1]) {
             assert!(
-                table.insert(name.clone(), labels.clone()).is_none(),
+                table.insert(name.clone(), shape.clone()).is_none(),
                 "`{name}` documented twice"
             );
         }
@@ -61,6 +66,21 @@ fn backticked(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
+fn kind_name(kind: catalogue::Kind) -> &'static str {
+    match kind {
+        catalogue::Kind::Counter => "counter",
+        catalogue::Kind::Gauge => "gauge",
+        catalogue::Kind::Histogram => "histogram",
+    }
+}
+
+/// Series name → type, from the `# TYPE` lines.
+fn rendered_types(body: &str) -> BTreeMap<&str, &str> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("# TYPE ")?.split_once(' '))
+        .collect()
+}
+
 #[test]
 fn documented_metrics_match_the_recorder_output() {
     let docs = documented();
@@ -71,28 +91,35 @@ fn documented_metrics_match_the_recorder_output() {
         preregister::register_targets(&config);
     });
     let body = recorder.handle().render();
-    let rendered: BTreeMap<String, BTreeSet<String>> = rendered_series(&body)
+    let types = rendered_types(&body);
+    let rendered: BTreeMap<String, Shape> = rendered_series(&body)
         .into_iter()
-        .map(|(name, labels)| (name, labels.into_iter().collect()))
+        .map(|(name, labels)| {
+            let kind = types
+                .get(name.as_str())
+                .unwrap_or_else(|| panic!("`{name}` has no # TYPE line"));
+            let shape = ((*kind).to_owned(), labels.into_iter().collect());
+            (name, shape)
+        })
         .collect();
 
-    for (name, labels) in &rendered {
+    for (name, shape) in &rendered {
         let documented = docs
             .get(name)
             .unwrap_or_else(|| panic!("`{name}` is exported but not in {QUICKSTART}"));
-        assert_eq!(
-            labels, documented,
-            "`{name}`: exported vs documented labels"
-        );
+        assert_eq!(shape, documented, "`{name}`: exported vs documented");
     }
     for metric in catalogue::CATALOGUE {
         let documented = docs
             .get(metric.name)
             .unwrap_or_else(|| panic!("`{}` is catalogued but not documented", metric.name));
-        let catalogued: BTreeSet<String> = metric.labels.iter().map(|l| (*l).to_owned()).collect();
+        let catalogued: Shape = (
+            kind_name(metric.kind).to_owned(),
+            metric.labels.iter().map(|l| (*l).to_owned()).collect(),
+        );
         assert_eq!(
             &catalogued, documented,
-            "`{}`: catalogued vs documented labels",
+            "`{}`: catalogued vs documented",
             metric.name
         );
         if metric.kind == catalogue::Kind::Counter {

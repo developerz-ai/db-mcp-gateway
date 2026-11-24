@@ -296,3 +296,94 @@ async fn sampled_types_are_bson_types_not_extended_json_shapes() {
     assert_eq!(types("bytes"), json!(["binary"]), "{sample}");
     assert!(!sample.to_string().contains(hex), "{sample}");
 }
+
+/// The `sample` of a collection holding exactly `document`.
+async fn sample_of(document: mongodb::bson::Document) -> Value {
+    let a = adapter(SERVER).await;
+    let coll = format!("{}-wide", unique_collection("mdesc"));
+    side_client()
+        .database(TARGET_DB)
+        .collection(&coll)
+        .insert_one(document)
+        .await
+        .expect("seed");
+    let full = a
+        .describe_schema(schema_query(&coll, SchemaDetail::Full, 5))
+        .await;
+    drop_collection(&side_client(), &coll).await;
+    full.expect("full").rows.remove(0).remove(4)
+}
+
+fn field_names(sample: &Value) -> Vec<&str> {
+    sample["fields"]
+        .as_array()
+        .expect("fields")
+        .iter()
+        .filter_map(|f| f["name"].as_str())
+        .collect()
+}
+
+/// A hundred fields at each of three levels: a million leaves in a document
+/// well under 16 MiB, whose names alone would not fit one as metadata. The
+/// sample is cut and says so; the listing stands.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_wide_and_deep_document_is_a_truncated_sample_not_an_error() {
+    let level = |child: mongodb::bson::Bson| -> mongodb::bson::Document {
+        (0..100)
+            .map(|i| (format!("{i:02}"), child.clone()))
+            .collect()
+    };
+    let leaves = level(mongodb::bson::Bson::Int32(1));
+    let sample = sample_of(level(level(leaves.into()).into())).await;
+    assert_eq!(sample["sampled"], 1, "{sample}");
+    assert_eq!(sample["truncated"], true);
+    let names = field_names(&sample);
+    assert_eq!(names.len(), 200);
+    assert!(names.contains(&"00"), "{names:?}");
+    assert!(names.contains(&"00.00"), "{names:?}");
+}
+
+/// The bound holds on every level: a nested field past it is not reported
+/// even when it sorts first by name, and the sample says it was cut.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_document_past_the_field_bound_below_the_top_level_is_truncated() {
+    let mut many: mongodb::bson::Document = (0..250)
+        .map(|i| (format!("f{i:03}"), mongodb::bson::Bson::Int32(1)))
+        .collect();
+    many.insert("a_late", 1);
+    let sample = sample_of(doc! { "a": { "b": many } }).await;
+    assert_eq!(sample["truncated"], true);
+    let names = field_names(&sample);
+    assert!(names.contains(&"a.b.f000"), "{names:?}");
+    assert!(!names.contains(&"a.b.a_late"), "{names:?}");
+}
+
+/// The server reads 201 fields of an object and no more: a later field is
+/// not reported even when it sorts first by name, and the sample says it
+/// was cut.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_field_past_the_per_document_bound_is_not_read() {
+    let mut document: mongodb::bson::Document = (0..210)
+        .map(|i| (format!("f{i:03}"), mongodb::bson::Bson::Int32(1)))
+        .collect();
+    document.insert("a_late", 1);
+    let sample = sample_of(document).await;
+    assert_eq!(sample["truncated"], true);
+    let names = field_names(&sample);
+    assert!(!names.contains(&"a_late"), "{names:?}");
+    assert!(names.contains(&"f000"), "{names:?}");
+}
+
+/// A field name past the reported length is left out, and the sample says
+/// so: names alone must not outgrow a reply either.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn an_oversized_field_name_is_left_out_and_reported() {
+    let long = "n".repeat(2_000);
+    let sample = sample_of(doc! { long.as_str(): { "child": 1 }, "kept": 1 }).await;
+    assert_eq!(field_names(&sample), ["_id", "kept"]);
+    assert_eq!(sample["truncated"], true);
+}

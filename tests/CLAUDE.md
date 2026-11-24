@@ -10,4 +10,4 @@ One binary per group dir: `it_db/` (real DBs, never a mocked target DB), `it_off
 | Integration | Gateway booted against real Postgres (CI service container). Real MCP requests over HTTP. |
 | Audit | Every integration test that hits a tool asserts an audit row exists. Tool failed authz → audit row with `outcome: forbidden`. Enforced by `it_offline::audit_assertion_guard`. |
 | Isolation | Every `tests/it_db/` test declares `#[serial_test::serial(world)]` (table-wide side effect: reaper/pruner/GC sweep, cap seeding, global counts) or `#[serial_test::parallel(world)]` — the suites share one process under `cargo test`. Enforced by `it_offline::isolation_guard`. After adding or removing a `serial(world)`, run `bin/regen-serial`. |
-| Panics | Tests may `unwrap`/`expect`/`panic`: a test file opens with `#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]`, since `[lints.clippy]` denies them for shipped code. |
+| Panics | Tests may `unwrap`/`expect`/`panic`: a test binary's root file opens with `#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]`, since `[lints.clippy]` denies them for shipped code. |

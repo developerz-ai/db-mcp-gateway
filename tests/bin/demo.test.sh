@@ -28,12 +28,18 @@ if [[ -z "${GATEWAY_IMAGE:-}" ]]; then
     remote=0
     # The public HTTPS URL, never `origin`: an SSH origin ignores git's
     # low-speed abort (the portable deadline; no coreutils `timeout` on
-    # macOS). No user or system config, so no `insteadOf` turns it back into
-    # SSH, and no credential prompt.
-    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
-      GIT_HTTP_LOW_SPEED_LIMIT=1 GIT_HTTP_LOW_SPEED_TIME=20 \
-      git ls-remote --exit-code --tags https://github.com/developerz-ai/db-mcp-gateway.git \
-      "v$version" >/dev/null 2>&1 || remote=$?
+    # macOS). Outside the checkout with git's repository variables cleared
+    # (GIT_DIR, GIT_CONFIG_COUNT, GIT_CONFIG_PARAMETERS, ...) and no user or
+    # system config, so no `insteadOf` redirects it; https only, no prompt.
+    (
+      # shellcheck disable=SC2046 # a list of variable names
+      unset $(git rev-parse --local-env-vars)
+      cd /
+      GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+        GIT_ALLOW_PROTOCOL=https GIT_HTTP_LOW_SPEED_LIMIT=1 GIT_HTTP_LOW_SPEED_TIME=20 \
+        git ls-remote --exit-code --tags https://github.com/developerz-ai/db-mcp-gateway.git \
+        "v$version"
+    ) >/dev/null 2>&1 || remote=$?
     if [[ $remote -eq 2 ]]; then
       export GATEWAY_IMAGE=${pinned%:*}:main
       printf 'note: release v%s is not cut yet; testing %s\n' "$version" "$GATEWAY_IMAGE" >&2

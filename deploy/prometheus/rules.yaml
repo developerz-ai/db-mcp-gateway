@@ -17,9 +17,13 @@ groups:
         # The gauge clause: a refusal in the last 15m, by the stamp the
         # gateway sets on every one. It shows on a pod first scraped after the
         # refusal, which increase() cannot (a counter born above 0 has no
-        # increase), however late that first scrape. The increase() clause
-        # keeps firing through a gateway clock skewed by more than the window.
-        expr: sum(increase(tool_calls{outcome="audit_unavailable"}[5m])) > 0 or time() - max(audit_last_failure_timestamp{kind="write"}) < 900
+        # increase), however late that first scrape (within the 15m).
+        # Skew, per series and before min(): a stamp over 60s in the future is
+        # dropped, and so is one that already read the same 15m ago - a real
+        # stamp under 15m old did not exist then, a fast clock's did. So a
+        # scraped stamp fires for at most 15m whatever the gateway's clock
+        # says; a clock off by more than 15m leaves only the increase() clause.
+        expr: sum(increase(tool_calls{outcome="audit_unavailable"}[5m])) > 0 or min(time() - audit_last_failure_timestamp{kind="write"} >= -60 unless audit_last_failure_timestamp{kind="write"} == audit_last_failure_timestamp{kind="write"} offset 15m) < 900
         labels:
           severity: critical
         annotations:
@@ -37,7 +41,7 @@ groups:
           runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditwriteslow
       - alert: GatewayAuditFallbackFailures
         # Gauge clause as in GatewayAuditUnavailable, over 30m.
-        expr: sum(increase(audit_fallback_failures_total[15m])) > 0 or time() - max(audit_last_failure_timestamp{kind="fallback"}) < 1800
+        expr: sum(increase(audit_fallback_failures_total[15m])) > 0 or min(time() - audit_last_failure_timestamp{kind="fallback"} >= -60 unless audit_last_failure_timestamp{kind="fallback"} == audit_last_failure_timestamp{kind="fallback"} offset 30m) < 1800
         labels:
           severity: warning
         annotations:

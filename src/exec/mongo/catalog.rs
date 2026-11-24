@@ -130,8 +130,8 @@ impl MongoAdapter {
     /// may list but not read is still listed, its sample withheld: one
     /// unreadable collection never sinks the whole listing.
     async fn sample(&self, collection: &str, query: &SchemaQuery<'_>) -> Result<Value, ExecError> {
-        match self.sample_field_trees(collection, query).await {
-            Ok(trees) => Ok(infer_fields(&trees)),
+        match self.sample_field_lists(collection, query).await {
+            Ok((lists, cut)) => Ok(infer_fields(&lists, cut)),
             Err(ExecError::Rejected(rejection))
                 if rejection.kind() == RejectionKind::PermissionDenied =>
             {
@@ -141,26 +141,33 @@ impl MongoAdapter {
         }
     }
 
-    /// The field trees (see [`field_types`]) of up to `query.sample_limit`
+    /// The field lists (see [`field_types`]) of up to `query.sample_limit`
     /// documents of `collection`, through `execute` like any `aggregate` the
-    /// caller could run.
-    async fn sample_field_trees(
+    /// caller could run, and whether the result budget cut them short.
+    async fn sample_field_lists(
         &self,
         collection: &str,
         query: &SchemaQuery<'_>,
-    ) -> Result<Vec<Value>, ExecError> {
+    ) -> Result<(Vec<Value>, bool), ExecError> {
         let command = json!({
             "aggregate": collection,
-            "pipeline": [{ "$project": { "_id": 0, "fields": field_types() } }],
+            "pipeline": [{ "$project": { "_id": 0, "levels": field_types() } }],
             "cursor": {},
         });
         let found = self.read(&command, query.sample_limit, query).await?;
-        found
+        let cut = found.truncated && found.rows.len() < query.sample_limit as usize;
+        let lists = found
             .rows
-            .iter()
-            .filter_map(|row| row.first())
-            .map(|tree| tree.get("fields").cloned().ok_or(ExecError::Decode))
-            .collect()
+            .into_iter()
+            .filter_map(|row| row.into_iter().next())
+            .map(|mut document| {
+                document
+                    .get_mut("levels")
+                    .map(Value::take)
+                    .ok_or(ExecError::Decode)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((lists, cut))
     }
 
     /// `[{name, key, unique}]` for one collection.

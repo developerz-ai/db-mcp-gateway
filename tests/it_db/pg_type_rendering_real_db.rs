@@ -307,3 +307,109 @@ async fn a_zero_row_text_cast_read_keeps_its_columns() {
     assert_eq!(result.columns, vec!["oid", "relacl"]);
     assert_eq!(result.column_types, vec!["OID", "TEXT"]);
 }
+
+/// The read every fallback test runs: `ev_action` sends it through the
+/// cursor description, whose planning folds the immutable call — the
+/// fallback is what is slow, not the read. Returns `(function, sql)`.
+async fn slow_fallback(owner: &sqlx::PgPool) -> (String, String) {
+    let function = format!("dbmcp_slow_{}", Uuid::new_v4().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION {function}(s int) RETURNS int IMMUTABLE LANGUAGE plpgsql AS \
+         $$ BEGIN PERFORM pg_sleep(s); RETURN s; END $$"
+    )))
+    .execute(owner)
+    .await
+    .expect("create slow function");
+    let sql = format!("SELECT {function}(8), ev_action FROM pg_rewrite LIMIT 1");
+    (function, sql)
+}
+
+/// A timeout, a cancel or a lost connection while the fallback describes a
+/// read is reported as itself, never as the type lookup that led there.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn an_operational_failure_while_describing_is_reported_as_itself() {
+    let owner = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&owner_url())
+        .await
+        .expect("target-db reachable; run `bin/dev up`");
+    let (function, sql) = slow_fallback(&owner).await;
+    let adapter = adapter().await;
+
+    let timed_out = adapter
+        .execute(ExecQuery {
+            statement_timeout_ms: Some(300),
+            ..read(&sql, 1)
+        })
+        .await;
+
+    let victim = read(&sql, 1);
+    let request_id = victim.request_id;
+    let (cancelled, ()) = tokio::join!(adapter.execute(victim), async {
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if adapter
+                .cancel_request(request_id)
+                .await
+                .expect("cancel runs")
+            {
+                return;
+            }
+        }
+        panic!("the fallback was never cancelled");
+    });
+
+    let victim = read(&sql, 1);
+    let tag = format!("dbmcp-{}-%", victim.request_id.simple());
+    let (lost, ()) = tokio::join!(adapter.execute(victim), async {
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let killed: Vec<bool> = sqlx::query_scalar(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE application_name LIKE $1 AND query LIKE 'DECLARE%'",
+            )
+            .bind(&tag)
+            .fetch_all(&owner)
+            .await
+            .expect("terminate runs");
+            if killed.contains(&true) {
+                return;
+            }
+        }
+        panic!("the fallback was never seen");
+    });
+
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP FUNCTION {function}(int)"
+    )))
+    .execute(&owner)
+    .await
+    .expect("drop slow function");
+    assert!(
+        matches!(timed_out, Err(ExecError::Timeout)),
+        "{timed_out:?}"
+    );
+    assert!(
+        matches!(cancelled, Err(ExecError::Cancelled)),
+        "{cancelled:?}"
+    );
+    assert!(matches!(lost, Err(ExecError::Unavailable)), "{lost:?}");
+}
+
+/// What the target refuses while the fallback plans the caller's statement
+/// is the caller's error, with its own code.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_refusal_while_describing_keeps_its_sqlstate() {
+    let adapter = adapter().await;
+    let err = adapter
+        .execute(read("SELECT 1 / 0, ev_action FROM pg_rewrite LIMIT 1", 1))
+        .await
+        .expect_err("division by zero");
+    let ExecError::Rejected(rejection) = err else {
+        panic!("{err:?}")
+    };
+    assert_eq!(rejection.sqlstate(), "22012");
+    assert_eq!(rejection.position(), None);
+}
