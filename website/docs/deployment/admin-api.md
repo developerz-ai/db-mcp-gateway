@@ -54,7 +54,7 @@ Every admin response, success or error, carries `Cache-Control: no-store`: the b
 
 ## Errors
 
-Every error body has one shape, and carries the gateway-minted request id (also in the matching log line and `permissions_audit.request_id`):
+Every error body has one shape, and carries the gateway-minted request id, also in the matching log line. Correlate failed writes with that log line: a rolled-back write has no `permissions_audit` row. Successful writes record the id in `permissions_audit.request_id`:
 
 ```json
 { "error": { "code": "conflict", "message": "row changed since expected_updated_at; re-read and retry", "request_id": "…" } }
@@ -73,7 +73,7 @@ Every error body has one shape, and carries the gateway-minted request id (also 
 
 ## Pagination
 
-`GET` on `/users`, `/databases` and `/grants` takes `?limit=&offset=`. `limit` defaults to `100` and is clamped to `1..=1000`; `offset` defaults to `0`. The body is a bare JSON array — no total, no cursor: keep paging until a page comes back shorter than `limit`. Order is stable: users and grants by `(created_at, id)`, databases by `(server, db_name)`.
+`GET` on `/users`, `/databases` and `/grants` takes `?limit=&offset=`. `limit` defaults to `100` and is clamped to `1..=1000`; `offset` defaults to `0`. The body is a bare JSON array — no total, no cursor: keep paging until a page comes back shorter than the effective, clamped limit. Advance the offset by that limit. Order is stable: users and grants by `(created_at, id)`, databases by `(server, db_name)`.
 
 ## Optimistic concurrency
 

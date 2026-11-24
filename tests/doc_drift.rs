@@ -384,6 +384,14 @@ fn documented_client_urls_end_in_the_mcp_path() {
         }
     }
     assert!(checked >= 10, "only {checked} client URLs found");
+    let config: serde_json::Value = serde_json::from_str(&read("examples/.mcp.json"))
+        .expect("example MCP config is valid JSON");
+    let servers = config["mcpServers"].as_object().expect("MCP servers");
+    assert!(!servers.is_empty(), "example MCP config has no servers");
+    for (name, server) in servers {
+        let url = server["url"].as_str().expect("server URL");
+        assert!(url.ends_with(MCP_PATH), "{name}: {url} lacks {MCP_PATH}");
+    }
 }
 
 #[test]

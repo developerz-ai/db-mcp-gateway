@@ -240,3 +240,26 @@ fn escape_heavy_sql_is_cut_by_its_encoded_size() {
         assert_eq!(body["request_id"], "req-escape");
     }
 }
+
+#[test]
+fn oversized_sql_and_params_are_truncated_together_as_json() {
+    use super::format::{MAX_MESSAGE_BYTES, message};
+    let mut row = row("req-both");
+    row.sql = Some("\u{1}".repeat(3_000));
+    row.params = Some(serde_json::json!(["x".repeat(20_000)]));
+    let message = message(&row);
+    assert!(message.len() <= MAX_MESSAGE_BYTES);
+    let body = &message[message.find('{').unwrap()..];
+    let body: serde_json::Value = serde_json::from_str(body).expect("complete JSON body");
+    assert_eq!(body["request_id"], "req-both");
+}
+
+#[test]
+fn oversized_metadata_remains_valid_json() {
+    let mut row = row("req-metadata");
+    row.user_sub = "x".repeat(20_000);
+    let message = super::format::message(&row);
+    assert!(message.len() <= super::format::MAX_MESSAGE_BYTES);
+    let body = &message[message.find('{').unwrap()..];
+    let _: serde_json::Value = serde_json::from_str(body).expect("complete JSON body");
+}

@@ -19,11 +19,12 @@ token_re='dbmcp_svc_[0-9a-f]{64}'
 exempt=(':!tests/**' ':!website/**' ':!config/example.yaml' ':!.github/**' ':!src/config/yaml/**')
 scan_error() { echo "pre-commit: secret scan could not run ($1) — refusing the commit." >&2; exit 2; }
 
-names=$(git diff --cached --name-only -z --diff-filter=ACMRT -- . "${exempt[@]}" | tr '\0' '\n') \
+names_file=$(mktemp)
+trap 'rm -f "$names_file"' EXIT
+git diff --cached --name-only -z --diff-filter=ACMRT -- . "${exempt[@]}" > "$names_file" \
   || scan_error 'git diff --name-only failed'
-mapfile -t staged <<<"$names"
-[[ -n ${staged[0]:-} ]] || staged=()
-by_name=$(grep -E "$token_re" <<<"$names") || (( $? == 1 )) || scan_error 'grep failed'
+mapfile -d '' -t staged < "$names_file"
+by_name=$(tr '\0' '\n' < "$names_file" | grep -E "$token_re") || (( $? == 1 )) || scan_error 'grep failed'
 by_content=''
 if (( ${#staged[@]} )); then
   # Captured, not piped: grep's early exit cannot SIGPIPE git into a pass.

@@ -39,8 +39,8 @@ pub(in crate::audit::stream) fn format_rfc5424(row: &AuditRow) -> String {
 }
 
 /// [`format_rfc5424`], cut to [`MAX_MESSAGE_BYTES`]. The `sql` field is cut
-/// first, then `params`, so the body stays valid JSON; only if that cannot
-/// make it fit is the message itself cut.
+/// first, then `params`. If other metadata is too large, emit a small JSON
+/// truncation notice rather than an invalid partial object.
 pub(in crate::audit::stream) fn message(row: &AuditRow) -> String {
     let message = format_rfc5424(row);
     let Some(excess) = message.len().checked_sub(MAX_MESSAGE_BYTES) else {
@@ -50,8 +50,9 @@ pub(in crate::audit::stream) fn message(row: &AuditRow) -> String {
     // control character six, so a raw-length cut can leave the body too big.
     let mut shrunk = row.clone();
     if let Some(sql) = row.sql.as_deref()
-        && let Some(keep) = json_len(sql).checked_sub(excess + TRUNCATION_MARKER.len())
+        && json_len(sql) > TRUNCATION_MARKER.len()
     {
+        let keep = json_len(sql).saturating_sub(excess + TRUNCATION_MARKER.len());
         shrunk.sql = Some(format!(
             "{}{TRUNCATION_MARKER}",
             prefix_within_json_len(sql, keep)
@@ -84,11 +85,10 @@ pub(in crate::audit::stream) fn message(row: &AuditRow) -> String {
             }
         }
     }
-    let keep = MAX_MESSAGE_BYTES - TRUNCATION_MARKER.len();
-    format!(
-        "{}{TRUNCATION_MARKER}",
-        prefix_at_char_boundary(&message, keep)
-    )
+    let header = message
+        .split_once(" audit - ")
+        .map_or("", |(header, _)| header);
+    format!("{header} audit - {{\"truncated\":true}}")
 }
 
 /// The bytes `text` takes inside a JSON string, quotes excluded.

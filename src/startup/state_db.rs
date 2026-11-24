@@ -5,10 +5,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use std::str::FromStr;
-
-use sqlx::postgres::PgConnectOptions;
-use sqlx::{ConnectOptions, PgPool};
+use sqlx::PgPool;
 use tokio::time::Instant;
 
 use db_mcp_gateway::config::Config;
@@ -64,18 +61,9 @@ pub(crate) async fn connect_state_db(config: &Config) -> anyhow::Result<PgPool> 
     Ok(state_db)
 }
 
-/// The request pool, once the state DB answers within `timeout`. Only the
-/// probe is bounded: migrations then run to the end, as one cut short would
-/// fail the boot it was meant to finish.
+/// Bound pool acquisition while letting migrations run to completion.
 async fn connect_within(config: &Config, timeout: Duration) -> Result<PgPool, StateDbError> {
-    let options =
-        PgConnectOptions::from_str(&config.state_db.url).map_err(StateDbError::Connect)?;
-    match tokio::time::timeout(timeout, options.connect()).await {
-        Ok(Ok(probe)) => drop(probe),
-        Ok(Err(err)) => return Err(StateDbError::Connect(err)),
-        Err(_elapsed) => return Err(StateDbError::Connect(sqlx::Error::PoolTimedOut)),
-    }
-    state::connect(&config.state_db.url, config.state_db.pool_size).await
+    state::connect_with_timeout(&config.state_db.url, config.state_db.pool_size, timeout).await
 }
 
 /// Retry `attempt` with doubling backoff while its failure may heal and the

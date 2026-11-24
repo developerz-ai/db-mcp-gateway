@@ -55,7 +55,16 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`connect_background`] so a long prune never takes a request's connection.
 /// Postgres-only, never re-pointed at a target DB.
 pub async fn connect(url: &str, pool_size: NonZeroU32) -> Result<PgPool, StateDbError> {
-    let pool = open_pg(url, pool_size.get(), REQUEST_SESSION_SQL).await?;
+    connect_with_timeout(url, pool_size, ACQUIRE_TIMEOUT).await
+}
+
+/// Bound pool acquisition without interrupting migrations once they start.
+pub async fn connect_with_timeout(
+    url: &str,
+    pool_size: NonZeroU32,
+    timeout: Duration,
+) -> Result<PgPool, StateDbError> {
+    let pool = open_pg_with_timeout(url, pool_size.get(), REQUEST_SESSION_SQL, timeout).await?;
 
     migrate::state_db(&pool)
         .await
@@ -88,10 +97,19 @@ async fn open_pg(
     max_connections: u32,
     session_sql: &'static str,
 ) -> Result<PgPool, StateDbError> {
+    open_pg_with_timeout(url, max_connections, session_sql, ACQUIRE_TIMEOUT).await
+}
+
+async fn open_pg_with_timeout(
+    url: &str,
+    max_connections: u32,
+    session_sql: &'static str,
+    timeout: Duration,
+) -> Result<PgPool, StateDbError> {
     let options = PgConnectOptions::from_str(url).map_err(StateDbError::Connect)?;
     PgPoolOptions::new()
         .max_connections(max_connections)
-        .acquire_timeout(ACQUIRE_TIMEOUT)
+        .acquire_timeout(timeout)
         .after_connect(move |conn, _meta| {
             Box::pin(async move { conn.execute(session_sql).await.map(|_| ()) })
         })
@@ -185,6 +203,28 @@ mod tests {
     //! Pure classification — no database, no network.
 
     use super::connect_error_class;
+
+    #[tokio::test]
+    async fn request_pool_connection_obeys_the_supplied_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let url = format!("postgres://user:password@{addr}/state?sslmode=disable");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::connect_with_timeout(
+                &url,
+                std::num::NonZeroU32::new(1).unwrap(),
+                std::time::Duration::from_millis(50),
+            ),
+        )
+        .await;
+        server.abort();
+        assert!(matches!(result, Ok(Err(super::StateDbError::Connect(_)))));
+    }
 
     /// Minimal [`sqlx::error::DatabaseError`] so the `Database` arm — the only
     /// one that reads a value back out of a driver-supplied object — can be

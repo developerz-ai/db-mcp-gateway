@@ -73,6 +73,13 @@ grep -qxF 'config/blob.bin' "$work/output" || fail "binary refusal does not name
 ! grep -qF "$token" "$work/output" || fail 'binary refusal echoed the token'
 git -C "$repo" rm -q --cached config/blob.bin
 
+newline_name=$'config/new\nline.bin'
+printf '\0%s\0' "$token" > "$repo/$newline_name"
+git -C "$repo" add "$newline_name"
+if hook pre-commit; then fail 'token in newline-named binary file accepted'; fi
+grep -qF 'staged change adds a service-token' "$work/output" || fail 'newline filename scan failed instead of detecting token'
+git -C "$repo" rm -q --cached "$newline_name"
+
 # Cleaning up a leak commits: deleting a file whose name (or content) holds a
 # token, or renaming it to a clean name, stages nothing to scan. Renaming a
 # clean file to a token name is refused.
