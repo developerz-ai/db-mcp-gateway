@@ -130,8 +130,9 @@ jobs:
           fi
           echo "$got on linux/$ARCH from ${{ matrix.registry }}" | tee -a "$GITHUB_STEP_SUMMARY"
       # The binary boots, not just links: config parse, state-DB connect +
-      # migrations, then serving. Plain HTTP on loopback with the dev signing
-      # key — a smoke, never a deployment; the IdP is not contacted until a login.
+      # migrations, then serving. Plain HTTP, published on the host's loopback
+      # only, with a random per-run signing key — a smoke, never a deployment;
+      # the IdP is not contacted until a login.
       - name: it boots against a state DB and serves
         if: env.SMOKE == 'true'
         run: |
