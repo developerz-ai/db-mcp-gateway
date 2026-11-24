@@ -63,7 +63,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 # Not `serde_yaml` — rationale in website/docs/initial-idea/08-config.md
 # §"YAML parser". Must be parsed via `config::yaml::non_leaking_options`.
-serde-saphyr = "1"
+serde-saphyr = "2"
 clap = { version = "4", features = ["derive", "env"] }
 
 # db
