@@ -176,12 +176,12 @@ fn ca_file(pem: &str) -> tempfile::NamedTempFile {
 
 #[tokio::test]
 async fn tls_sink_delivers_to_a_receiver_signed_by_the_pinned_ca() {
-    let server = pki("localhost");
+    let server = pki("127.0.0.1");
     let ca = ca_file(&server.ca_pem);
     let (port, frame) = tls_receiver(server).await;
     let tls = SyslogTls::from_ca_file(ca.path()).expect("CA loads");
 
-    StreamSinks::syslog("localhost".into(), port, SyslogTransport::Tls(tls))
+    StreamSinks::syslog("127.0.0.1".into(), port, SyslogTransport::Tls(tls))
         .send(&row("req-tls"), &DetachedTasks::new());
 
     let frame = tokio::time::timeout(WAIT, frame).await.unwrap().unwrap();
@@ -191,12 +191,12 @@ async fn tls_sink_delivers_to_a_receiver_signed_by_the_pinned_ca() {
 /// A receiver whose certificate chains to another CA gets no row.
 #[tokio::test]
 async fn tls_sink_refuses_a_receiver_outside_the_pinned_ca() {
-    let (port, frame) = tls_receiver(pki("localhost")).await;
-    let other_ca = ca_file(&pki("localhost").ca_pem);
+    let (port, frame) = tls_receiver(pki("127.0.0.1")).await;
+    let other_ca = ca_file(&pki("127.0.0.1").ca_pem);
     let tls = SyslogTls::from_ca_file(other_ca.path()).unwrap();
     let tasks = DetachedTasks::new();
 
-    StreamSinks::syslog("localhost".into(), port, SyslogTransport::Tls(tls))
+    StreamSinks::syslog("127.0.0.1".into(), port, SyslogTransport::Tls(tls))
         .send(&row("req-untrusted"), &tasks);
 
     tasks.drain(WAIT).await.expect("delivery attempt finishes");
