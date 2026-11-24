@@ -4,10 +4,10 @@ status: in_progress
 created_by: sebi
 worked_by: claude
 owner: sebi
-percent: 90
-current_focus: "#381 carries every gateway slice (03-12) + PR review fixes; merge → 2.4.0 → deployments bump + GROUPS_MAX_AGE → consumer rows"
+percent: 95
+current_focus: "Shipped: #381 (slices 03-12) merged, v2.4.0 released and smoke-tested on GHCR + DOCR (amd64, arm64), both deployments on 2.4.0 with GROUPS_MAX_AGE, consumer adopted the 2.4.0 surface. Open: follow-up issues #382-#386, #395, #397, #398; owner rows."
 slices:
-  - {file: 01-unblock-main.md, status: in_progress, percent: 95, note: "gate job built (09a); owner: make `gate` the single required check"}
+  - {file: 01-unblock-main.md, status: done, percent: 100, note: "`gate` is the single required CI check (ruleset + classic protection), 2026-11-24, owner approved"}
   - {file: 02-security-patch.md, status: done, percent: 100, note: "#377 + #380, v2.3.1, GHSA-j6xv-c57r-59rw published; H2 (pg_query second parser) not started"}
   - {file: 03-exec-correctness.md, status: in_progress, percent: 95, note: "#381; follow-ups: Mongo NaN in code_with_scope, Mongo cleanup without permit, pipeline $lookup to system.*"}
   - {file: 04-auth-transport.md, status: in_progress, percent: 95, note: "#381; follow-ups: dedicated login error for a state-DB outage, hmac crate"}
@@ -25,6 +25,7 @@ decisions:
   - {date: 2026-11-23, by: sebi, rows: [H5], decision: "3.0 breaking rows later; additive rows now"}
   - {date: 2026-11-23, by: sebi, rows: [H8, H10], decision: "go: audit blocks lock changes only + daily audit issue; delete .coderabbit.yaml/.devin/ (apps not installed)"}
   - {date: 2026-11-23, by: sebi, rows: [H1, H9], decision: "full work: advisory drafted, published with 2.3.1; deny other-session statement views"}
-evidence: ["#376", "#377", "#380", "v2.3.1", "GHSA-j6xv-c57r-59rw"]
+  - {date: 2026-11-24, by: sebi, rows: [required-checks], decision: "make `gate` the single required check — applied after #381 merged"}
+evidence: ["#376", "#377", "#380", "v2.3.1", "GHSA-j6xv-c57r-59rw", "#381", "#394", "#393", "v2.4.0", "#396", "release-smoke 2.4.0 green (4/4)"]
 notes: "Human rows H1-H12 in overview.md. Repo-settings detail: owner's private notes. Deployment and consumer slices tracked in their own repositories."
 last_updated: 2026-11-24
