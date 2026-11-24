@@ -287,3 +287,111 @@ async fn wide_rows_page_by_bytes_without_refetching() {
     delete_audit_calls(&seed_pool, &caller).await;
     h.cleanup().await;
 }
+
+/// `BATCH_BYTES` in `src/transport/admin/audit_calls.rs`.
+const BATCH_BYTES: usize = 1 << 20;
+
+/// The body of a raw HTTP/1.1 GET, one entry per chunk: the export sends each
+/// batch as one chunk, so this is what each batch buffered.
+async fn body_chunks(url: &str, path_and_query: &str, bearer: &str) -> Vec<Vec<u8>> {
+    let url = url::Url::parse(url).expect("gateway URL");
+    let host = format!(
+        "{}:{}",
+        url.host_str().expect("host"),
+        url.port().expect("port")
+    );
+    let mut conn = TcpStream::connect(&host).await.expect("gateway");
+    let request = format!(
+        "GET {path_and_query} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {bearer}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    conn.write_all(request.as_bytes()).await.expect("request");
+    let mut raw = Vec::new();
+    conn.read_to_end(&mut raw).await.expect("response");
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("end of headers");
+    let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(head.contains("transfer-encoding: chunked"), "{head}");
+    let mut rest = &raw[split + 4..];
+    let mut chunks = Vec::new();
+    loop {
+        let eol = rest
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .expect("chunk size line");
+        let size = std::str::from_utf8(&rest[..eol]).expect("ascii size");
+        let size = usize::from_str_radix(size.split(';').next().expect("size"), 16).expect("hex");
+        rest = &rest[eol + 2..];
+        if size == 0 {
+            return chunks;
+        }
+        chunks.push(rest[..size].to_vec());
+        rest = &rest[size + 2..];
+    }
+}
+
+/// Rows whose stored size says little about their JSON line — `params` that
+/// compress to almost nothing, `sql` of control characters that escape to six
+/// bytes each — still keep every batch within the byte target plus one row,
+/// and every row arrives exactly once, newest first.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn compressible_and_escaped_rows_keep_batches_within_the_byte_target() {
+    let seed_pool = state_pool().await;
+    let caller = unique("o10-packed");
+    let mut packed = row(&caller, "run_query", OutcomeCode::Success);
+    for i in 0..120 {
+        packed.id = Uuid::new_v4();
+        packed.request_id = unique("req");
+        if i % 2 == 0 {
+            packed.sql = Some("SELECT $1".into());
+            packed.params = Some(serde_json::json!(["x".repeat(60_000)]));
+        } else {
+            packed.sql = Some("\u{1}".repeat(30_000));
+            packed.params = Some(serde_json::json!([1]));
+        }
+        audit::log(&seed_pool, &packed).await.expect("seed");
+    }
+    let expected: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM audit_calls WHERE user_sub = $1 ORDER BY occurred_at DESC, id DESC",
+    )
+    .bind(&caller)
+    .fetch_all(&seed_pool)
+    .await
+    .expect("seeded ids");
+    let h = O10::spawn().await;
+
+    let chunks = body_chunks(
+        &h.url,
+        &format!("/admin/v1/audit/calls?user={caller}&include_sql=true"),
+        &h.admin,
+    )
+    .await;
+    let mut ids = Vec::new();
+    for chunk in &chunks {
+        let text = std::str::from_utf8(chunk).expect("UTF-8 batch");
+        let widest = text.lines().map(|l| l.len() + 1).max().expect("a line");
+        assert!(
+            chunk.len() <= BATCH_BYTES + widest,
+            "a {}-byte batch past {BATCH_BYTES} + one {widest}-byte row",
+            chunk.len()
+        );
+        for line in text.lines() {
+            let line: Value = serde_json::from_str(line).expect("each line is JSON");
+            ids.push(
+                line["id"]
+                    .as_str()
+                    .expect("id")
+                    .parse::<Uuid>()
+                    .expect("uuid"),
+            );
+        }
+    }
+    assert_eq!(ids, expected, "every row exactly once, newest first");
+    assert!(chunks.len() > 1, "the rows span several batches");
+    delete_audit_calls(&seed_pool, &caller).await;
+    h.cleanup().await;
+}

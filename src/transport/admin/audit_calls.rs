@@ -33,6 +33,10 @@ use super::error::AdminError;
 use super::middleware::AdminActor;
 use super::page_query::invalid_query;
 use super::read_audit::{AdminRead, ReadScope, audit_read};
+use sql::SELECT;
+
+#[path = "audit_calls_sql.rs"]
+mod sql;
 
 pub const DEFAULT_LIMIT: u32 = 1_000;
 pub const MAX_LIMIT: u32 = 10_000;
@@ -52,44 +56,19 @@ pub struct AuditCallsQuery {
     pub include_sql: bool,
 }
 
-/// The keyset `page`, kept up to and including the row whose estimated
-/// width crosses `$12` bytes (the first row always); `page_rows` says if it
-/// was cut. The width is read from stored lengths (`octet_length` on text
-/// needs no detoast, `pg_column_size` on jsonb) plus a fixed allowance for
-/// the small columns, so sizing a page never serializes a row — the state
-/// DB also carries the synchronous audit writes.
-const SELECT: &str = "WITH page AS (SELECT id, request_id, occurred_at, user_sub, user_email, groups, tool, \
-        server_name, database_name, \
-        CASE WHEN $9::bool THEN sql END AS sql, \
-        CASE WHEN $9::bool THEN sql_truncated END AS sql_truncated, \
-        CASE WHEN $9::bool THEN params END AS params, \
-        reason, outcome, elapsed_ms, row_count, truncated, rows_affected, error_message, \
-        agent_client, ip, db_type, upstream_actor, upstream_run_id \
-     FROM audit_calls \
-     WHERE ($1::text IS NULL OR user_sub = $1 OR user_email = $1) \
-       AND ($2::text IS NULL OR server_name = $2) \
-       AND ($3::text IS NULL OR database_name = $3) \
-       AND ($4::text IS NULL OR tool = $4) \
-       AND ($5::text IS NULL OR outcome = $5) \
-       AND ($6::timestamptz IS NULL OR occurred_at >= $6) \
-       AND ($7::timestamptz IS NULL OR occurred_at < $7) \
-       AND ($10::timestamptz IS NULL OR (occurred_at, id) < ($10, $11)) \
-     ORDER BY occurred_at DESC, id DESC LIMIT $8), \
-     framed AS (SELECT page.*, count(*) OVER () AS page_rows, \
-        coalesce(sum(512 + coalesce(octet_length(sql), 0) + coalesce(pg_column_size(params), 0) \
-          + coalesce(octet_length(error_message), 0) + coalesce(octet_length(reason), 0) \
-          + coalesce(octet_length(user_email), 0) + coalesce(pg_column_size(groups), 0)) \
-          OVER (ORDER BY occurred_at DESC, id DESC \
-          ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS before FROM page) \
-     SELECT * FROM framed WHERE before < $12 ORDER BY occurred_at DESC, id DESC";
-
 /// Batches buffered between the query task and the response body.
 const BATCH_BUFFER: usize = 2;
 
 /// Rows one query reads before its connection goes back to the pool.
 const BATCH_ROWS: i64 = 200;
 
-/// Row bytes (as Postgres renders the row in JSON) a batch stops at: with
+/// The smallest candidate window: after a batch the byte bound cut short,
+/// the next query reads twice what fit (at least this many) instead of the
+/// full [`BATCH_ROWS`], so a wide export does not make the state DB size
+/// rows it will only hold back.
+const MIN_WINDOW: i64 = 16;
+
+/// Line bytes (bounded per row by [`SELECT`]'s `width`) a batch stops at: with
 /// `include_sql`, 200 rows of 64 KiB statements and params would otherwise be
 /// ~25 MiB per export.
 const BATCH_BYTES: i64 = 1 << 20;
@@ -163,8 +142,9 @@ async fn produce(
 ) {
     let mut remaining = i64::from(q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT));
     let mut after: Option<(DateTime<Utc>, uuid::Uuid)> = None;
+    let mut window = BATCH_ROWS;
     while remaining > 0 {
-        let asked = remaining.min(BATCH_ROWS);
+        let asked = remaining.min(window);
         let batch = match fetch_batch(&pool, &q, after, asked).await {
             Ok(batch) => batch,
             Err(()) => {
@@ -176,6 +156,7 @@ async fn produce(
         };
         let more = batch.more(asked);
         remaining -= batch.rows;
+        window = (batch.rows * 2).clamp(MIN_WINDOW, BATCH_ROWS);
         if !batch.text.is_empty() && tx.send(batch.text).await.is_err() {
             return;
         }
