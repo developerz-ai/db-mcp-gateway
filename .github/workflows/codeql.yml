@@ -39,6 +39,16 @@ jobs:
         with:
           languages: rust
           build-mode: none
+          # Test-only files hold planted secrets and fixed keys on purpose;
+          # scanning them only buries real findings.
+          config: |
+            paths-ignore:
+              - tests/**
+              - benchmarks/**
+              - "**/tests/**"
+              - "**/*_tests.rs"
+              - "**/*_proptests.rs"
+              - "**/tests.rs"
       - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           category: /language:rust

@@ -3,6 +3,10 @@
 # never echoing the token) outside the exempt paths, and stays fast — no
 # compile, no containers. pre-push runs clippy then the unit loop.
 set -euo pipefail
+
+# CI runners have no git identity; the scratch commits below need one.
+export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid
+export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid
 cd "$(dirname "$0")/../.."
 root=$PWD
 work=$(mktemp -d)
