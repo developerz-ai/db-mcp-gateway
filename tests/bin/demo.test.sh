@@ -11,6 +11,17 @@ set -euo pipefail
 cd "$(dirname "$0")/../../examples/demo"
 
 port=${DEMO_PORT:-18443}
+
+# A release PR bumps the pinned tag before that image is published (the tag
+# is cut after merge): test the same code through `:main`, which a release
+# PR does not change, and say so.
+if [[ -z "${GATEWAY_IMAGE:-}" ]]; then
+  pinned=$(sed -n 's/.*image: \${GATEWAY_IMAGE:-\([^}]*\)}.*/\1/p' docker-compose.yml | head -1)
+  if [[ -n "$pinned" ]] && ! docker manifest inspect "$pinned" >/dev/null 2>&1; then
+    export GATEWAY_IMAGE=${pinned%:*}:main
+    printf 'note: %s is not published yet; testing %s\n' "$pinned" "$GATEWAY_IMAGE" >&2
+  fi
+fi
 compose=(docker compose -p "db-mcp-gateway-demo-test-$$")
 export DEMO_PORT=$port
 trap '"${compose[@]}" --profile sso down -v >/dev/null 2>&1 || true' EXIT
