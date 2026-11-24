@@ -32,6 +32,13 @@ impl ResultBudget {
         self.rows_left > 0
     }
 
+    /// Whether a row of `wire_len` undecoded bytes can still fit. Asked
+    /// before decoding: a row whose wire form alone is past what is left is
+    /// never copied out of the driver's buffer.
+    pub(crate) fn fits_wire(&self, wire_len: usize) -> bool {
+        wire_len <= self.bytes_left
+    }
+
     /// Charge `row` against the budget. `false` means it does not fit and
     /// must not be returned; the budget is left unchanged.
     pub(crate) fn admit(&mut self, row: &[Value]) -> bool {
@@ -45,11 +52,11 @@ impl ResultBudget {
     }
 }
 
-/// Approximate in-memory weight of a decoded value: string and key bytes
-/// plus a small constant per node. Close enough to bound memory; exactness
-/// would cost a serialisation per cell.
+/// What a decoded value holds in memory: every node is a whole [`Value`]
+/// (an array of small numbers weighs several times its wire form), plus the
+/// bytes of each string and key.
 fn value_size(value: &Value) -> usize {
-    const NODE: usize = 8;
+    const NODE: usize = size_of::<Value>();
     match value {
         Value::Null | Value::Bool(_) | Value::Number(_) => NODE,
         Value::String(s) => NODE + s.len(),
@@ -57,7 +64,7 @@ fn value_size(value: &Value) -> usize {
         Value::Object(map) => {
             NODE + map
                 .iter()
-                .map(|(k, v)| k.len() + value_size(v))
+                .map(|(k, v)| size_of::<String>() + k.len() + value_size(v))
                 .sum::<usize>()
         }
     }
@@ -79,11 +86,27 @@ mod tests {
 
     #[test]
     fn byte_cap_rejects_the_row_that_would_overflow() {
-        let mut b = ResultBudget::with_bytes(100, 40);
-        assert!(b.admit(&[json!("0123456789")])); // 18
-        assert!(!b.admit(&[json!("01234567890123456789")])); // 28 > 22
+        const NODE: usize = size_of::<Value>();
+        let mut b = ResultBudget::with_bytes(100, 2 * NODE + 30);
+        assert!(b.admit(&[json!("0123456789")])); // leaves NODE + 20
+        assert!(!b.admit(&[json!("012345678901234567890")])); // NODE + 21
         // A smaller row still fits: the failed admit charged nothing.
-        assert!(b.admit(&[json!("0123")])); // 12 <= 22
+        assert!(b.admit(&[json!("01234567890123456789")])); // NODE + 20
+    }
+
+    #[test]
+    fn every_node_weighs_a_whole_value() {
+        let numbers = value_size(&json!([1, 2, 3, 4]));
+        assert_eq!(numbers, 5 * size_of::<Value>());
+    }
+
+    #[test]
+    fn a_row_past_the_budget_on_the_wire_does_not_fit() {
+        let mut b = ResultBudget::with_bytes(10, 200);
+        assert!(b.fits_wire(200));
+        assert!(!b.fits_wire(201));
+        assert!(b.admit(&[json!("0123456789")]));
+        assert!(!b.fits_wire(200));
     }
 
     #[test]

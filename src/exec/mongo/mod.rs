@@ -45,7 +45,7 @@ use super::adapter::{
     AdapterKind, DbAdapter, ExecError, ExecResult, TOKIO_TIMEOUT_SLACK_MS, effective_timeout_ms,
 };
 use super::pg::resolve_password;
-use super::pool_sizing::PoolSizing;
+use super::pool_sizing::{CallerSlots, PoolSizing};
 use super::query::{
     ActivityQuery, ExecQuery, ExplainQuery, SampleQuery, SchemaQuery, TableStatsQuery,
 };
@@ -72,6 +72,8 @@ pub struct MongoAdapter {
     stale: AtomicBool,
     /// Tracks drop-guard kills so a shutdown drain waits for them.
     detached: DetachedTasks,
+    /// Each caller's share of the driver's connection pool.
+    callers: CallerSlots,
 }
 
 impl std::fmt::Debug for MongoAdapter {
@@ -155,6 +157,7 @@ impl MongoAdapter {
             database_name,
             stale: AtomicBool::new(false),
             detached,
+            callers: CallerSlots::new(sizing),
         })
     }
 }
@@ -209,6 +212,9 @@ impl DbAdapter for MongoAdapter {
         rejector::validate_command(query.sql)
             .map_err(|err| ExecError::Forbidden(err.to_string()))?;
 
+        // The caller's share of the pool, taken outside the time budget as
+        // the pg adapter's acquire is.
+        let _slot = self.callers.take(CONNECT_TIMEOUT).await?;
         let effective_ms = effective_timeout_ms(query.statement_timeout_ms);
         let budget = Duration::from_millis(u64::from(effective_ms) + TOKIO_TIMEOUT_SLACK_MS);
         match tokio::time::timeout(budget, self.dispatch(&query, effective_ms)).await {
@@ -217,6 +223,9 @@ impl DbAdapter for MongoAdapter {
         }
     }
 
+    /// No caller slot here: each catalog command goes through `execute`,
+    /// which takes its own; holding one across them would leave a caller
+    /// with a share of one waiting on itself.
     async fn describe_schema(&self, query: SchemaQuery<'_>) -> Result<ExecResult, ExecError> {
         self.describe(query).await
     }

@@ -10,6 +10,7 @@ mod cancel_guard;
 mod metric_names;
 mod outcome;
 mod types;
+mod work;
 
 pub use crate::audit::OutcomeCode;
 pub use outcome::{ToolErrorMessages, outcome_from_exec_error, success_outcome, tool_success};
@@ -39,6 +40,7 @@ use crate::tools::ToolCtx;
 
 use cancel_guard::CancelledAuditGuard;
 use metric_names::{AUDIT_WRITE_DURATION, QUERY_DURATION, TOOL_CALLS};
+use work::run_work;
 
 /// Load the caller's DB grants, then run `work` with them through
 /// [`audit_dispatch`]. A grants-load failure still writes an audit row
@@ -128,7 +130,7 @@ where
         store.sinks.clone(),
         store.tasks.clone(),
     );
-    let outcome = work.await;
+    let outcome = run_work(work, request_ctx, header.tool, state_db).await;
     let row = guard.record_outcome(&outcome);
     let duration_ms = outcome.elapsed_ms.unwrap_or(0);
     if let Some(elapsed_ms) = outcome.elapsed_ms {

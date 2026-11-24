@@ -5,13 +5,19 @@
 //! `/mcp` that is the same path as a client disconnect (target query
 //! cancelled, audit row `cancelled`) — and answered `504`. A body that has not
 //! fully arrived by the deadline fails extraction, which frees the
-//! concurrency permit a slow-loris sender would otherwise pin.
+//! concurrency permit a slow-loris sender would otherwise pin. The OAuth
+//! routes read the body before taking a permit at all ([`buffer_oauth_body`]).
 
 use std::time::Duration;
 
+use axum::Json;
 use axum::Router;
-use axum::extract::DefaultBodyLimit;
+use axum::body::{Body, to_bytes};
+use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use serde_json::json;
 use tower_http::timeout::{RequestBodyDeadlineLayer, TimeoutLayer};
 
 use crate::audit::AUDIT_WRITE_TIMEOUT;
@@ -19,17 +25,25 @@ use crate::exec::DEFAULT_STATEMENT_TIMEOUT_MS;
 
 /// Time for a client to deliver a whole request body.
 const BODY_READ_DEADLINE: Duration = Duration::from_secs(10);
+/// OAuth forms are a few hundred bytes; a sender still dribbling after this
+/// is not a real client.
+const OAUTH_BODY_DEADLINE: Duration = Duration::from_secs(5);
 
-/// `/mcp`: the statement ceiling, one pool acquire, the intent and outcome
-/// audit writes, plus slack for authz and serialisation.
+/// `/mcp`: the waits one call can stack in sequence — the caller's pool
+/// share, then a pool connection (both bounded at 5 s by the adapters), the
+/// statement ceiling, the intent and outcome audit writes — plus slack for
+/// the adapters' 0.5 s past the ceiling, authz and serialisation. 75 s.
 pub const MCP_TIMEOUT: Duration = Duration::from_millis(
     DEFAULT_STATEMENT_TIMEOUT_MS as u64
+        + CALLER_SLOT_ALLOWANCE.as_millis() as u64
         + POOL_ACQUIRE_ALLOWANCE.as_millis() as u64
         + 2 * AUDIT_WRITE_TIMEOUT.as_millis() as u64
         + SLACK.as_millis() as u64,
 );
+const CALLER_SLOT_ALLOWANCE: Duration = Duration::from_secs(5);
 const POOL_ACQUIRE_ALLOWANCE: Duration = Duration::from_secs(5);
-const SLACK: Duration = Duration::from_secs(10);
+/// Covers the exec layer's 0.5 s timer slack past the statement ceiling.
+const SLACK: Duration = Duration::from_secs(5);
 
 /// OAuth / login routes: `/auth/callback` waits on the IdP code exchange,
 /// which `auth::oidc` bounds at 45 s.
@@ -91,14 +105,51 @@ impl Bounds {
     }
 }
 
+/// Read the whole body (≤ [`OAUTH_BODY_LIMIT`], within
+/// [`OAUTH_BODY_DEADLINE`]) before the OAuth budget's permit is taken.
+/// Those routes are open, so without this 64 slow senders would hold every
+/// permit and shed each real login and refresh.
+pub(super) async fn buffer_oauth_body(req: Request, next: Next) -> Response {
+    let (parts, body) = req.into_parts();
+    let read = tokio::time::timeout(OAUTH_BODY_DEADLINE, to_bytes(body, OAUTH_BODY_LIMIT)).await;
+    match read {
+        Ok(Ok(bytes)) => {
+            next.run(Request::from_parts(parts, Body::from(bytes)))
+                .await
+        }
+        // Over the limit, or the outer body deadline fired first.
+        Ok(Err(_)) => body_refused(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body too large or unreadable",
+        ),
+        Err(_) => body_refused(
+            StatusCode::REQUEST_TIMEOUT,
+            "request body not received in time",
+        ),
+    }
+}
+
+/// RFC 6749 §5.2 shape, as the OAuth handlers answer an undecodable body.
+fn body_refused(status: StatusCode, description: &str) -> Response {
+    let body = json!({ "error": "invalid_request", "error_description": description });
+    (status, Json(body)).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn mcp_timeout_outlasts_the_statement_ceiling_and_both_audit_writes() {
-        let floor = Duration::from_millis(u64::from(DEFAULT_STATEMENT_TIMEOUT_MS))
-            + 2 * AUDIT_WRITE_TIMEOUT;
+    fn mcp_timeout_outlasts_every_wait_a_call_stacks() {
+        let statement = Duration::from_millis(u64::from(DEFAULT_STATEMENT_TIMEOUT_MS) + 500);
+        let floor =
+            CALLER_SLOT_ALLOWANCE + POOL_ACQUIRE_ALLOWANCE + statement + 2 * AUDIT_WRITE_TIMEOUT;
         assert!(MCP_TIMEOUT > floor, "{MCP_TIMEOUT:?} <= {floor:?}");
+    }
+
+    /// Operator docs quote 75 s (and an 80 s drain built on it).
+    #[test]
+    fn mcp_timeout_is_the_documented_75_seconds() {
+        assert_eq!(MCP_TIMEOUT, Duration::from_secs(75));
     }
 }

@@ -11,7 +11,7 @@ use super::helpers::{oauth_error, query_rejected, random_token};
 use super::register::{
     is_loopback_redirect_uri, redirect_uri_matches, redirect_uris_acceptable, registry_error,
 };
-use crate::auth::oauth::OAuthBridge;
+use crate::auth::oauth::{ClientRecord, OAuthBridge};
 
 /// Upper bound on a `client_id` the gateway will *adopt* at `/authorize` (as
 /// opposed to one it minted at `/register`). `/authorize` is unauthenticated, so
@@ -60,6 +60,21 @@ fn bounds_violation(
 /// characters, no whitespace — nothing that would mangle a log line).
 fn is_adoptable_client_id(client_id: &str) -> bool {
     client_id.len() <= MAX_ADOPTABLE_CLIENT_ID && client_id.chars().all(|c| c.is_ascii_graphic())
+}
+
+fn redirect_registered(client: &ClientRecord, requested_uri: &str) -> bool {
+    client
+        .redirect_uris
+        .iter()
+        .any(|registered| redirect_uri_matches(registered, requested_uri))
+}
+
+fn redirect_mismatch() -> Response {
+    oauth_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        "redirect_uri must exactly match a registered redirect URI",
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,21 +129,17 @@ pub async fn authorize(
     // Resolve the client now, but record an adopted one only after every
     // other parameter validates: a request that fails PKCE or `state` must
     // leave nothing behind in the registry.
-    let (adopt, client_name) = match state.client_registry.lookup(client_id).await {
-        Some(registered) => {
-            if !registered
-                .redirect_uris
-                .iter()
-                .any(|r| redirect_uri_matches(r, &requested_uri))
-            {
-                return oauth_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request",
-                    "redirect_uri must exactly match a registered redirect URI",
-                );
-            }
-            (false, registered.client_name)
+    let registered = match state.client_registry.lookup(client_id).await {
+        Ok(registered) => registered,
+        // A state-DB failure is an outage, not an unknown client: answer it
+        // here so it can never reach the adopt path below.
+        Err(err) => return registry_error(err),
+    };
+    match &registered {
+        Some(client) if !redirect_registered(client, &requested_uri) => {
+            return redirect_mismatch();
         }
+        Some(_) => {}
         // Unknown client_id, loopback redirect: adopt the id rather than
         // dead-end. A client caches its `client_id` and replays it for as long
         // as it stays signed in; if the registration is gone (pre-0008 install,
@@ -141,10 +152,7 @@ pub async fn authorize(
         // host, which is exactly what the allowlist exists to prevent.
         None if is_loopback_redirect_uri(&requested_uri)
             && redirect_uris_acceptable(std::slice::from_ref(&requested_uri))
-            && is_adoptable_client_id(client_id) =>
-        {
-            (true, None)
-        }
+            && is_adoptable_client_id(client_id) => {}
         None => {
             return oauth_error(
                 StatusCode::BAD_REQUEST,
@@ -152,7 +160,7 @@ pub async fn authorize(
                 "unknown client_id; register via /register first",
             );
         }
-    };
+    }
     // PKCE is mandatory (OAuth 2.1 §7.5.2). Only S256 — never plain.
     let Some(code_challenge) = p.code_challenge.filter(|c| !c.is_empty()) else {
         return oauth_error(
@@ -183,18 +191,25 @@ pub async fn authorize(
     {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", violation);
     }
-    if adopt {
-        // `adopt` starts the row on the authorised-client TTL: this
-        // `/authorize` is its first use.
-        if let Err(err) = state
-            .client_registry
-            .adopt(client_id.to_string(), requested_uri.clone())
-            .await
-        {
-            return registry_error(err);
+    let client = match registered {
+        Some(client) => client,
+        None => {
+            let adopted = state
+                .client_registry
+                .adopt(client_id.to_string(), requested_uri.clone())
+                .await;
+            match adopted {
+                // Adoption never replaces a live registration, so one made
+                // for this id since the lookup above still decides.
+                Ok(client) if redirect_registered(&client, &requested_uri) => {
+                    tracing::info!("adopted an unregistered client_id for a loopback redirect");
+                    client
+                }
+                Ok(_) => return redirect_mismatch(),
+                Err(err) => return registry_error(err),
+            }
         }
-        tracing::info!("adopted an unregistered client_id for a loopback redirect");
-    }
+    };
     let redirect_uri = requested_uri;
     let auth = &state.auth;
 
@@ -227,7 +242,7 @@ pub async fn authorize(
             idp_verifier,
             OAuthBridge {
                 client_id: client_id.to_owned(),
-                client_name,
+                client_name: client.client_name,
                 client_redirect_uri: redirect_uri,
                 client_state,
                 code_challenge,

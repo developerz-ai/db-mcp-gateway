@@ -148,21 +148,29 @@ impl Drop for CancelledAuditGuard {
 }
 
 /// A dispatch dropped mid-work may have been dropped mid-commit. The work
-/// that knew its access is gone, so ask the intent it committed: a write is
-/// flagged as possibly committed. A failed lookup still writes the row.
+/// that knew its access is gone, so ask the intent it committed.
 async fn note_write_access(pool: &PgPool, row: &mut AuditRow) {
-    match audit::intent::access_of(pool, &row.request_id).await {
-        Ok(Some(Access::ReadWrite)) => {
-            let message = row.error_message.as_deref().unwrap_or(DISCONNECTED);
-            row.error_message = Some(format!("{message} ({WRITE_MAY_HAVE_COMMITTED})"));
+    let message = row.error_message.as_deref().unwrap_or(DISCONNECTED);
+    row.error_message = Some(flag_if_write(pool, &row.request_id, message).await);
+}
+
+/// `message`, flagged as possibly committed when the intent of `request_id`
+/// recorded write access — for work that ended without saying how far it
+/// got. A failed lookup returns `message` unflagged; the row is still
+/// written.
+pub(super) async fn flag_if_write(pool: &PgPool, request_id: &str, message: &str) -> String {
+    match audit::intent::access_of(pool, request_id).await {
+        Ok(Some(Access::ReadWrite)) => format!("{message} ({WRITE_MAY_HAVE_COMMITTED})"),
+        Ok(Some(Access::ReadOnly) | None) => message.to_string(),
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                class = %err.class(),
+                request_id,
+                "intent access lookup failed; row carries no access"
+            );
+            message.to_string()
         }
-        Ok(Some(Access::ReadOnly) | None) => {}
-        Err(err) => tracing::warn!(
-            %err,
-            class = %err.class(),
-            request_id = %row.request_id,
-            "intent access lookup failed; cancelled row carries no access"
-        ),
     }
 }
 

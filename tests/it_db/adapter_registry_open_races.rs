@@ -1,0 +1,225 @@
+//! `AdapterRegistry` under two races the single-flight slot used to lose:
+//!
+//! - a request still holding the pre-reload config snapshot reaches the
+//!   registry after the reload evicted the slot. Its open (old role) must not
+//!   become the adapter later requests on the new config are served from,
+//!   nor replace the one they are already served from;
+//! - callers queued on one open of a dead target must share that failure,
+//!   not each run their own open back to back;
+//! - a slot a reload superseded (a straggler's, or a removed database's)
+//!   must close once released, with no further lookup for its key.
+//!
+//! Audit assertion intentionally skipped: these drive the exec layer's
+//! registry directly, never the tool-dispatch path that writes audit rows.
+
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
+
+use crate::adapter_registry_concurrency::spawn_blackhole;
+use crate::common::pg_target::{self, READ_ROLE, READ_ROLE_PASSWORD, TARGET_USER};
+use db_mcp_gateway::config::{ConfigFile, Database, Password, Server};
+use db_mcp_gateway::exec::{AdapterRegistry, DbAdapter, ExecError, ExecQuery};
+use uuid::Uuid;
+
+/// Restated from `PgAdapter` (not exported); see
+/// `adapter_registry_concurrency::POOL_ACQUIRE_TIMEOUT`.
+const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn current_user(adapter: &dyn DbAdapter) -> String {
+    let result = adapter
+        .execute(ExecQuery {
+            sql: "SELECT current_user::text",
+            binds: &[],
+            statement_timeout_ms: Some(5_000),
+            row_limit: 1,
+            access: db_mcp_gateway::exec::Access::ReadOnly,
+            dry_run: false,
+            request_id: Uuid::new_v4(),
+        })
+        .await
+        .expect("current_user runs");
+    result.rows[0][0]
+        .as_str()
+        .expect("current_user is text")
+        .to_owned()
+}
+
+/// The same `(server, database)` key, re-pointed at the read role — what a
+/// reload that narrows `role:` produces.
+fn narrowed(database: &Database) -> Database {
+    Database {
+        role: READ_ROLE.to_string(),
+        password: Password::Literal(READ_ROLE_PASSWORD.into()),
+        ..database.clone()
+    }
+}
+
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn adapter_opened_from_a_pre_reload_snapshot_is_not_served_after_it() {
+    pg_target::ensure_read_role().await;
+    let server: Server = pg_target::server();
+    let before = pg_target::database();
+    let after = narrowed(&before);
+    let registry = AdapterRegistry::new();
+
+    let warm = registry.get_or_open(&server, &before).await.expect("opens");
+    assert_eq!(current_user(warm.as_ref()).await, TARGET_USER);
+
+    // The reload swaps the config, then evicts the changed key.
+    registry.evict(&server.name, &before.name).await;
+    // A request that loaded its snapshot before the swap opens afterwards.
+    let straggler = registry.get_or_open(&server, &before).await.expect("opens");
+    assert_eq!(current_user(straggler.as_ref()).await, TARGET_USER);
+
+    let next = registry.get_or_open(&server, &after).await.expect("opens");
+    assert_eq!(
+        current_user(next.as_ref()).await,
+        READ_ROLE,
+        "a request on the new config ran as the pre-reload role"
+    );
+    let again = registry.get_or_open(&server, &after).await.expect("cached");
+    assert!(
+        std::sync::Arc::ptr_eq(&next, &again),
+        "the new-config adapter is reused once open"
+    );
+}
+
+/// Old and new snapshots interleaving after a reload each keep one adapter:
+/// the straggler never replaces the new config's pool (which would open a
+/// second pool and split every caller's share across the two), and neither
+/// side opens a pool per lookup.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn interleaved_old_and_new_snapshots_never_replace_each_others_adapter() {
+    pg_target::ensure_read_role().await;
+    let server: Server = pg_target::server();
+    let before = pg_target::database();
+    let after = narrowed(&before);
+    let registry = AdapterRegistry::new();
+
+    registry.get_or_open(&server, &before).await.expect("opens");
+    registry.evict(&server.name, &before.name).await;
+    let next = registry.get_or_open(&server, &after).await.expect("opens");
+    let straggler = registry.get_or_open(&server, &before).await.expect("opens");
+    assert_eq!(current_user(straggler.as_ref()).await, TARGET_USER);
+
+    for round in 0..3 {
+        let new_side = registry.get_or_open(&server, &after).await.expect("cached");
+        assert!(
+            std::sync::Arc::ptr_eq(&next, &new_side),
+            "round {round}: an old-snapshot lookup replaced the new config's adapter"
+        );
+        let old_side = registry
+            .get_or_open(&server, &before)
+            .await
+            .expect("cached");
+        assert!(
+            std::sync::Arc::ptr_eq(&straggler, &old_side),
+            "round {round}: the old snapshot opened another pool"
+        );
+    }
+    assert_eq!(current_user(next.as_ref()).await, READ_ROLE);
+}
+
+const SWEEP_EVERY: Duration = Duration::from_millis(50);
+
+fn config_with(server: &Server, databases: Vec<Database>) -> ConfigFile {
+    let mut config = ConfigFile::from_yaml_str("permissions: []\n").expect("empty config");
+    config.servers = vec![Server {
+        databases,
+        ..server.clone()
+    }];
+    config
+}
+
+/// Polls until the registry let go of `adapter`, i.e. its pools closed.
+async fn assert_released(adapter: Weak<dyn DbAdapter>, what: &str) {
+    let deadline = Instant::now() + SWEEP_EVERY * 40;
+    while adapter.upgrade().is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the registry kept its pool"
+        );
+        tokio::time::sleep(SWEEP_EVERY / 2).await;
+    }
+}
+
+/// The straggler's slot is reinstalled after the reload; once it is released
+/// and traffic stops, the sweep alone closes its pool.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_superseded_pool_closes_after_reload_without_further_traffic() {
+    pg_target::ensure_read_role().await;
+    let server: Server = pg_target::server();
+    let before = pg_target::database();
+    let after = narrowed(&before);
+    let registry = AdapterRegistry::with_sweep_interval(SWEEP_EVERY);
+    registry.get_or_open(&server, &before).await.expect("opens");
+
+    registry
+        .retire_superseded(&config_with(&server, vec![after.clone()]))
+        .await;
+    let straggler = registry.get_or_open(&server, &before).await.expect("opens");
+    let next = registry.get_or_open(&server, &after).await.expect("opens");
+    assert_eq!(current_user(straggler.as_ref()).await, TARGET_USER);
+    let old = Arc::downgrade(&straggler);
+    drop(straggler);
+
+    assert_released(old, "superseded snapshot").await;
+    let again = registry.get_or_open(&server, &after).await.expect("cached");
+    assert!(Arc::ptr_eq(&next, &again), "the live adapter is kept");
+}
+
+/// A request holding a snapshot from before its database was removed opens
+/// a slot no lookup will ever reach again; the sweep still closes it.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_removed_databases_late_lookup_leaves_no_slot_behind() {
+    let server: Server = pg_target::server();
+    let removed = pg_target::database();
+    let registry = AdapterRegistry::with_sweep_interval(SWEEP_EVERY);
+
+    registry
+        .retire_superseded(&config_with(&server, Vec::new()))
+        .await;
+    let late = registry
+        .get_or_open(&server, &removed)
+        .await
+        .expect("opens");
+    assert_eq!(current_user(late.as_ref()).await, TARGET_USER);
+    let weak = Arc::downgrade(&late);
+    drop(late);
+
+    assert_released(weak, "removed database").await;
+}
+
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn callers_queued_on_a_failing_open_share_its_failure() {
+    let mut server = pg_target::server();
+    server.port = spawn_blackhole().await;
+    let database = pg_target::database();
+    let registry = AdapterRegistry::new();
+
+    let started = Instant::now();
+    let results = futures::future::join_all((0..4).map(|_| {
+        let (registry, server, database) = (registry.clone(), server.clone(), database.clone());
+        async move { registry.get_or_open(&server, &database).await }
+    }))
+    .await;
+    let elapsed = started.elapsed();
+
+    assert!(results.iter().all(Result::is_err), "the target is dead");
+    assert!(
+        results
+            .iter()
+            .any(|r| matches!(r, Err(ExecError::Unavailable))),
+        "queued callers answer from the remembered failure"
+    );
+    let two_opens = POOL_ACQUIRE_TIMEOUT + POOL_ACQUIRE_TIMEOUT / 2;
+    assert!(
+        elapsed < two_opens,
+        "queued callers each re-ran the open: {elapsed:?} for 4 callers"
+    );
+}

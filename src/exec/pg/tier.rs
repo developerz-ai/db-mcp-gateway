@@ -10,10 +10,11 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use crate::config::{Database, Password, Server};
 
 use super::super::adapter::ExecError;
-use super::super::pool_sizing::PoolSizing;
+use super::super::pool_sizing::{CallerSlots, PoolSizing};
 use super::config::{build_connect_options, resolve_password};
 use super::error::log_discarded;
-use super::{CANCEL_POOL_MAX_CONNECTIONS, POOL_ACQUIRE_TIMEOUT, reset_on_release};
+use super::release::{pin_lexing, reset_on_release};
+use super::{CANCEL_POOL_MAX_CONNECTIONS, POOL_ACQUIRE_TIMEOUT};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TierKind {
@@ -38,6 +39,8 @@ pub(super) struct Tier {
     pub(super) kind: TierKind,
     pub(super) pool: PgPool,
     pub(super) cancel_pool: PgPool,
+    /// Each caller's share of `pool`; cancels are not counted.
+    pub(super) callers: CallerSlots,
     /// Redacted from server messages before they reach the agent.
     pub(super) role: String,
 }
@@ -121,6 +124,7 @@ impl Tier {
             kind,
             pool,
             cancel_pool,
+            callers: CallerSlots::new(sizing),
             role: role.to_string(),
         }
     }
@@ -138,5 +142,6 @@ fn query_pool_options(sizing: PoolSizing) -> PgPoolOptions {
         .min_connections(sizing.min_connections)
         .idle_timeout(sizing.idle_timeout)
         .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+        .after_connect(pin_lexing)
         .after_release(reset_on_release)
 }

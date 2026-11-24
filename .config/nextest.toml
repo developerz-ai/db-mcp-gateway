@@ -41,7 +41,7 @@ path = "junit.xml"
 #   covered by the sql_guard unit tests.
 [profile.yugabyte]
 default-filter = """
-binary(it_db) & test(/^(exec_run_query|cancellation_real_db|sql_guard_side_effects|sql_guard_unicode_escape|explain_real_db|explain_e2e|sample_table_real_db|sample_table_authz_e2e|describe_schema_real_db|run_query_e2e|write_tier_e2e|tool_args_edge_e2e|introspection_tools_real_db|get_query_history_real_db|audit_integrity_describe_schema_e2e|audit_integrity_intent_e2e|secret_refs)::/)
+binary(it_db) & test(/^(exec_run_query|cancellation_real_db|sql_guard_side_effects|sql_guard_unicode_escape|explain_real_db|explain_e2e|sample_table_real_db|sample_table_authz_e2e|describe_schema_real_db|run_query_e2e|write_tier_e2e|tool_args_edge_e2e|introspection_tools_real_db|get_query_history_real_db|audit_integrity_describe_schema_e2e|audit_integrity_intent_e2e|secret_refs|sql_guard_differential|sql_guard_refusals_e2e|exec_isolation_real_db|pg_error_redaction_real_db|pg_result_budget_real_db)::/)
   - test(=sql_guard_side_effects::pg_notify_escapes_a_read_only_transaction_so_the_guard_denies_it)
   - test(=sql_guard_side_effects::sql_text_in_ts_stat_hides_a_denied_call_so_the_guard_denies_it)
 """

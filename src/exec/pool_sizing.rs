@@ -3,10 +3,19 @@
 //! Pools are lazy and shrink to nothing: `min_connections` defaults to 0 and
 //! idle connections close after `idle_timeout`, so an idle gateway holds no
 //! target connection at all.
+//!
+//! A pool is also shared out: [`CallerSlots`] keeps any one caller from
+//! holding every connection of a database.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+
 use crate::config::{Database, PoolConfig, Server};
+
+use super::adapter::{Caller, ExecError, current_caller};
 
 /// Default upper bound on one database's query pool.
 ///
@@ -84,12 +93,108 @@ impl Default for PoolSizing {
     }
 }
 
+/// Callers tracked before idle ones are swept. Subjects come from the IdP,
+/// so the real count is the organisation's size; the sweep only bounds a
+/// misbehaving one.
+const SWEEP_CALLERS_AT: usize = 1_024;
+
+/// One pool's connections, shared out per caller: each may hold all but one,
+/// so a caller who fills its share with slow queries still leaves a
+/// connection for everyone else. The transport's per-identity request cap
+/// cannot do this — it is larger than a pool. A pool of one connection has
+/// nothing to share out and is left whole.
+#[derive(Debug)]
+pub(crate) struct CallerSlots {
+    per_caller: usize,
+    slots: Mutex<HashMap<Caller, Arc<Semaphore>>>,
+}
+
+impl CallerSlots {
+    pub(crate) fn new(sizing: PoolSizing) -> Self {
+        let max = usize::try_from(sizing.max_connections).unwrap_or(usize::MAX);
+        Self {
+            per_caller: max.saturating_sub(1).max(1),
+            slots: Mutex::default(),
+        }
+    }
+
+    /// One of the current caller's slots, waited for at most `wait`; taken
+    /// before the connection and held as long as it is. A caller already at
+    /// its share for the whole wait gets [`ExecError::Unavailable`], as from
+    /// a saturated pool. `None` outside any caller scope: the gateway's own
+    /// work is not counted.
+    pub(crate) async fn take(
+        &self,
+        wait: Duration,
+    ) -> Result<Option<OwnedSemaphorePermit>, ExecError> {
+        let Some(caller) = current_caller() else {
+            return Ok(None);
+        };
+        let slots = self.slots_of(caller).await;
+        match tokio::time::timeout(wait, slots.acquire_owned()).await {
+            Ok(Ok(slot)) => Ok(Some(slot)),
+            // Timed out; the semaphore is never closed.
+            Ok(Err(_)) | Err(_) => Err(ExecError::Unavailable),
+        }
+    }
+
+    async fn slots_of(&self, caller: Caller) -> Arc<Semaphore> {
+        let mut slots = self.slots.lock().await;
+        if slots.len() >= SWEEP_CALLERS_AT {
+            // A held or awaited slot keeps a second reference alive.
+            slots.retain(|_, held| Arc::strong_count(held) > 1);
+        }
+        let per_caller = self.per_caller;
+        Arc::clone(
+            slots
+                .entry(caller)
+                .or_insert_with(|| Arc::new(Semaphore::new(per_caller))),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
+    use super::super::adapter::for_caller;
     use super::*;
     use crate::config::{Password, ServerKind, Tls};
+
+    fn slots(max_connections: u32) -> CallerSlots {
+        CallerSlots::new(PoolSizing {
+            max_connections,
+            ..PoolSizing::default()
+        })
+    }
+
+    const SHORT: Duration = Duration::from_millis(20);
+
+    #[tokio::test]
+    async fn a_caller_holds_all_but_one_connection_at_most() {
+        let slots = slots(3);
+        for_caller(Caller::new("a"), async {
+            let _first = slots.take(SHORT).await.expect("first slot");
+            let _second = slots.take(SHORT).await.expect("second slot");
+            let third = slots.take(SHORT).await;
+            assert!(matches!(third, Err(ExecError::Unavailable)), "{third:?}");
+            // Another caller's share is its own.
+            let other = for_caller(Caller::new("b"), slots.take(SHORT)).await;
+            assert!(matches!(other, Ok(Some(_))), "{other:?}");
+        })
+        .await;
+        // Released with its holder.
+        let again = for_caller(Caller::new("a"), slots.take(SHORT)).await;
+        assert!(matches!(again, Ok(Some(_))), "{again:?}");
+    }
+
+    #[tokio::test]
+    async fn a_pool_of_one_is_left_whole_and_unscoped_work_is_not_counted() {
+        let slots = slots(1);
+        let held = for_caller(Caller::new("a"), slots.take(SHORT)).await;
+        assert!(matches!(held, Ok(Some(_))), "{held:?}");
+        assert!(matches!(slots.take(SHORT).await, Ok(None)));
+    }
 
     fn pool(max: Option<u32>, min: Option<u32>, idle: Option<u64>) -> Option<PoolConfig> {
         Some(PoolConfig {

@@ -1,9 +1,56 @@
 //! Random hammer: the guard must never panic, never allow a write-shaped
 //! statement, and never crash on garbage input. Doesn't try to be a
-//! complete grammar — just throws shapes at it.
+//! complete grammar — just throws shapes at it. The token-soup properties
+//! check the guard against Postgres's tokenization (`pg_scan`); the same
+//! soup is run through a real Postgres in `tests/it_db/sql_guard_differential.rs`.
 
 use super::*;
 use proptest::prelude::*;
+
+/// Pieces the two lexers are most likely to read differently: quotes,
+/// escapes, string prefixes, comment openers, operator characters, line
+/// breaks, dollar quotes, number shapes, non-ASCII.
+const TOKEN_PIECES: &[&str] = &[
+    " ", "\n", "\r", "\t", "'", "''", "\\", "\\'", "--", "/*", "*/", "$$", "$t$", "$1", "E'", "e'",
+    "U&'", "U&\"", "X'", "B'", "N'", "b\"", "\"", ">", "<", "-", "/", "*", "|", "=", "@", "~", "+",
+    "a", "1", "1e", ".", ",", "(", ")", ";", "::", "é", "\u{a0}", "0x", "L", "_",
+];
+
+fn token_soup() -> impl Strategy<Value = String> {
+    proptest::collection::vec(proptest::sample::select(TOKEN_PIECES), 0..10)
+        .prop_map(|pieces| pieces.concat())
+}
+
+/// A statement with a denied call the soup around it may hide or expose.
+fn mutated_statement() -> impl Strategy<Value = String> {
+    (token_soup(), token_soup(), token_soup())
+        .prop_map(|(a, b, c)| format!("SELECT 1 {a} , pg_notify('c', 'p') {b} , lo_creat(1) {c}"))
+}
+
+/// `sql` as Postgres tokenizes it: comments dropped, one space between
+/// tokens. Nothing is left for a second lexer to read another way.
+fn as_postgres_tokens(sql: &str) -> Option<String> {
+    let lexemes = pg_scan::scan(sql).ok()?;
+    let texts: Vec<&str> = lexemes.iter().map(|l| &sql[l.start..l.end]).collect();
+    Some(texts.join(" "))
+}
+
+fn is_one_read_statement(sql: &str) -> bool {
+    let Ok(statements) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
+        return false;
+    };
+    let [statement] = statements.as_slice() else {
+        return false;
+    };
+    let mut statement = statement;
+    while let Statement::Explain {
+        statement: inner, ..
+    } = statement
+    {
+        statement = inner;
+    }
+    matches!(statement, Statement::Query(_))
+}
 
 fn arbitrary_safe_select() -> impl Strategy<Value = String> {
     proptest::sample::select(&[
@@ -51,6 +98,39 @@ proptest! {
         // never aborts. RecursionLimitExceeded is fine; it's a typed
         // GuardError::Parse, not a panic.
         let _ = is_read_only(&s);
+    }
+
+    #[test]
+    fn never_panics_on_token_soup(sql in mutated_statement()) {
+        let _ = check_sql(&sql, Access::ReadOnly);
+        let _ = check_sql(&sql, Access::ReadWrite);
+    }
+
+    /// Whatever the read guard admits is still one admitted read statement
+    /// once rewritten token by token the way Postgres splits it.
+    #[test]
+    fn admitted_text_is_one_read_statement_as_postgres_tokenizes_it(sql in token_soup()) {
+        let sql = format!("SELECT 1 {sql}");
+        if is_read_only(&sql).is_ok() {
+            let plain = as_postgres_tokens(&sql);
+            prop_assert!(plain.is_some(), "admitted but unscannable: {sql:?}");
+            let plain = plain.unwrap_or_default();
+            prop_assert!(is_one_read_statement(&plain), "{sql:?} reads as {plain:?}");
+            prop_assert!(is_read_only(&plain).is_ok(), "{sql:?} reads as {plain:?}");
+        }
+    }
+
+    /// No arrangement of quotes, comments and operators around a denied
+    /// call gets it past the guard.
+    #[test]
+    fn token_mutations_never_hide_a_denied_call(sql in mutated_statement()) {
+        if is_read_only(&sql).is_ok() {
+            let plain = as_postgres_tokens(&sql).unwrap_or_default();
+            prop_assert!(
+                !plain.contains("pg_notify (") && !plain.contains("lo_creat ("),
+                "{sql:?} reads as {plain:?}"
+            );
+        }
     }
 
     #[test]

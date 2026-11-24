@@ -23,7 +23,9 @@
 //! `SELECT ... FOR UPDATE/SHARE`, `SELECT ... INTO`, `EXPLAIN ANALYZE` in
 //! any spelling (`ANALYZE` keyword or `(ANALYZE)` / `(ANALYSE)` option — all
 //! execute) — is rejected with a typed error, as is text Postgres lexes
-//! differently from sqlparser (a Unicode-escaped identifier, `U&"…"`).
+//! differently from sqlparser: a Unicode-escaped identifier (`U&"…"`), or
+//! any text the two split into different tokens (`lexical`, `pg_scan`).
+//! A relation showing other sessions' statements is refused by name.
 //! Conservative on purpose: better to reject a legitimate exotic statement
 //! than quietly send an unintended one.
 //!
@@ -41,7 +43,9 @@
 //! were manually enumerated — that's the class of gap this module exists to
 //! close, and the reason the walk is now visitor-driven, not hand-recursion.
 
+mod denylist;
 mod lexical;
+mod pg_scan;
 mod shape;
 mod visitor;
 
@@ -89,6 +93,12 @@ pub enum GuardError {
     ExplainAnalyze,
     #[error("Unicode-escaped identifiers (U&\"…\") are not allowed; spell the identifier plainly")]
     UnicodeEscapedIdentifier,
+    #[error("the SQL text is ambiguous: {0}")]
+    AmbiguousTokens(&'static str),
+    #[error(
+        "relation `{0}` is not allowed (it shows other sessions' statements); use the db_activity tool"
+    )]
+    DeniedRelation(&'static str),
     /// Stable error code: `GUARD_DENIED_FUNCTION`.
     #[error("function `{0}` is not allowed (high-privilege server-side function)")]
     DeniedFunction(&'static str),

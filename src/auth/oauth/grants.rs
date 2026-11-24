@@ -34,6 +34,18 @@ impl std::fmt::Debug for Minted {
     }
 }
 
+/// Why a fresh authorization got no grant handed back.
+#[derive(Debug, thiserror::Error)]
+pub enum MintError {
+    /// Failed before any COMMIT was sent: nothing exists, a retry is safe.
+    #[error(transparent)]
+    NotMinted(#[from] AuthError),
+    /// The grant was or may have been committed, but its tokens never reached
+    /// the caller. A retry could mint a second grant for one authorization.
+    #[error("grant minted or commit outcome unknown; tokens not delivered")]
+    Unconfirmed,
+}
+
 impl RefreshTokens {
     /// Start a chain for a fresh authorization: a new session plus a refresh
     /// token paired with it. `refresh_token` is the caller-generated bearer.
@@ -43,9 +55,24 @@ impl RefreshTokens {
         identity: GrantIdentity,
         refresh_token: String,
         session_ttl: Duration,
-    ) -> Result<Minted, AuthError> {
-        self.mint_session(sessions, identity, refresh_token, session_ttl, None)
-            .await
+    ) -> Result<Minted, MintError> {
+        let RefreshBackend::Db(pool) = &self.backend else {
+            let minted = self
+                .mint_in_memory(sessions, identity, refresh_token, session_ttl, None)
+                .await?;
+            return Ok(minted);
+        };
+        let session = new_session(&identity, session_ttl, None);
+        let mut tx = pool.begin().await.map_err(AuthError::from)?;
+        self.write_fresh_chain(&mut tx, &identity, &refresh_token, &session)
+            .await?;
+        // An error here does not say which way the commit went.
+        tx.commit().await.map_err(|_| MintError::Unconfirmed)?;
+        sessions.committed(Some(&session), &[]).await;
+        Ok(Minted {
+            session,
+            refresh_token,
+        })
     }
 
     /// Redeem `presented`: consume it, revoke its paired session, and mint a
@@ -68,7 +95,7 @@ impl RefreshTokens {
                 sessions.revoke(id).await?;
             }
             let minted = self
-                .mint_session(
+                .mint_in_memory(
                     sessions,
                     old.identity,
                     refresh_token,
@@ -81,9 +108,11 @@ impl RefreshTokens {
 
         let mut tx = pool.begin().await?;
         let presented_hash = hash_secret(presented);
-        // Lock before consuming, so a concurrent reuse-revocation of this
-        // chain sees either none or all of this rotation.
-        if let Some(chain_id) = db::live_chain(&mut *tx, &presented_hash).await? {
+        // Lock before consuming, so a concurrent logout of this subject or
+        // reuse-revocation of this chain sees either none or all of this
+        // rotation.
+        if let Some((sub, chain_id)) = db::live_chain(&mut *tx, &presented_hash).await? {
+            db::lock_subject(&mut *tx, &sub).await?;
             db::lock_chain(&mut *tx, chain_id).await?;
         }
         let Some(row) = db::rotate_out_refresh_token(&mut *tx, &presented_hash).await? else {
@@ -122,8 +151,11 @@ impl RefreshTokens {
         }))
     }
 
-    /// RFC 7009 for a refresh token: end the chain and revoke the paired
-    /// session. `Ok(false)` when `presented` is not a live refresh token.
+    /// RFC 7009 for a refresh token: end its chain and revoke the paired
+    /// session. A token a rotation has already consumed still names its
+    /// chain, so a revoke that loses the race to a rotation ends the pair
+    /// that rotation minted. `Ok(false)` when `presented` was never a refresh
+    /// token of a chain that is still live.
     pub async fn revoke(
         &self,
         sessions: &SessionStore,
@@ -138,18 +170,12 @@ impl RefreshTokens {
             }
             return Ok(true);
         };
-        let mut tx = pool.begin().await?;
-        let Some(row) = db::take_refresh_token(&mut *tx, &hash_secret(presented)).await? else {
-            return Ok(false);
-        };
-        let revoked = revoke_paired(&mut tx, row.session_id.map(SessionId::from)).await?;
-        tx.commit().await?;
-        sessions.committed(None, &revoked).await;
-        Ok(true)
+        Self::revoke_in(sessions, pool.begin().await?, presented).await
     }
 
     /// Logout: revoke every session of `sub` and drop every refresh chain, in
-    /// one transaction. Returns the number of sessions revoked.
+    /// one transaction, after waiting out any in-flight mint or rotation for
+    /// `sub`. Returns the number of sessions revoked.
     pub async fn end_all_for_sub(
         &self,
         sessions: &SessionStore,
@@ -161,6 +187,7 @@ impl RefreshTokens {
             return Ok(revoked);
         };
         let mut tx = pool.begin().await?;
+        db::lock_subject(&mut *tx, sub).await?;
         let revoked = SessionStore::revoke_all_for_sub_in(&mut tx, sub).await?;
         db::delete_refresh_tokens_for_sub(&mut *tx, sub).await?;
         tx.commit().await?;
@@ -168,7 +195,8 @@ impl RefreshTokens {
         Ok(revoked.len())
     }
 
-    async fn mint_session(
+    /// The memory backend's mint (tests only): no transaction to lose.
+    async fn mint_in_memory(
         &self,
         sessions: &SessionStore,
         identity: GrantIdentity,
@@ -176,49 +204,44 @@ impl RefreshTokens {
         session_ttl: Duration,
         chain_born: Option<DateTime<Utc>>,
     ) -> Result<Minted, AuthError> {
-        let RefreshBackend::Db(pool) = &self.backend else {
-            let session = sessions
-                .create(
-                    &identity.sub,
-                    &identity.email,
-                    &identity.groups,
-                    session_ttl,
-                    chain_born,
-                )
-                .await?;
-            // The memory backend's only failure is its size cap.
-            self.store(
-                &refresh_token,
-                identity,
-                session.issued_at,
-                Some(session.id),
+        let session = sessions
+            .create(
+                &identity.sub,
+                &identity.email,
+                &identity.groups,
+                session_ttl,
+                chain_born,
             )
-            .await
-            .map_err(|_| AuthError::StoreFull)?;
-            return Ok(Minted {
-                session,
-                refresh_token,
-            });
-        };
-        let session = new_session(&identity, session_ttl, chain_born);
-        let mut tx = pool.begin().await?;
-        SessionStore::insert_in(&mut tx, &session).await?;
-        // A fresh chain is born with its session, so both clocks start together.
-        self.store_paired(
-            &mut tx,
+            .await?;
+        // The memory backend's only failure is its size cap.
+        self.store(
             &refresh_token,
-            &identity,
+            identity,
             session.issued_at,
-            Uuid::new_v4(),
-            session.id,
+            Some(session.id),
         )
-        .await?;
-        tx.commit().await?;
-        sessions.committed(Some(&session), &[]).await;
+        .await
+        .map_err(|_| AuthError::StoreFull)?;
         Ok(Minted {
             session,
             refresh_token,
         })
+    }
+
+    /// Everything a fresh grant writes, up to but not including its COMMIT.
+    async fn write_fresh_chain(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        identity: &GrantIdentity,
+        refresh_token: &str,
+        session: &Session,
+    ) -> Result<(), AuthError> {
+        db::lock_subject(&mut *tx, &identity.sub).await?;
+        SessionStore::insert_in(tx, session).await?;
+        // A fresh chain is born with its session, so both clocks start together.
+        let (born, chain_id) = (session.issued_at, Uuid::new_v4());
+        self.store_paired(tx, refresh_token, identity, born, chain_id, session.id)
+            .await
     }
 
     async fn store_paired(

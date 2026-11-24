@@ -1812,3 +1812,77 @@ async fn revoke_sessions_logs_the_subject_out_and_audits_once() {
 
     h.cleanup().await;
 }
+
+/// The kill switch fires while a refresh rotation of the same subject has
+/// written its new session and token but not committed. The revoke must wait
+/// for it and end the new pair too — and still write its one audit row.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn revoke_sessions_during_an_in_flight_rotation_ends_the_new_pair() {
+    use crate::oauth_revoke_race_real_db::{
+        InFlightRotation, chains_of, cleanup_sub, live_grants, mint_chain,
+    };
+
+    let (mut h, auth_cfg, sessions) = spawn_gateway().await;
+    let admin_sub = format!("admin-e2e-{}", Uuid::new_v4().simple());
+    let target_sub = format!("target-e2e-race-{}", Uuid::new_v4().simple());
+    h.track(admin_sub.clone());
+    h.track(target_sub.clone());
+    let admin_jwt = mint_session(
+        &sessions,
+        &auth_cfg.session_signing_key,
+        &admin_sub,
+        "admin@example.com",
+        &[ADMIN_GROUP.to_string()],
+    )
+    .await;
+    let target = PgPermissionsRepo::new(h.pool.clone())
+        .upsert_user(&target_sub, "victim@example.com", &[])
+        .await
+        .unwrap();
+    let first = mint_chain(&h.pool, &target_sub).await;
+    let chains = chains_of(&h.pool, &target_sub).await;
+
+    let rotation = InFlightRotation::begin(&h.pool, &target_sub, &first).await;
+    let revoke = tokio::spawn(
+        client()
+            .post(format!(
+                "{}/admin/v1/users/{}/revoke-sessions",
+                h.base_url, target.id
+            ))
+            .bearer_auth(&admin_jwt)
+            .send(),
+    );
+    rotation.commit_once_blocking(&h.pool).await;
+    let resp = revoke.await.expect("join").expect("revoke responds");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["revoked_sessions"], 1, "the rotation's new session");
+    assert_eq!(
+        body["revoked_refresh_tokens"], 1,
+        "the rotation's new token"
+    );
+
+    assert_eq!(
+        live_grants(&h.pool, &target_sub).await,
+        (0, 0),
+        "the revoke left a live session or refresh token behind"
+    );
+    let audit_rows: i64 =
+        sqlx::query("SELECT COUNT(*) FROM permissions_audit WHERE target_id = $1")
+            .bind(target.id)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap()
+            .get(0);
+    assert_eq!(audit_rows, 1);
+    let (action, before, after, _, _) = latest_audit_for_target(&h.pool, target.id)
+        .await
+        .expect("audit");
+    assert_eq!(action, "update");
+    assert_eq!(before.unwrap()["live_sessions"], 1);
+    assert_eq!(after.unwrap()["live_sessions"], 0);
+
+    cleanup_sub(&h.pool, &target_sub, &chains).await;
+    h.cleanup().await;
+}

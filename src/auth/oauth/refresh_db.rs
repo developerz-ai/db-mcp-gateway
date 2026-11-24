@@ -4,10 +4,10 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use sqlx::PgConnection;
+use sqlx::{PgConnection, Postgres, Transaction};
 use uuid::Uuid;
 
-use super::GrantIdentity;
+use super::{GrantIdentity, RefreshTokens, hash_secret};
 use crate::auth::{AuthError, SessionId, SessionStore};
 use crate::state::oauth::{self as db, NewRefreshToken};
 
@@ -69,16 +69,31 @@ pub(super) async fn revoke_reused_chain(
     conn: &mut sqlx::PgConnection,
     presented_hash: &[u8],
 ) -> Result<Vec<SessionId>, AuthError> {
-    let Some(chain_id) = db::rotated_chain(&mut *conn, presented_hash, REUSE_GRACE).await? else {
+    let Some((sub, chain_id)) =
+        db::rotated_chain(&mut *conn, presented_hash, Some(REUSE_GRACE)).await?
+    else {
         return Ok(Vec::new());
     };
-    // Waits out an in-flight rotation; the delete below then sees its token.
+    let revoked = end_chain(conn, &sub, chain_id).await?;
+    tracing::warn!(%chain_id, "rotated refresh token replayed; chain revoked");
+    Ok(revoked)
+}
+
+/// Delete `chain_id`'s live token and revoke its paired session; returns the
+/// sessions this revoked. Locks as every grant change does — subject, then
+/// chain, then rows — so it waits out an in-flight rotation and then sees
+/// that rotation's token, and cannot deadlock with a logout of `sub`.
+pub(super) async fn end_chain(
+    conn: &mut sqlx::PgConnection,
+    sub: &str,
+    chain_id: Uuid,
+) -> Result<Vec<SessionId>, AuthError> {
+    db::lock_subject(&mut *conn, sub).await?;
     db::lock_chain(&mut *conn, chain_id).await?;
     let mut revoked = Vec::new();
     for paired in db::delete_chain(&mut *conn, chain_id).await? {
         revoked.extend(revoke_paired(conn, paired.map(SessionId::from)).await?);
     }
-    tracing::warn!(%chain_id, "rotated refresh token replayed; chain revoked");
     Ok(revoked)
 }
 
@@ -95,4 +110,30 @@ pub(super) async fn revoke_paired(
         revoked.push(id);
     }
     Ok(revoked)
+}
+
+impl RefreshTokens {
+    /// The DB half of [`RefreshTokens::revoke`], run in `tx`, which the
+    /// caller began. Public so a test can commit a rotation between that
+    /// BEGIN and the lookup — the order where an age test against the
+    /// transaction's start would miss the rotation's tombstone.
+    pub async fn revoke_in(
+        sessions: &SessionStore,
+        mut tx: Transaction<'_, Postgres>,
+        presented: &str,
+    ) -> Result<bool, AuthError> {
+        let presented_hash = hash_secret(presented);
+        let chain = match db::live_chain(&mut *tx, &presented_hash).await? {
+            Some(chain) => Some(chain),
+            // No grace: unlike a replay at `/token`, this asks for the end.
+            None => db::rotated_chain(&mut *tx, &presented_hash, None).await?,
+        };
+        let Some((sub, chain_id)) = chain else {
+            return Ok(false);
+        };
+        let revoked = end_chain(&mut tx, &sub, chain_id).await?;
+        tx.commit().await?;
+        sessions.committed(None, &revoked).await;
+        Ok(true)
+    }
 }

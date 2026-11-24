@@ -12,7 +12,7 @@ use crate::auth::{AuthError, pkce};
 use super::super::app_state::OAuthState;
 use super::helpers::{form_rejected, oauth_error, random_token};
 use super::urls::MCP_SCOPE;
-use crate::auth::oauth::{AuthFacade, IssuedTokens};
+use crate::auth::oauth::{AuthFacade, IssuedTokens, MintError};
 
 #[derive(Debug, Deserialize)]
 pub struct TokenForm {
@@ -50,15 +50,15 @@ pub async fn token(
             "supported grant types: authorization_code, refresh_token",
         );
     }
-    let auth = &state.auth;
     if grant == Some("refresh_token") {
-        token_refresh(auth, form).await
+        token_refresh(&state.auth, form).await
     } else {
-        token_authorization_code(auth, form).await
+        token_authorization_code(&state, form).await
     }
 }
 
-async fn token_authorization_code(auth: &AuthFacade, form: TokenForm) -> Response {
+async fn token_authorization_code(state: &OAuthState, form: TokenForm) -> Response {
+    let auth = &state.auth;
     let (Some(code), Some(verifier)) = (form.code.as_deref(), form.code_verifier.as_deref()) else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -67,7 +67,8 @@ async fn token_authorization_code(auth: &AuthFacade, form: TokenForm) -> Respons
         );
     };
 
-    // One-time: take() removes the code so a replay finds nothing.
+    // One-time: take() removes the code so a replay finds nothing, and every
+    // refusal below for what the client sent leaves it consumed.
     let Some(entry) = auth.codes.take(code).await else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -115,8 +116,48 @@ async fn token_authorization_code(auth: &AuthFacade, form: TokenForm) -> Respons
         );
     }
 
-    // Fresh authorization → fresh session + refresh-token chain.
-    token_response(auth.issue_tokens(entry.identity, random_token()).await)
+    // A redeemed code proves a verified IdP login used this client: only now
+    // does its registration earn the long TTL. Before minting, so a failure
+    // never leaves a session behind an error response. A registration that
+    // lapsed mid-login has nothing to promote; the login still stands.
+    if state
+        .client_registry
+        .promote(&entry.client_id)
+        .await
+        .is_err()
+    {
+        auth.codes.restore(code, entry).await;
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "could not issue tokens; try again",
+        );
+    }
+
+    // Fresh authorization → fresh session + refresh-token chain. The identity
+    // is cloned so a failed mint can hand the code back.
+    match auth
+        .issue_tokens(entry.identity.clone(), random_token())
+        .await
+    {
+        Ok(issued) => token_response(Ok(issued)),
+        Err(MintError::NotMinted(err)) => {
+            // A retryable 503 with provably nothing issued, so the code —
+            // proven by PKCE to be this client's — is put back for it.
+            auth.codes.restore(code, entry).await;
+            token_response(Err(err))
+        }
+        Err(MintError::Unconfirmed) => {
+            // The grant may exist: handing the code back would let the retry
+            // mint a second one. The code stays spent; the client starts over.
+            tracing::warn!("token issuance unconfirmed; authorization code not restored");
+            oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "token issuance could not be confirmed; restart authorization",
+            )
+        }
+    }
 }
 
 async fn token_refresh(auth: &AuthFacade, form: TokenForm) -> Response {
@@ -178,3 +219,7 @@ fn token_response(issued: Result<IssuedTokens, AuthError>) -> Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+#[path = "token_tests.rs"]
+mod tests;

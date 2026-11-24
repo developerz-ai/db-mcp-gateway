@@ -18,6 +18,7 @@ pub mod tls;
 mod auth_middleware;
 mod auth_routes;
 mod bounds;
+mod catch_panic;
 mod dispatch;
 mod mcp_handler;
 mod mcp_headers;
@@ -113,7 +114,10 @@ pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError
                 config.max_concurrent_requests,
             )),
             limit::enforce,
-        ));
+        ))
+        // Applied last, so it runs first: the body is in before a permit is
+        // taken (`bounds::buffer_oauth_body`).
+        .route_layer(middleware::from_fn(bounds::buffer_oauth_body));
 
     let mut router = Bounds::Open
         .apply(open)
@@ -155,9 +159,11 @@ pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError
         router = router.merge(Bounds::Admin.apply(admin));
     }
 
-    // Outermost, so every response — including 404/405 and every rejection
-    // above — carries the request id.
-    Ok(router.layer(middleware::from_fn(request_id::assign)))
+    // Outermost, so every response — including 404/405, every rejection
+    // above and a caught panic — carries the request id.
+    Ok(router
+        .layer(middleware::from_fn(catch_panic::catch_panic))
+        .layer(middleware::from_fn(request_id::assign)))
 }
 
 /// Build a minimal router for protocol-only testing (no bearer auth required).

@@ -23,9 +23,9 @@ async fn cleanup(pool: &PgPool, client_id: &str) {
 }
 
 /// A client caches a `client_id` whose registration lapsed but the GC hasn't
-/// swept yet; `/authorize` adopts it. Adoption must revive the row — before
-/// the fix the upsert kept the lapsed `expires_at`, the lookup filtered it
-/// out, and every retry 503'd until GC ran.
+/// swept yet; `/authorize` adopts it. Adoption must revive the row — an
+/// upsert that kept the lapsed `expires_at` left it filtered out of the
+/// lookup, and every retry 503'd until GC ran.
 #[tokio::test]
 #[serial_test::serial(world)]
 async fn adopting_a_lapsed_unswept_client_revives_it() {
@@ -48,16 +48,17 @@ async fn adopting_a_lapsed_unswept_client_revives_it() {
         .expect("adoption revives a lapsed registration");
     assert_eq!(
         reg.redirect_uris(&client_id).await,
-        Some(vec!["http://127.0.0.1:2/cb".into()])
+        Ok(Some(vec!["http://127.0.0.1:2/cb".into()]))
     );
-    let promoted: bool = sqlx::query_scalar(
-        "SELECT expires_at > now() + interval '89 days' FROM oauth_clients WHERE client_id = $1",
+    let unused: bool = sqlx::query_scalar(
+        "SELECT expires_at <= created_at + interval '1 hour' \
+         FROM oauth_clients WHERE client_id = $1",
     )
     .bind(&client_id)
     .fetch_one(&pool)
     .await
     .expect("read expiry");
-    assert!(promoted, "adopted client carries the full authorised TTL");
+    assert!(unused, "a revived client restarts on the unused TTL");
 
     cleanup(&pool, &client_id).await;
 }
@@ -71,9 +72,10 @@ async fn re_registering_a_live_client_keeps_its_expiry() {
     cleanup(&pool, &client_id).await;
 
     let reg = ClientRegistry::with_db(pool.clone());
-    reg.adopt(client_id.clone(), "http://127.0.0.1:2/cb".into())
+    reg.insert(client_id.clone(), vec!["http://127.0.0.1:2/cb".into()])
         .await
-        .expect("adopted");
+        .expect("registered");
+    assert_eq!(reg.promote(&client_id).await, Ok(true));
     let expiry = "SELECT expires_at FROM oauth_clients WHERE client_id = $1";
     let before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(expiry)
         .bind(&client_id)

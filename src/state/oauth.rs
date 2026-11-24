@@ -14,7 +14,10 @@ use uuid::Uuid;
 
 mod clients;
 
-pub use clients::{ClientRow, delete_expired_clients, insert_client_capped, touch_client};
+pub use clients::{
+    ClientRow, LiveClient, delete_expired_clients, find_client, insert_client_capped,
+    lock_client_registry, promote_client,
+};
 
 /// A refresh-token row to upsert. `token_hash` is the SHA-256 of the bearer
 /// value — the raw token never reaches the DB.
@@ -135,14 +138,30 @@ pub async fn lock_chain(conn: impl PgExecutor<'_>, chain_id: Uuid) -> Result<(),
     Ok(())
 }
 
-/// The chain of a live (not yet rotated-out) token, if any. Read before
-/// [`lock_chain`] so the rotation can lock before it consumes the token.
+/// Serialise every grant change of one subject — mint, rotation, logout,
+/// admin revoke — until the transaction ends. Without it a subject-wide
+/// revocation overlapping an uncommitted rotation misses the rotation's new
+/// session and token: they are invisible to its statements, and the row
+/// locks it waits on are the old pair's. Take it before any row of the
+/// subject is written, and before [`lock_chain`].
+pub async fn lock_subject(conn: impl PgExecutor<'_>, user_sub: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('oauth_subject:' || $1, 0))")
+        .bind(user_sub)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// The subject and chain of a live (not yet rotated-out) token, if any. Read
+/// before [`lock_subject`] and [`lock_chain`] so the rotation can lock
+/// before it consumes the token.
 pub async fn live_chain(
     conn: impl PgExecutor<'_>,
     token_hash: &[u8],
-) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT chain_id FROM oauth_refresh_tokens WHERE token_hash = $1 AND expires_at > now()",
+) -> Result<Option<(String, Uuid)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT user_sub, chain_id FROM oauth_refresh_tokens \
+         WHERE token_hash = $1 AND expires_at > now()",
     )
     .bind(token_hash)
     .fetch_optional(conn)
@@ -174,17 +193,23 @@ pub async fn rotate_out_refresh_token(
     .await
 }
 
-/// The live chain a tombstoned (already rotated-out) `token_hash` belongs to,
-/// if it was rotated out more than `grace` ago. `None` for an unknown hash, a
-/// lapsed chain, or a rotation still inside `grace`.
+/// The subject and chain a tombstoned (already rotated-out) `token_hash`
+/// belongs to. `None` for an unknown hash, a chain with no token left, or —
+/// with a `grace` — a rotation younger than it. No `grace` means no age
+/// test at all: a zero one would still compare against this transaction's
+/// start, and miss a rotation that committed after it. Read before
+/// [`lock_subject`] and [`lock_chain`], like [`live_chain`].
 pub async fn rotated_chain(
     conn: impl PgExecutor<'_>,
     token_hash: &[u8],
-    grace: chrono::Duration,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT chain_id FROM oauth_refresh_rotated \
-         WHERE token_hash = $1 AND expires_at > now() AND rotated_at <= now() - $2",
+    grace: Option<chrono::Duration>,
+) -> Result<Option<(String, Uuid)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT live.user_sub, rotated.chain_id FROM oauth_refresh_rotated rotated \
+         JOIN oauth_refresh_tokens live ON live.chain_id = rotated.chain_id \
+         WHERE rotated.token_hash = $1 AND rotated.expires_at > now() \
+           AND ($2::interval IS NULL OR rotated.rotated_at <= now() - $2) \
+         LIMIT 1",
     )
     .bind(token_hash)
     .bind(grace)

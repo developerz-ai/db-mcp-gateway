@@ -16,13 +16,19 @@
 //! 3. A read runs as the database's read `role` in a `READ ONLY`
 //!    transaction; only `Access::ReadWrite` reaches the write tier
 //!    (`write_role`). No session state survives a connection's return to
-//!    the pool (see [`reset_on_release`]).
+//!    the pool (see `release`).
+//! 4. Memory is bounded per query, not per cell: a row past the result
+//!    budget is refused from its wire length, before it is decoded (see
+//!    `stream`). The driver has still buffered that one row — up to
+//!    Postgres' 1 GiB row limit — and the buffer is given back on release.
 //!
 //! Split by responsibility: `tier` owns one role's pools, `cancel` owns the
 //! identity-checked cancel and its drop guard, `truncate` owns
 //! read-truncation cleanup, `decode` owns row → JSON, `error` owns
 //! `sqlx::Error` → `ExecError`, `config` owns password resolution and
-//! `PgConnectOptions` construction, `run` owns the per-query transaction.
+//! `PgConnectOptions` construction, `release` owns the session reset between
+//! callers, `run` owns the per-query transaction,
+//! `stream` owns row collection against the result budget.
 //! `catalog`, `sample`, `explain` and `introspect` build the Postgres SQL
 //! behind the matching `DbAdapter` methods.
 
@@ -34,18 +40,21 @@ mod error;
 mod explain;
 mod introspect;
 mod methods;
+mod redact;
+mod release;
 mod run;
 mod sample;
+mod stream;
 mod tier;
 mod truncate;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use futures::future::BoxFuture;
-use sqlx::pool::{PoolConnection, PoolConnectionMetadata};
+use sqlx::PgPool;
+use sqlx::pool::PoolConnection;
 use sqlx::postgres::Postgres;
-use sqlx::{Executor, PgConnection};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::audit::drain::DetachedTasks;
@@ -56,8 +65,9 @@ use super::pool_sizing::PoolSizing;
 use super::query::{ActivityQuery, ExecQuery};
 use super::sql_guard::Access;
 
-use error::{AcquireFailure, is_feature_not_supported, log_discarded};
+use error::AcquireFailure;
 use run::{RunCtx, run_query_inner};
+use stream::LARGE_ROW_DECODES;
 use tier::Tier;
 
 // Re-exported so `super::pg::resolve_password` keeps working for sibling
@@ -89,6 +99,9 @@ pub struct PgAdapter {
     stale: AtomicBool,
     /// Tracks drop-guard cancels so a shutdown drain waits for them.
     detached: DetachedTasks,
+    /// Bounds how many large rows are being decoded at once, across both
+    /// tiers (see `stream`).
+    large_rows: Semaphore,
     /// Composite label for metrics tagging — bounded cardinality, supplied
     /// from YAML config rather than user input.
     db_label: String,
@@ -129,6 +142,7 @@ impl PgAdapter {
             write,
             stale: AtomicBool::new(false),
             detached,
+            large_rows: Semaphore::new(LARGE_ROW_DECODES),
             db_label,
         })
     }
@@ -146,11 +160,12 @@ impl PgAdapter {
         std::iter::once(&self.read).chain(self.write.iter().filter(|t| t.is_connected()))
     }
 
-    /// A connection for one query, bounded by [`POOL_ACQUIRE_TIMEOUT`]. A
-    /// credential rejection marks the adapter stale.
-    async fn acquire(&self, tier: &Tier) -> Result<PoolConnection<Postgres>, ExecError> {
-        tier.pool
-            .acquire()
+    /// A connection from one of a tier's pools, bounded by
+    /// [`POOL_ACQUIRE_TIMEOUT`]. The one place a connect-phase error is
+    /// handled: it is never rendered (it can name the role and the client
+    /// address), and a credential rejection marks the adapter stale.
+    async fn acquire(&self, pool: &PgPool) -> Result<PoolConnection<Postgres>, ExecError> {
+        pool.acquire()
             .await
             .map_err(|err| match AcquireFailure::of(&err) {
                 AcquireFailure::Auth => {
@@ -165,7 +180,10 @@ impl PgAdapter {
     /// mode comes from `query.access`, not from the tier: `explain` of a
     /// write runs on the write tier in a read-only transaction.
     async fn run(&self, tier: &Tier, query: &ExecQuery<'_>) -> Result<ExecResult, ExecError> {
-        let mut conn = self.acquire(tier).await?;
+        // The caller's share of the pool first, so a caller at its share
+        // waits on itself rather than taking the connection others need.
+        let _slot = tier.callers.take(POOL_ACQUIRE_TIMEOUT).await?;
+        let mut conn = self.acquire(&tier.pool).await?;
         // Belt-and-suspenders: a Tokio-side deadline so even a misapplied
         // SET LOCAL (or a DB that ignores it) still bounds the call. Same
         // effective value as the DB-side cap set inside `run_query_inner`.
@@ -175,6 +193,7 @@ impl PgAdapter {
             cancel_pool: &tier.cancel_pool,
             role: &tier.role,
             detached: &self.detached,
+            large_rows: &self.large_rows,
         };
         match tokio::time::timeout(budget, run_query_inner(&mut conn, &ctx, query)).await {
             Ok(result) => result,
@@ -221,39 +240,6 @@ impl PgAdapter {
         };
         self.run(tier, &exec).await
     }
-}
-
-/// `after_release` hook: wipe session state before a connection serves the
-/// next caller. `RESET ALL` undoes session `SET`s / `set_config(…, false)`;
-/// `pg_advisory_unlock_all()` drops session advisory locks. Not `DISCARD
-/// ALL`: it would also drop the prepared statements sqlx's cache still
-/// believes exist. A failed reset discards the connection.
-///
-/// A server without advisory locks (YugabyteDB with the preview flag off)
-/// rejects the unlock as `feature_not_supported`; it can hold no advisory
-/// lock, so the connection is kept. The rejected statement aborted the
-/// implicit transaction the pair ran in, taking `RESET ALL` with it, so the
-/// reset is repeated alone.
-fn reset_on_release(
-    conn: &mut PgConnection,
-    _meta: PoolConnectionMetadata,
-) -> BoxFuture<'_, Result<bool, sqlx::Error>> {
-    Box::pin(async move {
-        let reset = match conn
-            .execute("RESET ALL; SELECT pg_advisory_unlock_all()")
-            .await
-        {
-            Err(err) if is_feature_not_supported(&err) => conn.execute("RESET ALL").await,
-            other => other,
-        };
-        match reset {
-            Ok(_) => Ok(true),
-            Err(err) => {
-                log_discarded(&err, "connection reset failed; discarding");
-                Ok(false)
-            }
-        }
-    })
 }
 
 #[cfg(test)]

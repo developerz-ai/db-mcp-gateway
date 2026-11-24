@@ -1,7 +1,10 @@
 use super::*;
 
+mod attribute_notation;
 mod denied_families;
 mod denied_functions;
+mod denied_relations;
+mod lexer_agreement;
 mod lexical;
 mod read_only;
 mod write_access;

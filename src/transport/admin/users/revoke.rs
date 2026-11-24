@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::audit::permissions::{PermissionsAuditAction, PermissionsAuditTargetType};
 use crate::auth::SessionStore;
-use crate::state::oauth::delete_refresh_tokens_for_sub;
+use crate::state::oauth::{delete_refresh_tokens_for_sub, lock_subject};
 use crate::state::permissions::pg::users;
 
 use super::super::audited_tx::AuditedTx;
@@ -49,6 +49,11 @@ pub async fn revoke_sessions(
     if is_self {
         atx.actor_is(user.id);
     }
+    // Wait out an in-flight mint or rotation for this subject: its new
+    // session and token must be visible to the two statements below.
+    lock_subject(&mut **atx.tx(), &user.user_sub)
+        .await
+        .map_err(|err| internal("lock_subject", err, rid))?;
     let revoked = SessionStore::revoke_all_for_sub_in(atx.tx(), &user.user_sub)
         .await
         .map_err(|err| internal("revoke_sessions", err, rid))?;
