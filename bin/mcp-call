@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# bin/mcp-call — one MCP tools/call against a running gateway, as a service token.
+#   bin/mcp-call <tool> [json-arguments]
+#   bin/mcp-call --list                      tools/list
+# e.g. bin/mcp-call run_query '{"server":"local","database":"shop","sql":"select * from orders"}'
+# Defaults target `bin/run`: http://127.0.0.1:<GATEWAY_BIND port><MCP_PATH> and
+# the token bin/run minted (target/dev/service-token). Override with MCP_URL
+# and DBMCP_TOKEN (e.g. the examples/demo token). Exit 1 on a JSON-RPC error
+# or a tool result with isError.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+# shellcheck source=bin/lib/dotenv.sh
+. bin/lib/dotenv.sh
+
+usage() { echo "usage: bin/mcp-call <tool> [json-arguments] | bin/mcp-call --list" >&2; exit 2; }
+
+case "${1:-}" in
+  --list) body='{"jsonrpc":"2.0","id":1,"method":"tools/list"}' ;;
+  '' | -*) usage ;;
+  *)
+    [[ $1 =~ ^[a-z_]+$ ]] || usage
+    body=$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"%s","arguments":%s}}' \
+      "$1" "${2:-"{}"}")
+    ;;
+esac
+
+bind=${GATEWAY_BIND:-127.0.0.1:8443}
+url=${MCP_URL:-http://127.0.0.1:${bind##*:}${MCP_PATH:-/mcp}}
+if [[ -z ${DBMCP_TOKEN:-} ]]; then
+  token_file=target/dev/service-token
+  [[ -s $token_file ]] || { echo "bin/mcp-call: no token: run bin/run first, or set DBMCP_TOKEN" >&2; exit 2; }
+  DBMCP_TOKEN=$(<"$token_file")
+fi
+
+# The token goes to curl on stdin, never on its command line (visible in ps).
+response=$(printf 'header = "Authorization: Bearer %s"\n' "$DBMCP_TOKEN" \
+  | curl -sS --config - -H 'Content-Type: application/json' --data-binary "$body" "$url")
+
+if command -v jq >/dev/null 2>&1; then
+  jq . <<<"$response"
+else
+  printf '%s\n' "$response"
+fi
+if [[ $response == *'"error":'* || $response == *'"isError":true'* ]]; then
+  exit 1
+fi

@@ -4,12 +4,12 @@ This is the reference for engineers whose org has already deployed the gateway. 
 
 If you're standing the gateway up, see [../deployment/quickstart.md](../deployment/quickstart.md) first.
 
-> Every `https://db.internal.acme.com` below is a placeholder. Your platform team gives you the real one — same shape, different domain.
+> Every `https://db.internal.acme.com` below is a placeholder. Your platform team gives you the real one — same shape, different domain. The MCP endpoint is the origin **plus `/mcp`** (or the operator's `MCP_PATH`); the bare origin answers `404`.
 
 ## Prerequisites
 
 - Claude Code installed and logged in.
-- Your gateway's URL (ask your platform team — looks like `https://db.internal.acme.com`).
+- Your gateway's MCP URL (ask your platform team — looks like `https://db.internal.acme.com/mcp`).
 - A working SSO login at your org's IdP.
 
 ## Add the gateway as a remote MCP server
@@ -17,7 +17,7 @@ If you're standing the gateway up, see [../deployment/quickstart.md](../deployme
 The gateway speaks MCP over HTTP. One command:
 
 ```bash
-claude mcp add --transport http db-gateway https://db.internal.acme.com
+claude mcp add --transport http db-gateway https://db.internal.acme.com/mcp
 ```
 
 That's it. Restart Claude Code (or run `/mcp` to verify).
@@ -35,7 +35,7 @@ The example above uses **local** scope (just this project, just you). Two other 
 Most teams want `--scope project` so the config lands in `.mcp.json` and gets reviewed in PR like anything else:
 
 ```bash
-claude mcp add --transport http db-gateway --scope project https://db.internal.acme.com
+claude mcp add --transport http db-gateway --scope project https://db.internal.acme.com/mcp
 ```
 
 The resulting `.mcp.json`:
@@ -45,7 +45,7 @@ The resulting `.mcp.json`:
   "mcpServers": {
     "db-gateway": {
       "type": "http",
-      "url": "https://db.internal.acme.com"
+      "url": "https://db.internal.acme.com/mcp"
     }
   }
 }
@@ -105,9 +105,9 @@ Beyond queries, ask for:
 
 ## When something requires a reason
 
-Some grants require a reason string (typical for prod). When the gateway returns `reason_required`, Claude Code surfaces it and you type the reason in chat. The agent then retries the call with `reason: "..."` baked in. That reason ends up in the audit log.
+Some grants require a reason string (typical for prod). The gateway refuses the call with `reason_required`; Claude Code has no special prompt for it — the agent reads the error and asks you in chat, then retries the call with `reason: "..."` set. That reason ends up in the audit log. Saying the reason up front ("…for SUPPORT-4421") saves the round trip.
 
-You'll see something like:
+The agent's question looks something like:
 
 ```text
 The gateway requires a reason for this query against prod.
@@ -122,11 +122,11 @@ Quick reference. The deeper explanations + corporate-proxy / popup-blocker / `re
 
 | Symptom | Likely cause |
 |---|---|
-| [`401` on every call, login URL loops](first-query.md#the-browser-popup-blocker-ate-the-sso-redirect) | Browser callback got blocked. Copy the callback URL from the address bar into the prompt Claude Code shows. |
+| [`401` on every call, login loops](first-query.md#the-browser-popup-blocker-ate-the-sso-redirect) | Browser callback got blocked, or your session was revoked. `/mcp` → *Authenticate* again. |
 | `forbidden` on a query that used to work | You were removed from a group, or the group's grant was changed. Permissions are reviewed in git — check the gateway's config repo. |
 | [`timeout` on `run_query`](first-query.md#timeout-on-run_query) | Query was slow. Ask the agent to `explain` first, or narrow it. Operator-set; not bypassable. |
-| [`row_limit_exceeded` (or `truncated: true`)](first-query.md#row_limit_exceeded-or-truncated-true-in-the-response) | Result was clipped. Add a tighter `WHERE`/`LIMIT`, or aggregate. |
-| Gateway tools missing from `/mcp` | Either the gateway URL is wrong, the gateway is down, or your token expired silently. `/mcp` → *Reconnect*. |
+| [`truncated: true`](first-query.md#truncated-true-in-the-response) | Result was clipped. Add a tighter `WHERE`/`LIMIT`, or aggregate. |
+| Gateway tools missing from `/mcp` | The URL is wrong (most often: missing the `/mcp` path — the bare origin is a `404`), the gateway is down, or your token expired. Check the URL, then `/mcp` → *Reconnect*. |
 | `500`/`503` instead of `401` | Gateway-side failure (often its state DB). Not a sign-in problem — retry; tell the operator if it persists. |
 | TLS / cert error instead of `401` | Corporate proxy is intercepting. See [first-query.md → Corporate proxy / VPN](first-query.md#corporate-proxy--vpn). |
 
@@ -138,12 +138,12 @@ claude mcp remove db-gateway
 
 ## Pre-configured OAuth (rare)
 
-If your org's deployment doesn't support OAuth Dynamic Client Registration, your platform team will give you a `client-id` and tell you which callback port to use. Then:
+The gateway serves OAuth Dynamic Client Registration (`POST /register`) itself, so Claude Code registers on its own and you should not need this. It exists for a deployment whose proxy blocks `/register`: your platform team then gives you a `client-id` and a callback port. Then:
 
 ```bash
 claude mcp add --transport http \
   --client-id <your-client-id> --client-secret --callback-port 8080 \
-  db-gateway https://db.internal.acme.com
+  db-gateway https://db.internal.acme.com/mcp
 ```
 
 `--client-secret` prompts you to paste the secret with masked input; it's stored in your system keychain, not in any config file.

@@ -1,0 +1,146 @@
+# One-command demo: gateway + state DB + seeded Postgres target + a dev-only
+# service account, so no IdP is needed. Loopback only, plain HTTP — a demo,
+# never a deployment (that is examples/docker-compose.yml).
+#
+#   cd examples/demo && docker compose up -d
+#   docker compose logs ready        # prints the `claude mcp add …` line
+#
+# Then ask Claude: "list the servers you can see, then the 5 latest orders".
+#
+# SSO path (Dex, static user dev@example.com / dev-only-password, group
+# `devs`): `docker compose --profile sso up -d`, then add the gateway without
+# the Authorization header and sign in from Claude Code's /mcp.
+#
+# Variables (all optional):
+#   DEMO_PORT      host port for the gateway (default 8443). The SSO profile
+#                  needs 8443: it is the redirect URI config/dex.yaml registers.
+#   GATEWAY_IMAGE  gateway image (default the pinned release below; a local
+#                  build: GATEWAY_IMAGE=db-mcp-gateway:dev)
+#
+# Teardown: `docker compose --profile sso down -v` (drops the data and the token).
+
+name: db-mcp-gateway-demo
+
+services:
+  gateway:
+    image: ${GATEWAY_IMAGE:-ghcr.io/developerz-ai/db-mcp-gateway:2.3.1}
+    environment:
+      DB_MCP_GATEWAY_CONFIG: /etc/gateway/config.yml
+      RUST_LOG: info
+      STATE_DB_URL: postgres://gateway:demo-state-only@state-db:5432/gateway
+      DEMO_RO_PASSWORD: demo-ro-only
+      # Published on 127.0.0.1 only (ports below), so plain HTTP never leaves the box.
+      TLS_DISABLED: "true"
+      # Dex shares this container's network namespace (profile `sso`), so the
+      # loopback issuer resolves both here and in the browser. Without the
+      # profile it is never contacted: service-token calls need no IdP.
+      OIDC_ISSUER: http://localhost:5556
+      OIDC_CLIENT_ID: dev
+      OIDC_CLIENT_SECRET: dev-only-oidc-secret
+      OIDC_REDIRECT_URL: http://localhost:${DEMO_PORT:-8443}/auth/callback
+      # The committed dev signing key; accepted only with a loopback issuer.
+      ALLOW_INSECURE_SIGNING_KEY: "true"
+    ports:
+      - "127.0.0.1:${DEMO_PORT:-8443}:8443"
+      - "127.0.0.1:5556:5556"   # Dex (profile `sso`) listens in this namespace
+    volumes:
+      - ./gateway.yaml:/etc/gateway/config.yml:ro
+      - demo-secrets:/run/demo-secrets:ro
+    depends_on:
+      state-db:
+        condition: service_healthy
+      target-db:
+        condition: service_healthy
+      mint-token:
+        condition: service_completed_successfully
+    # No healthcheck: the distroless image has no shell, wget or curl, and the
+    # binary has no self-probe. `ready` below polls /healthz over the network.
+
+  state-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: demo-state-only
+      POSTGRES_DB: gateway
+    volumes:
+      - state-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  target-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: shop_owner
+      POSTGRES_PASSWORD: demo-owner-only
+      POSTGRES_DB: shop
+      DEMO_RO_PASSWORD: demo-ro-only
+    volumes:
+      - target-db-data:/var/lib/postgresql/data
+      - ./init-target.sh:/docker-entrypoint-initdb.d/init-target.sh:ro
+      - ./seed.sql:/demo/seed.sql:ro
+    healthcheck:
+      # Ready once the init script has created the gateway's role.
+      test: ["CMD-SHELL", "psql -U shop_owner -d shop -tAc \"SELECT 1 FROM pg_roles WHERE rolname = 'mcp_demo_ro'\" | grep -qx 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Mints the dev-only service token once (same shape as bin/mint-service-token)
+  # into a volume only the gateway and `ready` mount.
+  mint-token:
+    image: busybox:1.38.0-musl
+    volumes:
+      - demo-secrets:/run/demo-secrets
+    command:
+      - sh
+      - -euc
+      - |
+        f=/run/demo-secrets/service-token
+        if [ ! -s "$$f" ]; then
+          umask 077
+          printf 'dbmcp_svc_%s' "$$(head -c 32 /dev/urandom | od -An -vtx1 | tr -d ' \n')" > "$$f"
+        fi
+        chown 65532:65532 "$$f"   # the image's nonroot user
+        chmod 0400 "$$f"
+
+  # Waits for the gateway, then prints the one line to paste.
+  ready:
+    image: busybox:1.38.0-musl
+    environment:
+      DEMO_PORT: ${DEMO_PORT:-8443}
+    volumes:
+      - demo-secrets:/run/demo-secrets:ro
+    depends_on:
+      gateway:
+        condition: service_started
+    command:
+      - sh
+      - -euc
+      - |
+        i=0
+        until wget -q -O /dev/null http://gateway:8443/healthz 2>/dev/null; do
+          i=$$((i + 1))
+          [ "$$i" -lt 60 ] || { echo 'gateway not healthy after 60 s: docker compose logs gateway' >&2; exit 1; }
+          sleep 1
+        done
+        echo
+        echo 'Gateway is up. Add it to Claude Code (dev-only token):'
+        echo
+        echo "  claude mcp add --transport http demo-db http://localhost:$$DEMO_PORT/mcp --header \"Authorization: Bearer $$(cat /run/demo-secrets/service-token)\""
+        echo
+
+  dex:
+    image: ghcr.io/dexidp/dex:v2.45.1
+    profiles: ["sso"]
+    network_mode: "service:gateway"
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    volumes:
+      - ../../config/dex.yaml:/etc/dex/config.yaml:ro
+
+volumes:
+  state-db-data:
+  target-db-data:
+  demo-secrets:

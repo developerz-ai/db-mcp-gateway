@@ -123,7 +123,7 @@ class PostEditTest(unittest.TestCase):
 
     def test_release_and_brief_notes(self):
         self.assertIn("chore(release)", post_edit.version_note("Cargo.toml"))
-        self.assertIn("brief_rows", post_edit.brief_note(".dz/briefs/health.md"))
+        self.assertIn("brief_rows", post_edit.brief_note(".dz/schedules/health.md"))
         self.assertIsNone(post_edit.version_note("README.md"))
 
     def test_committed_migration_note(self):

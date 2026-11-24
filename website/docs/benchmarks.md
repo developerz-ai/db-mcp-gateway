@@ -347,9 +347,9 @@ The first published run (2026-11-04, invocations 1–3 in REPORT.md) was taken
 on an 8-vCPU KVM guest with ~10.4% CPU steal and the harness defaults (2000
 requests per phase). Eight of its nine overhead rows were marked
 `Trustworthy: no`, with baseline drift up to 109.7%. Its artifacts —
-[`postgres.json`](https://github.com/developerz-ai/db-mcp-gateway/blob/main/benchmarks/results/postgres.json),
-[`mongo.json`](https://github.com/developerz-ai/db-mcp-gateway/blob/main/benchmarks/results/mongo.json),
-[`instances4.json`](https://github.com/developerz-ai/db-mcp-gateway/blob/main/benchmarks/results/instances4.json)
+[`postgres.json.gz`](https://github.com/developerz-ai/db-mcp-gateway/blob/main/benchmarks/results/postgres.json.gz),
+[`mongo.json.gz`](https://github.com/developerz-ai/db-mcp-gateway/blob/main/benchmarks/results/mongo.json.gz),
+[`instances4.json.gz`](https://github.com/developerz-ai/db-mcp-gateway/blob/main/benchmarks/results/instances4.json.gz)
 — stay committed, with their full reports in REPORT.md, as the record of
 what a noisy host does to these numbers. They were measured against gateway
 v1.6.0 and are not comparable with the figures above.
@@ -392,7 +392,7 @@ direction, [open an issue](https://github.com/developerz-ai/db-mcp-gateway/issue
 | [`benchmarks/results/postgres-write-quiet.json.gz`](https://github.com/developerz-ai/db-mcp-gateway/blob/main/benchmarks/results/postgres-write-quiet.json.gz) | Write-path run: same fields |
 | [`benchmarks/results/instances4-quiet.json.gz`](https://github.com/developerz-ai/db-mcp-gateway/blob/main/benchmarks/results/instances4-quiet.json.gz) | Four-instance run: same fields plus the per-instance-count scaling rows |
 | [`benchmarks/results/REPORT.md`](https://github.com/developerz-ai/db-mcp-gateway/blob/main/benchmarks/results/REPORT.md) | Invocation log: exact commands, exit statuses, host snapshots, the harness's complete captured output verbatim, warnings, failed attempts and exploratory runs |
-| `postgres.json`, `mongo.json`, `instances4.json` | The earlier shared-host run (see above) |
+| `postgres.json.gz`, `mongo.json.gz`, `instances4.json.gz` | The earlier shared-host run (see above) |
 | [`benchmarks/README.md`](https://github.com/developerz-ai/db-mcp-gateway/blob/main/benchmarks/README.md) | The method: what it measures, how it tries not to lie to you, how to extend it |
 
 No credential, connection string, service token or password appears in any

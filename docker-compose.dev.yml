@@ -171,6 +171,26 @@ services:
       retries: 60
       start_period: 120s
 
+  # Dev-only OIDC IdP for the SSO path (`bin/run --idp`), at the OIDC_ISSUER
+  # .env.example sets. Static user dev@example.com / dev-only-password in group
+  # `devs` (config/dex.yaml). Behind the `idp` profile — `bin/dev up` and
+  # `bin/test` never start it (the tests run their own mock IdP). examples/demo
+  # profile `sso` uses the same config and port: run one at a time.
+  dex:
+    image: ghcr.io/dexidp/dex:v2.45.1
+    profiles: ["idp"]
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    ports:
+      # Bind to localhost only (see state-db above). The issuer URL names this port.
+      - "127.0.0.1:5556:5556"
+    volumes:
+      - ./config/dex.yaml:/etc/dex/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5556/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
 volumes:
   state-db-data:
   target-db-data:

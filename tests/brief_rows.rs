@@ -1,4 +1,4 @@
-//! Guard for `.dz/briefs/health.md`: its signal table and its `## Rows`
+//! Guard for `.dz/schedules/health.md`: its signal table and its `## Rows`
 //! section are one contract. A signal with no declared row is a failure the
 //! `health` schedule never files; a row with no signal is a rule with nothing
 //! to check. Parity is asserted in both directions — count, order and names.
@@ -16,7 +16,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-const BRIEF: &str = ".dz/briefs/health.md";
+const BRIEF: &str = ".dz/schedules/health.md";
 
 /// The row ids the brief declares, in table order. One per signal.
 const EXPECTED_IDS: [&str; 5] = [

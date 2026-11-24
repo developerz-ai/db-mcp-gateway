@@ -76,9 +76,8 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
     // Build the header before any post-deserialisation validation so a
     // `since` / `limit` rejection is still audited. Missing that row would
     // leave the boundary probes (a caller sweeping bad `limit` values
-    // against another user's server) undetectable — .coderabbit.yaml
-    // §src/audit: "flag any code path that completes a tool call without an
-    // audit row".
+    // against another user's server) undetectable: no code path completes a
+    // tool call without an audit row.
     let header = AuditHeader {
         tool: TOOL_NAME,
         server: Some(&args.server),

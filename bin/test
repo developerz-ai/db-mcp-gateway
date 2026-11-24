@@ -1,15 +1,36 @@
 #!/usr/bin/env bash
 # bin/test — unit + integration tests. Brings up the dev stack if needed.
+#   bin/test --unit   lib + bin unit tests and tests/it_offline only: no Docker,
+#                     no database (the pre-push hook's loop)
 # Runs cargo-nextest when installed (.config/nextest.toml), else `cargo test`.
+# Queued behind other heavy runs on this checkout (bin/lib/queue.sh;
+# DBMCP_NO_QUEUE=1 opts out).
 # Pass-through args go to the runner (e.g. bin/test --test smoke -- --nocapture);
 # nextest accepts the libtest flags after `--`.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-if [[ -f .env ]]; then
-  set -a; . ./.env; set +a
+# shellcheck source=bin/lib/dotenv.sh
+. bin/lib/dotenv.sh
+# shellcheck source=bin/lib/queue.sh
+. bin/lib/queue.sh
+
+if [[ ${1:-} == --unit ]]; then
+  shift
+  unit=(--lib --bins --test it_offline --all-features)
+  queue_lock heavy "bin/test --unit $*"
+  if command -v cargo-nextest >/dev/null 2>&1; then
+    exec cargo nextest run "${unit[@]}" "$@"
+  fi
+  exec cargo test "${unit[@]}" "$@"
 fi
+
+# Full suite: the machine-wide ledger when present, then the repo's own
+# compile queue and the dev-DB lock (one suite at a time on the shared DBs).
+queue_heavy_reexec bin/test "$@"
+queue_lock heavy "bin/test $*"
+queue_lock db "bin/test $*"
 
 compose=(docker compose -f docker-compose.dev.yml)
 

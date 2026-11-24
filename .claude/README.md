@@ -8,13 +8,13 @@
 | `settings.json` | Permissions and hooks. Personal overrides go in `settings.local.json` (gitignored) |
 | `hooks/` | Python 3 stdlib, no packages. A box without `python3` skips them. Tests: `python3 -I .claude/hooks/test_hooks.py`, run by `workflow-lint.yml` |
 
-Every agent and skill file carries the marker `owned by this repository's maintainers`; `tests/public_tree.rs` fails a file without it.
+Every agent and skill file carries the marker `owned by this repository's maintainers`; `.github/scripts/public_tree.py` fails a file without it.
 
 ## Hooks
 
-**`guard_bash.py`, before every Bash call, about 20ms.** Refuses `--no-verify`, a force-push to `main`, `git worktree add`, moving or deleting a published `v*` tag (`git tag -d/-f`, `git push --delete`, a forced or `:`-prefixed tag refspec), `gh pr merge --admin`, `gh release delete`, `docker push` of the gateway image, and `pkill -f` with a pattern that matches its own shell. Creating and pushing a new `v*` tag is allowed: the release lane does that after the `chore(release)` PR merges (`.dz/briefs/release-due.md`). It reads the command's words, not quoted text, and fails open on anything it cannot parse. It is a seatbelt, not a sandbox: `bash -c "git push -f origin main"` gets past it.
+**`guard_bash.py`, before every Bash call, about 20ms.** Refuses `--no-verify`, a force-push to `main`, `git worktree add`, moving or deleting a published `v*` tag (`git tag -d/-f`, `git push --delete`, a forced or `:`-prefixed tag refspec), `gh pr merge --admin`, `gh release delete`, `docker push` of the gateway image, and `pkill -f` with a pattern that matches its own shell. Creating and pushing a new `v*` tag is allowed: the release lane does that after the `chore(release)` PR merges (`.dz/schedules/release-due.md`). It reads the command's words, not quoted text, and fails open on anything it cannot parse. It is a seatbelt, not a sandbox: `bash -c "git push -f origin main"` gets past it.
 
-**`post_edit.py`, after every Edit or Write.** `rustfmt --check` on an edited `.rs` file, about 50ms; a diff in that file goes back to the agent. Advice only, never a block (the edit has already happened): the security-review label on a `CLAUDE.md` security path, a spec update for `src/tools/`, `src/config/`, `src/transport/`, never editing a committed migration, the 300-LOC cap, the release-PR rule on `Cargo.toml`, the `tests/brief_rows.rs` guard on `.dz/briefs/health.md`, `actionlint` on workflows and `shellcheck` on `bin/` scripts. A missing tool or a timeout never fails anything.
+**`post_edit.py`, after every Edit or Write.** `rustfmt --check` on an edited `.rs` file, about 50ms; a diff in that file goes back to the agent. Advice only, never a block (the edit has already happened): the security-review label on a `CLAUDE.md` security path, a spec update for `src/tools/`, `src/config/`, `src/transport/`, never editing a committed migration, the 300-LOC cap, the release-PR rule on `Cargo.toml`, the `tests/brief_rows.rs` guard on `.dz/schedules/health.md`, `actionlint` on workflows and `shellcheck` on `bin/` scripts. A missing tool or a timeout never fails anything.
 
 ## If a hook refuses something legitimate
 

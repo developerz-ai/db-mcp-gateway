@@ -1,60 +1,42 @@
-target/
-.git/
-.github/
-docs/
-.claude/
-.env
-.env.*
-*.md
-!README.md
+# Allowlist: the build context is exactly what `cargo build --release` and the
+# runtime stage read. A denylist let every new top-level file or directory
+# (docs, tests, website, tooling state) into `COPY . .`, so a docs-only change
+# busted the planner layer and forced a cold release rebuild; an allowlist fails
+# the other way — a new file the build needs is missing and the build breaks
+# loudly, on the PR's `image-check` job.
+*
 
-# Key material must never enter the build context. `tests/data/test_idp_key.pem`
-# is one today: harmless in itself (a throwaway IdP key in a public repo, and
-# the runtime stage copies only the binary), but `COPY . .` pulled it into the
-# builder layer, and `cache-to: type=gha` exports those layers. The binary
-# embeds exactly one external file — `config/example.yaml` — so nothing here is
-# reachable from `cargo build --release`. Deny by extension, not by path, so the
-# next key added anywhere is covered without anyone remembering this file.
-*.pem
-*.key
-*.p12
-*.pfx
-*.jks
-*.crt
-*.der
-*.pk8
-*.asc
-*.gpg
+# The workspace manifest and lock, plus the toolchain file the builder honours
+# (the Dockerfile's `FROM rust:<channel>` must match it).
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+# `[patch.crates-io]` stub; a workspace member `cargo chef` must restore.
+!third_party/
+# The crate itself and what it embeds: `sqlx::migrate!` reads both migration
+# directories at compile time.
+!src/
+!migrations/
+!migrations-mysql/
+# The runtime stage ships it as the reference config.
+!config/example.yaml
+
+# Key material must never enter the build context, even under an allowed
+# directory: `cache-to: type=gha` exports the builder layers. Deny by
+# extension, not by path, so the next key added anywhere is covered.
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.jks
+**/*.crt
+**/*.der
+**/*.pk8
+**/*.asc
+**/*.gpg
 # SSH keys carry no extension, so match the conventional names too.
-id_rsa*
-id_ed25519*
-id_ecdsa*
-
-# The Docusaurus site is ~400 MB with node_modules and is never part of the
-# binary. Left in, it dominated the build context and made a docs-only push
-# invalidate the `COPY . .` layer, forcing a cold release rebuild.
-website/
-
-# Local tooling state — same reasoning: context weight and spurious cache busts.
-tmp/
-.codegraph/
-.claude-task-master/
-
-# The planner stage generates this itself. A `cargo chef prepare` run in the
-# working tree would otherwise ship a stale copy in the build context, busting
-# the planner's `COPY . .` layer on a file the build immediately overwrites.
-recipe.json
-
-# Benchmark harness: never built into the runtime image (see Cargo.toml
-# `bench-harness` feature). Keeping it out of the context also keeps a
-# benchmark config out of a shipped layer.
-benchmarks/
-
-# Integration tests are never built into the image, but cargo autodiscovers
-# every `tests/*.rs` as a target and `cargo chef prepare` writes each one into
-# the recipe. A PR that added a test file therefore changed the recipe and
-# re-ran the ~190 s dependency `cook` (plus a ~120 s re-export of its ~490 MB
-# layer to the gha cache): 4 of the 10 cook misses in 20 `main` pushes
-# (2026-11-12..14) changed no dependency, only added test files. Unit tests
-# live under `src/` and stay in the context.
-tests/
+**/id_rsa*
+**/id_ed25519*
+**/id_ecdsa*
+**/.env
+**/.env.*

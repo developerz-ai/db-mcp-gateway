@@ -2,23 +2,29 @@ plan: 101-agent-human-gateway-hardening
 title: Gateway hardening + agent/human UX
 status: in_progress
 created_by: sebi
-worked_by: ""
+worked_by: claude
 owner: sebi
-percent: 5
-current_focus: "01: #376; owner rulesets left. Next: 02"
+percent: 35
+current_focus: "PR-B (07, 09a, 10, 11, deps) in review. Next: wave C = 03 rest + 04 + 05 → 2.4.0"
 slices:
-  - {file: 01-unblock-main.md, status: in_progress, percent: 90}
-  - {file: 02-security-patch.md, status: not_started, percent: 0}
-  - {file: 03-exec-correctness.md, status: not_started, percent: 0}
-  - {file: 04-auth-transport.md, status: not_started, percent: 0}
+  - {file: 01-unblock-main.md, status: in_progress, percent: 95, note: "gate job built (09a); owner: make `gate` the single required check (SET-3)"}
+  - {file: 02-security-patch.md, status: done, percent: 100, note: "#377 + #380, v2.3.1, GHSA-j6xv-c57r-59rw published; H2 (pg_query second parser) not started"}
+  - {file: 03-exec-correctness.md, status: in_progress, percent: 20, note: "E1, E3 in #377; rest wave C"}
+  - {file: 04-auth-transport.md, status: in_progress, percent: 5, note: "A11 in #377; rest wave C"}
   - {file: 05-audit-state.md, status: not_started, percent: 0}
   - {file: 06-agent-surface.md, status: not_started, percent: 0}
-  - {file: 07-docs-onboarding.md, status: not_started, percent: 0}
+  - {file: 07-docs-onboarding.md, status: in_progress, percent: 80, note: "D1-D8, P1-P3 in PR-B; login UX (src) and demo CI smoke left"}
   - {file: 08-operator-tooling.md, status: not_started, percent: 0}
-  - {file: 09-ci-cd.md, status: not_started, percent: 0}
-  - {file: 10-dev-experience.md, status: not_started, percent: 0}
-  - {file: 11-repo-cleanup.md, status: not_started, percent: 0}
+  - {file: 09-ci-cd.md, status: in_progress, percent: 50, note: "C1-C8, C15 in PR-B; wave b left"}
+  - {file: 10-dev-experience.md, status: in_progress, percent: 85, note: "X1-X7, X9 + repo job queue in PR-B; X8 CLAUDE.md 21.7→~15 KB (target 10 KB not met)"}
+  - {file: 11-repo-cleanup.md, status: in_progress, percent: 85, note: "deps (sqlx 0.9.1, mongodb 3.10, axum-server 0.9, MSRV 1.94.1, no audit ignore) + files in PR-B; #372 closed, labels deleted, #378/#379 filed; dead-API row left"}
   - {file: 12-tests.md, status: not_started, percent: 0}
-evidence: ["#376"]
-notes: "Human rows H1-H12 in overview.md. Slice 02 and SET detail: owner's private notes."
-last_updated: 2026-11-23
+decisions:
+  - {date: 2026-11-23, by: sebi, rows: [H3, H4, H6], decision: "accept recommendations"}
+  - {date: 2026-11-23, by: sebi, rows: [H7], decision: "MSRV 1.94.1 yes"}
+  - {date: 2026-11-23, by: sebi, rows: [H5], decision: "3.0 breaking rows later; additive rows now"}
+  - {date: 2026-11-23, by: sebi, rows: [H8, H10], decision: "go: audit blocks lock changes only + daily audit issue; delete .coderabbit.yaml/.devin/ (apps not installed)"}
+  - {date: 2026-11-23, by: sebi, rows: [H1, H9], decision: "full work: advisory drafted, published with 2.3.1; deny other-session statement views"}
+evidence: ["#376", "#377", "#380", "v2.3.1", "GHSA-j6xv-c57r-59rw"]
+notes: "Human rows H1-H12 in overview.md. SET-n detail: owner's private notes. Deployment and consumer slices tracked in their own repositories."
+last_updated: 2026-11-24

@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use sqlx::{Column, Connection, Executor, PgConnection, PgPool, Postgres, Transaction};
+use sqlx::{Column, Connection, Executor, PgConnection, PgPool, Postgres, SqlSafeStr, Transaction};
 use tokio::sync::Semaphore;
 
 use crate::audit::drain::DetachedTasks;
@@ -59,7 +59,7 @@ pub(super) async fn run_query_inner(
          SET LOCAL standard_conforming_strings = on",
         tag.as_str()
     );
-    tx.execute(setup.as_str())
+    tx.execute(sqlx::AssertSqlSafe(setup))
         .await
         .map_err(|e| classify(e, role, ""))?;
 
@@ -164,9 +164,12 @@ async fn describe_columns(
     sql: &str,
     budget: Duration,
 ) -> Option<Vec<String>> {
-    let described = tokio::time::timeout(budget, (&mut **tx).describe(sql))
-        .await
-        .ok()?;
+    let described = tokio::time::timeout(
+        budget,
+        (&mut **tx).describe(sqlx::AssertSqlSafe(sql).into_sql_str()),
+    )
+    .await
+    .ok()?;
     Some(match described {
         Ok(described) => described
             .columns()

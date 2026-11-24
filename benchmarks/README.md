@@ -244,7 +244,7 @@ build or the runtime image.
 
 Named result files are **committed gzipped** (`gunzip -k` to read; the raw samples make them ~14 MB uncompressed) — `results/*-quiet.json.gz` (the
 bare-metal run the page quotes), the earlier shared-host
-`results/postgres.json`, `results/mongo.json` and `results/instances4.json`,
+`results/postgres.json.gz`, `results/mongo.json.gz` and `results/instances4.json.gz`,
 and `results/REPORT.md` are the run evidence behind
 `website/docs/benchmarks.md`, which links each figure to its artifact.
 `REPORT.md` is append-only: a new run adds an invocation section, it never

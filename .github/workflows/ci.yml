@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Cache warm run: every Rust cache key carries the ISO week, so the week's
+  # first entry is written here, before Dependabot's Monday 06:00 UTC PRs
+  # (dependabot.yml) restore it. Scheduled runs use the default branch, so the
+  # entries they save are readable by every PR.
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
 
 concurrency:
   # PRs: one group per ref, superseded runs cancelled. Pushes to main: one
@@ -22,46 +29,79 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Docs-only PRs skip the Rust jobs. The skip is per job, not a workflow-level
-  # `paths-ignore`: `clippy` and `test` are required checks, and a workflow that
-  # never starts leaves them pending forever, while a job skipped by `if:`
-  # reports as passed. So the skip needs an explicit `code=false`: if
-  # `changes` itself fails, its output is empty and the Rust jobs run. Pushes to `main` always run everything — `merge` needs
-  # them. Docs guards (pages.yml) run on their own path filter.
+  # Path filters for the jobs that may skip. The skip is per job, not a
+  # workflow-level `paths-ignore`: a workflow that never starts leaves its
+  # checks pending forever. Each filtered job needs an explicit `false` from
+  # here, so a failed `changes` (empty outputs) runs them all, and `gate` reads
+  # a skip as passed only when `changes` succeeded and ordered it.
   #
-  # Docs = `website/`, `docs/`, `.claude/` (agent config; its hooks are tested
-  # by workflow-lint.yml) and `*.md` — except under `.dz/`: tests/brief_rows.rs
-  # reads `.dz/briefs/health.md`, so a `.dz/` change always runs `test`.
-  # public-tree scans every tracked file and runs regardless.
+  #   code     PR touches more than docs. Docs = `website/`, `docs/`,
+  #            `.claude/` (its hooks are tested by workflow-lint.yml) and
+  #            `*.md`, except under `.dz/` (tests/brief_rows.rs reads it).
+  #            Always true off PRs: `merge` needs the Rust jobs on main.
+  #   deps     the lock, a manifest or the audit config changed: `audit`
+  #            blocks only then (owner decision H8); audit.yml audits `main`
+  #            daily for advisories published without a commit here.
+  #   image    what the Dockerfile builds changed (PRs only; main builds the
+  #            image itself).
+  #   msrv     a manifest or the lock changed.
+  #   website  the docs site's sources changed (PRs only; pages.yml builds and
+  #            deploys on main).
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       code: ${{ steps.diff.outputs.code }}
+      deps: ${{ steps.diff.outputs.deps }}
+      image: ${{ steps.diff.outputs.image }}
+      msrv: ${{ steps.diff.outputs.msrv }}
+      website: ${{ steps.diff.outputs.website }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # A PR checkout is the merge commit; its first parent is the base tip,
-          # so HEAD^1..HEAD is exactly what the PR changes.
+          # A PR checkout is the merge commit and a push to main is one squash
+          # commit; either way the first parent is the base tip, so HEAD^1..HEAD
+          # is exactly what changed.
           fetch-depth: 2
       - id: diff
         run: |
-          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
+          matches() { printf '%s\n' "$changed" | grep -qE "$1"; }
+          case "$GITHUB_EVENT_NAME" in
+            pull_request|push) ;;
+            *)
+              # Scheduled warm run / manual dispatch: the Rust jobs and audit.
+              printf '%s\n' code=true deps=true image=false msrv=false website=false >> "$GITHUB_OUTPUT"
+              exit 0 ;;
+          esac
+          # --no-renames: a rename would list only its destination, so moving a
+          # source file to a docs path would read as docs-only. No HEAD^1 (a
+          # multi-parent or truncated push) reads as "everything changed".
+          if ! changed=$(git diff --name-only --no-renames HEAD^1 HEAD); then
+            printf '%s\n' code=true deps=true image=true msrv=true website=true >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # --no-renames: a rename would list only its destination, so moving a
-          # source file to a docs path would read as docs-only.
-          changed=$(git diff --name-only --no-renames HEAD^1 HEAD)
-          code=false
-          if printf '%s\n' "$changed" | grep -qE '^\.dz/' \
-            || printf '%s\n' "$changed" \
-              | grep -vE '^(website/|docs/|\.claude/)|\.md$' | grep -q .; then
-            code=true
+          code=true deps=false image=false msrv=false website=false
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            if ! matches '^\.dz/' && ! printf '%s\n' "$changed" \
+                | grep -vE '^(website/|docs/|\.claude/)|\.md$' | grep -q .; then
+              code=false
+            fi
+            if matches '^(Dockerfile|\.dockerignore|Cargo\.(toml|lock)|rust-toolchain\.toml|src/|migrations/|migrations-mysql/|third_party/|config/example\.yaml$)'; then
+              image=true
+            fi
+            if matches '^(website/|README\.md$)'; then
+              website=true
+            fi
           fi
-          echo "code=$code" >> "$GITHUB_OUTPUT"
-          echo "code-affecting changes: $code"
+          if matches '^(Cargo\.(toml|lock)|third_party/.*Cargo\.toml|\.cargo/|(audit|deny)\.toml$|\.github/workflows/(ci|audit)\.yml$)'; then
+            deps=true
+          fi
+          if matches '^(Cargo\.(toml|lock)|third_party/.*Cargo\.toml)$'; then
+            msrv=true
+          fi
+          printf '%s\n' "code=$code" "deps=$deps" "image=$image" "msrv=$msrv" "website=$website" \
+            | tee -a "$GITHUB_OUTPUT"
 
   fmt:
     # GitHub-hosted runner: this repository is public.
@@ -102,11 +142,19 @@ jobs:
             exit 1
           fi
 
-  # Rust cache: the default rust-cache key is job id + rustc version +
-  # Cargo.lock/Cargo.toml hashes, so clippy (check artifacts) and test (full
-  # builds) each restore their own warm dependency cache. Saved from `main`
-  # only. A shared key made both jobs race to save one entry, and the loser
-  # restored the other job's artifacts — a cold build in disguise.
+  # Rust cache. Every key carries the ISO week (`%G-W%V`): on a prefix hit (a
+  # PR whose lock differs from every saved entry) rust-cache restores the
+  # newest entry and then deletes artifacts older than seven days
+  # (cleanTargetDir's timestamp check), so an entry from an older week came
+  # back nearly empty and dependency PRs compiled cold. A weekly key keeps
+  # every restorable entry younger than the week; the Monday warm run (`on:
+  # schedule`) writes it first. Saved from `main` only (pushes and the warm
+  # run).
+  #
+  # `clippy` keeps its own key (check artifacts); `test` and `yugabyte` share
+  # `ci-<week>` (yugabyte's graph is a subset of test's) and only `test` saves
+  # it — two savers raced for one entry and the loser restored the other's
+  # artifacts.
   #
   # No `cargo clean -p db-mcp-gateway`: restored local-crate artifacts can't go
   # stale (rust-cache drops workspace crates before saving, and checkout mtimes
@@ -132,16 +180,24 @@ jobs:
           if rustup toolchain list | grep -q '^stable'; then
             rustup toolchain uninstall stable
           fi
+      - id: week
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@f4371d1ec7179bfbd04a82a81e3b3af7f720750f # v2
         with:
+          key: ${{ steps.week.outputs.week }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --profile ci --all-targets --all-features -- -D warnings
       # --all-targets enables cfg(test), which makes imports used only by
-      # #[cfg(any(test, debug_assertions))] helpers look live. The release
-      # configuration compiles those helpers out, so the same code emitted
-      # unused-import warnings that only ever surfaced in a `docker build`.
-      # Lint the shipping configuration too.
-      - run: cargo clippy --release --all-features -- -D warnings
+      # #[cfg(any(test, debug_assertions))] helpers look live, and the `ci`
+      # profile has debug assertions on. The shipping configuration has
+      # neither, so the same code emitted unused-import warnings that only
+      # surfaced in a `docker build`. Lint lib + bins once more with debug
+      # assertions off. The flag goes after `--`: cargo hands those args to
+      # clippy-driver for workspace crates only, so the dependency graph
+      # checked above is reused as-is (one graph; `--release` built a second).
+      # The integration tests use those helpers, so the profile itself cannot
+      # turn debug assertions off.
+      - run: cargo clippy --profile ci --all-features -- -D warnings -C debug-assertions=off
       # The credential scrubber compiles its regexes at runtime, so a `regex`
       # feature missing from the *shipping* graph passes fmt, clippy and
       # `cargo test` and only surfaces in production. It did: `unicode-case`
@@ -180,8 +236,11 @@ jobs:
           if rustup toolchain list | grep -q '^stable'; then
             rustup toolchain uninstall stable
           fi
+      - id: week
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@f4371d1ec7179bfbd04a82a81e3b3af7f720750f # v2
         with:
+          shared-key: ci-${{ steps.week.outputs.week }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: install cargo-nextest
         uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
@@ -245,10 +304,13 @@ jobs:
           if rustup toolchain list | grep -q '^stable'; then
             rustup toolchain uninstall stable
           fi
+      - id: week
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+      # Restores `test`'s entry; never saves (see the cache note above clippy).
       - uses: Swatinem/rust-cache@f4371d1ec7179bfbd04a82a81e3b3af7f720750f # v2
         with:
-          key: yugabyte
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: ci-${{ steps.week.outputs.week }}
+          save-if: false
       - name: install cargo-nextest
         uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
         with:
@@ -279,38 +341,34 @@ jobs:
           path: target/nextest/ci-yugabyte/junit.xml
           if-no-files-found: ignore
 
+  # Blocks only a change that can move the advisory picture: the lock, a
+  # manifest or the audit config (owner decision H8). An advisory published
+  # against an unchanged lock is audit.yml's daily run, which opens an issue,
+  # instead of a red check on every unrelated PR and a `main` with no image.
   audit:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.deps != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install --no-self-update
-      # Prebuilt cargo-audit binary instead of `cargo install` (source compile
-      # every run). taiki-e/install-action pulls the release binary; the audit
-      # invocation and audit.toml ignore semantics below are unchanged.
+      # Prebuilt binary, version pinned: a new cargo-audit release can change
+      # what the same lock reports, which is a reviewed bump, not a surprise.
       - name: install cargo-audit
         uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
         with:
-          tool: cargo-audit
-      # RUSTSEC-2023-0071 (rsa via sqlx-mysql). NOT unreachable — MySQL is a
-      # supported permissions_store driver and CI exercises it. rsa 0.10 is
-      # fixed upstream, but sqlx 0.9 requires Rust 1.94 and cannot preserve the
-      # project's Rust 1.88 MSRV. See .cargo/audit.toml for the MSRV-raise plus
-      # sqlx-upgrade removal trigger.
-      - run: cargo audit --ignore RUSTSEC-2023-0071
+          tool: cargo-audit@0.23.0
+      # No ignores, here or in .cargo/audit.toml: a new one is a reviewed change.
+      - run: cargo audit
 
   # Spec 14 invariant: no literal dbmcp_svc_ service tokens in committed YAML.
   # The loader deliberately accepts Password::Literal for dev/test parity with
   # Database.password (issue #190), so it cannot enforce credential-free
   # committed config at boot — this job enforces it at the CI layer instead.
-  # Standalone today: it reports PR status but is not wired into build.needs
-  # and is not a required check (do not make it required without also running
-  # it on every PR, or it hard-locks merges).
   secret-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -338,7 +396,7 @@ jobs:
           rc=$?
           set -e
           if [ "$rc" -eq 0 ] && [ -n "$matches" ]; then
-            echo "::error::literal dbmcp_svc_ service token(s) in committed config — reference the secret via ENV: or FILE: (spec 14). ADVISORY guard: it fails this job; block merges by making secret-scan a required branch-protection check (#190 follow-up)."
+            echo "::error::literal dbmcp_svc_ service token(s) in committed config — reference the secret via ENV: or FILE: (spec 14)."
             printf '%s\n' "$matches"
             exit 1
           fi
@@ -347,13 +405,10 @@ jobs:
             exit 1
           fi
           echo "no literal service tokens in committed config (git grep rc=1)"
-      - name: secret-scan regex regression
-        # Pins the guard regex intent (#190) so a future loosening is caught.
-        # Wired into CI so it actually runs (was dead code otherwise).
-        run: bash tests/bin/secret-scan-regex.test.sh
 
-  # The gate's own regression scripts. `bin/ci` runs them too, but nothing in CI
-  # did, which let a red pages guard merge to main. secret-scan runs the fifth.
+  # The gate's own regression scripts: every tests/bin/*.test.sh (a glob, so a
+  # new script is never left out — a red pages guard once merged because
+  # nothing in CI ran it) and every .github/scripts/test_*.py. stdlib python.
   scripts:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -361,47 +416,152 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: bash tests/bin/check.test.sh
-      - run: bash tests/bin/doc-anchors.test.sh
-      - run: bash tests/bin/mint-service-token.test.sh
-      - run: bash tests/bin/pages-workflow.test.sh
+      - name: shell regression scripts
+        run: |
+          shopt -s nullglob
+          scripts=(tests/bin/*.test.sh)
+          (( ${#scripts[@]} > 0 )) || { echo '::error::no tests/bin/*.test.sh found'; exit 1; }
+          failed=0
+          for script in "${scripts[@]}"; do
+            echo "::group::$script"
+            bash "$script" || { echo "::error::$script failed"; failed=1; }
+            echo '::endgroup::'
+          done
+          exit "$failed"
+      - name: python script tests
+        run: |
+          shopt -s nullglob
+          for test in .github/scripts/test_*.py; do
+            python3 -I "$test" -v
+          done
 
-  # The public-tree guard (tests/public_tree.rs) runs on every PR, docs-only
-  # included: the leaks it catches live mostly in markdown, which the
-  # `changes` filter keeps out of `test`. Reads tracked files only — no
-  # service containers.
+  # The public-tree guard runs on every PR, docs-only included: the leaks it
+  # catches live mostly in markdown. Plain python over `git ls-files`, no
+  # toolchain (the cargo test it replaced compiled for up to 387 s to scan
+  # text); its rules are pinned by .github/scripts/test_public_tree.py in
+  # `scripts`.
   public-tree:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # rust-cache keys on every installed toolchain, so the runner image's
-      # preinstalled `stable` would re-key (cold-start) this cache whenever
-      # the image picks up a new release. Only the pinned toolchain stays.
-      - name: install pinned toolchain (rust-toolchain.toml)
+      # The private words come from a secret so the guard never publishes them
+      # (public_tree.py, module docs); a fork's PR gets none and the scan says
+      # it skipped them. The count line (files read, how many private words;
+      # never a word) proves the secret reached it.
+      - run: python3 -I .github/scripts/public_tree.py
+        env:
+          PUBLIC_TREE_PRIVATE_WORDS: ${{ secrets.PUBLIC_TREE_PRIVATE_WORDS }}
+          # Required on this repository's own runs (anything but a PR, or a PR
+          # from a branch here), where the secret exists: empty there is red.
+          # A fork's PR and Dependabot's get no Actions secrets, so they skip.
+          PUBLIC_TREE_PRIVATE_WORDS_REQUIRED: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.actor != 'dependabot[bot]' && '1' || '' }}
+
+  # The Dockerfile build a PR would otherwise first meet on `main` (C8):
+  # amd64 only, never pushed. Reads `build`'s gha layer cache, never writes
+  # one (a PR-scoped cache entry is unreadable by main and later PRs).
+  image-check:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.image != 'false' }}
+    runs-on: ubuntu-latest
+    # The main-push build's budget: a recipe change cooks cold.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: build (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          cache-from: type=gha,scope=linux-amd64
+          push: false
+
+  # The declared MSRV (`rust-version` in Cargo.toml, read here, never
+  # restated) still builds the lock: a dependency bump that needs a newer
+  # compiler fails on its PR. Lib + bins, default features — the shipped code.
+  msrv:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.msrv != 'false' }}
+    runs-on: ubuntu-latest
+    # A cold check of the whole graph (no cache restored across a lock change).
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: msrv
         run: |
-          rustup toolchain install --no-self-update
+          version=$(sed -n 's/^rust-version = "\([0-9.]*\)"$/\1/p' Cargo.toml)
+          if [ -z "$version" ]; then
+            echo '::error::Cargo.toml declares no rust-version'
+            exit 1
+          fi
+          rustup toolchain install "$version" --profile minimal --no-self-update
           if rustup toolchain list | grep -q '^stable'; then
             rustup toolchain uninstall stable
           fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - id: week
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@f4371d1ec7179bfbd04a82a81e3b3af7f720750f # v2
         with:
-          key: public-tree
+          key: ${{ steps.week.outputs.week }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # The private words come from a secret so the guard never publishes them
-      # (tests/public_tree.rs, module docs); a fork's PR gets none and the scan
-      # says it skipped them. --show-output prints the scan's count line (files
-      # read, how many private words; never a word) so the log proves the
-      # secret reached it.
-      - run: cargo test --profile ci --test public_tree -- --show-output
+      # `+<version>` overrides rust-toolchain.toml.
+      - run: cargo "+${{ steps.msrv.outputs.version }}" check --locked
+
+  # The docs site builds (docusaurus.config.ts throws on a broken link) for a
+  # PR that touches it, Dependabot's npm PRs included: `npm ci && build` is the
+  # website's whole gate. pages.yml builds and deploys on `main`.
+  website:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.website != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "20"
+      # Restore only: pages.yml saves this key on `main`. A PR-saved entry is
+      # readable by that PR alone, and one per npm bump filled half the cache.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('website/package-lock.json') }}
+          restore-keys: npm-${{ runner.os }}-
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+
+  # The single required check (ruleset, SET-3). GitHub reads a skipped
+  # required job as passed, so each job above required on its own let a failed
+  # `changes` merge a PR that ran nothing. `gate` always runs and passes only
+  # when every job succeeded or was skipped by a `changes` filter that said
+  # `false` (.github/scripts/ci_gate.py, pinned by test_ci_gate.py).
+  gate:
+    needs: [changes, fmt, clippy, test, yugabyte, audit, image-check, msrv, website, secret-scan, scripts, public-tree]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - run: python3 -I .github/scripts/ci_gate.py
         env:
-          PUBLIC_TREE_PRIVATE_WORDS: ${{ secrets.PUBLIC_TREE_PRIVATE_WORDS }}
-          # Required on this repository's own runs (a push to main, a PR from a
-          # branch here), where the secret exists: empty there is red. A fork's
-          # PR and Dependabot's get no Actions secrets, so they skip.
-          PUBLIC_TREE_PRIVATE_WORDS_REQUIRED: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && github.actor != 'dependabot[bot]' && '1' || '' }}
+          NEEDS: ${{ toJSON(needs) }}
 
   # Publish a multi-arch image on push to main, tagged with the short commit
   # SHA (what Argo Image Updater pins to, #17) + a moving `main` tag.
@@ -412,7 +572,7 @@ jobs:
   # path. A red commit still never gets an image at a tag anything consumes:
   # only its per-arch `linux-<arch>-<sha>` refs exist, Image Updater matches
   # `^sha-[0-9a-f]{7}$` alone, and `sha-*`/`main` are written by `merge`,
-  # which needs every quality job green. release.yml reuses `sha-*` the same
+  # which needs `gate` green. release.yml reuses `sha-*` the same
   # way, so it inherits the gate.
   #
   # Built on NATIVE per-arch runners in parallel (amd64 + arm64), each pushed at
@@ -500,13 +660,16 @@ jobs:
           push: true
 
   # Stitch the per-arch digests into one multi-arch manifest under the real
-  # tags. Skipped automatically when `build` is skipped (PRs), any arch fails,
-  # or any quality job fails — this is the publish gate.
+  # tags: the publish gate. Runs only when both arches built and `gate` passed.
+  # `needs` lists every quality job besides `gate` so the graph shows what
+  # publishing waits on; the `if:` is explicit because a filtered job
+  # (`audit`, `msrv`) may skip, and a skipped need would skip `merge` with it.
   # DUAL-PUSH: the same multi-arch manifest list is created in BOTH registries
   # so the short-SHA + main tags are pullable from whichever Image Updater (or
   # any external client) is configured to read.
   merge:
-    needs: [build, fmt, clippy, test, yugabyte, audit, secret-scan, public-tree, scripts]
+    needs: [build, gate, changes, fmt, clippy, test, yugabyte, audit, image-check, msrv, website, secret-scan, scripts, public-tree]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.gate.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

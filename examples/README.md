@@ -6,8 +6,9 @@ Starter templates for deploying and using the db-mcp-gateway.
 
 | File | Purpose |
 |---|---|
+| `demo/` | One-command local demo: `cd demo && docker compose up -d`, then `docker compose logs ready` prints the `claude mcp add` line. Gateway + state DB + seeded Postgres + a dev-only service token; `--profile sso` adds Dex for the SSO path. Loopback, plain HTTP — never a deployment |
 | `.mcp.json` | Claude Code MCP server configuration — add to your repo for team-wide access |
-| `docker-compose.yml` | Production-like deployment with gateway + state DB (customize secrets per your env) |
+| `docker-compose.yml` | Production-like deployment with gateway + state DB (customize secrets per your env; every required variable is listed in its header) |
 | `gateway.yaml` | Minimal gateway config — servers + permissions. Extend per [website/docs/deployment/config-reference.md](../website/docs/deployment/config-reference.md) |
 
 ## Quick start

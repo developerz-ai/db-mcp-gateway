@@ -32,12 +32,43 @@ Routes mount only when both `permissions_repo` and `state_db` are present in the
 
 ## Auth flow
 
-Same OIDC path as the MCP surface — see [`../usage/first-query.md`](../usage/first-query.md). Every admin request needs:
+Every admin request needs:
 
-1. **Bearer session token** in `Authorization: Bearer …` (issued by `/auth/login` → `/auth/callback`). 401 without it.
-2. **Membership in `admin.group`** carried on the SSO identity's `groups` claim. 403 without it. The check fires on every call; group membership is read from the live JWT, not cached.
+1. **A gateway session token** in `Authorization: Bearer …`. This is a JWT the *gateway* signs, not a token from your IdP: an IdP access or ID token is rejected with `401`. Two ways to get one:
+   - `POST /auth/login` returns `{ "login_url", "state" }`. Open `login_url` in a browser and sign in; the IdP redirects to `/auth/callback`, which answers `{ "session_token": "eyJ…", "expires_in_seconds": 28800 }`. Copy `session_token`.
+   - The access token an MCP client obtained through the gateway's OAuth bridge (`/authorize` → `/token`) is the same kind of session JWT, so it works too.
 
-On a successful admin call the gateway upserts the caller into `permissions_users` (idempotent) and stamps every write with their `user_id` + `user_email` in `permissions_audit`.
+   Service tokens (`dbmcp_svc_…`) never reach the admin API: boot refuses a service account mapped to the admin group.
+2. **Membership in `admin.group`** in the session's groups. `403 forbidden` without it. Groups are a snapshot taken from the ID token **at login** and stored with the session; they are not re-read from the IdP. Adding someone to the admin group takes effect at their next login; removing them takes effect when their session ends or is revoked ([revoke-sessions](#revoke-a-users-sessions)).
+3. **A fresh enough session**, when `admin.session_max_age_secs` is set. A session issued longer ago than that (or with an `issued_at` in the future) gets `403 session_too_old`; sign in again. This bounds how long a removed admin keeps admin access.
+
+On a successful **mutating** call the gateway upserts the caller into `permissions_users` inside the same transaction and stamps the write with their `user_id` + `user_email` in `permissions_audit`. A `GET` writes nothing.
+
+## Errors
+
+Every error body has one shape, and carries the gateway-minted request id (also in the matching log line and `permissions_audit.request_id`):
+
+```json
+{ "error": { "code": "conflict", "message": "row changed since expected_updated_at; re-read and retry", "request_id": "…" } }
+```
+
+| HTTP | `code` | When |
+|---|---|---|
+| 400 | `invalid_request` | Malformed body, path id or query string; validation failure; FK/CHECK violation |
+| 401 | `unauthorized` | No or invalid gateway session token |
+| 403 | `forbidden` | Caller not in `admin.group` |
+| 403 | `session_too_old` | Session older than `admin.session_max_age_secs` |
+| 404 | `not_found` | Missing or soft-deleted row. (With the admin API off, every `/admin/*` path is a plain `404` with no body.) |
+| 409 | `conflict` | `expected_updated_at` mismatch, or the database aborted the write to break a deadlock / serialization conflict. Re-read and retry |
+| 500 | `internal` | Anything else, including a failed audit write; the body never carries the cause |
+
+## Pagination
+
+`GET` on `/users`, `/databases` and `/grants` takes `?limit=&offset=`. `limit` defaults to `100` and is clamped to `1..=1000`; `offset` defaults to `0`. The body is a bare JSON array — no total, no cursor: keep paging until a page comes back shorter than `limit`. Order is stable: users and grants by `(created_at, id)`, databases by `(server, db_name)`.
+
+## Optimistic concurrency
+
+Every `PATCH` body accepts an optional `expected_updated_at` — the `updated_at` you read (RFC 3339). If the row changed since, the write is refused with `409 conflict` and nothing is written. Omit it for last-writer-wins.
 
 ## Audit guarantees
 
@@ -89,7 +120,7 @@ All paths are under `/admin/v1`. Request and response bodies are JSON. `Content-
 }
 ```
 
-Response: the full `PermissionsUser` row. Upsert is idempotent on the *live* row — soft-deleted rows stay until the retention pruner hard-deletes them `AUDIT_RETENTION_DAYS` after deletion.
+Response: the user row (`id`, `user_sub`, `user_email`, `groups`, `created_at`, `updated_at`) — `201` when created, `200` when an existing live row was updated. Upsert is idempotent on the *live* row — soft-deleted rows stay until the retention pruner hard-deletes them `AUDIT_RETENTION_DAYS` after deletion.
 
 `GET /admin/v1/users` — list live users, oldest first.
 
@@ -98,10 +129,14 @@ Response: the full `PermissionsUser` row. Upsert is idempotent on the *live* row
 `PATCH /admin/v1/users/:id` — partial update. Fields not in the body stay unchanged.
 
 ```json
-{ "user_email": "alice.new@example.com", "groups": ["engineers", "oncall"] }
+{ "user_email": "alice.new@example.com", "groups": ["engineers", "oncall"], "expected_updated_at": "2026-11-23T10:15:02.123456Z" }
 ```
 
-`DELETE /admin/v1/users/:id` — soft delete. Sets `deleted_at` and revokes the user's grants; subsequent live lookups return 404. The row is hard-deleted `AUDIT_RETENTION_DAYS` (default 90) after `deleted_at`; `permissions_audit` keeps the change on the same horizon.
+At least one of `user_email` / `groups` must be set.
+
+`POST /admin/v1/users/:id/revoke-sessions` — see [below](#revoke-a-users-sessions).
+
+`DELETE /admin/v1/users/:id` — soft delete, `204`. Sets `deleted_at` and revokes the user's grants; subsequent live lookups return 404. The row is hard-deleted `AUDIT_RETENTION_DAYS` (default 90) after `deleted_at`; `permissions_audit` keeps the change on the same horizon.
 
 ### Databases
 
@@ -154,7 +189,7 @@ Wildcard target:
 
 Bodies that mix `database_id` and `server` (or set neither) return 400 with a stable `invalid_request` code. The pg storage layer has a matching CHECK constraint as defense-in-depth — pinned by `xor_target_violations_are_rejected` in the e2e suite.
 
-Foreign-key violations (`user_id` or `database_id` not in the tables) and CHECK violations from the storage layer surface as 400 `invalid_request`, not 500. CodeRabbit added this mapping in #54.
+Foreign-key violations (`user_id` or `database_id` not in the tables) and CHECK violations from the storage layer surface as 400 `invalid_request`, not 500.
 
 `action` is one of `schema_read`, `query_read`, `query_write`, `history_read`. Spec 06 §Actions: `query_write` ⊇ `query_read` ⊇ `schema_read`. `history_read` is orthogonal.
 
@@ -168,11 +203,13 @@ Foreign-key violations (`user_id` or `database_id` not in the tables) and CHECK 
 
 ## End-to-end: first user + first grant
 
-The acceptance test for these docs — Sebby (or any deployer) can stand up a fresh install and add a user + grant from this page alone.
+The acceptance test for these docs — any deployer can stand up a fresh install and add a user + grant from this page alone.
 
 ```bash
-# 0. Sign in once to mint a session token. Browser flow; copy the token from
-#    Claude Code's keychain or your IdP's debug page.
+# 0. Mint a gateway session token (not an IdP token). Open login_url in a
+#    browser, sign in as a member of admin.group, copy session_token from the
+#    JSON /auth/callback shows.
+curl -sX POST https://gw/auth/login | jq -r .login_url
 export TOK=eyJhbGc…
 
 # 1. Register the user (idempotent by SSO sub).
@@ -206,6 +243,16 @@ curl -sX POST https://gw/admin/v1/grants \
 ```
 
 Alice can now `list_servers` from Claude Code and see `prod/billing`.
+
+## Revoke a user's sessions
+
+`POST /admin/v1/users/:id/revoke-sessions` (no body) — the operator kill switch for one subject. In one audited transaction it revokes every live session of that user's `user_sub` (`sessions.revoked_at`) and deletes every refresh chain, so no client can refresh back in.
+
+```json
+{ "revoked_sessions": 2, "revoked_refresh_tokens": 3 }
+```
+
+The `permissions_audit` row is an `update` of the user, with `before`/`after` carrying `live_sessions` and `refresh_tokens`. Grants are untouched — the user can sign in again, and that new session gets whatever their groups and grants allow then. To keep them out, also remove them from the IdP group or delete the user. The replica that served the call stops honouring the sessions at once; other replicas within `SESSION_CACHE_TTL_SECONDS` (default 30 s).
 
 ## Storage backend
 

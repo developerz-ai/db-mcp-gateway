@@ -2,11 +2,11 @@
 
 ## Distribution
 
-- **OCI image**: `ghcr.io/developerz-ai/db-mcp-gateway:<version>` on GitHub Container Registry. Multi-arch (amd64, arm64). Distroless base. Single static binary inside. Public, free, no Docker Hub rate limits.
+- **OCI image**: `ghcr.io/developerz-ai/db-mcp-gateway:<version>` on GitHub Container Registry (also pushed to DigitalOcean's registry). Multi-arch (amd64, arm64). Distroless `cc` base (glibc; no shell, no `kill`, no `curl`), running as `nonroot`. One binary inside. Public, free, no Docker Hub rate limits.
 - **Release trigger**: pushing a `v*` git tag fires `.github/workflows/release.yml`, which re-tags the multi-arch image `ci.yml` already built and tested for that commit (or builds it when there is none), pushes it to GHCR, and cuts a GitHub Release with auto-generated notes.
-- **GitHub Releases**: prebuilt static binaries for Linux amd64 / arm64 and macOS (dev convenience) attached to the same release.
+- **GitHub Releases**: release notes pointing at the image tags. No standalone binaries are attached — build from source (`cargo build --release`) if you need one outside a container.
 - **Helm chart**: published alongside the image on the same tag (roadmap, phase 8).
-- **Example repo**: a separate small repo with `docker-compose.yml` + skeleton `config.yaml` + provisioning SQL for the DB roles. Fork-and-edit shape.
+- **Examples**: `examples/` in this repository (`docker-compose.yml`, `gateway.yaml`). Provisioning SQL per engine lives in the docs ([target roles](../deployment/target-roles.md)), not as shipped templates.
 
 ## Minimum viable deployment
 
@@ -18,10 +18,16 @@ services:
     ports: ["8443:8443"]
     environment:
       STATE_DB_URL: postgres://gateway:${STATE_DB_PW}@state-db:5432/gateway
+      OIDC_ISSUER: ${OIDC_ISSUER}
       OIDC_CLIENT_ID: ${OIDC_CLIENT_ID}
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET}
+      OIDC_REDIRECT_URL: https://${GATEWAY_HOST}/auth/callback
+      SESSION_SIGNING_KEY: ${SESSION_SIGNING_KEY}   # >= 32 bytes
+      TLS_CERT_PATH: /etc/gateway/tls/tls.crt
+      TLS_KEY_PATH: /etc/gateway/tls/tls.key
     volumes:
       - ./config.yml:/etc/gateway/config.yml:ro
+      - ./tls:/etc/gateway/tls:ro
     depends_on: [state-db]
 
   state-db:
@@ -37,11 +43,11 @@ volumes:
   state-db-data:
 ```
 
-That's the whole thing. Put it behind your existing TLS-terminating reverse proxy or expose 8443 directly with the gateway's built-in TLS.
+That's the whole thing: each variable above is one boot refuses to start without (the redirect URL is one login breaks without). It exposes 8443 with the gateway's built-in TLS; behind a TLS-terminating proxy on a trusted network, replace the two cert variables with `TLS_DISABLED=true`. The full walkthrough is the [deployment quickstart](../deployment/quickstart.md#4-bring-it-up-with-docker-compose).
 
 ## Provisioning the target databases
 
-The repo ships SQL templates for the read-only roles, per DB engine. For Postgres:
+The repo ships no SQL templates; the per-engine recipes (Postgres, YugabyteDB, MongoDB, Redis) are in [target roles](../deployment/target-roles.md). For Postgres (`app_owner` = the role that owns the tables):
 
 ```sql
 -- run once per database the gateway will access
@@ -49,7 +55,7 @@ create role mcp_gateway_prod_app_ro with login password :'pw';
 grant connect on database app to mcp_gateway_prod_app_ro;
 grant usage on schema public to mcp_gateway_prod_app_ro;
 grant select on all tables in schema public to mcp_gateway_prod_app_ro;
-alter default privileges in schema public
+alter default privileges for role app_owner in schema public
   grant select on tables to mcp_gateway_prod_app_ro;
 alter role mcp_gateway_prod_app_ro set statement_timeout = '30s';
 alter role mcp_gateway_prod_app_ro set idle_in_transaction_session_timeout = '60s';
@@ -80,7 +86,7 @@ Co-deployed Postgres. Tiny — audit log is the bulky table and it's pruned (see
 - `SIGHUP` reloads the cert + key from the same paths without dropping live connections — rustls re-reads the handshake material atomically, in-flight sessions keep the old cert until they close. Matches cert-manager's rotation contract.
 - Reload failures (malformed PEM after a swap, wrong permissions) log the error and keep the previous cert serving; the next `SIGHUP` retries.
 - In a Kubernetes deployment, cert-manager mounts the cert as a `Certificate` resource. Cert-manager does NOT send `SIGHUP` itself — a reload controller (e.g. `stakater/reloader`) or a lifecycle/sidecar hook must be wired in to translate the renewal into a `SIGHUP` on the pod. Without that wiring the gateway will keep serving the previous cert until restart.
-- For docker-compose without cert-manager, mount your PEMs into the container and `docker exec ... kill -HUP 1` after rotating them.
+- For docker-compose without cert-manager, mount your PEMs into the container and `docker kill --signal=HUP <container>` after rotating them. The distroless image has no `kill` binary, so `docker exec … kill` does not work.
 
 ## Networking
 
@@ -90,9 +96,11 @@ Two paths must be open:
 |---|---|---|
 | Developer laptop | Gateway | Agents talk to gateway over HTTPS |
 | Gateway | Target DBs | Gateway connects to each DB on its port |
-| Gateway | IdP | OIDC discovery + token validation |
-| Gateway | Secrets backend | Pull DB credentials |
-| Gateway | Object storage (optional) | Audit archive |
+| Gateway | IdP | OIDC discovery, code exchange, JWKS |
+| Gateway | State DB | Sessions, audit, permissions |
+| Gateway | Syslog receiver (optional) | `logging.stream` syslog sink |
+
+No secrets-backend or object-storage path is needed today: secrets arrive as env vars or mounted files (`vault:` / `aws-sm:` / `gcp-sm:` refs abort boot), and there is no archive exporter ([11-roadmap](11-roadmap.md) phase 4).
 
 Run the gateway in the network segment that already reaches the DBs. Most installs put it next to existing internal tools.
 
@@ -103,10 +111,10 @@ Rule: When fronting databases with a connection pool proxy (e.g. pgcat), route t
 | Scenario | `config.servers[*].host` | `port` | `tls` | Notes |
 |---|---|---|---|---|
 | Direct to Postgres (no proxy) | `prod-rw.db.example.com` | `5432` | `required` | Standard database connection. |
-| Via cluster-internal proxy (Kubernetes) | `pgcat.pgcat.svc.cluster.local` | `6432` | `insecure` | Gateway → proxy → DB legs are mesh traffic; TLS terminates at gateway's public ingress (Traefik). Logs `WARN` every minute (`tls: insecure` is loud by design). |
+| Via cluster-internal proxy (Kubernetes) | `pgcat.pgcat.svc.cluster.local` | `6432` | `insecure` | Gateway → proxy → DB legs are mesh traffic; TLS terminates at the gateway or its ingress. Boot logs one `WARN` per `tls: insecure` server. |
 | Via cloud-managed proxy (RDS Proxy) | `prod-proxy.proxy.us-east-1.rds.amazonaws.com` | `5432` | `required` | Encryption in-transit expected; network isolation managed by cloud provider. |
 
-Verify the proxy endpoint and port with your infrastructure team. Proxy unavailability will appear in the gateway's startup logs and connection-attempt logs, or the proxy's own health endpoint — not in the gateway's `/readyz` probe (which only checks state DB reachability and the shutdown flag).
+What the gateway needs from the proxy (transaction-mode prepared statements, one Postgres server per endpoint for cancellation, the configured role passed through) is the [pooler contract](../deployment/pooler-contract.md). Verify the proxy endpoint and port with your infrastructure team. Proxy unavailability will appear in the gateway's startup logs and connection-attempt logs, or the proxy's own health endpoint — not in the gateway's `/readyz` probe (which only checks state DB reachability and the shutdown flag).
 
 ## Replicas
 
@@ -116,7 +124,7 @@ Login state for the OAuth bridge (pending `/authorize` flows and authorization c
 
 - Containers: tag-pinned pulls; the operator bumps the tag and redeploys.
 - Migrations: the gateway runs its own state-DB (and MySQL permissions-store) migrations on startup. They follow expand/contract: a migration that drops or narrows an object ships only in a release after the one that stopped using it has run everywhere, so release N-1 runs on schema N. An image therefore boots on a schema a newer release migrated, skipping the versions it does not know and logging `schema was migrated by a newer gateway release`. That makes a one-release rollback an image swap (from 2.0.3). A migration that already ran and was later edited (checksum mismatch) still refuses boot. Procedure: [upgrading-to-2 §Rollback](../deployment/upgrading-to-2.md#rollback).
-- Backward compat: config schema changes that drop or rename fields ship with a one-version deprecation window; the gateway warns when it sees the old name.
+- Config compatibility: there is no deprecation window. An unknown or renamed YAML key aborts boot with a `line:column` pointer, so a config change that drops or renames a key is a breaking change, listed in the release notes and the upgrade guide. Procedures: [operations](../deployment/operations.md).
 
 ## Observability
 
@@ -127,6 +135,6 @@ Login state for the OAuth bridge (pending `/authorize` flows and authorization c
 
 ## Shutdown
 
-`SIGTERM` flips `/healthz` and `/readyz` to 503, stops background loops, and gives in-flight requests an 80 s drain window: the 75 s `/mcp` request timeout (state-pool acquire 5 s + target statement ceiling 30 s + two audit writes of 15 s + 10 s slack) plus 5 s, so a call that times out still writes its outcome row. The permissions `LISTEN`/`NOTIFY` listener stays up through the drain, so a revoke announced during shutdown still reaches this replica's cache. Detached audit writes then get up to 20 s, and the two state-DB pools close (≤ 10 s each). Worst case 80 + 20 + 2 × 10 = 120 s: `terminationGracePeriodSeconds` must be ≥ 120 (plus any preStop sleep). `SIGHUP` never terminates the process — the handler is installed whether TLS is on or off.
+`SIGTERM` flips `/healthz` and `/readyz` to 503, stops background loops, and gives in-flight requests an 80 s drain window: the 75 s `/mcp` request timeout (caller pool-share wait 5 s + target pool acquire 5 s + statement ceiling 30 s + two audit writes of 15 s + 5 s slack) plus 5 s, so a call that times out still writes its outcome row. The permissions `LISTEN`/`NOTIFY` listener stays up through the drain, so a revoke announced during shutdown still reaches this replica's cache. Detached audit writes then get up to 20 s, and the two state-DB pools close (≤ 10 s each). Worst case 80 + 20 + 2 × 10 = 120 s: `terminationGracePeriodSeconds` must be ≥ 120 (plus any preStop sleep). `SIGHUP` never terminates the process — the handler is installed whether TLS is on or off.
 
 See [11-roadmap](11-roadmap.md) for what's deferred (k8s operator, multi-replica leader election, etc.).

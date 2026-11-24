@@ -50,6 +50,8 @@ updates:
     schedule:
       interval: weekly
       day: monday
+      # After ci.yml's 04:00 UTC Monday warm run writes the week's cache.
+      time: "06:00"
     open-pull-requests-limit: 5
     cooldown:
       default-days: 14
@@ -69,6 +71,8 @@ updates:
     schedule:
       interval: weekly
       day: monday
+      # After ci.yml's 04:00 UTC Monday warm run writes the week's cache.
+      time: "06:00"
     open-pull-requests-limit: 3
     cooldown:
       default-days: 14
@@ -79,6 +83,12 @@ updates:
         update-types:
           - minor
           - patch
+      # One PR for every advisory fix in the tree, instead of one per package.
+      # Its gate is ci.yml's `website` job (`npm ci`, typecheck, build).
+      npm-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   # The builder base image in `Dockerfile`.
   #

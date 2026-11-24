@@ -1,0 +1,39 @@
+# Dev gateway config for `bin/run` against docker-compose.dev.yml — never deploy it.
+# bin/run rewrites `port: 5434` when TARGET_DB_PORT differs, and exports the
+# two env refs below.
+servers:
+  - name: local
+    kind: postgres
+    host: localhost
+    port: 5434
+    tls: insecure                       # the dev Postgres has no TLS
+    databases:
+      # The dev superuser `app` — fine on a throwaway stack, never in production.
+      - name: app
+        role: app
+        password: ${ENV:TARGET_DB_PASSWORD}
+        description: "Dev target (integration-test fixtures)"
+      # Demo data, loaded by bin/seed (examples/demo/seed.sql).
+      - name: shop
+        role: app
+        password: ${ENV:TARGET_DB_PASSWORD}
+        description: "Demo shop: customers, products, orders"
+
+permissions:
+  # The Dex user (compose profile `idp`, config/dex.yaml).
+  - group: devs
+    grants:
+      - { server: local, database: "*", action: query_read, constraints: { row_limit: 1000 } }
+      - { server: local, database: "*", action: history_read }
+
+  # bin/mcp-call's service account.
+  - group: svc-dev
+    grants:
+      - { server: local, database: "*", action: query_read, constraints: { row_limit: 1000 } }
+      - { server: local, database: "*", action: history_read }
+
+service_accounts:
+  - name: dev
+    group: svc-dev
+    # Minted once by bin/run into target/dev/service-token (gitignored).
+    token: ${ENV:DBMCP_DEV_SERVICE_TOKEN}

@@ -1,0 +1,36 @@
+# Dev-only Dex IdP for the SSO path — never deploy it. Used by
+# docker-compose.dev.yml (profile `idp`, for `bin/run`) and examples/demo
+# (profile `sso`). Both put it at http://localhost:5556, the OIDC_ISSUER in
+# .env.example: the gateway accepts plain http only for a loopback issuer.
+#
+# Sign in as dev@example.com / dev-only-password (group `devs`).
+issuer: http://localhost:5556
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+oauth2:
+  skipApprovalScreen: true
+
+enablePasswordDB: true
+
+staticClients:
+  - id: dev
+    name: db-mcp-gateway (dev)
+    secret: dev-only-oidc-secret
+    # The gateway's default OIDC_REDIRECT_URL — bin/run and the demo both
+    # serve on localhost:8443.
+    redirectURIs:
+      - http://localhost:8443/auth/callback
+
+staticPasswords:
+  - email: dev@example.com
+    # bcrypt of "dev-only-password"
+    hash: "$2a$10$uPHTBKhuAKe0vWXxttBdWe/zzOyFb..4kxZ5M4w8bhbrFEcNTAgl2"
+    username: dev
+    userID: 6f1e2a43-8c55-4d0e-9b8e-3f0d2c7a9e10
+    groups:
+      - devs

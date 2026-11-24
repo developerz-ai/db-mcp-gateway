@@ -61,7 +61,7 @@ async fn quick_query_succeeds_with_columns_and_rows() {
     assert!(!result.truncated);
 }
 
-/// sqlx 0.8 rejects width-mismatched decodes at the OID layer: a
+/// sqlx rejects width-mismatched decodes at the OID layer: a
 /// `SMALLINT` (`INT2`) won't come out through the `i32` probe, nor `REAL`
 /// (`FLOAT4`) through `f64`. Without dedicated `i16`/`f32` branches the
 /// fallback silently returns `Value::Null` — a data-integrity bug on
@@ -516,9 +516,9 @@ async fn zero_row_bound_query_still_reports_column_names() {
 /// pool (the adapter under test never runs DDL).
 async fn scratch_table(probe: &sqlx::PgPool) -> String {
     let table = format!("exec_safety_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE \"{table}\" (id int PRIMARY KEY, v int NOT NULL DEFAULT 0)"
-    ))
+    )))
     .execute(probe)
     .await
     .expect("create scratch table");
@@ -526,9 +526,11 @@ async fn scratch_table(probe: &sqlx::PgPool) -> String {
 }
 
 async fn drop_table(probe: &sqlx::PgPool, table: &str) {
-    let _ = sqlx::query(&format!("DROP TABLE IF EXISTS \"{table}\""))
-        .execute(probe)
-        .await;
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TABLE IF EXISTS \"{table}\""
+    )))
+    .execute(probe)
+    .await;
 }
 
 /// The dev role can write, so only the read-only transaction stands between
@@ -541,7 +543,7 @@ async fn read_access_cannot_write_on_a_write_capable_role() {
     let a = adapter().await;
     let probe = probe_pool().await;
     let seq = format!("exec_safety_seq_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE SEQUENCE \"{seq}\""))
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SEQUENCE \"{seq}\"")))
         .execute(&probe)
         .await
         .expect("create sequence");
@@ -571,15 +573,17 @@ async fn read_access_cannot_write_on_a_write_capable_role() {
         );
     }
 
-    let called: bool = sqlx::query_scalar(&format!("SELECT is_called FROM \"{seq}\""))
-        .fetch_one(&probe)
-        .await
-        .expect("read sequence");
+    let called: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT is_called FROM \"{seq}\""
+    )))
+    .fetch_one(&probe)
+    .await
+    .expect("read sequence");
     let objects_after: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_largeobject_metadata")
         .fetch_one(&probe)
         .await
         .expect("count large objects");
-    let _ = sqlx::query(&format!("DROP SEQUENCE \"{seq}\""))
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP SEQUENCE \"{seq}\"")))
         .execute(&probe)
         .await;
     assert!(!called, "nextval advanced the sequence under read access");
@@ -612,9 +616,9 @@ async fn truncated_write_commits_and_reports_rows_affected() {
         ))
         .await
         .expect("update runs");
-    let (rows, ones): (i64, i64) = sqlx::query_as(&format!(
+    let (rows, ones): (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT count(*), count(*) FILTER (WHERE v = 1) FROM \"{table}\""
-    ))
+    )))
     .fetch_one(&probe)
     .await
     .expect("count rows");
@@ -857,14 +861,16 @@ async fn enum_values_decode_as_their_label() {
     let a = adapter().await;
     let probe = probe_pool().await;
     let ty = format!("exec_mood_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE TYPE \"{ty}\" AS ENUM ('happy', 'sad')"))
-        .execute(&probe)
-        .await
-        .expect("create enum");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TYPE \"{ty}\" AS ENUM ('happy', 'sad')"
+    )))
+    .execute(&probe)
+    .await
+    .expect("create enum");
     let r = a
         .execute(query(&format!("SELECT 'sad'::\"{ty}\" AS mood"), None, 10))
         .await;
-    let _ = sqlx::query(&format!("DROP TYPE \"{ty}\""))
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP TYPE \"{ty}\"")))
         .execute(&probe)
         .await;
     assert_eq!(r.expect("query runs").rows[0][0], "sad");
@@ -924,10 +930,12 @@ async fn dry_run_reports_rows_affected_and_rolls_back() {
         })
         .await
         .expect("dry run executes");
-    let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{table}\""))
-        .fetch_one(&probe)
-        .await
-        .expect("count rows");
+    let rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"{table}\""
+    )))
+    .fetch_one(&probe)
+    .await
+    .expect("count rows");
     drop_table(&probe, &table).await;
     assert_eq!(result.rows_affected, Some(2));
     assert_eq!(rows, 0, "dry run left a change behind");
@@ -976,10 +984,12 @@ async fn explain_analyzes_reads_and_only_plans_writes() {
         ))
         .await
         .expect_err("analyze of a write");
-    let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{table}\""))
-        .fetch_one(&probe)
-        .await
-        .expect("count rows");
+    let rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"{table}\""
+    )))
+    .fetch_one(&probe)
+    .await
+    .expect("count rows");
     drop_table(&probe, &table).await;
     assert!(matches!(refused, ExecError::Forbidden(_)), "{refused:?}");
     assert_eq!(rows, 0, "explain wrote");

@@ -21,5 +21,12 @@ cargo clippy --version >/dev/null 2>&1 || unavailable 'Clippy is unavailable. In
 docker compose version >/dev/null 2>&1 || unavailable 'Docker Compose v2 is unavailable. Install or enable the Compose plugin, then retry.'
 docker info >/dev/null 2>&1 || unavailable 'Docker daemon is unreachable. Start Docker and grant your user daemon access, then retry.'
 
+# The whole gate runs in the machine-wide ledger when present, and holds the
+# repo's compile queue (bin/ci's own bin/test then skips re-taking it).
+# shellcheck source=bin/lib/queue.sh
+. bin/lib/queue.sh
+queue_heavy_reexec bin/check "$@"
+queue_lock heavy "bin/check"
+
 # Only preflight failures use 75; preserve every status returned by the real gate.
 exec bin/ci

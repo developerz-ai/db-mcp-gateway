@@ -548,7 +548,7 @@ async fn history_query_uses_the_history_index() {
         .execute(&mut *tx)
         .await
         .expect("disable incremental sort");
-    let plan: Value = sqlx::query_scalar(&format!(
+    let plan: Value = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "EXPLAIN (FORMAT JSON) \
          SELECT id, request_id, sql, reason, outcome, elapsed_ms, row_count, occurred_at \
          FROM audit_calls \
@@ -558,7 +558,7 @@ async fn history_query_uses_the_history_index() {
          ORDER BY occurred_at DESC, id DESC \
          LIMIT 101",
         sub = booted.user_sub,
-    ))
+    )))
     .fetch_one(&mut *tx)
     .await
     .expect("explain runs");

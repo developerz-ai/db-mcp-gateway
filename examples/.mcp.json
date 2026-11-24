@@ -2,7 +2,7 @@
   "mcpServers": {
     "db-gateway": {
       "type": "http",
-      "url": "https://db.internal.acme.com"
+      "url": "https://db.internal.acme.com/mcp"
     }
   }
 }

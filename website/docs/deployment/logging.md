@@ -12,16 +12,18 @@ Every log line has at minimum:
 | `level` | string | `INFO` / `WARN` / `ERROR` / `DEBUG` |
 | `message` | string | The static log-line string |
 
-The dispatch-time log line (one per `tools/call`) adds:
+The dispatch-time log line (`message: "tool dispatched"`, one per `tools/call` that reached a tool — after authentication) adds:
 
 | Field | Type | When set |
 |---|---|---|
-| `request_id` | string | JSON-RPC request id |
-| `user_sub` | string | OIDC `sub` claim of the caller; `"anonymous"` on unauthenticated paths |
+| `request_id` | string | Gateway-minted request id — the same value as `audit_calls.request_id` (not the JSON-RPC `id`) |
+| `user_sub` | string | OIDC `sub` claim of the caller, or `service:<name>` for a service token. Always an authenticated identity: unauthenticated requests never reach dispatch (the debug-level `mcp request` line uses `"anonymous"` for them) |
 | `tool` | string | `run_query` / `explain` / `list_servers` / … |
 | `server` | string | `<server>` from the call args, empty for tools that aren't server-scoped |
 | `db` | string | `<database>` from the call args, empty for tools that aren't database-scoped |
-| `outcome` | string | `success` / `forbidden` / `forbidden_sql` / `invalid_arguments` / `timeout` / `syntax_error` / `unavailable` / `rate_limited` / `service_overloaded` / `internal` — canonical list per [spec 03 §Errors](../initial-idea/03-mcp-tools.md#errors) |
+| `outcome` | string | The audit outcome code: `success`, `dry_run`, `forbidden`, `forbidden_sql`, `permission_denied`, `undefined_object`, `invalid_arguments`, `reason_required`, `timeout`, `syntax_error`, `unavailable`, `unsupported_backend`, `internal`, `cancelled`, `audit_unavailable` (`abandoned` is written only by the reaper). `rate_limited` / `service_overloaded` are HTTP rejections before dispatch and never appear here |
+| `access` | string | `read` / `write` |
+| `upstream_run_id`, `upstream_actor` | string | The service-token attribution headers, when sent ([headless agents](../usage/headless-agents.md)) |
 | `duration_ms` | integer | Wall-clock the tool took; `0` for outcomes where the tool didn't start (e.g. forbidden before any work) |
 
 On audit-write failure the line additionally carries `audit_write_duration_ms` (integer) — wall-clock the failed audit insert took. `duration_ms` on that same line keeps the contract above (tool execution time), so `success` and `audit write failed` lines can be compared apples-to-apples.

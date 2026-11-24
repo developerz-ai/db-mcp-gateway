@@ -99,9 +99,9 @@ def check_push(args):
     forced = any(FORCE_FLAG.match(a) or a.startswith("+") for a in args)
     deleting = "--delete" in args or "-d" in args
     if any(RELEASE_TAG.match(ref.split(":")[-1]) for ref in refspecs) and (forced or deleting):
-        return "A published v* tag is never moved or deleted (.dz/briefs/release-due.md): ship the fix as the next patch."
+        return "A published v* tag is never moved or deleted (.dz/schedules/release-due.md): ship the fix as the next patch."
     if any(ref.startswith(":") and RELEASE_TAG.match(ref[1:]) for ref in refspecs):
-        return "A published v* tag is never deleted (.dz/briefs/release-due.md): ship the fix as the next patch."
+        return "A published v* tag is never deleted (.dz/schedules/release-due.md): ship the fix as the next patch."
     if forced and targets_main(refspecs):
         return "Force-push to main is forbidden (CLAUDE.md)."
     return None
@@ -127,7 +127,7 @@ def current_branch():
 def check_tag(args):
     moves = any(TAG_MOVE_OR_DELETE.match(a) for a in args)
     if moves and any(RELEASE_TAG.match(a) for a in args):
-        return "A published v* tag is never moved or deleted (.dz/briefs/release-due.md): ship the fix as the next patch."
+        return "A published v* tag is never moved or deleted (.dz/schedules/release-due.md): ship the fix as the next patch."
     return None
 
 
@@ -135,7 +135,7 @@ def check_gh(args):
     if args[:2] == ["pr", "merge"] and "--admin" in args:
         return "--admin bypasses the main-protection ruleset: get the required checks green."
     if args[:2] == ["release", "delete"]:
-        return "Deleting a GitHub Release is a maintainer's recovery step, never an agent's (.dz/briefs/health.md)."
+        return "Deleting a GitHub Release is a maintainer's recovery step, never an agent's (.dz/schedules/health.md)."
     return None
 
 

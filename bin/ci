@@ -19,13 +19,18 @@
 # against the heading IDs the build renders: a fragment pointing at no
 # heading is only a WARNING in the Docusaurus build (onBrokenAnchors
 # defaults to 'warn'), so without this the dead anchor would ship.
-# A missing GATE-SCOPED toolchain — cargo-audit (the
-# audit job) or Node 20+/npm plus the installed website dependencies (the
-# Pages job) — makes that one job report 'NOT RUN' while every other job is
-# still graded. A skip is never silent: it is printed and repeated in the
+# A missing GATE-SCOPED toolchain — python3 (the public-tree guard),
+# cargo-audit (the audit job) or Node 20+/npm plus the installed website
+# dependencies (the Pages job) — makes that one job report 'NOT RUN' while
+# every other job is still graded. A skip is never silent: it is printed and repeated in the
 # final summary.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# shellcheck source=bin/lib/queue.sh
+. bin/lib/queue.sh
+queue_heavy_reexec bin/ci "$@"
+queue_lock heavy "bin/ci"
 
 skipped_jobs=()
 
@@ -34,6 +39,7 @@ skipped_jobs=()
 # names all of them, so no job is ever silently not run.
 pending_jobs=(
   'orchestration regression'
+  'public-tree guard'
   'fmt + clippy'
   'test'
   'cargo audit'
@@ -128,6 +134,18 @@ job_reached 'orchestration regression'
 # tests/bin/check.test.sh replaces this entry in its own fixture; the real
 # script never recurses into the gate.
 bash tests/bin/check.test.sh
+echo '→ public-tree guard'
+job_reached 'public-tree guard'
+# ci.yml's public-tree job, before anything compiles: it reads only tracked
+# text, so a leak fails in a second instead of after the build. Locally the
+# PUBLIC_TREE_PRIVATE_WORDS secret is normally unset, and the guard says it
+# skipped those words. GATE-SCOPED: no python3 -> this job alone is NOT RUN.
+if command -v python3 >/dev/null 2>&1; then
+  python3 -I .github/scripts/test_public_tree.py
+  python3 -I .github/scripts/public_tree.py
+else
+  not_run 'public-tree guard' 'python3 is not on PATH' 'install: python3'
+fi
 job_reached 'fmt + clippy'
 bin/lint
 echo '→ actions are SHA-pinned'
@@ -175,11 +193,9 @@ bin/test
 echo '→ cargo audit'
 job_reached 'cargo audit'
 if command -v cargo-audit >/dev/null 2>&1; then
-  # CI's exact command (.github/workflows/ci.yml, audit job). The single
-  # ignore is the one .cargo/audit.toml already justifies; stating it on the
-  # command line keeps the local gate identical to CI instead of leaning on
-  # cargo-audit's config discovery.
-  cargo audit --ignore RUSTSEC-2023-0071
+  # CI's exact command (.github/workflows/ci.yml, audit job): no ignores, on
+  # the command line or in .cargo/audit.toml.
+  cargo audit
 else
   not_run 'cargo audit' 'cargo-audit is not on PATH' \
     'install: cargo install cargo-audit'

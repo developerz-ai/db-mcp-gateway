@@ -61,7 +61,7 @@ pub(super) fn reset_on_release(
         let reset = match conn.clear_cached_statements().await {
             Ok(()) => {
                 let with_unlock = format!("{RESET_SESSION}; {UNLOCK_ALL}");
-                match conn.execute(with_unlock.as_str()).await {
+                match conn.execute(sqlx::AssertSqlSafe(with_unlock)).await {
                     Err(err) if is_feature_not_supported(&err) => conn.execute(RESET_SESSION).await,
                     other => other,
                 }

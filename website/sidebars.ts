@@ -28,6 +28,20 @@ const sidebars: SidebarsConfig = {
       label: 'Deployment',
       items: [
         'deployment/config-reference',
+        {
+          type: 'category',
+          label: 'Identity providers',
+          items: [
+            'deployment/idp/okta',
+            'deployment/idp/entra',
+            'deployment/idp/google',
+            'deployment/idp/keycloak',
+            'deployment/idp/zitadel',
+          ],
+        },
+        'deployment/target-roles',
+        'deployment/pooler-contract',
+        'deployment/operations',
         'deployment/admin-api',
         'deployment/logging',
         'deployment/releasing',

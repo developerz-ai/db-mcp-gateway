@@ -17,11 +17,13 @@ fn unique_service_sub() -> String {
 
 async fn cleanup(pool: &PgPool, sub: &str) {
     for table in ["oauth_refresh_tokens", "sessions"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE user_sub = $1"))
-            .bind(sub)
-            .execute(pool)
-            .await
-            .expect("cleanup");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_sub = $1"
+        )))
+        .bind(sub)
+        .execute(pool)
+        .await
+        .expect("cleanup");
     }
 }
 

@@ -158,7 +158,7 @@ pub async fn ensure_read_role() {
                      GRANT SELECT ON TABLES TO {READ_ROLE}"
                 ),
             ]) {
-                sqlx::query(&sql)
+                sqlx::query(sqlx::AssertSqlSafe(sql))
                     .execute(&mut *tx)
                     .await
                     .unwrap_or_else(|err| panic!("provision {READ_ROLE}: {err}"));

@@ -14,7 +14,10 @@ pub(super) async fn get_user(
     let sql = format!(
         "SELECT {USER_COLUMNS} FROM permissions_users WHERE id = $1 AND deleted_at IS NULL"
     );
-    let row = sqlx::query(&sql).bind(id).fetch_optional(pool).await?;
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
     row.as_ref().map(user_from_row).transpose()
 }
 
@@ -28,7 +31,7 @@ pub(super) async fn list_users(
         "SELECT {USER_COLUMNS} FROM permissions_users WHERE deleted_at IS NULL \
          ORDER BY created_at, id LIMIT $1 OFFSET $2"
     );
-    let rows = sqlx::query(&sql)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(page.limit())
         .bind(page.offset())
         .fetch_all(pool)
@@ -78,7 +81,7 @@ pub async fn tx_lock_user_by_sub(
         "SELECT {USER_COLUMNS} FROM permissions_users \
          WHERE user_sub = $1 AND deleted_at IS NULL FOR UPDATE"
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(user_sub)
         .fetch_optional(&mut **tx)
         .await?;
@@ -94,7 +97,10 @@ pub async fn tx_lock_user(
         "SELECT {USER_COLUMNS} FROM permissions_users \
          WHERE id = $1 AND deleted_at IS NULL FOR UPDATE"
     );
-    let row = sqlx::query(&sql).bind(id).fetch_optional(&mut **tx).await?;
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?;
     row.as_ref().map(user_from_row).transpose()
 }
 
@@ -115,7 +121,7 @@ pub async fn tx_upsert_user(
                        updated_at = now() \
          RETURNING {USER_COLUMNS}"
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(user_sub)
         .bind(user_email)
         .bind(&groups_json)
@@ -142,7 +148,7 @@ pub async fn tx_update_user(
              updated_at = now() \
          WHERE id = $1 AND deleted_at IS NULL RETURNING {USER_COLUMNS}"
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(id)
         .bind(user_email)
         .bind(groups_json)
@@ -172,7 +178,7 @@ pub(super) async fn get_user_by_sub(
     let sql = format!(
         "SELECT {USER_COLUMNS} FROM permissions_users WHERE user_sub = $1 AND deleted_at IS NULL"
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(user_sub)
         .fetch_optional(pool)
         .await?;

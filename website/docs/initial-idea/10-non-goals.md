@@ -12,7 +12,7 @@ No visual SQL editor. No "drag a table onto a canvas." The agent writes the SQL;
 
 ## Not a credential vault
 
-We *use* a secret manager; we don't *replace* one. The gateway is not Vault, not 1Password, not AWS Secrets Manager. If you have one of those, point us at it. If you don't, get one first.
+We *use* a secret manager; we don't *replace* one. The gateway is not Vault, not 1Password, not AWS Secrets Manager. Today it reads credentials from env vars and mounted files (`${ENV:…}` / `${FILE:…}`) that your orchestrator fills from the secret manager; native `vault:` / `aws-sm:` / `gcp-sm:` refs are recognised but abort boot until those backends ship. If you have no secret manager, get one first.
 
 ## Not a SaaS
 
@@ -36,7 +36,7 @@ Data corrections and bulk updates belong in your existing runbooks, not in an ag
 
 ## Not a database
 
-The state Postgres is internal plumbing for sessions + audit. It's not exposed, not extensible, not queryable through the gateway's own MCP tools. Don't try to use it as application storage.
+The state Postgres is internal plumbing for sessions, audit and (by default) the permissions store. It's not exposed and not extensible; the only MCP access to it is `get_query_history`, which returns the caller's own audit rows. Don't try to use it as application storage.
 
 ## Not an AI product
 
@@ -56,4 +56,4 @@ We don't tunnel arbitrary DB protocol traffic. We expose specific MCP tools that
 
 ## Not an admin UI
 
-Permissions live in YAML in git. There is no `/admin` web UI for editing groups, granting access, or rotating credentials. The platform/infra teams who deploy this prefer config-as-code and we are not going to talk them out of it.
+Permissions live in YAML in git, or — opt-in — go through the SSO-gated `/admin/v1/*` JSON API, whose every write commits a `permissions_audit` row ([12](12-dynamic-permissions.md)). There is no web UI for editing groups, granting access, or rotating credentials. The platform/infra teams who deploy this prefer config-as-code and we are not going to talk them out of it.

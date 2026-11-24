@@ -79,6 +79,7 @@ async fn sighup_reloads_tls_cert_without_dropping_listener() {
     let rustls_for_server = rustls.clone();
     let server = tokio::spawn(async move {
         axum_server::from_tcp_rustls(std_listener, rustls_for_server)
+            .expect("adopt listener")
             .handle(server_handle)
             .serve(app.into_make_service())
             .await

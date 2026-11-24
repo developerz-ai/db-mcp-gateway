@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # bin/dev — local dev stack control.
-#   bin/dev up           start state-db + target-db + target-mongo + permissions-mysql (waits for health)
-#   bin/dev down         stop and remove containers
+#   bin/dev up           start the default services (state-db, target-db, target-mongo,
+#                        target-redis, target-dragonfly, permissions-mysql) and wait for health;
+#                        the profiles `yugabyte` (target-yugabyte) and `idp` (dex) stay off
+#   bin/dev down        stop and remove containers
 #   bin/dev reset        down + remove volumes (fresh DBs)
 #   bin/dev logs [svc]   follow logs
 #   bin/dev psql state   psql into state-db
@@ -15,9 +17,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-if [[ -f .env ]]; then
-  set -a; . ./.env; set +a
-fi
+# shellcheck source=bin/lib/dotenv.sh
+. bin/lib/dotenv.sh
 
 COMPOSE=(docker compose -f docker-compose.dev.yml)
 
@@ -38,7 +39,9 @@ case "${1:-up}" in
     esac
     ;;
   ysqlsh)
-    # yugabyted binds YSQL to the container address, not localhost.
+    # yugabyted binds YSQL to the container address, not localhost. The
+    # single quotes are deliberate: the inner shell expands them.
+    # shellcheck disable=SC2016
     exec "${COMPOSE[@]}" --profile yugabyte exec \
       -e PGPASSWORD="${TARGET_DB_PASSWORD:-app-dev-only}" target-yugabyte \
       bash -c 'exec bin/ysqlsh -h "$(hostname -i | awk "{print \$1}")" -U "$1" -d "$2"' ysqlsh \

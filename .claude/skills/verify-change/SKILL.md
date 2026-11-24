@@ -8,76 +8,58 @@ applies: [rust]
 > House skill — written from this repo’s own detected commands and
 > owned by this repository's maintainers. Correct it in place; setup never overwrites a skill that exists.
 
-## The one gate
+## Use the bin/ wrappers, not raw cargo
 
-`bin/check` is the local gate and delegates to `bin/ci`. CI does not invoke it:
-`.github/workflows/ci.yml` independently configures fmt with SHA-pin validation,
-both clippy configurations, scrub-feature validation, all-target/all-feature
-tests, dependency audit and the tracked-token scan with its regex regression.
-The local gate runs the checks it can run faithfully — lint, the SHA-pin scan
-and the tracked-token scan (ports of the workflow's greps: the token scan's
-exact command line pinned by the orchestration regression, both scans'
-verdicts exercised by it), CI's exact audit command, the token-regex
-regression from the same script CI runs
-(`tests/bin/secret-scan-regex.test.sh`), the all-feature
-test invocation and Pages parity — plus isolated shell orchestration
-regressions. Both scans fail closed: the SHA-pin scan checks each grep's
-status on its own, so a scan that cannot read `.github/workflows` is a
-tooling error rather than an empty result, and the tracked-token scan reports
-a hit by location (`path:line`) — never the credential it matched.
+Every check below has a `bin/` wrapper. The compiling and testing ones queue
+(`bin/lib/queue.sh`): a repo-local `heavy` lock serialises compiles, a `db`
+lock lets one suite at a time touch the shared dev databases, and the outer
+full-suite runs (`bin/check`, full `bin/test`, `bin/test-yugabyte`) also
+queue under the machine-wide `heavy` ledger when it is on PATH. A raw
+`cargo test` against `tests/it_db/` skips the `db` lock and races whatever
+else is using the same Postgres/MySQL/Mongo/Redis — never run one.
+`DBMCP_NO_QUEUE=1` opts out, for a dedicated box only.
 
-The gate also runs the Pages-parity job — website typecheck, production build
-and the post-build sensitive-asset denylist from `.github/workflows/pages.yml` —
-whenever the site toolchain is present (Node 20+, npm, installed website
-dependencies). When that toolchain is absent, that one job is reported `NOT RUN`
-and the gate still grades everything else. Pages retains its existing path
-filters; CI stays the authority for the audit and Pages jobs. See
-`CONTRIBUTING.md#local-quality-gate-matrix` for the mapping. Local success does
-not guarantee CI publishing or deployment success.
+## Narrowest proof first, the full gate once
 
-Prepare Rust (rustc, rustfmt and clippy), a C compiler (`cc`), `make`, Bash,
-GNU grep, Docker Compose and a running Docker daemon. These are REQUIRED: a
-missing one returns 75, because the gate cannot grade anything at all. The
-refusal lives in `bin/check`'s preflight — the gate's single entry point — so
-missing-tool handling has one owner.
+| Step | Command | What it proves |
+|------|---------|----------------|
+| install | `bin/setup` (`--hooks` also sets `core.hooksPath .githooks`) | host prerequisites, cargo-nextest + cargo-audit at CI's versions, `cargo fetch --locked`, the six default dev services healthy; log in `target/setup.log` |
+| format | `bin/fmt` | rewrites; `bin/lint` only checks |
+| unit loop | `bin/test --unit` | lib + bin unit tests and `tests/it_offline` — no Docker, no database |
+| one DB suite | `bin/test --test it_db <module>::` | that module against the real dev stack (target DB never mocked) |
+| lint | `bin/lint` | fmt-check, clippy `-D warnings` on all targets and on the release cfg, `bin/check-scrub-features` |
+| Yugabyte | `bin/test-yugabyte` | the Postgres query-path suite against YugabyteDB (profile `yugabyte`); only when the Postgres exec path changed |
+| the gate | `bin/check` | preflight, then `bin/ci`: the orchestration regression, the public-tree guard, lint + the SHA-pin scan, `bin/test` (full suite), `cargo audit`, the tracked-token scan, the doc-anchor guard and Pages parity |
 
-Two toolchains are GATE-SCOPED — each belongs to exactly one job: cargo-audit
-(the audit job) and Node 20+/npm plus the installed website dependencies (the
-Pages job). When one is absent, that job reports
-`NOT RUN: <job> - <reason> (<how to enable it>)` and the gate keeps grading
-every other job. The skip is printed and repeated in the final summary; it is
-never silent.
+Run `bin/check` once, at the end, in the background with its output in a
+file; it is minutes long. CI does not invoke it: `.github/workflows/ci.yml`
+configures its jobs independently and `bin/ci` mirrors them. The mapping is
+`CONTRIBUTING.md#local-quality-gate-matrix`. The git hooks are the fast
+subset: pre-commit = fmt + staged token scan, pre-push = clippy +
+`bin/test --unit`.
 
-`bin/check` installs nothing. The local audit command is CI's exact command,
-`cargo audit --ignore RUSTSEC-2023-0071`; the ignore set is unchanged (only
-`RUSTSEC-2023-0071`, justified in `.cargo/audit.toml` and `audit.toml`).
-`bin/setup` alone is insufficient: it does not install cargo-audit or website
-dependencies. Prepare both separately to have every job run.
+`bin/test` (full, or with `--test it_db …`) runs
+`docker compose -f docker-compose.dev.yml up -d --wait` before cargo, so the
+six default services (`state-db`, `target-db`, `permissions-mysql`,
+`target-mongo`, `target-redis`, `target-dragonfly`) must be healthy. A stack
+that never became healthy returns 75 without invoking cargo and names each
+unhealthy service. Test arguments are forwarded unchanged (cargo-nextest when
+installed, else `cargo test`).
 
-`bin/test` always runs `docker compose -f docker-compose.dev.yml up -d --wait`
-before cargo, including when the state DB is already running. All four services
-(`state-db`, `target-db`, `permissions-mysql`, `target-mongo`) must be healthy.
-A stack that never became healthy returns 75 without invoking cargo, and the
-report names every unhealthy service with its state and health. 75 is reserved
-for an unreachable resource or a confirmed health failure: a malformed compose
-file or any other compose command failure keeps its own exit status, so the
-platform blames the change and not the box. Test arguments are forwarded
-unchanged.
+The audit ignore set is empty: `.cargo/audit.toml` — the one config
+cargo-audit reads — ignores nothing, and a new ignore is a reviewed change. Website dependencies
+(`cd website && npm ci`) are the one thing `bin/setup` does not install;
+without them the Pages job reports `NOT RUN`.
 
-Registry login, image/manifest pushes, release publication, artifact upload and
-Pages deployment are separate credentialed CI-only steps, not local validation.
-CI cache cleanup is also deliberately not reproduced locally.
-
-| Step | Command | What it is |
-|------|---------|------------|
-| install | `bin/setup` | export PATH="$HOME/.cargo/bin:$PATH" && (dpkg -s build-essential openssl curl >/dev/null 2>&1 \|\| (sudo -n apt-get update && sudo -n apt-get install -y --no-install-recommends build-essential openssl curl)) && cargo fetch --locked && docker compose -f docker-compose.dev.yml up -d --wait |
-| run | `bin/dev` | cd "$(dirname "$0")/.."; c="docker compose -f docker-compose.dev.yml"; case "${1:-up}" in up) $c up -d --wait;; down) $c down;; logs) shift; $c logs -f "$@";; psql) case "${2:-state}" in state) $c exec -T state-db psql -U "${STATE_DB_USER:-gateway}" "${@:3}";; target) $c exec -T target-db psql -U "${TARGET_DB_USER:-app}" "${@:3}";; esac;; esac — on developerz.ai runs, start it with code_bash_background when you need a running stack |
-| prove | `bin/check` | cd "$(dirname "$0")/.." && export PATH="$HOME/.cargo/bin:$PATH" && bin/ci |
+Registry login, image pushes, releases and Pages deployment are CI-only steps,
+not local validation.
 
 ## Rules
 
 - Run every command from the repo root — the scripts `cd` there themselves.
 - `bin/check` red is not a pull request. Fix the cause, never silence the gate.
+- Changed a dependency? Re-run `bin/setup` before `bin/check`, or you are proving a stale tree.
+- Add the test that fails first, then the fix — a green run that never went red proves nothing.
 
 ## Exit codes `bin/check` must use
 
@@ -93,14 +75,11 @@ red. Exit 1 cannot carry that difference, so one code is reserved:
 
 - Guard the REQUIRED preconditions FIRST and `exit 75` when one is unmet. `exit 1`
   there tells the platform your change is broken when it is your environment that is.
-- A job whose own toolchain is absent is not an environment blocker: report
+- A job whose own toolchain is absent (python3 for the public-tree guard;
+  cargo-audit; Node 20+/npm + installed website dependencies) is not an environment blocker: report
   `NOT RUN: <job> - <reason> (<how to enable it>)` and keep grading. A job that
   runs and fails keeps its own non-zero code — never turn a red job into a skip.
 - Every job that did not run is named in the output and repeated in the final
   summary, which then reads
   `✓ Local quality checks passed for the gates that ran (no publishing or deployment)`
-  instead of claiming a full pass. A gate that stops early names the jobs it
-  never reached the same way: each gets a `NOT RUN: <job> - <reason>` notice
-  and an entry in the final list.
-- Changed a dependency? Re-run `bin/setup` before `bin/check`, or you are proving a stale tree.
-- Add the test that fails first, then the fix — a green run that never went red proves nothing.
+  instead of claiming a full pass.

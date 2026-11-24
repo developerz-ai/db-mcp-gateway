@@ -140,7 +140,7 @@ pub async fn ping(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
 /// What the boot seam can actually produce is narrower than this `match`, and
 /// the difference matters when reading a class in Loki. `sqlx`'s pool swallows
 /// `Io(ConnectionRefused)` and transient `Database` errors and retries them
-/// until the acquire deadline (`sqlx-core-0.8.6/src/pool/inner.rs:374`), so at
+/// until the acquire deadline (`sqlx-core-0.9.1/src/pool/inner.rs:391`), so at
 /// boot a server that is down, unroutable or not yet listening arrives as
 /// **`pool_timed_out`**, never as `io/ConnectionRefused`. `io/*` is reached
 /// only by the io kinds that bubble immediately, and a rejected password —

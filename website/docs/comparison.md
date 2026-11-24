@@ -1,367 +1,134 @@
 # Comparison
 
-db-mcp-gateway vs alternative approaches for AI agent database access. Feature comparison, security analysis, and operational considerations.
+db-mcp-gateway next to the other ways an AI agent gets at a database: handing it a connection string, a hand-written MCP wrapper, an off-the-shelf MCP database server, and an infrastructure access gateway. Statements about other products describe their general shape as of writing; check their current docs before deciding on them.
 
 ---
 
-## 🎯 Positioning Summary
+## Positioning
 
-**db-mcp-gateway** is a **specialized security gateway** for AI agent database access, not a general-purpose database proxy. It trades minimal latency for enterprise security, complete audit trails, and AI-agent optimization.
+db-mcp-gateway is an **MCP server that holds the database credentials** and puts SSO identity, per-group grants and a synchronous audit row in front of every tool call. It is not a connection pooler, not a SQL proxy, and not a general access platform.
 
-| Characteristic | db-mcp-gateway | Direct DB Access | General Proxies |
-|---------------|----------------|------------------|-----------------|
-| **Use Case** | AI agents + compliance | Human developers | Load balancing |
-| **Security Model** | Zero-trust + SSO | Credential-based | Connection-based |
-| **Audit Trail** | Complete per-query | None/ad-hoc | Limited |
-| **Interface** | MCP (AI agents) | SQL/CLI | SQL protocol |
-| **Configuration** | YAML + Git | Manual | GUI/Config files |
+| | db-mcp-gateway | Connection string in the agent | MCP database server / toolbox | Access gateway (session broker) |
+|---|---|---|---|---|
+| **Credential on the developer's machine** | None | Yes | Usually yes (DSN in the client's config), unless you host it centrally | No (brokered) |
+| **Interface the agent sees** | MCP tools | Driver / CLI | MCP tools | Database wire protocol |
+| **Identity on each query** | SSO user or `service:<name>` | The shared DB role | Usually the server's DB role | SSO user per session |
+| **Per-query audit row before the result** | Yes, synchronous | No | Depends; usually logs at best | Session/query recording, varies by product |
+| **Read-only by default** | Yes (role + read-only transaction + statement guard) | Only if the role is | Varies (some run reads in a read-only transaction) | Only if the role is |
 
 ---
 
-## 🔐 vs Direct Database Access
+## vs a connection string in the agent
 
-### Security Comparison
-
-**Direct Database Access:**
 ```bash
-# Developer's laptop contains production credentials
+# The credential now lives on a laptop, in shell history and in the agent's context
 DATABASE_URL="postgres://user:password@prod-db:5432/app"
-psql $DATABASE_URL
 ```
 
-**db-mcp-gateway:**
 ```bash
-# No credentials on laptop, SSO-based authentication
-claude mcp add db-gateway https://db.internal.com
-# First query triggers browser SSO
-# Gateway holds credentials, agent never sees them
+# No credential on the laptop; the first call triggers browser SSO
+claude mcp add --transport http db-gateway https://db.internal.acme.com/mcp
 ```
 
-**Security Analysis:**
-| Aspect | Direct Access | db-mcp-gateway |
-|--------|--------------|----------------|
-| **Credential Exposure** | ✅ High (laptops, logs) | ❌ None (never leaves gateway) |
-| **User Attribution** | ❌ Shared accounts | ✅ Individual SSO identities |
-| **Audit Trail** | ❌ Ad-hoc or none | ✅ Complete, per-query |
-| **Compliance** | ❌ Difficult to prove | ✅ Built-in, regulatory-ready |
-| **Revocation** | ✅ Immediate (password change) | ✅ Immediate (token expiry) |
+| Aspect | Connection string | db-mcp-gateway |
+|---|---|---|
+| Credential exposure | High: laptops, logs, agent context | None: the gateway holds it |
+| Attribution | The shared role | Each SSO user, per call |
+| Audit trail | Whatever the database logs | One `audit_calls` row per call, committed before the response |
+| Revoking one person | Rotate the shared password, redistribute it to everyone else | Remove them from the IdP group, or `revoke-sessions`; replicas converge within `SESSION_CACHE_TTL_SECONDS` (30 s), grant changes within `PERMISSIONS_CACHE_TTL_SECONDS` (60 s) at worst |
+| Setup | Minutes | Hours: deploy, IdP app, roles, permissions |
+| Latency | Direct | One extra hop plus two synchronous audit writes — [measured](benchmarks.md) |
 
-### Operational Comparison
-
-| Aspect | Direct Access | db-mcp-gateway |
-|--------|--------------|----------------|
-| **Setup Time** | Minutes (give credentials) | Hours (deployment + config) |
-| **Onboarding** | Manual credential distribution | SSO group membership |
-| **Offboarding** | Password rotation (impact all) | Token expiry + group removal |
-| **Troubleshooting** | Who has access? (unclear) | Audit log shows everything |
-| **Cost** | Credential management overhead | Gateway operations overhead |
-
-### When to Use Each
-
-**Choose Direct Access When:**
-- Development environments with no compliance requirements
-- Local development with personal databases
-- Teams already managing database access well
-- Latency-critical applications where any proxy hop is unacceptable
-
-**Choose db-mcp-gateway When:**
-- Production databases require compliance and audit
-- AI agents need database access without credential exposure
-- Teams want SSO integration and centralized access control
-- Regulatory requirements mandate user attribution
+Pick the connection string for personal or throwaway databases where nobody needs to know who ran what. Pick the gateway when the database matters and the agent should never hold its credential.
 
 ---
 
-## 🤖 vs Custom MCP Implementations
+## vs a hand-written MCP wrapper
 
-### Feature Comparison
+A wrapper is quick to write:
 
-**Custom MCP Wrapper (Quick Implementation):**
 ```python
-# 50-line Python script
 @app.post("/query")
 async def run_query(sql: str):
     return await database.execute(sql)
 ```
 
-**db-mcp-gateway:**
-```yaml
-# Production-ready with enterprise features
-permissions:
-  - group: analytics-team
-    grants:
-      - server: production
-        database: analytics_db
-        action: query_read
-        constraints:
-          row_limit: 10000
-          require_reason: true
-```
-
-**Feature Analysis:**
-| Feature | Custom Wrapper | db-mcp-gateway |
-|---------|----------------|----------------|
-| **Development Time** | Hours (initial) | Days (setup) |
-| **Maintenance Burden** | High (ongoing) | Low (upstream) |
-| **Security Features** | Basic (DIY) | Complete (SSO + audit) |
-| **Multi-Database** | Reinvent per DB type | Built-in (PG, YugabyteDB, Mongo, Redis) |
-| **Compliance Ready** | ❌ Build yourself | ✅ Built-in |
-| **Performance** | Yours to tune | [Measured](benchmarks.md) |
-| **Error Handling** | Custom | Typed errors with stable codes |
-
-### Total Cost of Ownership
-
-We have not measured this, so we are not going to publish a number for it.
-What a custom wrapper actually costs depends almost entirely on how much of
-the following you end up rebuilding — which is the honest comparison:
+What it costs depends on how much of the following you end up rebuilding — we have not measured it and will not publish a number:
 
 | Capability | Custom wrapper | db-mcp-gateway |
 |---|---|---|
-| OIDC login + session handling | You build and maintain it | Ships |
+| OIDC login + session handling + MCP OAuth | You build and maintain it | Ships |
 | Per-query identity in an audit row | You build and maintain it | Ships |
 | Read-only enforcement that survives a clever query | You build and maintain it | Ships |
-| Statement timeouts, row caps, cancellation | You build and maintain it | Ships |
-| A second database engine | Rebuild per engine | Add a `servers:` entry |
+| Statement timeouts, row caps, cancellation on disconnect | You build and maintain it | Ships |
+| A second database engine | Rebuild per engine | Add a `servers:` entry (Postgres, YugabyteDB, MongoDB, Redis-protocol) |
 | Keeping all of the above correct as agents change | Yours | Upstream's |
 
-If none of those rows matter to you, a wrapper may be cheaper, and you
-should evaluate that option.
-
-### When to Use Each
-
-**Choose Custom Wrapper When:**
-- Proof-of-concept or MVP phase
-- Very specialized requirements not met by gateway
-- Team has excess development capacity
-- Compliance requirements are minimal
-
-**Choose db-mcp-gateway When:**
-- Production deployment with compliance requirements
-- Long-term maintenance consideration
-- Multi-database environments
-- Enterprise security requirements (SSO, audit)
+If none of those rows matter to you, a wrapper may be cheaper — evaluate it.
 
 ---
 
-## 🔄 vs General Database Proxies
+## vs MCP database servers and toolboxes
 
-### ProxySQL (MySQL)
+There are many MCP servers that expose a database to an agent: per-engine servers (the original reference Postgres server, community MySQL / Mongo / Redis servers), multi-database servers such as DBHub, and configurable toolboxes such as Google's MCP Toolbox for Databases, where an operator declares parameterised SQL tools in a file.
 
-**ProxySQL Strengths:**
-- Advanced query routing and caching
-- Connection pooling optimization
-- Read-write splitting
-- Query rewriting capabilities
+They solve "give the agent tools for this database". The usual shape is a process the developer runs locally (stdio) with a DSN in its config, or a shared server running as one database role. What they typically leave to you:
 
-**db-mcp-gateway Differences:**
-- **AI Attribution:** Individual user identity vs shared connections
-- **MCP Protocol:** AI agent interface vs MySQL wire protocol
-- **Configuration:** YAML + git vs SQL-based config
-- **Security Model:** SSO groups vs IP-based rules
+| Concern | Typical MCP DB server / toolbox | db-mcp-gateway |
+|---|---|---|
+| Where the credential lives | Client config or the server's env | Only the gateway, never in a response, log or error |
+| Who the caller is | The process; sometimes an auth layer you add | SSO user via OIDC, or a named service token |
+| Per-group, per-database permissions | Usually none, or tool-level | `group × server × database × action` grants with constraints |
+| Audit | Optional logging | Synchronous audit row per call; failed audit write fails the call |
+| Free-form SQL vs fixed tools | Varies — toolboxes favour predeclared queries | Free-form `run_query` behind grants, plus fixed introspection tools |
 
-**Comparison:**
-| Feature | ProxySQL | db-mcp-gateway |
-|---------|----------|----------------|
-| **Target Users** | DBAs optimizing performance | Security teams enabling AI agents |
-| **Interface** | MySQL wire protocol | MCP (AI agents) |
-| **User Attribution** | Connection-level | Query-level (SSO) |
-| **Configuration** | SQL commands, runtime tables | YAML files, git-tracked |
-| **Learning Curve** | Steep (ProxySQL-specific) | Shallow (standard YAML) |
-
-### PgBouncer (PostgreSQL)
-
-**PgBouncer Strengths:**
-- Lightweight connection pooling
-- PostgreSQL protocol optimization
-- Minimal resource footprint
-- Proven production stability
-
-**db-mcp-gateway Differences:**
-- **Security Focus:** User attribution + audit vs connection pooling
-- **Protocol Layer:** MCP on top vs PostgreSQL protocol directly
-- **Feature Set:** SSO + permissions vs pure connection management
-
-**Comparison:**
-| Feature | PgBouncer | db-mcp-gateway |
-|---------|-----------|----------------|
-| **Primary Goal** | Connection pooling efficiency | Security + compliance |
-| **Gateway-specific work per query** | Pool checkout | Authz check, query guard, synchronous audit write |
-| **User Tracking** | Connection name only | Full query attribution |
-| **Configuration** | INI files | YAML + git |
-| **Multi-Database** | PostgreSQL only | PG, YugabyteDB, Mongo, Redis |
-
-### VSQL (General SQL Proxy)
-
-**VSQL Strengths:**
-- Database-agnostic SQL interface
-- Query analysis and optimization
-- Multi-database query federation
-
-**db-mcp-gateway Differences:**
-- **AI-Native:** MCP protocol optimized for agents vs SQL protocol
-- **Security:** SSO + audit vs generic authentication
-- **Operations:** Single-purpose vs general-purpose query engine
-
-**Comparison:**
-| Feature | VSQL | db-mcp-gateway |
-|---------|------|----------------|
-| **Use Case** | Data federation | AI agent security |
-| **Protocol** | SQL (any client) | MCP (AI agents only) |
-| **Security** | Basic authentication | SSO + audit + permissions |
-| **Complexity** | High (query federation) | Low (security wrapper) |
+A toolbox of predeclared queries is a narrower blast radius than free-form SQL. If the questions your agents ask are known in advance, that is a real advantage; you can also run such a toolbox behind your own auth. The gateway is for when engineers need ad-hoc debugging queries and you need to know who ran each one.
 
 ---
 
-## 🏢 vs Enterprise Data Gateways
+## vs infrastructure access gateways
 
-### Immuta (Data Governance)
+Teleport (database access), StrongDM, HashiCorp Boundary and similar products broker human (and machine) access to databases: SSO login, short-lived or injected credentials, session recording and, in some products, query-level logs. They speak the database wire protocol, so `psql` and drivers work through them.
 
-**Immuta Strengths:**
-- Advanced data governance and masking
-- Fine-grained column-level security
-- Policy-as-code for data access
-- Integration with major data platforms
+| Concern | Access gateway | db-mcp-gateway |
+|---|---|---|
+| Interface | DB wire protocol (any client) | MCP tools only |
+| Scope | Servers, Kubernetes, databases, more | Databases for AI agents, nothing else |
+| Agent-specific limits (row caps, result-size caps, `reason_required`, statement guard) | Generally not | Built in |
+| Audit granularity | Session and, depending on product, query | One row per tool call, with reason, row count and outcome |
+| Operations | A platform to run (or buy) | One container + one Postgres |
+| Cost | Commercial tiers for most enterprise features | Open source (MIT) |
 
-**db-mcp-gateway Differences:**
-- **Simplicity:** Focused on AI agent use case vs enterprise-wide governance
-- **Deployment:** Single container vs complex platform
-- **Learning Curve:** YAML configuration vs policy framework
-- **Cost:** Open source vs enterprise licensing
-
-**Comparison:**
-| Feature | Immuta | db-mcp-gateway |
-|---------|--------|----------------|
-| **Scope** | Enterprise-wide data governance | AI agent database access |
-| **Deployment** | Multi-service platform | Single Docker container |
-| **Learning Curve** | Steep (framework + policies) | Shallow (YAML config) |
-| **Cost** | Enterprise licensing | Open source |
-| **AI Agent Focus** | Generic | Purpose-built |
-
-### Collibra (Data Catalog)
-
-**Collibra Strengths:**
-- Data catalog and lineage
-- Business glossary and definitions
-- Data quality monitoring
-- Collaborative data governance
-
-**db-mcp-gateway Differences:**
-- **Purpose:** Runtime access control vs metadata management
-- **Real-time:** Query-time enforcement vs documentation-time policies
-- **Scope:** Database access specifically vs full data lifecycle
-
-**Comparison:**
-| Feature | Collibra | db-mcp-gateway |
-|---------|----------|----------------|
-| **Primary Purpose** | Data catalog + governance | Runtime database access control |
-| **Enforcement** | Documentation/policy | Real-time query blocking |
-| **AI Agents** | Not specific | Purpose-built |
-| **Complexity** | High (enterprise platform) | Low (security gateway) |
+If you already run one of these for humans, it is a good way to give the *gateway* its network path to the databases. They complement each other: the access gateway governs connections, db-mcp-gateway governs what an agent may run and records it. Some access gateways have started adding MCP-facing features; compare those directly against the table above.
 
 ---
 
-## 🎯 Decision Matrix
+## Not the same layer: poolers and data governance
 
-### Use Case Fit Analysis
-
-| Scenario | Recommended Solution | Rationale |
-|----------|----------------------|-----------|
-| **AI agents need prod DB access** | db-mcp-gateway | Purpose-built for AI + security |
-| **Optimize MySQL read-write splitting** | ProxySQL | Performance-focused, not security |
-| **Reduce PostgreSQL connection count** | PgBouncer | Connection pooling specialty |
-| **Enterprise-wide data governance** | Immuta/Collibra | Broader scope, enterprise features |
-| **Simple dev database access** | Direct access | Low risk, no compliance needed |
-| **Compliance-required audit trail** | db-mcp-gateway | Built-in audit + SSO |
-| **Multi-database query federation** | Custom solution or VSQL | Different problem domain |
-
-### Organizational Fit
-
-**Small Teams (`<10` developers):**
-- **Direct access** usually sufficient
-- **db-mcp-gateway** for compliance requirements or production access
-- **Avoid:** Complex enterprise platforms (Immuta, Collibra)
-
-**Medium Teams (10-50 developers):**
-- **db-mcp-gateway** for production databases
-- **Direct access** for development environments
-- **Proxies** (ProxySQL, PgBouncer) for performance optimization
-
-**Large Enterprises (50+ developers):**
-- **db-mcp-gateway** for AI agent access
-- **Enterprise platforms** (Immuta, Collibra) for broader governance
-- **Proxies** for performance optimization at scale
+- **Connection poolers** (PgBouncer, pgcat, ProxySQL, RDS Proxy) reduce connection count. They do not authenticate people or audit queries. The gateway can sit *in front of* one — see the [pooler contract](deployment/pooler-contract.md) for what it needs from it.
+- **Data governance platforms** (catalogs, masking, column-level policy across a warehouse) are broader. The gateway does no masking and no column-level policy; table and column scoping is the target-DB role's job ([spec 06](initial-idea/06-permissions.md)).
 
 ---
 
-## 🚀 Migration Paths
+## Decision matrix
 
-### From Direct Access to db-mcp-gateway
-
-**Phase 1: Parallel Deployment**
-```bash
-# Deploy gateway alongside existing access
-# Existing users: continue direct access
-# Early adopters: migrate to gateway
-```
-
-**Phase 2: Gradual Migration**
-```bash
-# Migrate teams by team
-# Start with read-only analytics
-# Expand to production debugging
-```
-
-**Phase 3: Gateway-First**
-```bash
-# New databases provisioned with gateway only
-# Direct access deprecated for new systems
-```
-
-### From Custom MCP to db-mcp-gateway
-
-**Reconfiguration Steps:**
-1. **Export existing permissions** from custom implementation
-2. **Map to gateway YAML** structure (groups → grants)
-3. **Update agent configs** to point to gateway URL
-4. **Decommission custom wrapper** after validation period
-
-Effort depends on factors such as permission mapping, agent configurations,
-validation, and deployment. We have no representative sample to estimate
-from, so we are not going to invent one.
+| Scenario | Fit |
+|---|---|
+| Engineers' agents need ad-hoc read access to production, attributed per person | db-mcp-gateway |
+| Unattended agents (CI, runners) need audited, scoped DB access | db-mcp-gateway with [service tokens](usage/headless-agents.md) |
+| Agents only ever need a fixed set of known queries | An MCP toolbox of predeclared queries (optionally behind your own auth) |
+| Humans need `psql` through SSO with session recording | An access gateway |
+| Too many connections to Postgres | A pooler |
+| Personal or disposable database | Connection string |
+| Masking or column-level policy | A governance product or database-native features |
 
 ---
 
-## 📊 Feature Summary Matrix
+## Migrating to the gateway
 
-| Feature | Direct Access | Custom MCP | ProxySQL | PgBouncer | db-mcp-gateway |
-|---------|--------------|------------|----------|-----------|----------------|
-| **Security** | ❌ Low | ⚠️ Variable | ⚠️ Medium | ⚠️ Medium | ✅ High |
-| **Audit Trail** | ❌ None | ⚠️ Optional | ❌ Basic | ❌ Basic | ✅ Complete |
-| **SSO Integration** | ❌ No | ⚠️ DIY | ❌ No | ❌ No | ✅ Built-in |
-| **User Attribution** | ❌ Shared | ⚠️ DIY | ❌ IP-based | ❌ Connection name | ✅ Per-query SSO |
-| **Multi-Database** | ✅ Native | ❌ Reinvent | ❌ MySQL only | ❌ PG only | ✅ PG+Mongo+Redis |
-| **MCP Protocol** | ❌ No | ✅ Yes | ❌ No | ❌ No | ✅ Yes |
-| **Configuration** | Ad-hoc | Custom code | SQL/Tables | INI files | ✅ YAML + Git |
-| **Maintenance** | Ongoing | High | Medium | Low | ✅ Low (upstream) |
-| **Performance** | Not measured | Not measured | Not measured | Not measured | [Measured](benchmarks.md) |
-| **Compliance** | ❌ DIY | ⚠️ DIY | ❌ Limited | ❌ Limited | ✅ Built-in |
+1. **Run it next to existing access.** Point one team's agents at it; nothing else changes.
+2. **Recreate permissions as grants.** Map each existing role or wrapper rule to `group × server × database × action`; keep table scoping in the database roles.
+3. **Switch agent configs** to `https://<gateway>/mcp` and remove DSNs from client configs and secrets on laptops.
+4. **Rotate the old credentials** once nothing uses them, so the copies that leaked onto laptops stop working.
 
----
-
-## 🎯 Bottom Line
-
-**db-mcp-gateway excels when:**
-- AI agents need database access with enterprise security
-- Compliance requires user attribution and audit trails
-- Teams want SSO integration and git-based configuration
-- Multi-database environments need unified access control
-
-**Consider alternatives when:**
-- Pure performance optimization is the goal (use ProxySQL/PgBouncer)
-- Simple development environments without compliance needs (use direct access)
-- Enterprise-wide data governance beyond databases (use Immuta/Collibra)
-- Maximum performance is critical and a proxy hop sits on your critical path
-  — ours is [measured](benchmarks.md), but only on one shared host, so budget
-  for measuring it on your own hardware before committing
-
-**The sweet spot:** Production databases + AI agents + compliance requirements + operational simplicity.
+Effort depends on how many roles, agents and databases you have; we have no representative sample and will not invent an estimate.

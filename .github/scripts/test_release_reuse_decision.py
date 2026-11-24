@@ -5,6 +5,7 @@ import subprocess
 import sys
 import unittest
 
+sys.dont_write_bytecode = True  # a .pyc embeds the absolute path (public-tree)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from release_reuse_decision import decide  # noqa: E402
 

@@ -1,8 +1,7 @@
 name: weekly
 
-# Cheap checks off the PR path, against `main` (scheduled runs use the default
-# branch). A new advisory lands without any commit here, so the PR-time
-# `audit` job alone would only notice it on the next unrelated PR.
+# Checks off the PR path, against `main` (scheduled runs use the default
+# branch). The advisory audit is daily, in audit.yml.
 on:
   schedule:
     - cron: "0 6 * * 1"
@@ -19,24 +18,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  audit:
-    # GitHub-hosted runner: this repository is public.
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: install pinned toolchain (rust-toolchain.toml)
-        run: rustup toolchain install --no-self-update
-      - name: install cargo-audit
-        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
-        with:
-          tool: cargo-audit
-      # Same ignore as ci.yml's `audit` job; .cargo/audit.toml holds its
-      # removal trigger.
-      - run: cargo audit --ignore RUSTSEC-2023-0071
-
   # Report only: what `cargo update` would move. Applying it is a reviewed PR
   # (Dependabot, or by hand narrowly — CLAUDE.md §Dependency graph; sqlx stays
   # pinned with its sqlx-sqlite stub).
@@ -75,15 +56,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # As in ci.yml: only the pinned toolchain, so the runner image's
-      # `stable` never re-keys the rust-cache entry below.
+      # No rust-cache: one release build a week restored a ~1 GB entry that
+      # was evicted or a week stale by the next run, and saved another.
       - name: install pinned toolchain (rust-toolchain.toml)
-        run: |
-          rustup toolchain install --no-self-update
-          if rustup toolchain list | grep -q '^stable'; then
-            rustup toolchain uninstall stable
-          fi
-      - uses: Swatinem/rust-cache@f4371d1ec7179bfbd04a82a81e3b3af7f720750f # v2
+        run: rustup toolchain install --no-self-update
       - name: run the benchmark harness
         run: ./benchmarks/gateway_overhead.sh --out "$RESULT"
       - name: gate against the stored baseline

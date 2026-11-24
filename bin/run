@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# bin/run — run the gateway from source against the dev stack.
+#   bin/run [--idp] [cargo run flags…]     e.g. bin/run --release
+# Starts state-db + target-db (--idp: also Dex, compose profile `idp`), mints a
+# dev service token once into target/dev/service-token (bin/mcp-call reads
+# it), then `cargo run` with config/dev.yaml. The defaults below are dev-only;
+# .env and the shell override them (the shell wins).
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+# shellcheck source=bin/lib/dotenv.sh
+. bin/lib/dotenv.sh
+
+compose=(docker compose -f docker-compose.dev.yml)
+services=(state-db target-db)
+if [[ ${1:-} == --idp ]]; then
+  shift
+  compose+=(--profile idp)
+  services+=(dex)
+fi
+
+: "${STATE_DB_URL:=postgres://${STATE_DB_USER:-gateway}:${STATE_DB_PASSWORD:-gateway-dev-only}@localhost:${STATE_DB_PORT:-5433}/${STATE_DB_NAME:-gateway}}"
+: "${TARGET_DB_PASSWORD:=app-dev-only}"
+: "${TLS_DISABLED:=true}"
+: "${OIDC_ISSUER:=http://localhost:5556}"
+: "${OIDC_CLIENT_ID:=dev}"
+: "${OIDC_CLIENT_SECRET:=dev-only-oidc-secret}"
+: "${ALLOW_INSECURE_SIGNING_KEY:=true}"
+export STATE_DB_URL TARGET_DB_PASSWORD TLS_DISABLED OIDC_ISSUER OIDC_CLIENT_ID \
+  OIDC_CLIENT_SECRET ALLOW_INSECURE_SIGNING_KEY
+
+target_port=${TARGET_DB_PORT:-5434}
+[[ $target_port =~ ^[0-9]+$ ]] || { echo "bin/run: TARGET_DB_PORT must be a port number" >&2; exit 2; }
+
+mkdir -p target/dev
+token_file=target/dev/service-token
+if [[ ! -s $token_file ]]; then
+  (umask 077 && printf 'dbmcp_svc_%s' "$(openssl rand -hex 32)" > "$token_file")
+fi
+DBMCP_DEV_SERVICE_TOKEN=$(<"$token_file")
+export DBMCP_DEV_SERVICE_TOKEN
+
+# YAML has no interpolation for ports: render a copy when .env moved the target.
+config=config/dev.yaml
+if [[ $target_port != 5434 ]]; then
+  config=target/dev/config.yaml
+  sed "s/^    port: 5434\$/    port: ${target_port}/" config/dev.yaml > "$config"
+fi
+
+# Start only what is not running: `up` on a running service under different
+# env (another port in the shell than in .env) would recreate it under you.
+running=$("${compose[@]}" ps --status running --services)
+missing=()
+for service in "${services[@]}"; do
+  grep -qx "$service" <<<"$running" || missing+=("$service")
+done
+if (( ${#missing[@]} )); then
+  echo "→ starting ${missing[*]}"
+  "${compose[@]}" up -d --wait "${missing[@]}"
+fi
+exec cargo run --bin db-mcp-gateway "$@" -- --config "$config"

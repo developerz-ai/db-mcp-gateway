@@ -23,12 +23,13 @@ You are an elite software engineer and the pilot of this task: own the outcome, 
 - Make the smallest correct change. Done means a tool result in this run proves it, not a diff written.
 
 Write every audit row through `src/audit/` and `src/tools/audit_dispatch/`; a tool module never inserts into `audit_calls` itself.
-Commit the audit row before the tool response leaves `src/transport/`; an audit write failure must fail the request, never fall back to best-effort.
+Keep the two phases: the intent row (`src/audit/intent.rs`, table `audit_call_intents`) commits before any target call; the completion row commits before the tool response leaves `src/transport/`; `src/audit/reaper.rs` turns an intent with no completion into `outcome: abandoned`. An audit write failure fails the request with `audit_unavailable`, never a best-effort fallback.
 Record the outcome code the client sees (`forbidden`, `forbidden_sql`, `timeout`, `cancelled`, `invalid_arguments`, …); `src/transport/errors.rs` owns those strings.
 Audit rejected calls too — a call that failed authz or argument validation still gets a row.
 Never let a row carry a DSN, password, role name or connection string; rows are exported to a SIEM.
-Add schema changes as a new numbered file in `migrations/`; never edit an applied migration.
-Keep the retention window driven by `AUDIT_RETENTION_DAYS` and the pruner in `src/audit/pruner.rs`.
-Route stream sinks (`stdout`, `syslog`) through `src/audit/stream.rs`; `archive` and `otlp` are not valid config yet and the parser rejects them.
-Assert the row in every integration test that calls a tool (`tests/it_db/*.rs` (+ `tests/it_offline/`, `tests/it_global/`)); the forbidden path must produce `outcome: forbidden`.
+Add schema changes as a new numbered file in `migrations/` (next number after the highest present; expand before contract — see the `state-migrations` skill); never edit an applied migration.
+Keep the retention window driven by `AUDIT_RETENTION_DAYS` (greater than zero) and the pruner in `src/audit/pruner.rs`.
+Route stream sinks (`stdout`, `syslog`) through `src/audit/stream/`; `otlp` and the archive tier are not implemented (#218) and the config parser rejects them.
+Assert the row in every integration test that calls a tool (`tests/it_db/`, plus `tests/it_offline/` and `tests/it_global/` where they dispatch one); the forbidden path must produce `outcome: forbidden`. Every `tests/it_db/` test declares `#[serial_test::serial(world)]` (pruner/reaper sweeps, global counts) or `#[serial_test::parallel(world)]`.
+Run DB suites only through the queued wrapper — `bin/test --test it_db audit_two_phase_real_db::` and friends — never a raw `cargo test` against the shared dev databases.
 Flag every change to the audit write path for the `security review required` label.

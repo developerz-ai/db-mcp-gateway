@@ -12,7 +12,7 @@
 [![CI](https://github.com/developerz-ai/db-mcp-gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/developerz-ai/db-mcp-gateway/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/developerz-ai/db-mcp-gateway?sort=semver)](https://github.com/developerz-ai/db-mcp-gateway/releases/latest)
 [![Image](https://img.shields.io/badge/image-ghcr.io-2496ED?logo=docker&logoColor=white)](https://github.com/developerz-ai/db-mcp-gateway/pkgs/container/db-mcp-gateway)
-[![Rust](https://img.shields.io/badge/rust-%E2%89%A5%201.88-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-%E2%89%A5%201.94.1-CE422B?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![GitHub stars](https://img.shields.io/github/stars/developerz-ai/db-mcp-gateway?style=flat&logo=github)](https://github.com/developerz-ai/db-mcp-gateway/stargazers)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -52,7 +52,7 @@ deployment in [`website/docs/deployment/quickstart.md`](website/docs/deployment/
 Client side, that is the whole setup:
 
 ```bash
-claude mcp add --transport http db-gateway --scope project https://db.internal.acme.com
+claude mcp add --transport http db-gateway --scope project https://db.internal.acme.com/mcp
 ```
 
 The first call triggers SSO in a real browser — no embedded webview, no token
@@ -151,7 +151,7 @@ hardware.
 |---|---|
 | Trying to understand what this is | [`website/docs/initial-idea/01-overview.md`](website/docs/initial-idea/01-overview.md) |
 | A developer whose org already runs it | [`website/docs/usage/first-query.md`](website/docs/usage/first-query.md) (5-min walkthrough) → [`website/docs/usage/claude-code.md`](website/docs/usage/claude-code.md) (reference) |
-| A platform/SRE deploying it | [`website/docs/deployment/quickstart.md`](website/docs/deployment/quickstart.md) |
+| A platform/SRE deploying it | [`website/docs/deployment/quickstart.md`](website/docs/deployment/quickstart.md) → [IdP guides](website/docs/deployment/idp/okta.md), [target roles](website/docs/deployment/target-roles.md), [operations](website/docs/deployment/operations.md) |
 | Adding it to a non-Claude MCP client | [`website/docs/usage/other-agents.md`](website/docs/usage/other-agents.md) |
 | Cutting a release | [`website/docs/deployment/releasing.md`](website/docs/deployment/releasing.md) |
 | Wondering what it *won't* do | [`website/docs/initial-idea/10-non-goals.md`](website/docs/initial-idea/10-non-goals.md) |
@@ -189,7 +189,7 @@ db-mcp-gateway is maintained by AI: by [developerz.ai](https://developerz.ai), t
 | a change that weakens a non-negotiable | declined with the rule quoted |
 | a breaking change (tool surface, error codes, config schema, audit shape) or a new feature | a human decides: the team still designs and builds features, humans and AI together |
 
-Scheduled checkups, briefs in [`.dz/briefs/`](.dz/briefs/): weekly `release-due` judges whether a release is needed, daily `security-release` ships a confirmed security fix off-cycle, weekly `health` catches the failures nothing announces, and monthly `improve` lands at most three small, evidenced improvements.
+Scheduled checkups, briefs in [`.dz/schedules/`](.dz/schedules/): weekly `release-due` judges whether a release is needed, daily `security-release` ships a confirmed security fix off-cycle, weekly `health` catches the failures nothing announces, and monthly `improve` lands at most three small, evidenced improvements.
 
 ## Star history
 

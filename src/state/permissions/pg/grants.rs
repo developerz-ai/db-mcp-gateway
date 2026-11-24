@@ -15,7 +15,10 @@ pub(super) async fn get_grant(
     let sql = format!(
         "SELECT {GRANT_COLUMNS} FROM permissions_grants WHERE id = $1 AND revoked_at IS NULL"
     );
-    let row = sqlx::query(&sql).bind(id).fetch_optional(pool).await?;
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
     row.as_ref().map(grant_from_row).transpose()
 }
 
@@ -33,7 +36,7 @@ pub(super) async fn list_grants(
            AND ($2::uuid IS NULL OR database_id = $2) \
          ORDER BY created_at, id LIMIT $3 OFFSET $4"
     );
-    let rows = sqlx::query(&sql)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(user_id)
         .bind(database_id)
         .bind(page.limit())
@@ -89,7 +92,7 @@ pub async fn tx_create_grant(
          WHERE $3::uuid IS NULL OR EXISTS (SELECT 1 FROM d) \
          RETURNING {GRANT_COLUMNS}"
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(user_id)
         .bind(server)
         .bind(database_id)
@@ -110,7 +113,10 @@ pub async fn tx_lock_grant(
         "SELECT {GRANT_COLUMNS} FROM permissions_grants \
          WHERE id = $1 AND revoked_at IS NULL FOR UPDATE"
     );
-    let row = sqlx::query(&sql).bind(id).fetch_optional(&mut **tx).await?;
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?;
     row.as_ref().map(grant_from_row).transpose()
 }
 
@@ -127,7 +133,7 @@ pub async fn tx_update_grant(
          SET action = COALESCE($2, action), constraints = $3, updated_at = now() \
          WHERE id = $1 AND revoked_at IS NULL RETURNING {GRANT_COLUMNS}"
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(id)
         .bind(action.map(GrantAction::as_db_str))
         .bind(constraints)
@@ -176,7 +182,10 @@ async fn revoke_where(
         "UPDATE permissions_grants SET revoked_at = now() \
          WHERE {column} = $1 AND revoked_at IS NULL RETURNING {GRANT_COLUMNS}"
     );
-    let rows = sqlx::query(&sql).bind(id).fetch_all(&mut **tx).await?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(id)
+        .fetch_all(&mut **tx)
+        .await?;
     let mut grants = rows
         .iter()
         .map(grant_from_row)
@@ -198,6 +207,9 @@ pub(super) async fn list_grants_for_user(
         "SELECT {GRANT_COLUMNS} FROM permissions_grants \
          WHERE user_id = $1 AND revoked_at IS NULL ORDER BY created_at"
     );
-    let rows = sqlx::query(&sql).bind(user_id).fetch_all(pool).await?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
     rows.iter().map(grant_from_row).collect()
 }

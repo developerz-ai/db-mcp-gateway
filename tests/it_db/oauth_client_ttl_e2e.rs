@@ -307,7 +307,10 @@ async fn fail_commits_minting_for(pool: &PgPool, trigger: &str, sub: &str) {
              EXECUTE FUNCTION {trigger}()"
         ),
     ] {
-        sqlx::query(&ddl).execute(pool).await.expect("install");
+        sqlx::query(sqlx::AssertSqlSafe(ddl))
+            .execute(pool)
+            .await
+            .expect("install");
     }
 }
 
@@ -361,7 +364,10 @@ async fn a_mint_whose_commit_errored_keeps_the_code_spent() {
         format!("DROP TRIGGER {trigger} ON oauth_refresh_tokens"),
         format!("DROP FUNCTION {trigger}()"),
     ] {
-        sqlx::query(&ddl).execute(&pool).await.expect("uninstall");
+        sqlx::query(sqlx::AssertSqlSafe(ddl))
+            .execute(&pool)
+            .await
+            .expect("uninstall");
     }
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"], "invalid_grant", "{body}");

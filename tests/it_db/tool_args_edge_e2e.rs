@@ -58,10 +58,12 @@ impl Fixture {
             .await
             .expect("target-db reachable; run `bin/dev up`");
         let table = format!("args_edge_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE TABLE \"{table}\" (v text)"))
-            .execute(&target)
-            .await
-            .expect("scratch table");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TABLE \"{table}\" (v text)"
+        )))
+        .execute(&target)
+        .await
+        .expect("scratch table");
         Self { gw, target, table }
     }
 
@@ -84,10 +86,13 @@ impl Fixture {
     }
 
     async fn rows(&self) -> i64 {
-        sqlx::query_scalar(&format!("SELECT count(*) FROM \"{}\"", self.table))
-            .fetch_one(&self.target)
-            .await
-            .unwrap()
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM \"{}\"",
+            self.table
+        )))
+        .fetch_one(&self.target)
+        .await
+        .unwrap()
     }
 
     async fn intents(&self) -> i64 {
@@ -103,10 +108,13 @@ impl Fixture {
     }
 
     async fn finish(self) {
-        sqlx::query(&format!("DROP TABLE \"{}\"", self.table))
-            .execute(&self.target)
-            .await
-            .expect("drop scratch table");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE \"{}\"",
+            self.table
+        )))
+        .execute(&self.target)
+        .await
+        .expect("drop scratch table");
         delete_audit_calls(&self.gw.state_db, &self.gw.user_sub).await;
     }
 }

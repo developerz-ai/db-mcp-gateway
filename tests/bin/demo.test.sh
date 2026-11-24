@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# End-to-end smoke for examples/demo (needs Docker; pulls images): bring the
+# demo up under a throwaway project name, take the printed `claude mcp add`
+# line, make one real tools/call run_query with its token, assert rows and the
+# audit row, then remove the project and its volumes.
+#   DEMO_PORT      host port (default 18443, away from bin/run's 8443)
+#   GATEWAY_IMAGE  image under test (default: the one the demo pins)
+set -euo pipefail
+cd "$(dirname "$0")/../../examples/demo"
+
+port=${DEMO_PORT:-18443}
+compose=(docker compose -p "db-mcp-gateway-demo-test-$$")
+export DEMO_PORT=$port
+trap '"${compose[@]}" down -v >/dev/null 2>&1 || true' EXIT
+
+fail() { printf 'FAIL: %s\n' "$1" >&2; "${compose[@]}" logs gateway ready >&2 || true; exit 1; }
+
+"${compose[@]}" up -d --wait >/dev/null 2>&1 || fail 'demo did not come up'
+
+line=''
+for _ in $(seq 60); do
+  line=$("${compose[@]}" logs --no-log-prefix ready 2>/dev/null | grep -F 'claude mcp add' || true)
+  [[ -n $line ]] && break
+  sleep 1
+done
+[[ -n $line ]] || fail 'no claude mcp add line printed'
+[[ $line == *"--transport http demo-db http://localhost:${port}/mcp --header \"Authorization: Bearer dbmcp_svc_"* ]] \
+  || fail 'unexpected claude mcp add line'
+token=$(grep -oE 'dbmcp_svc_[0-9a-f]{64}' <<<"$line")
+
+body='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"run_query","arguments":{"server":"demo","database":"shop","sql":"SELECT name FROM customers ORDER BY id LIMIT 2"}}}'
+response=$(printf 'header = "Authorization: Bearer %s"\n' "$token" \
+  | curl -sS --config - -H 'Content-Type: application/json' --data-binary "$body" "http://localhost:${port}/mcp")
+[[ $response == *'"isError":false'* && $response == *'Ada Lovelace'* && $response == *'Grace Hopper'* ]] \
+  || fail "run_query returned no rows: $response"
+
+audit=$("${compose[@]}" exec -T state-db psql -U gateway -d gateway -tAc \
+  "SELECT count(*) FROM audit_calls WHERE user_sub = 'service:demo' AND tool = 'run_query' AND outcome = 'success'")
+[[ $audit == 1 ]] || fail "expected one audit row, found <$audit>"
+
+echo 'ok: examples/demo (run_query returned rows, audited)'

@@ -5,13 +5,13 @@ Phased plan from skeleton to a deployable gateway. Each phase is mergeable indep
 ## Phase 0 — Skeleton ✅ done (v0.1.0)
 
 - Repo bootstrapped, CI green on an empty Rust workspace.
-- Docs in `docs/initial-idea/` describe the target.
+- Docs in `website/docs/initial-idea/` describe the target.
 - CLAUDE.md spells out architecture, conventions, non-negotiables.
 - License, README, .gitignore, Cargo workspace, basic GitHub Actions.
 
 ## Phase 1 — MCP transport + auth bones ✅ done (v0.1.0)
 
-- HTTP+SSE listener (hand-rolled JSON-RPC; no stable MCP SDK at the time).
+- HTTP listener (hand-rolled JSON-RPC; no stable MCP SDK at the time). Since 2.0 it is Streamable HTTP only: `POST` carries JSON-RPC, `GET` answers `405`.
 - OIDC login flow, JWT verification, in-memory session cache.
 - A single working tool: `list_servers` (returns config contents minus secrets).
 - State DB with sessions table; migrations on startup.
@@ -31,7 +31,7 @@ Phased plan from skeleton to a deployable gateway. Each phase is mergeable indep
 - TLS by default, cert reload on SIGHUP.
 - `/healthz`, `/readyz`, `/metrics`.
 - Structured logging.
-- Secrets references: `${ENV}`, Vault, AWS SM, GCP SM.
+- Secrets references: `${ENV:NAME}` and `${FILE:/path}`. `vault:` / `aws-sm:` / `gcp-sm:` refs parse but abort boot — those backends are **not started**.
 - Config validation with friendly errors at startup.
 - Docker image build + push pipeline.
 
@@ -51,7 +51,7 @@ Phased plan from skeleton to a deployable gateway. Each phase is mergeable indep
 - MongoDB adapter ✅ done (v0.2.0) — `DbAdapter` trait implemented; run_query wired; describe_schema (collections + indexes) and sample_table added in plan 101. Mongo stays read-only.
 - Redis adapter ✅ done — `kind: redis` for any RESP server (Redis, Dragonfly, Valkey, KeyDB; Redis and Dragonfly CI-tested). Read-only always: deny-by-default command allowlist, `SCAN` `COUNT` clamped, client-side timeout with the connection closed on a cut-off command. Client: `redis` 1.8.1 (`tokio-rustls-comp` only); TLS verifies chain and hostname. `run_query` only — `describe_schema`, `sample_table`, `explain`, `table_stats`, `db_activity`, `cancel_query` answer `unsupported_backend`. Key scoping is the ACL user's job ([06](06-permissions.md)).
 - YugabyteDB (YSQL) ✅ tested as a `kind: postgres` target — prod-proven on 2.25.2.0-b359, and since 2.0.1 the connection reset falls back to `RESET ALL` alone when the server has no advisory locks. A dedicated CI job (`yugabyte`, gating image publishing; locally `bin/test-yugabyte`) runs the Postgres query-path integration suite against it: 92 pass, 2 excluded because YugabyteDB ignores `NOTIFY` (yugabyte-db#1872; the guard's denial of `pg_notify` stays unit-tested), and one large-object sub-case is skipped. Cancellation needs `host` to name a single tserver, not a load balancer ([03](03-mcp-tools.md#cancel_query)).
-- MySQL adapter — **deferred post-1.0**. Config parses and validates, but dispatch returns `UnsupportedAdapter` at boot. See [note below](#mysql--mssql--deferred).
+- MySQL adapter — **deferred post-1.0**. Config parses and validates, but boot validation rejects the kind (`has_adapter`). See [note below](#mysql--mssql--deferred).
 - MSSQL adapter — **deferred post-1.0**. Same status as MySQL.
 - BigQuery adapter — not started.
 - Snowflake adapter — not started.
@@ -60,7 +60,7 @@ Each adapter implements the `DbAdapter` trait ([12](12-dynamic-permissions.md#db
 
 ### MySQL / MSSQL — deferred
 
-Config schema accepts `kind: mysql` and `kind: mssql`, but as of v1.0.0 the dispatcher rejects these at boot with a typed `UnsupportedAdapter` error rather than silently failing at query time. Full adapter implementation is planned but has no committed timeline. The driver crates (`sqlx` MySQL, `tiberius`) are not yet in `Cargo.toml`.
+The config parser knows `kind: mysql` and `kind: mssql`, but boot validation rejects both rather than letting them fail at query time. Full adapter implementation is planned but has no committed timeline. `sqlx`'s MySQL driver is in `Cargo.toml` only for the MySQL *permissions store*; there is no MySQL query path, and no MSSQL driver (`tiberius`).
 
 ## Phase 6 — Reason capture + policy hooks ✅ done (v0.2.0)
 
@@ -68,19 +68,19 @@ Config schema accepts `kind: mysql` and `kind: mssql`, but as of v1.0.0 the disp
 - Per-grant constraints: `row_limit`, `statement_timeout_ms` and `require_reason` are wired; `time_window` (business hours only) is still to come. `allowed_schemas` / `denied_tables` are dropped — table scoping is the target-DB role's job ([06](06-permissions.md)).
 - Dynamic permissions admin API — SSO-gated `/admin/*` endpoints for grant CRUD; all mutations audited synchronously to `permissions_audit`. See [12-dynamic-permissions](12-dynamic-permissions.md).
 
-## Phase 7 — HA + multi-replica
+## Phase 7 — HA + multi-replica (partial)
 
-- Two-replica deploys behind a load balancer.
-- Session storage already in state DB → mostly free.
-- Leader election for the retention pruner (don't run twice).
-- Documented runbook for rolling restarts.
+- Multi-replica deploys behind a load balancer ✅ for `/mcp`, the admin API and refresh: sessions, refresh tokens, audit and permissions are in the state DB; grant changes reach other replicas over `LISTEN`/`NOTIFY`.
+- OAuth bridge login state (pending `/authorize` flows, authorization codes) is still in process memory — login needs sticky routing or one replica ([09](09-deployment.md#replicas)). Not done.
+- Pruner and reaper run on every replica under a transaction-scoped advisory lock, so only one does the work ✅.
+- Documented runbook for rolling restarts: [operations](../deployment/operations.md#upgrade) ✅.
 
 ## Phase 8 — Operator ergonomics
 
 - `gateway admin …` subcommands (revoke session, list active sessions, replay audit query).
 - Helm chart with cert-manager integration.
-- Example `docker-compose` repo polished.
-- Provisioning SQL bundled and templated per engine.
+- Example `docker-compose` polished — lives in `examples/` in this repo, not a separate repo.
+- Provisioning SQL per engine — documented in [target roles](../deployment/target-roles.md) ✅; bundled templates not planned.
 
 ## Phase 9 — Write mode
 

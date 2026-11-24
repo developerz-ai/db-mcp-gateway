@@ -49,8 +49,9 @@ pub(super) async fn stream_rows(
     let mut decoders_for_rows = Vec::new();
 
     // Unnamed statement: ad-hoc SQL must not accumulate in the connection's
-    // prepared-statement cache.
-    let mut sqlx_query = sqlx::query(query.sql).persistent(false);
+    // prepared-statement cache. Running the caller's SQL is this path's job:
+    // the guard, the grant and the role's privileges bound it, not sqlx.
+    let mut sqlx_query = sqlx::query(sqlx::AssertSqlSafe(query.sql)).persistent(false);
     for bind in query.binds {
         sqlx_query = sqlx_query.bind(*bind);
     }

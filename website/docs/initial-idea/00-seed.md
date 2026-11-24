@@ -1,6 +1,6 @@
 # 00 — Seed
 
-The original framing of the project, captured verbatim before it gets refined into spec docs. Everything in `01-*` onwards is a derived view; this file is the source of truth for *intent*.
+The original framing of the project, kept as written for history. It records the *intent*; the numbered specs (`01-*` onwards) and the code are what the gateway does, and win wherever they disagree. Known divergences: images ship on GHCR (and DigitalOcean's registry), not Docker Hub; retention is the `AUDIT_RETENTION_DAYS` env var, not YAML; archive export and SQL-capture modes (full / redacted / metadata-only) are not shipped ([11-roadmap](11-roadmap.md) phase 4); there is no separate example repo; and per-database timeouts are set by the gateway per transaction, not only on the role.
 
 ## What it is
 

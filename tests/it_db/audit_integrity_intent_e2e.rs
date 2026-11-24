@@ -46,10 +46,12 @@ async fn write_intent_records_the_calls_sql_and_reason() {
         .await
         .expect("target-db reachable; run `bin/dev up`");
     let table = format!("intent_e2e_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE TABLE \"{table}\" (v text)"))
-        .execute(&target)
-        .await
-        .expect("scratch table");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE \"{table}\" (v text)"
+    )))
+    .execute(&target)
+    .await
+    .expect("scratch table");
 
     let sql = format!("INSERT INTO \"{table}\" (v) VALUES ('intent')");
     let reason = "OPS-11 intent attribution";
@@ -89,7 +91,7 @@ async fn write_intent_records_the_calls_sql_and_reason() {
         "intent and completion agree on reason"
     );
 
-    sqlx::query(&format!("DROP TABLE \"{table}\""))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE \"{table}\"")))
         .execute(&target)
         .await
         .expect("drop scratch table");

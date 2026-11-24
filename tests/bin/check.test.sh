@@ -14,6 +14,7 @@ fixture() {
   rm -rf "$work/repo" "$work/tools" "$work/calls.ready"
   mkdir -p "$work/repo"/{bin,tests/bin,website/node_modules/.bin,.github/workflows} "$work/tools"
   cp bin/{ci,check,lint,test,check-scrub-features} "$work/repo/bin/"
+  cp -r bin/lib "$work/repo/bin/"
   # Replace only the recursive test entry in the fixture, not the gate itself.
   printf 'echo orchestration >> "$CALLS"\n' > "$work/repo/tests/bin/check.test.sh"
   # The real token-regex regression, verbatim: the gate must run the same
@@ -102,7 +103,7 @@ STUB
   chmod +x "$work/tools/stub"
   # bin/check preflights the host toolchain before the gate runs, so rustc, cc
   # and make have to resolve on PATH exactly like cargo and docker do.
-  for tool in cargo cargo-audit docker node npm rustc cc make git; do
+  for tool in cargo cargo-audit docker node npm rustc cc make git python3; do
     ln -s stub "$work/tools/$tool"
   done
   : > "$work/calls"
@@ -179,13 +180,14 @@ run_gate 0
 for call in \
   'cargo fmt --all -- --check' \
   'cargo clippy --all-targets --all-features -- -D warnings' \
-  'cargo clippy --release --all-features -- -D warnings' \
+  'cargo clippy --profile ci --all-features -- -D warnings -C debug-assertions=off' \
   'cargo tree -e features -i regex-syntax -e no-dev' \
   'docker compose -f docker-compose.dev.yml up -d --wait' \
   'cargo test --all-targets --all-features' \
-  'cargo audit --ignore RUSTSEC-2023-0071' \
+  'cargo audit' \
   'git grep -nE dbmcp_svc_[0-9a-f]{64} -- :!tests/** :!website/** :!config/example.yaml :!.github/** :!src/config/yaml/**' \
-  'npm run typecheck' 'npm run build' 'orchestration'; do
+  'npm run typecheck' 'npm run build' 'orchestration' \
+  'python3 -I .github/scripts/public_tree.py'; do
   called "$call"
 done
 # The tracked-token scan's exact command line is pinned in the loop above
@@ -259,7 +261,7 @@ assert_output 'git grep tooling failure (rc=128) — secret-scan cannot read as 
 fixture
 run_gate 75 FAIL_AT='docker compose -f docker-compose.dev.yml up -d --wait'
 not_called 'cargo test --all-targets --all-features'
-not_called 'cargo audit --ignore RUSTSEC-2023-0071'
+not_called 'cargo audit'
 # The 75 names the unreachable resource instead of one generic message.
 assert_output 'Required prerequisite unavailable: dev stack'
 # The per-service diagnostics are part of the report: the unhealthy service is
@@ -298,10 +300,10 @@ done
 
 for stage in 'cargo fmt --all -- --check' \
   'cargo clippy --all-targets --all-features -- -D warnings' \
-  'cargo clippy --release --all-features -- -D warnings' \
+  'cargo clippy --profile ci --all-features -- -D warnings -C debug-assertions=off' \
   'cargo tree -e features -i regex-syntax -e no-dev' \
   'cargo test --all-targets --all-features' \
-  'cargo audit --ignore RUSTSEC-2023-0071' 'npm run typecheck' 'npm run build'; do
+  'cargo audit' 'npm run typecheck' 'npm run build'; do
   fixture
   run_gate 42 FAIL_AT="$stage"
   if [[ $stage != 'npm run build' ]]; then not_called 'npm run build'; fi
@@ -323,7 +325,7 @@ for missing in cargo rustc cc make docker grep; do
   fixture
   rm "$work/tools/$missing"
   run_gate 75
-  not_called 'cargo audit --ignore RUSTSEC-2023-0071'
+  not_called 'cargo audit'
 done
 for prerequisite in 'cargo fmt --version' 'cargo clippy --version' \
   'docker compose version' 'docker info'; do
@@ -335,7 +337,7 @@ done
 fixture
 rm "$work/tools/cargo-audit"
 run_gate 0
-not_called 'cargo audit --ignore RUSTSEC-2023-0071'
+not_called 'cargo audit'
 assert_output 'NOT RUN: cargo audit - cargo-audit is not on PATH (install: cargo install cargo-audit)'
 assert_output 'Jobs not run'
 assert_summary 'NOT RUN: cargo audit - cargo-audit is not on PATH (install: cargo install cargo-audit)'
@@ -346,6 +348,14 @@ called 'npm run typecheck'
 # The token-regex regression ran too; bash itself is not stubbed, so its
 # output is the proof it executed.
 assert_output 'passed, 0 failed'
+
+fixture
+rm "$work/tools/python3"
+run_gate 0
+not_called 'python3 -I .github/scripts/public_tree.py'
+assert_output 'NOT RUN: public-tree guard - python3 is not on PATH'
+assert_summary 'NOT RUN: public-tree guard - python3 is not on PATH'
+called 'cargo test --all-targets --all-features'
 
 fixture
 rm "$work/tools/node"
@@ -363,7 +373,7 @@ not_called 'npm run typecheck'
 not_called 'npm run build'
 assert_output 'NOT RUN: pages typecheck/build/artifact guard - npm is not on PATH'
 assert_summary 'NOT RUN: pages typecheck/build/artifact guard - npm is not on PATH'
-called 'cargo audit --ignore RUSTSEC-2023-0071'
+called 'cargo audit'
 
 for dependency in tsc docusaurus; do
   fixture
@@ -400,7 +410,7 @@ fixture
 printf 'exit 44\n' > "$work/repo/tests/bin/check.test.sh"
 run_gate 44
 # Stopping at the FIRST job names every job the gate never reached.
-for job in 'fmt + clippy' 'test' 'cargo audit' 'secret-scan' 'doc-anchor guard' 'pages artifact-handoff regression' 'pages typecheck/build/artifact guard'; do
+for job in 'public-tree guard' 'fmt + clippy' 'test' 'cargo audit' 'secret-scan' 'doc-anchor guard' 'pages artifact-handoff regression' 'pages typecheck/build/artifact guard'; do
   assert_not_run "NOT RUN: $job - the gate stopped before this job"
 done
 # A VALID fragment resolves and the gate passes. The double-hyphen target is

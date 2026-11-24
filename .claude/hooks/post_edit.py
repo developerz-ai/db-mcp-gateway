@@ -111,13 +111,13 @@ def version_note(path):
     if path == "Cargo.toml":
         return (
             "If this moves `version`: that is the release PR, alone, titled `chore(release): <next>` with "
-            "Cargo.lock and README.md; the v* tag goes on the merge commit after it lands (.dz/briefs/release-due.md)."
+            "Cargo.lock and README.md; the v* tag goes on the merge commit after it lands (.dz/schedules/release-due.md)."
         )
     return None
 
 
 def brief_note(path):
-    if path == ".dz/briefs/health.md":
+    if path == ".dz/schedules/health.md":
         return "tests/brief_rows.rs pins this brief's signal table against its ## Rows list: `cargo test --test brief_rows`."
     return None
 

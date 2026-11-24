@@ -5,7 +5,8 @@
       "clippy",
       "audit",
       "fmt",
-      "test"
+      "test",
+      "yugabyte"
     ]
   },
   "merge": {

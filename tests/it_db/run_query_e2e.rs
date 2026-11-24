@@ -318,9 +318,9 @@ async fn run_query_write_grant_commits_data_but_not_schema() {
         .await
         .expect("target-db reachable; run `bin/dev up`");
     let table = format!("write_e2e_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE \"{table}\" (id bigint PRIMARY KEY, note text)"
-    ))
+    )))
     .execute(&target)
     .await
     .expect("create scratch table");
@@ -441,10 +441,12 @@ async fn run_query_write_grant_commits_data_but_not_schema() {
     }
 
     // Cleanup.
-    sqlx::query(&format!("DROP TABLE IF EXISTS \"{table}\""))
-        .execute(&target)
-        .await
-        .expect("drop scratch table");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TABLE IF EXISTS \"{table}\""
+    )))
+    .execute(&target)
+    .await
+    .expect("drop scratch table");
 }
 
 /// A read-only (`query_read`) caller must NOT be able to write, even though the

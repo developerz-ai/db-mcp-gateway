@@ -119,7 +119,7 @@ pub async fn insert_client_capped(
     let mut tx = pool.begin().await?;
     lock_client_registry(&mut *tx).await?;
     let now = registry_clock(&mut *tx).await?;
-    let result = sqlx::query(&sql)
+    let result = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(client_id)
         .bind(Json(redirect_uris))
         .bind(cap)

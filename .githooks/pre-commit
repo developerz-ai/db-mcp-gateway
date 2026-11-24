@@ -1,7 +1,30 @@
 #!/usr/bin/env bash
-# pre-commit gate — owned by this repository's maintainers. Runs the SAME
-# `bin/check` CI runs, so a commit that would fail CI fails here first.
-# ACTIVATE IT (once, per clone): git config core.hooksPath .githooks
+# pre-commit — the fast gate (a few seconds): formatting, and no service-token
+# value in the staged change. pre-push adds clippy + unit tests. The full gate
+# is `bin/check` (= bin/ci), run on demand; CI runs the same jobs, not this hook.
+# ACTIVATE IT (once, per clone): bin/setup --hooks
+#                            or: git config core.hooksPath .githooks
 set -euo pipefail
 cd "$(dirname "$0")/.."
-exec bin/check
+
+echo '→ cargo fmt --check'
+cargo fmt --all -- --check
+
+# Same regex and exempt paths as CI's secret-scan job, over the staged diff only.
+token_re='dbmcp_svc_[0-9a-f]{64}'
+exempt=(':!tests/**' ':!website/**' ':!config/example.yaml' ':!.github/**' ':!src/config/yaml/**')
+if git diff --cached -U0 --no-color -- . "${exempt[@]}" | grep -qE "^\+.*${token_re}"; then
+  # File names only: never echo the token itself.
+  echo 'pre-commit: the staged change adds a service-token value (dbmcp_svc_…) in:' >&2
+  git diff --cached --name-only -G "$token_re" -- . "${exempt[@]}" >&2
+  echo "Reference it as \${ENV:…} or \${FILE:…} instead (spec 14)." >&2
+  exit 1
+fi
+
+if command -v shellcheck >/dev/null 2>&1; then
+  mapfile -t scripts < <(git diff --cached --name-only --diff-filter=ACMR -- 'bin/*' '.githooks/*' 'tests/bin/*.sh')
+  if (( ${#scripts[@]} )); then
+    echo '→ shellcheck (staged scripts)'
+    shellcheck -x "${scripts[@]}"
+  fi
+fi
