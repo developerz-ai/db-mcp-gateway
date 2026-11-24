@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use db_mcp_gateway::auth::oauth::ClientRegistry;
 use db_mcp_gateway::state::oauth as db;
 use sqlx::{PgPool, Postgres, Transaction};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::common::env::state_pool;
@@ -70,6 +71,17 @@ impl OpenWrite {
         pool: &PgPool,
         call: impl Future<Output = T> + Send + 'static,
     ) -> T {
+        let call = self.start_waiting(pool, call).await;
+        self.tx.commit().await.expect("commit the open write");
+        call.await.expect("join")
+    }
+
+    /// Start `call` and return once it is blocked behind this transaction.
+    async fn start_waiting<T: Send + 'static>(
+        &self,
+        pool: &PgPool,
+        call: impl Future<Output = T> + Send + 'static,
+    ) -> JoinHandle<T> {
         let call = tokio::spawn(call);
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -90,8 +102,7 @@ impl OpenWrite {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        self.tx.commit().await.expect("commit the open write");
-        call.await.expect("join")
+        call
     }
 }
 
@@ -341,5 +352,44 @@ async fn promotion_waits_for_the_registry_lock() {
     let promoted = held.commit_once_waited_on(&pool, promote).await;
 
     assert_eq!(promoted, Ok(true));
+    delete_prefixed(&pool, &client_id).await;
+}
+
+/// A promotion that waited on the registry lock while its client lapsed
+/// judges expiry when it gets the lock, not when its transaction began: the
+/// lapsed row is not renewed.
+#[tokio::test]
+#[serial_test::serial(world)]
+async fn a_client_that_lapsed_while_promotion_waited_is_not_renewed() {
+    let pool = state_pool().await;
+    let registry = ClientRegistry::with_db(pool.clone());
+    let client_id = format!("promotelapse-{}", Uuid::new_v4().simple());
+    registry
+        .insert(client_id.clone(), vec![SEEDED_URI.to_string()])
+        .await
+        .expect("register");
+
+    let mut held = OpenWrite::begin(&pool).await;
+    db::lock_client_registry(&mut *held.tx)
+        .await
+        .expect("registry lock");
+    let promote = {
+        let (registry, client_id) = (registry.clone(), client_id.clone());
+        async move { registry.promote(&client_id).await }
+    };
+    // The promotion's transaction began while the client was live.
+    let promote = held.start_waiting(&pool, promote).await;
+    sqlx::query("UPDATE oauth_clients SET expires_at = clock_timestamp() WHERE client_id = $1")
+        .bind(&client_id)
+        .execute(&mut *held.tx)
+        .await
+        .expect("lapse the client");
+    held.tx.commit().await.expect("release the registry lock");
+
+    assert_eq!(
+        promote.await.expect("join"),
+        Ok(false),
+        "a client that lapsed while promotion waited was renewed"
+    );
     delete_prefixed(&pool, &client_id).await;
 }

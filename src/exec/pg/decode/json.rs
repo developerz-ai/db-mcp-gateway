@@ -141,14 +141,19 @@ impl<'de> Visitor<'de> for Budgeted<'_, '_> {
         self.node(0)?;
         let mut map = Map::new();
         while let Some(key) = entries.next_key::<String>()? {
-            let entry = size_of::<String>().saturating_add(key.len());
-            self.claim(entry)?;
-            let value = entries.next_value_seed(Budgeted(&mut *self.0))?;
-            // `json` keeps duplicate keys and the map only the last value:
-            // what the replaced entry claimed is no longer held.
-            if let Some(replaced) = map.insert(key, value) {
-                self.0.refund(entry.saturating_add(claimed_by(&replaced)));
+            // `json` keeps duplicate keys and the map only the last value, in
+            // the first one's position (`Map::insert`, as `serde_json` does).
+            // The replaced value is released before its replacement is read,
+            // so the two are never charged at once.
+            if let Some(slot) = map.get_mut(&key) {
+                let replaced = std::mem::take(slot);
+                self.0.refund(claimed_by(&replaced));
+                *slot = entries.next_value_seed(Budgeted(&mut *self.0))?;
+                continue;
             }
+            self.claim(size_of::<String>().saturating_add(key.len()))?;
+            let value = entries.next_value_seed(Budgeted(&mut *self.0))?;
+            map.insert(key, value);
         }
         Ok(Value::Object(map))
     }
@@ -227,6 +232,41 @@ mod tests {
         let nodes = 4 * size_of::<Value>();
         let key = size_of::<String>() + 1;
         assert_eq!(weight.used, nodes + key + "last".len());
+    }
+
+    /// Parses `text` with the budget and asserts the same tree, in the same
+    /// key order, as `serde_json`'s own parse; returns the bytes charged.
+    fn parses_like_serde_json(text: &str) -> usize {
+        let budget = ResultBudget::new(10);
+        let mut weight = RowWeight::new(&budget);
+        let JsonCell::Value(parsed) = parse(text.as_bytes(), &mut weight) else {
+            panic!("the final object fits");
+        };
+        let want: Value = serde_json::from_str(text).expect("valid JSON");
+        assert_eq!(parsed.to_string(), want.to_string());
+        weight.used
+    }
+
+    /// The replaced value is refunded before its replacement is charged: a
+    /// first value that nearly fills the budget does not truncate a row
+    /// whose final value is small.
+    #[test]
+    fn a_large_value_replaced_by_a_small_one_fits() {
+        let big = "x".repeat(MAX_RESULT_BYTES - 1024);
+        let text = format!(r#"{{"a":1,"k":"{big}","b":2,"k":"{}"}}"#, "y".repeat(2048));
+        let nodes = 4 * size_of::<Value>();
+        let keys = 3 * (size_of::<String>() + 1);
+        assert_eq!(parses_like_serde_json(&text), nodes + keys + 2048);
+    }
+
+    /// Two values for one key, each fitting alone but not together.
+    #[test]
+    fn two_values_for_one_key_that_each_fit_alone_fit() {
+        let value = "v".repeat(MAX_RESULT_BYTES * 3 / 5);
+        let text = format!(r#"{{"k":"{value}","z":0,"k":"{value}"}}"#);
+        let nodes = 3 * size_of::<Value>();
+        let keys = 2 * (size_of::<String>() + 1);
+        assert_eq!(parses_like_serde_json(&text), nodes + keys + value.len());
     }
 
     #[test]

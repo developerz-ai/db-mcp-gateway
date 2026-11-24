@@ -4,10 +4,10 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use sqlx::PgConnection;
+use sqlx::{PgConnection, Postgres, Transaction};
 use uuid::Uuid;
 
-use super::GrantIdentity;
+use super::{GrantIdentity, RefreshTokens, hash_secret};
 use crate::auth::{AuthError, SessionId, SessionStore};
 use crate::state::oauth::{self as db, NewRefreshToken};
 
@@ -110,4 +110,30 @@ pub(super) async fn revoke_paired(
         revoked.push(id);
     }
     Ok(revoked)
+}
+
+impl RefreshTokens {
+    /// The DB half of [`RefreshTokens::revoke`], run in `tx`, which the
+    /// caller began. Public so a test can commit a rotation between that
+    /// BEGIN and the lookup — the order where an age test against the
+    /// transaction's start would miss the rotation's tombstone.
+    pub async fn revoke_in(
+        sessions: &SessionStore,
+        mut tx: Transaction<'_, Postgres>,
+        presented: &str,
+    ) -> Result<bool, AuthError> {
+        let presented_hash = hash_secret(presented);
+        let chain = match db::live_chain(&mut *tx, &presented_hash).await? {
+            Some(chain) => Some(chain),
+            // No grace: unlike a replay at `/token`, this asks for the end.
+            None => db::rotated_chain(&mut *tx, &presented_hash, None).await?,
+        };
+        let Some((sub, chain_id)) = chain else {
+            return Ok(false);
+        };
+        let revoked = end_chain(&mut tx, &sub, chain_id).await?;
+        tx.commit().await?;
+        sessions.committed(None, &revoked).await;
+        Ok(true)
+    }
 }

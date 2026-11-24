@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use super::refresh_chain::chain_expired;
-use super::refresh_db::{NewDbToken, end_chain, revoke_paired, revoke_reused_chain, store_db};
+use super::refresh_db::{NewDbToken, revoke_paired, revoke_reused_chain, store_db};
 use super::refresh_tokens::RefreshBackend;
 use super::{GrantIdentity, RefreshToken, RefreshTokens, hash_secret};
 use crate::auth::session::is_service_subject;
@@ -170,20 +170,7 @@ impl RefreshTokens {
             }
             return Ok(true);
         };
-        let mut tx = pool.begin().await?;
-        let presented_hash = hash_secret(presented);
-        let chain = match db::live_chain(&mut *tx, &presented_hash).await? {
-            Some(chain) => Some(chain),
-            // No grace: unlike a replay at `/token`, this asks for the end.
-            None => db::rotated_chain(&mut *tx, &presented_hash, None).await?,
-        };
-        let Some((sub, chain_id)) = chain else {
-            return Ok(false);
-        };
-        let revoked = end_chain(&mut tx, &sub, chain_id).await?;
-        tx.commit().await?;
-        sessions.committed(None, &revoked).await;
-        Ok(true)
+        Self::revoke_in(sessions, pool.begin().await?, presented).await
     }
 
     /// Logout: revoke every session of `sub` and drop every refresh chain, in

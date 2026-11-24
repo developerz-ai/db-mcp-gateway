@@ -252,14 +252,16 @@ async fn revoking_a_just_rotated_token_ends_its_chain() {
     chain.assert_nothing_live_and_cleanup("revoke").await;
 }
 
-/// A revoke whose transaction began before the rotation did: the tombstone
-/// is younger than that transaction's `now()`, and must still be found.
+/// A revoke whose transaction began before the rotation committed: the
+/// tombstone is younger than that transaction's `now()`, and the production
+/// revoke must still find it and end both bearers.
 #[tokio::test]
 #[serial_test::parallel(world)]
-async fn a_revoke_begun_before_the_rotation_still_finds_the_tombstone() {
+async fn a_revoke_begun_before_the_rotation_still_ends_the_chain() {
     let chain = Chain::mint("revoke-early", false).await;
+    let sessions = session_store(&chain.pool);
     let mut revoke = chain.pool.begin().await.expect("begin");
-    sqlx::query("SELECT now()")
+    sqlx::query("SELECT 1")
         .execute(&mut *revoke)
         .await
         .expect("open the transaction");
@@ -267,27 +269,18 @@ async fn a_revoke_begun_before_the_rotation_still_finds_the_tombstone() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     chain
         .store
-        .rotate(
-            &session_store(&chain.pool),
-            &chain.first,
-            token(),
-            SESSION_TTL,
-        )
+        .rotate(&sessions, &chain.first, token(), SESSION_TTL)
         .await
         .expect("rotate")
         .expect("first token is live");
 
-    let hash: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(chain.first.as_bytes()).into();
-    let found = db::rotated_chain(&mut *revoke, &hash, None)
-        .await
-        .expect("tombstone lookup");
-    revoke.rollback().await.expect("rollback");
-    assert_eq!(
-        found.map(|(sub, _)| sub),
-        Some(chain.sub.clone()),
+    assert!(
+        RefreshTokens::revoke_in(&sessions, revoke, &chain.first)
+            .await
+            .expect("revoke"),
         "a rotation committed after the revoke began was missed"
     );
-    cleanup_sub(&chain.pool, &chain.sub, &chain.chains).await;
+    chain.assert_nothing_live_and_cleanup("early revoke").await;
 }
 
 /// The same race lost the other way: the rotation committed first, so the
