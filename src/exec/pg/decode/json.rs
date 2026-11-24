@@ -148,6 +148,7 @@ impl<'de> Visitor<'de> for Budgeted<'_, '_> {
             if let Some(slot) = map.get_mut(&key) {
                 let replaced = std::mem::take(slot);
                 self.0.refund(claimed_by(&replaced));
+                drop(replaced);
                 *slot = entries.next_value_seed(Budgeted(&mut *self.0))?;
                 continue;
             }
