@@ -59,6 +59,7 @@ binary(it_global) | (binary(it_db) & (
   | test(=oauth_lifecycle_real_db::reusing_a_rotated_refresh_token_revokes_the_chain)
   | test(=oauth_login_caps_real_db::racing_code_inserts_fill_the_last_slot_once)
   | test(=oauth_login_caps_real_db::racing_consents_stay_within_the_global_cap)
+  | test(=oauth_login_caps_real_db::racing_login_flows_stay_within_the_global_cap)
   | test(=oauth_login_state_real_db::gc_sweeps_only_lapsed_login_state)
   | test(=permissions_pruner_real_db::pruner_hard_deletes_expired_soft_deleted_permissions_rows)
   | test(=pg_error_hints_real_db::near_misses_are_only_names_the_read_role_can_see)

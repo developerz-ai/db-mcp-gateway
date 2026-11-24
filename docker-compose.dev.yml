@@ -132,6 +132,12 @@ services:
   target-yugabyte:
     image: yugabytedb/yugabyte:2.25.2.0-b359@sha256:f1b868431c9f71013f451df8cc63c59886568bb1254e4cb6f98de14d0232a3ad
     profiles: ["yugabyte"]
+    # Docker's default 10 s grace SIGKILLs tablets mid-flush; the WAL then
+    # comes back without its footer and writes time out until the volume is
+    # recreated. `stop`/`down` without `-t` use this value. It buys a clean
+    # stop only if the command traps SIGTERM and passes it to yugabyted: bash
+    # as PID 1 ignores an untrapped one, and docker SIGKILLs after the grace.
+    stop_grace_period: 120s
     environment:
       YB_APP_USER: ${TARGET_DB_USER:-app}
       YB_APP_PASSWORD: ${TARGET_DB_PASSWORD:-app-dev-only}
@@ -146,6 +152,9 @@ services:
           --advertise_address="$$addr" \
           --tserver_flags="ysql_enable_auth=true" &
         yb=$$!
+        # bash as PID 1 ignores SIGTERM: forward it so YugabyteDB flushes and
+        # exits inside stop_grace_period instead of being SIGKILLed mid-write.
+        trap 'kill -TERM "$$yb"; wait "$$yb"; exit 0' TERM
         export PGPASSWORD=yugabyte
         until bin/ysqlsh -h "$$addr" -U yugabyte -d yugabyte -tAc 'SELECT 1' >/dev/null 2>&1; do
           kill -0 "$$yb" 2>/dev/null || exit 1

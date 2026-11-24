@@ -59,6 +59,13 @@ impl Fixture {
                  id_twice bigint GENERATED ALWAYS AS (id * 2) STORED)"
             ),
             format!("CREATE TABLE {s}.vault (id bigint, salary_band text)"),
+            format!("CREATE SCHEMA {s}_sealed"),
+            format!("CREATE TABLE {s}_sealed.keys (id bigint PRIMARY KEY)"),
+            format!(
+                "CREATE TABLE {s}.refs (id bigint, key_id bigint REFERENCES {s}_sealed.keys (id))"
+            ),
+            format!("GRANT SELECT (id) ON {s}_sealed.keys TO {r}"),
+            format!("GRANT SELECT (id, key_id) ON {s}.refs TO {r}"),
             format!("GRANT USAGE ON SCHEMA {s} TO {r}"),
             format!("GRANT SELECT (id, code_len, id_twice) ON {s}.ledger TO {r}"),
             format!("GRANT SELECT (id) ON {s}.vault TO {r}"),
@@ -78,8 +85,11 @@ impl Fixture {
     }
 
     async fn drop(self) {
-        self.exec(&format!("DROP SCHEMA {} CASCADE", self.schema))
-            .await;
+        self.exec(&format!(
+            "DROP SCHEMA {s}, {s}_sealed CASCADE",
+            s = self.schema
+        ))
+        .await;
         self.exec(&format!("DROP OWNED BY {}", self.role)).await;
         self.exec(&format!("DROP ROLE {}", self.role)).await;
     }
@@ -216,6 +226,24 @@ async fn keys_and_indexes_on_hidden_columns_are_left_out() {
     // `orders_pkey` and the INCLUDE index touch `hidden`.
     assert_eq!(names(&orders["indexes"]), ["orders_account_idx"]);
     assert!(!orders.to_string().contains("hidden"), "{orders}");
+}
+
+/// A foreign key into a schema the role holds no USAGE on is left out, even
+/// with column privileges on both sides: listing it would name that schema
+/// and table.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_foreign_key_into_a_schema_without_usage_is_left_out() {
+    let fixture = Fixture::create().await;
+    let (payload, outcome, _) = describe_full(&fixture).await;
+    let sealed = format!("{}_sealed", fixture.schema);
+    fixture.drop().await;
+
+    assert_eq!(outcome, "success", "{payload}");
+    let refs = table(&payload, "refs");
+    assert_eq!(names(&refs["columns"]), ["id", "key_id"]);
+    assert_eq!(refs["foreign_keys"], json!([]), "{refs}");
+    assert!(!payload.to_string().contains(&sealed), "{payload}");
 }
 
 /// A search term matches only names the role can see: `vault` holds a

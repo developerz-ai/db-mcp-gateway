@@ -7,16 +7,20 @@ use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
 
 /// Insert a pending login, first evicting the soonest-expiring flows so the
 /// table stays under `cap`: `/authorize` is unauthenticated, so refusing at
-/// the cap would let a flood block every real login. The count and the
-/// insert share one snapshot, so concurrent inserts may overshoot `cap` by
-/// their number — it is a resource ceiling, not an invariant.
+/// the cap would let a flood block every real login. An advisory lock held to
+/// commit serialises flow inserts across replicas: without it racing inserts
+/// each count the same snapshot and the table overshoots `cap` by their number.
 pub async fn insert_flow(
-    conn: impl PgExecutor<'_>,
+    pool: &PgPool,
     state_hash: &[u8],
     bridge: Option<&serde_json::Value>,
     ttl: chrono::Duration,
     cap: i64,
 ) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('oauth_pending_flows', 0))")
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
         "WITH evicted AS ( \
            DELETE FROM oauth_pending_flows WHERE state_hash IN ( \
@@ -31,9 +35,9 @@ pub async fn insert_flow(
     .bind(bridge.map(Json))
     .bind(ttl)
     .bind(cap)
-    .execute(conn)
+    .execute(&mut *tx)
     .await?;
-    Ok(())
+    tx.commit().await
 }
 
 /// Delete-and-return a live flow's bridge context in one statement, so only

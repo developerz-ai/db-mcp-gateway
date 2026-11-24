@@ -6,14 +6,18 @@
 //! Audit assertion intentionally skipped: these drive the adapter directly,
 //! never the tool-dispatch path that writes audit rows.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mongodb::bson::{Document, doc};
 use serde_json::json;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
 
 use crate::common::mongo_target::{
-    TARGET_DB, adapter, database, drop_collection, server, side_client, unique_collection,
+    TARGET_DB, TARGET_HOST, TARGET_PORT, adapter, database, drop_collection, server, side_client,
+    unique_collection,
 };
 use db_mcp_gateway::audit::drain::DetachedTasks;
 use db_mcp_gateway::config::Password;
@@ -158,70 +162,93 @@ async fn unauthorized_is_a_permission_refusal_not_a_syntax_error() {
     assert_eq!(rejection.to_string(), "13 not authorized");
 }
 
-/// Wait until the server runs an `aggregate` on `coll` — the slow read has
-/// the pool's only connection.
-async fn await_running_aggregate(coll: &str) {
-    let admin = side_client().database("admin");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let ops = admin
-            .run_command(doc! { "currentOp": 1, "command.aggregate": coll })
-            .await
-            .expect("currentOp");
-        let running = ops.get_array("inprog").is_ok_and(|ops| !ops.is_empty());
-        if running {
-            return;
+/// A TCP forwarder to the target that swallows the first client write
+/// carrying `marker` and then holds that connection silent: the command
+/// holding it never gets a reply, however fast the server would have been.
+/// Resolves `swallowed` once that write has arrived.
+async fn stalling_proxy(marker: String) -> (u16, tokio::sync::oneshot::Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+    let port = listener.local_addr().expect("proxy addr").port();
+    let (swallowed_tx, swallowed) = tokio::sync::oneshot::channel();
+    let swallowed_tx = Arc::new(std::sync::Mutex::new(Some(swallowed_tx)));
+    let marker = Arc::new(marker.into_bytes());
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            tokio::spawn(forward(client, marker.clone(), swallowed_tx.clone()));
         }
-        assert!(
-            Instant::now() < deadline,
-            "the slow aggregate never started"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    });
+    (port, swallowed)
+}
+
+type Signal = Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>;
+
+async fn forward(mut client: TcpStream, marker: Arc<Vec<u8>>, swallowed: Signal) {
+    let Ok(mut server) = TcpStream::connect((TARGET_HOST, TARGET_PORT)).await else {
+        return;
+    };
+    let (mut up, mut down) = ([0u8; 16 * 1024], [0u8; 16 * 1024]);
+    loop {
+        tokio::select! {
+            read = client.read(&mut up) => {
+                let Ok(n @ 1..) = read else { return };
+                if up[..n].windows(marker.len()).any(|w| w == marker.as_slice()) {
+                    if let Some(tx) = swallowed.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    // Keep both sockets open and silent until the test ends.
+                    return std::future::pending().await;
+                }
+                if server.write_all(&up[..n]).await.is_err() {
+                    return;
+                }
+            }
+            read = server.read(&mut down) => {
+                let Ok(n @ 1..) = read else { return };
+                if client.write_all(&down[..n]).await.is_err() {
+                    return;
+                }
+            }
+        }
     }
 }
 
-/// Every connection of the pool is busy with a slow read: the next caller
-/// waits outside its statement budget and gets `unavailable` after the 5 s
-/// acquire wait — not a `timeout` for a command that never started.
+/// The pool's only connection is held by a command whose reply never comes
+/// (a proxy swallows it): the next caller waits outside its statement budget
+/// and gets `unavailable` after the 5 s acquire wait — not a `timeout` for a
+/// command that never started. The held command ends as `timeout`.
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn a_saturated_pool_is_unavailable_not_timeout() {
-    let coll = unique_collection("mongosat");
-    // 40 000² comparisons outlast the 10 s budget on any host, so the slow
-    // read is still holding the connection through the waiter's 5 s acquire.
-    let docs: Vec<Document> = (0..40_000_i64).map(|i| doc! { "i": i }).collect();
-    insert(&coll, docs).await;
+    let stalled = unique_collection("mongosat");
+    let (port, swallowed) = stalling_proxy(stalled.clone()).await;
     let sizing = PoolSizing {
         max_connections: 1,
         ..PoolSizing::default()
     };
-    let a = MongoAdapter::open(
-        &server("mongo-sat"),
-        &database(),
-        sizing,
-        DetachedTasks::new(),
-    )
-    .await
-    .expect("client builds");
-    // Unindexed self-join: O(n²), and the `$match` keeps any row from
-    // coming back early, so it runs until its 10 s budget stops it.
-    let slow = format!(
-        r#"{{"aggregate":"{coll}","pipeline":[{{"$lookup":{{"from":"{coll}","localField":"i","foreignField":"unmatched","as":"m"}}}},{{"$match":{{"m.0":{{"$exists":true}}}}}}],"cursor":{{"batchSize":0}}}}"#
+    let mut via_proxy = server("mongo-sat");
+    via_proxy.host = "127.0.0.1".to_string();
+    via_proxy.port = port;
+    let a = MongoAdapter::open(&via_proxy, &database(), sizing, DetachedTasks::new())
+        .await
+        .expect("client builds");
+    let held = format!(r#"{{"count":"{stalled}","query":{{}}}}"#);
+    let count = format!(
+        r#"{{"count":"{}","query":{{}}}}"#,
+        unique_collection("mongosatwait")
     );
-    let count = format!(r#"{{"count":"{coll}","query":{{}}}}"#);
 
-    let slow_call = run(&a, &slow, Some(10_000));
+    let held_call = run(&a, &held, Some(10_000));
     let waiting_call = async {
-        await_running_aggregate(&coll).await;
+        // The command is written only once its call holds the connection.
+        swallowed.await.expect("the held command reaches the proxy");
         let started = Instant::now();
         (run(&a, &count, Some(1_000)).await, started.elapsed())
     };
-    let (slow_result, (waited, elapsed)) = tokio::join!(slow_call, waiting_call);
-    drop_collection(&side_client(), &coll).await;
+    let (held_result, (waited, elapsed)) = tokio::join!(held_call, waiting_call);
 
     assert!(
-        matches!(slow_result, Err(ExecError::Timeout)),
-        "{slow_result:?}"
+        matches!(held_result, Err(ExecError::Timeout)),
+        "{held_result:?}"
     );
     assert!(matches!(waited, Err(ExecError::Unavailable)), "{waited:?}");
     assert!(

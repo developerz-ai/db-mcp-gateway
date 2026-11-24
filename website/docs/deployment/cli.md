@@ -80,7 +80,7 @@ db-mcp-gateway login --url https://gateway.example.com
 
 Runs the gateway's own OAuth 2.1 flow as a native app (RFC 8252): registers a client with a loopback redirect (`POST /register`), prints the `/authorize` URL (PKCE S256) to open in a browser, catches the authorization code on `127.0.0.1`, and redeems it at `/token`. The session token lands in `$XDG_CONFIG_HOME/db-mcp-gateway/session.json` (else `~/.config/…`; `--token-file` to choose), written to a fresh `0600` file and renamed into place (a process holding the old file open never sees the new token). A session file other users can read is refused. The session lasts `SESSION_TTL_HOURS`; log in again when a command answers `401`.
 
-Every admin command takes `--token-file` and `--url`. The session belongs to the gateway `login` stored, so `--url` may only restate it: a different URL is refused rather than sent the token — log in to the other gateway with its own `--token-file`.
+Every admin command takes `--token-file` and `--url`. The session belongs to the gateway `login` stored, so `--url` may only restate it: a different URL is refused rather than sent the token — log in to the other gateway with its own `--token-file`. The URL must be `https://`, or `http://` to a loopback host (`127.0.0.1`, `[::1]`, `localhost`); any other `http://` URL is refused before a request is sent, so a bearer never crosses the network in clear text.
 
 ### `grants list` / `grants apply`
 

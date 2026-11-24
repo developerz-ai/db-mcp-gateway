@@ -10,16 +10,33 @@
 # in website/docs/deployment/cli.md). The same command ships in the image:
 #   docker run --rm ghcr.io/developerz-ai/db-mcp-gateway mint-service-token <name>
 #
-# Binary: $DB_MCP_GATEWAY_BIN, else `db-mcp-gateway` on PATH, else this
-# checkout built with cargo.
+# Binary, first found: $DB_MCP_GATEWAY_BIN; this checkout via `cargo run`
+# (built from the source you are on); this checkout's newest
+# target/{release,debug} build when cargo is absent; last, `db-mcp-gateway` on
+# PATH, with a notice — an installed binary may be another version entirely.
 set -euo pipefail
 
 if [[ -n "${DB_MCP_GATEWAY_BIN:-}" ]]; then
   exec "$DB_MCP_GATEWAY_BIN" mint-service-token "$@"
 fi
-if command -v db-mcp-gateway >/dev/null 2>&1; then
-  exec db-mcp-gateway mint-service-token "$@"
-fi
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec cargo run --quiet --manifest-path "$root/Cargo.toml" --bin db-mcp-gateway -- \
-  mint-service-token "$@"
+if command -v cargo >/dev/null 2>&1; then
+  exec cargo run --quiet --manifest-path "$root/Cargo.toml" --bin db-mcp-gateway -- \
+    mint-service-token "$@"
+fi
+target="${CARGO_TARGET_DIR:-$root/target}"
+built=""
+for candidate in "$target/release/db-mcp-gateway" "$target/debug/db-mcp-gateway"; do
+  if [[ -x $candidate && ( -z $built || $candidate -nt $built ) ]]; then
+    built=$candidate
+  fi
+done
+if [[ -n $built ]]; then
+  exec "$built" mint-service-token "$@"
+fi
+if installed=$(command -v db-mcp-gateway); then
+  echo "bin/mint-service-token: no cargo and no build in $target; using $installed from PATH" >&2
+  exec "$installed" mint-service-token "$@"
+fi
+echo "bin/mint-service-token: no cargo, no build in $target and no db-mcp-gateway on PATH (set DB_MCP_GATEWAY_BIN)" >&2
+exit 2

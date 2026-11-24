@@ -38,6 +38,11 @@ pub async fn privileges(
     sqlx::query("SET TRANSACTION READ ONLY")
         .execute(&mut *tx)
         .await?;
+    // Below `doctor`'s client-side probe timeout, so a stuck catalog read
+    // ends on the server too rather than holding a backend.
+    sqlx::query("SET LOCAL statement_timeout = '20s'")
+        .execute(&mut *tx)
+        .await?;
     let role = sqlx::query(
         "SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb \
          FROM pg_roles WHERE rolname = current_user",

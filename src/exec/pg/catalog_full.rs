@@ -8,9 +8,10 @@
 //! read, so each is listed only when the role sees every column it touches:
 //! a primary key or index with a hidden column is left out whole (never
 //! listed with the column dropped, which would misstate it), as is a foreign
-//! key with a hidden column on either side. A column's `default` — for a
-//! generated column, its generation expression — is left out when it reads
-//! a hidden column.
+//! key with a hidden column on either side or into a schema the role holds
+//! no USAGE on (listing it would name that schema and table). A column's
+//! `default` — for a generated column, its generation expression — is left
+//! out when it reads a hidden column.
 
 /// `[schema, table, kind, comment, row_estimate, columns, primary_key,
 /// foreign_keys, indexes]`. `row_estimate` is `reltuples`, `NULL` for a view
@@ -70,6 +71,7 @@ pub(super) const FULL_SELECT: &str = "SELECT n.nspname::text AS schema, c.relnam
        FROM pg_constraint f JOIN pg_class r ON r.oid = f.confrelid \
        JOIN pg_namespace rn ON rn.oid = r.relnamespace \
        WHERE f.conrelid = c.oid AND f.contype = 'f' \
+       AND has_schema_privilege(rn.oid, 'USAGE') \
        AND (pg_has_role(c.relowner, 'USAGE') OR NOT EXISTS (SELECT 1 FROM unnest(f.conkey) h(attnum) \
          WHERE NOT has_column_privilege(c.oid, h.attnum, 'SELECT, INSERT, UPDATE, REFERENCES'))) \
        AND (pg_has_role(r.relowner, 'USAGE') OR NOT EXISTS (SELECT 1 FROM unnest(f.confkey) h(attnum) \

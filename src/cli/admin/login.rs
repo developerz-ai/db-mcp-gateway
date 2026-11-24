@@ -13,7 +13,7 @@ use url::Url;
 use uuid::Uuid;
 
 use super::super::CliError;
-use super::client::{ensure_success, http_client};
+use super::client::{ensure_success, gateway_url, http_client};
 use super::session_file::StoredSession;
 
 /// How long the operator has to finish signing in.
@@ -26,7 +26,7 @@ const CALLBACK_PATH: &str = "/callback";
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub async fn run(gateway: &str) -> Result<StoredSession, CliError> {
-    let gateway = gateway.trim_end_matches('/');
+    let gateway = gateway_url(gateway)?;
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|err| CliError::io("bind a loopback port for the login callback", err))?;

@@ -49,6 +49,9 @@ jobs:
   #   msrv     a manifest, the lock or shipped Rust source changed.
   #   website  the docs site's sources changed (PRs only; pages.yml builds and
   #            deploys on main).
+  #   deploy   the manifests under `deploy/`, the metric catalogue their rules
+  #            and dashboard name, or the job's own script changed; every
+  #            `main` push runs it.
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -58,6 +61,7 @@ jobs:
       image: ${{ steps.diff.outputs.image }}
       msrv: ${{ steps.diff.outputs.msrv }}
       website: ${{ steps.diff.outputs.website }}
+      deploy: ${{ steps.diff.outputs.deploy }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -78,14 +82,14 @@ jobs:
           changed=$RUNNER_TEMP/changed
           matches() { grep -qzE "$1" "$changed"; }
           everything() {
-            printf '%s\n' code=true deps=true image=true msrv=true website=true >> "$GITHUB_OUTPUT"
+            printf '%s\n' code=true deps=true image=true msrv=true website=true deploy=true >> "$GITHUB_OUTPUT"
             exit 0
           }
           case "$GITHUB_EVENT_NAME" in
             pull_request|push) ;;
             *)
               # Scheduled warm run / manual dispatch: the Rust jobs and audit.
-              printf '%s\n' code=true deps=true image=false msrv=false website=false >> "$GITHUB_OUTPUT"
+              printf '%s\n' code=true deps=true image=false msrv=false website=false deploy=false >> "$GITHUB_OUTPUT"
               exit 0 ;;
           esac
           # The base: HEAD^1 on a PR; on a push, the ref's previous tip. A new
@@ -102,7 +106,7 @@ jobs:
           # --no-renames: a rename would list only its destination, so moving a
           # source file to a docs path would read as docs-only.
           git diff --name-only -z --no-renames "$base" HEAD > "$changed" || everything
-          code=true deps=false image=false msrv=false website=false
+          code=true deps=false image=false msrv=false website=false deploy=true
           # Docs-only skips on a PR alone (see `code` above). An empty diff is
           # not docs-only: it runs everything.
           if [ "$GITHUB_EVENT_NAME" = pull_request ] && [ -s "$changed" ] \
@@ -116,6 +120,9 @@ jobs:
             if matches '^(website/|README\.md$)'; then
               website=true
             fi
+            if ! matches '^(deploy/|src/startup/metrics/catalogue\.rs$|bin/check-deploy$|\.github/workflows/ci\.yml$)'; then
+              deploy=false
+            fi
           fi
           if matches '^(Cargo\.(toml|lock)|third_party/.*Cargo\.toml|\.cargo/|(audit|deny)\.toml$|\.github/workflows/(ci|audit)\.yml$)'; then
             deps=true
@@ -125,7 +132,7 @@ jobs:
           if matches '^(Cargo\.(toml|lock)$|src/|third_party/)'; then
             msrv=true
           fi
-          printf '%s\n' "code=$code" "deps=$deps" "image=$image" "msrv=$msrv" "website=$website" \
+          printf '%s\n' "code=$code" "deps=$deps" "image=$image" "msrv=$msrv" "website=$website" "deploy=$deploy" \
             | tee -a "$GITHUB_OUTPUT"
 
   fmt:
@@ -310,7 +317,9 @@ jobs:
             docker compose -f docker-compose.dev.yml ps -a
             exit 1
           fi
-      - run: cargo nextest run --profile ci --cargo-profile ci --all-targets --all-features
+      # promtool is the `deploy` job's (bin/check-deploy): run here it pulled
+      # the Prometheus image into every Rust PR. Locally bin/test still runs it.
+      - run: cargo nextest run --profile ci --cargo-profile ci --all-targets --all-features -E 'not (binary(deploy_catalogue) & test(=promtool_accepts_the_rules))'
       - name: upload JUnit report
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -397,6 +406,21 @@ jobs:
           name: junit-yugabyte
           path: target/nextest/ci-yugabyte/junit.xml
           if-no-files-found: ignore
+
+  # deploy/ against the real tools: promtool, helm lint, kubeconform on the
+  # rendered chart and kustomize base (bin/check-deploy, digest-pinned images,
+  # no Rust). Only when `deploy` says so: a PR touching the manifests, the
+  # metric catalogue or this file, and every `main` push.
+  deploy:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.deploy != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bin/check-deploy
 
   # Blocks only a change that can move the advisory picture: the lock, a
   # manifest or the audit config (owner decision H8). An advisory published
@@ -617,7 +641,7 @@ jobs:
   # when every job succeeded or was skipped by a `changes` filter that said
   # `false` (.github/scripts/ci_gate.py, pinned by test_ci_gate.py).
   gate:
-    needs: [changes, fmt, clippy, test, yugabyte, audit, image-check, msrv, website, secret-scan, scripts, public-tree]
+    needs: [changes, fmt, clippy, test, yugabyte, deploy, audit, image-check, msrv, website, secret-scan, scripts, public-tree]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -740,7 +764,7 @@ jobs:
   # so the short-SHA + main tags are pullable from whichever Image Updater (or
   # any external client) is configured to read.
   merge:
-    needs: [build, gate, changes, fmt, clippy, test, yugabyte, audit, image-check, msrv, website, secret-scan, scripts, public-tree]
+    needs: [build, gate, changes, fmt, clippy, test, yugabyte, deploy, audit, image-check, msrv, website, secret-scan, scripts, public-tree]
     if: ${{ !cancelled() && needs.build.result == 'success' && needs.gate.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10

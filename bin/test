@@ -6,7 +6,8 @@
 # Queued behind other heavy runs on this checkout (bin/lib/queue.sh;
 # DBMCP_NO_QUEUE=1 opts out).
 # Pass-through args go to the runner (e.g. bin/test --test smoke -- --nocapture);
-# nextest accepts the libtest flags after `--`.
+# nextest accepts the libtest flags after `--`. Several name filters work with
+# either runner: `bin/test --test it_db a:: b::`.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -16,14 +17,44 @@ cd "$(dirname "$0")/.."
 # shellcheck source=bin/lib/queue.sh
 . bin/lib/queue.sh
 
+# `cargo test` takes one positional filter; libtest after `--` takes many.
+# Sets `test_args` to "$@" with every filter moved behind `--` once there is
+# more than one (all of them, so the run still matches each). nextest takes
+# several filters natively and gets the args unchanged.
+cargo_test_args() {
+  local -a options=() filters=() rest=()
+  while (( $# > 0 )); do
+    case "$1" in
+      --) shift; rest=("$@"); break ;;
+      --test|--bin|--example|--bench|-p|--package|--exclude|-F|--features|--profile|--target|--target-dir|--manifest-path|-j|--jobs|--color|--message-format|--config|-Z)
+        options+=("$1"); shift
+        if (( $# > 0 )); then options+=("$1"); shift; fi ;;
+      -*) options+=("$1"); shift ;;
+      *) filters+=("$1"); shift ;;
+    esac
+  done
+  if (( ${#filters[@]} > 1 )); then
+    test_args=("${options[@]}" -- "${filters[@]}" "${rest[@]}")
+  elif (( ${#rest[@]} > 0 )); then
+    test_args=("${options[@]}" "${filters[@]}" -- "${rest[@]}")
+  else
+    test_args=("${options[@]}" "${filters[@]}")
+  fi
+}
+
+run_tests() {
+  if command -v cargo-nextest >/dev/null 2>&1; then
+    exec cargo nextest run "$@"
+  fi
+  cargo_test_args "$@"
+  exec cargo test "${test_args[@]}"
+}
+
 if [[ ${1:-} == --unit ]]; then
   shift
   unit=(--lib --bins --test it_offline --all-features)
   queue_lock heavy "bin/test --unit $*"
-  if command -v cargo-nextest >/dev/null 2>&1; then
-    exec cargo nextest run "${unit[@]}" "$@"
-  fi
-  exec cargo test "${unit[@]}" "$@"
+  run_tests "${unit[@]}" "$@"
 fi
 
 # Full suite: the machine-wide ledger when present, then the repo's own
@@ -101,7 +132,4 @@ if (( up_rc != 0 )); then
   exit "$up_rc"
 fi
 
-if command -v cargo-nextest >/dev/null 2>&1; then
-  exec cargo nextest run --all-targets --all-features "$@"
-fi
-exec cargo test --all-targets --all-features "$@"
+run_tests --all-targets --all-features "$@"

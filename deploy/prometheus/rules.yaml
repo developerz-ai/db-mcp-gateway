@@ -14,7 +14,10 @@ groups:
   - name: db-mcp-gateway.audit
     rules:
       - alert: GatewayAuditUnavailable
-        expr: sum(increase(tool_calls{outcome="audit_unavailable"}[5m])) > 0
+        # increase() needs two samples of a series, so a refusal before a new
+        # pod's first scrape (its series born above 0) would never show: the
+        # second clause catches a series that is non-zero but absent 5m ago.
+        expr: sum(increase(tool_calls{outcome="audit_unavailable"}[5m])) > 0 or sum(tool_calls{outcome="audit_unavailable"} > 0 unless tool_calls{outcome="audit_unavailable"} offset 5m) > 0
         labels:
           severity: critical
         annotations:
@@ -31,7 +34,9 @@ groups:
           description: 'Audit write p95 is {{ $value | humanizeDuration }}. Every response waits on this insert; at 15 s it becomes audit_unavailable.'
           runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditwriteslow
       - alert: GatewayAuditFallbackFailures
-        expr: sum(increase(audit_fallback_failures_total[15m])) > 0
+        # Second clause: a failure before a new pod's first scrape, as in
+        # GatewayAuditUnavailable.
+        expr: sum(increase(audit_fallback_failures_total[15m])) > 0 or sum(audit_fallback_failures_total > 0 unless audit_fallback_failures_total offset 15m) > 0
         labels:
           severity: warning
         annotations:

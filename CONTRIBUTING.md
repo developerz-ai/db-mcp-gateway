@@ -128,8 +128,10 @@ See [CLAUDE.md](CLAUDE.md) — it documents:
 We follow Rust idioms, enforced by:
 
 ```bash
-bin/fmt       # Format with rustfmt (max_width=100)
-bin/lint      # Check fmt + clippy -D warnings
+bin/fmt             # Format with rustfmt (max_width=100)
+bin/fmt --changed   # Only the .rs files changed vs origin/main, plus untracked ones
+bin/lint            # Check fmt + clippy -D warnings (CI's two clippy passes)
+bin/lint --lib      # Fast loop: fmt check + one clippy pass over lib + bins
 ```
 
 Key rules:
@@ -165,7 +167,8 @@ names every unhealthy service with its state and health. **75** is reserved for
 an unreachable resource or a confirmed health failure: a malformed compose file
 or any other compose command failure keeps its own exit status, so a broken
 compose file is blamed on the change and not on the box. Test arguments pass
-through unchanged.
+through; several name filters work without `--` (`bin/test --test it_db a:: b::`
+— under plain `cargo test` they are moved behind `--`).
 
 **Run the suite against YugabyteDB:**
 ```bash
@@ -179,6 +182,17 @@ It starts the state DB and `target-yugabyte` (compose profile `yugabyte`), waits
 bin/test --test <name>      # Integration test by file name
 cargo test <pattern>         # Unit test by pattern
 ```
+
+**Check your files while the tree is mid-edit** (several people or agents in one checkout):
+```bash
+bin/snapshot-check src/foo.rs tests/it_offline/foo.rs              # clippy + unit tests on HEAD + these files
+bin/snapshot-check src/foo.rs -- cargo test --test it_offline foo   # any command instead
+```
+It exports `HEAD` into `target/snapshot/<slot>/tree`, copies only the listed files over it and runs with its own `CARGO_TARGET_DIR`, so someone else's half-done edit cannot break your check. `--slot NAME` runs beside another snapshot; DB suites stay on `bin/test`.
+
+**Serial tests:** a test in `tests/it_db/` marked `#[serial_test::serial(world)]` must also run alone under nextest. `bin/regen-serial` rewrites that list in `.config/nextest.toml` (`--check` only reports); `it_offline::isolation_guard` fails until it is current.
+
+**Deploy manifests:** `bin/check-deploy` runs promtool, `helm lint` and kubeconform on `deploy/` through pinned images (Docker only) — CI's `deploy` job.
 
 **Test coverage:**
 - **Unit tests** — pure logic (authz eval, config validation, SQL rewriting). No real DB. Inline at the bottom of each source file.

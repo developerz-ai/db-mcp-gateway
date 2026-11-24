@@ -23,6 +23,7 @@ SKIP_ONLY_WHEN = {
     "clippy": "code",
     "test": "code",
     "yugabyte": "code",
+    "deploy": "deploy",
     "audit": "deps",
     "image-check": "image",
     "msrv": "msrv",

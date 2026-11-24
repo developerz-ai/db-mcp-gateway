@@ -11,6 +11,11 @@
 {{- if not (or $egress.targets $egress.anyTarget.enabled) }}
 {{- fail "networkPolicy.egress: no target egress; list scoped networkPolicy.egress.targets or opt in with networkPolicy.egress.anyTarget.enabled" }}
 {{- end }}
+{{- $ingress := .Values.networkPolicy.ingress }}
+{{- $anySource := eq (toString $ingress.gatewayFrom) "any" }}
+{{- if not (or $anySource (and (kindIs "slice" $ingress.gatewayFrom) $ingress.gatewayFrom)) }}
+{{- fail "networkPolicy.ingress.gatewayFrom: list the NetworkPolicy peers allowed to reach the gateway port (ingress controller, agent namespaces), or set it to `any` to open it to every source" }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -25,14 +30,17 @@ spec:
   ingress:
     - ports:
         - { port: gateway, protocol: TCP }
-      {{- with .Values.networkPolicy.ingress.gatewayFrom }}
+      {{- if not $anySource }}
       from:
-        {{- toYaml . | nindent 8 }}
+        {{- toYaml $ingress.gatewayFrom | nindent 8 }}
       {{- end }}
+    {{- /* An empty list means no scraper: a `from: []` would admit every source. */}}
+    {{- with $ingress.metricsFrom }}
     - ports:
         - { port: metrics, protocol: TCP }
       from:
-        {{- required "networkPolicy.ingress.metricsFrom must name the scraper: an empty list would open /metrics to every source" .Values.networkPolicy.ingress.metricsFrom | toYaml | nindent 8 }}
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
   egress:
     {{- include "gateway.egressRule" $egress.dns | nindent 4 }}
     {{- include "gateway.egressRule" $egress.stateDb | nindent 4 }}

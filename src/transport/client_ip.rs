@@ -15,6 +15,8 @@ use axum::http::request::Parts;
 
 const TRUSTED_PROXIES_VAR: &str = "TRUSTED_PROXIES";
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
+/// Prefix length of `::ffff:0:0/96`, the IPv4-mapped block.
+const MAPPED_PREFIX: u8 = 96;
 
 /// A `TRUSTED_PROXIES` entry that is not an IP or `ip/prefix` CIDR.
 #[derive(Debug, thiserror::Error)]
@@ -116,13 +118,19 @@ impl Cidr {
             (IpAddr::V6(net), IpAddr::V6(ip)) => {
                 same_prefix(net.to_bits(), ip.to_bits(), 128, self.prefix)
             }
-            // A canonical v4 peer is still the mapped v6 address on the wire.
-            (IpAddr::V6(net), IpAddr::V4(ip)) => same_prefix(
-                net.to_bits(),
-                ip.to_ipv6_mapped().to_bits(),
-                128,
-                self.prefix,
-            ),
+            // Only an entry inside `::ffff:0:0/96` names v4 addresses: a
+            // plain v6 range such as `::/0` would otherwise trust every v4
+            // peer through its mapped form.
+            (IpAddr::V6(net), IpAddr::V4(ip)) => {
+                net.to_ipv4_mapped().is_some()
+                    && self.prefix >= MAPPED_PREFIX
+                    && same_prefix(
+                        net.to_bits(),
+                        ip.to_ipv6_mapped().to_bits(),
+                        128,
+                        self.prefix,
+                    )
+            }
             (IpAddr::V4(_), IpAddr::V6(_)) => false,
         }
     }

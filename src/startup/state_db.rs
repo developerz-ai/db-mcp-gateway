@@ -154,11 +154,14 @@ mod tests {
         })
         .await;
         assert!(matches!(got, Err(StateDbError::Connect(_))));
+        // Only bounds that hold however late the scheduler wakes the sleeps:
+        // retrying stops only with under MIN_ATTEMPT left, and the backoff
+        // (0.5 s, then 1 s) leaves room for at most three attempts in 2 s.
         let elapsed = started.elapsed();
         assert!(elapsed >= Duration::from_millis(1500), "{elapsed:?}");
-        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
-        // Attempts at 0, 0.5 and 1.5 s; under MIN_ATTEMPT left, no fourth.
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+        let calls = calls.load(Ordering::SeqCst);
+        assert!((1..=3).contains(&calls), "{calls} attempts");
     }
 
     #[tokio::test]

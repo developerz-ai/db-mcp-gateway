@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# bin/check-deploy — validate deploy/ with the real tools, each a digest-pinned
+# image (Docker only, no Rust): `promtool check rules` and the rule unit tests
+# (rules.test.yaml), `helm lint --strict` on the chart with every optional
+# template on (ci/full-values.yaml), the values the chart must refuse to
+# render, and kubeconform --strict on the rendered chart and the rendered
+# kustomize base. CI's `deploy` job runs exactly this. The
+# catalogue and invariant checks are Rust tests (tests/deploy_catalogue.rs).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+PROMTOOL=prom/prometheus:v2.55.1@sha256:2659f4c2ebb718e7695cb9b25ffa7d6be64db013daba13e05c875451cf51b0d3
+HELM=alpine/helm:3.16.4@sha256:9b25e60ae264940b276e32866d37e3088e70c4e2d1784b964dc3f90346281a74
+KUBECTL=registry.k8s.io/kubectl:v1.31.0@sha256:99b37df34bc4f99ee322521d4c85cb98c1ceb8f70ff0618bef84eec9fe1ebc20
+KUBECONFORM=ghcr.io/yannh/kubeconform:v0.6.7@sha256:0925177fb05b44ce18574076141b5c3d83235e1904d3f952182ac99ddc45762c
+# CRD schemas (ServiceMonitor, PrometheusRule, Certificate) at a fixed commit.
+CRDS=https://raw.githubusercontent.com/datreeio/CRDs-catalog/04af58d740718c4dc719441bf39fb284c784f4a8
+KUBERNETES_VERSION=1.31.0
+CHART=/deploy/helm/db-mcp-gateway
+
+command -v docker >/dev/null 2>&1 || { echo 'Required prerequisite unavailable: Docker CLI' >&2; exit 75; }
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+# deploy/ read-only and no network, except kubeconform's schema fetch.
+tool() { docker run --rm --network=none -v "$PWD/deploy:/deploy:ro" "$@"; }
+
+# Unsafe values the chart must refuse: each `--set` on top of full-values.yaml
+# has to fail in the chart's own `fail`/`required`, not for another reason.
+REFUSED=(
+  networkPolicy.ingress.gatewayFrom=null
+  networkPolicy.ingress.gatewayFrom=all
+  tls.certManager.dnsNames=null
+)
+
+kubeconform() {
+  docker run --rm -i "$KUBECONFORM" -strict -summary \
+    -kubernetes-version "$KUBERNETES_VERSION" \
+    -schema-location default \
+    -schema-location "$CRDS/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json" - < "$1"
+}
+
+echo '→ promtool check rules'
+tool --entrypoint promtool "$PROMTOOL" check rules /deploy/prometheus/rules.yaml
+
+echo '→ promtool test rules'
+tool -w /deploy/prometheus --entrypoint promtool "$PROMTOOL" test rules rules.test.yaml
+
+echo '→ helm lint --strict'
+tool "$HELM" lint --strict "$CHART" -f "$CHART/ci/full-values.yaml"
+
+echo '→ helm refuses unsafe values'
+for value in "${REFUSED[@]}"; do
+  if tool "$HELM" template db-mcp-gateway "$CHART" -f "$CHART/ci/full-values.yaml" \
+      --set "$value" > /dev/null 2> "$work/refusal"; then
+    echo "the chart rendered with --set $value; it must refuse it" >&2
+    exit 1
+  fi
+  if ! grep -q 'execution error at' "$work/refusal"; then
+    echo "--set $value failed, but not in the chart's own check:" >&2
+    cat "$work/refusal" >&2
+    exit 1
+  fi
+  echo "  refused: $value"
+done
+
+echo '→ kubeconform: helm template'
+tool "$HELM" template db-mcp-gateway "$CHART" -f "$CHART/ci/full-values.yaml" > "$work/chart.yaml"
+kubeconform "$work/chart.yaml"
+
+echo '→ kubeconform: kustomize base'
+tool "$KUBECTL" kustomize /deploy/kustomize/base > "$work/kustomize.yaml"
+kubeconform "$work/kustomize.yaml"

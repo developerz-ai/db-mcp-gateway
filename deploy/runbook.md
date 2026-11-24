@@ -18,7 +18,7 @@ Every agent-facing error carries a `request_id`; it matches `audit_calls.request
 
 ### GatewayAuditUnavailable
 
-**Means.** Tool calls were answered `audit_unavailable`: the state DB refused the intent row or the completion row. Audit is synchronous (MUST #4), so agents are getting no answers. Severity critical.
+**Means.** Tool calls were answered `audit_unavailable`: the state DB refused the intent row or the completion row. Audit is synchronous (MUST #4), so agents are getting no answers. Severity critical. It also fires for 5m when a replica's first scrape already shows refusals (a failure before Prometheus first saw the pod), which `increase()` alone cannot see.
 
 **First checks.**
 - `/readyz` on each replica (`503` = the state DB does not answer `SELECT 1` in 2 s).
@@ -233,7 +233,7 @@ The database rejected the statement (message carries the SQLSTATE in the gateway
 
 ### `unavailable`
 
-The database was unreachable, refused the role's credentials, had no pooled connection free within 5 s, or rolled back for a retryable reason (`40001`, `40P01`, classes `08`, `53`, `57P`). Retryable. **Checks:** the gateway's `WARN`/`ERROR` lines for that `server`/`db` (they never name the role); pool saturation ([GatewayPoolSaturated](#gatewaypoolsaturated)); credentials (a rotated password); network path. **Fix:** see [GatewayTargetUnavailable](#gatewaytargetunavailable).
+The database was unreachable, refused the role's credentials, had no pooled connection free within 5 s, or rolled back for a retryable reason (`40001`, `40P01`, classes `08`, `53`, `57P`). Retryable only when the body carries no `write` or `write: not_applied` (a read, or a write that never reached a commit). With `write: unknown` the commit may have landed (the connection dropped around the commit): verify the change on the target (the row, the key, the statement in `audit_calls.sql`) before resending, or the write may apply twice. **Checks:** the gateway's `WARN`/`ERROR` lines for that `server`/`db` (they never name the role); pool saturation ([GatewayPoolSaturated](#gatewaypoolsaturated)); credentials (a rotated password); network path. **Fix:** see [GatewayTargetUnavailable](#gatewaytargetunavailable).
 
 ### `unsupported_backend`
 

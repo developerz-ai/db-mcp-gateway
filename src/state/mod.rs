@@ -48,7 +48,8 @@ const BACKGROUND_POOL_SIZE: u32 = 2;
 /// The permissions listener pins one connection for `LISTEN` and briefly
 /// takes a second for its liveness ping.
 const LISTENER_POOL_SIZE: u32 = 2;
-const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a state-DB caller waits for a pooled connection.
+pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connect the **request** pool to the state DB and run pending migrations.
 /// Sessions, authz and the audit insert share it; background jobs use
@@ -58,13 +59,17 @@ pub async fn connect(url: &str, pool_size: NonZeroU32) -> Result<PgPool, StateDb
     connect_with_timeout(url, pool_size, ACQUIRE_TIMEOUT).await
 }
 
-/// Bound pool acquisition without interrupting migrations once they start.
+/// Bound the first connect by `timeout` without interrupting migrations once
+/// they start. The pool keeps [`ACQUIRE_TIMEOUT`]: `timeout` is the boot
+/// retry's per-attempt slice, too short for the requests the pool serves.
 pub async fn connect_with_timeout(
     url: &str,
     pool_size: NonZeroU32,
     timeout: Duration,
 ) -> Result<PgPool, StateDbError> {
-    let pool = open_pg_with_timeout(url, pool_size.get(), REQUEST_SESSION_SQL, timeout).await?;
+    let pool = tokio::time::timeout(timeout, open_pg(url, pool_size.get(), REQUEST_SESSION_SQL))
+        .await
+        .map_err(|_| StateDbError::Connect(sqlx::Error::PoolTimedOut))??;
 
     migrate::state_db(&pool)
         .await
@@ -97,19 +102,10 @@ async fn open_pg(
     max_connections: u32,
     session_sql: &'static str,
 ) -> Result<PgPool, StateDbError> {
-    open_pg_with_timeout(url, max_connections, session_sql, ACQUIRE_TIMEOUT).await
-}
-
-async fn open_pg_with_timeout(
-    url: &str,
-    max_connections: u32,
-    session_sql: &'static str,
-    timeout: Duration,
-) -> Result<PgPool, StateDbError> {
     let options = PgConnectOptions::from_str(url).map_err(StateDbError::Connect)?;
     PgPoolOptions::new()
         .max_connections(max_connections)
-        .acquire_timeout(timeout)
+        .acquire_timeout(ACQUIRE_TIMEOUT)
         .after_connect(move |conn, _meta| {
             Box::pin(async move { conn.execute(session_sql).await.map(|_| ()) })
         })

@@ -131,3 +131,22 @@ async fn a_malformed_retry_budget_fails_boot() {
         gateway.lines()
     );
 }
+
+/// Each retry attempt gets an acquire timeout shortened to fit the budget;
+/// the pool boot keeps serves requests and must not inherit it.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn the_serving_pool_keeps_the_normal_acquire_timeout() {
+    let pool = db_mcp_gateway::state::connect_with_timeout(
+        &state_db_url(),
+        std::num::NonZeroU32::MIN,
+        Duration::from_millis(700),
+    )
+    .await
+    .expect("state DB up");
+    assert_eq!(
+        pool.options().get_acquire_timeout(),
+        db_mcp_gateway::state::ACQUIRE_TIMEOUT
+    );
+    pool.close().await;
+}

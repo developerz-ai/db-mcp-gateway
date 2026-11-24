@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 import unittest
@@ -11,7 +12,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ci_gate import SKIP_ONLY_WHEN, problems  # noqa: E402
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci_gate.py")
-DOCS_ONLY = {"code": "false", "deps": "false", "image": "false", "msrv": "false", "website": "true"}
+CI_YML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows", "ci.yml")
+DOCS_ONLY = {
+    "code": "false",
+    "deps": "false",
+    "image": "false",
+    "msrv": "false",
+    "website": "true",
+    "deploy": "false",
+}
 
 
 def run(changes_result="success", outputs=None, **results):
@@ -81,6 +90,33 @@ class Gate(unittest.TestCase):
         self.assertEqual(
             problems(needs), ["msrv: missing from gate.needs", "new-job: not in ci_gate.py's table"]
         )
+
+
+def job_needs(workflow, job):
+    """The `needs: [...]` list of `job` in ci.yml (stdlib only, no YAML parser)."""
+    found = re.search(rf"^  {re.escape(job)}:\n(?:    .*\n)*?    needs: \[([^\]]*)\]", workflow, re.M)
+    if not found:
+        raise AssertionError(f"ci.yml has no `{job}` job with a one-line needs list")
+    return [name.strip() for name in found.group(1).split(",")]
+
+
+class Workflow(unittest.TestCase):
+    """The table above is only half the contract: ci.yml must list the same jobs."""
+
+    def setUp(self):
+        with open(CI_YML, encoding="utf-8") as f:
+            self.workflow = f.read()
+
+    def test_gate_needs_exactly_the_table(self):
+        self.assertEqual(sorted(job_needs(self.workflow, "gate")), sorted(SKIP_ONLY_WHEN))
+
+    def test_merge_waits_on_every_gated_job(self):
+        needs = job_needs(self.workflow, "merge")
+        self.assertEqual(sorted(set(needs) - {"build", "gate"}), sorted(SKIP_ONLY_WHEN))
+
+    def test_every_skip_output_is_emitted_by_changes(self):
+        outputs = set(re.findall(r"^      (\w+): \$\{\{ steps\.diff\.outputs\.\1 \}\}$", self.workflow, re.M))
+        self.assertEqual({o for o in SKIP_ONLY_WHEN.values() if o}, outputs)
 
 
 class Cli(unittest.TestCase):

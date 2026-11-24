@@ -121,8 +121,19 @@ services:
         cd /run/demo-secrets
         umask 077
         hex32() { head -c 32 /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
-        [ -s service-token ] || printf 'dbmcp_svc_%s' "$$(hex32)" > service-token
-        [ -s session-signing-key ] || printf '%s\n' "$$(hex32)" > session-signing-key
+        # Whole or absent: a file cut short (a crash mid-write, a failed
+        # read of /dev/urandom) is re-minted, never reused. Written to a temp
+        # file, checked for its exact size and shape, then renamed into place.
+        # The values never reach stdout.
+        intact() { [ "$$(wc -c < "$$1")" -eq "$$2" ] && grep -qxE "$$3" "$$1"; }
+        mint() {
+          intact "$$1" "$$2" "$$3" 2>/dev/null && return 0
+          printf "$$4" "$$(hex32)" > "$$1.new"
+          intact "$$1.new" "$$2" "$$3" || { rm -f "$$1.new"; echo "mint-token: minted $$1 is malformed" >&2; exit 1; }
+          mv -f "$$1.new" "$$1"
+        }
+        mint service-token 74 'dbmcp_svc_[0-9a-f]{64}' 'dbmcp_svc_%s'
+        mint session-signing-key 65 '[0-9a-f]{64}' '%s\n'
         chown 65532:65532 service-token session-signing-key   # the image's nonroot user
         chmod 0400 service-token session-signing-key
         cp /bin/busybox busybox.new && chmod 0555 busybox.new && mv -f busybox.new busybox

@@ -49,8 +49,18 @@ grep -qxF "header = \"Authorization: Bearer $token\"" "$work/stdin" || fail 'tok
 # Arguments default to {}; --list is tools/list.
 call list_servers || fail 'list_servers failed'
 [[ $(<"$work/argv") == *'"params":{"name":"list_servers","arguments":{}}'* ]] || fail 'empty arguments not {}'
+env=('RESPONSE={"jsonrpc":"2.0","id":1,"result":{"tools":[]}}')
 call --list || fail '--list failed'
 [[ $(<"$work/argv") == *'"method":"tools/list"}'* ]] || fail '--list is not tools/list'
+# Each method's result must hold its own array: `{}` or the other method's
+# shape is not an answer.
+for body in '{"jsonrpc":"2.0","id":1,"result":{}}' '{"jsonrpc":"2.0","id":1,"result":{"content":[]}}' \
+  '{"jsonrpc":"2.0","id":1,"result":{"tools":{}}}'; do
+  env=("RESPONSE=$body")
+  rc=0; call --list || rc=$?
+  [[ $rc == 1 ]] || fail "tools/list answered by <$body> exited $rc"
+done
+env=()
 
 # GATEWAY_BIND / MCP_PATH move the default; MCP_URL and DBMCP_TOKEN override.
 env=(GATEWAY_BIND=0.0.0.0:9443 MCP_PATH=/gw)
@@ -84,6 +94,10 @@ if call run_query '{}'; then fail 'an envelope without result or error exited 0'
 # object: anything else is not a verdict, so it is a failure.
 for body in \
   '{"jsonrpc":"2.0","id":1,"result":"ok"}' \
+  '{"jsonrpc":"2.0","id":1,"result":{}}' \
+  '{"jsonrpc":"2.0","id":1,"result":{"isError":false}}' \
+  '{"jsonrpc":"2.0","id":1,"result":{"content":{},"isError":false}}' \
+  '{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}' \
   '{"jsonrpc":"2.0","id":1,"result":[]}' \
   '{"jsonrpc":"2.0","id":1,"result":null}' \
   '{"jsonrpc":"2.0","id":2,"result":{"isError":false}}' \

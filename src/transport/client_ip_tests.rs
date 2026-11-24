@@ -94,13 +94,21 @@ fn mapped_v6_entries_keep_their_v6_prefix() {
     let mapped_host = TrustedProxies::parse("::ffff:10.0.0.5/128").unwrap();
     assert!(mapped_host.trusts(ip("10.0.0.5")));
     assert!(!mapped_host.trusts(ip("10.0.0.6")));
-    // A /16 over v6 space is `::/16` — every mapped address — not the
-    // v4 range `0.0.0.0/16`.
-    let wide = TrustedProxies::parse("::ffff:0:0/16").unwrap();
-    assert!(wide.trusts(ip("10.0.0.1")));
-    assert!(wide.trusts(ip("::1")));
+    let every_v4 = TrustedProxies::parse("::ffff:0:0/96").unwrap();
+    assert!(every_v4.trusts(ip("203.0.113.7")));
+    assert!(!every_v4.trusts(ip("::1")));
+}
+
+#[test]
+fn a_plain_v6_range_never_trusts_a_v4_peer() {
     let all_v6 = TrustedProxies::parse("::/0").unwrap();
-    assert!(all_v6.trusts(ip("203.0.113.7")), "mapped peers are v6 too");
+    assert!(all_v6.trusts(ip("2001:db8::1")));
+    assert!(!all_v6.trusts(ip("203.0.113.7")));
+    assert!(!all_v6.trusts(ip("::ffff:203.0.113.7")));
+    // Wider than the mapped /96: it names v6 space, not a v4 range.
+    let wide = TrustedProxies::parse("::ffff:0:0/16").unwrap();
+    assert!(wide.trusts(ip("::1")));
+    assert!(!wide.trusts(ip("10.0.0.1")));
 }
 
 #[test]

@@ -35,6 +35,9 @@ struct Item {
     name: String,
     test: bool,
     exempt: bool,
+    /// The item's body minus comments, literals kept: where `"tools/call"`
+    /// and the assertion helpers are looked for, so a commented-out
+    /// `latest_audit(…)` asserts nothing.
     body: String,
     /// `body` minus comments and literals: where calls are looked for, so a
     /// `"redis.call(…)"` string is not a call to a harness `call`.
@@ -106,7 +109,7 @@ fn body_from(source: &str, from: usize) -> Option<&str> {
     None
 }
 
-/// Past any comment, string or char literal starting at `i` (so a `"{"` or
+/// Past any comment (line or block, not nested), string or char literal starting at `i` (so a `"{"` or
 /// a `// }` cannot unbalance the brace count); `i` itself otherwise.
 fn skip_literal(text: &str, i: usize) -> usize {
     let Some(tail) = text.get(i..) else {
@@ -119,6 +122,9 @@ fn skip_literal(text: &str, i: usize) -> usize {
     };
     if tail.starts_with("//") {
         return after("\n", 2);
+    }
+    if tail.starts_with("/*") {
+        return after("*/", 2);
     }
     if tail.starts_with("r#\"") {
         return after("\"#", 3);
@@ -150,6 +156,27 @@ fn skip_literal(text: &str, i: usize) -> usize {
         }
     }
     i
+}
+
+fn without_comments(body: &str) -> String {
+    let mut kept = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {
+        let next = skip_literal(body, i);
+        if next > i {
+            let skipped = &body[i..next];
+            if skipped.starts_with("//") || skipped.starts_with("/*") {
+                kept.push(' ');
+            } else {
+                kept.push_str(skipped);
+            }
+            i = next;
+        } else if let Some(c) = body[i..].chars().next() {
+            kept.push(c);
+            i += c.len_utf8();
+        }
+    }
+    kept
 }
 
 fn code_only(body: &str) -> String {
@@ -223,7 +250,7 @@ fn items(file: &str, source: &str) -> Vec<Item> {
                 .iter()
                 .any(|l| *l == "#[test]" || l.starts_with("#[tokio::test")),
             exempt: attrs.iter().any(|l| is_exempt_line(l)),
-            body: body.to_string(),
+            body: without_comments(body),
             code: code_only(body),
         });
     }
@@ -376,4 +403,22 @@ async fn unrelated() { let s = "{ send() }"; let c = '}'; let r = r#"{"#; } // }
     assert_eq!(unasserted(&found, &BTreeSet::new()), vec!["x.rs::forgot"]);
     let exempt = BTreeSet::from(["x.rs".to_string()]);
     assert!(unasserted(&found, &exempt).is_empty());
+}
+
+#[test]
+fn a_commented_out_assertion_does_not_count() {
+    let source = r##"
+#[tokio::test]
+async fn line() { post("tools/call").await; // latest_audit(&pool, "u", "t", "l").await;
+}
+#[tokio::test]
+async fn block() { post("tools/call").await; /* assert_audit_outcome(&pool, "x").await; */ }
+#[tokio::test]
+async fn kept() { post("tools/call").await; latest_audit(&pool, "// not a comment").await; }
+"##;
+    let found = items("x.rs", source);
+    assert_eq!(
+        unasserted(&found, &BTreeSet::new()),
+        vec!["x.rs::line", "x.rs::block"]
+    );
 }

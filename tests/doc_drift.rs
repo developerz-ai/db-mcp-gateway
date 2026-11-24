@@ -102,7 +102,7 @@ fn is_test_file(path: &Path) -> bool {
     name.ends_with("tests.rs") || path.components().any(|c| c.as_os_str() == "tests")
 }
 
-/// `text` up to its `#[cfg(test)] mod`, without comment lines.
+/// `text` up to its `#[cfg(test)] mod`, without comments.
 fn shipped_text(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let test_mod = (0..lines.len()).find(|&i| {
@@ -112,11 +112,72 @@ fn shipped_text(text: &str) -> String {
                 .find(|l| !l.trim_start().starts_with("#["))
                 .is_some_and(|l| l.trim_start().starts_with("mod "))
     });
-    lines[..test_mod.unwrap_or(lines.len())]
+    let code: String = lines[..test_mod.unwrap_or(lines.len())]
         .iter()
-        .filter(|l| !l.trim_start().starts_with("//"))
         .flat_map(|l| [*l, "\n"])
-        .collect()
+        .collect();
+    strip_comments(&code)
+}
+
+/// `code` with `//` and (unnested) `/* */` comments blanked; string, raw
+/// string and char literals are copied whole, so a `"/*"` in one is kept.
+fn strip_comments(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    let mut i = 0;
+    while let Some(c) = code[i..].chars().next() {
+        let rest = &code[i..];
+        if rest.starts_with("//") {
+            out.push(' ');
+            i = rest.find('\n').map_or(code.len(), |at| i + at);
+        } else if let Some(body) = rest.strip_prefix("/*") {
+            let end = body.find("*/").map_or(code.len(), |at| i + 2 + at + 2);
+            // Keep the line count: a failure may report a position.
+            out.extend(code[i..end].chars().filter(|&c| c == '\n'));
+            out.push(' ');
+            i = end;
+        } else {
+            let end = i + literal_len(rest).unwrap_or(c.len_utf8());
+            out.push_str(&code[i..end]);
+            i = end;
+        }
+    }
+    out
+}
+
+/// Byte length of the string, raw string or char literal `rest` opens with.
+fn literal_len(rest: &str) -> Option<usize> {
+    if let Some(raw) = rest.strip_prefix('r') {
+        let hashes = raw.len() - raw.trim_start_matches('#').len();
+        let body = raw[hashes..].strip_prefix('"')?;
+        let close = format!("\"{}", "#".repeat(hashes));
+        return Some(
+            body.find(&close)
+                .map_or(rest.len(), |at| rest.len() - body.len() + at + close.len()),
+        );
+    }
+    if let Some(body) = rest.strip_prefix('"') {
+        let mut escaped = false;
+        for (at, c) in body.char_indices() {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => return Some(1 + at + 1),
+                _ => {}
+            }
+        }
+        return Some(rest.len());
+    }
+    // A char literal ('x', '\''), not a lifetime ('a).
+    let body = rest.strip_prefix('\'')?;
+    let mut chars = body.char_indices();
+    let (_, first) = chars.next()?;
+    if first == '\\' {
+        chars.next();
+    }
+    match chars.next() {
+        Some((at, '\'')) => Some(1 + at + 1),
+        _ => None,
+    }
 }
 
 fn captures(re: &str, text: &str) -> BTreeSet<String> {
@@ -395,6 +456,18 @@ fn shipped_text_drops_comments_and_the_test_module() {
         "{routes:?}"
     );
     assert!(!shipped.contains("TEST_ONLY"));
+}
+
+#[test]
+fn shipped_text_drops_block_comments_but_not_strings() {
+    let text = "let r = Router::new()\n    /* .route(\"/inline\", get(gone)) */\n    /*\n    .route(\"/spanned\", get(gone))\n    */\n    .route(\"/kept/*rest\", get(kept)) // .route(\"/trailing\", get(gone))\n    .route(\"/also\", get(kept));\nconst Q: char = '\"';\n";
+    let routes = mounted_routes(&shipped_text(text));
+    let paths: BTreeSet<&str> = routes.iter().map(|(_, path)| path.as_str()).collect();
+    assert_eq!(
+        paths,
+        BTreeSet::from(["/kept/*rest", "/also"]),
+        "{routes:?}"
+    );
 }
 
 #[test]

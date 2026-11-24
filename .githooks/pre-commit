@@ -43,6 +43,20 @@ if (( ${#staged[@]} )); then
   # Captured, not piped: an early exit downstream cannot SIGPIPE git into a pass.
   by_content=$(git --literal-pathspecs grep --cached --text -l -E "$token_re" -- "${staged[@]}") \
     || (( $? == 1 )) || scan_error 'git grep failed'
+  # git grep skips symlinks, so a staged link's target (its blob) is scanned here.
+  entries=$(mktemp) || scan_error 'mktemp failed'
+  if ! git --literal-pathspecs ls-files --stage -z -- "${staged[@]}" > "$entries"; then
+    rm -f "$entries"
+    scan_error 'git ls-files failed'
+  fi
+  mapfile -d '' -t stage_entries < "$entries"
+  rm -f "$entries"
+  for entry in "${stage_entries[@]}"; do
+    [[ $entry == 120000\ * ]] || continue
+    read -r _ blob _ <<< "${entry%%$'\t'*}"
+    target=$(git cat-file blob "$blob") || scan_error 'git cat-file failed'
+    if [[ $target =~ $token_re ]]; then by_content+=$'\n'"${entry#*$'\t'}"; fi
+  done
 fi
 if [[ -n $by_content || ${#by_name[@]} -gt 0 ]]; then
   # File names only — a token inside a file name is redacted too.

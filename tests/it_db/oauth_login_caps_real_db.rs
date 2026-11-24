@@ -3,7 +3,7 @@
 //! cap leaves room for, and a restored code counts against it too.
 //!
 //! The global-cap tests are `#[serial_test::serial(world)]`: they size the cap
-//! from the table's live count, and the consent one evicts others' rows.
+//! from the table's live count, and the consent and flow ones evict others' rows.
 
 use std::time::Duration;
 
@@ -181,4 +181,34 @@ async fn racing_consents_stay_within_the_global_cap() {
 
     assert!(live_count(&pool, "oauth_pending_consents").await <= total);
     delete_consents(&pool, &prefix).await;
+}
+
+#[tokio::test]
+#[serial_test::serial(world)]
+async fn racing_login_flows_stay_within_the_global_cap() {
+    let pool = wide_pool().await;
+    let prefix = format!("caps-flow-{}", Uuid::new_v4().simple());
+    let cap = live_count(&pool, "oauth_pending_flows").await + 1;
+    let hashes: Vec<Vec<u8>> = (0..RACERS)
+        .map(|i| digest(&format!("{prefix}-{i}")))
+        .collect();
+
+    let racers = hashes.iter().map(|hash| {
+        let pool = pool.clone();
+        async move {
+            db::insert_flow(&pool, hash, None, chrono::Duration::seconds(300), cap)
+                .await
+                .expect("flow insert runs")
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(30), join_all(racers))
+        .await
+        .expect("inserts finish");
+
+    assert!(live_count(&pool, "oauth_pending_flows").await <= cap);
+    sqlx::query("DELETE FROM oauth_pending_flows WHERE state_hash = ANY($1)")
+        .bind(&hashes)
+        .execute(&pool)
+        .await
+        .expect("cleanup");
 }

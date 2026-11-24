@@ -23,6 +23,10 @@ use super::{CliError, ConfigArg, EXIT_ERROR, EXIT_FAILED, EXIT_OK};
 use probe::Privileges;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The whole catalog probe, client side. Each statement is also bounded on
+/// the server (`statement_timeout` in `probe::privileges`), so a stuck catalog read never
+/// holds a backend after `doctor` gives up.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
@@ -133,8 +137,16 @@ async fn inspect(
                 db_mcp_gateway::state::connect_error_class(&err)
             )
         })?;
-    probe::privileges(&mut conn, schemas)
+    within(PROBE_TIMEOUT, probe::privileges(&mut conn, schemas)).await
+}
+
+async fn within<T>(
+    limit: Duration,
+    probe: impl Future<Output = Result<T, sqlx::Error>>,
+) -> Result<T, String> {
+    tokio::time::timeout(limit, probe)
         .await
+        .map_err(|_| "catalog query timed out".to_string())?
         .map_err(|err| format!("catalog query failed ({})", sqlx_class(&err)))
 }
 
@@ -233,5 +245,19 @@ fn tier_name(tier: Tier) -> &'static str {
     match tier {
         Tier::Read => "read",
         Tier::Write => "write",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_catalog_probe_that_never_answers_times_out() {
+        let stuck = std::future::pending::<Result<(), sqlx::Error>>();
+        assert_eq!(
+            within(Duration::from_millis(10), stuck).await,
+            Err("catalog query timed out".to_string())
+        );
     }
 }

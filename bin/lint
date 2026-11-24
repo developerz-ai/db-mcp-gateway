@@ -1,14 +1,28 @@
 #!/usr/bin/env bash
 # bin/lint — read-only style + correctness gate. Same checks as CI fmt+clippy jobs.
+#   bin/lint --lib   fast loop: fmt check + one clippy pass over lib + bins
+#                    (no tests, benches or release-cfg pass); CI runs the rest
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+lib_only=false
+case "${1:-}" in
+  '') ;;
+  --lib) lib_only=true ;;
+  *) echo 'usage: bin/lint [--lib]' >&2; exit 2 ;;
+esac
 
 echo "→ cargo fmt --check"
 cargo fmt --all -- --check
 
 # shellcheck source=bin/lib/queue.sh
 . bin/lib/queue.sh
-queue_lock heavy "bin/lint"
+queue_lock heavy "bin/lint $*"
+
+if [[ $lib_only == true ]]; then
+  echo "→ cargo clippy (lib + bins)"
+  exec cargo clippy --profile ci --lib --bins --all-features -- -D warnings
+fi
 
 # Both passes on `--profile ci`, like CI: one profile, one shared graph.
 echo "→ cargo clippy"

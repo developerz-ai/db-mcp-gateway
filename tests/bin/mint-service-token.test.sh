@@ -52,10 +52,45 @@ status=$?
 set -e
 check "exit status" "2" "$status"
 
-echo "-- without DB_MCP_GATEWAY_BIN, db-mcp-gateway on PATH is used --"
-rm -f "$STUB_ARGS"
-env -u DB_MCP_GATEWAY_BIN PATH="$WORK:$PATH" "$SCRIPT" "analytics-bot"
-check "argv via PATH" $'mint-service-token\nanalytics-bot' "$(cat "$STUB_ARGS")"
+# Fallbacks run on a PATH of exactly these tools, against a copy of the
+# script in a scratch checkout (its target/ is ours to fill).
+mkdir -p "$WORK/repo/bin" "$WORK/tools" "$WORK/path"
+cp "$SCRIPT" "$WORK/repo/bin/"
+for tool in bash dirname; do ln -s "$(command -v "$tool")" "$WORK/tools/$tool"; done
+cp "$STUB" "$WORK/path/db-mcp-gateway"
+fallback() {
+  rm -f "$STUB_ARGS"
+  env -i PATH="$WORK/tools:$WORK/path" STUB_ARGS="$STUB_ARGS" \
+    bash "$WORK/repo/bin/mint-service-token" bot > "$WORK/out" 2>&1
+}
+
+echo "-- cargo present: the checkout's source wins over db-mcp-gateway on PATH --"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" cargo "$@" > "$STUB_ARGS"\n' > "$WORK/tools/cargo"
+chmod +x "$WORK/tools/cargo"
+fallback
+check "argv via cargo run" "cargo run --quiet --manifest-path $WORK/repo/Cargo.toml --bin db-mcp-gateway -- mint-service-token bot" \
+  "$(tr '\n' ' ' < "$STUB_ARGS" | sed 's/ $//')"
+rm "$WORK/tools/cargo"
+
+echo "-- no cargo: the checkout's newest build wins over PATH --"
+mkdir -p "$WORK/repo/target/debug" "$WORK/repo/target/release"
+printf '#!/usr/bin/env bash\necho release "$@" > "$STUB_ARGS"\n' > "$WORK/repo/target/release/db-mcp-gateway"
+printf '#!/usr/bin/env bash\necho debug "$@" > "$STUB_ARGS"\n' > "$WORK/repo/target/debug/db-mcp-gateway"
+chmod +x "$WORK/repo/target/"*/db-mcp-gateway
+touch -d '1 hour ago' "$WORK/repo/target/release/db-mcp-gateway"
+fallback
+check "newest build" "debug mint-service-token bot" "$(cat "$STUB_ARGS")"
+rm -r "$WORK/repo/target"
+
+echo "-- nothing in the checkout: PATH, with a notice --"
+fallback
+check "argv via PATH" $'mint-service-token\nbot' "$(cat "$STUB_ARGS")"
+check "PATH notice" "1" "$(grep -c 'from PATH' "$WORK/out")"
+
+echo "-- nothing at all: exit 2 --"
+rm "$WORK/path/db-mcp-gateway"
+set +e; fallback; status=$?; set -e
+check "exit status" "2" "$status"
 
 echo "=== summary: $PASS passed, $FAIL failed ==="
 (( FAIL == 0 ))

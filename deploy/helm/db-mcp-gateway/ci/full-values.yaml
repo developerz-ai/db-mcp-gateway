@@ -21,6 +21,11 @@ metrics:
 autoscaling:
   enabled: true
 networkPolicy:
+  ingress:
+    gatewayFrom:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: ingress-nginx
   egress:
     stateDb:
       to:

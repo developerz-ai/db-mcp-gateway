@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Isolated tests for `bin/test --unit`: it must reach cargo without Docker on
 # PATH, select the lib, bin and it_offline targets only, and pass extra args.
+# Several name filters reach `cargo test` behind `--` (it takes one
+# positional filter) and nextest unchanged (it takes many).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 work=$(mktemp -d)
@@ -30,9 +32,25 @@ unit -- --nocapture || fail 'bin/test --unit failed without Docker'
 [[ $(<"$work/calls") == 'cargo test --lib --bins --test it_offline --all-features -- --nocapture' ]] \
   || fail "unexpected cargo test call: $(<"$work/calls")"
 
+unit a:: || fail 'one filter failed'
+[[ $(<"$work/calls") == 'cargo test --lib --bins --test it_offline --all-features a::' ]] \
+  || fail "one filter moved: $(<"$work/calls")"
+
+unit a:: b:: || fail 'two filters failed'
+[[ $(<"$work/calls") == 'cargo test --lib --bins --test it_offline --all-features -- a:: b::' ]] \
+  || fail "two filters not behind --: $(<"$work/calls")"
+
+unit --features x a:: -j 2 b:: -- --nocapture || fail 'filters with options failed'
+[[ $(<"$work/calls") == 'cargo test --lib --bins --test it_offline --all-features --features x -j 2 -- a:: b:: --nocapture' ]] \
+  || fail "option values read as filters: $(<"$work/calls")"
+
 ln -s cargo "$work/tools/cargo-nextest"
 unit || fail 'bin/test --unit failed with nextest'
 [[ $(<"$work/calls") == 'cargo nextest run --lib --bins --test it_offline --all-features' ]] \
   || fail "unexpected nextest call: $(<"$work/calls")"
+
+unit a:: b:: || fail 'two filters failed with nextest'
+[[ $(<"$work/calls") == 'cargo nextest run --lib --bins --test it_offline --all-features a:: b::' ]] \
+  || fail "nextest filters rewritten: $(<"$work/calls")"
 
 echo 'ok: bin/test --unit'

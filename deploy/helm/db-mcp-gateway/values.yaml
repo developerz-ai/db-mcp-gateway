@@ -168,9 +168,14 @@ autoscaling:
 networkPolicy:
   enabled: true
   ingress:
-    # Who reaches the MCP/OAuth port; empty = anyone (agents, ingress).
+    # Who reaches the MCP/OAuth port: NetworkPolicy peers (the ingress
+    # controller, agent namespaces), or the string `any` to admit every
+    # source. Required: the chart fails to render while it is empty.
     gatewayFrom: []
-    # Who scrapes METRICS_BIND.
+    #   - namespaceSelector:
+    #       matchLabels:
+    #         kubernetes.io/metadata.name: ingress-nginx
+    # Who scrapes METRICS_BIND; empty = no scraper (the metrics port is closed).
     metricsFrom:
       - namespaceSelector:
           matchLabels:

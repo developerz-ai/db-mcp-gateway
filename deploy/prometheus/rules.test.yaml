@@ -1,0 +1,61 @@
+# `promtool test rules deploy/prometheus/rules.test.yaml`: the audit-failure
+# alerts fire on a steady increase and on a series first scraped above 0 (a
+# refusal before a new pod's first scrape), and stay quiet on a flat 0.
+rule_files:
+  - rules.yaml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      # A pod whose first scrape already counts a refusal, flat afterwards.
+      - series: 'tool_calls{tool="run_query",outcome="audit_unavailable",access="read",pod="new"}'
+        values: '_x3 1x10'
+      # A pod registered at 0 that never refuses.
+      - series: 'tool_calls{tool="run_query",outcome="audit_unavailable",access="read",pod="quiet"}'
+        values: '0x15'
+      - series: 'audit_fallback_failures_total{pod="new"}'
+        values: '_x3 2x20'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: GatewayAuditUnavailable
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: GatewayAuditUnavailable
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations:
+              summary: Tool calls refused because the audit store refused a write.
+              description: '1 tool calls answered audit_unavailable in 5m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
+      # Past the 5m window the series existed 5m ago: the flat counter is quiet.
+      - eval_time: 10m
+        alertname: GatewayAuditUnavailable
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: GatewayAuditFallbackFailures
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: Disconnect-path audit writes failed.
+              description: '2 disconnect-path audit writes failed in 15m; those calls are recorded only once the reaper marks them abandoned.'
+              runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditfallbackfailures
+      - eval_time: 20m
+        alertname: GatewayAuditFallbackFailures
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      # A long-lived pod whose counter steps from 0 to 3.
+      - series: 'tool_calls{tool="run_query",outcome="audit_unavailable",access="read",pod="old"}'
+        values: '0x10 3x10'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: GatewayAuditUnavailable
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: GatewayAuditUnavailable
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations:
+              summary: Tool calls refused because the audit store refused a write.
+              description: '3 tool calls answered audit_unavailable in 5m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable

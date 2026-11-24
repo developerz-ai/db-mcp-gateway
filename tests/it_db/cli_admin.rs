@@ -58,18 +58,23 @@ fn location(response: &reqwest::Response) -> String {
 }
 
 /// Read the authorize URL the CLI prints, then walk it as a browser would:
-/// gateway → IdP → gateway callback → the CLI's loopback redirect.
-async fn play_browser(child: &mut Child) {
+/// gateway → IdP → gateway callback → the CLI's loopback redirect. The
+/// handle yields everything the CLI wrote to stderr once it exits.
+async fn play_browser(child: &mut Child) -> std::thread::JoinHandle<String> {
     let stderr = child.stderr.take().expect("piped stderr");
     // Keep draining stderr after the URL: closing the pipe early would make
     // the CLI's next progress line fail with EPIPE and kill it.
     let (url_tx, url_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let drained = std::thread::spawn(move || {
+        let mut all = String::new();
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             if line.trim().starts_with("http") {
                 let _ = url_tx.send(line.trim().to_string());
             }
+            all.push_str(&line);
+            all.push('\n');
         }
+        all
     });
     let authorize = tokio::task::spawn_blocking(move || {
         url_rx
@@ -87,6 +92,7 @@ async fn play_browser(child: &mut Child) {
     assert_eq!(loopback.host_str(), Some("127.0.0.1"), "{loopback}");
     let done = browser.get(loopback).send().await.unwrap();
     assert!(done.status().is_success(), "{}", done.status());
+    drained
 }
 
 async fn audit_row(pool: &PgPool, target: Uuid) -> (String, String) {
@@ -128,18 +134,24 @@ async fn login_then_grants_and_session_revoke_are_audited() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    play_browser(&mut child).await;
+    let stderr = play_browser(&mut child).await;
     let login = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap())
         .await
         .unwrap();
+    let stderr = stderr.join().expect("stderr drained");
     assert!(login.status.success(), "{login:?}");
     let mode = std::fs::metadata(&token_file).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
     let session: Value = serde_json::from_slice(&std::fs::read(&token_file).unwrap()).unwrap();
     let bearer = session["access_token"].as_str().unwrap().to_string();
+    assert!(!bearer.is_empty());
     assert!(
         !String::from_utf8_lossy(&login.stdout).contains(&bearer),
-        "login never prints the token"
+        "login never prints the token to stdout"
+    );
+    assert!(
+        stderr.contains("Open this URL") && !stderr.contains(&bearer),
+        "login never prints the token to stderr: {stderr}"
     );
 
     // A subject to grant to (setup through the API directly).
@@ -254,7 +266,7 @@ async fn audit_query_and_export_stream_ndjson() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    play_browser(&mut child).await;
+    let _stderr = play_browser(&mut child).await;
     assert!(
         tokio::task::spawn_blocking(move || child.wait().unwrap())
             .await

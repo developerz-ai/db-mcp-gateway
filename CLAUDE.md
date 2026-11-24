@@ -45,9 +45,12 @@ Self-hosted MCP gateway. AI agents get audited, SSO-gated, read-only DB access. 
 | ysqlsh — target YugabyteDB (compose profile `yugabyte`) | `bin/dev ysqlsh` |
 | Full test (unit + integration; cargo-nextest when installed, else `cargo test`) | `bin/test` |
 | Postgres query-path suite against YugabyteDB (starts `state-db` + `target-yugabyte`, nextest profile `yugabyte`) | `bin/test-yugabyte` |
-| Single test by pattern | `bin/test --test <binary> <module>::` (e.g. `bin/test --test it_db run_query_e2e::`) |
-| Format | `bin/fmt` |
-| Lint (fmt-check + clippy -D warnings) | `bin/lint` |
+| Single test by pattern (several filters OK, no `--` needed) | `bin/test --test <binary> <module>::` (e.g. `bin/test --test it_db run_query_e2e:: explain_e2e::`) |
+| Format / only your changed `.rs` files (vs `origin/main` + untracked) | `bin/fmt` / `bin/fmt --changed` |
+| Lint (fmt-check + clippy -D warnings) / fast lib + bins pass | `bin/lint` / `bin/lint --lib` |
+| Check your files against HEAD while the shared tree is mid-edit (own target dir; `-- <cmd>` overrides clippy + unit tests) | `bin/snapshot-check <files…> [-- cargo test --test it_offline <filter>]` |
+| Regenerate nextest's run-alone list after adding/removing `#[serial_test::serial(world)]` | `bin/regen-serial` |
+| Validate `deploy/` (promtool, helm lint, kubeconform; Docker only) | `bin/check-deploy` |
 | Reproduce CI locally / one-command check (2 build jobs by default; `CARGO_BUILD_JOBS=$(nproc) bin/check` on a dedicated box) | `bin/ci` / `bin/check` |
 | Assert scrubber regex features in the shipping graph | `bin/check-scrub-features` |
 | Mint a static service bearer token | `bin/mint-service-token <name>` |
@@ -61,7 +64,7 @@ Self-hosted MCP gateway. AI agents get audited, SSO-gated, read-only DB access. 
 
 Secrets and local config: copy `.env.example` → `.env`. `.env` is gitignored; shell env beats `.env`.
 
-**Concurrency.** Many agents share one box. Build and test only through the `bin/` wrappers (`bin/test`, `bin/test-yugabyte`, `bin/lint`, `bin/check`, `bin/ci`): they queue on `.git/dbmcp-heavy.lock` (plus `.git/dbmcp-db.lock` for the shared dev DBs), print `queued: waiting for …`, and run under `heavy` when it is on `PATH`. Never raw `cargo test` against the DB suites. Never `bin/dev up`/`down` or `docker compose up` the dev stack while others use it — `up` under different env recreates containers. `DBMCP_NO_QUEUE=1` opts out.
+**Concurrency.** Many agents share one box. Build and test only through the `bin/` wrappers (`bin/test`, `bin/test-yugabyte`, `bin/lint`, `bin/check`, `bin/ci`): they queue on `.git/dbmcp-heavy.lock` (plus `.git/dbmcp-db.lock` for the shared dev DBs), print `queued: waiting for …`, and run under `heavy` when it is on `PATH`. Never raw `cargo test` against the DB suites. Never `bin/dev up`/`down` or `docker compose up` the dev stack while others use it — `up` under different env recreates containers. Stop `target-yugabyte` only with a 120 s grace (`docker stop -t 120`; compose uses its `stop_grace_period`) — a SIGKILL wedges its tablets. To verify your own files while others' edits break the build, `bin/snapshot-check` (HEAD + your files, separate target dir, `--slot` to run beside another agent). `DBMCP_NO_QUEUE=1` opts out.
 
 ## Layers
 

@@ -8,7 +8,7 @@
 //! Nextest ignores those attributes (one process per test), so
 //! `.config/nextest.toml` names every `serial(world)` test in its
 //! `threads-required = "num-test-threads"` override; the second guard keeps
-//! that list and the attributes in step.
+//! that list and the attributes in step; `bin/regen-serial` rewrites it.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -143,7 +143,7 @@ fn every_serial_world_test_runs_alone_under_nextest() {
     assert!(
         missing.is_empty() && stale.is_empty(),
         "`.config/nextest.toml`'s num-test-threads override must name exactly the \
-         serial(world) tests — add {missing:?}, remove {stale:?}"
+         serial(world) tests — add {missing:?}, remove {stale:?}. Fix: run `bin/regen-serial`"
     );
 }
 
