@@ -79,7 +79,7 @@ The binary needs its config path. The published image bakes `DB_MCP_GATEWAY_CONF
 
 The `:main` tag is published on every push to `main` (see [#10](https://github.com/developerz-ai/db-mcp-gateway/issues/10)). Building from source instead? `docker build -t db-mcp-gateway:dev .` and swap that tag into the `docker run` above.
 
-With `RUST_LOG` unset the gateway logs at `info`. If you mistype a secret ref or leave `TARGET_DB_PASSWORD` unset, the gateway **fails fast at boot** rather than at first query — e.g. ``Error: env var `TARGET_DB_PASSWORD` referenced in config is unset or empty in process environment``.
+With `RUST_LOG` unset the gateway logs at `info`. If you mistype a secret ref or leave `TARGET_DB_PASSWORD` unset, the gateway **fails fast at boot** rather than at first query, listing every unresolved ref with its site — e.g. ``servers[local].databases[app].password (read tier): env var `TARGET_DB_PASSWORD` referenced in config is unset or empty in process environment``. Validate a config without booting — every error at once, warnings, and the connection budget — with `db-mcp-gateway --config config.yml --check` (add `--no-secrets` in CI); see the [operator CLI](cli.md).
 
 You should see the gateway load config, migrate the state DB, and start listening:
 
@@ -117,10 +117,11 @@ The env→YAML unification is still pending, so these come from the environment,
 | `MCP_ALLOWED_ORIGINS` | unset (none) | Comma-separated browser origins (`https://host[:port]`, no path or wildcard) allowed to call `POST /mcp` (MCP spec: servers MUST validate `Origin` against DNS rebinding). A request **without** `Origin` (every non-browser agent) always passes; one **with** an `Origin` not listed gets `403` before authentication — no tool runs, no audit row is written, a `WARN` `rejected a request from a disallowed Origin` line is logged. With `GATEWAY_BIND` on loopback, loopback origins (`localhost`, `127.0.0.0/8`, `[::1]`, any port) are also allowed. A malformed entry aborts boot |
 | `TRUSTED_PROXIES` | unset (none) | Comma-separated IPs/CIDRs (`10.0.0.0/8,fd00::/8`) of reverse proxies in front of the gateway. When the TCP peer is one of them, the audit row's `ip` is the right-most `X-Forwarded-For` hop not itself a trusted proxy; otherwise `ip` is the TCP peer and `X-Forwarded-For` is ignored. List only proxies that overwrite or append to `X-Forwarded-For` — a listed address can claim any client IP. A malformed entry aborts boot |
 | `MCP_PATH` | `/mcp` | Absolute path the MCP endpoint mounts at. A path the gateway already serves (`/healthz`, `/auth/…`, `/admin…`, `/.well-known…`, …) aborts boot |
-| `METRICS_BIND` | `127.0.0.1:9090` | Prometheus `/metrics` listener — separate from `GATEWAY_BIND`, which no longer serves `/metrics`. Set `0.0.0.0:9090` for an in-cluster scrape and fence the port with a NetworkPolicy; must differ from `GATEWAY_BIND` |
+| `METRICS_BIND` | `127.0.0.1:9090` | Internal listener: Prometheus `/metrics`, plus `/healthz` and `/readyz` for probes that should not reach the public port — separate from `GATEWAY_BIND`, which does not serve `/metrics`. Set `0.0.0.0:9090` for an in-cluster scrape and fence the port with a NetworkPolicy; must differ from `GATEWAY_BIND` |
 | `MAX_CONCURRENT_REQUESTS` / `MAX_CONCURRENT_PER_IDENTITY` | `512` / `16` | In-flight ceilings (global → 503, per caller → 429). `0` aborts boot |
 | `STATE_DB_POOL_SIZE` | `10` | Request-path state-DB pool. `0`, or more than the concurrent-request ceiling (512), aborts boot. `1` works: pruner/GC/reaper use a separate fixed pool of 2, and the permissions `LISTEN` connection (plus its liveness ping) another fixed pool of 2 |
-| `STATE_DB_CONNECT_TIMEOUT_SECONDS` | `60` | How long boot keeps retrying the state DB (backoff 0.5 s doubling to 8 s; each attempt waits up to 5 s) before exiting. `0` = one attempt. Whole seconds, `0`–`3600`; anything else aborts boot. A malformed `STATE_DB_URL` or a failed migration is not retried. The HTTP listener binds only once the state DB is up, so `/healthz` and `/readyz` do not answer while boot retries — give a Kubernetes `startupProbe` at least this budget, or liveness restarts the pod mid-retry |
+| `PG_CANCEL_POOL_SIZE` | `2` | Connections in each Postgres tier's dedicated cancel pool (the pool `pg_cancel_backend` runs on, so a cancel never queues behind the queries it cancels). One per tier per database: a database with a `write_role` holds two. Integer `1`–`32`; anything else aborts boot |
+| `STATE_DB_CONNECT_TIMEOUT_SECONDS` | `60` | How long boot keeps retrying the state DB (backoff 0.5 s doubling to 8 s; each attempt waits up to 5 s, never past the budget; no attempt starts with under 0.5 s left) before exiting. `0` = one attempt. Whole seconds, `0`–`3600`; anything else aborts boot. A malformed `STATE_DB_URL` or a failed migration is not retried. The HTTP listener binds only once the state DB is up, so `/healthz` and `/readyz` do not answer while boot retries — give a Kubernetes `startupProbe` at least this budget, or liveness restarts the pod mid-retry |
 | `OIDC_ISSUER` | — (required) | IdP issuer URL (OIDC discovery base). A trailing slash is ignored |
 | `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | — (client id required) | Gateway's OIDC client credentials |
 | `OIDC_AUDIENCE` | `OIDC_CLIENT_ID` | Expected `aud` of IdP ID tokens |
@@ -191,7 +192,7 @@ Most restrictive value wins when multiple grants match. See [../initial-idea/06-
 
 | You need | Why |
 |---|---|
-| Docker + docker-compose (or k8s manifests) | Run the gateway image. A Helm chart is on the roadmap — until then, hand-roll the manifests (see below). |
+| Docker + docker-compose (or k8s manifests) | Run the gateway image. On Kubernetes, use the in-repo Helm chart or kustomize base: [Kubernetes](kubernetes.md). |
 | One Postgres instance for *gateway state* (sessions + audit) | Keep gateway state separate from your prod DBs |
 | Network reachability gateway → each target DB | Self-evident |
 | An OIDC IdP whose ID token carries a verified `email` and a `groups` claim | Identity. Guides: [Okta](idp/okta.md), [Entra ID](idp/entra.md), [Google Workspace](idp/google.md) (needs a broker), [Keycloak](idp/keycloak.md) |
@@ -363,8 +364,13 @@ services:
       state-db:
         condition: service_healthy
     restart: unless-stopped
-    # No healthcheck here: the image is distroless (no shell, curl or wget).
-    # Probe /readyz from outside — your load balancer or orchestrator.
+    # The image is distroless (no shell, curl or wget): the binary probes its
+    # own /healthz (see the operator CLI page). Readiness (/readyz) is for
+    # your load balancer or orchestrator.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/db-mcp-gateway", "--healthcheck"]
+      interval: 10s
+      timeout: 6s
 
   state-db:
     image: postgres:16
@@ -421,13 +427,15 @@ For richer signals use the dedicated endpoints below.
 
 ## Probes & metrics
 
-Three unauthenticated ops endpoints. `/healthz` and `/readyz` are mounted alongside `/mcp`; `/metrics` is served only on `METRICS_BIND` (default `127.0.0.1:9090`) — never on the public listener, because its labels name every configured database:
+Three unauthenticated ops endpoints. `/healthz` and `/readyz` are mounted alongside `/mcp` **and** on the internal `METRICS_BIND` listener (default `127.0.0.1:9090`); `/metrics` is served only on `METRICS_BIND` — never on the public listener, because its labels name every configured database:
 
 | Endpoint | Returns | What's behind it |
 |---|---|---|
-| `/healthz` | `200 ok` while running; `503 shutting down` once the process catches SIGTERM/Ctrl-C | Process liveness only — does not touch the state DB |
-| `/readyz` | `200 ok` when the state DB answers `SELECT 1` within 2s; `503` otherwise (or during shutdown) | Pulls the pod out of the Service endpoint set on transient DB outages, no restart |
+| `/healthz` | `200 ok` while running; `503 shutting down` once the process catches SIGTERM/Ctrl-C. On `METRICS_BIND` also `200 starting` while boot is still connecting to the state DB | Process liveness only — does not touch the state DB |
+| `/readyz` | `200 ok` when the state DB answers `SELECT 1` within 2s; `503` otherwise (or during shutdown). On `METRICS_BIND` also `503 starting` until boot completes | Pulls the pod out of the Service endpoint set on transient DB outages, no restart |
 | `/metrics` (on `METRICS_BIND`) | Prometheus text exposition (`text/plain; version=0.0.4`) | See the metric catalogue below |
+
+`METRICS_BIND` binds before boot connects to the state DB, so probes pointed at it answer during `STATE_DB_CONNECT_TIMEOUT_SECONDS` retries (liveness `200 starting`, readiness `503 starting`) — no `startupProbe` budget needed for that window.
 
 ### Metric catalogue
 
@@ -436,22 +444,34 @@ Names are fixed — dashboards and alerts are written against them. No label car
 | Series | Type | Labels |
 |---|---|---|
 | `tool_calls` | counter | `tool`, `outcome` (the spec 03 code the client saw — an intent or completion write that failed shows as `audit_unavailable`), `access` (`read`/`write`/`unknown` for a call dropped before it decided) |
-| `query_duration_seconds` | histogram (fixed buckets 5 ms – 60 s) | `tool` |
+| `tool_calls_by_db` | counter | `db` (`server/database`), `outcome`, `access` — only calls that named a database the config holds; a name the caller made up never becomes a label |
+| `query_duration_seconds` | histogram (fixed buckets 5 ms – 60 s) | `tool`, `db` (empty when the call named no configured database) |
 | `audit_write_duration_seconds` | histogram (fixed buckets 1 ms – 5 s) | — |
 | `audit_fallback_failures_total` | counter | — (a disconnect-path audit write failed; the row exists only once the reaper records it) |
 | `audit_abandoned_total` | counter | — (intents the reaper recorded as `abandoned`; only the lock-holding replica increments it, so `sum()` across replicas is exact) |
+| `audit_reaper_last_success_timestamp` | gauge | — (Unix seconds of the last completed reaper sweep; alert when it falls behind) |
 | `audit_pruner_runs_total` | counter | `result` (`ok`/`error`) |
 | `audit_pruner_last_success_timestamp` | gauge (unix seconds) | — |
-| `requests_shed_total` | counter | `scope` (`global`/`identity`/`oauth`) |
-| `pool_size` | gauge (configured max connections) | `db`, `pool_kind` (`query`/`cancel`, plus `write_query`/`write_cancel` when `write_role` is set) |
-| `sessions_created_total` / `sessions_revoked_total` | counter | — |
-| `config_reloads_total` | counter | `result` (`ok`/`error`) |
-| `log_lines_dropped_total` | counter | — |
 | `audit_stream_dropped_total` | counter | `sink` (`syslog`) |
+| `requests_shed_total` | counter | `scope` (`global`/`identity`/`oauth`) |
+| `handler_panics_total` | counter | `layer` (`http`: a route handler, answered `500`; `tool_work`: a tool's work, answered and audited `internal`) |
+| `pool_size` | gauge (configured max connections) | `db`, `pool_kind` (`query`/`cancel`, plus `write_query`/`write_cancel` when `write_role` is set; Mongo and Redis: `query`) |
+| `pool_connections_in_use` | gauge | `db`, `pool_kind` |
+| `pool_connections_idle` | gauge | `db`, `pool_kind` (Postgres and Redis; the Mongo driver does not expose it) |
+| `pool_acquire_wait_seconds` | histogram (fixed buckets 0.5 ms – 5 s) | `db`, `pool_kind` — every acquire, timed-out waits included (they sit at the 5 s acquire timeout) |
+| `state_db_pool_size` / `state_db_pool_connections_in_use` / `state_db_pool_connections_idle` | gauge | `pool` (`request`, `permissions_mysql`) |
+| `sessions_created_total` / `sessions_revoked_total` | counter | — |
+| `login_failures_total` | counter | `code` (`email_unverified`, `id_token`, `idp_exchange`, `state_unavailable`) |
+| `config_reloads_total` | counter | `result` (`ok`/`error`) |
+| `config_reload_last_success_timestamp` | gauge (unix seconds) | — (boot load or last successful SIGHUP reload) |
+| `config_info` | gauge (`1`) | `hash` (first 12 hex of the SHA-256 of the config file as on disk, `${…}` references unresolved) |
+| `tls_cert_not_after_timestamp` | gauge (unix seconds) | — (the served leaf certificate; absent with `TLS_DISABLED`) |
+| `build_info` | gauge (`1`) | `version`, `git_sha` (`unknown` when the build had no `GIT_SHA`) |
+| `log_lines_dropped_total` | counter | — |
 
 `audit_stream_dropped_total` counts only syslog deliveries that failed. The `stdout` stream sink writes through the same non-blocking log queue as every other log line, so an audit row it drops when that queue is full is counted only in `log_lines_dropped_total` — the two are not separable by metric. Every stream sink is a best-effort copy; the state DB row is the record.
 
-Histograms use fixed buckets so they aggregate across replicas. Gauges and histograms untouched for an hour leave the output (an evicted database's labels do not linger); counters never expire.
+Every counter is exported at `0` from boot for each stable label set — `tool_calls` for every tool × outcome, `tool_calls_by_db` for every configured database × outcome (a reload adds new databases' series) — so `increase()` sees the first event. Histograms use fixed buckets so they aggregate across replicas. Pool gauges are sampled every 15 s while the pool is open; the other gauges are re-set every minute. A gauge or histogram untouched for an hour leaves the output, so a database removed by a reload stops being reported an hour after its pool closes; counters never expire. The source of truth for names, types and labels is `src/startup/metrics/catalogue.rs`.
 
 ### k8s probes
 
@@ -519,8 +539,8 @@ Point them at [../usage/first-query.md](../usage/first-query.md) — 5-minute ha
 - [ ] `gateway: { env: production }` in config — inline literal secrets abort boot.
 - [ ] TLS terminating on the gateway or fronting proxy; never plain HTTP from devs.
 - [ ] State DB on its own volume, backed up ([operations.md](operations.md#backup)).
-- [ ] Two replicas behind a load balancer for HA. The OAuth bridge keeps its login-flow state in-process, so pin `/register`, `/authorize`, `/auth/callback`, and `/token` with sticky routing (or run a single replica); steady-state `/mcp` traffic needs no stickiness. See [../initial-idea/02-architecture.md](../initial-idea/02-architecture.md#ha).
+- [ ] Two replicas behind a load balancer for HA — no sticky routing for any route: login state lives in the state DB. Give every replica the same `SESSION_SIGNING_KEY` and `OIDC_REDIRECT_URL`. See [../initial-idea/02-architecture.md](../initial-idea/02-architecture.md#ha).
 
 ## Helm / Kubernetes
 
-A Helm chart is on the roadmap (see [../initial-idea/11-roadmap.md](../initial-idea/11-roadmap.md), phase 8). Until then, the docker-compose layout translates cleanly to a `Deployment` + `Service` + `PersistentVolumeClaim` + `Secret` set if you'd rather hand-roll it.
+The Helm chart (`deploy/helm/db-mcp-gateway`) and a kustomize base ship in this repository, with Prometheus alerts, a Grafana dashboard and a runbook: see [Kubernetes](kubernetes.md).

@@ -17,7 +17,7 @@ use db_mcp_gateway::auth::{
 };
 use db_mcp_gateway::authz::PermissionsCache;
 use db_mcp_gateway::config::{Config, ConfigFile, PermissionsStoreDriver};
-use db_mcp_gateway::exec::AdapterRegistry;
+use db_mcp_gateway::exec::{AdapterRegistry, pg};
 use db_mcp_gateway::state;
 use db_mcp_gateway::state::permissions::PermissionsRepo;
 use db_mcp_gateway::state::permissions::mysql::MysqlPermissionsRepo;
@@ -25,6 +25,8 @@ use db_mcp_gateway::state::permissions::pg::{PgPermissionsRepo, notify};
 use db_mcp_gateway::transport::{AppState, McpState, OAuthState};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
+
+use super::metrics;
 
 /// Wire every `AppState` dependency. Moves `config_file` and `auth_config` in.
 /// `stop` is the process shutdown token; probes go 503 once it is cancelled.
@@ -54,6 +56,9 @@ pub(crate) async fn build_app_state(
     let detached = DetachedTasks::new();
     let (permissions_repo, permissions_cache) =
         build_permissions(&config_file, config, state_db, &detached, drained).await?;
+    pg::init_cancel_pool_size_from_env()?;
+    metrics::preregister::register_targets(&config_file);
+    metrics::state_pools::spawn_state_pool_sampler("request", state_db.clone(), stop.clone());
     let mcp = McpState {
         audit_sinks: Arc::new(ArcSwap::from_pointee(
             StreamSinks::from_config(&config_file.logging.stream)
@@ -66,14 +71,16 @@ pub(crate) async fn build_app_state(
         permissions_repo,
         detached,
     };
+    // Login state in the shared state DB (migration 0022): no sticky routing.
+    let flows = PendingFlows::with_db(state_db.clone(), &auth_config.session_signing_key);
     let oauth = OAuthState {
         auth: AuthFacade {
             jwt: SessionJwt::new(&auth_config.session_signing_key),
             config: Arc::new(auth_config),
             sessions,
             oidc,
-            flows: PendingFlows::default(),
-            codes: AuthCodes::default(),
+            flows,
+            codes: AuthCodes::with_db(state_db.clone()),
             // Persist refresh chains in the shared state DB: a chain is meant to
             // outlive the process (that is what `REFRESH_TTL_DAYS` buys), and an
             // in-memory store silently capped the real "stay signed in" window at
@@ -87,7 +94,9 @@ pub(crate) async fn build_app_state(
         client_registry: ClientRegistry::with_db(state_db.clone()),
         mcp_path: Arc::from(config.mcp_path.as_str()),
     };
-    Ok(AppState::new(mcp, oauth, stop))
+    let app_state = AppState::new(mcp, oauth, stop);
+    metrics::probes::probe_state().attach(app_state.clone());
+    Ok(app_state)
 }
 
 /// Spec 12 §"Storage backends" / #59: the permissions store the YAML selects
@@ -114,7 +123,7 @@ async fn build_permissions(
             Ok((repo, cache))
         }
         PermissionsStoreDriver::Mysql => {
-            let repo = connect_mysql_repo(config).await?;
+            let repo = connect_mysql_repo(config, drained.clone()).await?;
             let cache = PermissionsCache::new(repo.clone(), ttl).with_detached(detached.clone());
             Ok((repo, cache))
         }
@@ -153,7 +162,10 @@ fn spawn_permissions_listener(pool: PgPool, cache: PermissionsCache, stop: Cance
     });
 }
 
-async fn connect_mysql_repo(config: &Config) -> anyhow::Result<Arc<dyn PermissionsRepo>> {
+async fn connect_mysql_repo(
+    config: &Config,
+    stop: CancellationToken,
+) -> anyhow::Result<Arc<dyn PermissionsRepo>> {
     let dsn = std::env::var("PERMISSIONS_DB_DSN").map_err(|_| {
         anyhow::anyhow!("permissions_store.driver = mysql requires PERMISSIONS_DB_DSN env")
     })?;
@@ -164,6 +176,7 @@ async fn connect_mysql_repo(config: &Config) -> anyhow::Result<Arc<dyn Permissio
         pool_size = config.state_db.pool_size,
         "mysql permissions store connected, migrations applied"
     );
+    metrics::state_pools::spawn_state_pool_sampler("permissions_mysql", pool.clone(), stop);
     Ok(Arc::new(MysqlPermissionsRepo::new(pool)))
 }
 

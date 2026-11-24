@@ -251,7 +251,7 @@ async fn revoke_lands_after_the_listener_backend_is_terminated() {
     })
     .await;
     b.await_flushes(2).await;
-    assert!(logs.contains(RECOVERED), "recovery is logged");
+    eventually("recovery is logged", || async { logs.contains(RECOVERED) }).await;
 
     b.listener.abort();
     cleanup(&p, &seeded).await;
@@ -291,7 +291,7 @@ async fn revoke_lands_after_the_listener_connection_goes_silent() {
     })
     .await;
     assert!(logs.contains("heard no ping within the liveness deadline"));
-    assert!(logs.contains(RECOVERED), "recovery is logged");
+    eventually("recovery is logged", || async { logs.contains(RECOVERED) }).await;
 
     b.listener.abort();
     cleanup(&p, &seeded).await;

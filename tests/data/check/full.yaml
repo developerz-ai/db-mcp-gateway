@@ -1,0 +1,83 @@
+# Every key the config accepts, once. `tests/it_offline/cli_config_schema.rs`
+# pins it both ways: it must parse (every section denies unknown keys, so each
+# key here exists in the serde types) and its key paths must equal the
+# properties of website/static/config.schema.json. A new config key lands in
+# all three.
+gateway:
+  env: development
+servers:
+  - name: prod
+    kind: postgres
+    description: Production replica
+    host: db.example.internal
+    port: 5432
+    tls: verify_full
+    tls_ca_file: tests/data/check/full.yaml
+    pool:
+      max_connections: 8
+      min_connections: 0
+      idle_timeout_s: 300
+    role: mcp_reports_ro
+    password: ${ENV:FULL_REPORTS_RO}
+    databases:
+      - reports
+      - name: app
+        role: mcp_app_ro
+        password: ${ENV:FULL_APP_RO}
+        description: Orders and customers
+        auth_database: app
+        connect_name: app_production
+        pool:
+          max_connections: 4
+          min_connections: 1
+          idle_timeout_s: 60
+        write_role: mcp_app_rw
+        write_password: ${ENV:FULL_APP_RW}
+constraint_profiles:
+  careful:
+    require_reason: true
+    row_limit: 1000
+    statement_timeout_ms: 5000
+permissions:
+  - group: engineers
+    grants:
+      - server: prod
+        database: app
+        action: query_read
+        profile: careful
+        constraints:
+          require_reason: true
+          row_limit: 1000
+          statement_timeout_ms: 5000
+      - server: prod
+        database: "*"
+        except: [app]
+        action: query_read
+  - user: "okta|00u1oncall"
+    grants: []
+  - group: svc-ci-bot
+    grants: []
+admin:
+  enabled: true
+  group: gateway-admins
+  session_max_age_secs: 3600
+permissions_store:
+  driver: pg
+service_accounts:
+  - name: ci-bot
+    group: svc-ci-bot
+    token: ${ENV:FULL_CI_BOT}
+    max_concurrent_requests: 4
+    require_upstream: true
+  - name: ci-bot-next
+    group: svc-ci-bot
+    tokens:
+      - ${ENV:FULL_CI_BOT_NEXT}
+logging:
+  stream:
+    - kind: stdout
+    - kind: syslog
+      host: syslog.example.internal
+      port: 6514
+      transport: tls
+      ca_file: tests/data/check/full.yaml

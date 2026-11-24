@@ -20,7 +20,11 @@
 //!     command at another database), `$readPreference`, `lsid`, `txnNumber`,
 //!     `autocommit`, `startTransaction`, `writeConcern` — none is listed, so
 //!     none passes.
-//!  3. The denied operators — `$out`, `$merge`, `$function`, `$where`,
+//!  3. A data read (`find`, `aggregate`, `count`, `distinct`) must not name
+//!     a `system.*` collection ([`is_system_collection`]): those hold server
+//!     state (`system.profile` keeps other sessions' queries, `system.js`
+//!     stored code), not application data.
+//!  4. The denied operators — `$out`, `$merge`, `$function`, `$where`,
 //!     `$accumulator` — are rejected at *any* depth in the document tree.
 //!
 //! Mongo's wire format is BSON, but the gateway accepts the command as
@@ -142,6 +146,9 @@ pub enum RejectReason {
 
     #[error("mongo command `{command}` does not allow top-level field `{field}`")]
     DisallowedField { command: String, field: String },
+
+    #[error("mongo command `{0}` may not read a `system.*` collection")]
+    SystemCollection(String),
 }
 
 impl RejectReason {
@@ -180,7 +187,19 @@ pub fn validate_command(json: &str) -> Result<(), RejectReason> {
         });
     }
 
+    if let Some(Value::String(collection)) = object.get(command)
+        && command != "listIndexes"
+        && is_system_collection(collection)
+    {
+        return Err(RejectReason::SystemCollection(command.clone()));
+    }
+
     walk_for_denied(&value)
+}
+
+/// A collection under Mongo's reserved `system.` prefix.
+pub fn is_system_collection(name: &str) -> bool {
+    name.starts_with("system.")
 }
 
 /// Recursive walk for any `$op` key in [`DENIED_OPERATORS`]. The walk is

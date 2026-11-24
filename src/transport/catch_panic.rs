@@ -27,6 +27,7 @@ pub(super) async fn catch_panic(req: Request, next: Next) -> Response {
         Err(_) => {
             // The payload is not logged: it may quote request or target data.
             tracing::error!(%request_id, path, "handler panicked; answering 500");
+            metrics::counter!("handler_panics_total", "layer" => "http").increment(1);
             internal_error(request_id)
         }
     }

@@ -50,6 +50,12 @@ pub async fn complete_bridge_login(
                 request_id = %page.request_id(),
                 "bridge login failed at the IdP exchange"
             );
+            let code = match err {
+                AuthError::EmailUnverified => "email_unverified",
+                AuthError::IdToken => "id_token",
+                _ => "idp_exchange",
+            };
+            metrics::counter!("login_failures_total", "code" => code).increment(1);
             return match err {
                 AuthError::EmailUnverified => {
                     email_unverified(page, error_redirect(&bridge, "access_denied").as_deref())
@@ -107,6 +113,7 @@ pub(super) async fn issue_code(
         // `complete_bridge_login`), so 302 back with a valid OAuth error code
         // instead. `temporarily_unavailable` (RFC 6749 §4.1.2.1) is the
         // overload signal.
+        metrics::counter!("login_failures_total", "code" => "state_unavailable").increment(1);
         return redirect_with_error(bridge, "temporarily_unavailable");
     }
 

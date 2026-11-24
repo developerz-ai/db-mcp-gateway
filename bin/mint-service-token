@@ -4,71 +4,22 @@
 #
 #   bin/mint-service-token <name>
 #
-# Prints a fresh `dbmcp_svc_<64 hex>` token, the YAML stanza to add, and the
-# env-var name to store the value under. Run by a human operator, never by
-# the gateway: there is deliberately no in-band mint API.
+# A thin wrapper over `db-mcp-gateway mint-service-token <name>`, which prints
+# a fresh `dbmcp_svc_<64 hex>` token, the YAML stanza to add, and the env var
+# to store it under (the steps, rotation and revocation are in that output and
+# in website/docs/deployment/cli.md). The same command ships in the image:
+#   docker run --rm ghcr.io/developerz-ai/db-mcp-gateway mint-service-token <name>
 #
-# After minting:
-#   1. Store the token value in the org secret store of record — the
-#      value is shown ONCE here and is not recoverable from the gateway.
-#   2. Deliver it to the pod as a k8s Secret / SealedSecret mounted env var
-#      (or file + `${FILE:…}` ref).
-#   3. Add the printed stanza to the gateway config YAML (reviewed by PR),
-#      with a matching `permissions:` block for the group.
-#   4. Apply it: `kill -HUP` every gateway pod (config reload) or roll the
-#      deployment. A new env var only reaches a pod on restart, so a value
-#      delivered as `${ENV:…}` needs a roll; a mounted `${FILE:…}` does not.
-#
-# Rotation requires an explicit overlap phase because each entry carries one
-# token AND src/config/yaml/service_accounts.rs rejects duplicate
-# service-account names — the new value CANNOT reuse the original <name>.
-# Mint fresh against a DISTINCT temporary name (e.g. `<name>-next`): mint new
-# -> add a SECOND service_accounts entry (with a distinct name + matching
-# `permissions:` block) -> reload (SIGHUP) or roll -> update clients -> remove
-# the OLD entry -> reload or roll again. Audit rows
-# during the rotation window attribute to the temporary name (`service:<name>-next`)
-# instead of the original — document the choice in the PR.
+# Binary: $DB_MCP_GATEWAY_BIN, else `db-mcp-gateway` on PATH, else this
+# checkout built with cargo.
 set -euo pipefail
 
-name="${1:-}"
-if [[ ! "$name" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]; then
-  echo "usage: bin/mint-service-token <name>" >&2
-  echo "  <name> must match ^[a-z0-9][a-z0-9-]{0,62}\$ — it becomes the audit identity service:<name>" >&2
-  exit 2
+if [[ -n "${DB_MCP_GATEWAY_BIN:-}" ]]; then
+  exec "$DB_MCP_GATEWAY_BIN" mint-service-token "$@"
 fi
-
-# 32 bytes of CSPRNG entropy, hex-encoded (64 chars) — matches the exact
-# shape the boot validator requires (`dbmcp_svc_` + 64 lowercase hex). A
-# token this script emits always satisfies the store's checks.
-token="dbmcp_svc_$(openssl rand -hex 32)"
-# Env-var name derived from the service name: ci-bot -> SERVICE_TOKEN_CI_BOT.
-env_var="SERVICE_TOKEN_$(tr 'a-z-' 'A-Z_' <<< "$name")"
-
-cat <<EOF
-token (store this — shown once): ${token}
-
-1. Put the value in the org secret store of record, then deliver it
-   to the gateway pod as env var ${env_var} (SealedSecret) — or as a mounted
-   file and use \${FILE:/run/secrets/...} below instead.
-
-2. Add to the gateway YAML (the group needs its own permissions: block):
-
-service_accounts:
-  - name: ${name}
-    group: svc-${name}
-    token: \${ENV:${env_var}}
-
-permissions:
-  - group: svc-${name}
-    grants: []   # fill in the minimal grants this service needs
-
-3. Reload: kill -HUP every gateway pod, or roll the deployment (a value
-   delivered as a new env var needs the roll; a mounted file does not).
-   Revocation = remove the complete stanza (name + group + token ref) and
-   reload again; emptying or unsetting the secret is NOT revocation
-   (unresolved refs fail the reload or boot). Rotation needs an explicit
-   overlap: mint fresh against a DISTINCT temporary name (e.g. <name>-next
-   — the same <name> is rejected as a duplicate), add a SECOND stanza
-   under that distinct name, reload, update clients, remove the OLD
-   stanza, reload again.
-EOF
+if command -v db-mcp-gateway >/dev/null 2>&1; then
+  exec db-mcp-gateway mint-service-token "$@"
+fi
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec cargo run --quiet --manifest-path "$root/Cargo.toml" --bin db-mcp-gateway -- \
+  mint-service-token "$@"

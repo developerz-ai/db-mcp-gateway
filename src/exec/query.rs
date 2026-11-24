@@ -30,6 +30,23 @@ pub struct ExecQuery<'a> {
     pub request_id: Uuid,
 }
 
+/// One positional parameter of a caller's statement, bound to its `$n` by
+/// position over the extended protocol: always a value, never SQL text. The
+/// SQL type follows the JSON type — `bool`, `int8`, `float8`, `text`,
+/// `jsonb` (an array or object) — except [`QueryParam::Null`], an untyped
+/// NULL whose type the server infers from where the placeholder stands.
+/// Values travel in binary, so a string is always `text`: a server-inferred
+/// type would read its bytes as that type's binary form.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryParam {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Text(String),
+    Json(serde_json::Value),
+}
+
 /// Catalog lookup for one schema (or every schema the read role may use,
 /// when `schema` is `None`), optionally narrowed to one table and to the
 /// tables whose name or column names contain `search`, case-insensitively.

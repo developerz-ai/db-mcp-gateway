@@ -36,7 +36,8 @@ pub use pool_sizing::{
     DEFAULT_POOL_IDLE_TIMEOUT, DEFAULT_POOL_MAX_CONNECTIONS, InvalidPoolSizing, PoolSizing,
 };
 pub use query::{
-    ActivityQuery, ExecQuery, ExplainQuery, SampleQuery, SchemaDetail, SchemaQuery, TableStatsQuery,
+    ActivityQuery, ExecQuery, ExplainQuery, QueryParam, SampleQuery, SchemaDetail, SchemaQuery,
+    TableStatsQuery,
 };
 pub use registry::AdapterRegistry;
 pub use rejection::{DbRejection, RejectionKind};

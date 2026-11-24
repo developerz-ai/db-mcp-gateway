@@ -2,12 +2,17 @@
 //! (A12), the audited client IP behind trusted proxies (A18), and the
 //! dispatch span's fields on lines logged deep inside a tool call (U6).
 
+use std::time::Duration;
+
 use serde_json::{Value, json};
 
 use crate::boot_binary::{BinaryGateway, service_only_yaml};
 use crate::common::audit::{find_audit, latest_audit};
 use crate::common::cleanup::delete_audit_calls;
 use crate::common::env::state_pool;
+
+/// How long a log line may trail the response that caused it.
+const LOG_WAIT: Duration = Duration::from_secs(5);
 
 const ORIGIN_TOKEN: &str =
     "dbmcp_svc_4444444444444444444444444444444444444444444444444444444444444443";
@@ -45,14 +50,14 @@ async fn a_disallowed_origin_is_refused_before_auth_and_audit() {
             .is_none(),
         "a refused Origin wrote an audit row"
     );
-    assert!(
-        gateway.records().iter().any(|line| {
+    let refusal = gateway
+        .await_record(LOG_WAIT, |line| {
             line["message"] == "rejected a request from a disallowed Origin"
-                && line["origin"] == "https://attacker.example"
-        }),
-        "{:#?}",
-        gateway.lines()
-    );
+                && line["reason"] == "Origin not allowed"
+                && line.get("origin").is_none()
+        })
+        .await;
+    assert!(refusal.is_some(), "{:#?}", gateway.lines());
 
     let (status, body) = gateway
         .call_tool(
@@ -180,13 +185,14 @@ async fn a_target_error_line_carries_the_dispatch_span() {
     )
     .await;
 
-    let records = gateway.records();
-    let exec_line = records.iter().find(|line| {
-        line["target"]
-            .as_str()
-            .is_some_and(|target| target.starts_with("db_mcp_gateway::exec"))
-            && line.get("request_id").is_none()
-    });
+    let exec_line = gateway
+        .await_record(LOG_WAIT, |line| {
+            line["target"]
+                .as_str()
+                .is_some_and(|target| target.starts_with("db_mcp_gateway::exec"))
+                && line.get("request_id").is_none()
+        })
+        .await;
     let Some(line) = exec_line else {
         panic!("no exec-layer line:\n{:#?}", gateway.lines());
     };

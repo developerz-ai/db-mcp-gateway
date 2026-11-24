@@ -6,15 +6,20 @@
 //! Audit assertion intentionally skipped: these drive the adapter directly,
 //! never the tool-dispatch path that writes audit rows.
 
+use std::collections::BTreeSet;
+
 use redis::aio::MultiplexedConnection;
 use serde_json::json;
 
-use crate::common::redis_target::{Flavor, adapter, admin, admin_cmd, delete_keys, ok, unique_key};
+use crate::common::redis_target::{
+    Flavor, READ_USER, adapter, admin, admin_cmd, delete_keys, ok, unique_key,
+};
 use db_mcp_gateway::exec::PoolSizing;
 
-/// Close every client connection but `side`'s own. `CLIENT KILL USER` would
-/// be narrower, but Dragonfly has no `USER` filter, hence the serial test.
-async fn kill_other_clients(side: &mut MultiplexedConnection) -> usize {
+/// The ids of the clients the server lists, minus `side`'s own, that are
+/// not known to be another ACL user. Redis prints `user=`; Dragonfly does
+/// not, so there the id set alone tells connections apart.
+async fn gateway_client_ids(side: &mut MultiplexedConnection) -> BTreeSet<String> {
     let own = match admin_cmd(side, &["CLIENT", "ID"]).await {
         redis::Value::Int(id) => id.to_string(),
         other => panic!("CLIENT ID: {other:?}"),
@@ -24,19 +29,36 @@ async fn kill_other_clients(side: &mut MultiplexedConnection) -> usize {
         redis::Value::VerbatimString { text, .. } => text,
         other => panic!("CLIENT LIST: {other:?}"),
     };
-    let ids: Vec<String> = list
-        .lines()
+    list.lines()
+        .filter(|line| {
+            line.split(' ')
+                .find_map(|field| field.strip_prefix("user="))
+                .is_none_or(|user| user == READ_USER)
+        })
         .filter_map(|line| line.split(' ').find_map(|field| field.strip_prefix("id=")))
         .filter(|id| *id != own)
         .map(str::to_string)
+        .collect()
+}
+
+/// Close only the connections that appeared since `before`: the adapter's.
+/// Every other client of the shared server keeps its connection.
+async fn kill_new_clients(side: &mut MultiplexedConnection, before: &BTreeSet<String>) -> usize {
+    let new: Vec<String> = gateway_client_ids(side)
+        .await
+        .difference(before)
+        .cloned()
         .collect();
-    for id in &ids {
+    for id in &new {
         admin_cmd(side, &["CLIENT", "KILL", "ID", id]).await;
     }
-    ids.len()
+    new.len()
 }
 
 #[tokio::test]
+// Serial: telling the adapter's connection apart by "appeared since
+// `before`" needs no other test opening connections meanwhile (Dragonfly
+// lists no ACL user to filter on).
 #[serial_test::serial(world)]
 async fn a_read_on_a_connection_closed_while_idle_reconnects_once() {
     for flavor in Flavor::ALL {
@@ -44,15 +66,16 @@ async fn a_read_on_a_connection_closed_while_idle_reconnects_once() {
             max_connections: 1,
             ..PoolSizing::default()
         };
-        let a = adapter(flavor, sizing).await;
         let mut side = admin(flavor).await;
+        let before = gateway_client_ids(&mut side).await;
+        let a = adapter(flavor, sizing).await;
         let key = unique_key("idle");
         admin_cmd(&mut side, &["SET", &key, "still here"]).await;
         let get = format!(r#"["GET","{key}"]"#);
 
         // Opens the pool's one connection and leaves it idle.
         ok(&a, flavor, &get, 10).await;
-        let killed = kill_other_clients(&mut side).await;
+        let killed = kill_new_clients(&mut side, &before).await;
         let after = ok(&a, flavor, &get, 10).await;
         // The replacement went back to the pool and keeps serving.
         let again = ok(&a, flavor, &get, 10).await;

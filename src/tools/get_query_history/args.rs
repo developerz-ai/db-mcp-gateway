@@ -34,6 +34,10 @@ pub struct Arguments {
     /// `next_cursor` from the previous page; absent for the newest page.
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Only the entries whose `sql_sha256` is this: 64 hex digits, either
+    /// case.
+    #[serde(default)]
+    pub sql_sha256: Option<String>,
     /// Required when the grant sets `require_reason`; recorded in the audit
     /// row either way.
     #[serde(default)]
@@ -70,6 +74,17 @@ pub(super) fn parse_since(value: Option<&str>) -> Result<Option<DateTime<Utc>>, 
     DateTime::parse_from_rfc3339(raw)
         .map(|dt| Some(dt.with_timezone(&Utc)))
         .map_err(|_| ())
+}
+
+/// The `sql_sha256` filter in the lowercase hex the history computes.
+pub(super) fn parse_sql_sha256(value: Option<&str>) -> Result<Option<String>, ()> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    if raw.len() != 64 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(());
+    }
+    Ok(Some(raw.to_ascii_lowercase()))
 }
 
 #[cfg(test)]

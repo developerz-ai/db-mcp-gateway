@@ -5,6 +5,9 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use serde_json::Value;
 use sqlx::postgres::types::PgInterval;
 
+use super::json::RowWeight;
+use super::wire::Refused;
+
 /// Key of the marker object returned for a cell this gateway can't render.
 const UNSUPPORTED_TYPE_KEY: &str = "unsupported_type";
 
@@ -31,11 +34,18 @@ pub(super) fn float(v: f64) -> Value {
 
 pub(super) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
-    bytes.iter().fold(String::from("\\x"), |mut out, b| {
+    let mut prefixed = String::with_capacity(hex_len(bytes));
+    prefixed.push_str("\\x");
+    bytes.iter().fold(prefixed, |mut out, b| {
         // Writing to a String is infallible.
         let _ = write!(out, "{b:02x}");
         out
     })
+}
+
+/// How long [`hex`] renders `bytes`: the `\x` prefix, two digits a byte.
+pub(super) fn hex_len(bytes: &[u8]) -> usize {
+    bytes.len().saturating_mul(2).saturating_add(2)
 }
 
 /// ISO-8601 duration. Postgres keeps months, days and microseconds apart
@@ -131,35 +141,52 @@ pub(super) fn lsn(position: u64) -> String {
 /// A `tsvector` in Postgres' text form: `'lexeme':1A,2 'other'`. The wire
 /// form is a count, then per lexeme its NUL-terminated text, a position
 /// count and the positions — 14 bits of position under 2 bits of weight.
-pub(super) fn tsvector(wire: &[u8]) -> Option<String> {
-    let (count, mut rest) = wire.split_first_chunk::<4>()?;
+/// Each lexeme is charged before it is appended: escaping can double it.
+pub(super) fn tsvector(wire: &[u8], weight: &mut RowWeight<'_>) -> Result<String, Refused> {
+    let (count, mut rest) = wire.split_first_chunk::<4>().ok_or(Refused::Undecodable)?;
     let mut out = String::new();
+    let mut lexeme = String::new();
     for index in 0..u32::from_be_bytes(*count) {
-        let end = rest.iter().position(|&byte| byte == 0)?;
-        let lexeme = std::str::from_utf8(&rest[..end]).ok()?;
-        let (positions, after) = rest[end + 1..].split_first_chunk::<2>()?;
-        rest = after;
-        if index > 0 {
+        lexeme.clear();
+        rest = tsvector_lexeme(rest, &mut lexeme).ok_or(Refused::Undecodable)?;
+        let separator = usize::from(index > 0);
+        if !weight.charge(separator + lexeme.len()) {
+            return Err(Refused::OverBudget);
+        }
+        if separator > 0 {
             out.push(' ');
         }
-        out.push('\'');
-        out.push_str(&lexeme.replace('\'', "''").replace('\\', "\\\\"));
-        out.push('\'');
-        for nth in 0..u16::from_be_bytes(*positions) {
-            let (position, after) = rest.split_first_chunk::<2>()?;
-            rest = after;
-            let position = u16::from_be_bytes(*position);
-            out.push(if nth == 0 { ':' } else { ',' });
-            out.push_str(&(position & 0x3FFF).to_string());
-            match position >> 14 {
-                3 => out.push('A'),
-                2 => out.push('B'),
-                1 => out.push('C'),
-                _ => {}
-            }
+        out.push_str(&lexeme);
+    }
+    if rest.is_empty() {
+        Ok(out)
+    } else {
+        Err(Refused::Undecodable)
+    }
+}
+
+/// One lexeme and its positions rendered into `out`; the wire left after it.
+fn tsvector_lexeme<'w>(wire: &'w [u8], out: &mut String) -> Option<&'w [u8]> {
+    let end = wire.iter().position(|&byte| byte == 0)?;
+    let text = std::str::from_utf8(&wire[..end]).ok()?;
+    let (positions, mut rest) = wire[end + 1..].split_first_chunk::<2>()?;
+    out.push('\'');
+    out.push_str(&text.replace('\'', "''").replace('\\', "\\\\"));
+    out.push('\'');
+    for nth in 0..u16::from_be_bytes(*positions) {
+        let (position, after) = rest.split_first_chunk::<2>()?;
+        rest = after;
+        let position = u16::from_be_bytes(*position);
+        out.push(if nth == 0 { ':' } else { ',' });
+        out.push_str(&(position & 0x3FFF).to_string());
+        match position >> 14 {
+            3 => out.push('A'),
+            2 => out.push('B'),
+            1 => out.push('C'),
+            _ => {}
         }
     }
-    rest.is_empty().then_some(out)
+    Some(rest)
 }
 
 #[cfg(test)]
@@ -217,9 +244,12 @@ mod tests {
         wire.extend(7u16.to_be_bytes());
         wire.extend(b"plain\0");
         wire.extend(0u16.to_be_bytes());
-        assert_eq!(tsvector(&wire).as_deref(), Some("'it''s':1A,7 'plain'"));
-        assert_eq!(tsvector(&wire[..wire.len() - 1]), None);
-        assert_eq!(tsvector(&0u32.to_be_bytes()).as_deref(), Some(""));
+        let budget = crate::exec::budget::ResultBudget::new(1);
+        let mut weight = RowWeight::new(&budget);
+        let mut render = |wire: &[u8]| tsvector(wire, &mut weight);
+        assert_eq!(render(&wire).as_deref(), Ok("'it''s':1A,7 'plain'"));
+        assert_eq!(render(&wire[..wire.len() - 1]), Err(Refused::Undecodable));
+        assert_eq!(render(&0u32.to_be_bytes()).as_deref(), Ok(""));
     }
 
     #[test]

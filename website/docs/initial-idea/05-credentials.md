@@ -81,7 +81,7 @@ Per `(server, database)`:
 - Max connections in config (default 4, sized from the 2026-11-12 production baseline: per-database concurrency 0–1)
 - Min connections 0 and idle timeout 5 min: the pool opens on first use and an idle gateway holds no target connection
 - Acquire timeout 5 s — fail fast so the agent gets `unavailable`. It is spent before the statement timeout starts, never counted against it
-- A separate cancel pool (2 connections, lazy) carries `pg_cancel_backend`, so cancels never queue behind the queries they are cancelling
+- A separate cancel pool (`PG_CANCEL_POOL_SIZE` connections, default 2, lazy) carries `pg_cancel_backend`, so cancels never queue behind the queries they are cancelling
 - Mongo: the same sizing, plus a 5 s server-selection and connect timeout
 - Redis: `max_connections` and `idle_timeout_s` as above; `min_connections` is ignored (nothing is opened ahead of use). One connection per in-flight command (no shared multiplexed connection). A connection returns to the pool only after a complete reply or a server error reply; one hit by a timeout, a client disconnect or an I/O error is closed, never reused — its reply may still be in flight. A connection the server closed while idle fails that one call with `unavailable`; there is no retry
 - YugabyteDB (as `kind: postgres`): the Postgres pool unchanged. On release a connection gets the same reset as Postgres; a server without advisory locks rejects the unlock as `feature_not_supported`, and the gateway then repeats the resets without the unlock and keeps the connection (since 2.0.1)

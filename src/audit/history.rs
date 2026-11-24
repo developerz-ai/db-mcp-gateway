@@ -18,6 +18,10 @@ pub struct HistoryEntry {
     /// `sql` was cut — at [`HISTORY_SQL_MAX_BYTES`] here, or at
     /// [`super::AUDIT_SQL_MAX_BYTES`] when the row was stored.
     pub sql_truncated: bool,
+    /// Lowercase hex SHA-256 of `sql` as `audit_calls` stores it — before
+    /// the [`HISTORY_SQL_MAX_BYTES`] cut, after the store-time one. `None`
+    /// without `sql`.
+    pub sql_sha256: Option<String>,
     pub reason: Option<String>,
     pub occurred_at: String,
     pub elapsed_ms: Option<i64>,
@@ -72,6 +76,8 @@ pub struct HistoryQuery<'a> {
     /// only that run's rows come back, so agents sharing one token do not
     /// read each other's history by default. `None` for SSO sessions.
     pub upstream_run_id: Option<&'a str>,
+    /// Only the entries whose `sql_sha256` is this (lowercase hex).
+    pub sql_sha256: Option<&'a str>,
     pub since: Option<DateTime<Utc>>,
     pub before: Option<HistoryCursor>,
     pub limit: u32,

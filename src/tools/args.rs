@@ -20,6 +20,9 @@ const IDENTIFIER_MAX_BYTES: usize = 128;
 const REASON_MAX_BYTES: usize = 1024;
 /// The audit cap: every statement that runs is stored whole.
 const SQL_MAX_BYTES: usize = AUDIT_SQL_MAX_BYTES;
+/// Every string inside `params` — values and object keys at any depth. The
+/// tools hold each param's whole JSON to the same bound.
+const PARAMS_MAX_BYTES: usize = 64 * 1024;
 /// Any other string argument (`since`, `cursor`).
 const OTHER_MAX_BYTES: usize = 1024;
 /// Argument names; every real one is a short identifier.
@@ -71,16 +74,27 @@ fn check_object(map: &Map<String, Value>) -> Result<(), String> {
 
 fn check_value(key: &str, value: &Value, text: Text, max: usize) -> Result<(), String> {
     match value {
-        Value::String(s) if s.len() > max => Err(format!("`{key}` exceeds {max} bytes")),
-        Value::String(s) if has_forbidden_char(s, text) => {
-            Err(format!("`{key}` contains a control character"))
-        }
+        Value::String(s) => check_text(key, s, text, max),
         Value::Array(items) => items
             .iter()
             .try_for_each(|item| check_value(key, item, text, max)),
+        Value::Object(map) if key == "params" => map.iter().try_for_each(|(name, item)| {
+            check_text(key, name, text, max)?;
+            check_value(key, item, text, max)
+        }),
         Value::Object(map) => check_object(map),
         _ => Ok(()),
     }
+}
+
+fn check_text(key: &str, s: &str, text: Text, max: usize) -> Result<(), String> {
+    if s.len() > max {
+        return Err(format!("`{key}` exceeds {max} bytes"));
+    }
+    if has_forbidden_char(s, text) {
+        return Err(format!("`{key}` contains a control character"));
+    }
+    Ok(())
 }
 
 fn rule_for(key: &str) -> (Text, usize) {
@@ -90,6 +104,8 @@ fn rule_for(key: &str) -> (Text, usize) {
         (Text::Free, SQL_MAX_BYTES)
     } else if key == "reason" {
         (Text::Free, REASON_MAX_BYTES)
+    } else if key == "params" {
+        (Text::Free, PARAMS_MAX_BYTES)
     } else {
         (Text::Free, OTHER_MAX_BYTES)
     }

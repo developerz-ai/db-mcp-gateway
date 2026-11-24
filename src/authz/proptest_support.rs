@@ -61,6 +61,9 @@ pub(super) fn any_grant() -> impl Strategy<Value = Grant> {
         any_constraints(),
     )
         .prop_map(|(server, database, action, constraints)| Grant {
+            except: Vec::new(),
+            profile: None,
+            expires_at: None,
             server,
             database,
             action,
@@ -95,7 +98,7 @@ pub(super) fn identity_in(group: &str) -> Identity {
 /// Wrap a flat `Vec<Grant>` into one `Permission` keyed on `group`.
 pub(super) fn as_yaml_for(group: &str, grants: Vec<Grant>) -> Vec<Permission> {
     vec![Permission {
-        group: group.to_string(),
+        subject: crate::config::schema::Subject::Group(group.to_string()),
         grants,
     }]
 }

@@ -20,6 +20,7 @@ fn database(name: &str) -> Database {
         password: Password::Literal("pw".into()),
         description: String::new(),
         auth_database: None,
+        connect_name: None,
         pool: None,
         write_role: None,
         write_password: None,
@@ -42,6 +43,9 @@ fn server(name: &str) -> Server {
 
 fn grant(server: &str, database: &str, action: Action) -> Grant {
     Grant {
+        except: Vec::new(),
+        profile: None,
+        expires_at: None,
         server: server.to_string(),
         database: database.to_string(),
         action,
@@ -51,6 +55,9 @@ fn grant(server: &str, database: &str, action: Action) -> Grant {
 
 fn grant_with(server: &str, database: &str, action: Action, constraints: Constraints) -> Grant {
     Grant {
+        except: Vec::new(),
+        profile: None,
+        expires_at: None,
         server: server.to_string(),
         database: database.to_string(),
         action,
@@ -60,7 +67,7 @@ fn grant_with(server: &str, database: &str, action: Action, constraints: Constra
 
 fn permission(group: &str, server: &str, action: Action) -> Permission {
     Permission {
-        group: group.to_string(),
+        subject: crate::config::schema::Subject::Group(group.to_string()),
         grants: vec![grant(server, "*", action)],
     }
 }
@@ -126,7 +133,7 @@ fn db_grant_respects_action_hierarchy() {
 fn yaml_and_db_grants_merge_constraints() {
     let id = identity(&["oncall"]);
     let yaml_perms = vec![Permission {
-        group: "oncall".to_string(),
+        subject: crate::config::schema::Subject::Group("oncall".to_string()),
         grants: vec![grant_with(
             "prod",
             "app",
@@ -172,7 +179,7 @@ fn yaml_and_db_grants_merge_constraints() {
 fn evaluate_merges_yaml_and_db_most_restrictive() {
     let id = identity(&["engineers"]);
     let yaml_perms = vec![Permission {
-        group: "engineers".to_string(),
+        subject: crate::config::schema::Subject::Group("engineers".to_string()),
         grants: vec![grant_with(
             "*",
             "*",

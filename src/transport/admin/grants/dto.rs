@@ -42,6 +42,10 @@ pub struct CreateGrantRequest {
     /// being silently accepted.
     #[serde(default)]
     pub constraints: Constraints,
+    /// Evaluation ignores the grant from this instant on. Must be in the
+    /// future when given; absent never expires.
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// PATCH only touches the **mutable** fields. The target (Specific vs
@@ -60,6 +64,10 @@ pub struct UpdateGrantRequest {
     pub action: Option<String>,
     #[serde(default)]
     pub constraints: Option<ConstraintsPatch>,
+    /// Tri-state: absent keeps it, `null` clears it (never expires), a
+    /// timestamp sets it.
+    #[serde(default, deserialize_with = "crate::authz::patch::present")]
+    pub expires_at: Option<Option<DateTime<Utc>>>,
     /// Optimistic-concurrency precondition: 409 if the row's `updated_at`
     /// differs.
     #[serde(default)]
@@ -81,6 +89,10 @@ pub struct GrantResponse {
     pub db_name_wildcard: bool,
     pub action: String,
     pub constraints: JsonValue,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Past `expires_at`: still listed, no longer evaluated.
+    pub expired: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -88,6 +100,7 @@ pub struct GrantResponse {
 impl From<PermissionsGrant> for GrantResponse {
     fn from(g: PermissionsGrant) -> Self {
         let (server, database_id, db_name_wildcard) = g.target.columns();
+        let expired = g.expires_at.is_some_and(|at| Utc::now() >= at);
         Self {
             id: g.id,
             user_id: g.user_id,
@@ -96,6 +109,8 @@ impl From<PermissionsGrant> for GrantResponse {
             db_name_wildcard,
             action: g.action.as_db_str().to_string(),
             constraints: g.constraints,
+            expires_at: g.expires_at,
+            expired,
             created_at: g.created_at,
             updated_at: g.updated_at,
         }

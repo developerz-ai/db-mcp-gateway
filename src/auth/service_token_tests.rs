@@ -266,3 +266,20 @@ fn a_weak_second_token_is_rejected_at_boot() {
     let err = ServiceTokenStore::from_config(&[rotating]).expect_err("weak must fail");
     assert!(matches!(err, ServiceTokenError::WeakToken(name) if name == "ci-bot"));
 }
+
+#[test]
+fn a_large_rotation_list_loads_in_linear_time() {
+    // A pairwise duplicate check is ~2·10⁸ compares here: minutes, not the
+    // milliseconds a digest set takes.
+    let mut fleet = account("ci-bot", "svc-ci", &good_token("0"));
+    fleet.tokens = (1..=20_000u32)
+        .map(|i| Password::Literal(SecretString::from(good_token(&format!("{i:x}")))))
+        .collect();
+    let started = std::time::Instant::now();
+    ServiceTokenStore::from_config(&[fleet]).expect("distinct tokens load");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}

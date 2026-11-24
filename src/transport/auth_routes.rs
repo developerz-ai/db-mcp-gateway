@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{AuthError, Identity, pkce};
+use crate::auth::{AuthError, Identity};
 
 use super::app_state::OAuthState;
 use super::oauth::{self, PageContext, random_token};
@@ -29,13 +29,16 @@ pub struct LoginResponse {
 pub async fn login(State(state): State<OAuthState>) -> Result<Response, AuthError> {
     let auth = &state.auth;
     let csrf_state = random_token();
-    let nonce = random_token();
-    let (verifier, challenge) = pkce::generate();
+    let secrets = auth.flows.login_secrets(&csrf_state);
     let url = auth
         .oidc
-        .authorize_url(&csrf_state, &nonce, &challenge)
+        .authorize_url(&csrf_state, &secrets.nonce, &secrets.idp_challenge())
         .await?;
-    auth.flows.insert(csrf_state.clone(), nonce, verifier).await;
+    // The store logged the cause; full or unreachable, a retryable 503.
+    auth.flows
+        .insert(&csrf_state)
+        .await
+        .map_err(|_| AuthError::StoreFull)?;
     Ok(no_store(Json(LoginResponse {
         login_url: url.to_string(),
         state: csrf_state,
@@ -92,7 +95,10 @@ pub async fn callback(
     // restarted mid-login. Recoverable on OUR side — never a 502, which reads
     // as an outage and hides the fix.
     let flow = match params.state.as_deref() {
-        Some(flow_state) => auth.flows.take(flow_state).await,
+        Some(flow_state) => match auth.flows.take(flow_state).await {
+            Ok(flow) => flow,
+            Err(_) => return oauth::login_unavailable(&page),
+        },
         None => None,
     };
     let Some(flow) = flow else {

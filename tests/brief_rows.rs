@@ -13,6 +13,9 @@
 //! swapping two rows — fails here. `EXPECTED_IDS` additionally pins the five
 //! ids themselves, so a reworded id fails even when its tokens still derive.
 
+// CLAUDE.md §Conventions: tests may panic; `[lints.clippy]` denies it for shipped code.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 

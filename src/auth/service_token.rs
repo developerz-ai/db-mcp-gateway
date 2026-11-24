@@ -14,8 +14,11 @@
 //! `Debug`/`Display` for anything in this module; the store compare is
 //! constant-time.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret as _, SecretString};
+use sha2::{Digest as _, Sha256};
 
 /// Strict boot-time shape check: `dbmcp_svc_` + exactly 64 lowercase
 /// ASCII-hex characters. Anything else (short, overlong, non-hex,
@@ -121,6 +124,9 @@ impl ServiceTokenStore {
     /// can't honour its configured auth surface must not serve.
     pub fn from_config(accounts: &[ServiceAccount]) -> Result<Self, ServiceTokenError> {
         let mut tokens: Vec<ResolvedServiceToken> = Vec::with_capacity(accounts.len());
+        // Digest → owning account, for the duplicate check: keyed by digest
+        // so no map holds token material, and linear in the token count.
+        let mut seen: HashMap<[u8; 32], &str> = HashMap::new();
         for account in accounts {
             let policy = ServicePolicy {
                 require_upstream: account.require_upstream,
@@ -134,7 +140,7 @@ impl ServiceTokenStore {
                 let token = reference
                     .resolve()
                     .map_err(|source| ServiceTokenError::Resolve(account.name.clone(), source))?;
-                reject_unusable(&tokens, &account.name, token.expose_secret())?;
+                reject_unusable(&mut seen, &account.name, token.expose_secret())?;
                 tokens.push(ResolvedServiceToken {
                     name: account.name.clone(),
                     group: account.group.clone(),
@@ -168,20 +174,18 @@ impl ServiceTokenStore {
 
 /// Refuse a malformed token, or one already resolved — for another account or
 /// this one — so `authenticate` never has to pick between two entries.
-fn reject_unusable(
-    resolved: &[ResolvedServiceToken],
-    name: &str,
+fn reject_unusable<'a>(
+    seen: &mut HashMap<[u8; 32], &'a str>,
+    name: &'a str,
     token: &str,
 ) -> Result<(), ServiceTokenError> {
     if !is_well_formed_token(token) {
         return Err(ServiceTokenError::WeakToken(name.to_string()));
     }
-    match resolved
-        .iter()
-        .find(|existing| ct_eq(existing.token.expose_secret().as_bytes(), token.as_bytes()))
-    {
+    let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+    match seen.insert(digest, name) {
         Some(existing) => Err(ServiceTokenError::DuplicateToken(
-            existing.name.clone(),
+            existing.to_string(),
             name.to_string(),
         )),
         None => Ok(()),

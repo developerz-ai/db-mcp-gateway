@@ -38,6 +38,7 @@ pub(super) fn grant_payload(g: &PermissionsGrant) -> JsonValue {
         "db_name_wildcard": wildcard,
         "action": g.action.as_db_str(),
         "constraints": g.constraints,
+        "expires_at": g.expires_at,
         "created_at": g.created_at,
         "updated_at": g.updated_at,
     })

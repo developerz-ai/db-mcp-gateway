@@ -1,0 +1,29 @@
+# Every optional template on: helm lint / kubeconform input (tests/deploy_catalogue.rs).
+oidc:
+  issuer: https://idp.example.com
+  clientId: db-mcp-gateway
+  redirectUrl: https://db-gateway.example.com/auth/callback
+tls:
+  certManager:
+    enabled: true
+    issuerRef:
+      name: letsencrypt
+    dnsNames: [db-gateway.example.com]
+secretMounts:
+  - name: prod-app-ro
+    secretName: prod-app-ro
+    mountPath: /etc/gateway/secrets/prod-app-ro
+metrics:
+  serviceMonitor:
+    enabled: true
+  prometheusRule:
+    enabled: true
+autoscaling:
+  enabled: true
+networkPolicy:
+  egress:
+    stateDb:
+      to:
+        - ipBlock: { cidr: 10.20.0.0/24 }
+      ports:
+        - { port: 5432, protocol: TCP }

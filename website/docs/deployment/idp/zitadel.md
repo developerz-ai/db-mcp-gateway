@@ -31,7 +31,7 @@ OIDC_SCOPES=openid email profile
 
 `OIDC_SCOPES` drops `groups`, which Zitadel does not define.
 
-**Organisations.** The value under each role lists the organisations that granted it; the gateway reads only the role name. If the project is granted to other organisations (project grants), their users holding a role match too. Either don't grant the gateway's project to organisations you don't trust, or emit a filtered claim with an Action (below).
+**Organisations.** The value under each role lists the organisations that granted it; the gateway reads only the role name, and counts a role only when its value is such an object (or `true`) — a role mapped to `false` or `null` grants nothing. If the project is granted to other organisations (project grants), their users holding a role match too. Either don't grant the gateway's project to organisations you don't trust, or emit a filtered claim with an Action (below).
 
 ### Filtering with an Action (only when needed)
 
@@ -59,12 +59,25 @@ Then keep the default `OIDC_GROUPS_CLAIM=groups`.
 
 ## Gateway settings
 
+Pick the groups claim by setup. **Without** the filtering Action, read the project-scoped roles claim:
+
 ```env
 OIDC_ISSUER=https://auth.acme.com        # your Zitadel instance / custom domain
 OIDC_CLIENT_ID=<client-id>
 OIDC_CLIENT_SECRET=…
 OIDC_REDIRECT_URL=https://db.internal.acme.com/auth/callback
 OIDC_GROUPS_CLAIM=urn:zitadel:iam:org:project:<projectId>:roles
+OIDC_SCOPES=openid email profile
+```
+
+**With** the filtering Action, read the Action's `groups` claim instead — pointing at the roles claim would bypass the organisation filter:
+
+```env
+OIDC_ISSUER=https://auth.acme.com
+OIDC_CLIENT_ID=<client-id>
+OIDC_CLIENT_SECRET=…
+OIDC_REDIRECT_URL=https://db.internal.acme.com/auth/callback
+OIDC_GROUPS_CLAIM=groups
 OIDC_SCOPES=openid email profile
 ```
 

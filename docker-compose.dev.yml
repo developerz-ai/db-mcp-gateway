@@ -3,7 +3,7 @@
 
 services:
   state-db:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d
     environment:
       POSTGRES_USER: ${STATE_DB_USER:-gateway}
       POSTGRES_PASSWORD: ${STATE_DB_PASSWORD:-gateway-dev-only}
@@ -23,7 +23,7 @@ services:
       retries: 10
 
   target-db:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d
     environment:
       POSTGRES_USER: ${TARGET_DB_USER:-app}
       POSTGRES_PASSWORD: ${TARGET_DB_PASSWORD:-app-dev-only}
@@ -42,7 +42,7 @@ services:
   # Mysql permissions store for #59. Optional — only opened when
   # `permissions_store.driver = mysql` in YAML. State DB itself stays pg.
   permissions-mysql:
-    image: mysql:8
+    image: mysql:8@sha256:8c233bad33d520a7aae1c1e619c3a9775f4a1ba2d463d692fada04ec7f40be00
     environment:
       MYSQL_ROOT_PASSWORD: ${PERMISSIONS_MYSQL_ROOT_PASSWORD:-mysql-dev-only}
       MYSQL_DATABASE: ${PERMISSIONS_MYSQL_DB:-permissions}
@@ -64,7 +64,7 @@ services:
   # via spec 05; for the dev stack we lean on the rejector as the gateway
   # guardrail and keep the container's auth bootstrap simple.
   target-mongo:
-    image: mongo:7
+    image: mongo:7@sha256:41e8195b2791692695e1dc9bd21cd51d0a3af05fff8ace9304a5c1acf94f1ae1
     environment:
       MONGO_INITDB_ROOT_USERNAME: ${TARGET_MONGO_USER:-app}
       MONGO_INITDB_ROOT_PASSWORD: ${TARGET_MONGO_PASSWORD:-app-dev-only}
@@ -89,7 +89,7 @@ services:
   # which the gateway refuses as a role; tests create a least-privilege ACL
   # user (`+@read`, key-scoped) through it, as an operator would.
   target-redis:
-    image: redis:8.4-alpine
+    image: redis:8.4-alpine@sha256:ff72f74e4f471df79ed920aa8bbc35efe72ff8a1f8acdc50aad5dbb9b14a4034
     command: ["redis-server", "--requirepass", "${TARGET_REDIS_PASSWORD:-redis-dev-only}", "--save", "", "--appendonly", "no"]
     ports:
       # Bind to localhost only (see state-db above).
@@ -105,7 +105,7 @@ services:
   # Dragonfly target: Redis-protocol compatible, the same `kind: redis`.
   # The same Redis suite runs against it so a protocol difference fails CI.
   target-dragonfly:
-    image: docker.dragonflydb.io/dragonflydb/dragonfly:v1.39.0
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:v1.39.0@sha256:0fa01a2b929e704c7a9300d23e7f52002ebd39e90996fb8bb63826aed92fa06f
     command: ["dragonfly", "--requirepass=${TARGET_DRAGONFLY_PASSWORD:-dragonfly-dev-only}", "--maxmemory=512mb", "--proactor_threads=2", "--dbfilename="]
     ulimits:
       memlock: -1
@@ -130,7 +130,7 @@ services:
   # with password auth on, then waits on yugabyted so its exit stops the
   # container.
   target-yugabyte:
-    image: yugabytedb/yugabyte:2.25.2.0-b359
+    image: yugabytedb/yugabyte:2.25.2.0-b359@sha256:f1b868431c9f71013f451df8cc63c59886568bb1254e4cb6f98de14d0232a3ad
     profiles: ["yugabyte"]
     environment:
       YB_APP_USER: ${TARGET_DB_USER:-app}
@@ -177,7 +177,7 @@ services:
   # `bin/test` never start it (the tests run their own mock IdP). examples/demo
   # profile `sso` uses the same config and port: run one at a time.
   dex:
-    image: ghcr.io/dexidp/dex:v2.45.1
+    image: ghcr.io/dexidp/dex:v2.45.1@sha256:8499afd690c437f52301efd2b05b2455da5bd2dfc20332cd697dc9937f808462
     profiles: ["idp"]
     command: ["dex", "serve", "/etc/dex/config.yaml"]
     ports:

@@ -210,7 +210,12 @@ async fn describe_full(gateway: &LoggedInGateway, coll: &str) -> Value {
     )
     .await;
     assert_eq!(row.outcome, "success");
-    assert_eq!(row.sql.as_deref(), Some(format!("app.{coll}").as_str()));
+    let plain = format!("app.{coll}");
+    let sql = row.sql.as_deref().unwrap_or_default();
+    assert!(
+        sql == plain || sql == format!("{plain} [detail=full, sampled ≤ 100 docs per collection]"),
+        "{sql}"
+    );
     let text = response["result"]["content"][0]["text"]
         .as_str()
         .expect("text");

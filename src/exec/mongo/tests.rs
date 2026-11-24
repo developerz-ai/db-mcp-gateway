@@ -24,6 +24,7 @@ fn database_for(name: &str, role: &str, password: &str) -> Database {
         password: Password::Literal(password.into()),
         description: String::new(),
         auth_database: None,
+        connect_name: None,
         pool: None,
         write_role: None,
         write_password: None,

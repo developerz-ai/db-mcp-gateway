@@ -230,6 +230,23 @@ fn guard(sql: &str, access: Access) -> Result<Access, GuardError> {
     }
 }
 
+/// `sql` up to the end of its last token, a terminating `;` dropped: the
+/// text that nests as a subquery. Read off Postgres's own token boundaries,
+/// so a comment after the `;` (`… ; -- note`) cannot hide it, and a `;`
+/// inside a string or comment is never taken for it. `None` when the text
+/// does not scan (the guard has then refused it already).
+pub(crate) fn statement_body(sql: &str) -> Option<&str> {
+    let lexemes = pg_scan::scan(sql).ok()?;
+    // Past every lexeme that is nothing but `;`, then the `;`s ending the
+    // last that is not (adjacent symbols merge, as in `);`).
+    let kept = |lexeme: &pg_scan::Lexeme| match lexeme.kind {
+        pg_scan::Kind::Symbols => sql[lexeme.start..lexeme.end].trim_end_matches(';').len(),
+        _ => lexeme.end - lexeme.start,
+    };
+    let last = lexemes.iter().rev().find(|lexeme| kept(lexeme) > 0)?;
+    Some(&sql[..last.start + kept(last)])
+}
+
 /// Only a `Query` reads; every other admitted shape is a data write.
 fn required_access(stmt: &Statement) -> Access {
     match stmt {

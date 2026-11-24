@@ -18,6 +18,7 @@ pub mod explain;
 pub mod get_query_history;
 pub mod list_databases;
 pub mod list_servers;
+mod query_params;
 pub mod run_query;
 pub mod sample_table;
 pub mod table_stats;

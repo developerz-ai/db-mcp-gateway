@@ -22,6 +22,7 @@ fn database(name: &str) -> Database {
         password: Password::Literal("pw".into()),
         description: String::new(),
         auth_database: None,
+        connect_name: None,
         pool: None,
         write_role: None,
         write_password: None,
@@ -44,8 +45,11 @@ fn server(name: &str) -> Server {
 
 fn permission(group: &str, server: &str, action: Action) -> Permission {
     Permission {
-        group: group.to_string(),
+        subject: crate::config::schema::Subject::Group(group.to_string()),
         grants: vec![Grant {
+            except: Vec::new(),
+            profile: None,
+            expires_at: None,
             server: server.to_string(),
             database: "*".to_string(),
             action,
@@ -56,8 +60,11 @@ fn permission(group: &str, server: &str, action: Action) -> Permission {
 
 fn permission_db(group: &str, server: &str, database: &str, action: Action) -> Permission {
     Permission {
-        group: group.to_string(),
+        subject: crate::config::schema::Subject::Group(group.to_string()),
         grants: vec![Grant {
+            except: Vec::new(),
+            profile: None,
+            expires_at: None,
             server: server.to_string(),
             database: database.to_string(),
             action,
@@ -74,8 +81,11 @@ fn permission_with(
     constraints: Constraints,
 ) -> Permission {
     Permission {
-        group: group.to_string(),
+        subject: crate::config::schema::Subject::Group(group.to_string()),
         grants: vec![Grant {
+            except: Vec::new(),
+            profile: None,
+            expires_at: None,
             server: server.to_string(),
             database: database.to_string(),
             action,

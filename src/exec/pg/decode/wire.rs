@@ -100,20 +100,42 @@ impl Scalar {
         })
     }
 
+    /// Text whose length follows the wire's is charged before it is built;
+    /// a rendering of a fixed-width value, once built.
     pub(super) fn decode(self, wire: &[u8], weight: &mut RowWeight<'_>) -> Result<Value, Refused> {
+        match self {
+            Self::Numeric => return numeric(wire, weight).map(Value::from),
+            Self::TsVector => return render::tsvector(wire, weight).map(Value::from),
+            Self::Text => {
+                charge(weight, wire.len())?;
+                let text = String::from_utf8(wire.to_vec()).map_err(|_| Refused::Undecodable)?;
+                return Ok(Value::from(text));
+            }
+            Self::Bytea => {
+                charge(weight, render::hex_len(wire))?;
+                return Ok(Value::from(render::hex(wire)));
+            }
+            _ => {}
+        }
+        let decoded = self.decode_fixed(wire).ok_or(Refused::Undecodable)?;
+        if let Value::String(rendered) = &decoded {
+            charge(weight, rendered.len())?;
+        }
+        Ok(decoded)
+    }
+
+    fn decode_fixed(self, wire: &[u8]) -> Option<Value> {
         let text = |rendered: Option<String>| rendered.map(Value::from);
-        let decoded = match self {
+        match self {
             Self::Bool => fixed(wire).map(|[byte]: [u8; 1]| Value::from(byte != 0)),
             Self::Int2 => fixed(wire).map(|b| Value::from(i16::from_be_bytes(b))),
             Self::Int4 => fixed(wire).map(|b| Value::from(i32::from_be_bytes(b))),
             Self::Int8 => fixed(wire).map(|b| Value::from(i64::from_be_bytes(b))),
             Self::Float4 => fixed(wire).map(|b| render::float(f64::from(f32::from_be_bytes(b)))),
             Self::Float8 => fixed(wire).map(|b| render::float(f64::from_be_bytes(b))),
-            Self::Numeric => return numeric(wire, weight).map(Value::from),
             Self::Money(digits) => {
                 fixed(wire).map(|b| Value::from(money(i64::from_be_bytes(b), digits)))
             }
-            Self::Text => text(String::from_utf8(wire.to_vec()).ok()),
             Self::Uuid => text(Uuid::from_slice(wire).ok().map(|uuid| uuid.to_string())),
             Self::TimestampTz => text(datetime::timestamptz(wire)),
             Self::Timestamp => text(datetime::timestamp(wire)),
@@ -125,13 +147,20 @@ impl Scalar {
             Self::Char => {
                 fixed(wire).map(|[byte]: [u8; 1]| Value::from(render::catalog_char(byte)))
             }
-            Self::TsVector => text(render::tsvector(wire)),
             Self::PgLsn => fixed(wire).map(|b| Value::from(render::lsn(u64::from_be_bytes(b)))),
-            Self::Bytea => Some(Value::from(render::hex(wire))),
             Self::Interval => interval(wire).map(|v| Value::from(render::interval(&v))),
             Self::Inet => text(render::inet(wire)),
-        };
-        decoded.ok_or(Refused::Undecodable)
+            // Decoded above, against the budget.
+            Self::Numeric | Self::TsVector | Self::Text | Self::Bytea => None,
+        }
+    }
+}
+
+fn charge(weight: &mut RowWeight<'_>, bytes: usize) -> Result<(), Refused> {
+    if weight.charge(bytes) {
+        Ok(())
+    } else {
+        Err(Refused::OverBudget)
     }
 }
 
@@ -154,8 +183,9 @@ fn interval(wire: &[u8]) -> Option<PgInterval> {
 /// A one-dimensional array of `element`: a JSON array whose items may be
 /// `null`. The wire form is `dimensions, has-nulls flag, element OID`, a
 /// `(length, lower bound)` pair per dimension, then each item behind its own
-/// length (`-1` for NULL). Every item is charged before it is decoded: a
-/// `bool[]` item is five bytes on the wire and a whole [`Value`] decoded.
+/// length (`-1` for NULL). Every item's [`Value`] is charged before any is
+/// reserved — a `bool[]` item is five bytes on the wire and a whole `Value`
+/// decoded — and each item's text as it is decoded.
 pub(super) fn array(
     element: Scalar,
     wire: &[u8],
@@ -173,13 +203,14 @@ pub(super) fn array(
         // Nested arrays would need a shape; the marker says to cast.
         _ => return Err(Refused::Undecodable),
     };
-    // An item is at least its four length bytes, so `length` cannot make
-    // this reserve more than the wire form holds.
-    let mut items = Vec::with_capacity(length.min(reader.0.len() / 4));
+    // An item is at least its four length bytes: more items than that is
+    // a length the bytes do not back.
+    if length > reader.0.len() / 4 {
+        return Err(Refused::Undecodable);
+    }
+    charge(weight, length.saturating_mul(size_of::<Value>()))?;
+    let mut items = Vec::with_capacity(length);
     for _ in 0..length {
-        if !weight.charge(size_of::<Value>()) {
-            return Err(Refused::OverBudget);
-        }
         items.push(match usize::try_from(reader.int()?) {
             Ok(len) => element.decode(reader.take(len)?, weight)?,
             Err(_) => Value::Null,

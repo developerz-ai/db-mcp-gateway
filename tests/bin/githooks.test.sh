@@ -61,6 +61,36 @@ grep -qxF 'config/dbmcp_svc_<redacted>.yaml' "$work/output" || fail "file name n
 git -C "$repo" rm -q --cached "config/$token.yaml"
 rm "$repo/config/$token.yaml"
 
+# A binary file's patch has no added lines: the staged blob is scanned as bytes.
+printf '\0\001bin\0%s\0' "$token" > "$repo/config/blob.bin"
+git -C "$repo" add config/blob.bin
+if hook pre-commit; then fail 'token inside a staged binary file accepted'; fi
+grep -qxF 'config/blob.bin' "$work/output" || fail "binary refusal does not name the file: $(<"$work/output")"
+! grep -qF "$token" "$work/output" || fail 'binary refusal echoed the token'
+git -C "$repo" rm -q --cached config/blob.bin
+
+# Cleaning up a leak commits: deleting a file whose name (or content) holds a
+# token, or renaming it to a clean name, stages nothing to scan. Renaming a
+# clean file to a token name is refused.
+git -C "$repo" commit -q --no-verify -m base
+printf 'x\n' > "$repo/config/$token.yaml"
+printf 'token: %s\n' "$token" > "$repo/config/leaked.yaml"
+printf 'clean\n' > "$repo/config/plain.yaml"
+git -C "$repo" add config
+git -C "$repo" commit -q --no-verify -m leak
+git -C "$repo" rm -q "config/$token.yaml" config/leaked.yaml
+hook pre-commit || fail "deleting leaked files refused: $(<"$work/output")"
+git -C "$repo" reset -q --hard
+git -C "$repo" mv "config/$token.yaml" config/renamed.yaml
+hook pre-commit || fail "renaming a leaked name away refused: $(<"$work/output")"
+git -C "$repo" reset -q --hard
+git -C "$repo" mv config/plain.yaml "config/new-$token.yaml"
+if hook pre-commit; then fail 'renaming to a token name accepted'; fi
+grep -qxF 'config/new-dbmcp_svc_<redacted>.yaml' "$work/output" || fail "rename target not named: $(<"$work/output")"
+git -C "$repo" reset -q --hard
+git -C "$repo" rm -q "config/$token.yaml" config/leaked.yaml
+git -C "$repo" commit -q --no-verify -m cleanup
+
 # A scanner that errors is a refusal, never a clean pass.
 mkdir -p "$work/badgrep"
 printf '#!/usr/bin/env bash\nexit 2\n' > "$work/badgrep/grep"

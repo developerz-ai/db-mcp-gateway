@@ -7,6 +7,9 @@
 //! - `CLAUDE.md`'s Commands table names only `bin/` scripts that exist, and
 //!   names every one of them (`bin/lib/` holds sourced helpers, not commands).
 
+// CLAUDE.md §Conventions: tests may panic; `[lints.clippy]` denies it for shipped code.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -7,8 +7,11 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use super::schema::{LoggingBlock, Permission, Server, ServiceAccount, ServiceAccountSpec};
-use super::secret::SecretError;
+use super::schema::{
+    ConstraintProfiles, LoggingBlock, Permission, PermissionSpec, Server, ServerSpec,
+    ServiceAccount, ServiceAccountSpec, apply_constraint_profiles,
+};
+use super::secret::{SecretError, SiteSecretError};
 use admin::AdminBlock;
 
 pub use admin::{AdminConfig, AdminGroup};
@@ -21,8 +24,11 @@ mod gateway;
 mod limits;
 mod reload_diff;
 mod roles;
+mod secret_refs;
 mod service_accounts;
+mod targets;
 mod validate;
+mod validate_profiles;
 mod write_tier;
 
 #[derive(Debug, Clone)]
@@ -55,9 +61,13 @@ struct RawConfigFile {
     #[serde(default)]
     gateway: GatewayBlock,
     #[serde(default)]
-    servers: Vec<Server>,
+    servers: Vec<ServerSpec>,
     #[serde(default)]
-    permissions: Vec<Permission>,
+    permissions: Vec<PermissionSpec>,
+    /// Named constraint sets grants reference by `profile:`; folded into the
+    /// grants here, so `ConfigFile` carries only resolved constraints.
+    #[serde(default)]
+    constraint_profiles: ConstraintProfiles,
     #[serde(default)]
     admin: Option<AdminBlock>,
     #[serde(default)]
@@ -69,11 +79,27 @@ struct RawConfigFile {
 }
 
 impl RawConfigFile {
+    /// `servers:` and `permissions:` convert here rather than in serde: a
+    /// parse error drops its message (it could quote the file), these keep it.
     fn into_config(self) -> Result<ConfigFile, ConfigFileError> {
+        let servers = self
+            .servers
+            .into_iter()
+            .map(Server::try_from)
+            .collect::<Result<_, _>>()
+            .map_err(ConfigFileError::Invalid)?;
+        let mut permissions = self
+            .permissions
+            .into_iter()
+            .map(Permission::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ConfigFileError::Invalid)?;
+        apply_constraint_profiles(&self.constraint_profiles, &mut permissions)
+            .map_err(ConfigFileError::Invalid)?;
         Ok(ConfigFile {
             gateway: self.gateway,
-            servers: self.servers,
-            permissions: self.permissions,
+            servers,
+            permissions,
             admin: AdminConfig::from_block(self.admin)?,
             permissions_store: self.permissions_store,
             service_accounts: self
@@ -140,6 +166,17 @@ pub enum ConfigLoadError {
     File(#[from] ConfigFileError),
     #[error(transparent)]
     Secret(#[from] SecretError),
+    /// Every unresolved reference, from [`ConfigFile::resolve_all_secrets`].
+    #[error("{} secret reference(s) did not resolve:\n{}", .0.len(), list_secret_errors(.0))]
+    Secrets(Vec<SiteSecretError>),
+}
+
+fn list_secret_errors(errors: &[SiteSecretError]) -> String {
+    errors
+        .iter()
+        .map(|err| format!("  - {err}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl ConfigFile {
@@ -206,10 +243,10 @@ impl ConfigFile {
         let raw: RawConfigFile = serde_saphyr::from_str_with_options(raw, non_leaking_options())
             .map_err(|source| ConfigFileError::parse_from(PathBuf::from("<inline>"), source))?;
         let mut parsed = raw.into_config()?;
-        // Group names are compared to IdP claims verbatim; stray YAML
-        // whitespace would make a block silently match nobody.
+        // Group names and user subjects are compared to IdP claims verbatim;
+        // stray YAML whitespace would make a block silently match nobody.
         for permission in &mut parsed.permissions {
-            permission.group = permission.group.trim().to_string();
+            permission.subject.trim();
         }
         parsed.validate()?;
         Ok(parsed)

@@ -38,10 +38,20 @@ services:
       OIDC_CLIENT_ID: dev
       OIDC_CLIENT_SECRET: dev-only-oidc-secret
       OIDC_REDIRECT_URL: http://localhost:${DEMO_PORT:-8443}/auth/callback
-      # A fixed, public key: this container binds 0.0.0.0, where the gateway
-      # refuses ALLOW_INSECURE_SIGNING_KEY. Sessions signed with it are only
-      # as private as this file — a demo, never a deployment.
-      SESSION_SIGNING_KEY: demo-only-session-signing-key-not-for-production
+    # SESSION_SIGNING_KEY is random per demo project, minted by `mint-token`
+    # (this container binds 0.0.0.0, where a public key would let any compose
+    # peer forge sessions). The gateway reads it from the environment only and
+    # the distroless image has no shell, so mint-token also drops its static
+    # busybox into the volume and this entrypoint loads the key with the
+    # shell's own `read`: never on a command line, in `docker inspect`, or a log.
+    entrypoint:
+      - /run/demo-secrets/busybox
+      - sh
+      - -euc
+      - |
+        read -r SESSION_SIGNING_KEY < /run/demo-secrets/session-signing-key
+        export SESSION_SIGNING_KEY
+        exec /usr/local/bin/db-mcp-gateway
     ports:
       - "127.0.0.1:${DEMO_PORT:-8443}:8443"
     volumes:
@@ -92,27 +102,29 @@ services:
       timeout: 3s
       retries: 30
 
-  # Mints the dev-only service token once (same shape as bin/mint-service-token)
-  # into a volume only the gateway and `ready` mount.
+  # Mints the dev-only service token (same shape as bin/mint-service-token) and
+  # the session signing key once, into a volume only the gateway and `ready`
+  # mount, plus the busybox the gateway's entrypoint runs.
   mint-token:
-    image: busybox:1.38.0-musl
+    image: busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6
     volumes:
       - demo-secrets:/run/demo-secrets
     command:
       - sh
       - -euc
       - |
-        f=/run/demo-secrets/service-token
-        if [ ! -s "$$f" ]; then
-          umask 077
-          printf 'dbmcp_svc_%s' "$$(head -c 32 /dev/urandom | od -An -vtx1 | tr -d ' \n')" > "$$f"
-        fi
-        chown 65532:65532 "$$f"   # the image's nonroot user
-        chmod 0400 "$$f"
+        cd /run/demo-secrets
+        umask 077
+        hex32() { head -c 32 /dev/urandom | od -An -vtx1 | tr -d ' \n'; }
+        [ -s service-token ] || printf 'dbmcp_svc_%s' "$$(hex32)" > service-token
+        [ -s session-signing-key ] || printf '%s\n' "$$(hex32)" > session-signing-key
+        chown 65532:65532 service-token session-signing-key   # the image's nonroot user
+        chmod 0400 service-token session-signing-key
+        cp /bin/busybox busybox.new && chmod 0555 busybox.new && mv -f busybox.new busybox
 
   # Waits for the gateway, then prints the one line to paste.
   ready:
-    image: busybox:1.38.0-musl
+    image: busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6
     environment:
       DEMO_PORT: ${DEMO_PORT:-8443}
     volumes:
@@ -146,9 +158,11 @@ services:
 
   # Publishes Dex to the browser at the same http://localhost:5556. Dex lives
   # in the gateway's namespace, whose ports exist in every profile; this relay
-  # keeps 5556 unreserved unless `sso` is on.
+  # keeps 5556 unreserved unless `sso` is on. The digest pins a busybox whose
+  # `nc -lk -e` is a persistent server (one forked relay per connection);
+  # tests/bin/demo.test.sh reaches Dex through it, connection after connection.
   dex-port:
-    image: busybox:1.38.0-musl
+    image: busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6
     profiles: ["sso"]
     depends_on:
       dex:

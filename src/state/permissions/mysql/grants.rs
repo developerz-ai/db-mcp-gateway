@@ -52,7 +52,7 @@ where
 {
     let row = sqlx::query(
         "SELECT id, user_id, server, database_id, db_name_wildcard, action, \
-                constraints_json, created_at, updated_at, revoked_at \
+                constraints_json, created_at, updated_at, revoked_at, expires_at \
          FROM permissions_grants \
          WHERE id = ? AND revoked_at IS NULL",
     )
@@ -69,7 +69,7 @@ pub(super) async fn list_grants_for_user(
 ) -> Result<Vec<PermissionsGrant>, RepoError> {
     let rows = sqlx::query(
         "SELECT id, user_id, server, database_id, db_name_wildcard, action, \
-                constraints_json, created_at, updated_at, revoked_at \
+                constraints_json, created_at, updated_at, revoked_at, expires_at \
          FROM permissions_grants \
          WHERE user_id = ? AND revoked_at IS NULL \
          ORDER BY created_at",
@@ -100,7 +100,7 @@ pub(super) async fn list_grants(
     // index when the filter is set.
     let rows = sqlx::query(
         "SELECT id, user_id, server, database_id, db_name_wildcard, action, \
-                constraints_json, created_at, updated_at, revoked_at \
+                constraints_json, created_at, updated_at, revoked_at, expires_at \
          FROM permissions_grants \
          WHERE revoked_at IS NULL \
            AND (? IS NULL OR user_id = ?) \
@@ -139,7 +139,7 @@ pub(super) async fn live_grants_for_sub(
 ) -> Result<Vec<LiveGrant>, RepoError> {
     let rows = sqlx::query(
         "SELECT g.id, COALESCE(g.server, d.server) AS server, d.db_name, g.action, \
-                g.constraints_json \
+                g.constraints_json, g.expires_at \
          FROM permissions_grants g \
          JOIN permissions_users u ON u.id = g.user_id \
          LEFT JOIN permissions_databases d ON d.id = g.database_id AND d.deleted_at IS NULL \

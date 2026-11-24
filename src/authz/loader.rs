@@ -42,19 +42,22 @@ pub async fn load_db_grants_for(
 
 /// Project one store row. A wildcard becomes `database: "*"`, which the
 /// evaluator matches against the databases the *config* declares.
-pub(super) fn to_config_grant(grant: LiveGrant) -> Result<Grant, LoadError> {
+pub fn to_config_grant(grant: LiveGrant) -> Result<Grant, LoadError> {
     let constraints: Constraints = serde_json::from_value(grant.constraints).map_err(|source| {
         LoadError::DecodeConstraints {
             grant_id: grant.id,
             source,
         }
     })?;
-    Ok(Grant {
-        server: grant.server,
-        database: grant.db_name.unwrap_or_else(|| "*".to_string()),
-        action: action_from_db(grant.action),
+    let database = grant.db_name.as_deref().unwrap_or("*");
+    let mut config_grant = Grant::new(
+        &grant.server,
+        database,
+        action_from_db(grant.action),
         constraints,
-    })
+    );
+    config_grant.expires_at = grant.expires_at;
+    Ok(config_grant)
 }
 
 fn action_from_db(a: GrantAction) -> Action {

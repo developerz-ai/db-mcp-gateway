@@ -23,7 +23,16 @@ use tower::ServiceExt;
 const DISPATCH_TOKEN: &str =
     "dbmcp_svc_8888888888888888888888888888888888888888888888888888888888888888";
 const DISPATCH_SUB: &str = "service:metrics-bot";
-const DISPATCH_YAML: &str = "servers: []
+const DISPATCH_YAML: &str = "servers:
+  - name: metricsdb
+    kind: postgres
+    host: 127.0.0.1
+    port: 1
+    tls: insecure
+    databases:
+      - name: app
+        role: app
+        password: unused
 permissions:
   - group: svc-metrics
     grants: []
@@ -32,6 +41,9 @@ service_accounts:
     group: svc-metrics
     token: dbmcp_svc_8888888888888888888888888888888888888888888888888888888888888888
 ";
+
+/// A database name no config holds: a caller's guess.
+const GUESSED_DB: &str = "guessed_db_name";
 
 /// Label names that would put a user, a query or a request into a series.
 const FORBIDDEN_LABELS: &[&str] = &[
@@ -116,9 +128,46 @@ async fn request_path_series_carry_no_identity_or_sql_labels() {
         "list_servers",
     )
     .await;
+    // No grant: both are `forbidden` before any target call. Only the
+    // configured database may become a `db` label; the guess must not.
+    for (id, database) in [(4, "app"), (5, GUESSED_DB)] {
+        let forbidden = reqwest::Client::new()
+            .post(format!("{}/mcp", gw.url))
+            .bearer_auth(DISPATCH_TOKEN)
+            .json(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                          "params": {"name": "describe_schema", "arguments":
+                              {"server": "metricsdb", "database": database}}}))
+            .send()
+            .await
+            .expect("gateway reachable");
+        assert_eq!(forbidden.status(), 200);
+    }
+    assert_audit_outcome(
+        &pool,
+        DISPATCH_SUB,
+        "describe_schema",
+        "forbidden",
+        "describe_schema",
+    )
+    .await;
     delete_audit_calls(&pool, DISPATCH_SUB).await;
 
     let body = handle.render();
+    assert!(
+        body.contains(
+            r#"tool_calls_by_db{db="metricsdb/app",outcome="forbidden",access="read"} 1"#
+        ),
+        "the configured database's call is not counted per db:\n{body}"
+    );
+    // A call that named no database still carries the label, empty.
+    assert!(
+        body.contains(r#"query_duration_seconds_count{tool="list_servers",db=""} 1"#),
+        "the duration histogram lacks its db label:\n{body}"
+    );
+    assert!(
+        !body.contains(GUESSED_DB),
+        "a caller-typed database name became a label:\n{body}"
+    );
     assert!(
         body.lines().any(|line| line.starts_with("tool_calls")
             && line.contains(r#"tool="list_servers""#)

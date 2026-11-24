@@ -17,6 +17,23 @@ const MAX_CELL_BYTES_DESCRIPTION: &str = "Replace any cell whose JSON is longer 
                                           {\"$dbmcp_truncated\": {bytes, preview}} marker; \
                                           drops no row.";
 
+const PARAMS_DESCRIPTION: &str = "Postgres only: values bound to $1..$n, in order — never \
+                                  parsed as SQL. JSON null, boolean, integer, number, string, \
+                                  array/object bind as an untyped NULL, bool, int8, float8, \
+                                  text, jsonb; cast in the SQL for any other type \
+                                  ($1::date). At most 100, each at most 64 KiB of JSON.";
+
+/// The `params` property `run_query` and `explain` share.
+fn params_schema() -> serde_json::Value {
+    json!({
+        "type": "array",
+        "maxItems": 100,
+        // Any JSON value; a type list is beyond some clients' schema support.
+        "items": {},
+        "description": PARAMS_DESCRIPTION
+    })
+}
+
 const SQL_DESCRIPTION: &str = "By server kind: postgres — one SQL statement; mongo — a JSON \
                                command document, e.g. {\"find\":\"users\",\"filter\":{}}; \
                                redis — a JSON argv array, e.g. [\"HGETALL\",\"user:1\"].";
@@ -63,8 +80,9 @@ pub(super) fn explain() -> Tool {
         name: EXPLAIN_TOOL,
         title: "Explain query",
         description: format!(
-            "The query plan from `EXPLAIN (FORMAT JSON)`. Plain EXPLAIN never \
-             executes the statement; INSERT/UPDATE/DELETE need a query_write \
+            "The query plan from `EXPLAIN (FORMAT JSON)`, plus a `summary`: the root's \
+             total_cost and plan_rows, seq_scans (relations read by a sequential scan) \
+             and node_count. Plain EXPLAIN never executes the statement; INSERT/UPDATE/DELETE need a query_write \
              grant. `analyze: true` runs the statement for real timings — read \
              statements only, inside a read-only transaction and the {} statement \
              timeout. Postgres only.",
@@ -77,6 +95,7 @@ pub(super) fn explain() -> Tool {
                 "database": { "type": "string" },
                 "sql":      { "type": "string" },
                 "analyze":  { "type": "boolean", "default": false },
+                "params":   params_schema(),
                 "reason":   { "type": "string", "description": REASON_DESCRIPTION }
             },
             "required": ["server", "database", "sql"],
@@ -98,7 +117,8 @@ pub(super) fn run_query() -> Tool {
              `truncated_by` says which cap hit and `hint` how to page for the rest. \
              Statement timeout {} (a grant may lower it). \
              Read-only unless a query_write grant allows one INSERT/UPDATE/DELETE \
-             on Postgres; `dry_run: true` runs that write and rolls it back. Mongo \
+             on Postgres; `dry_run: true` runs that write and rolls it back (triggers \
+             fire; sequences advance). Mongo \
              and Redis are always read-only.",
             run_query_default_rows(),
             row_ceiling(),
@@ -112,6 +132,7 @@ pub(super) fn run_query() -> Tool {
                 "database": { "type": "string" },
                 "sql":      { "type": "string", "description": SQL_DESCRIPTION },
                 "limit":    { "type": "integer", "minimum": 1 },
+                "params":   params_schema(),
                 "dry_run":  { "type": "boolean", "default": false },
                 "max_bytes":      { "type": "integer", "minimum": 1,
                                     "description": MAX_BYTES_DESCRIPTION },

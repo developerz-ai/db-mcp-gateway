@@ -35,6 +35,7 @@
 //! behind the matching `DbAdapter` methods.
 
 mod cancel;
+mod cancel_pool;
 mod catalog;
 mod catalog_full;
 mod config;
@@ -44,6 +45,7 @@ mod explain;
 mod introspect;
 mod methods;
 mod near_miss;
+pub(crate) mod pool_metrics;
 mod recast;
 mod redact;
 mod release;
@@ -67,7 +69,7 @@ use crate::config::{Database, Server};
 
 use super::adapter::{ExecError, ExecResult, TOKIO_TIMEOUT_SLACK_MS, effective_timeout_ms};
 use super::pool_sizing::PoolSizing;
-use super::query::ExecQuery;
+use super::query::{ExecQuery, QueryParam};
 use super::sql_guard::Access;
 
 use error::{AcquireFailure, Origin};
@@ -77,21 +79,13 @@ use tier::{Tier, WriteTier};
 
 // Re-exported so `super::pg::resolve_password` keeps working for sibling
 // adapters (mongo::MongoAdapter::open) without exposing the config submodule.
+pub use cancel_pool::{InvalidCancelPoolSize, init_cancel_pool_size_from_env};
 pub(crate) use config::resolve_password;
 
 /// Bound on waiting for a pooled connection (or opening one). Spent *before*
 /// the statement budget starts: a saturated pool is `unavailable`, not a
 /// `timeout` of the caller's query.
 pub(super) const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Dedicated pool for `pg_cancel_backend(pid)`. Must stay separate
-/// from the main pool — if `CancelOnDrop::drop` fired through the main
-/// pool, its `execute` would queue on `acquire()` behind the very
-/// connections the cancels are trying to free (N hung queries + N drops
-/// with `max_connections = N` deadlocks every cancel until
-/// `statement_timeout` expires). Sized to 2 so a burst of concurrent
-/// disconnects gets two round-trips in parallel; cancels are single-round
-/// and cheap, no need for more.
-pub(super) const CANCEL_POOL_MAX_CONNECTIONS: u32 = 2;
 
 /// Per-`(server, database)` Postgres adapter: the read tier, plus the write
 /// tier when the database has a `write_role`. One instance per logical DB so
@@ -144,7 +138,7 @@ impl PgAdapter {
             .write_credentials()
             .map(|credentials| WriteTier::new(server, database, credentials, sizing, &db_label));
         Ok(Self {
-            read: Arc::new(read),
+            read,
             write,
             detached,
             large_rows: Semaphore::new(LARGE_ROW_DECODES),
@@ -189,26 +183,35 @@ impl PgAdapter {
         pool: &PgPool,
         request_id: Uuid,
     ) -> Result<PoolConnection<Postgres>, ExecError> {
-        pool.acquire().await.map_err(|err| {
-            match AcquireFailure::of(&err, &self.origin(tier, request_id)) {
+        let started = std::time::Instant::now();
+        let acquired = pool.acquire().await;
+        pool_metrics::record_acquire_wait(&self.db_label, tier.pool_kind(pool), started.elapsed());
+        acquired.map_err(
+            |err| match AcquireFailure::of(&err, &self.origin(tier, request_id)) {
                 AcquireFailure::Auth => {
                     tier.mark_stale();
                     ExecError::Connection
                 }
                 AcquireFailure::Other => ExecError::Unavailable,
-            }
-        })
+            },
+        )
     }
 
     /// Run `query` on `tier`'s query pool. The transaction mode comes from
     /// `query.access`, not from the tier: `explain` of a write runs on the
     /// write tier in a read-only transaction.
-    async fn run(&self, tier: &Tier, query: &ExecQuery<'_>) -> Result<ExecResult, ExecError> {
+    /// `params` are the caller's, bound after `query.binds`.
+    async fn run(
+        &self,
+        tier: &Tier,
+        query: &ExecQuery<'_>,
+        params: &[QueryParam],
+    ) -> Result<ExecResult, ExecError> {
         // The caller's share of the pool first, so a caller at its share
         // waits on itself rather than taking the connection others need.
         let _slot = tier.callers.take(POOL_ACQUIRE_TIMEOUT).await?;
         let mut conn = self.acquire(tier, &tier.pool, query.request_id).await?;
-        self.run_on(&mut conn, tier, query).await
+        self.run_on(&mut conn, tier, query, params).await
     }
 
     /// Run `query` on `conn`, a connection of `tier`, under the Tokio-side
@@ -218,6 +221,7 @@ impl PgAdapter {
         conn: &mut PgConnection,
         tier: &Tier,
         query: &ExecQuery<'_>,
+        params: &[QueryParam],
     ) -> Result<ExecResult, ExecError> {
         // Belt-and-suspenders: a Tokio-side deadline so even a misapplied
         // SET LOCAL (or a DB that ignores it) still bounds the call. Same
@@ -230,7 +234,7 @@ impl PgAdapter {
             detached: &self.detached,
             large_rows: &self.large_rows,
         };
-        match tokio::time::timeout(budget, run_query(conn, &ctx, query)).await {
+        match tokio::time::timeout(budget, run_query(conn, &ctx, query, params)).await {
             Ok(result) => result,
             Err(_elapsed) => Err(ExecError::Timeout),
         }
@@ -254,7 +258,7 @@ impl PgAdapter {
             dry_run: false,
             request_id,
         };
-        self.run(&self.read, &query).await
+        self.run(&self.read, &query, &[]).await
     }
 }
 

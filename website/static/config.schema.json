@@ -1,0 +1,428 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://developerz-ai.github.io/db-mcp-gateway/config.schema.json",
+  "title": "db-mcp-gateway config",
+  "description": "The gateway's YAML config (spec 08). Every object rejects unknown keys. Cross-field rules (unique names, grants naming declared servers, write_role pairing, production literals) are checked by `db-mcp-gateway --check`, not by this schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "gateway": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "env": {
+          "enum": [
+            "development",
+            "production"
+          ],
+          "default": "development",
+          "description": "`production` rejects inline literal secrets."
+        }
+      }
+    },
+    "servers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/server"
+      }
+    },
+    "permissions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/permission"
+      }
+    },
+    "constraint_profiles": {
+      "type": "object",
+      "description": "Named constraint sets a grant references with `profile:`; merged most-restrictively into the grant at parse time.",
+      "additionalProperties": {
+        "$ref": "#/$defs/constraints"
+      }
+    },
+    "admin": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "group": {
+          "type": "string",
+          "description": "SSO group authorizing /admin/v1/*; required when enabled."
+        },
+        "session_max_age_secs": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "description": "Spec 12 \u00a7Admin API."
+    },
+    "permissions_store": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "driver": {
+          "enum": [
+            "pg",
+            "mysql",
+            "none"
+          ]
+        }
+      },
+      "required": [
+        "driver"
+      ],
+      "description": "Where DB grants live; absent = the state DB (pg)."
+    },
+    "service_accounts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/service_account"
+      }
+    },
+    "logging": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "stream": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stream_sink"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "secret": {
+      "type": "string",
+      "minLength": 1,
+      "description": "`${ENV:NAME}`, `${FILE:/path}`, or an inline literal (development only)."
+    },
+    "pool": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_connections": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "min_connections": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "idle_timeout_s": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "description": "Per-field merge: database, then server, then built-in default."
+    },
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "postgres",
+            "mysql",
+            "mssql",
+            "mongo",
+            "redis"
+          ],
+          "description": "Query adapters exist for postgres, mongo and redis."
+        },
+        "description": {
+          "type": "string"
+        },
+        "host": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Default 6379 for redis, else 5432."
+        },
+        "tls": {
+          "enum": [
+            "required",
+            "verify_full",
+            "insecure"
+          ],
+          "default": "required"
+        },
+        "tls_ca_file": {
+          "type": "string",
+          "description": "PEM bundle; only with `tls: verify_full`."
+        },
+        "pool": {
+          "$ref": "#/$defs/pool"
+        },
+        "role": {
+          "type": "string",
+          "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$",
+          "description": "Default read role for every database that names none."
+        },
+        "password": {
+          "$ref": "#/$defs/secret",
+          "description": "Default password for the server-level `role`."
+        },
+        "databases": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "A database name; role and password come from the server."
+              },
+              {
+                "$ref": "#/$defs/database"
+              }
+            ]
+          }
+        }
+      },
+      "required": [
+        "name",
+        "kind",
+        "host"
+      ]
+    },
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string",
+          "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$"
+        },
+        "password": {
+          "$ref": "#/$defs/secret"
+        },
+        "description": {
+          "type": "string"
+        },
+        "auth_database": {
+          "type": "string",
+          "description": "Mongo authSource; default `name`."
+        },
+        "connect_name": {
+          "type": "string",
+          "description": "The database name on the target when it differs from `name` (the grant and audit address)."
+        },
+        "pool": {
+          "$ref": "#/$defs/pool"
+        },
+        "write_role": {
+          "type": "string",
+          "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$",
+          "description": "Postgres only; set with write_password."
+        },
+        "write_password": {
+          "$ref": "#/$defs/secret"
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "permission": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "group": {
+          "type": "string",
+          "minLength": 1
+        },
+        "user": {
+          "type": "string",
+          "minLength": 1,
+          "description": "An SSO subject (`sub`), instead of a group."
+        },
+        "grants": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/grant"
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "group"
+          ]
+        },
+        {
+          "required": [
+            "user"
+          ]
+        }
+      ]
+    },
+    "grant": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "server": {
+          "type": "string",
+          "description": "A server name or `*`."
+        },
+        "database": {
+          "type": "string",
+          "description": "A database name or `*`."
+        },
+        "action": {
+          "enum": [
+            "schema_read",
+            "query_read",
+            "query_write",
+            "history_read"
+          ]
+        },
+        "constraints": {
+          "$ref": "#/$defs/constraints"
+        },
+        "profile": {
+          "type": "string",
+          "description": "A `constraint_profiles:` name."
+        },
+        "except": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Only with `database: \"*\"`: databases the wildcard leaves out."
+        }
+      },
+      "required": [
+        "server",
+        "database",
+        "action"
+      ]
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "require_reason": {
+          "type": "boolean",
+          "default": false
+        },
+        "row_limit": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "statement_timeout_ms": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "service_account": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+        },
+        "group": {
+          "type": "string"
+        },
+        "token": {
+          "$ref": "#/$defs/secret"
+        },
+        "tokens": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/secret"
+          }
+        },
+        "max_concurrent_requests": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "require_upstream": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "name",
+        "group"
+      ],
+      "oneOf": [
+        {
+          "required": [
+            "token"
+          ]
+        },
+        {
+          "required": [
+            "tokens"
+          ]
+        }
+      ]
+    },
+    "stream_sink": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "stdout"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "syslog"
+            },
+            "host": {
+              "type": "string",
+              "minLength": 1
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "transport": {
+              "enum": [
+                "udp",
+                "tcp",
+                "tls"
+              ],
+              "default": "udp"
+            },
+            "ca_file": {
+              "type": "string",
+              "description": "Required with `transport: tls`."
+            }
+          },
+          "required": [
+            "kind",
+            "host",
+            "port"
+          ]
+        }
+      ]
+    }
+  }
+}

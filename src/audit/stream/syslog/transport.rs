@@ -7,6 +7,7 @@ use std::time::Duration;
 use rustls::pki_types::ServerName;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::time::Instant;
 use tokio_rustls::client::TlsStream;
 
 use super::format::octet_frame;
@@ -74,9 +75,12 @@ impl Connection {
         port: u16,
         transport: &SyslogTransport,
     ) -> Result<Self, DeliveryError> {
-        let addr = resolve(host, port).await?;
+        let addrs = resolve(host, port).await?;
         match transport {
             SyslogTransport::Udp => {
+                // A datagram cannot tell a dead receiver from a live one, so
+                // there is nothing to fall back on: the first address it is.
+                let addr = *addrs.first().ok_or(DeliveryError::NoAddress)?;
                 // Unspecified local port on the matching family; `send_to`
                 // names the receiver, so no `connect()`.
                 let bind_addr = if addr.is_ipv6() {
@@ -89,11 +93,11 @@ impl Connection {
                     .map_err(DeliveryError::Bind)?;
                 Ok(Self::Udp { socket, addr })
             }
-            SyslogTransport::Tcp => Ok(Self::Tcp(connect(addr).await?)),
+            SyslogTransport::Tcp => Ok(Self::Tcp(connect(&addrs).await?)),
             SyslogTransport::Tls(tls) => {
                 let name =
                     ServerName::try_from(host.to_owned()).map_err(|_| DeliveryError::ServerName)?;
-                let tcp = connect(addr).await?;
+                let tcp = connect(&addrs).await?;
                 let stream = step("TLS handshake", tls.connector().connect(name, tcp))
                     .await?
                     .map_err(DeliveryError::Handshake)?;
@@ -115,17 +119,33 @@ impl Connection {
     }
 }
 
-async fn resolve(host: &str, port: u16) -> Result<SocketAddr, DeliveryError> {
-    let mut addrs = step("DNS resolution", tokio::net::lookup_host((host, port)))
+async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, DeliveryError> {
+    let addrs: Vec<_> = step("DNS resolution", tokio::net::lookup_host((host, port)))
         .await?
-        .map_err(DeliveryError::Resolve)?;
-    addrs.next().ok_or(DeliveryError::NoAddress)
+        .map_err(DeliveryError::Resolve)?
+        .collect();
+    if addrs.is_empty() {
+        return Err(DeliveryError::NoAddress);
+    }
+    Ok(addrs)
 }
 
-async fn connect(addr: SocketAddr) -> Result<TcpStream, DeliveryError> {
-    step("TCP connect", TcpStream::connect(addr))
-        .await?
-        .map_err(DeliveryError::Connect)
+/// The first of `addrs` that accepts, in resolver order, all within one
+/// [`STEP_TIMEOUT`]. Each address gets an even share of the time left, so a
+/// black-holed first address cannot starve a healthy second one.
+async fn connect(addrs: &[SocketAddr]) -> Result<TcpStream, DeliveryError> {
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    let mut last = DeliveryError::NoAddress;
+    for (tried, addr) in addrs.iter().enumerate() {
+        let untried = u32::try_from(addrs.len() - tried).unwrap_or(u32::MAX);
+        let share = deadline.saturating_duration_since(Instant::now()) / untried;
+        last = match tokio::time::timeout(share, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(err)) => DeliveryError::Connect(err),
+            Err(_) => DeliveryError::TimedOut("TCP connect"),
+        };
+    }
+    Err(last)
 }
 
 /// `flush` matters for TLS: the record is only on the wire once flushed.
@@ -141,4 +161,30 @@ async fn step<T>(what: &'static str, future: impl Future<Output = T>) -> Result<
     tokio::time::timeout(STEP_TIMEOUT, future)
         .await
         .map_err(|_| DeliveryError::TimedOut(what))
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// A host whose first address refuses still reaches the second.
+    #[tokio::test]
+    async fn connect_tries_each_resolved_address() {
+        let refusing = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let refused = refusing.local_addr().expect("addr");
+        drop(refusing);
+        let healthy = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let reachable = healthy.local_addr().expect("addr");
+
+        let stream = connect(&[refused, reachable])
+            .await
+            .expect("second address");
+        assert_eq!(stream.peer_addr().expect("peer"), reachable);
+        assert!(matches!(
+            connect(&[refused]).await,
+            Err(DeliveryError::Connect(_))
+        ));
+    }
 }

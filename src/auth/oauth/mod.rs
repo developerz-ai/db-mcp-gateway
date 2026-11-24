@@ -6,14 +6,10 @@
 //! Dynamic-Client-Registration store ([`ClientRegistry`]) and the
 //! [`AuthFacade`] that bundles them for the HTTP handlers.
 //!
-//! The first two are in-process by design — both are seconds-to-minutes legs of
-//! a single browser round-trip, so a restart mid-login is a retry, not a
-//! sign-out. An HA deployment must still pin the OAuth dance to one replica or
-//! sticky-route it (see `website/docs/initial-idea/02-architecture.md#ha`).
-//!
-//! [`RefreshTokens`] and [`ClientRegistry`] are the exception: both are meant to
-//! outlive the process, so production persists them in the state DB
-//! (`crate::state::oauth`).
+//! Production persists every one of them in the shared state DB
+//! (`crate::state::oauth`), so each leg of a login may land on any replica — no
+//! sticky routing (`website/docs/initial-idea/02-architecture.md#ha`). Each
+//! store also has an in-process backend for tests.
 
 mod auth_codes;
 mod client_name;
@@ -21,7 +17,10 @@ mod client_registry;
 mod client_registry_mem;
 mod facade;
 mod grants;
+mod login_secrets;
 mod pending_flows;
+mod pending_flows_db;
+mod pending_flows_mem;
 mod redaction;
 mod refresh_chain;
 mod refresh_db;
@@ -35,7 +34,8 @@ pub use client_name::{ClientName, InvalidClientName, MAX_CLIENT_NAME_CHARS};
 pub use client_registry::{ClientRecord, ClientRegistry};
 pub use facade::{AuthFacade, IssuedTokens, Refreshed};
 pub use grants::{MintError, Minted};
-pub use pending_flows::{OAuthBridge, PendingFlow, PendingFlows};
+pub use login_secrets::LoginSecrets;
+pub use pending_flows::{OAuthBridge, PendingConsent, PendingFlow, PendingFlows};
 pub use refresh_chain::DEFAULT_REFRESH_TTL;
 pub use refresh_tokens::{RefreshToken, RefreshTokens};
 pub use rotation::Rotation;

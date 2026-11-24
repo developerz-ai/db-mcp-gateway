@@ -7,10 +7,12 @@
 //! default, and the shape this tool always had), `full` (real types, keys,
 //! indexes, comments, row estimates — see [`pg`]). Mongo answers collections
 //! (see [`mongo`]); at `full` it also samples documents, which is row data,
-//! so that part needs `query_read`.
+//! so that part needs `query_read`, and the audit row's `sql` says it read
+//! them: `<db> [detail=full, sampled ≤ <k> docs per collection]`.
 
 mod mongo;
 mod pg;
+mod sampling;
 
 use std::time::Instant;
 
@@ -25,9 +27,11 @@ use super::ToolCtx;
 use super::args::parse_arguments;
 use super::audit_dispatch::{
     AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, audit_outcome, error_outcome,
-    invalid_arguments, outcome_from_exec_error, reject_arguments, run_audited, success_outcome,
+    invalid_arguments, load_grants, outcome_from_exec_error, reject_arguments, run_with_grants,
+    success_outcome,
 };
-use super::target::{Target, ensure_reason, forbidden, record_intent, resolve_target};
+use super::target::{ensure_reason, forbidden, record_intent, resolve_target};
+use sampling::{Sampling, document_sampling, sampled_read, tightest};
 
 const TOOL_NAME: &str = "describe_schema";
 const ERROR_MESSAGES: ToolErrorMessages = ToolErrorMessages {
@@ -104,7 +108,7 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
         (_, Some(table)) => format!("{schema}.{table}"),
         (_, None) => schema.to_string(),
     };
-    let header = AuditHeader {
+    let mut header = AuditHeader {
         tool: TOOL_NAME,
         server: Some(&args.server),
         database: Some(&args.database),
@@ -116,9 +120,20 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
         let outcome = invalid_arguments(id.clone(), BLANK_SEARCH);
         return audit_outcome(ctx, id, header, outcome).await;
     }
+    // Grants first: whether Mongo's `full` samples documents is theirs to
+    // decide, and the audit row must say so from the intent row on.
+    let grants = match load_grants(ctx).await {
+        Ok(grants) => grants,
+        Err(outcome) => return audit_outcome(ctx, id, header, *outcome).await,
+    };
+    let sampling = document_sampling(ctx, &grants, &args);
+    let sampled_read = sampling.map(|s| sampled_read(&read, s));
+    if let Some(sampled) = sampled_read.as_deref() {
+        header.sql = Some(sampled);
+    }
     let args = &args;
-    run_audited(ctx, id, header, |id, grants| async move {
-        compute_outcome(ctx, id, &grants, &header, args).await
+    run_with_grants(ctx, id, header, grants, |id, grants| async move {
+        compute_outcome(ctx, id, &grants, &header, args, sampling).await
     })
     .await
 }
@@ -139,6 +154,7 @@ async fn compute_outcome(
     db_grants: &[Grant],
     header: &AuditHeader<'_>,
     args: &Arguments,
+    sampling: Option<Sampling>,
 ) -> Outcome {
     let Some(target) = resolve_target(
         ctx,
@@ -152,7 +168,6 @@ async fn compute_outcome(
     if let Err(rejected) = ensure_reason(&target.constraints, args.reason.as_deref()) {
         return *rejected;
     }
-    let sampling = document_sampling(ctx, db_grants, &target, args);
 
     if let Err(refused) = record_intent(ctx, header, &target, Access::ReadOnly).await {
         return *refused;
@@ -219,51 +234,6 @@ async fn compute_outcome(
     };
     let count = i64::try_from(count).unwrap_or(i64::MAX);
     success_outcome(id, text, Some(elapsed), Some(count), Some(result.truncated))
-}
-
-/// How Mongo's `full` may sample documents: under the caller's `query_read`
-/// grant, its reason rule and its constraints, at most
-/// [`MAX_SAMPLE_DOCUMENTS`] per collection.
-#[derive(Debug, Clone, Copy)]
-struct Sampling {
-    documents: u32,
-    statement_timeout_ms: Option<u32>,
-}
-
-fn document_sampling(
-    ctx: ToolCtx<'_>,
-    db_grants: &[Grant],
-    target: &Target<'_>,
-    args: &Arguments,
-) -> Option<Sampling> {
-    if target.server.kind != ServerKind::Mongo || args.detail != Detail::Full {
-        return None;
-    }
-    let read = resolve_target(
-        ctx,
-        db_grants,
-        Action::QueryRead,
-        &args.server,
-        &args.database,
-    )?;
-    ensure_reason(&read.constraints, args.reason.as_deref()).ok()?;
-    Some(Sampling {
-        documents: read
-            .constraints
-            .row_limit
-            .map_or(MAX_SAMPLE_DOCUMENTS, |limit| {
-                limit.min(MAX_SAMPLE_DOCUMENTS)
-            }),
-        statement_timeout_ms: read.constraints.statement_timeout_ms,
-    })
-}
-
-/// The smaller of two optional caps; an absent one does not cap.
-fn tightest(a: Option<u32>, b: Option<u32>) -> Option<u32> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
 }
 
 /// The schemas the read role may use, for a call that named none.

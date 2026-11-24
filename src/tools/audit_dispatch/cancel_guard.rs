@@ -10,7 +10,7 @@ use crate::audit::stream::StreamSinks;
 use crate::audit::{self, AuditRow, OutcomeCode};
 use crate::exec::Access;
 
-use super::metric_names::{ACCESS_UNKNOWN, AUDIT_FALLBACK_FAILURES, TOOL_CALLS};
+use super::metric_names::{ACCESS_UNKNOWN, AUDIT_FALLBACK_FAILURES, CallLabels};
 use super::{Outcome, WriteState};
 
 const DISCONNECTED: &str = "client disconnected before completion";
@@ -41,8 +41,8 @@ pub(super) struct CancelledAuditGuard {
     /// `Some` while armed; `disarm()` clears it and `Drop` then writes
     /// nothing. `PgPool` is `Arc`-internally so cloning is cheap.
     pub(super) state_db: Option<PgPool>,
-    /// The metric label; `row.tool` is an owned copy for the write.
-    pub(super) tool: &'static str,
+    /// The call metrics' labels; `row.tool` is an owned copy for the write.
+    pub(super) labels: CallLabels,
     pub(super) sinks: StreamSinks,
     pub(super) tasks: DetachedTasks,
 }
@@ -52,7 +52,7 @@ impl CancelledAuditGuard {
     /// recorded.
     pub(super) fn arm(
         mut row: AuditRow,
-        tool: &'static str,
+        labels: CallLabels,
         state_db: PgPool,
         sinks: StreamSinks,
         tasks: DetachedTasks,
@@ -60,7 +60,7 @@ impl CancelledAuditGuard {
         row.outcome = OutcomeCode::Cancelled;
         row.error_message = Some(DISCONNECTED.to_string());
         Self {
-            tool,
+            labels,
             row,
             completed: false,
             state_db: Some(state_db),
@@ -114,14 +114,8 @@ impl Drop for CancelledAuditGuard {
         };
         if !self.completed {
             // Mid-work drop: the dispatch never reached its own count.
-            counter!(
-                TOOL_CALLS,
-                "tool" => self.tool,
-                "outcome" => OutcomeCode::Cancelled.as_str(),
-                // The access is decided inside the dropped work.
-                "access" => ACCESS_UNKNOWN,
-            )
-            .increment(1);
+            // The access is decided inside the dropped work.
+            self.labels.count(OutcomeCode::Cancelled, ACCESS_UNKNOWN);
         }
         let mut row = self.row.clone();
         let sinks = self.sinks.clone();

@@ -87,6 +87,26 @@ impl BinaryGateway {
             .collect()
     }
 
+    /// The first JSON log record matching `wanted`, polled until `within`:
+    /// the process logs through a non-blocking writer and a reader thread,
+    /// so a line can trail the HTTP response that caused it.
+    pub async fn await_record(
+        &self,
+        within: Duration,
+        wanted: impl Fn(&Value) -> bool,
+    ) -> Option<Value> {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(line) = self.records().into_iter().find(|line| wanted(line)) {
+                return Some(line);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Wait until the listener is up; panics with the output if the process
     /// exits or the deadline passes first.
     pub async fn wait_listening(&mut self) {

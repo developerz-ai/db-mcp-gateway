@@ -1,0 +1,1807 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "db-mcp-gateway admin API",
+    "version": "1",
+    "description": "SSO-gated admin API (spec 12). Every write commits a permissions_audit row in its own transaction; explain, export, diff and the audit stream write an audit_calls row before responding."
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
+  "security": [
+    {
+      "bearer": []
+    }
+  ],
+  "paths": {
+    "/admin/v1/openapi.json": {
+      "get": {
+        "summary": "This document",
+        "operationId": "getOpenApi",
+        "responses": {
+          "200": {
+            "description": "OpenAPI 3.1 document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/admin/v1/users": {
+      "post": {
+        "summary": "Create (or refresh) a user",
+        "operationId": "createUser",
+        "responses": {
+          "200": {
+            "description": "Existing live user refreshed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "User created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateUser"
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "List live users",
+        "operationId": "listUsers",
+        "responses": {
+          "200": {
+            "description": "A page of users",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/User"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ]
+      }
+    },
+    "/admin/v1/users/{id}": {
+      "get": {
+        "summary": "Get a user",
+        "operationId": "getUser",
+        "responses": {
+          "200": {
+            "description": "The user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ]
+      },
+      "patch": {
+        "summary": "Update a user",
+        "operationId": "updateUser",
+        "responses": {
+          "200": {
+            "description": "Updated user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateUser"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ]
+      },
+      "delete": {
+        "summary": "Soft-delete a user and revoke its grants",
+        "operationId": "deleteUser",
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ]
+      }
+    },
+    "/admin/v1/users/{id}/revoke-sessions": {
+      "post": {
+        "summary": "Revoke every session of a user",
+        "operationId": "revokeUserSessions",
+        "responses": {
+          "200": {
+            "description": "Sessions revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ]
+      }
+    },
+    "/admin/v1/databases": {
+      "post": {
+        "summary": "Register a database",
+        "operationId": "createDatabase",
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Database"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDatabase"
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "List live databases",
+        "operationId": "listDatabases",
+        "responses": {
+          "200": {
+            "description": "A page of databases",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Database"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ]
+      }
+    },
+    "/admin/v1/databases/{id}": {
+      "get": {
+        "summary": "Get a database",
+        "operationId": "getDatabase",
+        "responses": {
+          "200": {
+            "description": "The database",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Database"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ]
+      },
+      "patch": {
+        "summary": "Update a database",
+        "operationId": "updateDatabase",
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Database"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateDatabase"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ]
+      },
+      "delete": {
+        "summary": "Soft-delete a database and revoke its specific grants",
+        "operationId": "deleteDatabase",
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ]
+      }
+    },
+    "/admin/v1/grants": {
+      "post": {
+        "summary": "Create a grant",
+        "operationId": "createGrant",
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Grant"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateGrant"
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "List live grants (expired ones flagged `expired: true`)",
+        "operationId": "listGrants",
+        "responses": {
+          "200": {
+            "description": "A page of grants",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Grant"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "database_id",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ]
+      }
+    },
+    "/admin/v1/grants/batch": {
+      "post": {
+        "summary": "Apply grant upserts and deletes in one audited transaction (all or nothing)",
+        "operationId": "batchGrants",
+        "responses": {
+          "200": {
+            "description": "Every change applied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/v1/grants/{id}": {
+      "get": {
+        "summary": "Get a grant",
+        "operationId": "getGrant",
+        "responses": {
+          "200": {
+            "description": "The grant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Grant"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ]
+      },
+      "patch": {
+        "summary": "Update a grant's action, constraints or expiry",
+        "operationId": "updateGrant",
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Grant"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateGrant"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ]
+      },
+      "delete": {
+        "summary": "Revoke a grant",
+        "operationId": "deleteGrant",
+        "responses": {
+          "204": {
+            "description": "Revoked"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ]
+      }
+    },
+    "/admin/v1/explain": {
+      "post": {
+        "summary": "Why is a (user | group, server, database, action) allowed or denied",
+        "operationId": "explain",
+        "responses": {
+          "200": {
+            "description": "The decision, matched grants and merged constraints",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Explanation"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExplainRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/v1/permissions/export": {
+      "get": {
+        "summary": "Effective permissions: YAML ∪ DB as one document",
+        "operationId": "exportPermissions",
+        "responses": {
+          "200": {
+            "description": "The document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PermissionsDocument"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/admin/v1/permissions/diff": {
+      "post": {
+        "summary": "Diff a desired permissions document against the effective one (read-only)",
+        "operationId": "diffPermissions",
+        "responses": {
+          "200": {
+            "description": "The diff",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PermissionsDiff"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PermissionsDocument"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/v1/audit/calls": {
+      "get": {
+        "summary": "Stream audit_calls rows as NDJSON, newest first",
+        "operationId": "streamAuditCalls",
+        "responses": {
+          "200": {
+            "description": "One JSON object per line; a final {\"error\": …} line means the stream was cut short",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "user",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "user_sub or user_email"
+          },
+          {
+            "name": "server",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "db",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "tool",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "outcome",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "spec 03 outcome code"
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "inclusive"
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "description": "exclusive"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10000,
+              "default": 1000
+            },
+            "description": "clamped to 1..=10000"
+          },
+          {
+            "name": "include_sql",
+            "in": "query",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "include the stored statement text and its params"
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "gateway session JWT of a caller in the admin group"
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "Stable error envelope",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "forbidden",
+                  "unauthorized",
+                  "session_too_old",
+                  "not_found",
+                  "invalid_request",
+                  "conflict",
+                  "audit_unavailable",
+                  "internal"
+                ]
+              },
+              "message": {
+                "type": "string"
+              },
+              "request_id": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "Constraints": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "require_reason": {
+            "type": "boolean"
+          },
+          "row_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          },
+          "statement_timeout_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          }
+        }
+      },
+      "Action": {
+        "type": "string",
+        "enum": [
+          "schema_read",
+          "query_read",
+          "query_write",
+          "history_read"
+        ]
+      },
+      "Subject": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "group": {
+            "type": "string"
+          },
+          "user": {
+            "type": "string"
+          }
+        },
+        "description": "exactly one of group / user"
+      },
+      "User": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "user_sub": {
+            "type": "string"
+          },
+          "user_email": {
+            "type": "string"
+          },
+          "groups": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CreateUser": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "user_sub",
+          "user_email"
+        ],
+        "properties": {
+          "user_sub": {
+            "type": "string"
+          },
+          "user_email": {
+            "type": "string"
+          },
+          "groups": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "UpdateUser": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "user_email": {
+            "type": "string"
+          },
+          "groups": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "expected_updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Database": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "server": {
+            "type": "string"
+          },
+          "db_name": {
+            "type": "string"
+          },
+          "db_type": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CreateDatabase": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "server",
+          "db_name",
+          "db_type"
+        ],
+        "properties": {
+          "server": {
+            "type": "string"
+          },
+          "db_name": {
+            "type": "string"
+          },
+          "db_type": {
+            "type": "string",
+            "enum": [
+              "postgres",
+              "mysql",
+              "mongo",
+              "redis"
+            ]
+          }
+        }
+      },
+      "UpdateDatabase": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "server": {
+            "type": "string"
+          },
+          "db_name": {
+            "type": "string"
+          },
+          "db_type": {
+            "type": "string"
+          },
+          "expected_updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Grant": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "database_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "server": {
+            "type": "string"
+          },
+          "db_name_wildcard": {
+            "type": "boolean"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "schema_read",
+              "query_read",
+              "query_write",
+              "history_read"
+            ]
+          },
+          "constraints": {
+            "$ref": "#/components/schemas/Constraints"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expired": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CreateGrant": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "user_id",
+          "action"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "database_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "server": {
+            "type": "string"
+          },
+          "db_name_wildcard": {
+            "type": "boolean"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "schema_read",
+              "query_read",
+              "query_write",
+              "history_read"
+            ]
+          },
+          "constraints": {
+            "$ref": "#/components/schemas/Constraints"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "description": "exactly one target: database_id, or server + db_name_wildcard: true"
+      },
+      "UpdateGrant": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "schema_read",
+              "query_read",
+              "query_write",
+              "history_read"
+            ]
+          },
+          "constraints": {
+            "type": "object",
+            "description": "per-key patch; null clears a key"
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "null clears (never expires)"
+          },
+          "expected_updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "BatchRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "changes"
+        ],
+        "properties": {
+          "changes": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 500,
+            "items": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "type": "object",
+                      "required": [
+                        "op"
+                      ],
+                      "properties": {
+                        "op": {
+                          "const": "upsert"
+                        }
+                      }
+                    },
+                    {
+                      "$ref": "#/components/schemas/CreateGrant"
+                    }
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "op",
+                    "id"
+                  ],
+                  "properties": {
+                    "op": {
+                      "const": "delete"
+                    },
+                    "id": {
+                      "type": "string",
+                      "format": "uuid"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "BatchResponse": {
+        "type": "object",
+        "properties": {
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "index": {
+                  "type": "integer"
+                },
+                "op": {
+                  "type": "string",
+                  "enum": [
+                    "created",
+                    "updated",
+                    "unchanged",
+                    "deleted"
+                  ]
+                },
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "grant": {
+                  "$ref": "#/components/schemas/Grant"
+                }
+              }
+            }
+          }
+        }
+      },
+      "ExplainRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "server",
+          "database",
+          "action"
+        ],
+        "properties": {
+          "user": {
+            "type": "string"
+          },
+          "group": {
+            "type": "string"
+          },
+          "groups": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "with user only; default: the user's cached groups"
+          },
+          "server": {
+            "type": "string"
+          },
+          "database": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "schema_read",
+              "query_read",
+              "query_write",
+              "history_read"
+            ]
+          }
+        },
+        "description": "exactly one of user / group"
+      },
+      "DocumentGrant": {
+        "type": "object",
+        "required": [
+          "subject",
+          "server",
+          "database",
+          "action"
+        ],
+        "properties": {
+          "source": {
+            "type": "string",
+            "enum": [
+              "yaml",
+              "db"
+            ]
+          },
+          "grant_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "subject": {
+            "$ref": "#/components/schemas/Subject"
+          },
+          "server": {
+            "type": "string"
+          },
+          "database": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "schema_read",
+              "query_read",
+              "query_write",
+              "history_read"
+            ]
+          },
+          "constraints": {
+            "$ref": "#/components/schemas/Constraints"
+          },
+          "except": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "profile": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expired": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Explanation": {
+        "type": "object",
+        "properties": {
+          "decision": {
+            "type": "string",
+            "enum": [
+              "allow",
+              "deny"
+            ]
+          },
+          "constraints": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Constraints"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "subject": {
+            "$ref": "#/components/schemas/Subject"
+          },
+          "groups": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "server": {
+            "type": "string"
+          },
+          "database": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "schema_read",
+              "query_read",
+              "query_write",
+              "history_read"
+            ]
+          },
+          "target_declared": {
+            "type": "boolean"
+          },
+          "matched": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DocumentGrant"
+            }
+          },
+          "expired": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DocumentGrant"
+            }
+          }
+        }
+      },
+      "PermissionsDocument": {
+        "type": "object",
+        "required": [
+          "grants"
+        ],
+        "properties": {
+          "generated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "grants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DocumentGrant"
+            }
+          }
+        }
+      },
+      "PermissionsDiff": {
+        "type": "object",
+        "properties": {
+          "add": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "remove": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "change": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "unchanged": {
+            "type": "integer"
+          }
+        }
+      }
+    }
+  }
+}

@@ -13,16 +13,17 @@ use serde_json::Value;
 
 use crate::audit::intent::WRITE_MAY_HAVE_COMMITTED;
 use crate::config::{Action, Grant, ServerKind};
-use crate::exec::{Access, ExecQuery, ExecResult};
+use crate::exec::{Access, ExecQuery, ExecResult, QueryParam};
 use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
 use super::args::{LIMIT_AT_LEAST_ONE, parse_arguments};
 use super::audit_dispatch::{
     AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, WriteEffect, audit_outcome,
-    invalid_arguments, note_timeout_limit, outcome_from_exec_error, reject_arguments, run_audited,
-    write_state,
+    invalid_arguments, note_timeout_limit, outcome_from_exec_error, reject_arguments,
+    run_audited_with_params, write_state,
 };
+use super::query_params::{parse_params, unsupported_for};
 use super::tabular::caps::{ByteCaps, RowLimit};
 use super::tabular::{RowShaping, rows_outcome};
 use super::target::{effective_row_limit, ensure_reason, forbidden, record_intent, resolve_target};
@@ -57,6 +58,9 @@ pub struct Arguments {
     /// Cap on one cell's JSON size; a larger cell becomes a marker.
     #[serde(default)]
     pub max_cell_bytes: Option<NonZeroU32>,
+    /// Values bound to `$1..$n` (Postgres only); see `query_params`.
+    #[serde(default)]
+    pub params: Vec<Value>,
 }
 
 /// `run_query`'s fields beside the shared row-result ones.
@@ -91,9 +95,17 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
         let outcome = invalid_arguments(id.clone(), LIMIT_AT_LEAST_ONE);
         return audit_outcome(ctx, id, header, outcome).await;
     }
-    let args = &args;
-    run_audited(ctx, id, header, |id, grants| async move {
-        compute_outcome(ctx, id, &grants, &header, args).await
+    let params = match parse_params(&args.params) {
+        Ok(params) => params,
+        Err(message) => {
+            let outcome = invalid_arguments(id.clone(), &message);
+            return audit_outcome(ctx, id, header, outcome).await;
+        }
+    };
+    let (args, params) = (&args, &params);
+    let stored = (!args.params.is_empty()).then_some(args.params.as_slice());
+    run_audited_with_params(ctx, id, header, stored, |id, grants| async move {
+        compute_outcome(ctx, id, &grants, &header, args, params).await
     })
     .await
 }
@@ -104,6 +116,7 @@ async fn compute_outcome(
     db_grants: &[Grant],
     header: &AuditHeader<'_>,
     args: &Arguments,
+    params: &[QueryParam],
 ) -> Outcome {
     // Constraints come from the read-level merge: it matches *every* grant that
     // applies to this (server, db) — `query_write` included, since it implies
@@ -134,6 +147,9 @@ async fn compute_outcome(
 
     if let Err(rejected) = ensure_reason(constraints, args.reason.as_deref()) {
         return *rejected;
+    }
+    if let Some(message) = unsupported_for(server.kind).filter(|_| !params.is_empty()) {
+        return invalid_arguments(id, &message);
     }
 
     // Defense-in-depth on top of the DB role: the guard refuses anything the
@@ -210,7 +226,7 @@ async fn compute_outcome(
         request_id: ctx.request.request_id,
     };
     let executed = match ctx.registry.get_or_open(server, database).await {
-        Ok(adapter) => adapter.execute(query).await,
+        Ok(adapter) => adapter.execute_with_params(query, params).await,
         Err(err) => Err(err),
     };
     let state = write_state(&executed, args.dry_run);

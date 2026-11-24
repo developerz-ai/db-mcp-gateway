@@ -7,7 +7,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use metrics::gauge;
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::sync::Mutex;
@@ -16,10 +15,12 @@ use crate::config::{Database, Password, Server};
 
 use super::super::adapter::ExecError;
 use super::super::pool_sizing::{CallerSlots, PoolSizing};
+use super::POOL_ACQUIRE_TIMEOUT;
+use super::cancel_pool::cancel_pool_size;
 use super::config::{connect_options, resolve_password, with_password};
 use super::error::{Origin, log_discarded};
+use super::pool_metrics::{self, sqlx_sample};
 use super::release::{pin_lexing, reset_on_release};
-use super::{CANCEL_POOL_MAX_CONNECTIONS, POOL_ACQUIRE_TIMEOUT};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TierKind {
@@ -35,10 +36,18 @@ impl TierKind {
             Self::Write => "write",
         }
     }
+
+    /// The `pool_kind` metric labels of the tier's query and cancel pools.
+    fn pool_kinds(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Read => ("query", "cancel"),
+            Self::Write => ("write_query", "write_cancel"),
+        }
+    }
 }
 
-/// The query pool and its dedicated cancel pool (see
-/// [`super::CANCEL_POOL_MAX_CONNECTIONS`]), both connected as `role`: a role
+/// The query pool and its dedicated cancel pool (sized by
+/// `PG_CANCEL_POOL_SIZE`, see [`super::cancel_pool`]), both connected as `role`: a role
 /// can cancel its own backends without extra privileges.
 pub(super) struct Tier {
     pub(super) kind: TierKind,
@@ -61,7 +70,7 @@ impl Tier {
         database: &Database,
         sizing: PoolSizing,
         db_label: &str,
-    ) -> Result<Self, ExecError> {
+    ) -> Result<Arc<Self>, ExecError> {
         let password = resolve_password(&database.password).await?;
         let opts = with_password(connect_options(server, database, &database.role), &password);
         let pool = query_pool_options(sizing)
@@ -94,30 +103,37 @@ impl Tier {
         role: &str,
         sizing: PoolSizing,
         db_label: &str,
-    ) -> Self {
+    ) -> Arc<Self> {
         let cancel_pool = PgPoolOptions::new()
-            .max_connections(CANCEL_POOL_MAX_CONNECTIONS)
+            .max_connections(cancel_pool_size())
             .min_connections(0)
             .idle_timeout(sizing.idle_timeout)
             .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
             .connect_lazy_with(opts);
-        // Configured maxima, one gauge per pool — cheap first signal for
-        // "pool exists for this db" with bounded label cardinality.
-        let (query_kind, cancel_kind) = match kind {
-            TierKind::Read => ("query", "cancel"),
-            TierKind::Write => ("write_query", "write_cancel"),
-        };
-        gauge!("pool_size", "db" => db_label.to_string(), "pool_kind" => query_kind)
-            .set(f64::from(sizing.max_connections));
-        gauge!("pool_size", "db" => db_label.to_string(), "pool_kind" => cancel_kind)
-            .set(f64::from(CANCEL_POOL_MAX_CONNECTIONS));
-        Self {
+        let tier = Arc::new(Self {
             kind,
             pool,
             cancel_pool,
             callers: CallerSlots::new(sizing),
             role: role.to_string(),
             stale: AtomicBool::new(false),
+        });
+        let db_label = db_label.to_owned();
+        pool_metrics::spawn_sampler(Arc::downgrade(&tier), move |tier: &Tier| {
+            let (query_kind, cancel_kind) = tier.kind.pool_kinds();
+            pool_metrics::publish(&db_label, query_kind, sqlx_sample(&tier.pool));
+            pool_metrics::publish(&db_label, cancel_kind, sqlx_sample(&tier.cancel_pool));
+        });
+        tier
+    }
+
+    /// The `pool_kind` label of `pool`, one of this tier's two.
+    pub(super) fn pool_kind(&self, pool: &PgPool) -> &'static str {
+        let (query_kind, cancel_kind) = self.kind.pool_kinds();
+        if std::ptr::eq(pool, &self.cancel_pool) {
+            cancel_kind
+        } else {
+            query_kind
         }
     }
 
@@ -181,14 +197,14 @@ impl WriteTier {
         let password = resolve_password(&self.password).await?;
         let opts = with_password(self.options.clone(), &password);
         let pool = query_pool_options(self.sizing).connect_lazy_with(opts.clone());
-        let tier = Arc::new(Tier::assemble(
+        let tier = Tier::assemble(
             TierKind::Write,
             pool,
             opts,
             &self.role,
             self.sizing,
             &self.db_label,
-        ));
+        );
         *current = Some(Arc::clone(&tier));
         Ok(tier)
     }

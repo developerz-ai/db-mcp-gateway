@@ -6,11 +6,12 @@ here (`<action> <reason>`). Pinned by test_release_reuse_decision.py.
 
 Actions:
   wait         ci.yml has not finished (or not registered yet): poll again
-  check-image  ci.yml is green: probe the registry for `sha-<7>`
-  reuse        green and the image exists: re-tag it
-  build        no ci.yml run for this commit, or green without an image:
-               build from the tag, with a warning
-  block        ci.yml failed/cancelled, or never finished: fail the release
+  check-image  ci.yml is green: probe both registries for `sha-<7>`
+  reuse        green and the image exists in both: re-tag it
+  block        no ci.yml run for this commit, ci.yml failed/cancelled or never
+               finished, or green without `sha-<7>` in both registries: fail
+               the release. Nothing ships that ci.yml did not test, so there
+               is no build-from-the-tag fallback.
 """
 
 import sys
@@ -23,7 +24,7 @@ def decide(status, conclusion, image, grace_over, deadline_over):
         raise ValueError(f"image must be one of {IMAGE_STATES}, got {image!r}")
     if status == "none":
         if grace_over:
-            return "build", "no ci.yml push run on main for this commit"
+            return "block", "no ci.yml push run on main for this commit"
         return "wait", "ci.yml run not registered yet"
     if status != "completed":
         if deadline_over:
@@ -34,8 +35,8 @@ def decide(status, conclusion, image, grace_over, deadline_over):
     if image == "unchecked":
         return "check-image", "ci.yml is green"
     if image == "present":
-        return "reuse", "ci.yml is green and sha-<7> exists"
-    return "build", "ci.yml is green but its sha-<7> image is missing"
+        return "reuse", "ci.yml is green and sha-<7> exists in both registries"
+    return "block", "ci.yml is green but sha-<7> is missing from a registry (re-run ci.yml's merge)"
 
 
 def main(argv):

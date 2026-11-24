@@ -220,8 +220,11 @@ fn config_with_timeout(statement_timeout_ms: Option<u32>) -> ConfigFile {
         gateway: Default::default(),
         servers: vec![server(SERVER_NAME)],
         permissions: vec![Permission {
-            group: GROUP.to_string(),
+            subject: db_mcp_gateway::config::schema::Subject::Group(GROUP.to_string()),
             grants: vec![Grant {
+                except: Vec::new(),
+                profile: None,
+                expires_at: None,
                 server: SERVER_NAME.to_string(),
                 database: TARGET_DB.to_string(),
                 action: Action::QueryRead,

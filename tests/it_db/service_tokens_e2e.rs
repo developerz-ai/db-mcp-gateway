@@ -78,6 +78,7 @@ struct BootedGateway {
     url: String,
     client: reqwest::Client,
     state_db: sqlx::PgPool,
+    human_sub: String,
 }
 
 /// One gateway with everything wired: mock IdP (human path), two service
@@ -87,8 +88,9 @@ async fn boot_gateway() -> BootedGateway {
 
     // The human login flow needs an IdP even though the service-token tests
     // never drive it; same mock as auth_e2e.
+    let human_sub = format!("human-{}", uuid::Uuid::new_v4().simple());
     let user = MockUser {
-        sub: format!("human-{}", uuid::Uuid::new_v4().simple()),
+        sub: human_sub.clone(),
         email: "human@example.com".to_string(),
         groups: vec!["engineers".into()],
     };
@@ -103,6 +105,7 @@ async fn boot_gateway() -> BootedGateway {
         url: gw.url,
         client: no_redirect_client(),
         state_db: gw.state_db,
+        human_sub,
     }
 }
 
@@ -232,6 +235,7 @@ async fn service_token_with_empty_grants_sees_nothing() {
 /// the exact body the live-test fence and MCP clients rely on.
 #[tokio::test]
 #[serial_test::parallel(world)]
+// audit-guard: exempt — both requests are refused at the bearer check, before any identity exists to audit
 async fn unconfigured_or_missing_token_is_unauthorized() {
     let gw = boot_gateway().await;
 
@@ -310,6 +314,8 @@ async fn human_session_jwt_still_works_with_service_accounts_configured() {
         !rendered.contains("\"name\":\"staging\""),
         "engineers must not inherit the service group's scope: {rendered}"
     );
+    let row = latest_audit(&gw.state_db, &gw.human_sub, "list_servers", "human session").await;
+    assert_eq!(row.outcome.as_str(), "success");
 }
 
 /// `/auth/logout` is bearer-gated too; a service token resolves an identity

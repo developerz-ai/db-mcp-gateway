@@ -57,6 +57,9 @@ proptest! {
     ) {
         let id = identity_in(TEST_GROUP);
         let wildcard = Grant {
+            except: Vec::new(),
+            profile: None,
+            expires_at: None,
             server: server.clone(),
             database: "*".to_string(),
             action,
@@ -87,12 +90,18 @@ proptest! {
     ) {
         let id = identity_in(TEST_GROUP);
         let wildcard = Grant {
+            except: Vec::new(),
+            profile: None,
+            expires_at: None,
             server: server.clone(),
             database: "*".to_string(),
             action,
             constraints: wc_constraints,
         };
         let specific = Grant {
+            except: Vec::new(),
+            profile: None,
+            expires_at: None,
             server: server.clone(),
             database: db.clone(),
             action,
@@ -127,6 +136,9 @@ proptest! {
     ) {
         let id = identity_in(TEST_GROUP);
         let wildcard = Grant {
+            except: Vec::new(),
+            profile: None,
+            expires_at: None,
             server: server.clone(),
             database: "*".to_string(),
             action,
@@ -163,6 +175,9 @@ proptest! {
 
         let id = identity_in(TEST_GROUP);
         let wildcard = Grant {
+            except: Vec::new(),
+            profile: None,
+            expires_at: None,
             server: server.clone(),
             database: "*".to_string(),
             action: grant_action,
@@ -194,6 +209,9 @@ proptest! {
     ) {
         let id = identity_in(TEST_GROUP);
         let wildcard = Grant {
+            except: Vec::new(),
+            profile: None,
+            expires_at: None,
             server: "*".to_string(),
             database: "*".to_string(),
             action,
@@ -225,6 +243,9 @@ proptest! {
         // User is in "outsider"; the wildcard lives in "insider".
         let id = identity_in("outsider");
         let wildcard = Grant {
+            except: Vec::new(),
+            profile: None,
+            expires_at: None,
             server: "*".to_string(),
             database: "*".to_string(),
             action,

@@ -72,4 +72,7 @@ if (( ${#missing[@]} )); then
   "${compose[@]}" up -d --wait "${missing[@]}"
 fi
 bin/seed
+# The owner password is bin/seed's alone: the gateway connects as the
+# read-only login, even when the shell or .env exports the owner's.
+unset TARGET_DB_PASSWORD
 exec cargo run --bin db-mcp-gateway "$@" -- --config "$config"

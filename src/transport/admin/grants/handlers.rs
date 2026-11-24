@@ -21,8 +21,8 @@ use super::super::validation::{
     check_unchanged, internal, invalid_body, invalid_id, not_found, store_error,
 };
 use super::validation::{
-    constraints_to_json, map_create_grant_error, parse_action, parse_grant_target, positive_bounds,
-    positive_patch_bounds,
+    constraints_to_json, future_expiry, map_create_grant_error, parse_action, parse_grant_target,
+    positive_bounds, positive_patch_bounds,
 };
 use super::{CreateGrantRequest, GrantResponse, GrantsState, ListGrantsQuery, UpdateGrantRequest};
 
@@ -38,16 +38,24 @@ pub async fn create(
     let target = parse_grant_target(&body, &state.known_servers, rid)?;
     let action = parse_action(&body.action, rid)?;
     positive_bounds(&body.constraints, rid)?;
+    future_expiry(body.expires_at, rid)?;
     let constraints = constraints_to_json(&body.constraints);
 
     let mut atx = AuditedTx::begin_locked(&state.state_db, &actor).await?;
-    let grant = grants::tx_create_grant(atx.tx(), body.user_id, &target, action, &constraints)
-        .await
-        .map_err(|err| map_create_grant_error(err, rid))?
-        .ok_or_else(|| {
-            AdminError::invalid("invalid grant reference: user or database does not exist")
-                .with_request_id(rid)
-        })?;
+    let grant = grants::tx_create_grant(
+        atx.tx(),
+        body.user_id,
+        &target,
+        action,
+        &constraints,
+        body.expires_at,
+    )
+    .await
+    .map_err(|err| map_create_grant_error(err, rid))?
+    .ok_or_else(|| {
+        AdminError::invalid("invalid grant reference: user or database does not exist")
+            .with_request_id(rid)
+    })?;
     let change = change_for_user(&mut atx, grant.user_id).await?;
     atx.audit(
         Action::Create,
@@ -104,12 +112,13 @@ pub async fn patch(
     let Path(id) = id.map_err(|_| invalid_id("grant", rid))?;
     let Json(body) = body.map_err(|_| invalid_body(rid))?;
     let patch = body.constraints.unwrap_or_default();
-    if body.action.is_none() && patch.is_empty() {
-        return Err(
-            AdminError::invalid("PATCH body must set at least one of action, constraints")
-                .with_request_id(rid),
-        );
+    if body.action.is_none() && patch.is_empty() && body.expires_at.is_none() {
+        return Err(AdminError::invalid(
+            "PATCH body must set at least one of action, constraints, expires_at",
+        )
+        .with_request_id(rid));
     }
+    future_expiry(body.expires_at.flatten(), rid)?;
     let action = body
         .action
         .as_deref()
@@ -128,7 +137,8 @@ pub async fn patch(
     let current: Constraints = serde_json::from_value(before.constraints.clone())
         .map_err(|err| internal("decode constraints", err, rid))?;
     let merged = constraints_to_json(&patch.apply(&current));
-    let after = grants::tx_update_grant(atx.tx(), id, action, &merged)
+    let expires_at = body.expires_at.unwrap_or(before.expires_at);
+    let after = grants::tx_update_grant(atx.tx(), id, action, &merged, expires_at)
         .await
         .map_err(|err| store_error("update_grant", err, rid))?
         .ok_or_else(|| not_found(rid))?;

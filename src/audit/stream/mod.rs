@@ -115,6 +115,8 @@ fn send_stdout(row: &AuditRow) {
     // which cannot happen for `Vec<String>` — but keeps the log line valid
     // rather than crashing the fire-and-forget path.
     let groups = serde_json::to_string(&row.groups).unwrap_or_default();
+    // The JSONB `audit_calls.params` holds, as JSON text; `""` without params.
+    let params = row.params.as_ref().map(ToString::to_string);
     tracing::info!(
         target: "audit_stream",
         audit_id = %row.id,
@@ -139,6 +141,7 @@ fn send_stdout(row: &AuditRow) {
         upstream_run_id = row.upstream_run_id.as_deref().unwrap_or(""),
         rows_affected = row.rows_affected,
         sql_truncated = row.sql_truncated,
+        params = params.as_deref().unwrap_or(""),
         "audit row streamed"
     );
 }

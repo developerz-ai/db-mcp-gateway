@@ -96,9 +96,42 @@ pub enum ConfigFileError {
          `tls`; the CA would be silently unused — set `transport: tls` or drop `ca_file`"
     )]
     SyslogSinkCaFileWithoutTls { index: usize },
+    /// Two or more validation failures, in file order. Built only by
+    /// [`Self::from_errors`], so it never holds fewer than two or a nested
+    /// `Many`; a single failure keeps its own variant.
+    #[error("{} config errors:\n{}", .0.len(), render_each(.0))]
+    Many(Vec<ConfigFileError>),
+}
+
+fn render_each(errors: &[ConfigFileError]) -> String {
+    errors
+        .iter()
+        .map(|err| format!("  - {err}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl ConfigFileError {
+    /// `None` when `errors` is empty, the error itself when there is one, and
+    /// [`Self::Many`] otherwise — so callers matching one variant keep working
+    /// for a config with one mistake.
+    pub(super) fn from_errors(errors: Vec<ConfigFileError>) -> Option<Self> {
+        let mut flat: Vec<ConfigFileError> = errors.into_iter().flat_map(Self::into_list).collect();
+        match flat.len() {
+            0 => None,
+            1 => flat.pop(),
+            _ => Some(Self::Many(flat)),
+        }
+    }
+
+    /// Every individual failure this error carries, in file order.
+    pub fn into_list(self) -> Vec<ConfigFileError> {
+        match self {
+            Self::Many(errors) => errors,
+            other => vec![other],
+        }
+    }
+
     /// Build a `Parse` error with location information extracted up-front.
     /// Operators read `Display` first; making them dig through `source()`
     /// for line numbers is the polish #16 is fixing.

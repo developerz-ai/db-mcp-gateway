@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use crate::common::env::state_db_url;
 use db_mcp_gateway::audit::reaper::ReapCursor;
-use db_mcp_gateway::audit::{self, AuditRow, OutcomeCode};
+use db_mcp_gateway::audit::{self, AuditRow, CallIntent, OutcomeCode};
+use db_mcp_gateway::exec::Access;
 use db_mcp_gateway::state;
 use sqlx::{Executor, PgPool};
 use uuid::Uuid;
@@ -66,6 +67,24 @@ fn row(user_sub: &str) -> AuditRow {
         upstream_run_id: None,
         rows_affected: None,
         sql_truncated: false,
+        params: None,
+    }
+}
+
+fn intent(request_id: Uuid) -> CallIntent<'static> {
+    CallIntent {
+        request_id,
+        user_sub: "role-split",
+        user_email: "role-split@example.com",
+        tool: "run_query",
+        server: "prod",
+        database: "app",
+        db_type: Some("postgres"),
+        access: Access::ReadOnly,
+        sql: Some("SELECT 1"),
+        reason: None,
+        upstream_actor: None,
+        upstream_run_id: None,
     }
 }
 
@@ -124,12 +143,48 @@ async fn runtime_role_appends_and_prunes_but_cannot_rewrite_audit_rows() {
         .await
         .expect("read");
     assert_eq!(history, 1);
-    audit::pruner::run_once(&app_pool, 90)
+
+    // Work for both sweeps, so each must delete or decode a row, not just
+    // run: a completion past retention (seeded by the owner — `audit::log`
+    // writes only *now*) and an intent with no completion.
+    sqlx::query(
+        "INSERT INTO audit_calls (id, request_id, user_sub, user_email, tool, outcome, occurred_at) \
+         VALUES ($1, 'ancient', 'role-split', 'role-split@example.com', 'list_servers', \
+                 'success', now() - interval '100 days')",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&owner_pool)
+    .await
+    .expect("seed an expired completion");
+    let orphan = Uuid::new_v4();
+    audit::intent::record(&app_pool, &intent(orphan))
+        .await
+        .expect("the runtime role records an intent");
+
+    let pruned = audit::pruner::run_once(&app_pool, 90)
         .await
         .expect("pruner runs as the runtime role");
-    audit::reaper::run_once(&app_pool, Duration::ZERO, &mut ReapCursor::default())
+    assert!(
+        pruned >= 1,
+        "the expired completion was not pruned: {pruned}"
+    );
+    let reaped = audit::reaper::run_once(&app_pool, Duration::ZERO, &mut ReapCursor::default())
         .await
         .expect("reaper runs as the runtime role");
+    assert_eq!(reaped, Some(1), "the orphaned intent was not reaped");
+    let abandoned: String =
+        sqlx::query_scalar("SELECT outcome FROM audit_calls WHERE request_id = $1")
+            .bind(orphan.to_string())
+            .fetch_one(&app_pool)
+            .await
+            .expect("the reaped row reads back");
+    assert_eq!(abandoned, "abandoned");
+    let ancient: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_calls WHERE request_id = 'ancient'")
+            .fetch_one(&app_pool)
+            .await
+            .expect("read");
+    assert_eq!(ancient, 0);
 
     for sql in [
         "UPDATE audit_calls SET outcome = 'success'",

@@ -85,6 +85,7 @@ impl AppState {
     /// store (Postgres, over `state_db`), an in-memory client registry, an
     /// empty adapter registry and an uninstalled metrics recorder. Mutate the
     /// public fields for anything else (a MySQL repo, a shared cache).
+    #[allow(clippy::expect_used)] // test-only wiring: a bad test config should fail loudly
     pub fn for_tests(config: ConfigFile, state_db: PgPool, auth: AuthFacade) -> Self {
         use std::time::Duration;
 

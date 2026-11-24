@@ -64,6 +64,7 @@ fn full_row() -> AuditRow {
         upstream_run_id: Some("run-7".into()),
         rows_affected: Some(3),
         sql_truncated: true,
+        params: Some(serde_json::json!([1, "x", null])),
     }
 }
 
@@ -109,6 +110,7 @@ fn stdout_carries_every_audit_row_field() {
     assert_eq!(event["upstream_run_id"], "run-7");
     assert_eq!(event["rows_affected"], 3);
     assert_eq!(event["sql_truncated"], true);
+    assert_eq!(event["params"], r#"[1,"x",null]"#);
 }
 
 /// A read has no `rows_affected`; stdout leaves the field out rather than
@@ -128,4 +130,5 @@ fn syslog_body_carries_every_audit_row_field() {
     for field in row_fields(&row) {
         assert!(body.get(&field).is_some(), "syslog body lacks `{field}`");
     }
+    assert_eq!(body["params"], serde_json::json!([1, "x", null]));
 }

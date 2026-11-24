@@ -98,7 +98,8 @@ impl Cidr {
             Some((addr, prefix)) => (addr, Some(prefix.parse::<u8>().ok()?)),
             None => (entry, None),
         };
-        let network = addr.parse::<IpAddr>().ok()?.to_canonical();
+        // Kept in its written family: a mapped entry's prefix counts v6 bits.
+        let network = addr.parse::<IpAddr>().ok()?;
         let max = max_prefix(network);
         let prefix = prefix.unwrap_or(max);
         (prefix <= max).then_some(Self { network, prefix })
@@ -115,7 +116,14 @@ impl Cidr {
             (IpAddr::V6(net), IpAddr::V6(ip)) => {
                 same_prefix(net.to_bits(), ip.to_bits(), 128, self.prefix)
             }
-            _ => false,
+            // A canonical v4 peer is still the mapped v6 address on the wire.
+            (IpAddr::V6(net), IpAddr::V4(ip)) => same_prefix(
+                net.to_bits(),
+                ip.to_ipv6_mapped().to_bits(),
+                128,
+                self.prefix,
+            ),
+            (IpAddr::V4(_), IpAddr::V6(_)) => false,
         }
     }
 }
@@ -130,19 +138,22 @@ fn same_prefix(a: u128, b: u128, width: u32, prefix: u8) -> bool {
     a.checked_shr(shift).unwrap_or(0) == b.checked_shr(shift).unwrap_or(0)
 }
 
-/// Every `X-Forwarded-For` hop, left to right across repeated headers. A
-/// non-UTF-8 header contributes one hop that will not parse.
-fn forwarded_hops(headers: &HeaderMap) -> Vec<&str> {
+/// Every `X-Forwarded-For` hop, left to right across repeated headers. Split
+/// as bytes, so a non-ASCII entry a client forged costs only its own hop, not
+/// the hops trusted proxies appended after it.
+fn forwarded_hops(headers: &HeaderMap) -> Vec<&[u8]> {
     headers
         .get_all(X_FORWARDED_FOR)
         .iter()
-        .flat_map(|value| value.to_str().unwrap_or("?").split(','))
-        .map(str::trim)
+        .flat_map(|value| value.as_bytes().split(|&byte| byte == b','))
+        .map(<[u8]>::trim_ascii)
         .collect()
 }
 
 /// A hop is a bare IP, or an `ip:port` / `[v6]:port` some proxies write.
-fn parse_hop(hop: &str) -> Option<IpAddr> {
+/// Non-UTF-8 is no IP: the walk stops at the trusted hop before it.
+fn parse_hop(hop: &[u8]) -> Option<IpAddr> {
+    let hop = std::str::from_utf8(hop).ok()?;
     hop.parse::<IpAddr>()
         .or_else(|_| hop.parse::<SocketAddr>().map(|addr| addr.ip()))
         .ok()
@@ -150,105 +161,5 @@ fn parse_hop(hop: &str) -> Option<IpAddr> {
 }
 
 #[cfg(test)]
-mod tests {
-    use axum::http::HeaderValue;
-
-    use super::*;
-
-    fn peer(ip: &str) -> SocketAddr {
-        SocketAddr::new(ip.parse().unwrap(), 40000)
-    }
-
-    fn xff(values: &[&str]) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        for value in values {
-            headers.append(X_FORWARDED_FOR, HeaderValue::from_str(value).unwrap());
-        }
-        headers
-    }
-
-    fn ip(raw: &str) -> IpAddr {
-        raw.parse().unwrap()
-    }
-
-    #[test]
-    fn untrusted_peer_is_the_client_whatever_it_forwards() {
-        let none = TrustedProxies::default();
-        let headers = xff(&["203.0.113.7"]);
-        assert_eq!(none.client_ip(peer("10.0.0.5"), &headers), ip("10.0.0.5"));
-        let lb = TrustedProxies::parse("10.0.0.0/8").unwrap();
-        assert_eq!(
-            lb.client_ip(peer("198.51.100.1"), &headers),
-            ip("198.51.100.1")
-        );
-    }
-
-    #[test]
-    fn trusted_peer_yields_the_rightmost_untrusted_hop() {
-        let proxies = TrustedProxies::parse("10.0.0.0/8, 192.168.1.5").unwrap();
-        // The client forged `1.1.1.1`; the edge proxy appended the real peer.
-        let headers = xff(&["1.1.1.1, 203.0.113.7", "192.168.1.5"]);
-        assert_eq!(
-            proxies.client_ip(peer("10.0.0.5"), &headers),
-            ip("203.0.113.7")
-        );
-    }
-
-    #[test]
-    fn trusted_peer_without_a_usable_hop_stays_the_peer() {
-        let proxies = TrustedProxies::parse("10.0.0.0/8").unwrap();
-        assert_eq!(
-            proxies.client_ip(peer("10.0.0.5"), &HeaderMap::new()),
-            ip("10.0.0.5")
-        );
-        let garbage = xff(&["203.0.113.7, not-an-ip"]);
-        assert_eq!(
-            proxies.client_ip(peer("10.0.0.5"), &garbage),
-            ip("10.0.0.5")
-        );
-        let all_trusted = xff(&["10.1.1.1, 10.2.2.2"]);
-        assert_eq!(
-            proxies.client_ip(peer("10.0.0.5"), &all_trusted),
-            ip("10.1.1.1")
-        );
-    }
-
-    #[test]
-    fn hops_with_ports_and_mapped_v6_peers_resolve() {
-        let proxies = TrustedProxies::parse("10.0.0.0/8,fd00::/8").unwrap();
-        let headers = xff(&["[2001:db8::1]:443"]);
-        assert_eq!(
-            proxies.client_ip(peer("::ffff:10.0.0.5"), &headers),
-            ip("2001:db8::1")
-        );
-        let headers = xff(&["203.0.113.7:5000"]);
-        assert_eq!(
-            proxies.client_ip(peer("fd00::1"), &headers),
-            ip("203.0.113.7")
-        );
-    }
-
-    #[test]
-    fn prefix_zero_and_full_width_are_honoured() {
-        let all = TrustedProxies::parse("0.0.0.0/0").unwrap();
-        assert!(all.trusts(ip("203.0.113.7")));
-        assert!(!all.trusts(ip("::1")), "a v4 range never matches v6");
-        let one = TrustedProxies::parse("::1/128").unwrap();
-        assert!(one.trusts(ip("::1")));
-        assert!(!one.trusts(ip("::2")));
-    }
-
-    #[test]
-    fn malformed_entries_fail_boot() {
-        for bad in [
-            "10.0.0.0/33",
-            "::/129",
-            "10.0.0",
-            "proxy.internal",
-            "10.0.0.0/8,",
-            "*",
-        ] {
-            assert!(TrustedProxies::parse(bad).is_err(), "{bad:?} accepted");
-        }
-    }
-}
+#[path = "client_ip_tests.rs"]
+mod tests;

@@ -82,6 +82,24 @@ async fn authorize_refuses_a_resource_that_is_not_this_gateway() {
 }
 
 #[tokio::test]
+async fn authorize_refuses_the_advertised_resource_with_extra_components() {
+    let (base, client_id) = gateway_and_client().await;
+    let ours = advertised_resource(&base).await;
+    let with_userinfo = ours.replacen("://", "://agent@", 1);
+    for altered in [
+        format!("{ours}?tenant=other"),
+        format!("{ours}?"),
+        format!("{ours}#"),
+        format!("{ours}//"),
+        with_userinfo,
+    ] {
+        let (status, body) = authorize(&base, &client_id, &altered).await;
+        assert_eq!(status, 400, "{altered}: {body}");
+        assert_eq!(body["error"], "invalid_target", "{altered}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn authorize_accepts_the_advertised_resource() {
     let (base, client_id) = gateway_and_client().await;
     let ours = advertised_resource(&base).await;

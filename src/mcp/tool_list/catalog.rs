@@ -90,7 +90,8 @@ pub(super) fn get_query_history() -> Tool {
         name: GET_QUERY_HISTORY_TOOL,
         title: "Query history",
         description: "Your recent queries against a (server, database), newest \
-                      first: SQL, timestamp, duration, row count and outcome. \
+                      first: SQL and its sql_sha256, timestamp, duration, row count \
+                      and outcome; `sql_sha256` narrows to one statement's runs. \
                       Recovers context across sessions. Scoped to your \
                       authenticated identity, never to a client-supplied user; a \
                       service token that sends `x-dbmcp-run-id` sees only that \
@@ -111,6 +112,10 @@ pub(super) fn get_query_history() -> Tool {
                 "cursor":   { "type": "string",
                                "description": "Opaque `next_cursor` from a previous \
                                                 page; returns the entries after it." },
+                "sql_sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$",
+                               "description": "Hex SHA-256 of the stored SQL (an \
+                                                entry's sql_sha256); only its \
+                                                entries are returned." },
                 "reason":   { "type": "string", "description": REASON_DESCRIPTION }
             },
             "required": ["server", "database"],

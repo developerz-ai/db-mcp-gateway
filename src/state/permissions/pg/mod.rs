@@ -5,6 +5,7 @@
 //! together.
 
 pub mod databases;
+pub mod export;
 pub mod grants;
 pub mod notify;
 mod rows;
@@ -156,7 +157,8 @@ mod seed {
                 user_id,
                 &target,
                 action,
-                &constraints
+                &constraints,
+                None
             ));
             created.ok_or(RepoError::Sqlx(sqlx::Error::RowNotFound))
         }

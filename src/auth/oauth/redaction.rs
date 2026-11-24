@@ -51,8 +51,8 @@ impl Debug for PendingConsent {
     }
 }
 
-/// The maps are keyed by the OIDC `state` and the consent id, both bearer
-/// values for the flow they name; nothing inside is worth a log line.
+/// Holds the key the login secrets derive from, and either a pool (whose
+/// `Debug` can render the DSN) or maps of pending logins: nothing to print.
 impl Debug for PendingFlows {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         f.debug_struct("PendingFlows").finish_non_exhaustive()
@@ -70,6 +70,7 @@ impl Debug for AuthCode {
     }
 }
 
+/// A pool (whose `Debug` can render the DSN) or a map of pending codes.
 impl Debug for AuthCodes {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         f.debug_struct("AuthCodes").finish_non_exhaustive()
@@ -80,14 +81,12 @@ impl Debug for AuthCodes {
 mod tests {
     use super::*;
 
-    const SECRETS: [&str; 9] = [
+    const SECRETS: [&str; 7] = [
         "sub-4711",
         "dana@example.com",
         "db-oncall",
         "client-state-secret",
         "challenge-secret",
-        "nonce-secret",
-        "verifier-secret",
         "csrf-secret",
         "oidc-state-secret",
     ];
@@ -128,31 +127,30 @@ mod tests {
     async fn pending_flows_and_consents_print_no_secret() {
         let flows = PendingFlows::default();
         flows
-            .insert_bridge(
-                "oidc-state-secret".into(),
-                "nonce-secret".into(),
-                "verifier-secret".into(),
-                bridge(),
-            )
-            .await;
+            .insert_bridge("oidc-state-secret", bridge())
+            .await
+            .expect("stored");
         flows
-            .insert_consent(
-                "consent-id".into(),
-                "csrf-secret".into(),
-                identity(),
-                bridge(),
-            )
-            .await;
+            .insert_consent("consent-id", "csrf-secret", identity(), bridge())
+            .await
+            .expect("stored");
         assert_redacted(&format!("{flows:?}"));
 
-        let flow = flows.take("oidc-state-secret").await.expect("live flow");
+        let flow = flows
+            .take("oidc-state-secret")
+            .await
+            .expect("store")
+            .expect("live flow");
         let printed = format!("{flow:?}");
         assert_redacted(&printed);
+        assert!(!printed.contains(&flow.nonce), "{printed}");
+        assert!(!printed.contains(&flow.idp_verifier), "{printed}");
         assert!(printed.contains("mcp-client"), "{printed}");
 
         let consent = flows
             .take_consent("consent-id")
             .await
+            .expect("store")
             .expect("live consent");
         assert_redacted(&format!("{consent:?}"));
     }
@@ -174,7 +172,11 @@ mod tests {
         assert_redacted(&printed);
         assert!(!printed.contains("code-secret"), "{printed}");
 
-        let code = codes.take("code-secret").await.expect("live code");
+        let code = codes
+            .take("code-secret")
+            .await
+            .expect("store")
+            .expect("live code");
         assert_redacted(&format!("{code:?}"));
     }
 }

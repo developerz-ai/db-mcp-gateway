@@ -41,9 +41,9 @@ pub async fn insert_call(pool: &PgPool, row: &AuditRow) -> Result<(), sqlx::Erro
          (id, request_id, user_sub, user_email, groups, tool, server_name, database_name, \
           sql, reason, outcome, elapsed_ms, row_count, truncated, error_message, \
           agent_client, ip, db_type, upstream_actor, upstream_run_id, rows_affected, \
-          sql_truncated) \
+          sql_truncated, params) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
-                 $19, $20, $21, $22) \
+                 $19, $20, $21, $22, $23) \
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(row.id)
@@ -68,6 +68,7 @@ pub async fn insert_call(pool: &PgPool, row: &AuditRow) -> Result<(), sqlx::Erro
     .bind(&row.upstream_run_id)
     .bind(row.rows_affected)
     .bind(row.sql_truncated)
+    .bind(&row.params)
     .execute(pool)
     .await?;
     Ok(())
@@ -84,7 +85,7 @@ pub async fn latest_call_for_user_tool(
         "SELECT id, request_id, user_sub, user_email, groups, tool, server_name, database_name, \
                 sql, reason, outcome, elapsed_ms, row_count, truncated, error_message, \
                 agent_client, ip, db_type, upstream_actor, upstream_run_id, rows_affected, \
-                sql_truncated, occurred_at \
+                sql_truncated, params, occurred_at \
          FROM audit_calls WHERE user_sub = $1 AND tool = $2 \
          ORDER BY occurred_at DESC LIMIT 1",
     )
@@ -127,5 +128,6 @@ pub async fn latest_call_for_user_tool(
         upstream_run_id: r.try_get("upstream_run_id")?,
         rows_affected: r.try_get("rows_affected")?,
         sql_truncated: r.try_get("sql_truncated")?,
+        params: r.try_get("params")?,
     }))
 }

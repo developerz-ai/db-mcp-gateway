@@ -16,13 +16,20 @@
 //! the data write ([`audited_tx`]). Audit failure rolls back. CLAUDE.md
 //! non-negotiable #4.
 
+pub mod audit_calls;
 mod audited_tx;
 pub mod databases;
 pub mod error;
+pub mod explain;
+mod grant_view;
 pub mod grants;
 pub mod middleware;
+pub mod openapi;
 pub mod page_query;
 mod payload;
+mod permissions_diff;
+pub mod permissions_doc;
+mod read_audit;
 pub mod users;
 mod validation;
 
@@ -69,6 +76,14 @@ pub struct AdminDeps {
     pub known_servers: Arc<[String]>,
     /// The live config: a database registration must name a database the
     /// config declares *now*, not at boot — a reload can add or drop one.
+    pub config: Arc<ArcSwap<ConfigFile>>,
+}
+
+/// State of the audited read routes (explain, export/diff, audit stream).
+#[derive(Debug, Clone)]
+pub struct ReadState {
+    pub repo: Arc<dyn PermissionsRepo>,
+    pub state_db: PgPool,
     pub config: Arc<ArcSwap<ConfigFile>>,
 }
 
@@ -125,10 +140,24 @@ pub fn router(deps: AdminDeps) -> Router {
             state_db: state_db.clone(),
             cache: cache.clone(),
             known_servers: known_servers.clone(),
+            config: config.clone(),
+        });
+    let read_routes = Router::new()
+        .route("/admin/v1/explain", post(explain::explain))
+        .route("/admin/v1/permissions/export", get(permissions_doc::export))
+        .route(
+            "/admin/v1/permissions/diff",
+            post(permissions_doc::diff_document),
+        )
+        .route("/admin/v1/audit/calls", get(audit_calls::stream))
+        .with_state(ReadState {
+            repo: repo.clone(),
+            state_db: state_db.clone(),
             config,
         });
     let grants_routes = Router::new()
         .route("/admin/v1/grants", post(grants::create).get(grants::list))
+        .route("/admin/v1/grants/batch", post(grants::batch))
         .route(
             "/admin/v1/grants/:id",
             get(grants::get_one)
@@ -146,6 +175,8 @@ pub fn router(deps: AdminDeps) -> Router {
         .merge(users_routes)
         .merge(databases_routes)
         .merge(grants_routes)
+        .merge(read_routes)
+        .route("/admin/v1/openapi.json", get(openapi::document))
         .route_layer(axum_mw::from_fn_with_state(mw_state, require_admin_group))
         .route_layer(axum_mw::map_response(no_store))
 }

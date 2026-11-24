@@ -5,7 +5,7 @@
 - **OCI image**: `ghcr.io/developerz-ai/db-mcp-gateway:<version>` on GitHub Container Registry (also pushed to DigitalOcean's registry). Multi-arch (amd64, arm64). Distroless `cc` base (glibc; no shell, no `kill`, no `curl`), running as `nonroot`. One binary inside. Public, free, no Docker Hub rate limits.
 - **Release trigger**: pushing a `v*` git tag fires `.github/workflows/release.yml`, which re-tags the multi-arch image `ci.yml` already built and tested for that commit (or builds it when there is none), pushes it to GHCR, and cuts a GitHub Release with auto-generated notes.
 - **GitHub Releases**: release notes pointing at the image tags. No standalone binaries are attached — build from source (`cargo build --release`) if you need one outside a container.
-- **Helm chart**: published alongside the image on the same tag (roadmap, phase 8).
+- **Helm chart / kustomize base**: `deploy/helm/db-mcp-gateway` and `deploy/kustomize/base` in this repository, versioned with the image (`appVersion` is the crate version, pinned by `tests/deploy_catalogue.rs`); not yet published to a chart repository. Kubernetes ≥ 1.30 (the `preStop` hook is the native `sleep` action — the image has no shell). Grace period ≥ 130 s (10 s preStop + the 120 s [shutdown](#shutdown) drain), HTTPS probes with a `startupProbe` covering `STATE_DB_CONNECT_TIMEOUT_SECONDS`, the `restricted` security context, a NetworkPolicy, ServiceMonitor and a PrometheusRule built from `deploy/prometheus/rules.yaml`. Guide: [Kubernetes](../deployment/kubernetes.md).
 - **Examples**: `examples/` in this repository (`docker-compose.yml`, `gateway.yaml`). Provisioning SQL per engine lives in the docs ([target roles](../deployment/target-roles.md)), not as shipped templates.
 
 ## Minimum viable deployment
@@ -100,9 +100,9 @@ Two paths must be open:
 | Gateway | State DB | Sessions, audit, permissions |
 | Gateway | Syslog receiver (optional) | `logging.stream` syslog sink |
 
-`POST /mcp` validates `Origin` (MCP Streamable HTTP, against DNS rebinding): a request without one passes (non-browser agents), one whose `Origin` is not a bare `scheme://host[:port]` (a path, even `/`, is refused — the same rule as a listed entry) or not in `MCP_ALLOWED_ORIGINS` — or, on a loopback bind, not a loopback origin — gets `403` before authentication, with no audit row and a `WARN` log line.
+`POST /mcp` validates `Origin` (MCP Streamable HTTP, against DNS rebinding): a request without one passes (non-browser agents), one whose `Origin` is not a bare `scheme://host[:port]` (checked on the raw header before URL parsing: a path, even `/` or `/.`, a `\`, userinfo, whitespace or non-ASCII is refused — the same rule as a listed entry) or not in `MCP_ALLOWED_ORIGINS` — or, on a loopback bind, not a loopback origin — gets `403` before authentication, with no audit row and a `WARN` log line carrying the request id and the reason, never the header value (it may carry URL credentials). A request with more than one `Origin` header is refused the same way, even when the first is allowed.
 
-Behind a reverse proxy, set `TRUSTED_PROXIES` to the proxies' addresses: when the TCP peer is one of them, the audit row's `ip` is the right-most `X-Forwarded-For` hop that is not itself a trusted proxy. Unset, `ip` is the TCP peer and `X-Forwarded-For` is ignored.
+Behind a reverse proxy, set `TRUSTED_PROXIES` to the proxies' addresses: when the TCP peer is one of them, the audit row's `ip` is the right-most `X-Forwarded-For` hop that is not itself a trusted proxy. Hops are split as bytes, so a non-ASCII entry a client forged does not hide the hops proxies appended after it; a hop that is not an IP (non-UTF-8 included) ends the walk at the trusted hop before it — the gateway records the proxy rather than guess past it. An IPv4-mapped IPv6 entry (`::ffff:10.0.0.0/104`) keeps its IPv6 prefix length and matches the IPv4 peers it maps. Unset, `ip` is the TCP peer and `X-Forwarded-For` is ignored.
 
 No secrets-backend or object-storage path is needed today: secrets arrive as env vars or mounted files (`vault:` / `aws-sm:` / `gcp-sm:` refs abort boot), and there is no archive exporter ([11-roadmap](11-roadmap.md) phase 4).
 
@@ -122,7 +122,7 @@ What the gateway needs from the proxy (transaction-mode prepared statements, one
 
 ## Replicas
 
-Login state for the OAuth bridge (pending `/authorize` flows and authorization codes) lives in process memory. Run one replica, or route `/authorize`, `/auth/callback` and `/token` to the same replica with sticky sessions, so a login's `/authorize` and `/token` hit the same replica. Sessions, refresh tokens, audit and permissions live in the shared state DB and work on any replica.
+Run as many replicas as you like behind a plain load balancer: no route needs sticky sessions. Sessions, refresh tokens, audit, permissions and the OAuth bridge's login state (pending logins, consents and authorization codes, migration 0022) all live in the shared state DB, so each step of a login may land on a different replica. Every replica must run with the same `SESSION_SIGNING_KEY` and the same `OIDC_REDIRECT_URL` (the load balancer's `/auth/callback`): bearers and the IdP-side login secrets are derived from the key, and the IdP sends every login back to that one URL. See [02-architecture §HA](02-architecture.md#ha).
 
 ## Upgrades
 
@@ -135,7 +135,10 @@ Login state for the OAuth bridge (pending `/authorize` flows and authorization c
 - `/healthz` (liveness) — always returns 200 if the binary is up.
 - `/readyz` (readiness) — 200 only when the state DB is reachable (and the gateway is not shutting down).
 - Boot retries an unreachable state DB with backoff for `STATE_DB_CONNECT_TIMEOUT_SECONDS` (default 60 s), then exits. The listener binds only after the state DB is up, so neither probe answers during that window: give the `startupProbe` at least that budget.
-- `/metrics` (Prometheus) on its own listener, `METRICS_BIND` (default `127.0.0.1:9090`) — not on the public listener, whose hostname returns 404 for it. Catalogue: [deployment quickstart](../deployment/quickstart.md#metric-catalogue).
+- `/metrics` (Prometheus) on its own listener, `METRICS_BIND` (default `127.0.0.1:9090`) — not on the public listener, whose hostname returns 404 for it. Catalogue: [deployment quickstart](../deployment/quickstart.md#metric-catalogue); the source of truth is `src/startup/metrics/catalogue.rs`, pinned to the emit sites by a test.
+- `/healthz` and `/readyz` are also served on `METRICS_BIND`, so probes need not reach the public port. That listener binds before boot reaches the state DB: until boot completes it answers liveness `200 starting` and readiness `503 starting`.
+- Metric contract: no label carries a user, email, SQL text, request id or host; a `db` label is a configured `server/database`, never a caller-typed name. Every counter is exported at `0` from boot for each stable label set (per tool × outcome, and per configured database × outcome — a reload adds new databases), so `increase()` sees the first event. Target pools (every adapter) and the state DB pools publish size, in-use and idle gauges, sampled every 15 s while the pool is open, plus an acquire-wait histogram. Gauges that change only on an event — `build_info`, `config_info{hash}`, `config_reload_last_success_timestamp`, `tls_cert_not_after_timestamp`, `audit_pruner_last_success_timestamp` — are re-set every minute, so the exporter's one-hour idle eviction (which retires a removed database's series) never drops a live value.
+- `PG_CANCEL_POOL_SIZE` (default 2, `1`–`32`) sizes each Postgres tier's cancel pool; out of range aborts boot.
 - Structured JSON logs to stdout; `RUST_LOG` defaults to `info`, and the `audit_stream` target is always at INFO.
 
 ## Shutdown

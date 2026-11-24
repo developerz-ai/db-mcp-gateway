@@ -1,0 +1,15 @@
+{{- if and .Values.tls.enabled .Values.tls.certManager.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "gateway.fullname" . }}
+  labels:
+    {{- include "gateway.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "gateway.tlsSecretName" . }}
+  issuerRef:
+    kind: {{ .Values.tls.certManager.issuerRef.kind }}
+    name: {{ required "tls.certManager.issuerRef.name is required" .Values.tls.certManager.issuerRef.name }}
+  dnsNames:
+    {{- required "tls.certManager.dnsNames is required" .Values.tls.certManager.dnsNames | toYaml | nindent 4 }}
+{{- end }}

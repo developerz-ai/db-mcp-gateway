@@ -47,7 +47,7 @@ pub(super) use bridge_login::complete_bridge_login;
 pub(super) use consent::{CONSENT_PATH, consent};
 pub(super) use discovery::{authorization_server_metadata, protected_resource_metadata};
 pub(super) use helpers::{query_rejected, random_token, redirect_with_error};
-pub(super) use pages::{PageContext, login_expired, login_not_completed};
+pub(super) use pages::{PageContext, login_expired, login_not_completed, login_unavailable};
 pub(super) use register::register;
 pub(super) use revoke::revoke;
 pub(super) use token::token;

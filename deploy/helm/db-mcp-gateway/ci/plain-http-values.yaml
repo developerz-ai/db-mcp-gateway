@@ -1,0 +1,9 @@
+# TLS terminated upstream: probes switch to HTTP, no TLS volume.
+oidc:
+  issuer: https://idp.example.com
+  clientId: db-mcp-gateway
+  redirectUrl: https://db-gateway.example.com/auth/callback
+tls:
+  enabled: false
+networkPolicy:
+  enabled: false

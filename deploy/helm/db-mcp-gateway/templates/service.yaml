@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "gateway.fullname" . }}
+  labels:
+    {{- include "gateway.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "gateway.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: {{ ternary "https" "http" .Values.tls.enabled }}
+      port: {{ .Values.service.port }}
+      targetPort: gateway
+      protocol: TCP
+---
+# /metrics labels name every configured database: its own Service, never the
+# one an Ingress routes to.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "gateway.fullname" . }}-metrics
+  labels:
+    {{- include "gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "gateway.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+      protocol: TCP

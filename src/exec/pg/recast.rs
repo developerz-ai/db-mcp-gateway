@@ -23,20 +23,22 @@
 //! not changed, only nested.
 //!
 //! The column names and types come from a probe that returns one row of
-//! NULLs. It runs over the simple protocol, the one whose result description
-//! the driver does not look up — and which would run a second statement
-//! smuggled into the text. So the statement is first `PREPARE`d over the
-//! extended protocol, which refuses more than one: the text is proven a
-//! single statement before it is ever nested. Everything runs in a
-//! read-only transaction that is rolled back, tagged and guarded like the
+//! NULLs. It is `EXECUTE`d over the simple protocol, the one whose result
+//! description the driver does not look up — and which would run a second
+//! statement smuggled into the text. So the statement is first `PREPARE`d
+//! over the extended protocol, which refuses more than one: the text is
+//! proven a single statement before it is ever nested. Both are prepared
+//! with the caller's params' types, and the probe executes with every param
+//! NULL: it reads no row, so their values do not matter. Everything runs in
+//! a read-only transaction that is rolled back, tagged and guarded like the
 //! read itself: `cancel_query` finds the probe, and a dropped call cancels it.
 
 use sqlx::postgres::types::Oid;
 use sqlx::{Column, Connection, Executor, PgConnection, Postgres, Transaction};
 
 use super::super::adapter::{ExecError, effective_timeout_ms};
-use super::super::query::ExecQuery;
-use super::super::sql_guard::Access;
+use super::super::query::{ExecQuery, QueryParam};
+use super::super::sql_guard::{Access, statement_body};
 use super::cancel::{Backend, BackendTag, CancelOnDrop};
 use super::run::RunCtx;
 
@@ -63,14 +65,15 @@ pub(super) fn may_apply(err: &ExecError, query: &ExecQuery<'_>) -> bool {
 
 /// `query`'s statement with every column the driver cannot take cast to
 /// text, or `None` when the statement does not prepare or has no such
-/// column.
+/// column. `params` are the ones the statement will run with.
 pub(super) async fn text_cast_sql(
     conn: &mut PgConnection,
     ctx: &RunCtx<'_>,
     query: &ExecQuery<'_>,
+    params: &[QueryParam],
 ) -> Option<String> {
     let mut tx = conn.begin().await.ok()?;
-    let wrapped = guarded_probe(&mut tx, ctx, query).await;
+    let wrapped = guarded_probe(&mut tx, ctx, query, params).await;
     // Read-only and nothing to keep; a failed rollback is the release
     // hook's to clean up (`release`).
     let _ = tx.rollback().await;
@@ -84,6 +87,7 @@ async fn guarded_probe(
     tx: &mut Transaction<'_, Postgres>,
     ctx: &RunCtx<'_>,
     query: &ExecQuery<'_>,
+    params: &[QueryParam],
 ) -> Option<String> {
     let tag = BackendTag::for_request(query.request_id);
     let ms = effective_timeout_ms(query.statement_timeout_ms).min(PROBE_TIMEOUT_MS);
@@ -104,29 +108,39 @@ async fn guarded_probe(
         Backend { pid, tag },
         ctx.detached.clone(),
     );
-    let wrapped = probe(tx, statement_body(query.sql)).await;
+    let wrapped = match statement_body(query.sql) {
+        Some(body) => probe(tx, body, params).await,
+        None => None,
+    };
     cancel.disarm();
     wrapped
 }
 
-async fn probe(tx: &mut Transaction<'_, Postgres>, body: &str) -> Option<String> {
+async fn probe(
+    tx: &mut Transaction<'_, Postgres>,
+    body: &str,
+    params: &[QueryParam],
+) -> Option<String> {
+    let types = param_types(params);
     // Extended protocol: a second statement in `body` is refused here.
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "PREPARE dbmcp_recast AS\n{body}"
-    )))
-    .persistent(false)
-    .execute(&mut **tx)
-    .await
-    .ok()?;
+    prepare(tx, &format!("PREPARE dbmcp_recast{types} AS\n{body}")).await?;
     tx.execute("DEALLOCATE dbmcp_recast").await.ok()?;
-    let probe = format!(
-        "SELECT q.* FROM (SELECT 1) AS one LEFT JOIN \
-         (SELECT * FROM (\n{body}\n) AS s LIMIT 0) AS q ON true"
-    );
+    prepare(
+        tx,
+        &format!(
+            "PREPARE dbmcp_probe{types} AS SELECT q.* FROM (SELECT 1) AS one LEFT JOIN \
+             (SELECT * FROM (\n{body}\n) AS s LIMIT 0) AS q ON true"
+        ),
+    )
+    .await?;
     let row = (&mut **tx)
-        .fetch_optional(sqlx::AssertSqlSafe(probe))
+        .fetch_optional(sqlx::AssertSqlSafe(execute_with_nulls(
+            "dbmcp_probe",
+            params.len(),
+        )))
         .await
         .ok()??;
+    tx.execute("DEALLOCATE dbmcp_probe").await.ok()?;
     let columns: Vec<(String, u32)> = sqlx::Row::columns(&row)
         .iter()
         .map(|c| {
@@ -148,6 +162,39 @@ async fn probe(tx: &mut Transaction<'_, Postgres>, body: &str) -> Option<String>
     Some(wrap(body, &columns))
 }
 
+async fn prepare(tx: &mut Transaction<'_, Postgres>, sql: &str) -> Option<()> {
+    let statement = sqlx::query(sqlx::AssertSqlSafe(sql)).persistent(false);
+    statement.execute(&mut **tx).await.ok().map(drop)
+}
+
+/// The `PREPARE` type list for the types `params` run with (see
+/// [`QueryParam`]), empty without params. Every name is a constant.
+fn param_types(params: &[QueryParam]) -> String {
+    if params.is_empty() {
+        return String::new();
+    }
+    let types: Vec<&str> = params
+        .iter()
+        .map(|param| match param {
+            QueryParam::Null => "unknown",
+            QueryParam::Bool(_) => "bool",
+            QueryParam::Int(_) => "int8",
+            QueryParam::Float(_) => "float8",
+            QueryParam::Text(_) => "text",
+            QueryParam::Json(_) => "jsonb",
+        })
+        .collect();
+    format!(" ({})", types.join(", "))
+}
+
+/// `EXECUTE name` with `count` NULL arguments.
+fn execute_with_nulls(name: &str, count: usize) -> String {
+    match count {
+        0 => format!("EXECUTE {name}"),
+        _ => format!("EXECUTE {name}({})", vec!["NULL"; count].join(", ")),
+    }
+}
+
 /// Which of `types` the driver cannot take, themselves or as an array's
 /// element. The OIDs are numbers, so they are interpolated, not bound.
 async fn untakeable(tx: &mut Transaction<'_, Postgres>, types: &[u32]) -> Option<Vec<u32>> {
@@ -167,12 +214,6 @@ async fn untakeable(tx: &mut Transaction<'_, Postgres>, types: &[u32]) -> Option
         .await
         .ok()?;
     Some(found.into_iter().map(|oid| oid.0).collect())
-}
-
-/// A trailing `;` ends a statement but not a subquery.
-fn statement_body(sql: &str) -> &str {
-    let body = sql.trim_end();
-    body.strip_suffix(';').unwrap_or(body)
 }
 
 /// The wrapper statement: `columns` are each output column's name and
@@ -200,40 +241,5 @@ fn quote_ident(name: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::exec::rejection::DbRejection;
-
-    #[test]
-    fn only_the_columns_without_binary_form_are_cast() {
-        let wrapped = wrap(
-            statement_body("SELECT oid, relacl, relname FROM pg_class -- all;\n ; "),
-            &[("oid", false), ("relacl", true), ("rel\"name", false)],
-        );
-        assert_eq!(
-            wrapped,
-            "SELECT q.c1 AS \"oid\", q.c2::text AS \"relacl\", q.c3 AS \"rel\"\"name\" FROM (\n\
-             SELECT oid, relacl, relname FROM pg_class -- all;\n \n) AS q(c1, c2, c3)"
-        );
-    }
-
-    #[test]
-    fn only_a_read_refused_for_a_missing_function_is_tried_again() {
-        let rejected = |code| ExecError::Rejected(DbRejection::new(code, "", ""));
-        let mut query = ExecQuery {
-            sql: "SELECT relacl FROM pg_class",
-            binds: &[],
-            statement_timeout_ms: None,
-            row_limit: 1,
-            access: Access::ReadOnly,
-            dry_run: false,
-            request_id: uuid::Uuid::nil(),
-        };
-        assert!(may_apply(&rejected(NO_BINARY_OUTPUT), &query));
-        assert!(!may_apply(&rejected("42601"), &query));
-        assert!(may_apply(&ExecError::Sql, &query));
-        assert!(!may_apply(&ExecError::Timeout, &query));
-        query.access = Access::ReadWrite;
-        assert!(!may_apply(&rejected(NO_BINARY_OUTPUT), &query));
-    }
-}
+#[path = "recast_tests.rs"]
+mod tests;

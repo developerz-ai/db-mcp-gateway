@@ -120,6 +120,19 @@ pub(in crate::transport) fn login_expired(page: &PageContext) -> Response {
     .render(page)
 }
 
+/// The login store (the state DB) could not be read or written: nothing is
+/// wrong with the sign-in itself, and it cannot be resumed from here.
+pub(in crate::transport) fn login_unavailable(page: &PageContext) -> Response {
+    Notice {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        heading: "Sign-in temporarily unavailable",
+        message: "The gateway could not reach its own storage to finish this sign-in. Please \
+                  start the connection again from your client in a moment.",
+        return_to_client: None,
+    }
+    .render(page)
+}
+
 /// The IdP sent the browser back without a code on the bespoke login flow.
 pub(in crate::transport) fn login_not_completed(page: &PageContext) -> Response {
     Notice {

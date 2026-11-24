@@ -13,6 +13,12 @@ The admin API is **off by default**. Setting `admin.enabled: true` in YAML opens
 | Grants CRUD with XOR target + wildcard (#54) | works |
 | Synchronous `permissions_audit` writes (#51) | works |
 | Cache invalidation on grant change | works |
+| Grant `expires_at` (expired grants listed `expired: true`, ignored by evaluation) | works |
+| Batch apply — many grant upserts/deletes, one audited transaction | works |
+| `explain` — why a call is allowed or denied | works |
+| Effective-permissions export + diff (YAML ∪ DB) | works |
+| `audit/calls` NDJSON stream | works |
+| OpenAPI 3.1 document at `GET /admin/v1/openapi.json` | works |
 | Pg backend (default) | works |
 | Mysql backend | **resolver path only** — boot rejects `permissions_store.driver: mysql` + `admin.enabled: true` until a transactional `PermissionsRepo` shape lands. Operators on mysql today use YAML grants or pre-populate the tables directly. |
 
@@ -62,6 +68,7 @@ Every error body has one shape, and carries the gateway-minted request id (also 
 | 403 | `session_too_old` | Session older than `admin.session_max_age_secs` |
 | 404 | `not_found` | Missing or soft-deleted row. (With the admin API off, every `/admin/*` path is a plain `404` with no body.) |
 | 409 | `conflict` | `expected_updated_at` mismatch, or the database aborted the write to break a deadlock / serialization conflict. Re-read and retry |
+| 503 | `audit_unavailable` | An audited read (`explain`, `permissions/export`, `permissions/diff`, `audit/calls`) could not write its `audit_calls` row; nothing was returned. Retry once the state DB recovers |
 | 500 | `internal` | Anything else, including a failed audit write; the body never carries the cause |
 
 ## Pagination
@@ -89,6 +96,8 @@ Audit shape (one row per write):
 | `request_id` | Threaded from the HTTP request for join-back to operator dashboards |
 | `ts` | Server-side, assigned at write time (not monotonic — ordering uses `(ts, id)` as the tie-breaker). |
 
+Reads that disclose grants or audit history — `explain`, `permissions/export`, `permissions/diff`, `audit/calls` — write one `audit_calls` row each (`tool` = `admin.explain`, `admin.permissions_export`, `admin.permissions_diff`, `admin.audit_calls`; the admin as `user_sub`) **before** the response goes out. If it cannot be written the read fails with `503 audit_unavailable`. A request refused as invalid reads nothing and writes no row.
+
 Query examples (run as the state DB superuser):
 
 ```sql
@@ -108,7 +117,7 @@ SELECT ts, actor_email, action, before, after
 
 ## Endpoints
 
-All paths are under `/admin/v1`. Request and response bodies are JSON. `Content-Type: application/json` is required on POST/PATCH.
+All paths are under `/admin/v1`. Request and response bodies are JSON (except the NDJSON audit stream). `Content-Type: application/json` is required on POST/PATCH. The machine-readable contract is `GET /admin/v1/openapi.json` (OpenAPI 3.1, admin-gated like every other route); a test holds it equal to the mounted routes.
 
 ### Users
 
@@ -201,9 +210,48 @@ Foreign-key violations (`user_id` or `database_id` not in the tables) and CHECK 
 
 `GET /admin/v1/grants/:id` — by id.
 
-`PATCH /admin/v1/grants/:id` — partial update of `action` / `constraints`. **The target is the grant's identity and is NOT mutable** — re-target via DELETE + POST. Bodies that carry `database_id` / `server` / `db_name_wildcard` are rejected at parse time.
+`PATCH /admin/v1/grants/:id` — partial update of `action` / `constraints` / `expires_at`. **The target is the grant's identity and is NOT mutable** — re-target via DELETE + POST. Bodies that carry `database_id` / `server` / `db_name_wildcard` are rejected at parse time.
+
+**Expiry.** `POST` (and `PATCH`) take an optional `"expires_at": "2026-12-31T00:00:00Z"`, which must be in the future; `PATCH` with `"expires_at": null` removes it. From that instant on the grant no longer authorizes anything, but it stays a live row: `GET` responses keep showing it with `"expired": true` (and `expires_at`) until you `DELETE` it. YAML grants never expire.
 
 `DELETE /admin/v1/grants/:id` — revoke. Sets `revoked_at`; the cache invalidates for the affected user post-commit (`tests/it_db/admin_grants_e2e.rs::live_grant_change_invalidates_cache_for_user`).
+
+`POST /admin/v1/grants/batch` — apply up to 500 changes in **one** transaction, all or nothing:
+
+```json
+{ "changes": [
+  { "op": "upsert", "user_id": "…", "server": "prod", "db_name_wildcard": true,
+    "action": "query_read", "constraints": { "row_limit": 500 }, "expires_at": "2026-12-31T00:00:00Z" },
+  { "op": "delete", "id": "uuid-of-a-grant" }
+] }
+```
+
+An `upsert` carries the `POST /admin/v1/grants` fields and is keyed by `(user_id, target, action)`: an existing live grant with that key gets the given `constraints` and `expires_at` (replaced, not merged), otherwise a grant is created. Response: `{"results": [{"index", "op": "created" | "updated" | "unchanged" | "deleted", "id", "grant"?}]}`. Each applied change writes its own `permissions_audit` row; an `unchanged` upsert writes nothing. Any failing change (message prefixed `changes[<i>]: `) rolls back the whole batch, audit rows included.
+
+### Explain
+
+`POST /admin/v1/explain` — why a call would be allowed or denied, from the same evaluation every tool call runs:
+
+```json
+{ "user": "okta|00u123", "server": "prod", "database": "app", "action": "query_read" }
+```
+
+Exactly one of `user` (SSO subject) or `group`. With `user`, `groups` (optional) overrides the group claims assumed; by default the groups cached on the user's `permissions_users` row are used. Response: `decision` (`allow` / `deny`), merged `constraints` (or `null`), `matched` (each grant with `source: yaml` + its `subject`, or `source: db` + `grant_id`), `expired` (DB grants that would match but for their expiry), `groups`, and `target_declared` (whether the config declares that database at all).
+
+### Export and diff
+
+`GET /admin/v1/permissions/export` — every grant evaluation can use, YAML ∪ DB, as `{"generated_at", "grants": [{source, subject, server, database, action, constraints, except?, profile?, expires_at?, expired?, grant_id?}]}`. DB grants appear with `subject: {"user": "<sub>"}`.
+
+`POST /admin/v1/permissions/diff` — post a desired document in the same shape (an edited export works; export-only keys are ignored) and get `{add, remove, change, unchanged}` against the effective permissions, keyed by `(subject, server, database, action)`. Read-only: nothing is written.
+
+### Audit calls
+
+`GET /admin/v1/audit/calls?user=&server=&db=&tool=&outcome=&since=&until=&limit=&include_sql=` — `audit_calls` rows as NDJSON (`Content-Type: application/x-ndjson`), newest first. `user` matches `user_sub` or `user_email`; `since` is inclusive, `until` exclusive (RFC 3339); `outcome` must be a spec 03 code; `limit` defaults to 1000 and is clamped to 1–10 000. The statement text and its bound parameters (`sql`, `sql_truncated`, `params`) are included only with `include_sql=true`. If the stream breaks after it started, the last line is `{"error": {"code": "internal", …}}`.
+
+```bash
+curl -sN -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "$GATEWAY/admin/v1/audit/calls?user=alice@example.com&outcome=forbidden&limit=50"
+```
 
 ## End-to-end: first user + first grant
 

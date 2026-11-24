@@ -42,7 +42,7 @@ REVOKE INSERT, UPDATE, DELETE ON _sqlx_migrations FROM gateway_app;
 
 `tests/it_db/audit_role_split_real_db.rs` runs this block against a fresh database and checks that `gateway_app` boots, writes audit rows, and runs the pruner and the reaper, and that an `UPDATE` or `TRUNCATE` on `audit_calls` is refused.
 
-**On every upgrade**, apply the new migrations as `gateway_owner` before rolling replicas, then re-run the block: a migration's new tables get no grants until you do. A replica that finds a pending migration under `gateway_app` refuses to boot, because the migration's DDL needs ownership; nothing is half-applied.
+**On every upgrade**, apply the new migrations as `gateway_owner` before rolling replicas, then re-run the block: a migration's new tables get no grants until you do. A replica cannot do it for you: one that finds a pending migration under `gateway_app` exits at boot, because recording the migration needs the write on `_sqlx_migrations` revoked above and its DDL needs ownership; nothing is half-applied. The [Upgrade](#upgrade) checklist puts the steps in order.
 
 **What this does not cover.** `gateway_app` keeps `DELETE` on the audit tables, because the retention pruner runs inside the gateway on the same `STATE_DB_URL`. Revoking it fails every hourly prune (`audit_pruner_runs_total{result="error"}`) and nothing ages the rows out. A separate pruner credential, so the runtime role can be insert-only, is not supported yet. Neither is a tamper-evident hash chain over the rows: a role holding `DELETE`, or `gateway_owner`, can still remove rows, so keep `gateway_owner`'s credential out of the gateway's environment and stream rows to an external store (`logging.stream`) if you need a copy the gateway cannot touch.
 
@@ -73,6 +73,15 @@ pg_dump --format=custom --no-owner \
 - **Retention matches the audit policy.** The gateway prunes rows past `AUDIT_RETENTION_DAYS` (default 90) hourly, but your backups keep whatever they contain for as long as you keep the backups. Set backup retention to the same window, or deliberately longer if compliance wants it ([spec 07](../initial-idea/07-logging-retention.md#retention-surfaces-outside-the-gateway)).
 - **Treat dumps as sensitive.** They hold SQL text, reasons and emails, plus session and refresh-token rows. They never hold target DB credentials.
 - Take one right before every upgrade — of the state DB **and**, with `permissions_store.driver: mysql`, of the permissions store (below).
+- **Roles are not in the dump.** `pg_dump` saves a database; `gateway_owner` and `gateway_app` are cluster-wide. With the [split roles](#state-db-roles), save their definitions beside each dump — without passwords, which stay in your secret manager:
+
+  ```bash
+  pg_dumpall --roles-only --no-role-passwords \
+    --host=state-db.internal --port=5432 --username=gateway_owner \
+    --file="gateway-roles-$(date -u +%Y%m%dT%H%M%SZ).sql"
+  ```
+
+  The file lists every role in the cluster; keep the `gateway_owner` and `gateway_app` lines.
 
 ### MySQL permissions store
 
@@ -93,8 +102,9 @@ Replace `permissions` and `'gateway'@'%'` with the schema and account in your `P
 ## Restore
 
 1. Stop every gateway replica (or scale to 0).
-2. Restore into an empty database, credentials from the password file: `pg_restore --no-owner --host=state-db.internal --port=5432 --username=gateway_owner --dbname=gateway gateway-….dump`.
-3. **Invalidate what the restore brought back.** A backup predates later logouts and `revoke-sessions` calls; restored, those sessions and refresh tokens are live again. Before starting the gateway:
+2. **On a replacement cluster, recreate the roles first.** `pg_restore` creates no roles, and a table's grants to `gateway_app` fail to restore while that role does not exist. As an administrator: run the `gateway_owner` / `gateway_app` lines of `gateway-roles-….sql` with `psql`, set each password from your secret manager with psql's `\password gateway_owner` (it prompts; the password never appears in an argument or in history), and create the database with `OWNER gateway_owner`. A single-role deployment recreates its one role the same way.
+3. Restore into the empty database as `gateway_owner`, credentials from the password file: `pg_restore --no-owner --host=state-db.internal --port=5432 --username=gateway_owner --dbname=gateway gateway-….dump`. With the roles in place, the dump's grants come back with the tables. With the split roles, re-run the [grants block](#state-db-roles) anyway, and check the result before starting a replica: `SELECT has_table_privilege('gateway_app', 'audit_calls', 'INSERT'), has_table_privilege('gateway_app', 'audit_calls', 'UPDATE')` answers `t`, `f`.
+4. **Invalidate what the restore brought back.** A backup predates later logouts and `revoke-sessions` calls; restored, those sessions and refresh tokens are live again. Before starting the gateway:
 
    ```sql
    update sessions set revoked_at = now() where revoked_at is null;
@@ -102,23 +112,26 @@ Replace `permissions` and `'gateway'@'%'` with the schema and account in your `P
    ```
 
    Rotating `SESSION_SIGNING_KEY` at the same time also invalidates every outstanding session JWT. Everyone signs in again; that is the point.
-4. **Re-check admin-API grants.** Grants revoked after the backup are back. Compare `permissions_audit` in the backup with your incident timeline, or with the live database if it survived, and revoke again.
-5. **MySQL permissions store** (`permissions_store.driver: mysql`), if it was lost too:
+5. **Re-check admin-API grants.** Grants revoked after the backup are back. Compare `permissions_audit` in the backup with your incident timeline, or with the live database if it survived, and revoke again.
+6. **MySQL permissions store** (`permissions_store.driver: mysql`), if it was lost too:
    1. Restore the schema into an empty server: `mysql --defaults-extra-file=/secure/admin.cnf --host=perm-db.internal < permissions-….sql` (the dump carries its `CREATE DATABASE`).
    2. Recreate the gateway's account if the server is new, and re-apply every statement in `permissions-….grants`.
    3. Verify before booting: `SHOW GRANTS FOR 'gateway'@'%'` matches `permissions-….grants` line for line; logged in **as the gateway's account** (its own option file), `SELECT MAX(version) FROM permissions._sqlx_migrations` answers and is no newer than the image you are about to start knows; and `SELECT COUNT(*) FROM permissions.permissions_grants` is plausible against your records. A missing privilege otherwise surfaces only at boot (a refused migration) or at the first grant lookup; catch it here instead.
-   4. Re-check its grants as in step 4: grants revoked after this backup are back.
-6. Start the gateway with the image version that last ran on this schema or a newer one (see [Rollback](#rollback)). Boot re-applies nothing that is already recorded in `_sqlx_migrations` (state DB and MySQL store alike).
+   4. Re-check its grants as in step 5: grants revoked after this backup are back.
+7. Start the gateway with the image version that last ran on this schema or a newer one (see [Rollback](#rollback)). Boot re-applies nothing that is already recorded in `_sqlx_migrations` (state DB and MySQL store alike).
 
 The audit rows written between the backup and the failure are gone; if you stream audit rows to a log pipeline (`logging.stream`), that copy is the only record of them.
 
 ## Upgrade
 
-1. Read the release notes and, across a major version, the upgrade guide ([2.0](upgrading-to-2.md)). Config keys are never silently ignored: an unknown or renamed key aborts boot with a `line:column` pointer, so a bad config fails the first replica, not production traffic.
+1. Read the release notes and, across a major version, the upgrade guide ([2.0](upgrading-to-2.md)). Config keys are never silently ignored: an unknown or renamed key aborts boot with a `line:column` pointer, so a bad config fails the first replica, not production traffic. Catch it before the rollout instead: run the new image's `db-mcp-gateway --config config.yml --check --no-secrets` in CI ([operator CLI](cli.md)) — every error at once, plus the connection budget to compare with each target's `max_connections`.
 2. Back up the state DB, and the MySQL permissions store with its grants if you run one ([Backup](#backup)).
-3. Bump the pinned image tag (`ghcr.io/developerz-ai/db-mcp-gateway:X.Y.Z`; avoid `:latest` and `:main` in production) and roll replicas one at a time. The first new replica applies the migrations at boot; migrations are expand/contract, so old replicas keep working on the new schema while the rollout runs.
-4. Give each old replica a full drain: `terminationGracePeriodSeconds` ≥ 120 (80 s request drain + 20 s detached audit writes + pool close).
-5. Watch `/readyz`, `tool_calls{outcome="audit_unavailable"}` and `config_reloads_total{result="error"}` after the rollout.
+3. **Migrate.** Migrations are expand/contract, so old replicas keep working on the new schema while the rollout runs.
+   - **One role** (`STATE_DB_URL` owns the schema): nothing to do here — the first new replica applies the migrations at boot.
+   - **[Split roles](#state-db-roles)**: `gateway_app` cannot migrate, so migrate as `gateway_owner` before any new replica starts — a one-off job running the **new** image with `STATE_DB_URL` pointing at `gateway_owner`, stopped once `/readyz` answers (or `sqlx migrate run` from the release tag's checkout), then re-run the grants block as `gateway_owner`. A new replica started earlier exits at boot on the pending migration, and its restarts keep failing until the job has run; nothing is half-applied.
+4. Bump the pinned image tag (`ghcr.io/developerz-ai/db-mcp-gateway:X.Y.Z`; avoid `:latest` and `:main` in production) and roll replicas one at a time.
+5. Give each old replica a full drain: `terminationGracePeriodSeconds` ≥ 120 (80 s request drain + 20 s detached audit writes + pool close).
+6. Watch `/readyz`, `tool_calls{outcome="audit_unavailable"}` and `config_reloads_total{result="error"}` after the rollout.
 
 Login flows in progress during the rollout (a browser between `/authorize` and `/token`) can fail, because that state is per process; users simply retry.
 

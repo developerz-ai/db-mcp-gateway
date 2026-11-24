@@ -23,19 +23,25 @@ pub(super) fn refusal(state: &OAuthState, requested: Option<&str>) -> Option<Res
     ))
 }
 
-/// Whether `requested` is `<gateway origin><mcp_path>`. The origin is that of
-/// `OIDC_REDIRECT_URL`, as in the discovery metadata. Compared as parsed URLs,
-/// so host case and a default port do not matter; neither does a trailing
-/// slash. A fragment is never a resource (RFC 8707 §2).
+/// Whether `requested` is the advertised `<gateway origin><mcp_path>`. The
+/// origin is that of `OIDC_REDIRECT_URL`, as in the discovery metadata.
+/// Compared as parsed URLs, so host case and a default port do not matter;
+/// the path must match exactly, one trailing slash aside. The advertised
+/// resource has no userinfo, query or fragment, so a request naming any —
+/// even an empty `?` or `#` — names something else (RFC 8707 §2).
 fn names_gateway(redirect_url: &str, mcp_path: &str, requested: &str) -> bool {
     let (Ok(gateway), Ok(requested)) = (Url::parse(redirect_url), Url::parse(requested)) else {
         return false;
     };
     let origin = gateway.origin();
+    let path = requested.path();
     origin.is_tuple()
         && requested.origin() == origin
+        && requested.username().is_empty()
+        && requested.password().is_none()
+        && requested.query().is_none()
         && requested.fragment().is_none()
-        && requested.path().trim_matches('/') == mcp_path.trim_matches('/')
+        && (path == mcp_path || path.strip_suffix('/') == Some(mcp_path))
 }
 
 #[cfg(test)]
@@ -55,7 +61,7 @@ mod tests {
         }
         assert!(names_gateway(
             "http://127.0.0.1:8443/auth/callback",
-            "mcp",
+            "/mcp",
             "http://127.0.0.1:8443/mcp"
         ));
     }
@@ -70,6 +76,14 @@ mod tests {
             "https://db.example.com/mcp/extra",
             "https://db.example.com/admin",
             "https://db.example.com/mcp#frag",
+            "https://db.example.com/mcp#",
+            "https://db.example.com/mcp?x=1",
+            "https://db.example.com/mcp?",
+            "https://user@db.example.com/mcp",
+            "https://user:pw@db.example.com/mcp",
+            "https://db.example.com//mcp",
+            "https://db.example.com/mcp//",
+            "https://db.example.com//mcp/",
             "https://db.example.com.evil.example/mcp",
             "/mcp",
             "not a url",

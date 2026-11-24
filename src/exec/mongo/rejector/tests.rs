@@ -183,6 +183,37 @@ fn rejector_matrix() {
             "{}",
             Err(RejectReason::EmptyCommand),
         ),
+        // --- system collections --------------------------------------------
+        (
+            "find on system.profile denied",
+            r#"{"find":"system.profile","filter":{}}"#,
+            Err(RejectReason::SystemCollection("find".into())),
+        ),
+        (
+            "aggregate on system.js denied",
+            r#"{"aggregate":"system.js","pipeline":[],"cursor":{}}"#,
+            Err(RejectReason::SystemCollection("aggregate".into())),
+        ),
+        (
+            "count on system.views denied",
+            r#"{"count":"system.views"}"#,
+            Err(RejectReason::SystemCollection("count".into())),
+        ),
+        (
+            "distinct on system.users denied",
+            r#"{"distinct":"system.users","key":"user"}"#,
+            Err(RejectReason::SystemCollection("distinct".into())),
+        ),
+        (
+            "listIndexes on a system collection allowed (metadata)",
+            r#"{"listIndexes":"system.views"}"#,
+            Ok(()),
+        ),
+        (
+            "a name merely containing system. allowed",
+            r#"{"find":"app.system.logs","filter":{}}"#,
+            Ok(()),
+        ),
     ];
 
     for (label, input, expected) in cases {

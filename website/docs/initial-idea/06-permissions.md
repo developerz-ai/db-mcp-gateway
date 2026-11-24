@@ -2,18 +2,21 @@
 
 ## Model
 
-Permissions are **grants** that attach a **group** to a **(server, database, action)** with optional **constraints**.
+Permissions are **grants** that attach a **subject** — a **group**, or one **user** — to a **(server, database, action)** with optional **constraints**.
 
 ```
-group  ⨯  (server, database)  ⨯  action  ⨯  constraints  →  allowed
+subject  ⨯  (server, database)  ⨯  action  ⨯  constraints  →  allowed
 ```
 
 | Piece | Meaning |
 |---|---|
-| **Group** | An SSO group claim (e.g. `backend-engineers`, `oncall`, `data-platform`). Synced from IdP. |
+| **Group** | An SSO group claim (e.g. `backend-engineers`, `oncall`, `data-platform`). Synced from IdP. A `permissions:` block names it with `group:`. |
+| **User** | One SSO subject (`user: <sub>`), for the grant that fits one person and no group. Matches only an SSO session with exactly that `sub` — never a service token (whose authority is exactly its one YAML group, [14](14-service-tokens.md)). A block names exactly one of `group:` / `user:`. |
 | **Server / database** | Logical names from the config — never raw hosts. On a `redis` server the database is the numeric logical DB index (`prod-cache/0`). |
 | **Action** | `schema_read`, `query_read`, `query_write`, `history_read`. |
-| **Constraint** | Per-grant overrides: `require_reason`, `row_limit`, `statement_timeout_ms`. A business-hours `time_window` is roadmap ([11](11-roadmap.md)). |
+| **Constraint** | Per-grant overrides: `require_reason`, `row_limit`, `statement_timeout_ms`. A grant may name a `profile:` from top-level `constraint_profiles:`; the profile is merged into the grant's own values most-restrictively at parse time, so a profile can tighten a grant, never loosen it. A business-hours `time_window` is roadmap ([11](11-roadmap.md)). |
+| **`except:`** | On a `database: "*"` grant only: databases the wildcard does not cover. Each entry must name a declared database (boot error otherwise). |
+| **Expiry** | DB-backed grants may carry `expires_at` ([12](12-dynamic-permissions.md)); from that instant on (inclusive) evaluation ignores the grant. YAML grants never expire. |
 
 A request is allowed iff *some* grant matches. Denies are not explicit — absence of a matching grant denies.
 
@@ -89,14 +92,14 @@ The same holds for keys on a Redis target: there is no `allowed_keys` constraint
 For a request `(user, groups, server, db, action)`:
 
 1. Resolve groups from the session.
-2. Collect every grant the caller holds on the target `(server, db)`: the YAML grants of each of the user's groups, plus the subject's DB-backed grants ([12](12-dynamic-permissions.md)) — none for a `service:<name>` identity, whose authority is exactly its YAML group. A `database: "*"` grant matches every database the config declares on that server.
+2. Collect every grant the caller holds on the target `(server, db)`: the YAML grants of each of the user's groups and of a `user:` block naming the caller's SSO `sub`, plus the subject's live, unexpired DB-backed grants ([12](12-dynamic-permissions.md)) — none of the last two for a `service:<name>` identity, whose authority is exactly its YAML group. A `database: "*"` grant matches every database the config declares on that server, minus its `except:` list.
 3. Keep only the grants whose action **includes the requested action** (`query_write ⊇ query_read ⊇ schema_read`; a grant includes its own action). These are the *matching* grants. None left → `forbidden`. `history_read` is outside the chain: it neither grants nor is granted by any of them.
 4. Merge constraints across the matching grants, and only those: take the **most restrictive** value for each (lowest `row_limit`, lowest `statement_timeout_ms`, `require_reason` = true wins). Zero is a bound, the tightest one — never "unset". The merge scope is therefore the requested action, not the caller's whole grant set:
    - a grant that does not include the requested action contributes nothing. A `query_read` grant's `row_limit` or `require_reason` never binds a `query_write` call — cap the write grant itself;
    - the inclusion runs one way. A `query_write` grant includes `query_read`, so it is a matching grant for a read and its constraints do merge into that read (and into a `schema_read` call).
 5. Apply constraints to the call.
 
-Most-restrictive merging means you can't accidentally upgrade your access by being in two groups. The decision depends only on the *set* of matching grants, never their order (`src/authz/resolver_proptests.rs`); the action scope of the merge is pinned by `src/authz/action_scope_proptests.rs`.
+Most-restrictive merging means you can't accidentally upgrade your access by being in two groups. A `user:` grant joins the same per-action merge: it can add an action the user's groups lack, but where it and a group grant both match, the tighter value wins (`src/authz/subject_proptests.rs`). The decision depends only on the *set* of matching grants, never their order (`src/authz/resolver_proptests.rs`); the action scope of the merge is pinned by `src/authz/action_scope_proptests.rs`. `POST /admin/v1/explain` answers "why allowed / denied" from this same evaluation (`authz::matching_grants`), not a re-implementation.
 
 ## Hot reload
 

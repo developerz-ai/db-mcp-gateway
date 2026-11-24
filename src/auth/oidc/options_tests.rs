@@ -160,3 +160,22 @@ fn errors_name_the_variable() {
         assert!(error.to_string().contains(var), "{error}");
     }
 }
+
+#[test]
+fn a_non_unicode_value_is_refused_not_read_as_unset() {
+    let unreadable = || Err(std::env::VarError::NotUnicode("\u{FFFD}".into()));
+    for var in LOGIN_OPTION_VARS {
+        assert_eq!(
+            env_value(var, unreadable()),
+            Err(LoginOptionsError::NotUnicode(var)),
+            "{var}"
+        );
+        assert_eq!(
+            env_value(var, Err(std::env::VarError::NotPresent)),
+            Ok(None)
+        );
+    }
+    assert!(LOGIN_OPTION_VARS.contains(&"GROUPS_MAX_AGE"));
+    let shown = LoginOptionsError::NotUnicode("GROUPS_MAX_AGE").to_string();
+    assert!(shown.contains("GROUPS_MAX_AGE"), "{shown}");
+}

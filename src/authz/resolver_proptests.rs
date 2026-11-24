@@ -11,6 +11,9 @@ use crate::config::{Action, Constraints, Grant};
 
 fn grant(action: Action, constraints: Constraints) -> Grant {
     Grant {
+        except: Vec::new(),
+        profile: None,
+        expires_at: None,
         server: "prod".into(),
         database: "app".into(),
         action,

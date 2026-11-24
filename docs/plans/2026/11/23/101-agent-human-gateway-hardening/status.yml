@@ -4,21 +4,21 @@ status: in_progress
 created_by: sebi
 worked_by: claude
 owner: sebi
-percent: 35
-current_focus: "PR-B (07, 09a, 10, 11, deps) in review. Next: wave C = 03 rest + 04 + 05 → 2.4.0"
+percent: 90
+current_focus: "#381 carries every gateway slice (03-12) + PR review fixes; merge → 2.4.0 → deployments bump + GROUPS_MAX_AGE → consumer rows"
 slices:
-  - {file: 01-unblock-main.md, status: in_progress, percent: 95, note: "gate job built (09a); owner: make `gate` the single required check (SET-3)"}
+  - {file: 01-unblock-main.md, status: in_progress, percent: 95, note: "gate job built (09a); owner: make `gate` the single required check"}
   - {file: 02-security-patch.md, status: done, percent: 100, note: "#377 + #380, v2.3.1, GHSA-j6xv-c57r-59rw published; H2 (pg_query second parser) not started"}
-  - {file: 03-exec-correctness.md, status: in_progress, percent: 20, note: "E1, E3 in #377; rest wave C"}
-  - {file: 04-auth-transport.md, status: in_progress, percent: 5, note: "A11 in #377; rest wave C"}
-  - {file: 05-audit-state.md, status: not_started, percent: 0}
-  - {file: 06-agent-surface.md, status: not_started, percent: 0}
-  - {file: 07-docs-onboarding.md, status: in_progress, percent: 80, note: "D1-D8, P1-P3 in PR-B; login UX (src) and demo CI smoke left"}
-  - {file: 08-operator-tooling.md, status: not_started, percent: 0}
-  - {file: 09-ci-cd.md, status: in_progress, percent: 50, note: "C1-C8, C15 in PR-B; wave b left"}
-  - {file: 10-dev-experience.md, status: in_progress, percent: 85, note: "X1-X7, X9 + repo job queue in PR-B; X8 CLAUDE.md 21.7→~15 KB (target 10 KB not met)"}
-  - {file: 11-repo-cleanup.md, status: in_progress, percent: 85, note: "deps (sqlx 0.9.1, mongodb 3.10, axum-server 0.9, MSRV 1.94.1, no audit ignore) + files in PR-B; #372 closed, labels deleted, #378/#379 filed; dead-API row left"}
-  - {file: 12-tests.md, status: not_started, percent: 0}
+  - {file: 03-exec-correctness.md, status: in_progress, percent: 95, note: "#381; follow-ups: Mongo NaN in code_with_scope, Mongo cleanup without permit, pipeline $lookup to system.*"}
+  - {file: 04-auth-transport.md, status: in_progress, percent: 95, note: "#381; follow-ups: dedicated login error for a state-DB outage, hmac crate"}
+  - {file: 05-audit-state.md, status: in_progress, percent: 90, note: "#381; follow-ups: abandoned rows carry no params, syslog last-resort cut on a huge error_message"}
+  - {file: 06-agent-surface.md, status: in_progress, percent: 95, note: "#381 incl. PR6 (params, explain summary, history sql_sha256) + security-review fixes"}
+  - {file: 07-docs-onboarding.md, status: in_progress, percent: 90, note: "#381; demo re-run --wait on kept volumes exits 1 (Compose v5.8 + one-shot `ready`)"}
+  - {file: 08-operator-tooling.md, status: in_progress, percent: 90, note: "#381: CLI (--check/--healthcheck/roles/doctor/admin), metrics catalogue, deploy/ rules+dashboard+runbook+Helm+kustomize, HA login state (0022), admin API O10 (0023), config O13; chart not published to a chart repo"}
+  - {file: 09-ci-cd.md, status: in_progress, percent: 90, note: "#381 incl. wave b (C10-C14); owner: repo settings (private notes)"}
+  - {file: 10-dev-experience.md, status: in_progress, percent: 85, note: "X8 CLAUDE.md ~14.5 KB (target 10 KB not met)"}
+  - {file: 11-repo-cleanup.md, status: in_progress, percent: 85, note: "dead-API row left"}
+  - {file: 12-tests.md, status: in_progress, percent: 80, note: "#381; left: sentry_scrub/redact_role in-src proptests, redis_timeout sleeps (needs injectable timeouts), MockIdp/config-builder dedup"}
 decisions:
   - {date: 2026-11-23, by: sebi, rows: [H3, H4, H6], decision: "accept recommendations"}
   - {date: 2026-11-23, by: sebi, rows: [H7], decision: "MSRV 1.94.1 yes"}
@@ -26,5 +26,5 @@ decisions:
   - {date: 2026-11-23, by: sebi, rows: [H8, H10], decision: "go: audit blocks lock changes only + daily audit issue; delete .coderabbit.yaml/.devin/ (apps not installed)"}
   - {date: 2026-11-23, by: sebi, rows: [H1, H9], decision: "full work: advisory drafted, published with 2.3.1; deny other-session statement views"}
 evidence: ["#376", "#377", "#380", "v2.3.1", "GHSA-j6xv-c57r-59rw"]
-notes: "Human rows H1-H12 in overview.md. SET-n detail: owner's private notes. Deployment and consumer slices tracked in their own repositories."
+notes: "Human rows H1-H12 in overview.md. Repo-settings detail: owner's private notes. Deployment and consumer slices tracked in their own repositories."
 last_updated: 2026-11-24

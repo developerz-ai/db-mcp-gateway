@@ -117,6 +117,15 @@ reject_call 'cargo'
 run || fail 'bin/run failed after a failed mint'
 [[ $(<"$work/repo/target/dev/service-token") =~ ^dbmcp_svc_[0-9a-f]{64}$ ]] || fail 'retry did not mint a full token'
 
+# An owner password exported by the shell or .env never reaches the gateway.
+fixture
+run TARGET_DB_PASSWORD=owner-from-shell || fail 'bin/run failed with an owner password in the shell'
+expect_call 'env TARGET_DB_PASSWORD=<unset>'
+fixture
+printf 'TARGET_DB_PASSWORD=owner-from-dotenv\n' > "$work/repo/.env"
+run || fail 'bin/run failed with an owner password in .env'
+expect_call 'env TARGET_DB_PASSWORD=<unset>'
+
 # A non-numeric port is refused before anything starts.
 fixture
 if run TARGET_DB_PORT=abc; then fail 'non-numeric TARGET_DB_PORT accepted'; fi

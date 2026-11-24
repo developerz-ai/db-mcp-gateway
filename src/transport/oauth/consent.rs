@@ -16,7 +16,8 @@ use super::super::app_state::OAuthState;
 use super::bridge_login::issue_code;
 use super::helpers::{oauth_error, random_token, redirect_with_error};
 use super::pages::{
-    NO_GROUPS_NOTICE, PageContext, consent_rejected, escape_html, with_page_headers,
+    NO_GROUPS_NOTICE, PageContext, consent_rejected, escape_html, login_unavailable,
+    with_page_headers,
 };
 use crate::auth::oauth::{AuthFacade, ClientName, GrantIdentity, OAuthBridge};
 use crate::transport::request_id::GatewayRequestId;
@@ -54,9 +55,17 @@ pub(super) async fn request_consent(
         consent_id: &consent_id,
         csrf: &csrf,
     });
-    auth.flows
-        .insert_consent(consent_id, csrf, identity, bridge)
-        .await;
+    // Cloned: the error path below still redirects with it.
+    if auth
+        .flows
+        .insert_consent(&consent_id, &csrf, identity, bridge.clone())
+        .await
+        .is_err()
+    {
+        // Same always-redirect contract as a failed code mint: the client's
+        // listener is waiting for an answer.
+        return redirect_with_error(&bridge, "temporarily_unavailable");
+    }
     with_page_headers(Html(html).into_response(), Some(&target.origin))
 }
 
@@ -96,8 +105,10 @@ pub async fn consent(
     let Ok(Form(form)) = form else {
         return consent_rejected(&page);
     };
-    let Some(pending) = state.auth.flows.take_consent(&form.consent_id).await else {
-        return consent_rejected(&page);
+    let pending = match state.auth.flows.take_consent(&form.consent_id).await {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return consent_rejected(&page),
+        Err(_) => return login_unavailable(&page),
     };
     if !pending.csrf_matches(&form.csrf) {
         tracing::warn!(%request_id, "consent submission with a mismatched CSRF token; flow discarded");

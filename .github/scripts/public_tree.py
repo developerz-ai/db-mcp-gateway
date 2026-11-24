@@ -188,47 +188,63 @@ def tracked_entries(root):
     return entries
 
 
-def read_blobs(root, blobs):
-    """Blob id -> bytes, read from git's object store in one batch. A missing or
-    non-blob object is a GuardError: the scan never passes what it did not read."""
-    unique = list(dict.fromkeys(blobs))
+def iter_blobs(root, blobs):
+    """(blob id, bytes) per unique id, streamed from one `git cat-file --batch`:
+    each id is asked for only after the previous blob was handed on, so peak
+    memory is the largest blob, not the tree. A missing or non-blob object is a
+    GuardError: the scan never passes what it did not read."""
     try:
-        out = subprocess.run(
+        proc = subprocess.Popen(
             ["git", "cat-file", "--batch"],
             cwd=root,
-            input="".join(f"{blob}\n" for blob in unique).encode(),
-            capture_output=True,
-            check=False,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
     except OSError as err:
         raise GuardError(f"git cat-file must run: {err}") from err
-    if out.returncode != 0:
-        raise GuardError(f"git cat-file exited {out.returncode}")
-    data, pos, contents = out.stdout, 0, {}
-    for blob in unique:
-        newline = data.find(b"\n", pos)
-        header = data[pos:newline].decode(errors="replace").split(" ") if newline != -1 else []
-        if len(header) != 3 or header[0] != blob or header[1] != "blob" or not header[2].isdigit():
-            raise GuardError(f"tracked blob {blob} must read from the index")
-        size = int(header[2])
-        contents[blob] = data[newline + 1 : newline + 1 + size]
-        if len(contents[blob]) != size:
-            raise GuardError(f"tracked blob {blob} came back truncated")
-        pos = newline + 1 + size + 1
-    return contents
+    try:
+        for blob in dict.fromkeys(blobs):
+            yield blob, _next_blob(proc, blob)
+    finally:
+        proc.kill()
+        proc.wait()
+        proc.stdin.close()
+        proc.stdout.close()
+
+
+def _next_blob(proc, blob):
+    try:
+        proc.stdin.write(f"{blob}\n".encode())
+        proc.stdin.flush()
+    except OSError as err:
+        raise GuardError(f"git cat-file stopped reading: {err}") from err
+    header = proc.stdout.readline().decode(errors="replace").split(" ")
+    if len(header) != 3 or header[0] != blob or header[1] != "blob" or not header[2].strip().isdigit():
+        raise GuardError(f"tracked blob {blob} must read from the index")
+    size = int(header[2])
+    content = proc.stdout.read(size)
+    if len(content) != size or proc.stdout.read(1) != b"\n":
+        raise GuardError(f"tracked blob {blob} came back truncated")
+    return content
 
 
 def scan(root, entries, private):
     """(blobs read, failures as `path: rule`) over index entries (path, blob)."""
     entries = [(path, blob) for path, blob in entries if not platform_owned(path)]
-    blobs = read_blobs(root, [blob for _, blob in entries])
-    failures = []
+    paths_by_blob = {}
     for path, blob in entries:
-        content = blobs[blob].decode("utf-8", errors="replace")
-        rules = violations(path, content)
-        if names_private_word(content, private):
-            rules.append("private word (from the secret)")
-        failures.extend(f"{path}: {rule}" for rule in rules)
+        paths_by_blob.setdefault(blob, []).append(path)
+    rules_by_entry = {}
+    for blob, data in iter_blobs(root, paths_by_blob):
+        content = data.decode("utf-8", errors="replace")
+        private_hit = names_private_word(content, private)
+        for path in paths_by_blob[blob]:
+            rules = violations(path, content)
+            if private_hit:
+                rules.append("private word (from the secret)")
+            rules_by_entry[path, blob] = rules
+    failures = [f"{path}: {rule}" for path, blob in entries for rule in rules_by_entry[path, blob]]
     return len(entries), failures
 
 

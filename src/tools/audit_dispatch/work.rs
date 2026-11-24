@@ -10,6 +10,7 @@ use sqlx::PgPool;
 use crate::audit::intent::WRITE_MAY_HAVE_COMMITTED;
 
 use super::cancel_guard::intent_wrote;
+use super::metric_names::HANDLER_PANICS;
 use super::{Outcome, OutcomeCode, RequestContext, WriteEffect, WriteState, error_outcome};
 
 /// What the client and the row are told; the panic payload never is.
@@ -40,6 +41,7 @@ where
                 tool,
                 "tool work panicked; answering internal"
             );
+            metrics::counter!(HANDLER_PANICS, "layer" => "tool_work").increment(1);
             let request_id = request_ctx.request_id.to_string();
             if !intent_wrote(state_db, &request_id).await {
                 return error_outcome(OutcomeCode::Internal, PANICKED);

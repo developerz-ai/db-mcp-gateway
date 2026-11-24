@@ -567,7 +567,7 @@ async fn list_excludes_soft_deleted() {
         .unwrap();
 
     let list: Vec<Value> = client()
-        .get(format!("{}/admin/v1/users", h.base_url))
+        .get(format!("{}/admin/v1/users?limit=1000", h.base_url)) // shared table: past one default page
         .bearer_auth(&jwt)
         .send()
         .await

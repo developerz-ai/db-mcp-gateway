@@ -53,6 +53,21 @@ fn keys_and_nested_values_are_checked_too() {
     assert!(check_arguments(&Value::Null).is_ok());
 }
 
+/// Every string inside `params`, object keys included, is free text up to
+/// the params bound — not an identifier, not the 1 KiB of other arguments.
+#[test]
+fn params_strings_are_free_text_up_to_their_own_bound() {
+    let long = "p".repeat(PARAMS_MAX_BYTES);
+    let nested = json!({ "params": [long.clone(), { "server": long.clone(), "k": ["a\tb"] }] });
+    assert!(check_arguments(&nested).is_ok());
+    let key = json!({ "params": [{ long.clone(): 1 }] });
+    assert!(check_arguments(&key).is_ok());
+    let past = json!({ "params": ["p".repeat(PARAMS_MAX_BYTES + 1)] });
+    assert!(check_arguments(&past).is_err());
+    assert!(check_arguments(&json!({ "params": [{ "k\u{0}": 1 }] })).is_err());
+    assert!(check_arguments(&json!({ "params": [["\u{0}"]] })).is_err());
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Sample {

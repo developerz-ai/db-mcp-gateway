@@ -37,6 +37,7 @@ pub fn database() -> Database {
         password: Password::Literal(TARGET_PASSWORD.into()),
         description: String::new(),
         auth_database: Some("admin".to_string()),
+        connect_name: None,
         pool: None,
         write_role: None,
         write_password: None,

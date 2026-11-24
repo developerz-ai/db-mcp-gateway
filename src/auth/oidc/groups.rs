@@ -18,8 +18,7 @@ pub(super) fn from_claim(
 ) -> Vec<String> {
     let names = match value {
         Some(Value::Array(items)) => array_names(claim, items),
-        // Zitadel: `{"<role>": {"<org id>": "<org domain>"}}`.
-        Some(Value::Object(roles)) => roles.keys().cloned().collect(),
+        Some(Value::Object(roles)) => object_names(claim, roles),
         None | Some(Value::Null) => {
             tracing::info!(
                 claim,
@@ -53,6 +52,26 @@ fn array_names(claim: &str, items: &[Value]) -> Vec<String> {
             claim,
             skipped,
             "groups claim holds entries that are not strings; they were ignored"
+        );
+    }
+    names
+}
+
+/// Zitadel: `{"<role>": {"<org id>": "<org domain>"}}`. A key is a grant
+/// only when its value is an assignment (an object) or literally `true`; a
+/// role mapped to `false`, `null` or anything else is not held.
+fn object_names(claim: &str, roles: &serde_json::Map<String, Value>) -> Vec<String> {
+    let names: Vec<String> = roles
+        .iter()
+        .filter(|(_, assignment)| matches!(assignment, Value::Object(_) | Value::Bool(true)))
+        .map(|(role, _)| role.clone())
+        .collect();
+    let skipped = roles.len() - names.len();
+    if skipped > 0 {
+        tracing::warn!(
+            claim,
+            skipped,
+            "groups claim maps roles to values that are not assignments; they were ignored"
         );
     }
     names
@@ -130,6 +149,23 @@ mod tests {
             ["db-oncall", "db-readers"]
         );
         assert!(from_claim(CLAIM, Some(&json!({})), None).is_empty());
+    }
+
+    #[test]
+    fn object_keys_whose_value_is_not_an_assignment_never_grant() {
+        let claim = json!({
+            "db-admins": false,
+            "db-oncall": null,
+            "db-auditors": 0,
+            "db-writers": "yes",
+            "db-ops": [],
+            "db-readers": {"2901": "acme.zitadel.cloud"},
+            "db-legacy": true,
+        });
+        assert_eq!(
+            from_claim(CLAIM, Some(&claim), None),
+            ["db-readers", "db-legacy"]
+        );
     }
 
     #[test]

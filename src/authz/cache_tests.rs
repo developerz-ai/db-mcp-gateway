@@ -56,6 +56,7 @@ impl PermissionsRepo for CountingRepo {
             db_name: None,
             action: GrantAction::QueryRead,
             constraints: serde_json::json!({}),
+            expires_at: None,
         }])
     }
 }

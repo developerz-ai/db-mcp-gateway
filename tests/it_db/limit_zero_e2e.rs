@@ -5,12 +5,11 @@
 //!
 //! Needs the target Postgres (`bin/dev up`).
 
-use std::time::Duration;
-
 use crate::common::audit::latest_audit;
 use crate::common::gateway::{LoggedInGateway, spawn_logged_in};
 use crate::common::idp::MockUser;
-use serde_json::{Value, json};
+use crate::common::mcp::call_tool;
+use serde_json::json;
 
 const YAML: &str = r#"
 servers:
@@ -38,27 +37,6 @@ async fn boot() -> LoggedInGateway {
     spawn_logged_in(&crate::common::pg_target::config_yaml(YAML), user).await
 }
 
-async fn call(gw: &LoggedInGateway, tool: &str, arguments: Value) -> Value {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .unwrap()
-        .post(format!("{}/mcp", gw.url))
-        .bearer_auth(&gw.bearer)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": { "name": tool, "arguments": arguments }
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap()
-}
-
 async fn intents_of(gw: &LoggedInGateway) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM audit_call_intents WHERE user_sub = $1")
         .bind(&gw.user_sub)
@@ -81,7 +59,7 @@ async fn zero_limit_is_invalid_arguments_and_audited() {
             json!({ "server": "target", "database": "app", "table": "t", "limit": 0 }),
         ),
     ] {
-        let resp = call(&gw, tool, arguments).await;
+        let resp = call_tool(&gw, tool, arguments).await;
         assert_eq!(resp["error"]["code"], -32602, "{tool}: {resp}");
         assert_eq!(
             resp["error"]["message"], "`limit` must be at least 1",
@@ -104,7 +82,7 @@ async fn zero_limit_is_invalid_arguments_and_audited() {
     );
 
     // `limit: 1` still runs: the bound is 0, not small values.
-    let resp = call(
+    let resp = call_tool(
         &gw,
         "run_query",
         json!({ "server": "target", "database": "app", "sql": "SELECT 1", "limit": 1 }),

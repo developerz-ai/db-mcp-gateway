@@ -117,3 +117,79 @@ fn fixed_width_types_refuse_any_other_width() {
         Err(Refused::Undecodable)
     );
 }
+
+/// A weight with only `left` bytes of the result budget still unclaimed.
+fn weight_with(budget: &ResultBudget, left: usize) -> RowWeight<'_> {
+    let mut weight = RowWeight::new(budget);
+    assert!(weight.charge(MAX_RESULT_BYTES - left));
+    weight
+}
+
+#[test]
+fn expanded_text_is_charged_before_it_is_built() {
+    let budget = ResultBudget::new(1);
+    // `\x` plus two hex digits a byte: 202 bytes rendered from 100 sent.
+    let bytea = [0xab; 100];
+    assert_eq!(
+        Scalar::Bytea.decode(&bytea, &mut weight_with(&budget, 201)),
+        Err(Refused::OverBudget)
+    );
+    assert!(
+        Scalar::Bytea
+            .decode(&bytea, &mut weight_with(&budget, 202))
+            .is_ok()
+    );
+
+    let mut tsvector = 1u32.to_be_bytes().to_vec();
+    tsvector.extend(b"''''\0");
+    tsvector.extend(0u16.to_be_bytes());
+    // `'` doubled four times, inside quotes: ten bytes rendered.
+    assert_eq!(
+        Scalar::TsVector.decode(&tsvector, &mut weight_with(&budget, 9)),
+        Err(Refused::OverBudget)
+    );
+    assert_eq!(
+        Scalar::TsVector.decode(&tsvector, &mut weight_with(&budget, 10)),
+        Ok(json!("''''''''''"))
+    );
+}
+
+#[test]
+fn an_array_charges_its_items_text_and_storage() {
+    let budget = ResultBudget::new(1);
+    let item = [0xab; 100];
+    let wire = wire_array(&[Some(&item[..]), Some(&item[..])]);
+    let nodes = 2 * size_of::<Value>();
+    assert_eq!(
+        array(Scalar::Bytea, &wire, &mut weight_with(&budget, nodes + 202)),
+        Err(Refused::OverBudget)
+    );
+    assert!(array(Scalar::Bytea, &wire, &mut weight_with(&budget, nodes + 404)).is_ok());
+    // Every item's storage is claimed before any item is decoded.
+    let bools = wire_array(&[Some(&[1u8][..]); 4]);
+    assert_eq!(
+        array(
+            Scalar::Bool,
+            &bools,
+            &mut weight_with(&budget, 3 * size_of::<Value>())
+        ),
+        Err(Refused::OverBudget)
+    );
+}
+
+#[test]
+fn every_scalar_still_decodes_through_its_own_path() {
+    let budget = ResultBudget::new(1);
+    let mut weight = RowWeight::new(&budget);
+    // numeric 1.5: one digit group before the point, one after.
+    let numeric = [0, 2, 0, 0, 0, 0, 0, 1, 0, 1, 0x13, 0x88];
+    assert_eq!(
+        Scalar::Numeric.decode(&numeric, &mut weight),
+        Ok(json!("1.5"))
+    );
+    assert_eq!(Scalar::Text.decode(b"hi", &mut weight), Ok(json!("hi")));
+    assert_eq!(
+        Scalar::Bytea.decode(&[0x0a], &mut weight),
+        Ok(json!("\\x0a"))
+    );
+}

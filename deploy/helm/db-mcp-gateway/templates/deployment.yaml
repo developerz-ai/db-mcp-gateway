@@ -1,0 +1,184 @@
+{{- $minGrace := add 120 .Values.preStopSleepSeconds -}}
+{{- if lt (int .Values.terminationGracePeriodSeconds) (int $minGrace) -}}
+{{- fail (printf "terminationGracePeriodSeconds must be >= %d: the gateway drains up to 120 s after SIGTERM, after a %d s preStop sleep" (int $minGrace) (int .Values.preStopSleepSeconds)) -}}
+{{- end -}}
+{{- $startupPeriod := int .Values.probes.startup.periodSeconds -}}
+{{- $startupBudget := add .Values.stateDb.connectTimeoutSeconds .Values.startupMarginSeconds -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gateway.fullname" . }}
+  labels:
+    {{- include "gateway.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "gateway.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        {{- include "gateway.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Kubernetes sends no SIGHUP: a config change rolls the pods instead.
+        checksum/config: {{ .Values.config | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: gateway
+          image: {{ include "gateway.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: gateway
+              containerPort: 8443
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+          env:
+            - name: DB_MCP_GATEWAY_CONFIG
+              value: /etc/gateway/config/config.yml
+            - name: GATEWAY_BIND
+              value: "0.0.0.0:8443"
+            - name: METRICS_BIND
+              value: "0.0.0.0:{{ .Values.metrics.port }}"
+            - name: STATE_DB_CONNECT_TIMEOUT_SECONDS
+              value: {{ .Values.stateDb.connectTimeoutSeconds | quote }}
+            - name: OIDC_ISSUER
+              value: {{ required "oidc.issuer is required" .Values.oidc.issuer | quote }}
+            - name: OIDC_CLIENT_ID
+              value: {{ required "oidc.clientId is required" .Values.oidc.clientId | quote }}
+            - name: OIDC_REDIRECT_URL
+              value: {{ required "oidc.redirectUrl is required" .Values.oidc.redirectUrl | quote }}
+            - name: STATE_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.keys.stateDbUrl }}
+            - name: SESSION_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.keys.sessionSigningKey }}
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.keys.oidcClientSecret }}
+                  optional: true
+            {{- if .Values.tls.enabled }}
+            - name: TLS_CERT_PATH
+              value: /etc/gateway/tls/tls.crt
+            - name: TLS_KEY_PATH
+              value: /etc/gateway/tls/tls.key
+            {{- else }}
+            - name: TLS_DISABLED
+              value: "true"
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          lifecycle:
+            preStop:
+              # Native sleep action (no shell in the distroless image).
+              sleep:
+                seconds: {{ .Values.preStopSleepSeconds }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: gateway
+              scheme: {{ include "gateway.probeScheme" . }}
+            periodSeconds: {{ $startupPeriod }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+            # Covers STATE_DB_CONNECT_TIMEOUT_SECONDS + margin: the listener
+            # binds only after boot reaches the state DB.
+            failureThreshold: {{ div (add $startupBudget (sub $startupPeriod 1)) $startupPeriod }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: gateway
+              scheme: {{ include "gateway.probeScheme" . }}
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: gateway
+              scheme: {{ include "gateway.probeScheme" . }}
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/gateway/config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/gateway/tls
+              readOnly: true
+            {{- end }}
+            {{- range .Values.secretMounts }}
+            - name: secret-{{ .name }}
+              mountPath: {{ .mountPath }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "gateway.fullname" . }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ include "gateway.tlsSecretName" . }}
+        {{- end }}
+        {{- range .Values.secretMounts }}
+        - name: secret-{{ .name }}
+          secret:
+            secretName: {{ .secretName }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

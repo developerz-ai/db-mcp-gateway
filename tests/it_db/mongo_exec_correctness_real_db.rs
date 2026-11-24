@@ -158,6 +158,28 @@ async fn unauthorized_is_a_permission_refusal_not_a_syntax_error() {
     assert_eq!(rejection.to_string(), "13 not authorized");
 }
 
+/// Wait until the server runs an `aggregate` on `coll` — the slow read has
+/// the pool's only connection.
+async fn await_running_aggregate(coll: &str) {
+    let admin = side_client().database("admin");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let ops = admin
+            .run_command(doc! { "currentOp": 1, "command.aggregate": coll })
+            .await
+            .expect("currentOp");
+        let running = ops.get_array("inprog").is_ok_and(|ops| !ops.is_empty());
+        if running {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the slow aggregate never started"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Every connection of the pool is busy with a slow read: the next caller
 /// waits outside its statement budget and gets `unavailable` after the 5 s
 /// acquire wait — not a `timeout` for a command that never started.
@@ -165,7 +187,9 @@ async fn unauthorized_is_a_permission_refusal_not_a_syntax_error() {
 #[serial_test::parallel(world)]
 async fn a_saturated_pool_is_unavailable_not_timeout() {
     let coll = unique_collection("mongosat");
-    let docs: Vec<Document> = (0..8_000_i64).map(|i| doc! { "i": i }).collect();
+    // 40 000² comparisons outlast the 10 s budget on any host, so the slow
+    // read is still holding the connection through the waiter's 5 s acquire.
+    let docs: Vec<Document> = (0..40_000_i64).map(|i| doc! { "i": i }).collect();
     insert(&coll, docs).await;
     let sizing = PoolSizing {
         max_connections: 1,
@@ -188,7 +212,7 @@ async fn a_saturated_pool_is_unavailable_not_timeout() {
 
     let slow_call = run(&a, &slow, Some(10_000));
     let waiting_call = async {
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        await_running_aggregate(&coll).await;
         let started = Instant::now();
         (run(&a, &count, Some(1_000)).await, started.elapsed())
     };

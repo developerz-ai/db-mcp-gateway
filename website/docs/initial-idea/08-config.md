@@ -117,9 +117,9 @@ logging:
 ## Resolution order
 
 1. File at `--config` flag, else `$DB_MCP_GATEWAY_CONFIG`. The binary has no default path — with neither set it exits. The published image sets `DB_MCP_GATEWAY_CONFIG=/etc/gateway/config.yml`.
-2. `${ENV:NAME}` placeholders expanded from process env; `${FILE:/path}` placeholders read from disk (trailing newline stripped). A `${ENV:…}` ref whose variable is unset or empty aborts boot, as does a missing or empty file.
+2. `${ENV:NAME}` placeholders expanded from process env; `${FILE:/path}` placeholders read from disk (trailing newline stripped from both). A `${ENV:…}` ref whose variable is unset or empty aborts boot, as does a missing or empty file.
 3. `vault:`, `aws-sm:`, `gcp-sm:` references resolved from the named backend (when backend integrations land — until then, recognised refs also abort boot rather than silently failing at first DB connect).
-4. Final config validated against the schema. Errors at this stage refuse to start the process — no half-loaded state.
+4. Final config validated against the schema. Errors at this stage refuse to start the process — no half-loaded state. Every validation error and every unresolved secret ref is reported in the one abort (each ref named by server, database and tier), not just the first.
 
 ## Validation rules (non-exhaustive)
 
@@ -201,6 +201,16 @@ Outcomes count in `config_reloads_total{result="ok"|"error"}`. A `SIGHUP` with T
 - `permissions_store.driver`.
 
 Env-driven settings (listeners, state DB, TLS paths, OIDC) are read once at boot.
+
+## Operator CLI
+
+The binary is its own operator tool (reference: [deployment/cli](../deployment/cli.md)). Every mode below runs without booting — no state DB, listener or Sentry stream — and exits `0` success, `1` a negative answer, `2` usage, `3` could not run.
+
+- **`--check [--no-secrets]`** validates without booting: parse, validate, and (unless `--no-secrets`) resolve every secret ref, reporting every error; warnings for unverified/plaintext target TLS, constraints no tool under their action reads (`row_limit` on `schema_read`, `row_limit`/`statement_timeout_ms` on `history_read`), and set env vars that share a gateway prefix but are not read (typos); and the per-replica connection budget (read + write tiers + Postgres cancel pools per server; state DB request + background + listener pools). Messages carry field and object names, never values. A hand-written JSON Schema (`website/static/config.schema.json`) mirrors the keys; a test pins it to the parser through a fixture that uses every key.
+- **`--healthcheck`** GETs the local `/healthz` (from `GATEWAY_BIND`; TLS unverified on loopback, no credential sent) and exits `0`/`1` — the healthcheck for the distroless image.
+- **`login`, `grants list|apply`, `sessions revoke`, `audit query|export`** are clients of the audited admin API (spec 12) and hold no privilege of their own. `login` is the gateway's own OAuth flow run as a native app (RFC 8252: DCR with a loopback redirect, PKCE S256); the session token is stored in a `0600` file and a group- or world-readable one is refused.
+- **`mint-service-token <name>`** replaces the shell script's logic (spec 14); `bin/mint-service-token` is a wrapper.
+- **`roles`** prints the provisioning SQL for each configured database's read and write roles and never connects; **`doctor`** connects as each configured Postgres role and reports superuser/admin attributes, write or `CREATE` privileges on the read role, and in-scope relations it cannot read, plus `max_connections` against the budget. Doctor runs catalog reads in a rolled-back `READ ONLY` transaction. Neither grants anything (MUST #3).
 
 ## What is *not* in config
 

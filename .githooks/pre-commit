@@ -10,24 +10,27 @@ cd "$(dirname "$0")/.."
 echo '→ cargo fmt --check'
 cargo fmt --all -- --check
 
-# Same regex and exempt paths as CI's secret-scan job, over the staged diff only.
-# The diff goes to a file first: `git diff | grep -q` under pipefail lets grep's
-# early exit SIGPIPE git, which turns a match into a failed `if` — an accept.
+# Same regex and exempt paths as CI's secret-scan job, over the staged side of
+# the change only: names and index blobs of added, copied, modified, renamed
+# and retyped paths. A deletion stages nothing, so removing a leaked file (or
+# a leaked file name) always commits. The blobs are scanned as bytes
+# (`--text`): a binary file's patch carries no added lines.
 token_re='dbmcp_svc_[0-9a-f]{64}'
 exempt=(':!tests/**' ':!website/**' ':!config/example.yaml' ':!.github/**' ':!src/config/yaml/**')
-staged=$(mktemp)
-trap 'rm -f "$staged"' EXIT
 scan_error() { echo "pre-commit: secret scan could not run ($1) — refusing the commit." >&2; exit 2; }
 
-git diff --cached -U0 --no-color -- . "${exempt[@]}" > "$staged" || scan_error 'git diff failed'
-all_names=$(git diff --cached --name-only -- . "${exempt[@]}") || scan_error 'git diff --name-only failed'
-# A token in a file name counts too: an empty new file has no `+++` line.
-by_name=$(grep -E "$token_re" <<<"$all_names") || (( $? == 1 )) || scan_error 'grep failed'
-hit=0
-grep -qE "^\+.*${token_re}" "$staged" || hit=$?
-(( hit <= 1 )) || scan_error "grep exited $hit"
-if (( hit == 0 )) || [[ -n $by_name ]]; then
-  by_content=$(git diff --cached --name-only -G "$token_re" -- . "${exempt[@]}") || scan_error 'git diff --name-only failed'
+names=$(git diff --cached --name-only -z --diff-filter=ACMRT -- . "${exempt[@]}" | tr '\0' '\n') \
+  || scan_error 'git diff --name-only failed'
+mapfile -t staged <<<"$names"
+[[ -n ${staged[0]:-} ]] || staged=()
+by_name=$(grep -E "$token_re" <<<"$names") || (( $? == 1 )) || scan_error 'grep failed'
+by_content=''
+if (( ${#staged[@]} )); then
+  # Captured, not piped: grep's early exit cannot SIGPIPE git into a pass.
+  by_content=$(git --literal-pathspecs grep --cached --text -l -E "$token_re" -- "${staged[@]}") \
+    || (( $? == 1 )) || scan_error 'git grep failed'
+fi
+if [[ -n $by_content || -n $by_name ]]; then
   # File names only — a token inside a file name is redacted too.
   echo 'pre-commit: the staged change adds a service-token value (dbmcp_svc_…) in:' >&2
   printf '%s\n%s\n' "$by_content" "$by_name" | sed '/^$/d' | sort -u \

@@ -3,8 +3,10 @@
 //! An admin write queues a `NOTIFY` inside its transaction ([`tx_notify`]);
 //! Postgres delivers it to every listening replica only if that transaction
 //! commits. [`listen`] feeds each delivery to the caller. A dropped listener
-//! connection can lose notifications, so every (re)connect reports
-//! [`PermissionsChange::All`] — the bound is the reconnect delay, not the TTL.
+//! connection loses notifications, so from the drop until `LISTEN` is back
+//! the listener reports [`PermissionsChange::All`] at once and then every
+//! [`Liveness::ping_every`], and once more on resubscribing — the bound is
+//! one beat, not the TTL and not the length of the outage.
 //!
 //! A drop is not always announced: a NAT or firewall can discard the
 //! connection without a FIN, and a receive on it then waits forever. So the
@@ -20,7 +22,7 @@ use std::time::Duration;
 
 use sqlx::postgres::PgListener;
 use sqlx::{PgPool, Postgres, Transaction};
-use tokio::time::{MissedTickBehavior, timeout};
+use tokio::time::{Instant, MissedTickBehavior, timeout};
 
 use super::super::{PermissionsChange, RepoError};
 
@@ -80,28 +82,63 @@ where
     F: Fn(PermissionsChange) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let mut backoff = RECONNECT_MIN;
-    let mut recovering = false;
+    let mut lost = false;
     loop {
-        match subscribe(&pool, liveness.deadline).await {
-            Ok(mut listener) => {
-                backoff = RECONNECT_MIN;
-                on_change(PermissionsChange::All).await;
-                if recovering {
-                    tracing::info!("permissions listener recovered; grant cache flushed");
-                }
-                tokio::select! {
-                    () = drain(&mut listener, liveness.deadline, &on_change) => {}
-                    never = ping(&pool, liveness.ping_every) => match never {},
-                }
-            }
-            Err(error_type) => {
-                tracing::warn!(error_type, "permissions listener connect failed");
-            }
+        // Unsubscribed, a change is announced to nobody: until LISTEN is
+        // back, flush once a beat, so no grant outlives a missed revoke by
+        // more than `ping_every` — however long the outage lasts.
+        let mut listener = tokio::select! {
+            listener = subscribe_with_backoff(&pool, liveness.deadline, lost) => listener,
+            never = flush_every(liveness.ping_every, lost, &on_change) => match never {},
+        };
+        on_change(PermissionsChange::All).await;
+        if lost {
+            tracing::info!("permissions listener recovered; grant cache flushed");
         }
-        recovering = true;
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(RECONNECT_MAX);
+        tokio::select! {
+            () = drain(&mut listener, liveness.deadline, &on_change) => {}
+            never = ping(&pool, liveness.ping_every) => match never {},
+        }
+        lost = true;
+    }
+}
+
+/// Subscribe, backing off between failures. After a lost connection the
+/// first try waits too, so a connection that drops as soon as it is made
+/// cannot spin.
+async fn subscribe_with_backoff(pool: &PgPool, deadline: Duration, wait_first: bool) -> PgListener {
+    let mut backoff = RECONNECT_MIN;
+    let mut wait = wait_first;
+    loop {
+        if wait {
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(RECONNECT_MAX);
+        }
+        wait = true;
+        match subscribe(pool, deadline).await {
+            Ok(listener) => return listener,
+            Err(error_type) => tracing::warn!(error_type, "permissions listener connect failed"),
+        }
+    }
+}
+
+/// Flush the whole cache every `every`, for as long as it runs; first at
+/// once when a connection was just `lost`. At boot nothing is cached yet.
+async fn flush_every<F, Fut>(every: Duration, lost: bool, on_change: &F) -> Infallible
+where
+    F: Fn(PermissionsChange) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let first = if lost {
+        Instant::now()
+    } else {
+        Instant::now() + every
+    };
+    let mut ticker = tokio::time::interval_at(first, every);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        on_change(PermissionsChange::All).await;
     }
 }
 

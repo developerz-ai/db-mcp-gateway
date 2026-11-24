@@ -80,6 +80,25 @@ env=('RESPONSE=<html>proxy error</html>')
 if call run_query '{}'; then fail 'a non-JSON body exited 0'; fi
 env=('RESPONSE={"jsonrpc":"2.0","id":1}')
 if call run_query '{}'; then fail 'an envelope without result or error exited 0'; fi
+# Only one envelope answering id 1, with exactly one of result/error, each an
+# object: anything else is not a verdict, so it is a failure.
+for body in \
+  '{"jsonrpc":"2.0","id":1,"result":"ok"}' \
+  '{"jsonrpc":"2.0","id":1,"result":[]}' \
+  '{"jsonrpc":"2.0","id":1,"result":null}' \
+  '{"jsonrpc":"2.0","id":2,"result":{"isError":false}}' \
+  '{"jsonrpc":"2.0","result":{"isError":false}}' \
+  '{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":1,"message":"x"}}' \
+  '{"jsonrpc":"2.0","id":1,"error":"boom"}' \
+  '{"jsonrpc":"1.0","id":1,"result":{}}' \
+  '[{"jsonrpc":"2.0","id":1,"result":{}}]' \
+  '{"jsonrpc":"2.0","id":1,"result":{}}{"jsonrpc":"2.0","id":1,"result":{}}' \
+  '{"jsonrpc":"2.0","id":1,"result":{}'; do
+  env=("RESPONSE=$body")
+  rc=0; call run_query '{}' || rc=$?
+  [[ $rc == 1 ]] || fail "malformed envelope <$body> exited $rc"
+  grep -qF 'not a JSON-RPC envelope' "$work/output" || fail "malformed envelope <$body> not reported"
+done
 env=()
 for bad in '' 'Run-Query' '-x' 'a"b'; do
   rc=0; call "$bad" || rc=$?

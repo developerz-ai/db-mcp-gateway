@@ -14,6 +14,7 @@ use super::super::query::{ExecQuery, SampleQuery, SchemaDetail, SchemaQuery};
 use super::super::sql_guard::Access;
 use super::MongoAdapter;
 use super::infer::infer_fields;
+use super::rejector::is_system_collection;
 
 /// Indexes listed per collection. Mongo allows 64; the cap only bounds a
 /// pathological reply.
@@ -86,6 +87,7 @@ impl MongoAdapter {
             Value::from(kind),
         ];
         let sample = match query.detail {
+            SchemaDetail::Full if is_system_collection(name) => Some(withheld_sample()),
             SchemaDetail::Full => Some(infer_fields(&self.sample_documents(name, query).await?)),
             _ => None,
         };
@@ -183,6 +185,12 @@ impl MongoAdapter {
         })
         .await
     }
+}
+
+/// The `sample` of a `system.*` collection, which is never read: server
+/// state, not application data (see the rejector).
+fn withheld_sample() -> Value {
+    json!({ "sampled": 0, "fields": [], "truncated": false, "withheld": "system collection" })
 }
 
 /// The `find` a sample runs. `sample_table` stores it as the audit row's

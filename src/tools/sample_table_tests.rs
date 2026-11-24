@@ -4,41 +4,55 @@ use super::*;
 
 #[test]
 fn parse_table_defaults_schema_and_names_the_bad_argument() {
-    let table = parse_table(None, None, "users").expect("valid");
+    let table = parse_table(None, "users").expect("valid");
     assert_eq!(table.schema.as_str(), DEFAULT_SCHEMA);
     assert_eq!(table.table.as_str(), "users");
     assert_eq!(
-        parse_table(None, Some("bad-schema"), "users").err(),
+        parse_table(Some("bad-schema"), "users").err(),
         Some(("schema", IDENTIFIER_PATTERN))
-    );
-    assert_eq!(
-        parse_table(Some("postgres"), None, "users; drop").err(),
-        Some(("table", IDENTIFIER_PATTERN))
     );
 }
 
-/// A Mongo collection may hold `-` and `.`; a bad one names the collection
-/// rule, not the SQL identifier one.
+/// Before authz the kind is not consulted: `table` is held to the loosest
+/// rule, a collection name, whatever server it names.
 #[test]
-fn a_mongo_table_is_a_collection_name() {
-    let table = parse_table(Some("mongo"), None, "order-items.v2").expect("valid");
+fn before_authz_a_table_is_held_to_the_collection_rule() {
+    let table = parse_table(None, "order-items.v2").expect("valid");
     assert_eq!(table.table.as_str(), "order-items.v2");
-    assert_eq!(
-        parse_table(Some("postgres"), None, "order-items").err(),
-        Some(("table", IDENTIFIER_PATTERN))
-    );
-    for bad in ["events.", "users; drop", "-x"] {
+    for bad in ["events.", "users; drop", "-x", "a b"] {
         assert_eq!(
-            parse_table(Some("mongo"), None, bad).err(),
+            parse_table(None, bad).err(),
             Some(("table", COLLECTION_PATTERN)),
             "{bad}"
         );
     }
 }
 
+/// After authz the target's rule applies: a SQL table is an identifier, a
+/// Mongo `system.*` collection is refused `forbidden`.
+#[test]
+fn after_authz_the_target_kind_decides() {
+    let table = |name| parse_table(None, name).expect("valid").table;
+    let refused = |kind, name| refuse_for_kind(Value::Null, kind, table(name)).map(|o| o.code);
+    assert_eq!(refused(ServerKind::Mongo, "order-items.v2"), None);
+    assert_eq!(refused(ServerKind::Postgres, "users"), None);
+    assert_eq!(
+        refused(ServerKind::Postgres, "order-items"),
+        Some(OutcomeCode::InvalidArguments)
+    );
+    assert_eq!(
+        refused(ServerKind::Mysql, "a.b"),
+        Some(OutcomeCode::InvalidArguments)
+    );
+    assert_eq!(
+        refused(ServerKind::Mongo, "system.profile"),
+        Some(OutcomeCode::Forbidden)
+    );
+}
+
 #[test]
 fn audited_read_names_the_table_or_the_mongo_find() {
-    let table = parse_table(None, Some("sales"), "orders").expect("valid");
+    let table = parse_table(Some("sales"), "orders").expect("valid");
     assert_eq!(audited_read(Some("postgres"), table), "sales.orders");
     let find: Value = serde_json::from_str(&audited_read(Some("mongo"), table))
         .expect("the Mongo read is a JSON command");

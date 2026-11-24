@@ -1,0 +1,14 @@
+{{- if .Values.metrics.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "gateway.fullname" . }}
+  labels:
+    {{- include "gateway.labels" . | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- /* files/rules.yaml links to deploy/prometheus/rules.yaml, whose top level is `groups:`. */}}
+  {{- .Files.Get "files/rules.yaml" | nindent 2 }}
+{{- end }}

@@ -13,7 +13,7 @@ permissions group and audit attribution.
 ### Token type
 
 Opaque static bearer, shape `dbmcp_svc_<64 hex chars>` (32 bytes of CSPRNG
-entropy), minted operator-side by `bin/mint-service-token <name>`.
+entropy), minted operator-side by `db-mcp-gateway mint-service-token <name>` (in the image; `bin/mint-service-token` wraps it in a checkout).
 
 The prefix is enforced at boot, and it is load-bearing, not cosmetic:
 
@@ -156,7 +156,9 @@ about tokens is callable over HTTP — the lifecycle is GitOps:
   attribute to `service:<name>`. A value repeated inside the list, or shared
   with another account, aborts boot. Sequence: (1) mint a new value
   (`bin/mint-service-token <name>`) and store it in the secret store; (2)
-  turn the stanza's `token:` into `tokens: [<old ref>, <new ref>]`; (3)
+  turn the stanza's `token:` into `tokens: ["<old ref>", "<new ref>"]`
+  — each `${ENV:…}` / `${FILE:…}` ref quoted, since unquoted braces are
+  invalid inside a YAML flow list (or use a block list, one `- ` per ref); (3)
   `kill -HUP` every pod (or roll the deployment) and wait until it
   completes — a reload rebuilds the token store, but a `${ENV:…}` ref reads
   the pod's environment, which only changes on a restart, so a value

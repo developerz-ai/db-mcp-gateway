@@ -12,6 +12,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from public_tree import (  # noqa: E402
     GuardError,
+    iter_blobs,
     names_private_word,
     platform_owned,
     private_words,
@@ -167,6 +168,35 @@ class Scan(unittest.TestCase):
         with self.assertRaises(GuardError):
             scan(root, [("a.md", missing)], [])
 
+
+    def test_blobs_stream_one_at_a_time(self):
+        root = repo_with(self, {"a.md": "first"})
+        [(_, blob)] = tracked_entries(root)
+        missing = "0123456789abcdef0123456789abcdef01234567"
+        blobs = iter_blobs(root, [blob, blob, missing])
+        # The first blob is handed on before the next id is even asked for.
+        self.assertEqual(next(blobs), (blob, b"first"))
+        with self.assertRaises(GuardError):
+            next(blobs)
+
+    def test_a_blob_at_several_paths_is_reported_at_each(self):
+        root = repo_with(self, {"a.md": "x QUIMTEL y", "b.md": "x QUIMTEL y", "c.md": "public"})
+        self.assertEqual(
+            scan(root, tracked_entries(root), private_words("quimtel")),
+            (3, ["a.md: private word (from the secret)", "b.md: private word (from the secret)"]),
+        )
+
+    def test_binary_and_empty_blobs_are_read_whole(self):
+        root = temp_dir(self)
+        git(root, "init", "-q")
+        with open(os.path.join(root, "blob.bin"), "wb") as handle:
+            handle.write(b"\0\n\xff" * 70_000 + b"QUIMTEL\n")
+        open(os.path.join(root, "empty"), "w").close()
+        git(root, "add", "-A")
+        self.assertEqual(
+            scan(root, tracked_entries(root), private_words("quimtel")),
+            (2, ["blob.bin: private word (from the secret)"]),
+        )
 
 if __name__ == "__main__":
     unittest.main()

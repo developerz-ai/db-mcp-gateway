@@ -261,6 +261,7 @@ async fn a_refresh_past_groups_max_age_requires_a_new_login() {
 
 #[tokio::test]
 #[serial_test::parallel(world)]
+// audit-guard: exempt — its one `tools/call` carries a revoked session and is refused 401 at the bearer check, before dispatch
 async fn a_foreign_resource_is_invalid_target_and_spends_nothing() {
     let pool = state_pool().await;
     let gw = spawn(&pool, "1h").await;

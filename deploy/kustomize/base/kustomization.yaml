@@ -1,0 +1,30 @@
+# Minimal kustomize base mirroring the Helm chart's defaults
+# (deploy/helm/db-mcp-gateway). An overlay sets the image tag, gateway.env
+# (OIDC_*), config.yml, and creates the two Secrets this base only references:
+#   db-mcp-gateway      STATE_DB_URL, SESSION_SIGNING_KEY, OIDC_CLIENT_SECRET
+#   db-mcp-gateway-tls  kubernetes.io/tls (tls.crt, tls.key)
+# Generated ConfigMap names carry a content hash, so a config change rolls the
+# pods: Kubernetes sends no SIGHUP.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+labels:
+  - pairs:
+      app.kubernetes.io/name: db-mcp-gateway
+    # Selectors are written out in each resource: includeSelectors would also
+    # rewrite the NetworkPolicy's kube-dns peer selector.
+    includeTemplates: true
+resources:
+  - deployment.yaml
+  - service.yaml
+  - networkpolicy.yaml
+  - pdb.yaml
+images:
+  - name: ghcr.io/developerz-ai/db-mcp-gateway
+    newTag: "2.3.1"
+configMapGenerator:
+  - name: db-mcp-gateway-config
+    files:
+      - config.yml
+  - name: db-mcp-gateway-env
+    envs:
+      - gateway.env

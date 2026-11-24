@@ -5,7 +5,10 @@
 use std::future::Future;
 use std::time::Duration;
 
-use sqlx::PgPool;
+use std::str::FromStr;
+
+use sqlx::postgres::PgConnectOptions;
+use sqlx::{ConnectOptions, PgPool};
 use tokio::time::Instant;
 
 use db_mcp_gateway::config::Config;
@@ -19,6 +22,10 @@ const DEFAULT_BUDGET: Duration = Duration::from_secs(60);
 const MAX_BUDGET_SECONDS: u64 = 3600;
 const FIRST_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
+/// The longest one attempt waits for the state DB to answer.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+/// With less than this of the budget left, no further attempt is started.
+const MIN_ATTEMPT: Duration = Duration::from_millis(500);
 
 /// `STATE_DB_CONNECT_TIMEOUT_SECONDS` is not whole seconds in `0..=3600`.
 #[derive(Debug, thiserror::Error)]
@@ -47,11 +54,9 @@ fn parse_budget(raw: &str) -> Result<Duration, ConnectBudgetError> {
 /// after this returns, so probes do not answer while it retries.
 pub(crate) async fn connect_state_db(config: &Config) -> anyhow::Result<PgPool> {
     let budget = connect_budget_from_env()?;
-    let state_db = retry_connect(budget, || {
-        state::connect(&config.state_db.url, config.state_db.pool_size)
-    })
-    .await
-    .map_err(|err| boot_db_error("state DB", err))?;
+    let state_db = retry_connect(budget, |timeout| connect_within(config, timeout))
+        .await
+        .map_err(|err| boot_db_error("state DB", err))?;
     tracing::info!(
         pool_size = config.state_db.pool_size,
         "state DB connected, migrations applied"
@@ -59,20 +64,40 @@ pub(crate) async fn connect_state_db(config: &Config) -> anyhow::Result<PgPool> 
     Ok(state_db)
 }
 
+/// The request pool, once the state DB answers within `timeout`. Only the
+/// probe is bounded: migrations then run to the end, as one cut short would
+/// fail the boot it was meant to finish.
+async fn connect_within(config: &Config, timeout: Duration) -> Result<PgPool, StateDbError> {
+    let options =
+        PgConnectOptions::from_str(&config.state_db.url).map_err(StateDbError::Connect)?;
+    match tokio::time::timeout(timeout, options.connect()).await {
+        Ok(Ok(probe)) => drop(probe),
+        Ok(Err(err)) => return Err(StateDbError::Connect(err)),
+        Err(_elapsed) => return Err(StateDbError::Connect(sqlx::Error::PoolTimedOut)),
+    }
+    state::connect(&config.state_db.url, config.state_db.pool_size).await
+}
+
 /// Retry `attempt` with doubling backoff while its failure may heal and the
-/// budget allows another try. A malformed URL and a failed migration never
-/// heal by waiting, so they return at once.
+/// budget allows another try. Each attempt is handed a timeout that ends by
+/// the deadline — a zero budget gets one full attempt. A malformed URL and a
+/// failed migration never heal by waiting, so they return at once.
 async fn retry_connect<T, F, Fut>(budget: Duration, attempt: F) -> Result<T, StateDbError>
 where
-    F: Fn() -> Fut,
+    F: Fn(Duration) -> Fut,
     Fut: Future<Output = Result<T, StateDbError>>,
 {
     let deadline = Instant::now() + budget;
+    let mut timeout = if budget.is_zero() {
+        ATTEMPT_TIMEOUT
+    } else {
+        ATTEMPT_TIMEOUT.min(budget)
+    };
     let mut backoff = FIRST_BACKOFF;
     let mut attempt_no: u32 = 0;
     loop {
         attempt_no = attempt_no.saturating_add(1);
-        let err = match attempt().await {
+        let err = match attempt(timeout).await {
             Ok(value) => return Ok(value),
             Err(err) => err,
         };
@@ -80,10 +105,11 @@ where
             return Err(err);
         };
         let class = state::connect_error_class(source);
-        let wait = backoff.min(deadline.saturating_duration_since(Instant::now()));
-        if class == "configuration" || wait.is_zero() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if class == "configuration" || left < MIN_ATTEMPT {
             return Err(err);
         }
+        let wait = backoff.min(left - MIN_ATTEMPT);
         tracing::warn!(
             attempt = attempt_no,
             error_class = %class,
@@ -91,6 +117,7 @@ where
             "state DB not reachable yet; retrying"
         );
         tokio::time::sleep(wait).await;
+        timeout = ATTEMPT_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
@@ -118,7 +145,7 @@ mod tests {
     #[tokio::test]
     async fn retries_until_the_database_answers() {
         let calls = AtomicU32::new(0);
-        let got = retry_connect(Duration::from_secs(60), || async {
+        let got = retry_connect(Duration::from_secs(60), |_| async {
             match calls.fetch_add(1, Ordering::SeqCst) {
                 0 | 1 => Err(connect_failure(sqlx::Error::PoolTimedOut)),
                 _ => Ok("pool"),
@@ -133,23 +160,45 @@ mod tests {
     async fn gives_up_once_the_budget_is_spent() {
         let calls = AtomicU32::new(0);
         let started = Instant::now();
-        let got: Result<(), _> = retry_connect(Duration::from_secs(2), || async {
+        let got: Result<(), _> = retry_connect(Duration::from_secs(2), |_| async {
             calls.fetch_add(1, Ordering::SeqCst);
             Err(connect_failure(sqlx::Error::PoolTimedOut))
         })
         .await;
         assert!(matches!(got, Err(StateDbError::Connect(_))));
         let elapsed = started.elapsed();
-        assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
-        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
-        // Attempts at 0, 0.5 and 1.5 s, then one when the budget runs out.
-        assert!(calls.load(Ordering::SeqCst) >= 4);
+        assert!(elapsed >= Duration::from_millis(1500), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        // Attempts at 0, 0.5 and 1.5 s; under MIN_ATTEMPT left, no fourth.
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn no_attempt_outlives_the_budget() {
+        let budget = Duration::from_secs(3);
+        let started = Instant::now();
+        // Slack for the deadline `retry_connect` takes a moment after this one.
+        let deadline = started + budget + Duration::from_millis(50);
+        let got: Result<(), _> = retry_connect(budget, |timeout| async move {
+            assert!(
+                Instant::now() + timeout <= deadline,
+                "{timeout:?} past the budget"
+            );
+            // A blackholed host: the attempt takes its whole timeout.
+            tokio::time::sleep(timeout).await;
+            Err(connect_failure(sqlx::Error::PoolTimedOut))
+        })
+        .await;
+        assert!(got.is_err());
+        let elapsed = started.elapsed();
+        assert!(elapsed < budget + Duration::from_millis(200), "{elapsed:?}");
     }
 
     #[tokio::test]
     async fn zero_budget_is_a_single_attempt() {
-        let calls = AtomicU32::new(0);
-        let got: Result<(), _> = retry_connect(Duration::ZERO, || async {
+        let calls = &AtomicU32::new(0);
+        let got: Result<(), _> = retry_connect(Duration::ZERO, |timeout| async move {
+            assert_eq!(timeout, ATTEMPT_TIMEOUT);
             calls.fetch_add(1, Ordering::SeqCst);
             Err(connect_failure(sqlx::Error::PoolTimedOut))
         })
@@ -161,7 +210,7 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_url_is_not_retried() {
         let calls = AtomicU32::new(0);
-        let got: Result<(), _> = retry_connect(Duration::from_secs(60), || async {
+        let got: Result<(), _> = retry_connect(Duration::from_secs(60), |_| async {
             calls.fetch_add(1, Ordering::SeqCst);
             Err(connect_failure(sqlx::Error::Configuration(
                 "bad url".into(),

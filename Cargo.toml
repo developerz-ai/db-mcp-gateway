@@ -161,6 +161,9 @@ metrics-util = { version = "0.20.4", default-features = false }  # MetricKindMas
 
 # ids + time
 uuid = { version = "1", features = ["v4", "serde"] }
+# CSPRNG bytes for `mint-service-token` (src/cli/mint.rs). Already in the
+# lock through uuid; naming it adds no package.
+getrandom = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
 # error tracking → GlitchTip (Sentry-protocol ingest). Error tracking ONLY:
@@ -197,6 +200,15 @@ serial_test = "3"            # Serialize real-DB tests that share one global tab
 tempfile = "3"
 rcgen = "0.14"                # Self-signed certs for the TLS+SIGHUP integration test
 libc = "0.2"                  # `raise(SIGHUP)` from the integration test (in-process signal)
+
+# CLAUDE.md §Conventions "No panics": a panic in a hot path crashes every
+# user. Denied for library and binary code; `#[test]` fns and `#[cfg(test)]`
+# modules are exempt via `clippy.toml`, the integration-test crates by an
+# inner `allow` at each crate root.
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
 
 # 29 integration-test binaries plus the lib each carried full DWARF: measured
 # 188MB of a 244MB test binary, and a 43GB target/ dir. The linker copies all

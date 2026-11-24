@@ -12,8 +12,8 @@ use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
 use crate::common::pg_target::{
-    READ_ROLE, TARGET_USER, adapter, is_yugabyte, owner_url, single_connection_adapter,
-    writable_adapter,
+    READ_ROLE, TARGET_USER, adapter, await_active_query, is_yugabyte, owner_url,
+    single_connection_adapter, writable_adapter,
 };
 use db_mcp_gateway::exec::{
     Access, DbAdapter, ExecError, ExecQuery, MAX_RESULT_BYTES, RejectionKind,
@@ -785,14 +785,13 @@ async fn zero_timeout_is_not_unlimited() {
 #[serial_test::parallel(world)]
 async fn saturated_pool_is_unavailable_not_timeout() {
     let a = std::sync::Arc::new(single_connection_adapter().await);
+    let marker = format!("holder-{}", Uuid::new_v4().simple());
+    let holder_sql = format!("SELECT pg_sleep(8) /* {marker} */");
     let holder = {
         let a = a.clone();
-        tokio::spawn(async move {
-            a.execute(query("SELECT pg_sleep(8)", Some(10_000), 1))
-                .await
-        })
+        tokio::spawn(async move { a.execute(query(&holder_sql, Some(10_000), 1)).await })
     };
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    await_active_query(&marker).await;
 
     let err = a
         .execute(query("SELECT 1", Some(100), 1))

@@ -44,6 +44,7 @@ fn row(request_id: &str) -> AuditRow {
         upstream_run_id: None,
         rows_affected: None,
         sql_truncated: false,
+        params: None,
     }
 }
 
@@ -212,4 +213,30 @@ fn ca_file_errors_are_typed() {
     let empty = ca_file("not a certificate\n");
     let no_cert = SyslogTls::from_ca_file(empty.path());
     assert!(matches!(no_cert, Err(SyslogTlsError::NoCertificate { .. })));
+}
+
+/// SQL whose JSON escaping outgrows its raw length (`\u0001` is six bytes
+/// encoded, `"` two) is cut by its encoded size: the body stays a parseable
+/// object with the statement's start and the marker, never a hard-cut one.
+#[test]
+fn escape_heavy_sql_is_cut_by_its_encoded_size() {
+    use super::format::{MAX_MESSAGE_BYTES, TRUNCATION_MARKER, message};
+    for (start, filler) in [
+        ("SELECT '", "\u{1}"),
+        ("SELECT '", "\""),
+        ("SELECT '", "é\\"),
+    ] {
+        let mut row = row("req-escape");
+        row.sql = Some(format!("{start}{}", filler.repeat(4_000)));
+
+        let message = message(&row);
+
+        assert!(message.len() <= MAX_MESSAGE_BYTES, "{}", message.len());
+        let body = &message[message.find('{').expect("JSON body")..];
+        let body: serde_json::Value = serde_json::from_str(body).expect("body is JSON");
+        let sql = body["sql"].as_str().expect("sql kept as a string");
+        assert!(sql.starts_with(start), "{sql}");
+        assert!(sql.ends_with(TRUNCATION_MARKER), "{sql}");
+        assert_eq!(body["request_id"], "req-escape");
+    }
 }

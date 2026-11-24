@@ -2,6 +2,7 @@
 //! what the gateway asks the IdP for, how it reads the groups claim, how old
 //! a login's groups may get, and who a refused user is told to contact.
 
+use std::env::VarError;
 use std::time::Duration;
 
 const DEFAULT_SCOPES: &str = "openid email profile groups";
@@ -11,6 +12,14 @@ const GROUPS_MAX_AGE_MIN: Duration = Duration::from_secs(60);
 const GROUPS_MAX_AGE_MAX: Duration = Duration::from_secs(366 * 24 * 3600);
 const SUPPORT_CONTACT_MAX_CHARS: usize = 200;
 const GROUPS_PREFIX_MAX_CHARS: usize = 128;
+/// Every variable [`LoginOptions::from_lookup`] reads.
+const LOGIN_OPTION_VARS: [&str; 5] = [
+    "OIDC_SCOPES",
+    "OIDC_GROUPS_PREFIX",
+    "OIDC_TOKEN_AUTH_METHOD",
+    "GROUPS_MAX_AGE",
+    "GATEWAY_SUPPORT_CONTACT",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LoginOptions {
@@ -144,11 +153,25 @@ pub enum LoginOptionsError {
          control characters"
     )]
     SupportContact,
+    /// Read as unset it would drop the operator's setting to its default.
+    #[error("invalid {0}: the value is not valid UTF-8")]
+    NotUnicode(&'static str),
 }
 
 impl LoginOptions {
     pub fn from_env() -> Result<Self, LoginOptionsError> {
-        Self::from_lookup(|var| std::env::var(var).ok())
+        let mut values = Vec::with_capacity(LOGIN_OPTION_VARS.len());
+        for var in LOGIN_OPTION_VARS {
+            if let Some(value) = env_value(var, std::env::var(var))? {
+                values.push((var, value));
+            }
+        }
+        Self::from_lookup(|var| {
+            values
+                .iter()
+                .find(|(name, _)| *name == var)
+                .map(|(_, value)| value.clone())
+        })
     }
 
     /// [`Self::from_env`] over any variable source. An unset variable keeps
@@ -178,6 +201,19 @@ impl LoginOptions {
                 .map(|raw| SupportContact::parse(&raw))
                 .transpose()?,
         })
+    }
+}
+
+/// An unset variable is `None`; one set to bytes that are not UTF-8 is an
+/// error, never `None` — that would boot without the operator's setting.
+fn env_value(
+    var: &'static str,
+    raw: Result<String, VarError>,
+) -> Result<Option<String>, LoginOptionsError> {
+    match raw {
+        Ok(value) => Ok(Some(value)),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(_)) => Err(LoginOptionsError::NotUnicode(var)),
     }
 }
 

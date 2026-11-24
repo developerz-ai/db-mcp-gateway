@@ -244,5 +244,6 @@ fn abandoned_row(row: &PgRow) -> Result<Option<AuditRow>, sqlx::Error> {
         upstream_run_id: row.try_get("upstream_run_id")?,
         rows_affected: None,
         sql_truncated: row.try_get("sql_truncated")?,
+        params: None,
     }))
 }

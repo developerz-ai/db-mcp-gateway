@@ -77,6 +77,7 @@ pub fn database() -> Database {
         password: Password::Literal(TARGET_PASSWORD.into()),
         description: String::new(),
         auth_database: None,
+        connect_name: None,
         pool: None,
         write_role: None,
         write_password: None,
@@ -143,27 +144,71 @@ pub async fn ensure_read_role() {
                 .connect(&owner_url())
                 .await
                 .expect("target-db reachable; run `bin/dev up`");
-            let mut tx = owner.begin().await.expect("begin");
-            let lock = (!is_yugabyte()).then(|| "SELECT pg_advisory_xact_lock(424242)".to_string());
-            for sql in lock.into_iter().chain([
-                format!(
-                    "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{READ_ROLE}') \
-                     THEN CREATE ROLE {READ_ROLE} LOGIN PASSWORD '{READ_ROLE_PASSWORD}'; END IF; END $$"
-                ),
-                format!("GRANT CONNECT ON DATABASE {TARGET_DB} TO {READ_ROLE}"),
-                format!("GRANT USAGE ON SCHEMA public TO {READ_ROLE}"),
-                format!("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {READ_ROLE}"),
-                format!(
-                    "ALTER DEFAULT PRIVILEGES FOR ROLE {TARGET_USER} IN SCHEMA public \
-                     GRANT SELECT ON TABLES TO {READ_ROLE}"
-                ),
-            ]) {
-                sqlx::query(sqlx::AssertSqlSafe(sql))
-                    .execute(&mut *tx)
-                    .await
-                    .unwrap_or_else(|err| panic!("provision {READ_ROLE}: {err}"));
+            // `GRANT SELECT ON ALL TABLES IN SCHEMA public` races fixture
+            // tables other tests create and drop meanwhile ("tuple
+            // concurrently deleted"); the advisory lock cannot cover those.
+            // Such a catalog race is retried, anything else fails the test.
+            let mut attempt = 0;
+            while let Err(err) = provision_read_role(&owner).await {
+                attempt += 1;
+                assert!(
+                    attempt < 5 && err.to_string().contains("concurrently"),
+                    "provision {READ_ROLE}: {err}"
+                );
             }
-            tx.commit().await.expect("commit read role");
         })
         .await;
+}
+
+async fn provision_read_role(owner: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+    let mut tx = owner.begin().await?;
+    let lock = (!is_yugabyte()).then(|| "SELECT pg_advisory_xact_lock(424242)".to_string());
+    for sql in lock.into_iter().chain([
+        format!(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{READ_ROLE}') \
+             THEN CREATE ROLE {READ_ROLE} LOGIN PASSWORD '{READ_ROLE_PASSWORD}'; END IF; END $$"
+        ),
+        format!("GRANT CONNECT ON DATABASE {TARGET_DB} TO {READ_ROLE}"),
+        format!("GRANT USAGE ON SCHEMA public TO {READ_ROLE}"),
+        format!("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {READ_ROLE}"),
+        format!(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE {TARGET_USER} IN SCHEMA public \
+             GRANT SELECT ON TABLES TO {READ_ROLE}"
+        ),
+    ]) {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await
+}
+
+/// Wait until the target runs a statement containing `marker` — read off
+/// `pg_stat_activity` as the owner, which sees every backend. What a test
+/// that needs a query in flight polls instead of sleeping.
+pub async fn await_active_query(marker: &str) {
+    let owner = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&owner_url())
+        .await
+        .expect("target-db reachable; run `bin/dev up`");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let active: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+             WHERE state = 'active' AND pid <> pg_backend_pid() AND strpos(query, $1) > 0)",
+        )
+        .bind(marker)
+        .fetch_one(&owner)
+        .await
+        .expect("pg_stat_activity");
+        if active {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no active query containing {marker:?} after 10 s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }

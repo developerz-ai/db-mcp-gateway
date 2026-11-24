@@ -2,7 +2,9 @@
 # End-to-end smoke for examples/demo (needs Docker; pulls images): bring the
 # demo up under a throwaway project name, take the printed `claude mcp add`
 # line, make one real tools/call run_query with its token, assert rows and the
-# audit row, then remove the project and its volumes.
+# audit row; check the session signing key is minted per project, then bring
+# up the `sso` profile and reach Dex through its published port; then remove
+# the project and its volumes. Needs host ports DEMO_PORT and 5556 free.
 #   DEMO_PORT      host port (default 18443, away from bin/run's 8443)
 #   GATEWAY_IMAGE  image under test (default: the one the demo pins)
 set -euo pipefail
@@ -11,7 +13,7 @@ cd "$(dirname "$0")/../../examples/demo"
 port=${DEMO_PORT:-18443}
 compose=(docker compose -p "db-mcp-gateway-demo-test-$$")
 export DEMO_PORT=$port
-trap '"${compose[@]}" down -v >/dev/null 2>&1 || true' EXIT
+trap '"${compose[@]}" --profile sso down -v >/dev/null 2>&1 || true' EXIT
 
 fail() { printf 'FAIL: %s\n' "$1" >&2; "${compose[@]}" logs gateway ready >&2 || true; exit 1; }
 
@@ -38,4 +40,32 @@ audit=$("${compose[@]}" exec -T state-db psql -U gateway -d gateway -tAc \
   "SELECT count(*) FROM audit_calls WHERE user_sub = 'service:demo' AND tool = 'run_query' AND outcome = 'success'")
 [[ $audit == 1 ]] || fail "expected one audit row, found <$audit>"
 
-echo 'ok: examples/demo (run_query returned rows, audited)'
+# The signing key: random per project, in the shared volume, never in the
+# container's configured environment (docker inspect) or the gateway log.
+key=$("${compose[@]}" run --rm --no-deps -T --entrypoint sh mint-token -c 'cat /run/demo-secrets/session-signing-key') \
+  || fail 'no session signing key in the demo volume'
+[[ $key =~ ^[0-9a-f]{64}$ ]] || fail 'the session signing key is not 32 random bytes in hex'
+config_env=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$("${compose[@]}" ps -q gateway)")
+[[ $config_env != *SESSION_SIGNING_KEY* ]] || fail 'the signing key is in the container configuration'
+gateway_log=$("${compose[@]}" logs gateway 2>&1)
+[[ $gateway_log != *"$key"* ]] || fail 'the gateway logged the signing key'
+
+# SSO profile, the walkthrough's way (a fresh `--profile sso up`): a new
+# volume mints a new key; Dex answers through the published loopback port,
+# connection after connection (the relay keeps listening).
+"${compose[@]}" down -v >/dev/null 2>&1 || fail 'demo did not stop'
+"${compose[@]}" --profile sso up -d --wait >/dev/null 2>&1 || fail 'the sso profile did not come up'
+fresh=$("${compose[@]}" run --rm --no-deps -T --entrypoint sh mint-token -c 'cat /run/demo-secrets/session-signing-key') \
+  || fail 'no session signing key in the sso run'
+[[ $fresh =~ ^[0-9a-f]{64}$ && $fresh != "$key" ]] || fail 'a new demo volume did not mint a new signing key'
+discovery=http://localhost:5556/.well-known/openid-configuration
+for _ in $(seq 1 30); do
+  curl -fsS -m 2 "$discovery" >/dev/null 2>&1 && break
+  sleep 1
+done
+for _ in 1 2 3; do
+  oidc=$(curl -fsS -m 5 "$discovery") || fail 'Dex unreachable on localhost:5556'
+  [[ $oidc =~ \"issuer\":\ ?\"http://localhost:5556\" ]] || fail "unexpected Dex discovery: $oidc"
+done
+
+echo 'ok: examples/demo (run_query returned rows, audited; random signing key; Dex via sso profile)'

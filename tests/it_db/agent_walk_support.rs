@@ -1,5 +1,6 @@
 //! Plumbing shared by the agent-surface e2e tests (`agent_walk_e2e`,
-//! `tool_errors_body_e2e`, `run_query_sizing_e2e`, `sample_table_columns_e2e`):
+//! `tool_errors_body_e2e`, `run_query_sizing_e2e`, `sample_table_columns_e2e`,
+//! `tool_error_codes_e2e`):
 //! a logged-in gateway on the live target, one MCP call that returns the
 //! payload and the gateway `request_id`, and a throwaway fixture schema.
 
@@ -77,12 +78,18 @@ pub struct Agent {
 
 impl Agent {
     pub async fn boot() -> Self {
+        Self::boot_with(YAML).await
+    }
+
+    /// An agent on a gateway running `yaml` (a [`config_yaml`] template) that
+    /// grants the `engineers` group.
+    pub async fn boot_with(yaml: &str) -> Self {
         let user = MockUser {
             sub: format!("agent-walk-{}", uuid::Uuid::new_v4().simple()),
             email: "agent-walk@example.com".to_string(),
             groups: vec!["engineers".to_string()],
         };
-        let gateway = spawn_logged_in(&config_yaml(YAML), user).await;
+        let gateway = spawn_logged_in(&config_yaml(yaml), user).await;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(8))
             .build()

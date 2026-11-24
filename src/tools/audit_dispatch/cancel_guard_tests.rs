@@ -34,6 +34,7 @@ fn row() -> AuditRow {
         upstream_run_id: None,
         rows_affected: None,
         sql_truncated: false,
+        params: None,
     }
 }
 
@@ -44,7 +45,7 @@ fn unarmed_guard() -> CancelledAuditGuard {
         row: row(),
         completed: false,
         state_db: None,
-        tool: "run_query",
+        labels: CallLabels::untargeted("run_query"),
         sinks: StreamSinks::default(),
         tasks: DetachedTasks::new(),
     }
@@ -144,7 +145,7 @@ async fn armed_row_reads_cancelled_until_an_outcome_is_recorded() {
     let pool = PgPool::connect_lazy("postgres://unused@localhost/unused").expect("lazy pool");
     let guard = CancelledAuditGuard::arm(
         row(),
-        "run_query",
+        CallLabels::untargeted("run_query"),
         pool,
         StreamSinks::default(),
         DetachedTasks::new(),

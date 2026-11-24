@@ -4,6 +4,8 @@ The gateway never creates, widens or owns a database role (MUST #3); you provisi
 
 Store each password in your secret manager and reference it as `${ENV:…}` or `${FILE:…}` in `databases[].password`.
 
+`db-mcp-gateway roles --config config.yml` prints these statements filled in from your config (print only), and `db-mcp-gateway doctor --config config.yml` connects as each configured Postgres role and reports superuser attributes, write privileges on a read role and tables it cannot read — see the [operator CLI](cli.md). Neither grants anything.
+
 ## PostgreSQL
 
 `app_owner` stands for the role that owns your tables (the one migrations run as).

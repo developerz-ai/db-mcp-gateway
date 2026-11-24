@@ -3,15 +3,20 @@
 //! filters `catalog::schema_query` appends bind every value.
 //!
 //! Columns are filtered the way `information_schema.columns` filters them
-//! (owner, or a privilege on the column); a foreign key is listed only when
-//! the role can see the referenced relation too.
+//! (owner, or a privilege on the column). Keys and indexes name columns too,
+//! and an index definition can quote any column its expressions or predicate
+//! read, so each is listed only when the role sees every column it touches:
+//! a primary key or index with a hidden column is left out whole (never
+//! listed with the column dropped, which would misstate it), as is a foreign
+//! key with a hidden column on either side.
 
 /// `[schema, table, kind, comment, row_estimate, columns, primary_key,
 /// foreign_keys, indexes]`. `row_estimate` is `reltuples`, `NULL` for a view
 /// or a table never analysed; `columns` is
 /// `[{name, data_type, nullable, default?, comment?, element_type?,
 /// enum_values?}]` with `data_type` from `format_type`; `primary_key` a
-/// column-name array or `NULL`; `foreign_keys`
+/// column-name array or `NULL` (none, or one the role cannot fully see);
+/// `foreign_keys`
 /// `[{name, columns, references: {schema, table, columns}}]`; `indexes`
 /// `[{name, columns, unique, primary, definition}]`, an expression key
 /// column `null`.
@@ -41,7 +46,10 @@ pub(super) const FULL_SELECT: &str = "SELECT n.nspname::text AS schema, c.relnam
      (SELECT json_agg(a.attname ORDER BY k.ord) \
        FROM pg_constraint p, unnest(p.conkey) WITH ORDINALITY k(attnum, ord) \
        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum \
-       WHERE p.conrelid = c.oid AND p.contype = 'p') AS primary_key, \
+       WHERE p.conrelid = c.oid AND p.contype = 'p' \
+       AND (pg_has_role(c.relowner, 'USAGE') OR NOT EXISTS (SELECT 1 FROM unnest(p.conkey) h(attnum) \
+         WHERE NOT has_column_privilege(c.oid, h.attnum, 'SELECT, INSERT, UPDATE, REFERENCES')))) \
+       AS primary_key, \
      COALESCE((SELECT json_agg(json_build_object( \
          'name', f.conname, \
          'columns', (SELECT json_agg(a.attname ORDER BY k.ord) \
@@ -55,8 +63,10 @@ pub(super) const FULL_SELECT: &str = "SELECT n.nspname::text AS schema, c.relnam
        FROM pg_constraint f JOIN pg_class r ON r.oid = f.confrelid \
        JOIN pg_namespace rn ON rn.oid = r.relnamespace \
        WHERE f.conrelid = c.oid AND f.contype = 'f' \
-       AND (pg_has_role(r.relowner, 'USAGE') \
-         OR has_any_column_privilege(r.oid, 'SELECT, INSERT, UPDATE, REFERENCES'))), \
+       AND (pg_has_role(c.relowner, 'USAGE') OR NOT EXISTS (SELECT 1 FROM unnest(f.conkey) h(attnum) \
+         WHERE NOT has_column_privilege(c.oid, h.attnum, 'SELECT, INSERT, UPDATE, REFERENCES'))) \
+       AND (pg_has_role(r.relowner, 'USAGE') OR NOT EXISTS (SELECT 1 FROM unnest(f.confkey) h(attnum) \
+         WHERE NOT has_column_privilege(r.oid, h.attnum, 'SELECT, INSERT, UPDATE, REFERENCES')))), \
        '[]'::json) AS foreign_keys, \
      COALESCE((SELECT json_agg(json_build_object( \
          'name', ic.relname, \
@@ -69,4 +79,12 @@ pub(super) const FULL_SELECT: &str = "SELECT n.nspname::text AS schema, c.relnam
          'definition', pg_get_indexdef(i.indexrelid) \
        ) ORDER BY ic.relname) \
        FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid \
-       WHERE i.indrelid = c.oid), '[]'::json) AS indexes";
+       WHERE i.indrelid = c.oid \
+       AND (pg_has_role(c.relowner, 'USAGE') OR NOT EXISTS ( \
+         SELECT 1 FROM unnest(i.indkey::int2[]) h(attnum) WHERE h.attnum > 0 \
+           AND NOT has_column_privilege(c.oid, h.attnum, 'SELECT, INSERT, UPDATE, REFERENCES') \
+         UNION ALL SELECT 1 FROM pg_depend d \
+         WHERE d.classid = 'pg_class'::regclass AND d.objid = i.indexrelid \
+           AND d.refclassid = 'pg_class'::regclass AND d.refobjid = c.oid AND d.refobjsubid > 0 \
+           AND NOT has_column_privilege(c.oid, d.refobjsubid::int2, \
+             'SELECT, INSERT, UPDATE, REFERENCES')))), '[]'::json) AS indexes";

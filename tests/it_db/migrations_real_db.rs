@@ -95,6 +95,14 @@ async fn migrations_apply_from_empty_and_rerun_as_a_no_op() {
         }
     }
 
+    let params_type: Option<String> = sqlx::query_scalar(
+        "SELECT data_type::text FROM information_schema.columns \
+         WHERE table_name = 'audit_calls' AND column_name = 'params'",
+    )
+    .fetch_optional(&fresh)
+    .await
+    .expect("information_schema lookup");
+
     fresh.close().await;
     admin
         .execute(sqlx::AssertSqlSafe(format!(
@@ -122,6 +130,11 @@ async fn migrations_apply_from_empty_and_rerun_as_a_no_op() {
         );
     }
     assert!(intents_idx, "0010 index missing");
+    assert_eq!(
+        params_type.as_deref(),
+        Some("jsonb"),
+        "0024 audit_calls.params"
+    );
     assert!(history_idx, "0011 index missing");
     assert!(superseded_idx.is_empty(), "0015 left {superseded_idx:?}");
     assert!(

@@ -14,6 +14,7 @@
 //! [`validation::parse_grant_target`] enforces the XOR. PATCH cannot change
 //! the target — that's the grant's identity; re-target by DELETE + POST.
 
+mod batch;
 mod dto;
 mod handlers;
 mod validation;
@@ -25,6 +26,7 @@ use sqlx::PgPool;
 use crate::authz::PermissionsCache;
 use crate::state::permissions::PermissionsRepo;
 
+pub use batch::{BatchChange, BatchRequest, BatchResult, MAX_BATCH_CHANGES, batch};
 pub use dto::{CreateGrantRequest, GrantResponse, ListGrantsQuery, UpdateGrantRequest};
 pub use handlers::{create, delete, get_one, list, patch};
 

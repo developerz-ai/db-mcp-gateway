@@ -13,7 +13,7 @@ use super::super::app_state::OAuthState;
 use super::helpers::{form_rejected, oauth_error, random_token};
 use super::resource;
 use super::urls::MCP_SCOPE;
-use crate::auth::oauth::{AuthFacade, IssuedTokens, MintError, Refreshed};
+use crate::auth::oauth::{AuthCode, AuthFacade, IssuedTokens, MintError, Refreshed};
 
 #[derive(Deserialize)]
 pub struct TokenForm {
@@ -88,12 +88,16 @@ async fn token_authorization_code(state: &OAuthState, form: TokenForm) -> Respon
 
     // One-time: take() removes the code so a replay finds nothing, and every
     // refusal below for what the client sent leaves it consumed.
-    let Some(entry) = auth.codes.take(code).await else {
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_grant",
-            "authorization code is invalid or expired",
-        );
+    let entry = match auth.codes.take(code).await {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "authorization code is invalid or expired",
+            );
+        }
+        Err(_) => return issue_failed(),
     };
 
     // client_id, when sent, must match the registrant (RFC 6749 §3.2.1).
@@ -145,12 +149,7 @@ async fn token_authorization_code(state: &OAuthState, form: TokenForm) -> Respon
         .await
         .is_err()
     {
-        auth.codes.restore(code, entry).await;
-        return oauth_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server_error",
-            "could not issue tokens; try again",
-        );
+        return restore_code(auth, code, entry, issue_failed()).await;
     }
 
     // Fresh authorization → fresh session + refresh-token chain. The identity
@@ -163,8 +162,7 @@ async fn token_authorization_code(state: &OAuthState, form: TokenForm) -> Respon
         Err(MintError::NotMinted(err)) => {
             // A retryable 503 with provably nothing issued, so the code —
             // proven by PKCE to be this client's — is put back for it.
-            auth.codes.restore(code, entry).await;
-            token_response(Err(err))
+            restore_code(auth, code, entry, token_response(Err(err))).await
         }
         Err(MintError::Unconfirmed) => {
             // The grant may exist: handing the code back would let the retry
@@ -176,6 +174,29 @@ async fn token_authorization_code(state: &OAuthState, form: TokenForm) -> Respon
                 "token issuance could not be confirmed; restart authorization",
             )
         }
+    }
+}
+
+/// Nothing was issued and the code is unchanged (or back): retry the request.
+fn issue_failed() -> Response {
+    oauth_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "server_error",
+        "could not issue tokens; try again",
+    )
+}
+
+/// Put a provably unused code back and answer `retry`. A code that could not
+/// be put back is spent: a "try again" would only meet `invalid_grant`, so
+/// the client is told to start over instead.
+async fn restore_code(auth: &AuthFacade, code: &str, entry: AuthCode, retry: Response) -> Response {
+    match auth.codes.restore(code, entry).await {
+        Ok(()) => retry,
+        Err(_) => oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "could not issue tokens; restart authorization",
+        ),
     }
 }
 

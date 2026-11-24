@@ -1,0 +1,15 @@
+config: tests/data/check/warnings.yaml
+secrets: not resolved (--no-secrets)
+warning: server `prod`: target TLS is encrypted but the server certificate is NOT verified (set `tls: verify_full`)
+warning: server `legacy`: target TLS is disabled; credentials and results cross the network in plaintext
+warning: permission group `engineers` grant on `prod`/`app`: `row_limit` has no effect on a `schema_read` grant
+warning: permission group `engineers` grant on `*`/`app`: `statement_timeout_ms` has no effect on a `history_read` grant
+warning: env `OIDC_ISUER` is set but the gateway reads no such variable (known: OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_AUDIENCE, OIDC_REDIRECT_URL, OIDC_GROUPS_CLAIM, OIDC_SCOPES, OIDC_GROUPS_PREFIX, OIDC_TOKEN_AUTH_METHOD)
+warning: env `TLS_CERT` is set but the gateway reads no such variable (known: TLS_CERT_PATH, TLS_KEY_PATH, TLS_DISABLED)
+connection budget (one replica, every pool full; multiply by replicas):
+  prod/app: read 4 + cancel 2 = 6
+  prod total: 6 — keep below the target's max_connections (`db-mcp-gateway doctor` reads it)
+  legacy/app: read 4 = 4
+  legacy total: 4 — keep below the target's max_connections (`db-mcp-gateway doctor` reads it)
+  state DB: request 10 (STATE_DB_POOL_SIZE) + background 2 + listener 2 = 14
+result: valid (0 error(s), 6 warning(s))

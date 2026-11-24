@@ -2,11 +2,15 @@
 # does (`--profile ci`).
 #
 # nextest runs every test in its own process, and tests from different binaries
-# run at the same time. Two consequences for this repo's integration tests:
-# `#[serial]` (an in-process lock) no longer serialises anything, and binaries
-# sharing the state DB / MySQL store / target DBs truncate each other's rows.
-# So every integration-test binary is in one group that runs one test at a
-# time — the isolation `cargo test` gave for free. Unit tests stay parallel.
+# run at the same time, so `#[serial_test::serial(world)]` (an in-process lock)
+# serialises nothing here. Every integration test is in the `shared-db` group,
+# 4 at a time — the concurrency `#[serial_test::parallel(world)]` tests already
+# meet under `cargo test`. A test that declares `serial(world)` (a table-wide
+# sweep, cap seeding, a global count) runs alone instead: the override below
+# names each one with `threads-required = "num-test-threads"`, and
+# `it_offline::isolation_guard` fails when that list and the attributes drift.
+# `it_global` installs process-wide recorders and counts, so it runs alone too.
+# Unit tests stay parallel.
 
 [profile.default]
 # A test past 60 s is reported as slow; past 5 min it is killed. The real-DB
@@ -15,7 +19,59 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 fail-fast = false
 
 [test-groups]
-shared-db = { max-threads = 1 }
+shared-db = { max-threads = 4 }
+
+[[profile.default.overrides]]
+filter = """
+binary(it_global) | (binary(it_db) & (
+    test(=audit_integrity_intent_real_db::abandoned_row_carries_the_intent_statement_and_reason)
+  | test(=audit_integrity_real_db::pruner_never_orphans_a_surviving_intent)
+  | test(=audit_integrity_real_db::reaper_cursor_resumes_without_rescanning_or_skipping)
+  | test(=audit_integrity_real_db::reaper_records_abandons_across_batch_boundaries)
+  | test(=audit_integrity_write_commit_e2e::committed_write_with_a_failed_completion_says_it_is_in)
+  | test(=audit_pruner_real_db::pruner_deletes_only_rows_older_than_ttl)
+  | test(=audit_pruner_real_db::pruner_deletes_permissions_audit_rows_older_than_ttl)
+  | test(=audit_pruner_real_db::pruner_drains_a_backlog_larger_than_one_batch)
+  | test(=audit_two_phase_real_db::intent_without_completion_is_reaped_as_abandoned)
+  | test(=client_registry_real_db::at_cap_evicts_the_oldest_never_authorised_client_real_db)
+  | test(=client_registry_real_db::at_cap_of_authorised_clients_is_store_full_real_db)
+  | test(=client_registry_real_db::expired_registration_is_swept_and_not_returned)
+  | test(=client_registry_real_db::re_register_updates_redirect_uris)
+  | test(=client_registry_real_db::registration_survives_a_restart)
+  | test(=exec_run_query::read_access_cannot_write_on_a_write_capable_role)
+  | test(=oauth_client_adopt_cap_real_db::a_client_that_lapsed_while_promotion_waited_is_not_renewed)
+  | test(=oauth_client_adopt_cap_real_db::a_victim_promoted_under_the_eviction_is_not_deleted)
+  | test(=oauth_client_adopt_cap_real_db::adopting_an_id_another_adoption_is_committing_evicts_no_bystander)
+  | test(=oauth_client_adopt_cap_real_db::adoptions_racing_newcomers_at_the_cap_never_rewrite_a_live_client)
+  | test(=oauth_client_adopt_cap_real_db::concurrent_adoptions_of_a_live_client_at_the_cap_evict_nothing)
+  | test(=oauth_client_adopt_cap_real_db::promotion_waits_for_the_registry_lock)
+  | test(=oauth_client_ttl_e2e::a_mint_whose_commit_errored_keeps_the_code_spent)
+  | test(=oauth_client_ttl_e2e::resolving_every_unused_client_does_not_block_registration)
+  | test(=oauth_code_restore_real_db::a_mint_failing_before_commit_puts_the_code_back)
+  | test(=oauth_lifecycle_real_db::adopting_a_lapsed_unswept_client_revives_it)
+  | test(=oauth_lifecycle_real_db::gc_sweeps_lapsed_tombstones)
+  | test(=oauth_lifecycle_real_db::re_registering_a_live_client_keeps_its_expiry)
+  | test(=oauth_lifecycle_real_db::replay_inside_the_grace_keeps_the_chain)
+  | test(=oauth_lifecycle_real_db::reuse_revocation_waits_for_an_in_flight_rotation)
+  | test(=oauth_lifecycle_real_db::reuse_revokes_only_its_own_chain)
+  | test(=oauth_lifecycle_real_db::reusing_a_rotated_refresh_token_revokes_the_chain)
+  | test(=oauth_login_state_real_db::gc_sweeps_only_lapsed_login_state)
+  | test(=permissions_pruner_real_db::pruner_hard_deletes_expired_soft_deleted_permissions_rows)
+  | test(=pg_error_hints_real_db::near_misses_are_only_names_the_read_role_can_see)
+  | test(=pg_error_redaction_real_db::a_cancel_refused_at_login_carries_no_server_text)
+  | test(=pool_sizing_real_db::redis_sweep_closes_connections_idle_past_the_timeout)
+  | test(=reaper_stream_real_db::reaped_row_reaches_the_stream_sink)
+  | test(=redis_bounded_values_real_db::the_server_is_never_asked_for_an_unbounded_reply)
+  | test(=redis_idle_reconnect_real_db::a_read_on_a_connection_closed_while_idle_reconnects_once)
+  | test(=redis_timeout_real_db::a_saturated_pool_is_unavailable_not_timeout)
+  | test(=redis_timeout_real_db::a_stalled_server_times_out_and_the_connection_is_discarded)
+  | test(=refresh_tokens_real_db::expired_chain_is_rejected_and_swept)
+  | test(=session_cache_real_db::gc_deletes_long_expired_rows_and_keeps_the_rest)
+  | test(=two_replicas_real_db::pruners_on_two_replicas_never_fail_or_touch_retained_rows)
+))
+"""
+threads-required = "num-test-threads"
+test-group = "shared-db"
 
 [[profile.default.overrides]]
 filter = "kind(test)"
@@ -40,6 +96,9 @@ path = "junit.xml"
 #   tests prove escapes a read-only transaction. The guard's denial is still
 #   covered by the sql_guard unit tests.
 [profile.yugabyte]
+# One test at a time: YSQL refuses concurrent DDL across sessions (40001
+# "Catalog Version Mismatch"), and every module here creates fixtures with DDL.
+test-threads = 1
 default-filter = """
 binary(it_db) & test(/^(exec_run_query|cancellation_real_db|sql_guard_side_effects|sql_guard_unicode_escape|explain_real_db|explain_e2e|sample_table_real_db|sample_table_authz_e2e|describe_schema_real_db|run_query_e2e|write_tier_e2e|tool_args_edge_e2e|introspection_tools_real_db|get_query_history_real_db|audit_integrity_describe_schema_e2e|audit_integrity_intent_e2e|secret_refs|sql_guard_differential|sql_guard_refusals_e2e|exec_isolation_real_db|pg_error_redaction_real_db|pg_result_budget_real_db|pg_type_rendering_real_db|pg_write_tier_real_db)::/)
   - test(=sql_guard_side_effects::pg_notify_escapes_a_read_only_transaction_so_the_guard_denies_it)

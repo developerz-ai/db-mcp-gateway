@@ -11,6 +11,7 @@
 use crate::common;
 use std::time::Duration;
 
+use crate::common::audit::latest_audit;
 use crate::common::cleanup::delete_audit_calls;
 use crate::common::gateway::{LoggedInGateway, spawn_logged_in};
 use crate::common::idp::MockUser;
@@ -90,6 +91,7 @@ async fn write_audit_row(
         upstream_run_id: None,
         rows_affected: None,
         sql_truncated: false,
+        params: None,
     };
     log(pool, &row).await.expect("audit insert");
     // Bump occurred_at backwards so the test is deterministic regardless of
@@ -115,34 +117,19 @@ async fn write_audit_row(
 /// `sql` must be NULL: this tool takes no SQL, and a non-NULL value would mean
 /// the dispatch header was populated from the wrong tool's arguments.
 async fn assert_dispatch_audited(pool: &sqlx::PgPool, user_sub: &str, outcome: &str) {
-    #[derive(sqlx::FromRow)]
-    struct DispatchRow {
-        outcome: String,
-        sql: Option<String>,
-        server_name: Option<String>,
-        database_name: Option<String>,
-    }
-
-    let row: Option<DispatchRow> = sqlx::query_as(
-        "SELECT outcome, sql, server_name, database_name \
-         FROM audit_calls \
-         WHERE user_sub = $1 AND tool = 'get_query_history' \
-         ORDER BY occurred_at DESC LIMIT 1",
-    )
-    .bind(user_sub)
-    .fetch_optional(pool)
-    .await
-    .expect("audit query");
-
-    let row = row.unwrap_or_else(|| panic!("no `get_query_history` audit row for {user_sub}"));
-    assert_eq!(row.outcome, outcome, "audit row outcome for {user_sub}");
+    let row = latest_audit(pool, user_sub, "get_query_history", user_sub).await;
+    assert_eq!(
+        row.outcome.as_str(),
+        outcome,
+        "audit row outcome for {user_sub}"
+    );
     assert!(
         row.sql.is_none(),
         "get_query_history writes no SQL, got {:?}",
         row.sql,
     );
-    assert_eq!(row.server_name.as_deref(), Some("target"));
-    assert_eq!(row.database_name.as_deref(), Some("app"));
+    assert_eq!(row.server.as_deref(), Some("target"));
+    assert_eq!(row.database.as_deref(), Some("app"));
 }
 
 async fn call_history(url: &str, bearer: &str, arguments: Value) -> Value {
@@ -604,6 +591,7 @@ async fn history_filters_by_claimed_run_id() {
         server: "target",
         database: "app",
         upstream_run_id: run,
+        sql_sha256: None,
         since: None,
         before: None,
         limit: 10,

@@ -18,6 +18,7 @@ pub(crate) use background::{
 };
 pub(crate) use boot::build_app_state;
 pub(crate) use logging::{init_logging, spawn_dropped_lines_exporter};
+pub(crate) use metrics::state_pools::spawn_state_pool_sampler;
 pub(crate) use metrics::{install_recorder, spawn_listener as spawn_metrics_listener};
 pub(crate) use serve::serve;
 pub(crate) use state_db::connect_state_db;
@@ -118,7 +119,10 @@ async fn reload_tls(
     key_path: &std::path::Path,
 ) {
     match tls::reload(rustls, cert_path, key_path).await {
-        Ok(()) => tracing::info!(cert_path = %cert_path.display(), "TLS certificate reloaded"),
+        Ok(()) => {
+            tracing::info!(cert_path = %cert_path.display(), "TLS certificate reloaded");
+            metrics::loaded::record_cert_loaded(cert_path).await;
+        }
         Err(error) => tracing::error!(
             %error,
             cert_path = %cert_path.display(),
@@ -129,11 +133,15 @@ async fn reload_tls(
 
 async fn reload_config(targets: &ReloadTargets) {
     match config::reload::reload(targets).await {
-        Ok(evicted) => tracing::info!(
-            path = %targets.path.display(),
-            evicted_pools = evicted,
-            "config reloaded"
-        ),
+        Ok(evicted) => {
+            tracing::info!(
+                path = %targets.path.display(),
+                evicted_pools = evicted,
+                "config reloaded"
+            );
+            metrics::preregister::register_targets(&targets.config.load());
+            metrics::loaded::record_config_loaded(&targets.path).await;
+        }
         // `ReloadError` names files, env vars and settings — never a secret.
         Err(error) => tracing::error!(
             %error,

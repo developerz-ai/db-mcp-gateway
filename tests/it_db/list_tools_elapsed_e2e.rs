@@ -2,12 +2,11 @@
 //! tool's work"), including the tools that never reach a target:
 //! `list_servers`, `list_databases`, `get_query_history`.
 
-use std::time::Duration;
-
 use crate::common::audit::latest_audit;
-use crate::common::gateway::{LoggedInGateway, spawn_logged_in};
+use crate::common::gateway::spawn_logged_in;
 use crate::common::idp::MockUser;
-use serde_json::{Value, json};
+use crate::common::mcp::call_tool;
+use serde_json::json;
 
 const YAML: &str = r#"
 servers:
@@ -27,27 +26,6 @@ permissions:
       - { server: target, database: app, action: history_read }
 "#;
 
-async fn call(gw: &LoggedInGateway, tool: &str, arguments: Value) -> Value {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .unwrap()
-        .post(format!("{}/mcp", gw.url))
-        .bearer_auth(&gw.bearer)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": { "name": tool, "arguments": arguments }
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap()
-}
-
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn untargeted_success_rows_carry_elapsed_ms() {
@@ -66,7 +44,7 @@ async fn untargeted_success_rows_carry_elapsed_ms() {
             json!({ "server": "target", "database": "app" }),
         ),
     ] {
-        let resp = call(&gw, tool, arguments).await;
+        let resp = call_tool(&gw, tool, arguments).await;
         assert_eq!(resp["result"]["isError"], false, "{tool}: {resp}");
         let row = latest_audit(&gw.state_db, &gw.user_sub, tool, tool).await;
         assert_eq!(row.outcome, "success", "{tool}");

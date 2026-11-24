@@ -14,6 +14,9 @@
 //! - every documented MCP client URL ends in the MCP path;
 //! - every gateway config under `examples/` parses.
 
+// CLAUDE.md §Conventions: tests may panic; `[lints.clippy]` denies it for shipped code.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};

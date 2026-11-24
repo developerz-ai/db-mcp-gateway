@@ -3,7 +3,10 @@
 //!
 //! Schema and table are caller input that the adapter interpolates as
 //! identifiers, so both must parse as [`Identifier`] here; anything else is
-//! rejected before the adapter sees it.
+//! rejected before the adapter sees it. Which rule `table` follows depends
+//! on the server's kind, so before authz it is held only to the loosest one
+//! (a collection name) and to the target's own rule after: an ungranted
+//! caller gets the same answer for every server, configured or not.
 
 use std::num::NonZeroU32;
 use std::time::Instant;
@@ -11,7 +14,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{Action, Grant};
+use crate::config::{Action, Grant, ServerKind};
+use crate::exec::mongo::rejector::is_system_collection;
 use crate::exec::mongo::sample_command;
 use crate::exec::sql_guard::Access;
 use crate::exec::{
@@ -90,7 +94,7 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
     }
     // Validated at the edge: the adapter interpolates both as identifiers,
     // and the audit row names the table they make up.
-    let table = match parse_table(header.db_type, args.schema.as_deref(), &args.table) {
+    let table = match parse_table(args.schema.as_deref(), &args.table) {
         Ok(table) => table,
         Err((field, pattern)) => {
             let outcome = invalid_arguments(id.clone(), &format!("`{field}` must match {pattern}"));
@@ -152,21 +156,32 @@ fn parse_columns(columns: Option<&[String]>) -> Result<Vec<&str>, String> {
 }
 
 /// `Err` names the argument that is not an identifier and the rule it
-/// broke: on Mongo, `table` is a collection name ([`COLLECTION_PATTERN`]).
+/// broke. `table` is held to the loosest rule any kind takes, a collection
+/// name ([`COLLECTION_PATTERN`]); [`refuse_for_kind`] applies the target's.
 fn parse_table<'a>(
-    db_type: Option<&str>,
     schema: Option<&'a str>,
     table: &'a str,
 ) -> Result<TableRef<'a>, (&'static str, &'static str)> {
     let schema = Identifier::parse(schema.unwrap_or(DEFAULT_SCHEMA))
         .map_err(|_| ("schema", IDENTIFIER_PATTERN))?;
-    let table = match db_type {
-        Some("mongo") => {
-            Identifier::parse_collection(table).map_err(|_| ("table", COLLECTION_PATTERN))
-        }
-        _ => Identifier::parse(table).map_err(|_| ("table", IDENTIFIER_PATTERN)),
-    }?;
+    let table = Identifier::parse_collection(table).map_err(|_| ("table", COLLECTION_PATTERN))?;
     Ok(TableRef { schema, table })
+}
+
+/// Why `table` cannot be sampled on a server of `kind`, once the caller is
+/// authorized on it: a SQL table must be an identifier, and a Mongo
+/// `system.*` collection holds server state, not application data.
+fn refuse_for_kind(id: Value, kind: ServerKind, table: Identifier<'_>) -> Option<Outcome> {
+    match kind {
+        ServerKind::Mongo if is_system_collection(table.as_str()) => Some(error_outcome(
+            OutcomeCode::Forbidden,
+            "system collections are not readable through the gateway",
+        )),
+        ServerKind::Mongo => None,
+        _ => Identifier::parse(table.as_str())
+            .is_err()
+            .then(|| invalid_arguments(id, &format!("`table` must match {IDENTIFIER_PATTERN}"))),
+    }
 }
 
 async fn compute_outcome(
@@ -192,6 +207,9 @@ async fn compute_outcome(
     ) else {
         return forbidden();
     };
+    if let Some(refused) = refuse_for_kind(id.clone(), target.server.kind, table.table) {
+        return refused;
+    }
     let constraints = &target.constraints;
 
     // Same guard as `run_query`: this tool returns rows, so a grant demanding

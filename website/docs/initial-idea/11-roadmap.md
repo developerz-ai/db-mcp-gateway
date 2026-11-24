@@ -71,14 +71,14 @@ The config parser knows `kind: mysql` and `kind: mssql`, but boot validation rej
 ## Phase 7 — HA + multi-replica (partial)
 
 - Multi-replica deploys behind a load balancer ✅ for `/mcp`, the admin API and refresh: sessions, refresh tokens, audit and permissions are in the state DB; grant changes reach other replicas over `LISTEN`/`NOTIFY`.
-- OAuth bridge login state (pending `/authorize` flows, authorization codes) is still in process memory — login needs sticky routing or one replica ([09](09-deployment.md#replicas)). Not done.
+- OAuth bridge login state (pending `/authorize` flows, consents, authorization codes) lives in the state DB (migration 0022) — no sticky routing; replicas share `SESSION_SIGNING_KEY` ([09](09-deployment.md#replicas)) ✅.
 - Pruner and reaper run on every replica under a transaction-scoped advisory lock, so only one does the work ✅.
 - Documented runbook for rolling restarts: [operations](../deployment/operations.md#upgrade) ✅.
 
 ## Phase 8 — Operator ergonomics
 
 - `gateway admin …` subcommands (revoke session, list active sessions, replay audit query).
-- Helm chart with cert-manager integration.
+- Helm chart (`deploy/helm/db-mcp-gateway`, optional cert-manager `Certificate`), kustomize base, Prometheus alerts, Grafana dashboard and runbook (`deploy/`) ✅ — [Kubernetes](../deployment/kubernetes.md). Publishing the chart to a chart repository on the release tag is still open.
 - Example `docker-compose` polished — lives in `examples/` in this repo, not a separate repo.
 - Provisioning SQL per engine — documented in [target roles](../deployment/target-roles.md) ✅; bundled templates not planned.
 

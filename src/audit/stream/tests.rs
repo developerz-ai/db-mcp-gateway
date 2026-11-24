@@ -53,6 +53,7 @@ fn sample_row() -> AuditRow {
         upstream_run_id: None,
         rows_affected: None,
         sql_truncated: false,
+        params: None,
     }
 }
 
@@ -243,6 +244,24 @@ fn oversized_row_is_cut_to_one_datagram_with_valid_json() {
     assert!(sql.starts_with("SELECT 'xxx"), "{sql}");
     assert!(sql.ends_with(TRUNCATION_MARKER), "{sql}");
     assert_eq!(body["request_id"].as_str(), Some("req-stream-1"));
+}
+
+/// Params past one datagram are cut after `sql`: the array becomes a marked
+/// JSON string, as in `audit_calls.params`, and the body stays valid JSON.
+#[test]
+fn oversized_params_are_cut_to_a_marked_string_with_valid_json() {
+    let mut row = sample_row();
+    row.params = Some(serde_json::json!(["\"quoted\"".repeat(2_000), 7]));
+
+    let message = message(&row);
+
+    assert!(message.len() <= MAX_MESSAGE_BYTES, "{}", message.len());
+    let body: serde_json::Value =
+        serde_json::from_str(&message[message.find('{').unwrap()..]).expect("body is JSON");
+    let params = body["params"].as_str().expect("cut params are a string");
+    assert!(params.starts_with(r#"["\"quoted"#), "{params}");
+    assert!(params.ends_with(TRUNCATION_MARKER), "{params}");
+    assert_eq!(body["sql"], "SELECT 1");
 }
 
 /// No `sql` to shorten (an oversized error message, say): the message

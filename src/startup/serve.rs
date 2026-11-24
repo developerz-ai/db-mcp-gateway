@@ -41,6 +41,7 @@ pub(crate) async fn serve(
         permissions_cache: app_state.mcp.permissions_cache.clone(),
         adapter_registry: app_state.mcp.adapter_registry.clone(),
     };
+    super::metrics::loaded::record_config_loaded(&reload.path).await;
     let allowed_origins = AllowedOrigins::from_env(config.bind)?;
     let trusted_proxies = TrustedProxies::from_env()?;
     let app = transport::router(config, app_state)?
@@ -63,6 +64,7 @@ pub(crate) async fn serve(
             key_path,
         } => {
             let rustls = tls::load(&cert_path, &key_path).await?;
+            super::metrics::loaded::record_cert_loaded(&cert_path).await;
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
                 addr = %config.bind,

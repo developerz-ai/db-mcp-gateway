@@ -35,6 +35,16 @@ const REAPER_LOCK_KEY: i64 = 0x6462_6d63_7072_6170; // "dbmcprap"
 /// no recorded outcome, so an alert on any increase is warranted.
 const ABANDONED_TOTAL: &str = "audit_abandoned_total";
 
+/// Gauge: Unix seconds of the last sweep that completed (rows or not).
+const REAPER_LAST_SUCCESS: &str = "audit_reaper_last_success_timestamp";
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or_default()
+}
+
 /// Intents one batch examines: a short index range plus key probes, so a
 /// batch stays far below the background pool's statement timeout.
 const REAP_BATCH_ROWS: u32 = 10_000;
@@ -139,12 +149,14 @@ pub async fn run_streaming(pool: PgPool, sinks: Arc<ArcSwap<StreamSinks>>, tasks
         ticker.tick().await;
         let current = sinks.load_full();
         match sweep(&pool, REAPER_GRACE, &mut cursor, &current, &tasks).await {
-            Ok(Some(0) | None) => {}
-            Ok(Some(n)) => {
-                // Only the lock holder writes rows, so summing across replicas
-                // counts each abandoned call once.
-                metrics::counter!(ABANDONED_TOTAL).increment(n);
-                tracing::warn!(rows = n, "audit reaper: recorded abandoned calls");
+            Ok(reaped) => {
+                metrics::gauge!(REAPER_LAST_SUCCESS).set(unix_now());
+                if let Some(n @ 1..) = reaped {
+                    // Only the lock holder writes rows, so summing across
+                    // replicas counts each abandoned call once.
+                    metrics::counter!(ABANDONED_TOTAL).increment(n);
+                    tracing::warn!(rows = n, "audit reaper: recorded abandoned calls");
+                }
             }
             Err(err) => tracing::error!(
                 %err,

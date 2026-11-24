@@ -14,15 +14,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{Action, Grant, ServerKind};
-use crate::exec::{Access, ExplainQuery, GuardedSql};
+use crate::exec::{Access, ExplainQuery, GuardedSql, QueryParam};
 use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
 use super::args::parse_arguments;
 use super::audit_dispatch::{
-    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, WriteEffect, WriteState, error_outcome,
-    guard_rejected, outcome_from_exec_error, reject_arguments, run_audited, success_outcome,
+    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, WriteEffect, WriteState, audit_outcome,
+    error_outcome, guard_rejected, invalid_arguments, outcome_from_exec_error, reject_arguments,
+    run_audited_with_params, success_outcome,
 };
+use super::query_params::parse_params;
 use super::target::{ensure_reason, forbidden, record_intent, resolve_target};
 
 const TOOL_NAME: &str = "explain";
@@ -42,6 +44,9 @@ pub struct Arguments {
     pub analyze: bool,
     #[serde(default)]
     pub reason: Option<String>,
+    /// Values bound to `$1..$n`, as in `run_query`.
+    #[serde(default)]
+    pub params: Vec<Value>,
 }
 
 const ANALYZE_NEEDS_READ: &str =
@@ -52,6 +57,10 @@ struct SuccessPayload {
     /// The Postgres query plan as a JSON value (passed through verbatim from
     /// `EXPLAIN (FORMAT JSON)`'s single text column).
     plan: Value,
+    /// Cost, row estimate, sequential scans and node count read off `plan`;
+    /// absent when the plan has no root node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<PlanSummary>,
     elapsed_ms: u64,
 }
 
@@ -71,9 +80,17 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
         reason: args.reason.as_deref(),
         db_type: super::db_type_for_server(ctx.config, &args.server),
     };
-    let args = &args;
-    run_audited(ctx, id, header, |id, grants| async move {
-        compute_outcome(ctx, id, &grants, &header, args).await
+    let params = match parse_params(&args.params) {
+        Ok(params) => params,
+        Err(message) => {
+            let outcome = invalid_arguments(id.clone(), &message);
+            return audit_outcome(ctx, id, header, outcome).await;
+        }
+    };
+    let (args, params) = (&args, &params);
+    let stored = (!args.params.is_empty()).then_some(args.params.as_slice());
+    run_audited_with_params(ctx, id, header, stored, |id, grants| async move {
+        compute_outcome(ctx, id, &grants, &header, args, params).await
     })
     .await
 }
@@ -84,6 +101,7 @@ async fn compute_outcome(
     db_grants: &[Grant],
     header: &AuditHeader<'_>,
     args: &Arguments,
+    params: &[QueryParam],
 ) -> Outcome {
     let Some(target) = resolve_target(
         ctx,
@@ -155,7 +173,11 @@ async fn compute_outcome(
         statement_timeout_ms: target.constraints.statement_timeout_ms,
         request_id: ctx.request.request_id,
     };
-    let mut outcome = plan_outcome(id, adapter.explain(query).await, started);
+    let mut outcome = plan_outcome(
+        id,
+        adapter.explain_with_params(query, params).await,
+        started,
+    );
     if access == Access::ReadWrite {
         // Planned as the write role; plain EXPLAIN changes nothing.
         outcome.write = Some(WriteEffect {
@@ -188,6 +210,7 @@ fn plan_outcome(
             };
 
             let payload = SuccessPayload {
+                summary: summarize(&plan),
                 plan,
                 elapsed_ms: result.elapsed_ms,
             };
@@ -219,61 +242,10 @@ fn extract_plan(result: &crate::exec::ExecResult) -> Result<Value, ()> {
     }
 }
 
+#[path = "explain_summary.rs"]
+mod summary;
+use summary::{PlanSummary, summarize};
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extract_plan_decodes_string_cell() {
-        let result = crate::exec::ExecResult {
-            columns: vec!["QUERY PLAN".to_string()],
-            column_types: Vec::new(),
-            rows: vec![vec![Value::from(r#"[{"Plan":{"Node Type":"Seq Scan"}}]"#)]],
-            truncated: false,
-            elapsed_ms: 0,
-            rows_affected: None,
-        };
-        let plan = extract_plan(&result).expect("decodes");
-        assert_eq!(plan[0]["Plan"]["Node Type"], "Seq Scan");
-    }
-
-    #[test]
-    fn extract_plan_passes_through_already_parsed_json() {
-        // When sqlx decodes a `json` column directly, the cell is already a
-        // Value::Array (or Object) — pass through without re-parsing.
-        let result = crate::exec::ExecResult {
-            columns: vec!["QUERY PLAN".to_string()],
-            column_types: Vec::new(),
-            rows: vec![vec![serde_json::json!([{"Plan": {"Node Type": "Result"}}])]],
-            truncated: false,
-            elapsed_ms: 0,
-            rows_affected: None,
-        };
-        let plan = extract_plan(&result).expect("passes through");
-        assert_eq!(plan[0]["Plan"]["Node Type"], "Result");
-    }
-
-    #[test]
-    fn extract_plan_errors_on_empty_or_unexpected_shape() {
-        let empty = crate::exec::ExecResult {
-            columns: vec![],
-            column_types: Vec::new(),
-            rows: vec![],
-            truncated: false,
-            elapsed_ms: 0,
-            rows_affected: None,
-        };
-        assert!(extract_plan(&empty).is_err());
-
-        // Wrong cell type (number)
-        let wrong = crate::exec::ExecResult {
-            columns: vec!["QUERY PLAN".to_string()],
-            column_types: Vec::new(),
-            rows: vec![vec![Value::from(42)]],
-            truncated: false,
-            elapsed_ms: 0,
-            rows_affected: None,
-        };
-        assert!(extract_plan(&wrong).is_err());
-    }
-}
+#[path = "explain_tests.rs"]
+mod tests;

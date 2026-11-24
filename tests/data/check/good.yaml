@@ -1,0 +1,37 @@
+# --check fixture: valid, no warnings. The password is an env reference so
+# `--no-secrets` and an unset variable give different results.
+gateway:
+  env: production
+servers:
+  - name: prod
+    kind: postgres
+    description: Production replica
+    host: db.example.internal
+    tls: verify_full
+    pool:
+      max_connections: 6
+    databases:
+      - name: app
+        role: mcp_app_ro
+        password: ${ENV:CHECK_APP_RO_PASSWORD}
+        write_role: mcp_app_rw
+        write_password: ${FILE:/nonexistent/check-fixture/app-rw}
+  - name: cache
+    kind: redis
+    host: cache.example.internal
+    tls: verify_full
+    databases:
+      - name: "0"
+        role: gateway_ro
+        password: ${ENV:CHECK_CACHE_PASSWORD}
+permissions:
+  - group: engineers
+    grants:
+      - server: prod
+        database: app
+        action: query_read
+        constraints:
+          row_limit: 500
+      - server: cache
+        database: "0"
+        action: query_read

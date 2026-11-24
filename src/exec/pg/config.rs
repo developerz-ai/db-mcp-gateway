@@ -27,7 +27,7 @@ pub(super) fn connect_options(
         .host(&server.host)
         .port(server.port)
         .username(role)
-        .database(&database.name)
+        .database(database.connect_name())
         .ssl_mode(ssl_mode(server.tls))
         // sqlx logs every statement it runs at `info` by default; on the
         // target path that is the caller's SQL — audit-row material, never a

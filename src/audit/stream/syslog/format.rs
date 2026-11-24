@@ -39,26 +39,49 @@ pub(in crate::audit::stream) fn format_rfc5424(row: &AuditRow) -> String {
 }
 
 /// [`format_rfc5424`], cut to [`MAX_MESSAGE_BYTES`]. The `sql` field is cut
-/// first so the body stays valid JSON; only if that cannot make it fit is
-/// the message itself cut.
+/// first, then `params`, so the body stays valid JSON; only if that cannot
+/// make it fit is the message itself cut.
 pub(in crate::audit::stream) fn message(row: &AuditRow) -> String {
     let message = format_rfc5424(row);
     let Some(excess) = message.len().checked_sub(MAX_MESSAGE_BYTES) else {
         return message;
     };
-    // Every raw byte cut from `sql` removes at least one byte of its JSON
-    // encoding, so cutting `excess + marker` raw bytes is enough.
+    // Budgeted by encoded size: escaping makes a quote two bytes and a
+    // control character six, so a raw-length cut can leave the body too big.
+    let mut shrunk = row.clone();
     if let Some(sql) = row.sql.as_deref()
-        && let Some(keep) = sql.len().checked_sub(excess + TRUNCATION_MARKER.len())
+        && let Some(keep) = json_len(sql).checked_sub(excess + TRUNCATION_MARKER.len())
     {
-        let mut shrunk = row.clone();
         shrunk.sql = Some(format!(
             "{}{TRUNCATION_MARKER}",
-            prefix_at_char_boundary(sql, keep)
+            prefix_within_json_len(sql, keep)
         ));
         let message = format_rfc5424(&shrunk);
         if message.len() <= MAX_MESSAGE_BYTES {
             return message;
+        }
+    }
+    if let Some(params) = shrunk.params.as_ref().map(ToString::to_string) {
+        // A cut array becomes a JSON string, as in `audit_calls.params`. Its
+        // escapes make the string's encoding longer than the raw prefix, so
+        // the cut shrinks by each overshoot until the body fits.
+        let excess = format_rfc5424(&shrunk)
+            .len()
+            .saturating_sub(MAX_MESSAGE_BYTES);
+        let mut keep = params
+            .len()
+            .saturating_sub(excess + TRUNCATION_MARKER.len());
+        loop {
+            shrunk.params = Some(serde_json::Value::String(format!(
+                "{}{TRUNCATION_MARKER}",
+                prefix_at_char_boundary(&params, keep)
+            )));
+            let message = format_rfc5424(&shrunk);
+            match message.len().checked_sub(MAX_MESSAGE_BYTES) {
+                None | Some(0) => return message,
+                Some(_) if keep == 0 => break,
+                Some(over) => keep = keep.saturating_sub(over),
+            }
         }
     }
     let keep = MAX_MESSAGE_BYTES - TRUNCATION_MARKER.len();
@@ -66,6 +89,33 @@ pub(in crate::audit::stream) fn message(row: &AuditRow) -> String {
         "{}{TRUNCATION_MARKER}",
         prefix_at_char_boundary(&message, keep)
     )
+}
+
+/// The bytes `text` takes inside a JSON string, quotes excluded.
+fn json_len(text: &str) -> usize {
+    text.chars().map(json_char_len).sum()
+}
+
+/// The longest prefix of `text` whose JSON encoding fits in `budget` bytes.
+fn prefix_within_json_len(text: &str, budget: usize) -> &str {
+    let mut used = 0;
+    for (at, ch) in text.char_indices() {
+        used += json_char_len(ch);
+        if used > budget {
+            return text.split_at(at).0;
+        }
+    }
+    text
+}
+
+/// `serde_json`'s escaping: a short escape for quote, backslash and the
+/// common control characters, `\u00XX` for the other control characters.
+fn json_char_len(ch: char) -> usize {
+    match ch {
+        '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+        '\0'..='\u{1f}' => 6,
+        other => other.len_utf8(),
+    }
 }
 
 /// RFC 5425 §4.3 octet-counting frame (`MSG-LEN SP SYSLOG-MSG`), the framing

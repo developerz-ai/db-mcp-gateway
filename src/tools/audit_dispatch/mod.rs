@@ -10,7 +10,9 @@ mod cancel_guard;
 mod error_body;
 mod metric_names;
 mod outcome;
+mod report;
 mod types;
+mod with_grants;
 mod work;
 
 pub use crate::audit::OutcomeCode;
@@ -28,51 +30,26 @@ pub use types::{
     AuditHeader, AuditStore, HitLimit, Outcome, Reply, RequestContext, Upstream, UpstreamClaim,
     WriteEffect, WriteState,
 };
+pub use with_grants::run_audited;
+pub(in crate::tools) use with_grants::{load_grants, run_audited_with_params, run_with_grants};
 
 use std::future::Future;
-use std::sync::Arc;
 use std::time::Instant;
 
-use metrics::{counter, histogram};
+use metrics::histogram;
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::audit::intent::WRITE_MAY_HAVE_COMMITTED;
 use crate::audit::{self, AuditRow};
 use crate::auth::Identity;
-use crate::config::Grant;
 use crate::mcp::jsonrpc::Response;
 use crate::tools::ToolCtx;
 
 use cancel_guard::CancelledAuditGuard;
-use metric_names::{AUDIT_WRITE_DURATION, QUERY_DURATION, TOOL_CALLS};
+use metric_names::{AUDIT_WRITE_DURATION, CallLabels};
+use report::Dispatched;
 use work::run_work;
-
-/// Load the caller's DB grants, then run `work` with them through
-/// [`audit_dispatch`]. A grants-load failure still writes an audit row
-/// (`internal`) — the work never runs, but the call is accounted for.
-pub async fn run_audited<W, Fut>(
-    ctx: ToolCtx<'_>,
-    id: Value,
-    header: AuditHeader<'_>,
-    work: W,
-) -> Response
-where
-    W: FnOnce(Value, Arc<Vec<Grant>>) -> Fut,
-    Fut: Future<Output = Outcome>,
-{
-    match ctx.permissions_cache.get_for(ctx.identity).await {
-        Ok(grants) => {
-            let work = work(id.clone(), grants);
-            dispatch_in(ctx, id, header, work).await
-        }
-        Err(err) => {
-            tracing::error!(%err, "permissions cache load failed");
-            let outcome = error_outcome(OutcomeCode::Internal, "permissions_cache_load_failed");
-            audit_outcome(ctx, id, header, outcome).await
-        }
-    }
-}
 
 /// Audit an outcome decided before any work ran (argument rejections).
 pub async fn audit_outcome(
@@ -81,7 +58,7 @@ pub async fn audit_outcome(
     header: AuditHeader<'_>,
     outcome: Outcome,
 ) -> Response {
-    dispatch_in(ctx, id, header, async move { outcome }).await
+    dispatch_in(ctx, id, header, None, async move { outcome }).await
 }
 
 /// Audit a call whose arguments did not parse: `invalid_arguments`, no
@@ -100,6 +77,7 @@ async fn dispatch_in<Fut>(
     ctx: ToolCtx<'_>,
     id: Value,
     header: AuditHeader<'_>,
+    params: Option<&[Value]>,
     work: Fut,
 ) -> Response
 where
@@ -110,9 +88,13 @@ where
         sinks: ctx.audit_sinks,
         tasks: ctx.detached,
     };
-    audit_dispatch(id, ctx.identity, ctx.request, header, store, work).await
+    let labels = CallLabels::of(ctx.config, &header);
+    let call = (ctx.identity, ctx.request, header, labels);
+    dispatch(id, call, params, store, work).await
 }
 
+/// Run `work` audited, for a caller holding no config: its call metrics name
+/// no database.
 pub async fn audit_dispatch<Fut>(
     id: Value,
     identity: &Identity,
@@ -124,14 +106,44 @@ pub async fn audit_dispatch<Fut>(
 where
     Fut: Future<Output = Outcome>,
 {
+    let labels = CallLabels::untargeted(header.tool);
+    dispatch(
+        id,
+        (identity, request_ctx, header, labels),
+        None,
+        store,
+        work,
+    )
+    .await
+}
+
+/// Who called what, and the labels its metrics carry.
+type Call<'a> = (
+    &'a Identity,
+    &'a RequestContext,
+    AuditHeader<'a>,
+    CallLabels,
+);
+
+async fn dispatch<Fut>(
+    id: Value,
+    call: Call<'_>,
+    params: Option<&[Value]>,
+    store: AuditStore<'_>,
+    work: Fut,
+) -> Response
+where
+    Fut: Future<Output = Outcome>,
+{
+    let (identity, request_ctx, header, labels) = call;
     let state_db = store.pool;
     // Armed BEFORE awaiting the work: if `work.await` is dropped (agent
     // disconnect), the guard's `Drop` writes a `cancelled` row. It stays
     // armed until the primary write lands, so a failed or dropped primary
     // write is retried with whatever the guard last recorded.
     let mut guard = CancelledAuditGuard::arm(
-        pending_row(identity, request_ctx, &header),
-        header.tool,
+        pending_row(identity, request_ctx, &header, params),
+        labels.clone(),
         state_db.clone(),
         store.sinks.clone(),
         store.tasks.clone(),
@@ -140,7 +152,7 @@ where
     let row = guard.record_outcome(&outcome);
     let duration_ms = outcome.elapsed_ms.unwrap_or(0);
     if let Some(elapsed_ms) = outcome.elapsed_ms {
-        histogram!(QUERY_DURATION, "tool" => header.tool).record(elapsed_ms as f64 / 1000.0);
+        labels.record_duration(elapsed_ms as f64 / 1000.0);
     }
 
     let audit_started = Instant::now();
@@ -167,13 +179,13 @@ where
         // detached set, now carrying the code the client is about to see.
         let write = outcome.write.map(|w| w.state);
         guard.record_audit_failure(write);
-        record_dispatch(
+        let dispatched = Dispatched {
             identity,
             request_ctx,
-            &header,
-            &outcome,
-            OutcomeCode::AuditUnavailable,
-        );
+            header: &header,
+            labels: &labels,
+        };
+        dispatched.record(&outcome, OutcomeCode::AuditUnavailable);
         let message = audit_failure_message(write);
         let body = ToolErrorBody {
             code: OutcomeCode::AuditUnavailable,
@@ -185,7 +197,13 @@ where
         return tool_error(id, request_ctx.request_id, body);
     }
 
-    record_dispatch(identity, request_ctx, &header, &outcome, outcome.code);
+    let dispatched = Dispatched {
+        identity,
+        request_ctx,
+        header: &header,
+        labels: &labels,
+    };
+    dispatched.record(&outcome, outcome.code);
     // Streamed only now — a row that isn't the system of record yet must
     // not be streamed as if it were.
     store.sinks.send(&row, store.tasks);
@@ -218,43 +236,6 @@ fn audit_failure_message(write: Option<WriteState>) -> String {
     }
 }
 
-/// The per-call counter and the single "tool dispatched" line (issue #14
-/// field contract), both carrying `code` — the outcome the client saw.
-/// `upstream_*` are the caller's unverified claims, logged for correlation.
-fn record_dispatch(
-    identity: &Identity,
-    request_ctx: &RequestContext,
-    header: &AuditHeader<'_>,
-    outcome: &Outcome,
-    code: OutcomeCode,
-) {
-    let access = if outcome.write.is_some() {
-        "write"
-    } else {
-        "read"
-    };
-    counter!(
-        TOOL_CALLS,
-        "tool" => header.tool,
-        "outcome" => code.as_str(),
-        "access" => access,
-    )
-    .increment(1);
-    tracing::info!(
-        request_id = %request_ctx.request_id,
-        user_sub = %identity.user_sub,
-        tool = %header.tool,
-        server = header.server.unwrap_or(""),
-        db = header.database.unwrap_or(""),
-        outcome = code.as_str(),
-        access,
-        duration_ms = outcome.elapsed_ms.unwrap_or(0),
-        upstream_run_id = request_ctx.upstream.run_id(),
-        upstream_actor = request_ctx.upstream.actor(),
-        "tool dispatched"
-    );
-}
-
 /// The dispatch's audit row before the work runs: everything known
 /// up-front. One `id` per dispatch, shared by the primary write and the
 /// guard's fallback — `ON CONFLICT (id) DO NOTHING` makes the pair
@@ -264,6 +245,7 @@ fn pending_row(
     identity: &Identity,
     request_ctx: &RequestContext,
     header: &AuditHeader<'_>,
+    params: Option<&[Value]>,
 ) -> AuditRow {
     let (sql, sql_truncated) = match header.sql.map(audit::cap_stored_sql) {
         Some((sql, truncated)) => (Some(sql), truncated),
@@ -292,5 +274,6 @@ fn pending_row(
         upstream_run_id: request_ctx.upstream.run_id().map(str::to_string),
         rows_affected: None,
         sql_truncated,
+        params: params.map(audit::cap_stored_params),
     }
 }

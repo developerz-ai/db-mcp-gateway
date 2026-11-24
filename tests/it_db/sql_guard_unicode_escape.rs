@@ -10,7 +10,8 @@ use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
 use crate::common::pg_target::{
-    READ_ROLE, READ_ROLE_PASSWORD, TARGET_DB, TARGET_HOST, target_port, writable_adapter,
+    READ_ROLE, READ_ROLE_PASSWORD, TARGET_DB, TARGET_HOST, await_active_query, target_port,
+    writable_adapter,
 };
 use db_mcp_gateway::exec::sql_guard::{GuardError, check_sql};
 use db_mcp_gateway::exec::{Access, DbAdapter, ExecQuery};
@@ -47,13 +48,15 @@ async fn unicode_escaped_terminate_kills_another_identitys_query_so_the_guard_re
         .fetch_one(&mut *victim_conn)
         .await
         .expect("victim pid");
+    let marker = format!("victim-{}", Uuid::new_v4().simple());
+    let victim_sql = format!("SELECT pg_sleep(20) /* {marker} */");
     let victim_query = tokio::spawn(async move {
-        sqlx::query("SELECT pg_sleep(20)")
+        sqlx::query(sqlx::AssertSqlSafe(victim_sql))
             .execute(&mut *victim_conn)
             .await
             .map(|_| ())
     });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    await_active_query(&marker).await;
 
     let sql = format!(r#"SELECT current_user::text, U&"\0070g_terminate_backend"({pid})"#);
     let result = attacker

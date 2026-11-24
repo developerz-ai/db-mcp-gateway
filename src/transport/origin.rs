@@ -6,14 +6,15 @@
 //! present `Origin` passes only when it is in `MCP_ALLOWED_ORIGINS` or — with
 //! the gateway bound to loopback — is itself a loopback origin. The check runs
 //! before bearer auth, so a rejected request reaches no tool and writes no
-//! audit row; it is logged instead.
+//! audit row; it is logged instead — request id and reason only, never the
+//! caller-written header, which may carry URL credentials.
 
 use std::net::{IpAddr, SocketAddr};
 
 use axum::Json;
 use axum::extract::Request;
-use axum::http::StatusCode;
 use axum::http::header::ORIGIN;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
@@ -23,8 +24,6 @@ use super::request_id::GatewayRequestId;
 use crate::mcp::jsonrpc::{self, ErrorObject};
 
 const ALLOWED_ORIGINS_VAR: &str = "MCP_ALLOWED_ORIGINS";
-/// A rejected `Origin` is caller-controlled; the log keeps a bounded prefix.
-const LOGGED_ORIGIN_MAX_BYTES: usize = 128;
 
 /// An `MCP_ALLOWED_ORIGINS` entry that is not a bare `http(s)://host[:port]`.
 #[derive(Debug, thiserror::Error)]
@@ -84,16 +83,29 @@ fn parse_listed(entry: &str) -> Result<String, AllowedOriginsError> {
 /// path, query or fragment — the same rule for a listed entry and for an
 /// incoming header. Anything else — `null` included — is not one.
 fn parse_origin(raw: &str) -> Option<Url> {
+    if !is_bare_origin(raw) {
+        return None;
+    }
     let url = Url::parse(raw).ok()?;
     let plain = matches!(url.scheme(), "http" | "https")
         && url.host().is_some()
         && url.path() == "/"
-        && !raw.ends_with('/')
         && url.username().is_empty()
         && url.password().is_none()
         && url.query().is_none()
         && url.fragment().is_none();
     plain.then_some(url)
+}
+
+/// The raw text is `scheme://authority` and nothing more. Checked before URL
+/// parsing, which strips tabs and newlines, folds `\` into `/` and resolves
+/// `/.` away — any of which would let a path pass as the bare `/`.
+fn is_bare_origin(raw: &str) -> bool {
+    let visible_ascii = raw.bytes().all(|byte| matches!(byte, 0x21..=0x7E));
+    let Some((_, authority)) = raw.split_once("://") else {
+        return false;
+    };
+    visible_ascii && !authority.is_empty() && !authority.contains(['/', '\\', '?', '#', '@'])
 }
 
 fn is_loopback_host(url: &Url) -> bool {
@@ -107,21 +119,17 @@ fn is_loopback_host(url: &Url) -> bool {
 
 /// Middleware: 403 on a present `Origin` the policy does not allow.
 pub(super) async fn check(req: Request, next: Next) -> Response {
-    let Some(origin) = req.headers().get(ORIGIN) else {
-        return next.run(req).await;
-    };
+    let default_policy = AllowedOrigins::default();
     let policy = req
         .extensions()
         .get::<AllowedOrigins>()
-        .cloned()
-        .unwrap_or_default();
-    let origin = String::from_utf8_lossy(origin.as_bytes()).into_owned();
-    if policy.allows(&origin) {
+        .unwrap_or(&default_policy);
+    let Some(reason) = refusal(req.headers(), policy) else {
         return next.run(req).await;
-    }
+    };
     tracing::warn!(
         request_id = %GatewayRequestId::of(&req),
-        origin = prefix(&origin),
+        reason,
         "rejected a request from a disallowed Origin"
     );
     (
@@ -134,12 +142,17 @@ pub(super) async fn check(req: Request, next: Next) -> Response {
         .into_response()
 }
 
-fn prefix(raw: &str) -> &str {
-    let mut end = raw.len().min(LOGGED_ORIGIN_MAX_BYTES);
-    while !raw.is_char_boundary(end) {
-        end -= 1;
+/// Why `headers` must be refused, or `None` to let the request through. A
+/// repeated `Origin` is refused outright: a browser sends one, and checking
+/// only the first would let a disallowed second one ride along.
+fn refusal(headers: &HeaderMap, policy: &AllowedOrigins) -> Option<&'static str> {
+    let mut origins = headers.get_all(ORIGIN).iter();
+    let first = origins.next()?;
+    if origins.next().is_some() {
+        return Some("repeated Origin header");
     }
-    &raw[..end]
+    let allowed = first.to_str().is_ok_and(|origin| policy.allows(origin));
+    (!allowed).then_some("Origin not allowed")
 }
 
 #[cfg(test)]
@@ -227,10 +240,57 @@ mod tests {
     }
 
     #[test]
-    fn logged_origin_is_bounded_on_a_char_boundary() {
-        let long = "é".repeat(100);
-        let cut = prefix(&long);
-        assert!(cut.len() <= LOGGED_ORIGIN_MAX_BYTES);
-        assert!(long.starts_with(cut));
+    fn a_path_normalisation_would_erase_is_still_a_path() {
+        let policy = AllowedOrigins::parse("https://claude.ai", public_bind()).unwrap();
+        for bad in [
+            "https://claude.ai/.",
+            "https://claude.ai/..",
+            "https://claude.ai\\",
+            "https://claude.ai\n/x",
+            "https://user:pw@claude.ai",
+        ] {
+            assert!(!policy.allows(bad), "{bad:?} allowed");
+            assert!(
+                AllowedOrigins::parse(bad, public_bind()).is_err(),
+                "{bad:?} listed"
+            );
+        }
+        // A listed entry is trimmed; an incoming header is taken as sent.
+        for bad in ["https://claude.ai\t", "https://claude.ai "] {
+            assert!(!policy.allows(bad), "{bad:?} allowed");
+        }
+    }
+
+    fn origins(values: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(ORIGIN, value.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn a_repeated_origin_is_refused_even_when_the_first_is_allowed() {
+        let policy = AllowedOrigins::parse("https://claude.ai", public_bind()).unwrap();
+        assert_eq!(refusal(&origins(&[]), &policy), None);
+        assert_eq!(refusal(&origins(&["https://claude.ai"]), &policy), None);
+        assert_eq!(
+            refusal(&origins(&["https://attacker.example"]), &policy),
+            Some("Origin not allowed")
+        );
+        assert_eq!(
+            refusal(
+                &origins(&["https://claude.ai", "https://attacker.example"]),
+                &policy
+            ),
+            Some("repeated Origin header")
+        );
+        assert_eq!(
+            refusal(
+                &origins(&["https://claude.ai", "https://claude.ai"]),
+                &policy
+            ),
+            Some("repeated Origin header")
+        );
     }
 }

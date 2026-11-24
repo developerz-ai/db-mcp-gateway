@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use super::super::adapter::{DbAdapter, ExecError, ExecResult};
 use super::super::query::{
-    ActivityQuery, ExecQuery, ExplainQuery, SampleQuery, SchemaQuery, TableStatsQuery,
+    ActivityQuery, ExecQuery, ExplainQuery, QueryParam, SampleQuery, SchemaQuery, TableStatsQuery,
 };
 use super::super::rejection::DbRejection;
 use super::super::sql_guard::Access;
@@ -15,8 +15,16 @@ use super::{PgAdapter, catalog, explain, introspect, sample};
 #[async_trait]
 impl DbAdapter for PgAdapter {
     async fn execute(&self, query: ExecQuery<'_>) -> Result<ExecResult, ExecError> {
+        self.execute_with_params(query, &[]).await
+    }
+
+    async fn execute_with_params(
+        &self,
+        query: ExecQuery<'_>,
+        params: &[QueryParam],
+    ) -> Result<ExecResult, ExecError> {
         let tier = self.tier(query.access).await?;
-        let result = self.run(&tier, &query).await;
+        let result = self.run(&tier, &query, params).await;
         self.with_near_misses(result, query.sql, query.request_id)
             .await
     }
@@ -52,6 +60,14 @@ impl DbAdapter for PgAdapter {
     }
 
     async fn explain(&self, query: ExplainQuery<'_>) -> Result<ExecResult, ExecError> {
+        self.explain_with_params(query, &[]).await
+    }
+
+    async fn explain_with_params(
+        &self,
+        query: ExplainQuery<'_>,
+        params: &[QueryParam],
+    ) -> Result<ExecResult, ExecError> {
         let sql = explain::explain_sql(query.sql, query.analyze)?;
         // A write is planned under the role that would run it — `EXPLAIN`
         // checks privileges — but still in a read-only transaction.
@@ -65,7 +81,7 @@ impl DbAdapter for PgAdapter {
             dry_run: false,
             request_id: query.request_id,
         };
-        let result = self.run(&tier, &exec).await;
+        let result = self.run(&tier, &exec, params).await;
         // Positions count from the caller's statement, not the wrapper.
         let prefix = sql
             .chars()
@@ -91,7 +107,7 @@ impl DbAdapter for PgAdapter {
     async fn db_activity(&self, query: ActivityQuery) -> Result<ExecResult, ExecError> {
         let sql = introspect::activity_sql(TierKind::Read);
         let read = self
-            .run(&self.read, &Self::activity_query(&sql, &query))
+            .run(&self.read, &Self::activity_query(&sql, &query), &[])
             .await?;
         if self.write.is_none() {
             return Ok(read);
@@ -175,7 +191,8 @@ impl PgAdapter {
         query: &ActivityQuery,
     ) -> Result<ExecResult, ExecError> {
         let sql = introspect::activity_sql(write.kind);
-        self.run(write, &Self::activity_query(&sql, query)).await
+        self.run(write, &Self::activity_query(&sql, query), &[])
+            .await
     }
 
     /// Signal `request_id`'s backends of `tier`'s role.

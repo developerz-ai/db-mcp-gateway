@@ -17,7 +17,7 @@ pub(super) const DATABASE_COLUMNS: &str =
     "id, server, db_name, db_type, created_at, updated_at, deleted_at";
 
 pub(super) const GRANT_COLUMNS: &str = "id, user_id, server, database_id, db_name_wildcard, \
-     action, constraints, created_at, updated_at, revoked_at";
+     action, constraints, created_at, updated_at, revoked_at, expires_at";
 
 pub(super) fn user_from_row(row: &PgRow) -> Result<PermissionsUser, RepoError> {
     let groups_json: JsonValue = row.try_get("groups")?;
@@ -60,6 +60,7 @@ pub(super) fn grant_from_row(row: &PgRow) -> Result<PermissionsGrant, RepoError>
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         revoked_at: row.try_get("revoked_at")?,
+        expires_at: row.try_get("expires_at")?,
     })
 }
 
@@ -74,5 +75,6 @@ pub(super) fn live_grant_from_row(row: &PgRow) -> Result<LiveGrant, RepoError> {
         db_name: row.try_get("db_name")?,
         action: GrantAction::parse(&action)?,
         constraints: row.try_get("constraints")?,
+        expires_at: row.try_get("expires_at")?,
     })
 }

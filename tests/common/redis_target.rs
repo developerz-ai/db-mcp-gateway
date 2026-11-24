@@ -84,6 +84,7 @@ pub fn database() -> Database {
         password: Password::Literal(READ_PASSWORD.into()),
         description: String::new(),
         auth_database: None,
+        connect_name: None,
         pool: None,
         write_role: None,
         write_password: None,

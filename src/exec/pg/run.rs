@@ -13,7 +13,7 @@ use tokio::sync::Semaphore;
 use crate::audit::drain::DetachedTasks;
 
 use super::super::adapter::{ExecError, ExecResult, effective_timeout_ms};
-use super::super::query::ExecQuery;
+use super::super::query::{ExecQuery, QueryParam};
 use super::super::sql_guard::Access;
 use super::cancel::{Backend, BackendTag, CancelOnDrop};
 use super::error::{Origin, classify, classify_commit};
@@ -40,24 +40,25 @@ pub(super) struct RunCtx<'a> {
 /// cast to text (see [`recast`]); when that is not possible, or the target
 /// refuses the second statement too, the first refusal is the answer. The
 /// second attempt is the one that ran, so its timeout, cancel or lost
-/// connection is the answer.
+/// connection is the answer. `params` are bound to both attempts.
 pub(super) async fn run_query(
     conn: &mut PgConnection,
     ctx: &RunCtx<'_>,
     query: &ExecQuery<'_>,
+    params: &[QueryParam],
 ) -> Result<ExecResult, ExecError> {
-    let refused = match run_query_inner(conn, ctx, query).await {
+    let refused = match run_query_inner(conn, ctx, query, params).await {
         Err(err) if recast::may_apply(&err, query) => err,
         done => return done,
     };
-    let Some(sql) = recast::text_cast_sql(conn, ctx, query).await else {
+    let Some(sql) = recast::text_cast_sql(conn, ctx, query, params).await else {
         return Err(refused);
     };
     let recast = ExecQuery {
         sql: &sql,
         ..*query
     };
-    match run_query_inner(conn, ctx, &recast).await {
+    match run_query_inner(conn, ctx, &recast, params).await {
         Err(ExecError::Sql | ExecError::Rejected(_)) => Err(refused),
         done => done,
     }
@@ -67,6 +68,7 @@ async fn run_query_inner(
     conn: &mut PgConnection,
     ctx: &RunCtx<'_>,
     query: &ExecQuery<'_>,
+    params: &[QueryParam],
 ) -> Result<ExecResult, ExecError> {
     let started = Instant::now();
     let origin = &ctx.origin;
@@ -127,7 +129,8 @@ async fn run_query_inner(
     // / outer `tokio::time::timeout`): the one case where the backend is
     // still running and must be cancelled.
     let result = async {
-        let collected = stream_rows(&mut tx, query, origin, ctx.large_rows, money_digits).await?;
+        let collected =
+            stream_rows(&mut tx, query, params, origin, ctx.large_rows, money_digits).await?;
         let (mut columns, mut column_types) = (collected.columns, collected.column_types);
         // Reads only. Inside a write's transaction a failed lookup would
         // abort it, and the `COMMIT` that follows would then roll the write

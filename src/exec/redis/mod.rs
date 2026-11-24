@@ -35,6 +35,7 @@ use uuid::Uuid;
 use crate::config::{Database, Server, Tls};
 
 use super::adapter::{AdapterKind, DbAdapter, ExecError, ExecResult, effective_timeout_ms};
+use super::pg::pool_metrics::record_acquire_wait;
 use super::pg::resolve_password;
 use super::pool_sizing::{CallerSlots, PoolSizing};
 use super::query::{
@@ -129,7 +130,7 @@ impl RedisAdapter {
         }
         .map_err(|_| ExecError::Connection)?;
         Ok(Self {
-            pool: ConnPool::new(client, sizing),
+            pool: ConnPool::new(client, sizing, &db_label),
             callers: CallerSlots::new(sizing),
             db_label,
             role: database.role.clone(),
@@ -141,7 +142,10 @@ impl RedisAdapter {
     /// outside the statement budget, as on Postgres: a saturated pool is
     /// `unavailable`, never a `timeout` of the caller's command.
     async fn lease(&self) -> Result<Lease, ExecError> {
-        match tokio::time::timeout(POOL_ACQUIRE_TIMEOUT, self.pool.lease()).await {
+        let started = Instant::now();
+        let leased = tokio::time::timeout(POOL_ACQUIRE_TIMEOUT, self.pool.lease()).await;
+        record_acquire_wait(&self.db_label, "query", started.elapsed());
+        match leased {
             Ok(Ok(lease)) => Ok(lease),
             Ok(Err(err)) => Err(self.classify_connect(err)),
             Err(_elapsed) => {

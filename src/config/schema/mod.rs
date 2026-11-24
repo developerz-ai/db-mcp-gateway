@@ -15,11 +15,20 @@ use serde::Deserialize;
 
 use super::secret::Password;
 
+mod database;
+#[cfg(test)]
+mod o13_tests;
+mod permission;
+mod profiles;
 mod service_account;
 mod target;
 
 pub(crate) use service_account::ServiceAccountSpec;
 
+pub(crate) use permission::PermissionSpec;
+pub use permission::{Grant, Permission, Subject};
+pub use profiles::{ConstraintProfiles, apply_constraint_profiles};
+pub(crate) use target::ServerSpec;
 pub use target::{Database, Server, ServerKind, Tls};
 
 /// A headless (non-interactive) caller: a named service identity carrying
@@ -58,27 +67,6 @@ pub struct ServiceAccount {
     pub require_upstream: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Permission {
-    pub group: String,
-    #[serde(default)]
-    pub grants: Vec<Grant>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Grant {
-    pub server: String,
-    pub database: String,
-    pub action: Action,
-    /// Per-grant constraints layered on top of the action. Optional in YAML;
-    /// `authz::evaluate` merges these most-restrictively across all matching
-    /// grants (spec 06 §Evaluation).
-    #[serde(default)]
-    pub constraints: Constraints,
-}
-
 /// Constraints from spec 06. All fields optional — the *absence* of a value
 /// means "no constraint from this grant". Merging logic lives in
 /// `authz::Constraints` because the spec is clearest about merge in that
@@ -108,6 +96,16 @@ pub enum Action {
 }
 
 impl Action {
+    /// The YAML / wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SchemaRead => "schema_read",
+            Self::QueryRead => "query_read",
+            Self::QueryWrite => "query_write",
+            Self::HistoryRead => "history_read",
+        }
+    }
+
     /// Does a grant of `self` cover a request for `requested`?
     pub fn includes(self, requested: Action) -> bool {
         use Action::*;

@@ -15,7 +15,7 @@ const PKCE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 const HTTPS_REDIRECT: &str = "https://evil.example/cb";
 const LOOPBACK_REDIRECT: &str = "http://127.0.0.1:54611/callback";
 
-const CONFIG_YAML: &str = r#"
+pub(crate) const CONFIG_YAML: &str = r#"
 servers:
   - name: prod
     kind: postgres
@@ -61,7 +61,7 @@ fn location(resp: &reqwest::Response) -> String {
         .to_string()
 }
 
-fn query_param(url: &str, key: &str) -> Option<String> {
+pub(crate) fn query_param(url: &str, key: &str) -> Option<String> {
     reqwest::Url::parse(url)
         .unwrap()
         .query_pairs()
@@ -70,7 +70,7 @@ fn query_param(url: &str, key: &str) -> Option<String> {
 }
 
 /// Extract `value="…"` of the hidden input named `name` from the consent page.
-fn hidden_field(page: &str, name: &str) -> String {
+pub(crate) fn hidden_field(page: &str, name: &str) -> String {
     let marker = format!("name=\"{name}\" value=\"");
     let start = page.find(&marker).expect("hidden field present") + marker.len();
     let len = page[start..].find('"').expect("closing quote");
