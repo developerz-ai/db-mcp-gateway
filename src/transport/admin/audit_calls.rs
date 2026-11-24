@@ -52,8 +52,12 @@ pub struct AuditCallsQuery {
     pub include_sql: bool,
 }
 
-/// The keyset `page`, kept up to and including the row whose JSON width
-/// crosses `$12` bytes (the first row always); `page_rows` says if it was cut.
+/// The keyset `page`, kept up to and including the row whose estimated
+/// width crosses `$12` bytes (the first row always); `page_rows` says if it
+/// was cut. The width is read from stored lengths (`octet_length` on text
+/// needs no detoast, `pg_column_size` on jsonb) plus a fixed allowance for
+/// the small columns, so sizing a page never serializes a row — the state
+/// DB also carries the synchronous audit writes.
 const SELECT: &str = "WITH page AS (SELECT id, request_id, occurred_at, user_sub, user_email, groups, tool, \
         server_name, database_name, \
         CASE WHEN $9::bool THEN sql END AS sql, \
@@ -72,7 +76,10 @@ const SELECT: &str = "WITH page AS (SELECT id, request_id, occurred_at, user_sub
        AND ($10::timestamptz IS NULL OR (occurred_at, id) < ($10, $11)) \
      ORDER BY occurred_at DESC, id DESC LIMIT $8), \
      framed AS (SELECT page.*, count(*) OVER () AS page_rows, \
-        coalesce(sum(octet_length(row_to_json(page)::text)) OVER (ORDER BY occurred_at DESC, id DESC \
+        coalesce(sum(512 + coalesce(octet_length(sql), 0) + coalesce(pg_column_size(params), 0) \
+          + coalesce(octet_length(error_message), 0) + coalesce(octet_length(reason), 0) \
+          + coalesce(octet_length(user_email), 0) + coalesce(pg_column_size(groups), 0)) \
+          OVER (ORDER BY occurred_at DESC, id DESC \
           ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS before FROM page) \
      SELECT * FROM framed WHERE before < $12 ORDER BY occurred_at DESC, id DESC";
 
