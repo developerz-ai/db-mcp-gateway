@@ -49,9 +49,9 @@ permissions:
 
 ## Use Case 2: Analytics Without Direct Database Access
 
-**Problem:** Business analysts and data scientists need database access for reporting and analysis, but managing individual database accounts and teaching SQL to everyone is operationally expensive.
+**Problem:** Data and analytics engineers want their agents to query analytical databases, but managing an individual database account per person is operationally expensive.
 
-**Solution:** Provide natural language interface to databases through AI agents, with db-mcp-gateway enforcing read-only access and resource limits.
+**Solution:** Their agents (which turn questions into SQL — the gateway has no natural-language layer of its own) query through db-mcp-gateway, which enforces read-only access and resource limits. This is for engineers running agents, not for end users or business staff: see [non-goals](initial-idea/10-non-goals.md#not-a-tool-for-end-users).
 
 ### Implementation
 ```yaml
@@ -74,10 +74,10 @@ permissions:
 Schema scoping (only `public` and `analytics`, say) is not a grant setting: grant the database role `USAGE` and `SELECT` on exactly those schemas, and the database enforces it for every statement.
 
 ### Benefits
-- **Self-service:** Analysts ask questions in natural language
+- **Self-service:** Engineers ask their agent; no per-person database account
 - **Safety:** Read-only enforcement prevents accidental data modification
 - **Performance:** Resource limits prevent expensive analytical queries from impacting production
-- **Compliance:** Every question-answer pair is logged for audit purposes
+- **Compliance:** Every tool call is logged — SQL, reason, row count, outcome, identity. The prompt and the agent's answer are not; the gateway never sees them
 
 ### Example Interactions
 ```
@@ -134,7 +134,7 @@ All queries go through same gateway with:
 
 **Problem:** On-call engineers need production database access for debugging incidents, but compliance requirements mandate individual attribution, reason logging, and strict time limits.
 
-**Solution:** db-mcp-gateway enforces compliance requirements automatically while providing natural language interface for incident response.
+**Solution:** db-mcp-gateway enforces the compliance requirements on every call the on-call engineer's agent makes during incident response.
 
 ### Implementation
 ```yaml
@@ -163,10 +163,10 @@ Restricting access to business hours is not supported yet — a `time_window` co
 ```
 1. Alert triggers at 2 AM
 2. On-call engineer asks: "Show me recent errors for user ID 12345"
-3. Gateway requires: "Reason for production access?"
-4. Engineer enters: "Investigating incident INC-2024-0142"
+3. Gateway refuses the call with `reason_required`; the agent asks the engineer for one
+4. Engineer answers: "Investigating incident INC-2024-0142"; the agent retries with it
 5. Query executes with enforced limits
-6. Audit log captures: user, SQL, reason, timestamp, results
+6. Audit log captures: user, SQL, reason, timestamp, row count, outcome (never the result rows)
 ```
 
 ---
@@ -217,7 +217,7 @@ permissions:
 
 ### Backend Development Teams  
 - **Why:** You need production data for debugging and analysis
-- **Value:** Natural language interface instead of writing complex SQL
+- **Value:** Your agent writes and runs the SQL; you never hold the credential
 - **Benefit:** Faster incident response with compliance built-in
 
 ### Data Analytics Teams

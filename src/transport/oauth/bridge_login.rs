@@ -6,8 +6,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 
 use super::consent::request_consent;
-use super::helpers::{build_redirect, oauth_error, random_token, redirect_with_error};
+use super::helpers::{
+    build_redirect, error_redirect, oauth_error, random_token, redirect_with_error,
+};
+use super::pages::{PageContext, email_unverified};
 use super::register::is_loopback_redirect_uri;
+use crate::auth::AuthError;
 use crate::auth::oauth::{AuthFacade, GrantIdentity, OAuthBridge};
 
 /// Finish an MCP OAuth-bridge login: called by `/auth/callback` when the
@@ -17,12 +21,15 @@ use crate::auth::oauth::{AuthFacade, GrantIdentity, OAuthBridge};
 ///
 /// On any IdP-side failure we still 302 back with an `error` param (never a
 /// raw 5xx) so the client's loopback handler completes instead of hanging.
+/// The one exception is an unverified email: the user gets a page saying so,
+/// whose link carries the same `error` back to the client.
 pub async fn complete_bridge_login(
     auth: &AuthFacade,
     bridge: OAuthBridge,
     code: &str,
     nonce: &str,
     idp_verifier: &str,
+    page: &PageContext,
 ) -> Response {
     let verified = match auth
         .oidc
@@ -38,10 +45,31 @@ pub async fn complete_bridge_login(
             // bounced with `access_denied` and had nothing to correlate. Every
             // `AuthError` Display is secret-free by construction (see
             // `auth::errors`), so the variant is safe to record.
-            tracing::warn!(reason = %err, "bridge login failed at the IdP exchange");
-            return redirect_with_error(&bridge, "access_denied");
+            tracing::warn!(
+                reason = %err,
+                request_id = %page.request_id(),
+                "bridge login failed at the IdP exchange"
+            );
+            let code = match err {
+                AuthError::EmailUnverified => "email_unverified",
+                AuthError::IdToken => "id_token",
+                _ => "idp_exchange",
+            };
+            metrics::counter!("login_failures_total", "code" => code).increment(1);
+            return match err {
+                AuthError::EmailUnverified => {
+                    email_unverified(page, error_redirect(&bridge, "access_denied").as_deref())
+                }
+                _ => redirect_with_error(&bridge, "access_denied"),
+            };
         }
     };
+    if verified.groups.is_empty() {
+        tracing::warn!(
+            request_id = %page.request_id(),
+            "login carries no groups; group grants will not apply to it"
+        );
+    }
     let identity = GrantIdentity {
         sub: verified.sub,
         email: verified.email,
@@ -54,7 +82,7 @@ pub async fn complete_bridge_login(
     if is_loopback_redirect_uri(&bridge.client_redirect_uri) {
         return issue_code(auth, identity, &bridge).await;
     }
-    request_consent(auth, identity, bridge).await
+    request_consent(auth, identity, bridge, page).await
 }
 
 /// Mint a one-time authorization code bound to the verified identity, the PKCE
@@ -85,6 +113,7 @@ pub(super) async fn issue_code(
         // `complete_bridge_login`), so 302 back with a valid OAuth error code
         // instead. `temporarily_unavailable` (RFC 6749 §4.1.2.1) is the
         // overload signal.
+        metrics::counter!("login_failures_total", "code" => "state_unavailable").increment(1);
         return redirect_with_error(bridge, "temporarily_unavailable");
     }
 

@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# bin/snapshot-check — verify your files while the shared tree is mid-edit.
+#   bin/snapshot-check [--slot NAME] <file>... [-- <command>...]
+# Exports HEAD (git archive) into target/snapshot/<slot>/tree, overlays the
+# listed files from the working tree (a listed file that no longer exists is
+# removed), and runs there with CARGO_TARGET_DIR=target/snapshot/<slot>/target:
+#   default   cargo clippy --all-targets --all-features -- -D warnings, then
+#             cargo test --lib --bins --test it_offline --all-features
+#   -- cmd    that command instead (e.g. -- cargo test --test it_offline guard)
+# Other agents' uncommitted edits stay out; DB suites stay on bin/test.
+# A slot keeps stable paths, so reruns are incremental; one run per slot at a
+# time (flock) — pass --slot to run beside another agent (default: default).
+set -euo pipefail
+# Relative paths name files from where you ran it, like any other tool.
+prefix=$(git rev-parse --show-prefix)
+cd "$(dirname "$0")/.."
+root=$PWD
+
+usage() { echo 'usage: bin/snapshot-check [--slot NAME] <file>... [-- <command>...]' >&2; exit 2; }
+
+slot=default
+if [[ ${1:-} == --slot ]]; then
+  [[ ${2:-} =~ ^[A-Za-z0-9_.-]+$ ]] || usage
+  slot=$2
+  shift 2
+fi
+files=()
+while (( $# > 0 )) && [[ $1 != -- ]]; do
+  files+=("$1")
+  shift
+done
+(( ${#files[@]} > 0 )) || usage
+command=()
+if (( $# > 0 )); then
+  shift
+  command=("$@")
+  (( ${#command[@]} > 0 )) || usage
+fi
+
+for i in "${!files[@]}"; do
+  file=${files[$i]}
+  if [[ $file == "$root"/* ]]; then
+    file=${file#"$root"/}
+  elif [[ $file != /* ]]; then
+    file=$prefix${file#./}
+  fi
+  if [[ $file == /* || /$file/ == */../* ]]; then
+    echo "snapshot-check: '${files[$i]}' is not a path inside $root" >&2
+    exit 2
+  fi
+  files[i]=$file
+done
+
+# A symlinked directory on the way to a listed file would carry the overlay's
+# copy or removal outside the tree it names: refused on both sides (the
+# working tree here, the exported HEAD below). The file itself may be a link.
+symlinked_parent() {
+  local dir=$2
+  while [[ $dir == */* ]]; do
+    dir=${dir%/*}
+    if [[ -L $1/$dir ]]; then return 0; fi
+  done
+  return 1
+}
+refuse_symlinked_parents() {
+  local file
+  for file in "${files[@]}"; do
+    if symlinked_parent "$1" "$file"; then
+      echo "snapshot-check: '$file' is under a symlinked directory in $1" >&2
+      exit 2
+    fi
+  done
+}
+refuse_symlinked_parents "$root"
+
+# shellcheck source=bin/lib/queue.sh
+. bin/lib/queue.sh
+# Re-run under `heavy` with the paths already resolved against the root.
+resolved=(--slot "$slot" "${files[@]}")
+(( ${#command[@]} == 0 )) || resolved+=(-- "${command[@]}")
+queue_heavy_reexec bin/snapshot-check "${resolved[@]}"
+
+base=$root/target/snapshot/$slot
+mkdir -p "$base"
+if command -v flock >/dev/null 2>&1; then
+  exec 7>>"$base/lock"
+  if ! flock -n 7; then
+    echo "queued: snapshot slot '$slot' is in use (--slot NAME runs beside it)" >&2
+    flock 7
+  fi
+fi
+
+tree=$base/tree
+rm -rf "$tree"
+mkdir -p "$tree"
+git archive --format=tar HEAD | tar -x -C "$tree"
+refuse_symlinked_parents "$tree"
+for file in "${files[@]}"; do
+  # Removed first: copying onto a link in the export would write through it.
+  rm -f "$tree/$file"
+  if [[ -e $root/$file || -L $root/$file ]]; then
+    mkdir -p "$tree/$(dirname "$file")"
+    cp -a "$root/$file" "$tree/$file"
+  fi
+done
+echo "snapshot-check: HEAD $(git rev-parse --short HEAD) + ${#files[@]} file(s) in $tree"
+
+cd "$tree"
+export CARGO_TARGET_DIR=$base/target
+if (( ${#command[@]} > 0 )); then
+  exec "${command[@]}"
+fi
+cargo clippy --all-targets --all-features -- -D warnings
+exec cargo test --lib --bins --test it_offline --all-features

@@ -38,7 +38,7 @@ struct Plan {
 /// column, and gives `using_filesort` as a field instead of substring-matching
 /// the `Extra` blob.
 async fn explain(pool: &MySqlPool, query: &str) -> Plan {
-    let json: String = sqlx::query(&format!("EXPLAIN FORMAT=JSON {query}"))
+    let json: String = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN FORMAT=JSON {query}")))
         .fetch_one(pool)
         .await
         .expect("explain runs")

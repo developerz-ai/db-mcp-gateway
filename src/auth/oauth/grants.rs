@@ -10,11 +10,9 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use super::refresh_chain::chain_expired;
-use super::refresh_db::{NewDbToken, revoke_paired, revoke_reused_chain, store_db};
+use super::refresh_db::{NewDbToken, store_db};
 use super::refresh_tokens::RefreshBackend;
-use super::{GrantIdentity, RefreshToken, RefreshTokens, hash_secret};
-use crate::auth::session::is_service_subject;
+use super::{GrantIdentity, RefreshTokens, hash_secret};
 use crate::auth::{AuthError, Session, SessionId, SessionStore};
 use crate::state::oauth as db;
 
@@ -22,6 +20,8 @@ use crate::state::oauth as db;
 /// redacts the token.
 pub struct Minted {
     pub session: Session,
+    /// The lifetime `session` was minted with: the bearer's `expires_in`.
+    pub session_ttl: Duration,
     pub refresh_token: String,
 }
 
@@ -29,6 +29,7 @@ impl std::fmt::Debug for Minted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Minted")
             .field("session", &self.session)
+            .field("session_ttl", &self.session_ttl)
             .field("refresh_token", &"<redacted>")
             .finish()
     }
@@ -71,84 +72,9 @@ impl RefreshTokens {
         sessions.committed(Some(&session), &[]).await;
         Ok(Minted {
             session,
+            session_ttl,
             refresh_token,
         })
-    }
-
-    /// Redeem `presented`: consume it, revoke its paired session, and mint a
-    /// new session + refresh token that inherit the chain's birth time.
-    /// `Ok(None)` for an unknown, replayed or lapsed token. On the DB backend a
-    /// replay of an already-rotated token also revokes the whole chain (RFC
-    /// 9700 §4.14.2); the memory backend (tests only) does not track chains.
-    pub async fn rotate(
-        &self,
-        sessions: &SessionStore,
-        presented: &str,
-        refresh_token: String,
-        session_ttl: Duration,
-    ) -> Result<Option<Minted>, AuthError> {
-        let RefreshBackend::Db(pool) = &self.backend else {
-            let Some(old) = self.take(presented).await else {
-                return Ok(None);
-            };
-            if let Some(id) = old.session_id {
-                sessions.revoke(id).await?;
-            }
-            let minted = self
-                .mint_in_memory(
-                    sessions,
-                    old.identity,
-                    refresh_token,
-                    session_ttl,
-                    Some(old.issued_at),
-                )
-                .await?;
-            return Ok(Some(minted));
-        };
-
-        let mut tx = pool.begin().await?;
-        let presented_hash = hash_secret(presented);
-        // Lock before consuming, so a concurrent logout of this subject or
-        // reuse-revocation of this chain sees either none or all of this
-        // rotation.
-        if let Some((sub, chain_id)) = db::live_chain(&mut *tx, &presented_hash).await? {
-            db::lock_subject(&mut *tx, &sub).await?;
-            db::lock_chain(&mut *tx, chain_id).await?;
-        }
-        let Some(row) = db::rotate_out_refresh_token(&mut *tx, &presented_hash).await? else {
-            let revoked = revoke_reused_chain(&mut tx, &presented_hash).await?;
-            tx.commit().await?;
-            sessions.committed(None, &revoked).await;
-            return Ok(None);
-        };
-        let chain_id = row.chain_id;
-        let old = RefreshToken::from(row);
-        // A reserved-subject chain predates the IdP-login check; end it too.
-        if chain_expired(old.issued_at, Utc::now(), self.ttl())
-            || is_service_subject(&old.identity.sub)
-        {
-            // Commit the delete: a lapsed chain is dead either way.
-            tx.commit().await?;
-            return Ok(None);
-        }
-        let revoked = revoke_paired(&mut tx, old.session_id).await?;
-        let session = new_session(&old.identity, session_ttl, Some(old.issued_at));
-        SessionStore::insert_in(&mut tx, &session).await?;
-        self.store_paired(
-            &mut tx,
-            &refresh_token,
-            &old.identity,
-            old.issued_at,
-            chain_id,
-            session.id,
-        )
-        .await?;
-        tx.commit().await?;
-        sessions.committed(Some(&session), &revoked).await;
-        Ok(Some(Minted {
-            session,
-            refresh_token,
-        }))
     }
 
     /// RFC 7009 for a refresh token: end its chain and revoke the paired
@@ -196,7 +122,7 @@ impl RefreshTokens {
     }
 
     /// The memory backend's mint (tests only): no transaction to lose.
-    async fn mint_in_memory(
+    pub(super) async fn mint_in_memory(
         &self,
         sessions: &SessionStore,
         identity: GrantIdentity,
@@ -224,6 +150,7 @@ impl RefreshTokens {
         .map_err(|_| AuthError::StoreFull)?;
         Ok(Minted {
             session,
+            session_ttl,
             refresh_token,
         })
     }
@@ -244,7 +171,7 @@ impl RefreshTokens {
             .await
     }
 
-    async fn store_paired(
+    pub(super) async fn store_paired(
         &self,
         conn: &mut sqlx::PgConnection,
         refresh_token: &str,
@@ -270,7 +197,7 @@ impl RefreshTokens {
 
 /// `chain_born` doubles as the session's `issued_at` so
 /// `admin.session_max_age_secs` counts from the original login.
-fn new_session(
+pub(super) fn new_session(
     identity: &GrantIdentity,
     ttl: Duration,
     chain_born: Option<DateTime<Utc>>,

@@ -10,7 +10,7 @@ members = ["third_party/sqlx-sqlite-noop"]
 name = "db-mcp-gateway"
 version = "2.3.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.94.1"
 description = "Self-hosted MCP gateway for credentialled, audited, policy-scoped database access by AI agents — read-only by default, writes opt-in per grant"
 license = "MIT"
 repository = "https://github.com/developerz-ai/db-mcp-gateway"
@@ -40,13 +40,17 @@ required-features = ["bench-harness"]
 [dependencies]
 # async runtime + http
 # Named features, not "full": the runtime, timers, sockets, signals, locks and
-# the one async file read (`config::secret`). Add a feature when code needs it.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs"] }
+# the one async file read (`config::secret`), and `io-util` for the
+# syslog sink's TCP/TLS writes. Add a feature when code needs it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs", "io-util"] }
 axum = { version = "0.7", features = ["macros"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.9", features = ["tls-rustls"] }
 # rustls 0.23 requires explicit CryptoProvider selection — we pick aws-lc-rs
 # at boot in `transport::tls::install_crypto_provider`.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+# TLS syslog stream sink (`src/audit/stream/syslog/`): async client side of
+# the rustls stack above, same aws-lc-rs provider.
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
 tower = "0.5"
 futures = "0.3.32"            # Stream combinators for the SSE response
 
@@ -71,30 +75,47 @@ clap = { version = "4", features = ["derive", "env"] }
 # `#[derive(sqlx::FromRow)]` uses need them, and `sqlx::migrate!` expands to
 # `::sqlx::migrate::…`, so the umbrella's `migrate` feature cannot be dropped.
 #
+# sqlx 0.9 split the combined `runtime-tokio-rustls` feature: the runtime
+# (`runtime-tokio`) and the TLS backend are named separately.
+# `tls-rustls-ring-webpki` is what `runtime-tokio-rustls` selected in 0.8.
+#
+# `mysql-rsa` is load-bearing on MySQL 8: sqlx 0.9's `mysql` feature no longer
+# pulls `rsa`, and without the opt-in a `caching_sha2_password` full
+# authentication over a non-TLS connection fails with a configuration error —
+# which is the dev DSN (`docker-compose.dev.yml` runs `mysql:8` without TLS)
+# and any operator `PERMISSIONS_DB_DSN` without `ssl-mode=REQUIRED`. It
+# resolves to `rsa` 0.10, the release RUSTSEC-2023-0071 declares patched.
+#
+# Not 0.9.0: its Postgres driver resolves a custom type's OID through the
+# simple query protocol after the Parse, which destroys the unnamed statement
+# every ad-hoc query here runs as (`persistent(false)`), so a result with an
+# enum or `regclass` column failed with SQLSTATE 26000. 0.9.1 re-parses.
+#
 # The optional SQLite driver is a separate matter: sqlx keeps `sqlx-sqlite` as
 # an optional dependency, and Cargo.lock materialises an optional dependency as
 # soon as an enabled feature references it — even by a weak `dep?/feat`
 # reference. sqlx's `migrate`/`json`/`chrono`/`uuid` features each reference
 # `sqlx-sqlite?/…`, so the driver lands in the lock (with `libsqlite3-sys`
 # 0.30.1, flagged by RUSTSEC-2026-0459) even though the `sqlite` feature is
-# off and the driver is never compiled. No sqlx release can carry a fixed
-# `libsqlite3-sys` — sqlx-sqlite 0.8.6 requires `^0.30.1` and the fix landed
-# in 0.39.0 — so the driver is stood in for by a no-op stub; see
-# `[patch.crates-io]` below.
+# off and the driver is never compiled. sqlx-sqlite 0.9.1 widened its range to
+# `>=0.30.1, <0.41.0`, so a fixed `libsqlite3-sys` (0.39.0+) is resolvable
+# now, but the lock would still carry a C-library crate nothing here builds —
+# so the driver stays stood in for by a no-op stub; see `[patch.crates-io]`
+# below.
 #
 # The version is pinned exactly, not to a range: the stub satisfies only
-# sqlx's `sqlx-sqlite = "=0.8.6"` requirement, so a `cargo update` that moved
-# sqlx to 0.8.7 would leave the patch unused — the real driver, and
-# `libsqlite3-sys` with it, would return to the lock and RUSTSEC-2026-0459
-# with them. Bump sqlx and the stub's version in the same commit.
-sqlx = { version = "=0.8.6", default-features = false, features = ["runtime-tokio-rustls", "macros", "migrate", "json", "postgres", "mysql", "uuid", "chrono", "bigdecimal"] }
+# sqlx's `sqlx-sqlite = "=0.9.1"` requirement, so a `cargo update` that moved
+# sqlx to 0.9.2 would leave the patch unused — the real driver, and
+# `libsqlite3-sys` with it, would return to the lock. Bump sqlx and the stub's
+# version in the same commit.
+sqlx = { version = "=0.9.1", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "macros", "migrate", "json", "postgres", "mysql", "mysql-rsa", "uuid", "chrono", "bigdecimal"] }
 sqlparser = { version = "0.63", features = ["visitor"] }
 async-trait = "0.1"
 # Mongo target adapter (#57 scaffold + #58 exec). Disable default features so
 # we never pull native-tls's openssl link; rustls matches the rest of the
 # stack. Mongo is a target backend, not a permissions storage backend
 # (spec 12 §"Storage backends" excludes it).
-mongodb = { version = "3.7", default-features = false, features = ["rustls-tls-aws-lc", "dns-resolver", "compat-3-3-0", "bson-3"] }
+mongodb = { version = "3.10", default-features = false, features = ["rustls-tls-aws-lc", "dns-resolver", "compat-3-3-0", "bson-3"] }
 # Redis / Dragonfly target adapter (`src/exec/redis/`). Default features off:
 # the adapter sends raw argv through `redis::cmd`, so none of the typed
 # command helpers (acl, streams, script, …) are needed. `tokio-rustls-comp`
@@ -140,6 +161,9 @@ metrics-util = { version = "0.20.4", default-features = false }  # MetricKindMas
 
 # ids + time
 uuid = { version = "1", features = ["v4", "serde"] }
+# CSPRNG bytes for `mint-service-token` (src/cli/mint.rs). Already in the
+# lock through uuid; naming it adds no package.
+getrandom = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
 # error tracking → GlitchTip (Sentry-protocol ingest). Error tracking ONLY:
@@ -165,7 +189,7 @@ regex = { version = "1", default-features = false, features = [
 ] }
 tower-http = { version = "0.7.1", features = ["timeout"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
-arc-swap = "1.9.1"
+arc-swap = "1.9.4"
 
 [dev-dependencies]
 # Self dev-dependency: enables `test-support` for this crate's own integration
@@ -176,6 +200,15 @@ serial_test = "3"            # Serialize real-DB tests that share one global tab
 tempfile = "3"
 rcgen = "0.14"                # Self-signed certs for the TLS+SIGHUP integration test
 libc = "0.2"                  # `raise(SIGHUP)` from the integration test (in-process signal)
+
+# CLAUDE.md §Conventions "No panics": a panic in a hot path crashes every
+# user. Denied for library and binary code; `#[test]` fns and `#[cfg(test)]`
+# modules are exempt via `clippy.toml`, the integration-test crates by an
+# inner `allow` at each crate root.
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
 
 # 29 integration-test binaries plus the lib each carried full DWARF: measured
 # 188MB of a 244MB test binary, and a 43GB target/ dir. The linker copies all
@@ -213,9 +246,8 @@ strip = "debuginfo"
 # features each reference the optional SQLite driver, so it lands in the lock
 # with `libsqlite3-sys` 0.30.1 and RUSTSEC-2026-0459 fires — even though the
 # `sqlite` feature is never enabled and the driver is never compiled.
-# No sqlx release can carry a fixed `libsqlite3-sys`: sqlx-sqlite 0.8.6 requires
-# `^0.30.1`, sqlx-sqlite 0.9.0 still caps at `<0.38.0`, and the fix landed in
-# 0.39.0. The stub below stands in for the driver so the vulnerable crate
+# sqlx-sqlite 0.9.1 accepts the fixed `libsqlite3-sys` (0.39.0+), but the lock
+# would still carry a crate nothing here builds. The stub below stands in for the driver so the vulnerable crate
 # leaves the lock; no gate compiles it, because the `sqlite` feature is off and
 # the stub is not a default workspace member (CLAUDE.md §"Dependency graph").
 [patch.crates-io]

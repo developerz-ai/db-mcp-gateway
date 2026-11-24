@@ -1,0 +1,3 @@
+config: tests/data/check/parse_error.yaml
+error: tests/data/check/parse_error.yaml:5:11: invalid configuration (expected one of postgres, mysql, mssql, mongo, redis)
+result: invalid (1 error(s), 0 warning(s))

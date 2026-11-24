@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# pre-push — clippy and the Docker-free unit tests. The full gate (bin/check:
+# integration tests against the dev stack, audit, docs) runs on demand and in
+# CI.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+echo '→ cargo clippy'
+cargo clippy --all-targets --all-features -- -D warnings
+echo '→ bin/test --unit'
+bin/test --unit

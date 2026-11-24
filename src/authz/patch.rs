@@ -47,7 +47,7 @@ impl ConstraintsPatch {
 /// A key that is present deserializes to `Some(_)` — `Some(None)` for an
 /// explicit `null`. An absent key never reaches this and stays `None` via
 /// `#[serde(default)]`.
-fn present<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+pub fn present<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
 where
     T: Deserialize<'de>,
     D: Deserializer<'de>,

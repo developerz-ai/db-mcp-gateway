@@ -10,8 +10,8 @@ use crate::audit::stream::StreamSinks;
 use crate::audit::{self, AuditRow, OutcomeCode};
 use crate::exec::Access;
 
-use super::Outcome;
-use super::metric_names::{ACCESS_UNKNOWN, AUDIT_FALLBACK_FAILURES, TOOL_CALLS};
+use super::metric_names::{ACCESS_UNKNOWN, AUDIT_FALLBACK_FAILURES, CallLabels};
+use super::{Outcome, WriteState};
 
 const DISCONNECTED: &str = "client disconnected before completion";
 
@@ -41,8 +41,8 @@ pub(super) struct CancelledAuditGuard {
     /// `Some` while armed; `disarm()` clears it and `Drop` then writes
     /// nothing. `PgPool` is `Arc`-internally so cloning is cheap.
     pub(super) state_db: Option<PgPool>,
-    /// The metric label; `row.tool` is an owned copy for the write.
-    pub(super) tool: &'static str,
+    /// The call metrics' labels; `row.tool` is an owned copy for the write.
+    pub(super) labels: CallLabels,
     pub(super) sinks: StreamSinks,
     pub(super) tasks: DetachedTasks,
 }
@@ -52,7 +52,7 @@ impl CancelledAuditGuard {
     /// recorded.
     pub(super) fn arm(
         mut row: AuditRow,
-        tool: &'static str,
+        labels: CallLabels,
         state_db: PgPool,
         sinks: StreamSinks,
         tasks: DetachedTasks,
@@ -60,7 +60,7 @@ impl CancelledAuditGuard {
         row.outcome = OutcomeCode::Cancelled;
         row.error_message = Some(DISCONNECTED.to_string());
         Self {
-            tool,
+            labels,
             row,
             completed: false,
             state_db: Some(state_db),
@@ -90,13 +90,18 @@ impl CancelledAuditGuard {
 
     /// The primary write failed, so the client is told `audit_unavailable`.
     /// The fallback row records that — the code the client saw — and keeps
-    /// the tool's own outcome in `error_message`.
-    pub(super) fn record_audit_failure(&mut self) {
+    /// the tool's own outcome in `error_message`, flagged when a write may
+    /// be in the target (a timed-out write's message already is).
+    pub(super) fn record_audit_failure(&mut self, write: Option<WriteState>) {
         let row = &mut self.row;
-        let tool_outcome = match row.error_message.take() {
+        let mut tool_outcome = match row.error_message.take() {
             Some(message) => format!("tool outcome {}: {message}", row.outcome),
             None => format!("tool outcome {}", row.outcome),
         };
+        let may_have_written = matches!(write, Some(WriteState::Applied | WriteState::Unknown));
+        if may_have_written && !tool_outcome.contains(WRITE_MAY_HAVE_COMMITTED) {
+            tool_outcome.push_str(&format!(" ({WRITE_MAY_HAVE_COMMITTED})"));
+        }
         row.outcome = OutcomeCode::AuditUnavailable;
         row.error_message = Some(tool_outcome);
     }
@@ -109,14 +114,8 @@ impl Drop for CancelledAuditGuard {
         };
         if !self.completed {
             // Mid-work drop: the dispatch never reached its own count.
-            counter!(
-                TOOL_CALLS,
-                "tool" => self.tool,
-                "outcome" => OutcomeCode::Cancelled.as_str(),
-                // The access is decided inside the dropped work.
-                "access" => ACCESS_UNKNOWN,
-            )
-            .increment(1);
+            // The access is decided inside the dropped work.
+            self.labels.count(OutcomeCode::Cancelled, ACCESS_UNKNOWN);
         }
         let mut row = self.row.clone();
         let sinks = self.sinks.clone();
@@ -156,12 +155,21 @@ async fn note_write_access(pool: &PgPool, row: &mut AuditRow) {
 
 /// `message`, flagged as possibly committed when the intent of `request_id`
 /// recorded write access — for work that ended without saying how far it
-/// got. A failed lookup returns `message` unflagged; the row is still
-/// written.
-pub(super) async fn flag_if_write(pool: &PgPool, request_id: &str, message: &str) -> String {
+/// got.
+async fn flag_if_write(pool: &PgPool, request_id: &str, message: &str) -> String {
+    if intent_wrote(pool, request_id).await {
+        format!("{message} ({WRITE_MAY_HAVE_COMMITTED})")
+    } else {
+        message.to_string()
+    }
+}
+
+/// Whether the intent of `request_id` recorded write access. A failed
+/// lookup answers `false`; the row is still written, without the access.
+pub(super) async fn intent_wrote(pool: &PgPool, request_id: &str) -> bool {
     match audit::intent::access_of(pool, request_id).await {
-        Ok(Some(Access::ReadWrite)) => format!("{message} ({WRITE_MAY_HAVE_COMMITTED})"),
-        Ok(Some(Access::ReadOnly) | None) => message.to_string(),
+        Ok(Some(Access::ReadWrite)) => true,
+        Ok(Some(Access::ReadOnly) | None) => false,
         Err(err) => {
             tracing::warn!(
                 %err,
@@ -169,7 +177,7 @@ pub(super) async fn flag_if_write(pool: &PgPool, request_id: &str, message: &str
                 request_id,
                 "intent access lookup failed; row carries no access"
             );
-            message.to_string()
+            false
         }
     }
 }

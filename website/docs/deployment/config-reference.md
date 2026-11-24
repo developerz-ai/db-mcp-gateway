@@ -16,6 +16,18 @@ Boot-time validation (issue #16):
 - Every `${ENV:…}` / `${FILE:…}` ref must resolve cleanly; an unset or empty
   env var, or a missing or empty file, aborts startup (issue #15).
 - Server and database names may not be `*` (reserved for the grant wildcard).
+- Every validation error is reported at once (one boot abort lists them all),
+  and every unresolved secret ref is named by its site
+  (`servers[prod].databases[app].write_password (write tier)`), never its value.
+
+Check a config without booting — every error, warnings (unverified TLS,
+inert constraints, mistyped env vars) and the connection budget — with
+`db-mcp-gateway --config config.yml --check [--no-secrets]`; see the
+[operator CLI](cli.md#--check--validate-a-config-without-booting). The
+shape of this page is also published as a JSON Schema,
+[`config.schema.json`](pathname:///config.schema.json), for editor
+completion (`# yaml-language-server: $schema=https://developerz-ai.github.io/db-mcp-gateway/config.schema.json`);
+a test pins its keys to the parser's.
 
 ## Top level
 
@@ -23,7 +35,8 @@ Boot-time validation (issue #16):
 |---|---|---|---|
 | `gateway` | `{ env: production \| development }` | no (defaults `development`) | `production` rejects inline literal secrets (DB passwords, service tokens) at boot. |
 | `servers` | list of [Server](#server) | no (defaults `[]`) | Target DBs the gateway can dispatch to. |
-| `permissions` | list of [Permission](#permission) | no (defaults `[]`) | Group→grant mapping. Empty list means no caller can reach anything. |
+| `permissions` | list of [Permission](#permission) | no (defaults `[]`) | Group (or single-user) → grant mapping. An empty list removes only the YAML grants: with a permissions store (`pg`, the default, or `mysql`) its grants still apply, so an empty list denies every caller only with `permissions_store.driver: none`. |
+| `constraint_profiles` | map of name → [Constraints](#constraints) | no (defaults `{}`) | Named constraint sets a [Grant](#grant) references with `profile:`. See [Constraint profiles](#constraint-profiles). |
 | `admin` | [Admin](#admin) | no | `/admin/v1/*` surface gating — see [admin-api.md](admin-api.md). |
 | `permissions_store` | [PermissionsStore](#permissionsstore) | no | Storage backend for users/databases/grants. Absent → state DB (pg). |
 | `service_accounts` | list of [ServiceAccount](#serviceaccount) | no (defaults `[]`) | Static bearer tokens for headless clients — see [spec 14](../initial-idea/14-service-tokens.md). |
@@ -47,8 +60,10 @@ Boot-time validation (issue #16):
 | `tls` | `required` \| `verify_full` \| `insecure` | no | `required` | `required` encrypts; on Postgres it does **not** verify the certificate (boot warns), on Mongo and Redis it verifies chain + hostname. `verify_full` verifies chain + hostname. `insecure` is plaintext (boot warns). No client certificates (mTLS) on any target. |
 | `tls_ca_file` | path | no | system roots | CA bundle (PEM) for `verify_full`. Boot error when set without `verify_full` or when unreadable. |
 | `pool` | [Pool](#pool) | no | built-in defaults | Applies to every database on the server; a database's own `pool` wins per field. |
+| `role` | string | no | none | Default read `role` for every database entry that names none. Same checks as a database's `role`, applied to each database it reaches. |
+| `password` | [secret ref](#secret-references) | no | none | Default `password` for those entries. Same forms and production-literal rule. A database that ends up with no `role` or no `password` (neither its own nor the server's) aborts boot, naming the database. |
 | `description` | string | no | `""` | Human-readable purpose; surfaced by `list_servers`. |
-| `databases` | list of [Database](#database) | no | `[]` | Per-DB definitions. |
+| `databases` | list of [Database](#database) | no | `[]` | Per-DB definitions. An entry may be a bare name — `databases: [app, billing]` (Redis: `[0, 1]`) — which takes `role` / `password` from the server; mappings and names mix freely. |
 
 ## Database
 
@@ -57,8 +72,9 @@ Boot-time validation (issue #16):
 | Key | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `name` | string | **yes** | — | DB name on the target server. On `redis`, the logical DB index in plain decimal (`"0"`, `"1"`; not `"00"`) — anything else fails boot. |
-| `role` | string | **yes** | — | Postgres role / mongo username / Redis ACL username (`^[A-Za-z_][A-Za-z0-9_]*$`). Typo here is caught at boot. The backend's stock superuser is refused: `postgres`, `root` / `admin` (Mongo), `default` (Redis). |
-| `password` | [secret ref](#secret-references) | **yes** | — | `${ENV:…}` / `${FILE:…}` / `vault:…` / `aws-sm:…` / `gcp-sm:…` / inline literal. |
+| `role` | string | **yes**, unless the server sets `role` | server's `role` | Postgres role / mongo username / Redis ACL username (`^[A-Za-z_][A-Za-z0-9_]*$`). Typo here is caught at boot. The backend's stock superuser is refused: `postgres`, `root` / `admin` (Mongo), `default` (Redis). |
+| `password` | [secret ref](#secret-references) | **yes**, unless the server sets `password` | server's `password` | `${ENV:…}` / `${FILE:…}` / `vault:…` / `aws-sm:…` / `gcp-sm:…` / inline literal. |
+| `connect_name` | string | no | `name` | The database's real name on the server when the logical `name` (what grants, tools and the audit log use) differs — e.g. `name: app`, `connect_name: app_prod_v2`. Postgres connects to it; Mongo uses it as the default database and the `authSource` fallback. Blank is a boot error; a boot error on `redis` (address a Redis DB by its index `name`). |
 | `description` | string | no | `""` | |
 | `pool` | [Pool](#pool) | no | server's `pool`, then built-in defaults | Per-field override of the server's `pool`. |
 | `auth_database` | string | no | `None` (falls back to `name`) | Mongo `authSource`. Set to `"admin"` when the role lives outside the target DB (container-bootstrapped users). Empty/whitespace is a boot error — omit to fall back. Ignored by pg; a boot error on `redis` (ACL users are server-wide). See [multi-db.md](../usage/multi-db.md). |
@@ -222,8 +238,9 @@ Check it with `ACL GETUSER gateway_ro` and, logged in as that user,
 
 | Key | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `group` | string | **yes** | — | Group claim from the IdP token (e.g. `engineers`, `oncall`). |
-| `grants` | list of [Grant](#grant) | no | `[]` | Empty means the group is recognized but grants nothing. |
+| `group` | string | exactly one of `group` / `user` | — | Group claim from the IdP token (e.g. `engineers`, `oncall`). Unique across blocks; non-blank. |
+| `user` | string | exactly one of `group` / `user` | — | One SSO subject (`sub` claim). The block applies to an SSO session with exactly that `sub` — never to a service token. Unique across `user:` blocks; non-blank. Its grants merge with the user's group grants most-restrictively per action (spec 06). A service account's `group` must name a `group:` block, not a `user:` one. |
+| `grants` | list of [Grant](#grant) | no | `[]` | Empty means the subject is recognized but granted nothing. |
 
 ## Admin
 
@@ -241,9 +258,9 @@ Check it with `ACL GETUSER gateway_ro` and, logged in as that user,
 
 | Key | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `driver` | `pg` \| `mysql` | **yes** | — | `pg` (default if the block is absent) shares the state DB. `mysql` opens a separate pool via `PERMISSIONS_DB_DSN` env at boot. |
+| `driver` | `pg` \| `mysql` \| `none` | **yes** | — | `pg` (default if the block is absent) shares the state DB. `mysql` opens a separate pool via `PERMISSIONS_DB_DSN` env at boot. `none` is YAML-only: grants come from `permissions:` alone and no store is ever read — no grant query, no `LISTEN` connection. |
 
-> **Boot-gate**: `driver: mysql` + `admin.enabled: true` is rejected — admin handlers haven't been ported to mysql. Use pg for the admin path, or mysql with YAML grants only.
+> **Boot-gate**: `admin.enabled: true` needs `driver: pg` (or no block). With `driver: mysql` it is rejected — admin handlers haven't been ported to mysql — and with `driver: none` too, since the admin API edits a store a YAML-only install does not have. The driver is boot-fixed: a reload that changes it (absent → `pg` included) is refused.
 
 ## ServiceAccount
 
@@ -253,7 +270,8 @@ Check it with `ACL GETUSER gateway_ro` and, logged in as that user,
 |---|---|---|---|---|
 | `name` | string | **yes** | — | Stable service identity; becomes the audit identity `service:<name>`. Must match `^[a-z0-9][a-z0-9-]{0,62}$`, unique across the list. |
 | `group` | string | **yes** | — | The single permissions group the token acts as. Must be declared in `permissions:` (an empty `grants:` list recognizes a group that grants nothing) and must not equal `admin.group` when the admin surface is enabled — both abort boot. |
-| `token` | [secret ref](#secret-references) | **yes** | — | `${ENV:…}` or `${FILE:…}` (spec 14 — YAML carries the secret reference, never the bearer value). An inline literal token is accepted under the default `gateway.env: development` (dev/test parity with `password:`) and **rejected at boot under `gateway.env: production`**. Committed config is also checked in CI by the advisory `secret-scan` job, which fails on any literal `dbmcp_svc_<64hex>` in a tracked file outside its exempt paths. Resolved value must match `dbmcp_svc_` followed by exactly 64 lowercase hexadecimal characters (`0-9a-f`) — mint with `bin/mint-service-token <name>`. Short, overlong, non-hex, or mixed-case bodies abort boot with `ServiceTokenError::WeakToken`. Two accounts resolving to the same value abort boot (audit attribution would be ambiguous). |
+| `token` | [secret ref](#secret-references) | one of `token` / `tokens` | — | `${ENV:…}` or `${FILE:…}` (spec 14 — YAML carries the secret reference, never the bearer value). An inline literal token is accepted under the default `gateway.env: development` (dev/test parity with `password:`) and **rejected at boot under `gateway.env: production`**. Committed config is also checked in CI by the advisory `secret-scan` job, which fails on any literal `dbmcp_svc_<64hex>` in a tracked file outside its exempt paths. Resolved value must match `dbmcp_svc_` followed by exactly 64 lowercase hexadecimal characters (`0-9a-f`) — mint with `db-mcp-gateway mint-service-token <name>` (or the `bin/mint-service-token` wrapper). Short, overlong, non-hex, or mixed-case bodies abort boot with `ServiceTokenError::WeakToken`. Two accounts resolving to the same value abort boot (audit attribution would be ambiguous). |
+| `tokens` | list of [secret ref](#secret-references) | one of `token` / `tokens` | — | Several tokens for one account — the same-name rotation window ([spec 14 §Rotate](../initial-idea/14-service-tokens.md#mint--rotate--revoke)). Every entry obeys the `token` rules and authenticates as the same `service:<name>`, group and limits. Setting both `token` and `tokens`, neither, or an empty list aborts boot; a value repeated within the list or shared with another account aborts boot too. |
 | `max_concurrent_requests` | u32 > 0 | no | `MAX_CONCURRENT_PER_IDENTITY` (16) | In-flight request cap for this token, replacing the per-identity cap so a fleet of agents behind one token is not throttled as one user. The global `MAX_CONCURRENT_REQUESTS` cap still applies. `0` aborts boot. |
 | `require_upstream` | bool | no | `false` | Reject calls that lack the `x-dbmcp-run-id` and `x-dbmcp-on-behalf-of` headers (`invalid_arguments`). The headers are **claimed** by the caller: stored on the audit row, never verified, never used for authorization. The audit identity stays `service:<name>`. |
 
@@ -279,7 +297,7 @@ Tagged by `kind`; unknown keys and unshipped kinds (`otlp`, `kafka`) abort boot.
 | `kind` | Other keys | Notes |
 |---|---|---|
 | `stdout` | none | Emits the full audit row as a tracing event with `target: "audit_stream"` on the JSON stdout log. That target always logs at INFO, whatever `RUST_LOG` says. Lines dropped by a full log queue count in `log_lines_dropped_total` — see [logging.md](logging.md). |
-| `syslog` | `host` (string, non-blank), `port` (u16, non-zero) | RFC 5424 over UDP. Blank `host` or `port: 0` aborts boot. |
+| `syslog` | `host` (string, non-blank), `port` (u16, non-zero), `transport` (`udp` \| `tcp` \| `tls`, default `udp`), `ca_file` (path) | RFC 5424 over the chosen transport. `tls` verifies the receiver's certificate against the PEM CA bundle in `ca_file` only — never system roots — so `ca_file` is required with `tls` and rejected with `udp`/`tcp` (either mistake aborts boot, as do a blank `host` or `port: 0`). An unreadable or certificate-less `ca_file` fails boot, or keeps the running config on reload. |
 
 ## Grant
 
@@ -291,12 +309,29 @@ Tagged by `kind`; unknown keys and unshipped kinds (`otlp`, `kafka`) abort boot.
 | `database` | string | **yes** | — | Must match a `databases[].name` somewhere, or `"*"`. Catches typos at boot. |
 | `action` | `schema_read` \| `query_read` \| `query_write` \| `history_read` | **yes** | — | Misspelled variants (e.g. `query_reed`) fail at boot with the expected list. |
 | `constraints` | [Constraints](#constraints) | no | empty | Most-restrictive-merged across all matching grants (spec 06). |
+| `profile` | string | no | none | Name of a `constraint_profiles:` entry, merged with `constraints` most-restrictively when the config is parsed. An unknown name aborts boot. |
+| `except` | list of string | no | `[]` | Only with `database: "*"`: databases the wildcard leaves out. Each must name a declared database (on `server`, or on any server for `server: "*"`); otherwise boot fails. A `query_write` wildcard needs a `write_role` only on the databases it still covers. |
 
 ### Action hierarchy
 
 `query_write` ⊇ `query_read` ⊇ `schema_read`. `history_read` is its own track.
 A `query_write` grant needs a `write_role` on every database it matches —
 see [Write tier](#write-tier).
+
+### Constraint profiles
+
+```yaml
+constraint_profiles:
+  prod-read: { row_limit: 1000, statement_timeout_ms: 5000, require_reason: true }
+permissions:
+  - group: support
+    grants:
+      - { server: prod, database: "*", except: [billing], action: query_read, profile: prod-read }
+  - user: "okta|00u1oncall"
+    grants:
+      - { server: prod, database: billing, action: query_read, profile: prod-read,
+          constraints: { row_limit: 100 } }   # → row_limit 100 (tighter wins)
+```
 
 ## Constraints
 
@@ -327,6 +362,11 @@ Boot-time guarantees (issue #15):
 
 - Missing env var → boot abort with `EnvNotSet(name)`.
 - Missing or empty file → boot abort with `FileUnreadable` / `FileEmpty(path)`.
+- A `${FILE:…}` value drops its trailing `\n` / `\r`; a file that is only a
+  newline counts as empty. A `${ENV:…}` value is used byte for byte.
+- Every unresolved ref is reported in one abort, each naming its site:
+  `servers[<server>].databases[<db>].password (read tier)`,
+  `….write_password (write tier)`, `service_accounts[<name>].tokens[<i>]`.
 - Malformed `${…}` ref (legacy `${VAR}` syntax, empty `${ENV:}`, unknown
   scheme) → YAML parse error pointing at the line.
 

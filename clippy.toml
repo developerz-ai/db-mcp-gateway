@@ -1,0 +1,4 @@
+# `[lints.clippy]` in Cargo.toml denies unwrap/expect/panic; a test may panic.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

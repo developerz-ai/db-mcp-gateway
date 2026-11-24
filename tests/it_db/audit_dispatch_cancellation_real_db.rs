@@ -19,12 +19,13 @@
 //!      detached `tokio::spawn` writes it whenever the runtime schedules it.
 //!   6. Assert the row exists with `outcome = "cancelled"`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::common::audit::{DispatchSinks, find_audit, latest_audit};
 use crate::common::cleanup::delete_audit_calls;
 use crate::common::env::state_pool;
+use crate::common::log_capture::BufWriter;
 use db_mcp_gateway::audit;
 use db_mcp_gateway::auth::{Identity, SessionId};
 use db_mcp_gateway::config::StreamSinkConfig;
@@ -33,7 +34,6 @@ use db_mcp_gateway::tools::audit_dispatch::{
 };
 use serde_json::Value;
 use tokio::sync::Notify;
-use tracing_subscriber::fmt::MakeWriter;
 use uuid::Uuid;
 
 /// How long the drop-guard's detached audit write is allowed to take before we
@@ -77,7 +77,7 @@ async fn wait_for_audit_row(
 async fn wait_for_audit_stream_event(buf: &BufWriter, request_id: &str) -> Result<Value, String> {
     let deadline = tokio::time::Instant::now() + POLL_TIMEOUT;
     loop {
-        let raw = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let raw = buf.contents();
         let matches: Vec<Value> = raw
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -98,26 +98,6 @@ async fn wait_for_audit_stream_event(buf: &BufWriter, request_id: &str) -> Resul
                 "expected exactly 1 audit_stream event for request_id {request_id}, got {n} in:\n{raw}"
             ),
         }
-    }
-}
-
-#[derive(Clone, Default)]
-struct BufWriter(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for BufWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for BufWriter {
-    type Writer = Self;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
     }
 }
 

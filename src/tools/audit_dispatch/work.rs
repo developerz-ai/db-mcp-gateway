@@ -7,8 +7,11 @@ use std::panic::AssertUnwindSafe;
 use futures::FutureExt;
 use sqlx::PgPool;
 
-use super::cancel_guard::flag_if_write;
-use super::{Outcome, OutcomeCode, RequestContext, error_outcome};
+use crate::audit::intent::WRITE_MAY_HAVE_COMMITTED;
+
+use super::cancel_guard::intent_wrote;
+use super::metric_names::HANDLER_PANICS;
+use super::{Outcome, OutcomeCode, RequestContext, WriteEffect, WriteState, error_outcome};
 
 /// What the client and the row are told; the panic payload never is.
 const PANICKED: &str = "internal error";
@@ -38,9 +41,20 @@ where
                 tool,
                 "tool work panicked; answering internal"
             );
+            metrics::counter!(HANDLER_PANICS, "layer" => "tool_work").increment(1);
             let request_id = request_ctx.request_id.to_string();
-            let message = flag_if_write(state_db, &request_id, PANICKED).await;
-            error_outcome(OutcomeCode::Internal, &message)
+            if !intent_wrote(state_db, &request_id).await {
+                return error_outcome(OutcomeCode::Internal, PANICKED);
+            }
+            let mut outcome = error_outcome(
+                OutcomeCode::Internal,
+                &format!("{PANICKED} ({WRITE_MAY_HAVE_COMMITTED})"),
+            );
+            outcome.write = Some(WriteEffect {
+                rows_affected: None,
+                state: WriteState::Unknown,
+            });
+            outcome
         }
     }
 }

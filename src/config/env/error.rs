@@ -79,6 +79,6 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("invalid TLS_DISABLED `{0}`: expected `true` or `false`")]
-    TlsDisabledFlag(String),
+    #[error(transparent)]
+    TlsDisabledFlag(#[from] super::BoolFlagError),
 }

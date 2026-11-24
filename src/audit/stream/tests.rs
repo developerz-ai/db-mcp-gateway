@@ -1,7 +1,7 @@
 //! Sink behaviour without a state DB: stdout field contract, RFC 5424 shape,
 //! datagram size cap, UDP delivery on loopback.
 
-use super::syslog::{MAX_DATAGRAM_BYTES, TRUNCATION_MARKER, datagram, format_rfc5424};
+use super::syslog::{MAX_MESSAGE_BYTES, TRUNCATION_MARKER, format_rfc5424, message};
 use super::*;
 use crate::audit::OutcomeCode;
 use std::sync::{Arc, Mutex};
@@ -53,13 +53,16 @@ fn sample_row() -> AuditRow {
         upstream_run_id: None,
         rows_affected: None,
         sql_truncated: false,
+        params: None,
     }
 }
 
 /// No sinks configured → no-op. The common case (pre-#218 default).
 #[test]
 fn empty_sinks_is_a_no_op() {
-    StreamSinks::from_config(&[]).send(&sample_row(), &DetachedTasks::new());
+    StreamSinks::from_config(&[])
+        .expect("no sinks")
+        .send(&sample_row(), &DetachedTasks::new());
 }
 
 /// The `stdout` sink emits one `audit_stream`-targeted event carrying the
@@ -75,6 +78,7 @@ fn stdout_sink_emits_audit_stream_event_with_row_fields() {
 
     tracing::subscriber::with_default(subscriber, || {
         StreamSinks::from_config(&[StreamSinkConfig::Stdout])
+            .expect("stdout sink")
             .send(&sample_row(), &DetachedTasks::new());
     });
 
@@ -110,7 +114,9 @@ fn stdout_sink_emits_every_spec_07_field() {
     row.reason = Some("incident-42".into());
 
     tracing::subscriber::with_default(subscriber, || {
-        StreamSinks::from_config(&[StreamSinkConfig::Stdout]).send(&row, &DetachedTasks::new());
+        StreamSinks::from_config(&[StreamSinkConfig::Stdout])
+            .expect("stdout sink")
+            .send(&row, &DetachedTasks::new());
     });
 
     let raw = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
@@ -182,7 +188,10 @@ async fn syslog_sink_delivers_udp_datagram_to_configured_host_port() {
     StreamSinks::from_config(&[StreamSinkConfig::Syslog {
         host: "127.0.0.1".to_string(),
         port,
+        transport: SyslogTransportKind::Udp,
+        ca_file: None,
     }])
+    .expect("udp sink builds")
     .send(&sample_row(), &tasks);
 
     let mut buf = [0u8; 4096];
@@ -209,7 +218,10 @@ fn syslog_sink_with_bad_host_does_not_block_the_caller() {
         StreamSinks::from_config(&[StreamSinkConfig::Syslog {
             host: "this-host-does-not-resolve.invalid".to_string(),
             port: 514,
+            transport: SyslogTransportKind::Udp,
+            ca_file: None,
         }])
+        .expect("udp sink builds")
         .send(&sample_row(), &DetachedTasks::new());
         // `send` already returned above without awaiting the spawned
         // task — the assertion is simply that we got here.
@@ -223,9 +235,9 @@ fn oversized_row_is_cut_to_one_datagram_with_valid_json() {
     let mut row = sample_row();
     row.sql = Some(format!("SELECT '{}'", "x".repeat(100 * 1024)));
 
-    let message = datagram(&row);
+    let message = message(&row);
 
-    assert!(message.len() <= MAX_DATAGRAM_BYTES, "{}", message.len());
+    assert!(message.len() <= MAX_MESSAGE_BYTES, "{}", message.len());
     let body: serde_json::Value =
         serde_json::from_str(&message[message.find('{').unwrap()..]).expect("body is JSON");
     let sql = body["sql"].as_str().unwrap();
@@ -234,23 +246,44 @@ fn oversized_row_is_cut_to_one_datagram_with_valid_json() {
     assert_eq!(body["request_id"].as_str(), Some("req-stream-1"));
 }
 
-/// No `sql` to shorten (an oversized error message, say): the message
-/// itself is cut, still within the cap and still marked.
+/// Params past one datagram are cut after `sql`: the array becomes a marked
+/// JSON string, as in `audit_calls.params`, and the body stays valid JSON.
 #[test]
-fn oversized_row_without_sql_is_hard_cut_with_marker() {
+fn oversized_params_are_cut_to_a_marked_string_with_valid_json() {
+    let mut row = sample_row();
+    row.params = Some(serde_json::json!(["\"quoted\"".repeat(2_000), 7]));
+
+    let message = message(&row);
+
+    assert!(message.len() <= MAX_MESSAGE_BYTES, "{}", message.len());
+    let body: serde_json::Value =
+        serde_json::from_str(&message[message.find('{').unwrap()..]).expect("body is JSON");
+    let params = body["params"].as_str().expect("cut params are a string");
+    assert!(params.starts_with(r#"["\"quoted"#), "{params}");
+    assert!(params.ends_with(TRUNCATION_MARKER), "{params}");
+    assert_eq!(body["sql"], "SELECT 1");
+}
+
+/// No `sql` to shorten (an oversized error message, say): the free text is
+/// cut to the marker, so the body stays one parseable object.
+#[test]
+fn oversized_row_without_sql_cuts_free_text_to_the_marker() {
     let mut row = sample_row();
     row.sql = None;
     row.error_message = Some("e".repeat(20_000));
 
-    let message = datagram(&row);
+    let message = message(&row);
 
-    assert!(message.len() <= MAX_DATAGRAM_BYTES);
-    assert!(message.ends_with(TRUNCATION_MARKER));
+    assert!(message.len() <= MAX_MESSAGE_BYTES);
+    let body: serde_json::Value =
+        serde_json::from_str(&message[message.find('{').unwrap()..]).expect("body is JSON");
+    assert_eq!(body["error_message"], TRUNCATION_MARKER);
+    assert_eq!(body["request_id"].as_str(), Some("req-stream-1"));
 }
 
 #[test]
 fn small_row_is_sent_whole() {
-    let message = datagram(&sample_row());
+    let message = message(&sample_row());
     assert!(!message.contains(TRUNCATION_MARKER));
     assert!(message.contains("SELECT 1"));
 }

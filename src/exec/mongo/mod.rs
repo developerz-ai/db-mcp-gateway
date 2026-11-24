@@ -22,12 +22,15 @@ mod bson_json;
 mod cancel;
 mod catalog;
 mod dispatch;
+mod error;
+mod infer;
 pub mod rejector;
 
 pub use catalog::sample_command;
 #[cfg(test)]
 mod tests;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -35,6 +38,7 @@ use async_trait::async_trait;
 use mongodb::Client;
 use mongodb::options::{ClientOptions, Credential, ServerAddress, Tls as MongoTls, TlsOptions};
 use secrecy::ExposeSecret;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::audit::drain::DetachedTasks;
 use crate::config::{Database, Server, Tls};
@@ -44,6 +48,7 @@ use uuid::Uuid;
 use super::adapter::{
     AdapterKind, DbAdapter, ExecError, ExecResult, TOKIO_TIMEOUT_SLACK_MS, effective_timeout_ms,
 };
+use super::pg::pool_metrics::{self, permits_sample};
 use super::pg::resolve_password;
 use super::pool_sizing::{CallerSlots, PoolSizing};
 use super::query::{
@@ -74,6 +79,11 @@ pub struct MongoAdapter {
     detached: DetachedTasks,
     /// Each caller's share of the driver's connection pool.
     callers: CallerSlots,
+    /// One permit per connection of the driver's pool. The driver's own
+    /// checkout waits with no bound of its own, inside the statement budget;
+    /// waiting here instead keeps a saturated pool from reading as a
+    /// `timeout`. Shared with the pool-gauge sampler.
+    connections: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for MongoAdapter {
@@ -107,7 +117,7 @@ impl MongoAdapter {
         // separate fields. Same posture as sqlx's `PgConnectOptions`.
         // `authSource` controls which database mongo verifies the role
         // against. Operators pick this per their deployment:
-        //   - `None` (default) → fall back to `database.name`: the
+        //   - `None` (default) → fall back to the connect name: the
         //     least-privilege per-db user pattern spec 12 §237 calls out.
         //   - `Some("admin")` → cross-db user (mongo's container bootstrap
         //     pattern, common in dev / quickstart setups).
@@ -120,7 +130,7 @@ impl MongoAdapter {
                 database
                     .auth_database
                     .clone()
-                    .unwrap_or_else(|| database.name.clone()),
+                    .unwrap_or_else(|| database.connect_name().to_string()),
             ))
             .build();
 
@@ -130,7 +140,7 @@ impl MongoAdapter {
                 port: Some(server.port),
             }])
             .credential(credential)
-            .default_database(database.name.clone())
+            .default_database(database.connect_name().to_string())
             .build();
         // The driver verifies chain and hostname by default, so `required`
         // and `verify_full` are the same here; Postgres `required` is not.
@@ -150,7 +160,15 @@ impl MongoAdapter {
 
         let client = Client::with_options(options).map_err(|_| ExecError::Connection)?;
         let db_label = format!("{}/{}", server.name, database.name);
-        let database_name = database.name.clone();
+        let database_name = database.connect_name().to_string();
+        let connections = Arc::new(Semaphore::new(
+            usize::try_from(sizing.max_connections).unwrap_or(usize::MAX),
+        ));
+        // The driver does not expose how many of its connections are idle.
+        let (label, max) = (db_label.clone(), sizing.max_connections);
+        pool_metrics::spawn_sampler(Arc::downgrade(&connections), move |permits: &Semaphore| {
+            pool_metrics::publish(&label, "query", permits_sample(permits, max, None));
+        });
         Ok(Self {
             client,
             db_label,
@@ -158,7 +176,24 @@ impl MongoAdapter {
             stale: AtomicBool::new(false),
             detached,
             callers: CallerSlots::new(sizing),
+            connections,
         })
+    }
+
+    /// A connection of the pool reserved for one command, waited for at most
+    /// [`CONNECT_TIMEOUT`] outside the statement budget, as on Postgres.
+    async fn reserve_connection(&self) -> Result<SemaphorePermit<'_>, ExecError> {
+        let started = std::time::Instant::now();
+        let reserved = tokio::time::timeout(CONNECT_TIMEOUT, self.connections.acquire()).await;
+        pool_metrics::record_acquire_wait(&self.db_label, "query", started.elapsed());
+        match reserved {
+            Ok(Ok(permit)) => Ok(permit),
+            // Timed out; the semaphore is never closed.
+            Ok(Err(_)) | Err(_) => {
+                tracing::warn!(db = %self.db_label, "mongo pool acquire timed out");
+                Err(ExecError::Unavailable)
+            }
+        }
     }
 }
 
@@ -212,9 +247,10 @@ impl DbAdapter for MongoAdapter {
         rejector::validate_command(query.sql)
             .map_err(|err| ExecError::Forbidden(err.to_string()))?;
 
-        // The caller's share of the pool, taken outside the time budget as
-        // the pg adapter's acquire is.
+        // The caller's share of the pool, then a connection of it, both
+        // taken outside the time budget as the pg adapter's acquire is.
         let _slot = self.callers.take(CONNECT_TIMEOUT).await?;
+        let _connection = self.reserve_connection().await?;
         let effective_ms = effective_timeout_ms(query.statement_timeout_ms);
         let budget = Duration::from_millis(u64::from(effective_ms) + TOKIO_TIMEOUT_SLACK_MS);
         match tokio::time::timeout(budget, self.dispatch(&query, effective_ms)).await {

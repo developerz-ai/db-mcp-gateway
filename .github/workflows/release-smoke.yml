@@ -1,9 +1,12 @@
 name: release-smoke
 
-# Post-publish evidence that the image people pull runs: per architecture, pull
-# `ghcr.io/<repo>:<version>` from the public registry with no credential, check the platform it
-# resolved to, and check `--version` reports the tag. After every successful release, weekly on
-# the "Latest" release (where it also checks `:latest` is that version), and by hand.
+# Post-publish evidence that the image people pull runs: per architecture and per registry
+# (GHCR with no credential, DOCR with `DOCR_TOKEN`), pull `<registry>/<repo>:<version>`, check
+# the platform it resolved to and that `--version` reports the tag, then boot it against a
+# throwaway state DB and check `/healthz` answers 200 and an unauthenticated `/mcp` 401. After
+# every successful release, weekly on the "Latest" release (where it also checks `:latest` is
+# that version), and by hand. A pull_request run (this file changed) smokes GHCR only: DOCR's
+# secret is not handed to PR runs.
 #
 # Not a gate: it runs after the publish, so a failure rolls nothing back. A red run is a
 # `health` finding for a maintainer; the fix ships as the next patch, never a re-tag.
@@ -73,11 +76,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        registry: [ghcr, docr]
         include:
           - runner: ubuntu-latest
             arch: amd64
           - runner: ubuntu-24.04-arm
             arch: arm64
+          - registry: ghcr
+            repo: ghcr.io/developerz-ai/db-mcp-gateway
+          - registry: docr
+            repo: registry.digitalocean.com/developerz-ai/db-mcp-gateway
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     permissions:
@@ -87,14 +96,22 @@ jobs:
       VERSION: ${{ needs.resolve.outputs.version }}
       CHECK_LATEST: ${{ needs.resolve.outputs.check_latest }}
       ARCH: ${{ matrix.arch }}
+      IMAGE: ${{ matrix.repo }}
+      # Every step below runs unless this leg is DOCR on a PR run.
+      SMOKE: ${{ matrix.registry == 'ghcr' || github.event_name != 'pull_request' }}
     steps:
+      - name: log in to docr
+        if: matrix.registry == 'docr' && env.SMOKE == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: registry.digitalocean.com
+          username: ${{ secrets.DOCR_TOKEN }}
+          password: ${{ secrets.DOCR_TOKEN }}
       - name: pull the published image
-        run: |
-          set -euo pipefail
-          image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          echo "IMAGE=$image" >> "$GITHUB_ENV"
-          docker pull -q "$image:$VERSION"
+        if: env.SMOKE == 'true'
+        run: docker pull -q "$IMAGE:$VERSION"
       - name: it is the platform this runner asked for
+        if: env.SMOKE == 'true'
         run: |
           set -euo pipefail
           got=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE:$VERSION")
@@ -103,6 +120,7 @@ jobs:
             exit 1
           fi
       - name: it runs and reports its tag
+        if: env.SMOKE == 'true'
         run: |
           set -euo pipefail
           got=$(docker run --rm "$IMAGE:$VERSION" --version)
@@ -110,11 +128,76 @@ jobs:
             echo "::error::$IMAGE:$VERSION reports '$got', expected 'db-mcp-gateway $VERSION'"
             exit 1
           fi
-          echo "$got on linux/$ARCH" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "$got on linux/$ARCH from ${{ matrix.registry }}" | tee -a "$GITHUB_STEP_SUMMARY"
+      # The binary boots, not just links: config parse, state-DB connect +
+      # migrations, then serving. Plain HTTP on loopback with the dev signing
+      # key — a smoke, never a deployment; the IdP is not contacted until a login.
+      - name: it boots against a state DB and serves
+        if: env.SMOKE == 'true'
+        run: |
+          set -euo pipefail
+          docker network create smoke
+          docker run -d --name state --network smoke \
+            -e POSTGRES_USER=gateway -e POSTGRES_PASSWORD=smoke-only -e POSTGRES_DB=gateway \
+            postgres:16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d
+          # Over TCP: on a fresh volume the image's init server listens on the
+          # unix socket only, which a socket probe would call ready.
+          ready=false
+          for _ in $(seq 60); do
+            if docker exec state pg_isready -h 127.0.0.1 -U gateway -d gateway -q; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != true ]; then
+            echo "::error::the smoke state DB never accepted TCP connections"
+            exit 1
+          fi
+          config="$RUNNER_TEMP/config.yml"
+          cat > "$config" <<'YAML'
+          servers:
+            - name: smoke
+              kind: postgres
+              host: state
+              port: 5432
+              tls: insecure
+              databases:
+                - name: gateway
+                  role: gateway
+                  password: ${ENV:TARGET_DB_PASSWORD}
+          permissions:
+            - group: smoke
+              grants:
+                - { server: smoke, database: gateway, action: query_read }
+          YAML
+          chmod 644 "$config"
+          docker run -d --name gateway --network smoke -p 127.0.0.1:8443:8443 \
+            -e TLS_DISABLED=true -e ALLOW_INSECURE_SIGNING_KEY=true \
+            -e OIDC_ISSUER=http://localhost:5556 -e OIDC_CLIENT_ID=smoke \
+            -e STATE_DB_URL=postgres://gateway:smoke-only@state:5432/gateway \
+            -e TARGET_DB_PASSWORD=smoke-only \
+            -v "$config:/etc/gateway/config.yml:ro" \
+            "$IMAGE:$VERSION"
+          healthz=000
+          for _ in $(seq 60); do
+            healthz=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8443/healthz || true)
+            [ "$healthz" = 200 ] && break
+            sleep 1
+          done
+          mcp=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8443/mcp \
+            -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' || true)
+          if [ "$healthz" != 200 ] || [ "$mcp" != 401 ]; then
+            echo "::error::$IMAGE:$VERSION on linux/$ARCH: /healthz $healthz (want 200), unauthenticated /mcp $mcp (want 401)"
+            docker logs gateway
+            exit 1
+          fi
+          echo "/healthz 200, /mcp 401 on linux/$ARCH from ${{ matrix.registry }}" | tee -a "$GITHUB_STEP_SUMMARY"
       # release.yml moves `:latest` before it cuts the GitHub Release, so while a release runs
       # the two legitimately disagree: that is a notice, not a failure.
       - name: ":latest is the Latest release"
-        if: env.CHECK_LATEST == 'true'
+        if: env.CHECK_LATEST == 'true' && env.SMOKE == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

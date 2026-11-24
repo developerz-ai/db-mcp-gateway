@@ -171,7 +171,7 @@ fn rejector_matrix() {
         (
             "non-JSON rejected",
             "definitely not JSON",
-            Err(RejectReason::Malformed),
+            Err(RejectReason::Malformed { line: 1, column: 1 }),
         ),
         (
             "JSON array rejected (not an object)",
@@ -182,6 +182,37 @@ fn rejector_matrix() {
             "empty object rejected",
             "{}",
             Err(RejectReason::EmptyCommand),
+        ),
+        // --- system collections --------------------------------------------
+        (
+            "find on system.profile denied",
+            r#"{"find":"system.profile","filter":{}}"#,
+            Err(RejectReason::SystemCollection("find".into())),
+        ),
+        (
+            "aggregate on system.js denied",
+            r#"{"aggregate":"system.js","pipeline":[],"cursor":{}}"#,
+            Err(RejectReason::SystemCollection("aggregate".into())),
+        ),
+        (
+            "count on system.views denied",
+            r#"{"count":"system.views"}"#,
+            Err(RejectReason::SystemCollection("count".into())),
+        ),
+        (
+            "distinct on system.users denied",
+            r#"{"distinct":"system.users","key":"user"}"#,
+            Err(RejectReason::SystemCollection("distinct".into())),
+        ),
+        (
+            "listIndexes on a system collection allowed (metadata)",
+            r#"{"listIndexes":"system.views"}"#,
+            Ok(()),
+        ),
+        (
+            "a name merely containing system. allowed",
+            r#"{"find":"app.system.logs","filter":{}}"#,
+            Ok(()),
         ),
     ];
 
@@ -206,4 +237,22 @@ fn display_never_leaks_command_values() {
     assert!(rendered.contains("$where"));
     assert!(!rendered.contains("123-45-6789"), "leaked SSN: {rendered}");
     assert!(!rendered.contains("ssn"), "leaked field name: {rendered}");
+}
+
+/// A malformed payload names where it broke — and nothing it contained.
+#[test]
+fn malformed_json_carries_line_and_column_only() {
+    let err = validate_command("{\"find\": \"users\",\n \"filter\": {\"ssn\": 'x'}}")
+        .expect_err("single-quoted string is not JSON");
+    assert_eq!(
+        err,
+        RejectReason::Malformed {
+            line: 2,
+            column: 20
+        }
+    );
+    assert!(err.is_malformed());
+    assert!(!err.to_string().contains("ssn"), "{err}");
+    assert!(RejectReason::EmptyCommand.is_malformed());
+    assert!(!RejectReason::DisallowedOperator("$out").is_malformed());
 }

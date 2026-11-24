@@ -57,7 +57,7 @@ fn parses_the_committed_example_file() {
         config
             .permissions
             .iter()
-            .any(|p| p.group == "backend-engineers")
+            .any(|p| p.group() == Some("backend-engineers"))
     );
 }
 

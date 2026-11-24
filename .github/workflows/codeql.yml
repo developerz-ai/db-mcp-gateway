@@ -1,0 +1,54 @@
+name: codeql
+
+# Static analysis of the Rust sources (CodeQL `rust`, build-mode none: it
+# extracts from source, so no compile and no cache). Advisory: findings land
+# in the Security tab; nothing here is a required check or in ci.yml's `gate`.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "src/**"
+      - "benchmarks/harness/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/codeql.yml"
+  schedule:
+    - cron: "17 5 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: rust
+          build-mode: none
+          # Test-only files hold planted secrets and fixed keys on purpose;
+          # scanning them only buries real findings.
+          config: |
+            paths-ignore:
+              - tests/**
+              - benchmarks/**
+              - "**/tests/**"
+              - "**/*_tests.rs"
+              - "**/*_proptests.rs"
+              - "**/tests.rs"
+      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:rust

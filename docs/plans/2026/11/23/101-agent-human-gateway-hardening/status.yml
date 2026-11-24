@@ -2,23 +2,29 @@ plan: 101-agent-human-gateway-hardening
 title: Gateway hardening + agent/human UX
 status: in_progress
 created_by: sebi
-worked_by: ""
+worked_by: claude
 owner: sebi
-percent: 5
-current_focus: "01: #376; owner rulesets left. Next: 02"
+percent: 90
+current_focus: "#381 carries every gateway slice (03-12) + PR review fixes; merge → 2.4.0 → deployments bump + GROUPS_MAX_AGE → consumer rows"
 slices:
-  - {file: 01-unblock-main.md, status: in_progress, percent: 90}
-  - {file: 02-security-patch.md, status: not_started, percent: 0}
-  - {file: 03-exec-correctness.md, status: not_started, percent: 0}
-  - {file: 04-auth-transport.md, status: not_started, percent: 0}
-  - {file: 05-audit-state.md, status: not_started, percent: 0}
-  - {file: 06-agent-surface.md, status: not_started, percent: 0}
-  - {file: 07-docs-onboarding.md, status: not_started, percent: 0}
-  - {file: 08-operator-tooling.md, status: not_started, percent: 0}
-  - {file: 09-ci-cd.md, status: not_started, percent: 0}
-  - {file: 10-dev-experience.md, status: not_started, percent: 0}
-  - {file: 11-repo-cleanup.md, status: not_started, percent: 0}
-  - {file: 12-tests.md, status: not_started, percent: 0}
-evidence: ["#376"]
-notes: "Human rows H1-H12 in overview.md. Slice 02 and SET detail: owner's private notes."
-last_updated: 2026-11-23
+  - {file: 01-unblock-main.md, status: in_progress, percent: 95, note: "gate job built (09a); owner: make `gate` the single required check"}
+  - {file: 02-security-patch.md, status: done, percent: 100, note: "#377 + #380, v2.3.1, GHSA-j6xv-c57r-59rw published; H2 (pg_query second parser) not started"}
+  - {file: 03-exec-correctness.md, status: in_progress, percent: 95, note: "#381; follow-ups: Mongo NaN in code_with_scope, Mongo cleanup without permit, pipeline $lookup to system.*"}
+  - {file: 04-auth-transport.md, status: in_progress, percent: 95, note: "#381; follow-ups: dedicated login error for a state-DB outage, hmac crate"}
+  - {file: 05-audit-state.md, status: in_progress, percent: 90, note: "#381; follow-ups: abandoned rows carry no params, syslog last-resort cut on a huge error_message"}
+  - {file: 06-agent-surface.md, status: in_progress, percent: 95, note: "#381 incl. PR6 (params, explain summary, history sql_sha256) + security-review fixes"}
+  - {file: 07-docs-onboarding.md, status: in_progress, percent: 90, note: "#381; demo re-run --wait on kept volumes exits 1 (Compose v5.8 + one-shot `ready`)"}
+  - {file: 08-operator-tooling.md, status: in_progress, percent: 90, note: "#381: CLI (--check/--healthcheck/roles/doctor/admin), metrics catalogue, deploy/ rules+dashboard+runbook+Helm+kustomize, HA login state (0022), admin API O10 (0023), config O13; chart not published to a chart repo"}
+  - {file: 09-ci-cd.md, status: in_progress, percent: 90, note: "#381 incl. wave b (C10-C14); owner: repo settings (private notes)"}
+  - {file: 10-dev-experience.md, status: in_progress, percent: 85, note: "X8 CLAUDE.md ~14.5 KB (target 10 KB not met)"}
+  - {file: 11-repo-cleanup.md, status: in_progress, percent: 85, note: "dead-API row left"}
+  - {file: 12-tests.md, status: in_progress, percent: 80, note: "#381; left: sentry_scrub/redact_role in-src proptests, redis_timeout sleeps (needs injectable timeouts), MockIdp/config-builder dedup"}
+decisions:
+  - {date: 2026-11-23, by: sebi, rows: [H3, H4, H6], decision: "accept recommendations"}
+  - {date: 2026-11-23, by: sebi, rows: [H7], decision: "MSRV 1.94.1 yes"}
+  - {date: 2026-11-23, by: sebi, rows: [H5], decision: "3.0 breaking rows later; additive rows now"}
+  - {date: 2026-11-23, by: sebi, rows: [H8, H10], decision: "go: audit blocks lock changes only + daily audit issue; delete .coderabbit.yaml/.devin/ (apps not installed)"}
+  - {date: 2026-11-23, by: sebi, rows: [H1, H9], decision: "full work: advisory drafted, published with 2.3.1; deny other-session statement views"}
+evidence: ["#376", "#377", "#380", "v2.3.1", "GHSA-j6xv-c57r-59rw"]
+notes: "Human rows H1-H12 in overview.md. Repo-settings detail: owner's private notes. Deployment and consumer slices tracked in their own repositories."
+last_updated: 2026-11-24

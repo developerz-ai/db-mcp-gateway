@@ -3,7 +3,7 @@ use serde_json::Value;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 use super::*;
-use crate::auth::oauth::{ClientRegistry, GrantIdentity};
+use crate::auth::oauth::{AuthCodes, ClientRegistry, GrantIdentity};
 use crate::transport::app_state::offline_for_tests;
 
 // RFC 7636 Appendix B test vector.
@@ -37,6 +37,7 @@ async fn redeem(state: &OAuthState) -> (StatusCode, Value) {
         code_verifier: Some(VERIFIER.into()),
         refresh_token: None,
         client_id: Some("client-1".into()),
+        resource: None,
     };
     let response = token(State(state.clone()), Ok(Form(form))).await;
     let status = response.status();
@@ -58,7 +59,13 @@ async fn a_failed_promotion_leaves_the_code_redeemable() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["error"], "server_error");
     assert!(
-        state.auth.codes.take(CODE).await.is_some(),
+        state
+            .auth
+            .codes
+            .take(CODE)
+            .await
+            .expect("memory take")
+            .is_some(),
         "a retryable 503 consumed the authorization code"
     );
 }
@@ -73,7 +80,13 @@ async fn a_failed_mint_leaves_the_code_redeemable() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["error"], "server_error");
     assert!(
-        state.auth.codes.take(CODE).await.is_some(),
+        state
+            .auth
+            .codes
+            .take(CODE)
+            .await
+            .expect("memory take")
+            .is_some(),
         "a retryable 503 consumed the authorization code"
     );
 }
@@ -90,8 +103,32 @@ async fn a_failed_pkce_check_still_consumes_the_code() {
         code_verifier: Some("wrong-verifier".into()),
         refresh_token: None,
         client_id: None,
+        resource: None,
     };
     let response = token(State(state.clone()), Ok(Form(form))).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert!(state.auth.codes.take(CODE).await.is_none());
+    assert!(
+        state
+            .auth
+            .codes
+            .take(CODE)
+            .await
+            .expect("memory take")
+            .is_none()
+    );
+}
+
+/// The code store itself is unreachable: nothing was taken or issued, so the
+/// client is told to retry rather than to restart authorization.
+#[tokio::test]
+async fn an_unreachable_code_store_is_a_retryable_503() {
+    let mut state = offline_for_tests().oauth;
+    let down = PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(200))
+        .connect_lazy_with(PgConnectOptions::new().host("offline.invalid"));
+    state.auth.codes = AuthCodes::with_db(down);
+
+    let (status, body) = redeem(&state).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "server_error");
 }

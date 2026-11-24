@@ -1,0 +1,219 @@
+# db-mcp-gateway chart values. Secrets are never values here: the chart
+# references Secrets you create (sealed-secrets, external-secrets, Vault, …).
+# Guide: website/docs/deployment/kubernetes.md.
+
+image:
+  repository: ghcr.io/developerz-ai/db-mcp-gateway
+  # Empty = the chart's appVersion.
+  tag: ""
+  # sha256:… — pins the exact image; takes precedence over tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Two replicas: login state, sessions and audit live in the state DB, so no
+# sticky routing is needed (spec 02 §HA).
+replicaCount: 2
+
+# The gateway's YAML config (servers + permissions), mounted read-only at
+# /etc/gateway/config/config.yml. A change rolls the pods (checksum
+# annotation): Kubernetes sends no SIGHUP. Passwords are `${FILE:…}` refs to
+# a Secret mounted with `secretMounts`, never literals.
+config: |
+  gateway:
+    env: production
+  servers: []
+  permissions: []
+
+# Existing Secret holding the gateway's own secrets as env vars. Required keys:
+# the state DB URL and the session signing key (≥ 32 bytes, the same on every
+# replica). The OIDC client secret key is read when present.
+secrets:
+  existingSecret: db-mcp-gateway
+  keys:
+    stateDbUrl: STATE_DB_URL
+    sessionSigningKey: SESSION_SIGNING_KEY
+    oidcClientSecret: OIDC_CLIENT_SECRET
+
+# Extra Secrets mounted read-only for `${FILE:/path}` refs in `config`, e.g.
+#   - name: prod-app-ro
+#     secretName: prod-app-ro
+#     mountPath: /etc/gateway/secrets/prod-app-ro
+secretMounts: []
+
+oidc:
+  # All three required.
+  issuer: ""
+  clientId: ""
+  # https://<public host>/auth/callback — the same on every replica.
+  redirectUrl: ""
+
+# Boot retries an unreachable state DB this long, then exits. The listener
+# binds only afterwards, so the startupProbe gets this budget plus
+# `startupMarginSeconds` (migrations, TLS load).
+stateDb:
+  connectTimeoutSeconds: 60
+startupMarginSeconds: 60
+
+tls:
+  # false = plain HTTP behind a TLS-terminating proxy on a trusted network
+  # (TLS_DISABLED=true); probes switch to HTTP.
+  enabled: true
+  # A kubernetes.io/tls Secret. Empty with certManager.enabled = <fullname>-tls.
+  secretName: ""
+  # A cert-manager Certificate writing that Secret. A renewal reaches the pod
+  # only on restart: add a reloader annotation in podAnnotations.
+  certManager:
+    enabled: false
+    issuerRef:
+      kind: ClusterIssuer
+      name: ""
+    dnsNames: []
+
+# Anything else the gateway reads (website/docs/deployment/quickstart.md env
+# table): plain values or valueFrom refs.
+extraEnv: []
+#  - name: TRUSTED_PROXIES
+#    value: 10.0.0.0/8
+#  - name: PROD_APP_RO_PASSWORD
+#    valueFrom: { secretKeyRef: { name: prod-app-ro, key: password } }
+
+service:
+  type: ClusterIP
+  port: 443
+  annotations: {}
+
+metrics:
+  # METRICS_BIND: /metrics plus probe copies of /healthz and /readyz. Served
+  # by its own ClusterIP Service so an Ingress never routes to it.
+  port: 9090
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+  # A PrometheusRule from deploy/prometheus/rules.yaml.
+  prometheusRule:
+    enabled: false
+    labels: {}
+
+# Shutdown: the gateway drains requests 80 s, detached audit writes 20 s and
+# its state-DB pools 2 × 10 s = 120 s after SIGTERM. The preStop sleep runs
+# first so endpoints drop the pod before it stops accepting work. The chart
+# refuses a grace period below 120 + preStopSleepSeconds.
+terminationGracePeriodSeconds: 130
+preStopSleepSeconds: 10
+
+probes:
+  liveness:
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 2
+  startup:
+    periodSeconds: 5
+    timeoutSeconds: 3
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+  seccompProfile:
+    type: RuntimeDefault
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+# Every egress rule is `{ to: [peers], ports: [...] }`; an empty `to` allows
+# any destination on those ports — narrow it to your CIDRs or selectors. With
+# the policy on, target egress must be chosen: scoped `targets` or the
+# `anyTarget` opt-in; the chart fails to render with neither.
+networkPolicy:
+  enabled: true
+  ingress:
+    # Who reaches the MCP/OAuth port: NetworkPolicy peers (the ingress
+    # controller, agent namespaces), or the string `any` to admit every
+    # source. Required: the chart fails to render while it is empty.
+    gatewayFrom: []
+    #   - namespaceSelector:
+    #       matchLabels:
+    #         kubernetes.io/metadata.name: ingress-nginx
+    # Who scrapes METRICS_BIND; empty = no scraper (the metrics port is closed).
+    metricsFrom:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: monitoring
+  egress:
+    dns:
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+    stateDb:
+      to: []
+      ports:
+        - { port: 5432, protocol: TCP }
+    # OIDC discovery, JWKS and token exchange.
+    idp:
+      to: []
+      ports:
+        - { port: 443, protocol: TCP }
+    # One rule per target set, each with a non-empty `to` (the chart refuses
+    # an empty one), e.g.
+    #   - to: [{ ipBlock: { cidr: 10.30.0.0/16 } }]
+    #     ports: [{ port: 5432, protocol: TCP }]
+    targets: []
+    # Opt-in: the target ports to EVERY destination. Refused alongside a fenced
+    # `stateDb.to`: it would reopen the state DB's 5432 to anywhere.
+    anyTarget:
+      enabled: false
+      ports:
+        - { port: 5432, protocol: TCP }
+        - { port: 3306, protocol: TCP }
+        - { port: 27017, protocol: TCP }
+        - { port: 6379, protocol: TCP }
+    # Audit syslog sinks, GlitchTip, …
+    extra: []

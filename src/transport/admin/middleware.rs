@@ -25,9 +25,9 @@
 //!   routes specifically (e.g. `3600` = 1 h). A user with a session older than
 //!   this limit is forced to re-login, at which point IdP group state applies.
 //!
-//! The `permissions_users` upsert for the acting admin is intentionally absent
-//! here. Mutation handlers (POST / PATCH / DELETE) upsert it inside their own
-//! transaction ([`super::audited_tx::AuditedTx`]) so the actor-row write and
+//! The acting admin's `permissions_users` row is intentionally not touched
+//! here. Mutation handlers (POST / PATCH / DELETE) insert it if absent inside
+//! their own transaction ([`super::audited_tx::AuditedTx`]) so the actor-row write and
 //! the `permissions_audit` row are atomic. Read-only GETs never write to
 //! `permissions_users` at all — a GET does not produce an audit row and
 //! should not trigger a DB write.

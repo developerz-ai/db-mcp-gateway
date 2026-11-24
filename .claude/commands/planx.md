@@ -28,7 +28,7 @@ $ARGUMENTS
 1-2 sentences: what + why.
 
 ## Context
-- Stack facts the executor needs (Rust stable, tokio, axum, sqlx postgres-first, hand-rolled JSON-RPC over HTTP+SSE, serde+YAML config validated at boot, Postgres state store — only what's relevant).
+- Stack facts the executor needs (Rust toolchain from `rust-toolchain.toml`, tokio, axum, sqlx — Postgres targets (YugabyteDB YSQL included) and the MySQL permissions store (MySQL is not a query target) — mongodb + redis drivers for those targets, hand-rolled JSON-RPC over POST-only Streamable HTTP, serde-saphyr YAML config validated at boot, Postgres state store, `pg` or `mysql` permissions store — only what's relevant).
 - Which of the CLAUDE.md Non-negotiables this touches (credentials never leave the gateway / SSO identity → audit row / read-only by default / synchronous audit / permissions in YAML-by-PR or SSO admin API).
 - Reference patterns: `src/<layer>/<thing>.rs:12` — follow this for Z.
 - `security review required` label needed? (touching `src/auth/`, `src/authz/`, credential loading, audit write path, any new MCP tool, or SQL execution).
@@ -38,7 +38,7 @@ $ARGUMENTS
 2. [`02-<aspect>.md`](02-<aspect>.md) — ...
 
 ## Done when
-- Verifiable acceptance criteria spanning the whole feature. Includes: `bin/lint` clean, `bin/test` green, audit rows asserted for every tool path (incl. `outcome: forbidden` on failed authz).
+- Verifiable acceptance criteria spanning the whole feature. Includes: `bin/lint` clean, `bin/check` green, audit rows asserted for every tool path (incl. `outcome: forbidden` on failed authz).
 
 ## Risks / open questions
 - Anything the executor must decide or watch (authz constraint-merge edges, timeout/row-cap/cancellation, credential leakage in errors/logs).
@@ -58,7 +58,7 @@ $ARGUMENTS
 1. Ordered, concrete actions. Reference `Type::method` / `file:line`, don't restate.
 
 ## Tests
-- What to add/run. Tests written with the code. Unit = pure logic (no real DB); integration = real Postgres, NEVER mock the target DB; property tests (`proptest`) for authz constraint-merge. Command: `bin/test` (or `bin/test --test <name>` / `cargo test <pattern>`), `bin/lint`.
+- What to add/run. Tests written with the code. Unit = pure logic (no real DB); integration = real DBs from the dev stack, NEVER mock the target DB; property tests (`proptest`) for authz constraint-merge. Commands through the queued `bin/` wrappers only: `bin/test --unit` (no Docker), `bin/test --test it_db <module>::`, `bin/test-yugabyte` for Postgres exec-path changes, `bin/lint`; never a raw `cargo test` against `tests/it_db/` (it skips the dev-DB lock). New `tests/it_db/` tests declare `#[serial_test::serial(world)]` or `#[serial_test::parallel(world)]`.
 
 ## Done when
 - Verifiable acceptance criteria for this slice.

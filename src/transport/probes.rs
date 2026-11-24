@@ -93,9 +93,13 @@ async fn probe_state_db(pool: &PgPool) -> Result<(), ()> {
     match tokio::time::timeout(READYZ_DB_TIMEOUT, probe).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => {
-            // Body stays generic on purpose — the error may contain a host
-            // or role name; spec 05 forbids leaking either via HTTP.
-            tracing::warn!(%err, "readyz: state db query failed");
+            // A `sqlx::Error` can render the DSN, password included: only
+            // its credential-free class reaches the log (MUST #1), and the
+            // body stays generic.
+            tracing::warn!(
+                error_class = %crate::state::connect_error_class(&err),
+                "readyz: state db query failed"
+            );
             Err(())
         }
         Err(_elapsed) => {

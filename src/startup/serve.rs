@@ -6,8 +6,11 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+use axum::Extension;
 use db_mcp_gateway::config::reload::ReloadTargets;
 use db_mcp_gateway::config::{Config, TlsConfig};
+use db_mcp_gateway::transport::client_ip::TrustedProxies;
+use db_mcp_gateway::transport::origin::AllowedOrigins;
 use db_mcp_gateway::transport::{self, AppState, tls};
 
 use super::{install_shutdown_signal, spawn_reload_on_sighup};
@@ -38,7 +41,12 @@ pub(crate) async fn serve(
         permissions_cache: app_state.mcp.permissions_cache.clone(),
         adapter_registry: app_state.mcp.adapter_registry.clone(),
     };
-    let app = transport::router(config, app_state)?;
+    super::metrics::loaded::record_config_loaded(&reload.path).await;
+    let allowed_origins = AllowedOrigins::from_env(config.bind)?;
+    let trusted_proxies = TrustedProxies::from_env()?;
+    let app = transport::router(config, app_state)?
+        .layer(Extension(allowed_origins))
+        .layer(Extension(trusted_proxies));
 
     let handle = axum_server::Handle::new();
     let handle_for_signal = handle.clone();
@@ -56,6 +64,7 @@ pub(crate) async fn serve(
             key_path,
         } => {
             let rustls = tls::load(&cert_path, &key_path).await?;
+            super::metrics::loaded::record_cert_loaded(&cert_path).await;
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
                 addr = %config.bind,

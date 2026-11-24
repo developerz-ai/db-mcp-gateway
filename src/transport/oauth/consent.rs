@@ -4,19 +4,23 @@
 //! receives the code; this page asks the signed-in user, after `/auth/callback`,
 //! before any code is minted. See website/docs/initial-idea/04-auth-sso.md.
 
-use axum::Form;
 use axum::extract::State;
 use axum::extract::rejection::FormRejection;
-use axum::http::header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, REFERRER_POLICY};
-use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
+use axum::{Extension, Form};
 use serde::Deserialize;
 use url::Url;
 
 use super::super::app_state::OAuthState;
 use super::bridge_login::issue_code;
 use super::helpers::{oauth_error, random_token, redirect_with_error};
+use super::pages::{
+    NO_GROUPS_NOTICE, PageContext, consent_rejected, escape_html, login_unavailable,
+    with_page_headers,
+};
 use crate::auth::oauth::{AuthFacade, ClientName, GrantIdentity, OAuthBridge};
+use crate::transport::request_id::GatewayRequestId;
 
 /// Where the consent form posts. Mounted by `transport::router`.
 pub(in crate::transport) const CONSENT_PATH: &str = "/authorize/consent";
@@ -27,6 +31,7 @@ pub(super) async fn request_consent(
     auth: &AuthFacade,
     identity: GrantIdentity,
     bridge: OAuthBridge,
+    page: &PageContext,
 ) -> Response {
     // The redirect was validated at /register and matched at /authorize, so
     // this only fails on a corrupted registry row: fail closed, no redirect.
@@ -39,8 +44,10 @@ pub(super) async fn request_consent(
     };
     let consent_id = random_token();
     let csrf = random_token();
-    let page = consent_page(&ConsentView {
+    let html = consent_page(&ConsentView {
         email: &identity.email,
+        no_groups: identity.groups.is_empty(),
+        footer: &page.footer(),
         client_id: &bridge.client_id,
         client_name: bridge.client_name.as_ref().map(ClientName::as_str),
         redirect_uri: &bridge.client_redirect_uri,
@@ -48,10 +55,18 @@ pub(super) async fn request_consent(
         consent_id: &consent_id,
         csrf: &csrf,
     });
-    auth.flows
-        .insert_consent(consent_id, csrf, identity, bridge)
-        .await;
-    with_page_headers(Html(page).into_response(), Some(&target.origin))
+    // Cloned: the error path below still redirects with it.
+    if auth
+        .flows
+        .insert_consent(&consent_id, &csrf, identity, bridge.clone())
+        .await
+        .is_err()
+    {
+        // Same always-redirect contract as a failed code mint: the client's
+        // listener is waiting for an answer.
+        return redirect_with_error(&bridge, "temporarily_unavailable");
+    }
+    with_page_headers(Html(html).into_response(), Some(&target.origin))
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,7 +76,7 @@ pub enum Decision {
     Deny,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConsentForm {
     consent_id: String,
@@ -69,22 +84,35 @@ pub struct ConsentForm {
     decision: Decision,
 }
 
+/// Both ids are bearer values for the pending consent.
+impl std::fmt::Debug for ConsentForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsentForm")
+            .field("decision", &self.decision)
+            .finish_non_exhaustive()
+    }
+}
+
 /// `POST /authorize/consent` — the user's answer. Approve mints the code and
 /// 303s it to the client; deny 303s `access_denied` (RFC 6749 §4.1.2.1). An
 /// unknown, expired, reused or CSRF-mismatched submission releases nothing.
 pub async fn consent(
     State(state): State<OAuthState>,
+    Extension(request_id): Extension<GatewayRequestId>,
     form: Result<Form<ConsentForm>, FormRejection>,
 ) -> Response {
+    let page = PageContext::new(&state.auth, request_id);
     let Ok(Form(form)) = form else {
-        return consent_rejected();
+        return consent_rejected(&page);
     };
-    let Some(pending) = state.auth.flows.take_consent(&form.consent_id).await else {
-        return consent_rejected();
+    let pending = match state.auth.flows.take_consent(&form.consent_id).await {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return consent_rejected(&page),
+        Err(_) => return login_unavailable(&page),
     };
     if !pending.csrf_matches(&form.csrf) {
-        tracing::warn!("consent submission with a mismatched CSRF token; flow discarded");
-        return consent_rejected();
+        tracing::warn!(%request_id, "consent submission with a mismatched CSRF token; flow discarded");
+        return consent_rejected(&page);
     }
     match form.decision {
         Decision::Approve => issue_code(&state.auth, pending.identity, &pending.bridge).await,
@@ -115,6 +143,10 @@ impl RedirectTarget {
 #[derive(Debug)]
 struct ConsentView<'a> {
     email: &'a str,
+    /// The login carried no groups: say so before the user approves.
+    no_groups: bool,
+    /// Pre-rendered HTML from [`PageContext::footer`].
+    footer: &'a str,
     client_id: &'a str,
     client_name: Option<&'a str>,
     redirect_uri: &'a str,
@@ -133,20 +165,24 @@ fn consent_page(view: &ConsentView<'_>) -> String {
     let host = escape_html(view.redirect_host);
     let consent_id = escape_html(view.consent_id);
     let csrf = escape_html(view.csrf);
+    let no_groups = if view.no_groups { NO_GROUPS_NOTICE } else { "" };
+    let footer = view.footer;
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
 <title>Authorize application</title><style>\
 body{{font-family:system-ui,sans-serif;max-width:34rem;margin:4rem auto;padding:0 1rem;line-height:1.5}}\
 .host{{font-size:1.4rem;font-weight:700;word-break:break-all}}\
-.unverified{{color:#555;font-size:.9rem}}\
+.unverified,.meta{{color:#555;font-size:.9rem}}\
+.meta{{border-top:1px solid #ccc;margin-top:2rem;padding-top:1rem}}\
+.warn{{border-left:4px solid #b45309;padding-left:.75rem}}\
 code{{word-break:break-all}}button{{font-size:1rem;padding:.5rem 1.25rem;margin-right:.75rem}}\
 </style></head><body>\
 <h1>Authorize database access?</h1>\
 <p>You are signed in as <strong>{email}</strong>. An application is asking for \
 access to the database gateway on your behalf. If you approve, your access will \
 be sent to:</p>\
-<p class=\"host\">{host}</p>\
+<p class=\"host\">{host}</p>{no_groups}\
 <p>Full redirect: <code>{redirect_uri}</code><br>Client ID: <code>{client_id}</code> \
 (self-registered; the gateway has not verified who operates it).</p>\
 <p class=\"unverified\">Name the application gave itself (unverified, anyone can \
@@ -158,60 +194,8 @@ Otherwise deny.</p>\
 <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
 <button type=\"submit\" name=\"decision\" value=\"deny\">Deny</button>\
 <button type=\"submit\" name=\"decision\" value=\"approve\">Approve</button>\
-</form></body></html>"
+</form>{footer}</body></html>"
     )
-}
-
-/// Headers for the consent page: no framing (clickjacking a consent button is
-/// the obvious attack), no scripts, no caching of the one-time tokens, and
-/// forms may post only here — and redirect only to the client's origin.
-fn with_page_headers(mut response: Response, redirect_origin: Option<&str>) -> Response {
-    let csp = format!(
-        "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; \
-         frame-ancestors 'none'; form-action 'self' {}",
-        redirect_origin.unwrap_or_default()
-    );
-    let headers = response.headers_mut();
-    if let Ok(csp) = HeaderValue::from_str(&csp) {
-        headers.insert(CONTENT_SECURITY_POLICY, csp);
-    }
-    headers.insert(
-        HeaderName::from_static("x-frame-options"),
-        HeaderValue::from_static("DENY"),
-    );
-    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
-    headers.insert(
-        HeaderName::from_static("x-content-type-options"),
-        HeaderValue::from_static("nosniff"),
-    );
-    response
-}
-
-/// A submission that cannot be tied to a live consent. Never redirects: with
-/// no trusted flow there is no client redirect to send anything to.
-fn consent_rejected() -> Response {
-    let body = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-<title>Authorization not completed</title></head><body>\
-<h1>Authorization not completed</h1><p>This approval link expired or was already \
-used. Start the connection again from your client.</p></body></html>";
-    let response = (StatusCode::BAD_REQUEST, Html(body)).into_response();
-    with_page_headers(response, None)
-}
-
-fn escape_html(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for c in raw.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#x27;"),
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -219,17 +203,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn escape_html_neutralises_markup() {
-        assert_eq!(
-            escape_html("<a href=\"x\">'&'</a>"),
-            "&lt;a href=&quot;x&quot;&gt;&#x27;&amp;&#x27;&lt;/a&gt;"
-        );
-    }
-
-    #[test]
     fn page_escapes_every_interpolated_value() {
         let page = consent_page(&ConsentView {
             email: "<script>e</script>",
+            no_groups: false,
+            footer: "",
             client_id: "\"><img>",
             client_name: Some("<script>alert(1)</script>"),
             redirect_uri: "https://evil.example/cb?<x>",
@@ -251,6 +229,8 @@ mod tests {
     fn missing_name_reads_as_no_name_and_host_stays_prominent() {
         let page = consent_page(&ConsentView {
             email: "u@example.com",
+            no_groups: false,
+            footer: "<p class=\"meta\">footer</p>",
             client_id: "mcp-1",
             client_name: None,
             redirect_uri: "https://app.example/cb",
@@ -265,18 +245,31 @@ mod tests {
     }
 
     #[test]
-    fn page_headers_forbid_framing_and_caching() {
+    fn redirect_target_splits_host_and_origin() {
         let target = RedirectTarget::parse("https://app.example.com:8443/cb").expect("valid");
         assert_eq!(target.host, "app.example.com");
-        let response = with_page_headers(Html("x").into_response(), Some(&target.origin));
-        let header = |name: &str| response.headers()[name].to_str().unwrap().to_owned();
-        assert_eq!(header("x-frame-options"), "DENY");
-        assert_eq!(header("cache-control"), "no-store");
-        let csp = header("content-security-policy");
-        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
-        assert!(
-            csp.contains("form-action 'self' https://app.example.com:8443"),
-            "{csp}"
-        );
+        assert_eq!(target.origin, "https://app.example.com:8443");
+    }
+
+    #[test]
+    fn a_login_without_groups_is_told_so_before_approving() {
+        let view = |no_groups| ConsentView {
+            email: "u@example.com",
+            no_groups,
+            footer: "<p class=\"meta\">footer</p>",
+            client_id: "mcp-1",
+            client_name: None,
+            redirect_uri: "https://app.example/cb",
+            redirect_host: "app.example",
+            consent_id: "id",
+            csrf: "tok",
+        };
+        let warned = consent_page(&view(true));
+        assert!(warned.contains("<strong>no groups</strong>"), "{warned}");
+        let notice = warned.find("no groups").expect("notice");
+        let form = warned.find("<form").expect("form");
+        assert!(notice < form, "the notice renders before the buttons");
+        assert!(warned.ends_with("<p class=\"meta\">footer</p></body></html>"));
+        assert!(!consent_page(&view(false)).contains("no groups"));
     }
 }

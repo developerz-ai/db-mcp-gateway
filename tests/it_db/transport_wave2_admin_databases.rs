@@ -1,5 +1,6 @@
-//! `/admin/v1/databases` only registers databases on servers the gateway
-//! config declares — the same rule a wildcard grant already obeys. A refused
+//! `/admin/v1/databases` only registers databases the gateway config declares
+//! — server and database (A4) — the same rule a wildcard grant already obeys,
+//! so no row can sit dormant until a later reload arms it. A refused
 //! create or rename writes neither a row nor a `permissions_audit` entry
 //! (spec 12: a rejected request leaves the store and the audit table
 //! unchanged). Requires the dev state DB (`bin/dev up`).
@@ -37,12 +38,20 @@ struct Harness {
     pool: PgPool,
     jwt: String,
     admin_sub: String,
+    /// A database `prod` declares for this harness alone.
+    declared: String,
 }
 
 async fn spawn() -> Harness {
     let pool = state_pool().await;
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
-    let gw = GatewayBuilder::new(CONFIG_YAML)
+    let declared = format!("wave2-{}", Uuid::new_v4().simple());
+    let app = "      - { name: app, role: ro, password: hunter2 }\n";
+    let yaml = CONFIG_YAML.replace(
+        app,
+        &format!("{app}      - {{ name: {declared}, role: ro, password: hunter2 }}\n"),
+    );
+    let gw = GatewayBuilder::new(&yaml)
         .admin(ADMIN_GROUP, true)
         .repo(repo)
         .spawn(pool)
@@ -71,6 +80,7 @@ async fn spawn() -> Harness {
         pool: gw.state_db,
         jwt,
         admin_sub,
+        declared,
     }
 }
 
@@ -141,7 +151,7 @@ async fn create_on_an_undeclared_server_is_refused_without_a_trace() {
 #[serial_test::parallel(world)]
 async fn rename_onto_an_undeclared_server_is_refused_and_row_unchanged() {
     let h = spawn().await;
-    let db_name = format!("wave2-{}", Uuid::new_v4().simple());
+    let db_name = h.declared.clone();
     let (status, created) = h
         .send(
             reqwest::Method::POST,
@@ -172,4 +182,85 @@ async fn rename_onto_an_undeclared_server_is_refused_and_row_unchanged() {
         .unwrap();
     assert_eq!(server, "prod");
     h.cleanup(&[id]).await;
+}
+
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn create_of_an_undeclared_database_is_refused_without_a_trace() {
+    let h = spawn().await;
+    let db_name = format!("wave2-undeclared-{}", Uuid::new_v4().simple());
+    let (status, err) = h
+        .send(
+            reqwest::Method::POST,
+            "/admin/v1/databases",
+            json!({ "server": "prod", "db_name": db_name, "db_type": "postgres" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+    assert_eq!(err["error"]["code"], "invalid_request");
+    let message = err["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("db_name") && message.contains("prod"),
+        "{err}"
+    );
+    assert_eq!(h.rows_named(&db_name).await, (0, 0), "no row, no audit");
+    h.cleanup(&[]).await;
+}
+
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn rename_onto_an_undeclared_database_is_refused_and_row_unchanged() {
+    let h = spawn().await;
+    let db_name = h.declared.clone();
+    let (status, created) = h
+        .send(
+            reqwest::Method::POST,
+            "/admin/v1/databases",
+            json!({ "server": "prod", "db_name": db_name, "db_type": "postgres" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+
+    let undeclared = format!("wave2-undeclared-{}", Uuid::new_v4().simple());
+    let (status, err) = h
+        .send(
+            reqwest::Method::PATCH,
+            &format!("/admin/v1/databases/{id}"),
+            json!({ "db_name": undeclared }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+    assert_eq!(err["error"]["code"], "invalid_request");
+    // Only the create's audit row; the refused PATCH left none.
+    assert_eq!(h.rows_named(&db_name).await, (1, 1));
+    assert_eq!(h.rows_named(&undeclared).await, (0, 0));
+    h.cleanup(&[id]).await;
+}
+
+/// A13: admin bodies carry subjects, emails and grant sets — success and
+/// refusal alike are `Cache-Control: no-store`.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn admin_responses_are_never_cached() {
+    let h = spawn().await;
+    let client = reqwest::Client::new();
+    let ok = client
+        .get(format!("{}/admin/v1/databases", h.base_url))
+        .bearer_auth(&h.jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    assert_eq!(ok.headers()["cache-control"], "no-store");
+    let refused = client
+        .post(format!("{}/admin/v1/databases", h.base_url))
+        .bearer_auth(&h.jwt)
+        .json(&json!({ "server": "nope", "db_name": "x", "db_type": "postgres" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(refused.headers()["cache-control"], "no-store");
+    h.cleanup(&[]).await;
 }

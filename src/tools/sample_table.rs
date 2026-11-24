@@ -3,25 +3,37 @@
 //!
 //! Schema and table are caller input that the adapter interpolates as
 //! identifiers, so both must parse as [`Identifier`] here; anything else is
-//! rejected before the adapter sees it.
+//! rejected before the adapter sees it. Which rule `table` follows depends
+//! on the server's kind, so before authz it is held only to the loosest one
+//! (a collection name) and to the target's own rule after: an ungranted
+//! caller gets the same answer for every server, configured or not.
 
+use std::collections::HashSet;
+use std::num::NonZeroU32;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{Action, Grant};
+use crate::config::{Action, Grant, ServerKind};
+use crate::exec::mongo::rejector::is_system_collection;
 use crate::exec::mongo::sample_command;
 use crate::exec::sql_guard::Access;
-use crate::exec::{IDENTIFIER_PATTERN, Identifier, SampleQuery};
+use crate::exec::{
+    COLLECTION_PATTERN, ExecError, ExecResult, IDENTIFIER_PATTERN, Identifier, SampleQuery,
+};
 use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
-use super::args::parse_arguments;
+use super::args::{LIMIT_AT_LEAST_ONE, parse_arguments};
 use super::audit_dispatch::{
-    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, audit_outcome, error_outcome,
-    invalid_arguments, outcome_from_exec_error, reject_arguments, run_audited, success_outcome,
+    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, audit_outcome, elapsed_ms_since,
+    error_outcome, invalid_arguments, note_timeout_limit, outcome_from_exec_error,
+    reject_arguments, run_audited,
 };
+use super::tabular::caps::{ByteCaps, MaxBytes, RowLimit};
+use super::tabular::columns::project;
+use super::tabular::{RowShaping, rows_outcome};
 use super::target::{effective_row_limit, ensure_reason, forbidden, record_intent, resolve_target};
 
 const TOOL_NAME: &str = "sample_table";
@@ -48,15 +60,20 @@ pub struct Arguments {
     pub limit: Option<u32>,
     #[serde(default)]
     pub reason: Option<String>,
+    /// Return only these columns (on Mongo: these top-level fields).
+    #[serde(default)]
+    pub columns: Option<Vec<String>>,
+    /// Cap on the JSON size of the returned rows (spec 03 §Results).
+    #[serde(default)]
+    pub max_bytes: Option<MaxBytes>,
+    /// Cap on one cell's JSON size; a larger cell becomes a marker.
+    #[serde(default)]
+    pub max_cell_bytes: Option<NonZeroU32>,
 }
 
+/// `sample_table` has no fields beyond the shared row-result ones.
 #[derive(Debug, Serialize)]
-struct SuccessPayload<'a> {
-    columns: &'a [String],
-    rows: &'a [Vec<Value>],
-    truncated: bool,
-    elapsed_ms: u64,
-}
+struct NoExtraFields {}
 
 pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Response {
     let args: Arguments = match parse_arguments(arguments) {
@@ -72,15 +89,23 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
         reason: args.reason.as_deref(),
         db_type: super::db_type_for_server(ctx.config, &args.server),
     };
+    if args.limit == Some(0) {
+        let outcome = invalid_arguments(id.clone(), LIMIT_AT_LEAST_ONE);
+        return audit_outcome(ctx, id, header, outcome).await;
+    }
     // Validated at the edge: the adapter interpolates both as identifiers,
     // and the audit row names the table they make up.
     let table = match parse_table(args.schema.as_deref(), &args.table) {
         Ok(table) => table,
-        Err(field) => {
-            let outcome = invalid_arguments(
-                id.clone(),
-                &format!("`{field}` must match {IDENTIFIER_PATTERN}"),
-            );
+        Err((field, pattern)) => {
+            let outcome = invalid_arguments(id.clone(), &format!("`{field}` must match {pattern}"));
+            return audit_outcome(ctx, id, header, outcome).await;
+        }
+    };
+    let columns = match parse_columns(args.columns.as_deref()) {
+        Ok(columns) => columns,
+        Err(message) => {
+            let outcome = invalid_arguments(id.clone(), &message);
             return audit_outcome(ctx, id, header, outcome).await;
         }
     };
@@ -88,7 +113,7 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
     header.sql = Some(&read);
     let args = &args;
     run_audited(ctx, id, header, |id, grants| async move {
-        compute_outcome(ctx, id, &grants, &header, args, table).await
+        compute_outcome(ctx, id, &grants, &header, args, table, &columns).await
     })
     .await
 }
@@ -109,11 +134,56 @@ fn audited_read(db_type: Option<&str>, table: TableRef<'_>) -> String {
     }
 }
 
-/// `Err` names the argument that is not an identifier.
-fn parse_table<'a>(schema: Option<&'a str>, table: &'a str) -> Result<TableRef<'a>, &'static str> {
-    let schema = Identifier::parse(schema.unwrap_or(DEFAULT_SCHEMA)).map_err(|_| "schema")?;
-    let table = Identifier::parse(table).map_err(|_| "table")?;
+/// The `columns` to keep, if named: at least one, each an identifier, none
+/// twice. `Err` is the client message.
+fn parse_columns(columns: Option<&[String]>) -> Result<Vec<&str>, String> {
+    let Some(columns) = columns else {
+        return Ok(Vec::new());
+    };
+    if columns.is_empty() {
+        return Err("`columns` must name at least one column".to_owned());
+    }
+    let mut names: Vec<&str> = Vec::with_capacity(columns.len());
+    let mut seen: HashSet<&str> = HashSet::with_capacity(columns.len());
+    for column in columns {
+        let name = Identifier::parse(column)
+            .map_err(|_| format!("every `columns` entry must match {IDENTIFIER_PATTERN}"))?
+            .as_str();
+        if !seen.insert(name) {
+            return Err(format!("`columns` names `{name}` twice"));
+        }
+        names.push(name);
+    }
+    Ok(names)
+}
+
+/// `Err` names the argument that is not an identifier and the rule it
+/// broke. `table` is held to the loosest rule any kind takes, a collection
+/// name ([`COLLECTION_PATTERN`]); [`refuse_for_kind`] applies the target's.
+fn parse_table<'a>(
+    schema: Option<&'a str>,
+    table: &'a str,
+) -> Result<TableRef<'a>, (&'static str, &'static str)> {
+    let schema = Identifier::parse(schema.unwrap_or(DEFAULT_SCHEMA))
+        .map_err(|_| ("schema", IDENTIFIER_PATTERN))?;
+    let table = Identifier::parse_collection(table).map_err(|_| ("table", COLLECTION_PATTERN))?;
     Ok(TableRef { schema, table })
+}
+
+/// Why `table` cannot be sampled on a server of `kind`, once the caller is
+/// authorized on it: a SQL table must be an identifier, and a Mongo
+/// `system.*` collection holds server state, not application data.
+fn refuse_for_kind(id: Value, kind: ServerKind, table: Identifier<'_>) -> Option<Outcome> {
+    match kind {
+        ServerKind::Mongo if is_system_collection(table.as_str()) => Some(error_outcome(
+            OutcomeCode::Forbidden,
+            "system collections are not readable through the gateway",
+        )),
+        ServerKind::Mongo => None,
+        _ => Identifier::parse(table.as_str())
+            .is_err()
+            .then(|| invalid_arguments(id, &format!("`table` must match {IDENTIFIER_PATTERN}"))),
+    }
 }
 
 async fn compute_outcome(
@@ -123,6 +193,7 @@ async fn compute_outcome(
     header: &AuditHeader<'_>,
     args: &Arguments,
     table: TableRef<'_>,
+    columns: &[&str],
 ) -> Outcome {
     // `query_read`, not `schema_read`: this tool returns *row data*. A
     // `schema_read` grant is metadata-only, and `Action::includes` would let a
@@ -138,6 +209,9 @@ async fn compute_outcome(
     ) else {
         return forbidden();
     };
+    if let Some(refused) = refuse_for_kind(id.clone(), target.server.kind, table.table) {
+        return refused;
+    }
     let constraints = &target.constraints;
 
     // Same guard as `run_query`: this tool returns rows, so a grant demanding
@@ -147,7 +221,7 @@ async fn compute_outcome(
     }
     let row_limit = effective_row_limit(args.limit, constraints.row_limit, DEFAULT_SAMPLE_LIMIT);
 
-    if let Err(refused) = record_intent(ctx, header, &target, Access::ReadOnly).await {
+    if let Err(refused) = record_intent(ctx, header, &target, Access::ReadOnly, None).await {
         return *refused;
     }
 
@@ -160,7 +234,7 @@ async fn compute_outcome(
         .await
     {
         Ok(a) => a,
-        Err(err) => return outcome_from_exec_error(err, started, &ERROR_MESSAGES),
+        Err(err) => return exec_failed(err, started, constraints.statement_timeout_ms),
     };
 
     let query = SampleQuery {
@@ -170,51 +244,53 @@ async fn compute_outcome(
         row_limit,
         request_id: ctx.request.request_id,
     };
+    let shaping = RowShaping {
+        limit: RowLimit {
+            effective: row_limit,
+            asked: args.limit.unwrap_or(DEFAULT_SAMPLE_LIMIT),
+        },
+        caps: ByteCaps {
+            max_bytes: args.max_bytes,
+            max_cell_bytes: args.max_cell_bytes,
+        },
+        kind: target.server.kind,
+    };
     match adapter.sample(query).await {
-        Ok(result) => {
-            let elapsed = i64::try_from(result.elapsed_ms).unwrap_or(i64::MAX);
-            let row_count = i64::try_from(result.rows.len()).unwrap_or(i64::MAX);
-            let truncated = result.truncated;
-            let payload = SuccessPayload {
-                columns: &result.columns,
-                rows: &result.rows,
-                truncated,
-                elapsed_ms: result.elapsed_ms,
-            };
-            let text = match serde_json::to_string(&payload) {
-                Ok(t) => t,
-                Err(_) => {
-                    return error_outcome(OutcomeCode::Internal, "failed to serialize result");
-                }
-            };
-            success_outcome(id, text, Some(elapsed), Some(row_count), Some(truncated))
-        }
-        Err(err) => outcome_from_exec_error(err, started, &ERROR_MESSAGES),
+        Ok(result) => sampled_outcome(id, result, shaping, columns, started),
+        Err(err) => exec_failed(err, started, constraints.statement_timeout_ms),
     }
+}
+
+fn exec_failed(err: ExecError, started: Instant, grant_timeout_ms: Option<u32>) -> Outcome {
+    let mut outcome = outcome_from_exec_error(err, started, &ERROR_MESSAGES);
+    note_timeout_limit(&mut outcome, grant_timeout_ms);
+    outcome
+}
+
+/// Keep the named `columns` (all when none were named), then size the rows.
+/// A named column the table lacks is `undefined_object`, as Postgres
+/// answers the same name in a `SELECT` list.
+fn sampled_outcome(
+    id: Value,
+    mut result: ExecResult,
+    shaping: RowShaping,
+    columns: &[&str],
+    started: Instant,
+) -> Outcome {
+    if !columns.is_empty()
+        && let Err(missing) = project(shaping.kind, &mut result, columns)
+    {
+        let message = format!(
+            "column does not exist: {}; describe_schema lists the table's columns",
+            missing.join(", ")
+        );
+        let mut outcome = error_outcome(OutcomeCode::UndefinedObject, &message);
+        outcome.elapsed_ms = Some(elapsed_ms_since(started));
+        return outcome;
+    }
+    rows_outcome(id, result, shaping, NoExtraFields {})
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_table_defaults_schema_and_names_the_bad_argument() {
-        let table = parse_table(None, "users").expect("valid");
-        assert_eq!(table.schema.as_str(), DEFAULT_SCHEMA);
-        assert_eq!(table.table.as_str(), "users");
-        assert_eq!(
-            parse_table(Some("bad-schema"), "users").err(),
-            Some("schema")
-        );
-        assert_eq!(parse_table(None, "users; drop").err(), Some("table"));
-    }
-
-    #[test]
-    fn audited_read_names_the_table_or_the_mongo_find() {
-        let table = parse_table(Some("sales"), "orders").expect("valid");
-        assert_eq!(audited_read(Some("postgres"), table), "sales.orders");
-        let find: Value = serde_json::from_str(&audited_read(Some("mongo"), table))
-            .expect("the Mongo read is a JSON command");
-        assert_eq!(find, serde_json::json!({ "find": "orders", "filter": {} }));
-    }
-}
+#[path = "sample_table_tests.rs"]
+mod tests;

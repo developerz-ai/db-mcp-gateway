@@ -54,17 +54,20 @@ The same logic justifies *not* having a `priority` field on grants. A grant eith
 
 Postgres first. MySQL is a second backend behind the same `PermissionsRepo` trait. **No MongoDB** for the permissions store — it'd add a third schema dialect for no gain (we already have pg, are adding mysql, and mongo's flexible schema is a liability for an authz store where the schema is the contract).
 
-Config switch:
+Config switch — a top-level `permissions_store:` block beside `permissions:` (the YAML grants, which always apply):
 
 ```yaml
-permissions:
-  yaml: config/permissions.yml      # optional, can be empty/absent
-  store:
-    driver: pg                       # pg | mysql
-    dsn: env:PERMISSIONS_DB_DSN
+permissions_store:
+  driver: pg                         # pg | mysql | none
 ```
 
-If `store` is absent, the gateway runs YAML-only and the admin API is disabled. This is the path the dogfood install keeps using.
+| `driver` | Grants come from | Admin API |
+|---|---|---|
+| absent / `pg` | YAML **and** the `permissions_*` tables in the state DB (the default — an absent block still reads the store) | allowed |
+| `mysql` | YAML **and** a MySQL store; DSN from the `PERMISSIONS_DB_DSN` env var, never YAML | refused at boot |
+| `none` | YAML only — the store is never read: no grant query, no `LISTEN` connection, the resolver cache answers empty | refused at boot (nothing to edit) |
+
+The driver is fixed at boot; a reload that changes it is refused. `driver: none` is the explicit YAML-only mode the dogfood install uses.
 
 **The MySQL store is read-only-provisioned.** The gateway only reads it; the operator fills it with their own tooling. Boot rejects `driver: mysql` together with `admin.enabled: true`, so there is no audited write path to MySQL and none is planned — the `permissions_audit` table its `0002` migration created stays unwritten. With no admin commit there is no cross-replica notification either: a change made in MySQL is honoured within `PERMISSIONS_CACHE_TTL_SECONDS` (clamped to ≤ 300 s). Identity and routing columns (`user_sub`, `server`, `db_name`) use the case- and accent-sensitive `utf8mb4_0900_as_cs` collation (`migrations-mysql/0004`), so `Alice` and `alice` are two subjects, as they are in Postgres.
 
@@ -95,7 +98,7 @@ Retention: the hourly audit pruner deletes `permissions_audit` rows whose `ts` i
 
 ## Admin API
 
-Surface: `/admin/v1/{users,databases,grants}`. SSO-gated to a configured admin group. No UI ever.
+Surface: `/admin/v1/{users,databases,grants}` plus the read routes `explain`, `permissions/{export,diff}`, `audit/calls` and `openapi.json`. SSO-gated to a configured admin group. No UI ever.
 
 ```yaml
 admin:
@@ -129,8 +132,16 @@ Pagination deliberately does *not* apply to the resolver's read: `authz::loader`
 | `POST` | `/admin/v1/grants` | Create a grant |
 | `GET` | `/admin/v1/grants` | List, filterable by user / database |
 | `GET` | `/admin/v1/grants/:id` | Fetch one |
-| `PATCH` | `/admin/v1/grants/:id` | Update action and/or constraints — constraints merge per key (see §PATCH merges per key) |
+| `PATCH` | `/admin/v1/grants/:id` | Update action, constraints and/or `expires_at` — constraints merge per key (see §PATCH merges per key); `expires_at: null` clears the expiry |
 | `DELETE` | `/admin/v1/grants/:id` | Revoke |
+| `POST` | `/admin/v1/grants/batch` | Apply 1–500 grant `upsert` / `delete` changes in **one** transaction, all or nothing, one `permissions_audit` row per applied change (§Batch apply) |
+| `POST` | `/admin/v1/explain` | Why a `(user \| group, server, database, action)` is allowed or denied: the matching grants and the merged constraints (§Explain) |
+| `GET` | `/admin/v1/permissions/export` | Effective permissions, YAML ∪ DB, as one document |
+| `POST` | `/admin/v1/permissions/diff` | Diff a desired document (the export's shape) against the effective one — read-only |
+| `GET` | `/admin/v1/audit/calls` | `audit_calls` rows as NDJSON, filtered; statement text only with `include_sql=true` |
+| `GET` | `/admin/v1/openapi.json` | OpenAPI 3.1 document of this surface, held equal to the mounted routes by a test (`src/transport/admin/openapi_tests.rs`) |
+
+**Reads that disclose grants or audit history are audited too.** `explain`, `permissions/export`, `permissions/diff` and `audit/calls` each write one `audit_calls` row (`tool` = `admin.explain` / `admin.permissions_export` / `admin.permissions_diff` / `admin.audit_calls`, the admin as `user_sub`, `outcome: success`; for `audit/calls` the row's `params` holds the requested filters and `include_sql`, so a read that disclosed statements and bound values is told apart from a metadata-only one) **before** the response goes out; if that write fails the read is refused with `audit_unavailable` (503) and nothing is returned (non-negotiable #4). A request rejected as invalid reads nothing and writes no row. The plain CRUD `GET`s are not audited, as before.
 
 ### What the API never returns
 
@@ -161,6 +172,24 @@ The `databases` endpoints register a *logical* db reference; the connection stri
 
 `db_name_wildcard: true` + `database_id: null` + `server` is the `db_name = "*"` form (see §Wildcard). `server` must name a server the gateway config declares; `"*"` or an undeclared name is `invalid_request` (400).
 
+`expires_at` (optional, RFC 3339) on `POST /admin/v1/grants` and on a batch upsert must be in the future; omit it for a grant that never expires. Stored in `permissions_grants.expires_at` (nullable; pg `0023` as TIMESTAMPTZ, mysql `0007` then `0008` as UTC `DATETIME(6)`, so both stores accept any year — a TIMESTAMP would stop at 2038). From that instant on — the instant itself included — evaluation ignores the grant; the row stays live (not revoked), so `GET /admin/v1/grants` keeps listing it with `expired: true` until an admin deletes it. The check runs at evaluation time, not load time, so a cached grant set cannot outlive an expiry. YAML grants have no expiry.
+
+### Explain
+
+`POST /admin/v1/explain` takes exactly one of `user` (an SSO subject) or `group`, plus `server`, `database`, `action`. For a `user`, the group claims assumed are `groups` from the body or, absent, the groups cached on the user's `permissions_users` row; the user's live DB grants are loaded with the resolver's own query. The answer comes from `authz::matching_grants` + `authz::decide` — the functions every tool call's `evaluate_effective` runs — so it is the decision a real call would get: `decision` (`allow` / `deny`), merged `constraints`, every `matched` grant with its source (`yaml` with its subject, or `db` with `grant_id`), `expired` DB grants that would have matched, and `target_declared` (whether the config declares that database). A group question sees no DB grant and no `user:` block. Explain never reads a live session, so it is a simulation for the groups it assumed: `groups_source` is `stored` (the groups on the user's `permissions_users` row, as `POST /admin/v1/users`, `PATCH /admin/v1/users/:id` or an admin's first audited write last set them — not necessarily the user's current SSO claims), `none` (no `permissions_users` row, no groups), `assumed` (from the body) or `group`, and an SSO session whose current claims differ from the stored ones can be decided differently.
+
+### Batch apply
+
+`POST /admin/v1/grants/batch` body: `{"changes": [{"op": "upsert", …CreateGrant fields…}, {"op": "delete", "id": …}]}`. Every change is validated before the transaction opens; then one audited transaction applies them in order. An upsert is keyed by `(user_id, target, action)`: the oldest live grant with that key is updated in place (constraints and `expires_at` replaced; audited `update`), otherwise one is created (audited `create`); an upsert that would change nothing writes and audits nothing (`op: unchanged`). Any failure — a validation error (message prefixed `changes[i]: `), a dead reference, a missing delete target, an audit write — rolls back every change. A batch touching one user invalidates that user's cached grants; several, every cache entry. Its body may be up to 1 MiB — 500 changes outgrow the 64 KiB every other admin body gets, save `permissions/diff`'s 16 MiB (500 maximal upserts, pretty-printed, take about 310 KiB).
+
+### Export and diff
+
+The export lists every YAML grant (`source: yaml`, its `subject` `{group}` or `{user}`) then every live DB grant (`source: db`, `grant_id`, `subject: {user: <sub>}`, `expires_at` / `expired` when set). A profile appears as its name; its constraints are already folded in. `POST /admin/v1/permissions/diff` accepts that document back (export-only keys are ignored) and compares by `(subject, server, database, action)`: `add` (desired only), `remove` (effective only), `change` (both, bodies differ), `unchanged` (count). It changes nothing — its one write is its own `audit_calls` row (`admin.permissions_diff`), committed before the response like every audited admin read; apply a diff with `grants/batch` or a YAML PR. Export and diff share one size contract: diff takes a body of up to 16 MiB (`grants/batch` takes 1 MiB; the other admin routes keep 64 KiB), whatever its grant count, so an export — unedited or edited — posts back while it fits the body limit; a store whose export passes 16 MiB needs a scoped comparison, not offered yet.
+
+### Audit stream
+
+`GET /admin/v1/audit/calls` filters on `user` (`user_sub` or `user_email`), `server`, `db`, `tool`, `outcome` (a spec 03 code; unknown → 400), `since` (inclusive) / `until` (exclusive), newest first, `limit` default 1000, clamped to 1–10 000; an unknown parameter is 400. Each line is one JSON object; `sql` / `sql_truncated` / `params` appear only with `include_sql=true` (still admin-only). The read's own audit row commits before the first byte; an error after streaming began ends the body with one `{"error": …}` line. Rows are read in keyset batches of up to 200 rows or 1 MiB of lines plus one row (each query reads a candidate window that starts at 16 rows and grows to twice what the previous batch sent, so the state DB sizes about what it returns; the query itself stops after the row that crosses 1 MiB, sizing each row by an upper bound on its JSON line read from stored lengths — text counted at its worst-case escaping, `params` and `groups` at their text form — so the state DB sends nothing the next batch re-reads and compressible values cannot inflate a batch), and each batch's state-DB connection is back in the pool before its lines are sent, so a client that stops reading holds no connection the audit write path needs.
+
 ### Validation + error semantics
 
 The grants handlers validate at the API layer **before** the DB CHECKs would catch it, so client-correctable mistakes surface as stable `invalid_request` (400) rather than `internal` (500):
@@ -171,7 +200,9 @@ The grants handlers validate at the API layer **before** the DB CHECKs would cat
 | Action parse | unknown action string | `invalid_request` (400) before any SQL runs |
 | Dead reference | `user_id` or `database_id` missing or soft-deleted — checked by the insert itself (`INSERT … SELECT … WHERE deleted_at IS NULL`, both rows held `FOR SHARE` until commit) | `invalid_request` (400), stable `invalid grant reference` message; DB error text never echoed (non-negotiable #1) |
 | Wildcard server | `server` is `"*"` or not declared in config | `invalid_request` (400) |
+| Past expiry | `expires_at` at or before now on POST, PATCH or a batch upsert | `invalid_request` (400); nothing written |
 | Zero bound | `constraints.row_limit` or `constraints.statement_timeout_ms` is `0` on POST, or set to `0` by PATCH (a zero would disable the bound, not tighten it) | `invalid_request` (400); nothing written |
+| Body too large | a body past its route's byte bound: 1 MiB for `grants/batch`, 16 MiB for `permissions/diff`, 64 KiB elsewhere | `payload_too_large` (413); nothing read or written |
 | Stale precondition | PATCH `expected_updated_at` differs from the locked row's `updated_at` | `conflict` (409); nothing written |
 | Deadlock / serialization abort (`40P01` / `40001`) | concurrent admin writes Postgres had to abort | `conflict` (409); safe to retry |
 | CHECK violation (`23514`) | belt-and-suspenders for a future migration adding a CHECK the handler doesn't pre-validate | `invalid_request` (400) |
@@ -182,7 +213,7 @@ The `(server, db_name)` UNIQUE index is partial (`WHERE deleted_at IS NULL`), so
 
 ### Locked writes
 
-Every admin mutation runs one shape (`src/transport/admin/audited_tx.rs`): begin → upsert the acting admin's `permissions_users` row → lock the target row (`SELECT … FOR UPDATE`) → mutate → write `permissions_audit` → queue `NOTIFY` → commit → invalidate this replica's cache. Locking the actor row first gives every admin write one lock order; a mutation of the actor's own user row skips the actor upsert (that row plays both parts). Because the target is locked before `before` is read, concurrent writes serialise and the audit chain is continuous: `after[n] == before[n+1]`. PATCH bodies may carry `expected_updated_at` (the value last read); a mismatch is 409.
+Every admin mutation runs one shape (`src/transport/admin/audited_tx.rs`): begin → lock the acting admin's `permissions_users` row, inserting it from the session snapshot only if absent (`ON CONFLICT DO NOTHING`, then `SELECT … FOR UPDATE`) → lock the target row (`SELECT … FOR UPDATE`) → mutate → write `permissions_audit` → queue `NOTIFY` → commit → invalidate this replica's cache. Locking the actor row first gives every admin write one lock order; a mutation of the actor's own user row skips the actor step (that row plays both parts). The actor step never rewrites an existing row: an unaudited email/groups refresh there would break that row's audit chain and bump its `updated_at` under another admin's precondition (a spurious 409). Because the target is locked before `before` is read, concurrent writes serialise and the audit chain is continuous: `after[n] == before[n+1]`. PATCH bodies may carry `expected_updated_at` (the value last read); a mismatch is 409.
 
 ### PATCH merges per key
 
@@ -190,13 +221,13 @@ Every admin mutation runs one shape (`src/transport/admin/audited_tx.rs`): begin
 
 ### PATCH cannot change the target
 
-`PATCH /admin/v1/grants/:id` accepts `action`, `constraints` and `expected_updated_at` only. The XOR target (`Specific` vs `Wildcard`) is the grant's identity — re-targeting is DELETE + POST. Bodies carrying `database_id` / `server` / `db_name_wildcard` are rejected at the parse layer (`deny_unknown_fields` → 400).
+`PATCH /admin/v1/grants/:id` accepts `action`, `constraints`, `expires_at` and `expected_updated_at` only. The XOR target (`Specific` vs `Wildcard`) is the grant's identity — re-targeting is DELETE + POST. Bodies carrying `database_id` / `server` / `db_name_wildcard` are rejected at the parse layer (`deny_unknown_fields` → 400).
 
 ### Cache invalidation
 
 The resolver caches each subject's DB grant set (`PermissionsCache`, keyed on `user_sub`). A cold miss is one store query; concurrent misses for one subject share it (single flight); a load overtaken by an invalidation of that subject is not cached (per-subject revision) and is retried at most three times; expired idle entries are swept on insert.
 
-An admin commit both drops this replica's affected entries and, inside the same transaction, `NOTIFY`s channel `dbmcp_permissions`; every replica's listener applies it on commit and never on rollback. The listener keeps running through the shutdown drain, so requests still in flight on a stopping replica see revokes until they finish. A listener that loses its connection reconnects with backoff and flushes everything on reconnect, since notifications sent meanwhile are lost. The bound on a revoke reaching every replica is therefore the notification latency, or the reconnect delay after a dropped listener — the TTL (`PERMISSIONS_CACHE_TTL_SECONDS`, default 60 s, clamped ≤ 300 s) bounds only what nothing announces, such as a MySQL store edited outside the gateway.
+An admin commit both drops this replica's affected entries and, inside the same transaction, `NOTIFY`s channel `dbmcp_permissions`; every replica's listener applies it on commit and never on rollback. The listener keeps running through the shutdown drain, so requests still in flight on a stopping replica see revokes until they finish. A connection can die without an error — a NAT or firewall dropping an idle flow — so the listener proves liveness: every 5 s it `NOTIFY`s a second channel, `dbmcp_permissions_ping`, that the same connection listens on, and 15 s without hearing anything counts as a lost connection. Notifications sent while the listener is unsubscribed are lost, so on a lost connection — announced or silent — it flushes the whole grant cache at once, then again every 5 s until `LISTEN` is re-established, however long reconnecting (with backoff) takes; resubscribing flushes once more and is logged (`permissions listener recovered; grant cache flushed`). From the moment a drop is noticed until `LISTEN` is back, no grant is served from a load older than that 5 s beat. The bound on a revoke reaching every replica is the notification latency while the listener is connected. On a lost connection there are two separate windows. The detection window: a revoke committed before the drop is noticed takes effect at the flush that noticing triggers — at once for an announced drop, up to 15 s after a silent one. The stale-cache window: once the drop is noticed, a replica keeps reloading grants between flushes, so a revoke committed just after such a reload is served until the next flush, up to 5 s later, for as long as reconnecting takes. The TTL (`PERMISSIONS_CACHE_TTL_SECONDS`, default 60 s, clamped ≤ 300 s) bounds only what nothing announces, such as a MySQL store edited outside the gateway.
 
 | Surface | Scope | Why |
 |---|---|---|
@@ -211,7 +242,7 @@ An admin commit both drops this replica's affected entries and, inside the same 
 | Detached from the request | Local invalidation runs on a `tokio::spawn`ed task (`PermissionsCache::spawn_apply`), so a client disconnect between commit and invalidate cannot strand a stale entry. |
 | `user_sub`-keyed | Grants reference users by row id; the handler resolves `user_sub` inside the transaction. |
 | Service identities | A `service:<name>` identity never reads the store — its authority is exactly its YAML group, so a DB grant seeded for it is inert. |
-| YAML-only installs | No resolver cache → invalidation is a no-op. |
+| YAML-only installs (`driver: none`) | No store, no admin API → nothing to invalidate. |
 
 ## Wildcard grants
 
@@ -242,7 +273,7 @@ The rejection runs before any INSERT/UPDATE against `permissions_databases`, so 
 
 ### Declared servers only on `/admin/v1/databases`
 
-`POST` and `PATCH` on `/admin/v1/databases` (a `PATCH` only when it sets `server`) require the trimmed `server` to name a server declared in the gateway's **boot** config — the same set a wildcard grant's `server` is checked against; a SIGHUP reload does not change it. An undeclared server is `400 invalid_request` (`server must name a server declared in the gateway config`). A row on an undeclared server would otherwise sit dormant until a later config change silently armed every specific grant on it. Like the sentinel check, the refusal happens before the transaction opens, so no `permissions_databases` row and no `permissions_audit` entry is written (verified in `tests/it_db/transport_wave2_admin_databases.rs`).
+`POST` and `PATCH` on `/admin/v1/databases` (a `PATCH` only when it sets `server`) require the trimmed `server` to name a server declared in the gateway's **boot** config — the same set a wildcard grant's `server` is checked against; a SIGHUP reload does not change it. An undeclared server is `400 invalid_request` (`server must name a server declared in the gateway config`). A row on an undeclared server would otherwise sit dormant until a later config change silently armed every specific grant on it. The same holds for the database: the resulting `(server, db_name)` must be a database the **live** config declares on that server (checked against the current config, so a reload that adds one makes it registrable at once); otherwise `400 invalid_request` (``db_name `x` is not a database the gateway config declares on server `y` ``); a `PATCH` checks the pair it would produce after locking the row and before writing anything. Like the sentinel check, the refusal happens before the transaction opens, so no `permissions_databases` row and no `permissions_audit` entry is written (verified in `tests/it_db/transport_wave2_admin_databases.rs`).
 
 The supported way to grant access to every database on a server is `db_name_wildcard: true` + `database_id: null` on `POST /admin/v1/grants` (see [Request shapes](#request-shapes) above), *not* a `permissions_databases` row literally named `"*"`.
 
@@ -297,7 +328,7 @@ The connection still uses a least-privilege mongo role (read-only on the target 
 
 `describe_schema` and `sample_table` work on Mongo too: `describe_schema` is `listCollections` + `listIndexes` (collections with their indexes; `schema` is ignored, `table` names one collection) and `sample_table` is a `find` with the sample limit. Mongo writes stay out of scope ([10](10-non-goals.md)); `write_role` on a Mongo database fails boot.
 
-Timeouts via `maxTimeMS`. Row caps via a server-side limit of `row_limit + 1` (`find` `limit`/`batchSize`, a trailing `$limit` stage on `aggregate`) plus the gateway's row and byte budget at the adapter. A reply missing its documented field, or a document that cannot be rendered, is a typed error — never a fabricated `null`. Cancellation: `killOp` on client disconnect, best-effort and requires an opt-in privilege — see [config-reference.md §Mongo](../deployment/config-reference.md#mongo) for the full contract (`statement_timeout_ms` is the guaranteed bound either way, same as pg's belt-and-suspenders `tokio::time::timeout`).
+Timeouts via `maxTimeMS`. Row caps via a server-side limit of `row_limit + 1` (`find` `limit`/`batchSize`, a trailing `$limit` stage on `aggregate`) plus the gateway's row and byte budget at the adapter. A reply missing its documented field, or a document that cannot be rendered, is a typed error — never a fabricated `null`. A NaN or infinite double, which JSON has no number for, renders as Extended JSON `{"$numberDouble":"NaN"}` (`"Infinity"`, `"-Infinity"`). Cancellation: `killOp` on client disconnect, best-effort and requires an opt-in privilege — see [config-reference.md §Mongo](../deployment/config-reference.md#mongo) for the full contract (`statement_timeout_ms` is the guaranteed bound either way, same as pg's belt-and-suspenders `tokio::time::timeout`).
 
 Audit row shape matches pg's: same `audit_calls` columns, with `db_type = 'mongo'` and the command document in `sql` exactly as sent — stored verbatim like SQL; there is no redaction policy ([07-logging-retention](07-logging-retention.md)).
 

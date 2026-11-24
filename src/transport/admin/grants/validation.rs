@@ -1,6 +1,7 @@
 //! Input validation + error mapping specific to the grants handlers. The
 //! cross-entity helpers live in [`super::super::validation`].
 
+use chrono::{DateTime, Utc};
 use serde_json::{Value as JsonValue, json};
 
 use crate::authz::ConstraintsPatch;
@@ -91,6 +92,21 @@ fn reject_zero(
         }
     }
     Ok(())
+}
+
+/// An expiry already past would create (or re-arm) a grant evaluation
+/// ignores from the start — almost certainly a clock or unit mistake.
+pub(super) fn future_expiry(
+    expires_at: Option<DateTime<Utc>>,
+    request_id: &str,
+) -> Result<(), AdminError> {
+    match expires_at {
+        Some(at) if at <= Utc::now() => Err(AdminError::invalid(
+            "expires_at must be in the future (omit it, or PATCH it to null, to never expire)",
+        )
+        .with_request_id(request_id)),
+        _ => Ok(()),
+    }
 }
 
 /// The JSONB layout the resolver reads back — identical whether the grant

@@ -36,7 +36,7 @@ fn unique_sub(prefix: &str) -> String {
 
 /// `id`s that `sql` selects for `key` — a plain consistent read, no locks.
 async fn ids(pool: &MySqlPool, sql: &str, key: &str) -> Vec<String> {
-    sqlx::query_scalar(sql)
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
         .bind(key)
         .fetch_all(pool)
         .await
@@ -51,7 +51,7 @@ async fn ids(pool: &MySqlPool, sql: &str, key: &str) -> Vec<String> {
 async fn delete_by_id(pool: &MySqlPool, table: &str, ids: &[String]) {
     let sql = format!("DELETE FROM {table} WHERE id = ?");
     for id in ids {
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .execute(pool)
             .await

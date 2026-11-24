@@ -17,7 +17,10 @@ use serde_json::json;
 /// adapter, which only reads on a database without a `write_role`.
 async fn ddl(sql: &str) -> Result<(), sqlx::Error> {
     let pool = sqlx::PgPool::connect(&target_db_url()).await?;
-    sqlx::query(sql).execute(&pool).await.map(|_| ())
+    sqlx::query(sqlx::AssertSqlSafe(sql))
+        .execute(&pool)
+        .await
+        .map(|_| ())
 }
 
 /// Generates a unique schema name per test run so concurrent runs (and any

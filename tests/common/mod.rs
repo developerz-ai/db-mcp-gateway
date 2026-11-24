@@ -12,6 +12,8 @@ pub mod cleanup;
 pub mod env;
 pub mod gateway;
 pub mod idp;
+pub mod log_capture;
+pub mod mcp;
 pub mod mongo_target;
 pub mod offline;
 pub mod pg_target;

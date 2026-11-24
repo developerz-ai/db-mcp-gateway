@@ -2,7 +2,7 @@
 
 Invocation log for the committed evidence in this directory. Invocations
 1–3 (shared KVM host, 2026-11-04) produced `postgres.json`, `mongo.json` and
-`instances4.json`; invocations 4–9 (bare-metal workstation, 2026-11-14,
+`instances4.json` (committed as `.json.gz`); invocations 4–9 (bare-metal workstation, 2026-11-14,
 appended at the end under "Quiet-host runs") produced `postgres-quiet.json`,
 `mongo-quiet.json`, `instances4-quiet.json` and `postgres-write-quiet.json` (committed as `.json.gz`).
 The host table, dirty-tree caveat, credentials and limitations sections
@@ -57,7 +57,7 @@ measured binary corresponds to the base commit's gateway code.
   `Trustworthy: no`
 - MySQL boot-rejection verdict: **PASS** (own report section, not a
   performance figure)
-- Artifact: [postgres.json](postgres.json)
+- Artifact: [postgres.json.gz](postgres.json.gz)
 
 ```text
 -- dev stack already running, leaving it up afterwards
@@ -196,7 +196,7 @@ raw results → benchmarks/results/postgres.json
   The `mongo_aggregate` gateway deltas are *negative* (the gateway measured
   faster than the first baseline); with a 38.8% drift between the two
   baselines that is the host moving, not a gateway speedup
-- Artifact: [mongo.json](mongo.json)
+- Artifact: [mongo.json.gz](mongo.json.gz)
 
 ```text
 -- dev stack already running, leaving it up afterwards
@@ -364,7 +364,7 @@ WARNING: working tree is dirty; the recorded commit does not identify this run
   (`range_scan`) → those delta rows are marked `Trustworthy: no`;
   `aggregate` drifted 3.2% and is the one `Trustworthy: yes` row in this
   whole evidence set
-- Artifact: [instances4.json](instances4.json)
+- Artifact: [instances4.json.gz](instances4.json.gz)
 
 ```text
 -- dev stack already running, leaving it up afterwards

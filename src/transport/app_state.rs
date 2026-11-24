@@ -85,6 +85,7 @@ impl AppState {
     /// store (Postgres, over `state_db`), an in-memory client registry, an
     /// empty adapter registry and an uninstalled metrics recorder. Mutate the
     /// public fields for anything else (a MySQL repo, a shared cache).
+    #[allow(clippy::expect_used)] // test-only wiring: a bad test config should fail loudly
     pub fn for_tests(config: ConfigFile, state_db: PgPool, auth: AuthFacade) -> Self {
         use std::time::Duration;
 
@@ -95,9 +96,9 @@ impl AppState {
             Duration::from_secs(crate::config::Config::default().permissions_cache_ttl_seconds);
         let detached = DetachedTasks::new();
         let mcp = McpState {
-            audit_sinks: Arc::new(ArcSwap::from_pointee(StreamSinks::from_config(
-                &config.logging.stream,
-            ))),
+            audit_sinks: Arc::new(ArcSwap::from_pointee(
+                StreamSinks::from_config(&config.logging.stream).expect("test sinks build"),
+            )),
             config: Arc::new(ArcSwap::from_pointee(config)),
             adapter_registry: AdapterRegistry::with_detached(detached.clone()),
             state_db,

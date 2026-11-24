@@ -75,6 +75,7 @@ pub(super) fn grant_from_row(row: &MySqlRow) -> Result<PermissionsGrant, RepoErr
         created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
         updated_at: row.try_get::<DateTime<Utc>, _>("updated_at")?,
         revoked_at: row.try_get::<Option<DateTime<Utc>>, _>("revoked_at")?,
+        expires_at: row.try_get::<Option<DateTime<Utc>>, _>("expires_at")?,
     })
 }
 
@@ -87,5 +88,6 @@ pub(super) fn live_grant_from_row(row: &MySqlRow) -> Result<LiveGrant, RepoError
         db_name: row.try_get("db_name")?,
         action: GrantAction::parse(&action_str)?,
         constraints: row.try_get("constraints_json")?,
+        expires_at: row.try_get::<Option<DateTime<Utc>>, _>("expires_at")?,
     })
 }

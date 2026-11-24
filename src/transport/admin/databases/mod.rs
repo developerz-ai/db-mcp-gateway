@@ -28,9 +28,11 @@ mod validation;
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use sqlx::PgPool;
 
 use crate::authz::PermissionsCache;
+use crate::config::ConfigFile;
 use crate::state::permissions::PermissionsRepo;
 
 pub use dto::{CreateDatabaseRequest, DatabaseResponse, UpdateDatabaseRequest};
@@ -45,6 +47,9 @@ pub struct DatabasesState {
     /// Server names the gateway config declares — the only servers a
     /// database may be registered on.
     pub known_servers: Arc<[String]>,
+    /// The live config; a registered `(server, db_name)` must be declared in
+    /// it, or the row would sit dormant until a later reload armed it.
+    pub config: Arc<ArcSwap<ConfigFile>>,
 }
 
 impl std::fmt::Debug for DatabasesState {
@@ -54,6 +59,6 @@ impl std::fmt::Debug for DatabasesState {
             .field("state_db", &"<PgPool>")
             .field("cache", &self.cache)
             .field("known_servers", &self.known_servers)
-            .finish()
+            .finish_non_exhaustive()
     }
 }

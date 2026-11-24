@@ -59,7 +59,7 @@ impl Fixture {
             format!("CREATE TABLE \"{table}\" (id bigint PRIMARY KEY, note text)"),
             format!("INSERT INTO \"{table}\" VALUES (1, 'one'), (2, 'two')"),
         ] {
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .execute(&target)
                 .await
                 .expect("scratch table");
@@ -90,10 +90,10 @@ impl Fixture {
     }
 
     async fn note(&self, id: i64) -> String {
-        sqlx::query_scalar(&format!(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT note FROM \"{}\" WHERE id = $1",
             self.table
-        ))
+        )))
         .bind(id)
         .fetch_one(&self.target)
         .await
@@ -105,10 +105,13 @@ impl Fixture {
     }
 
     async fn drop_table(self) {
-        sqlx::query(&format!("DROP TABLE \"{}\"", self.table))
-            .execute(&self.target)
-            .await
-            .expect("drop scratch table");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE \"{}\"",
+            self.table
+        )))
+        .execute(&self.target)
+        .await
+        .expect("drop scratch table");
     }
 }
 

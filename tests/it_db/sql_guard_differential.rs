@@ -28,7 +28,10 @@ const WRAPPER_CALL: &str = "count";
 async fn as_postgres_reads(conn: &mut PgConnection, sql: &str) -> Option<String> {
     let mut tx = conn.begin().await.expect("transaction opens");
     let view = format!("CREATE TEMP VIEW dbmcp_reading AS SELECT count(*) FROM ({sql}\n) t");
-    let created = sqlx::query(&view).persistent(false).execute(&mut *tx).await;
+    let created = sqlx::query(sqlx::AssertSqlSafe(view))
+        .persistent(false)
+        .execute(&mut *tx)
+        .await;
     let reading = match created {
         Ok(_) => Some(
             sqlx::query_scalar::<_, String>("SELECT pg_get_viewdef('dbmcp_reading'::regclass)")

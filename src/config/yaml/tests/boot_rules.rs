@@ -147,7 +147,7 @@ fn tls_ca_file_needs_verify_full_and_a_readable_file() {
 fn permission_group_names_are_trimmed_on_load() {
     let yaml = with_server("permissions:\n  - { group: '  backend  ', grants: [] }\n");
     let config = ConfigFile::from_yaml_str(&yaml).expect("parses");
-    assert_eq!(config.permissions[0].group, "backend");
+    assert_eq!(config.permissions[0].group(), Some("backend"));
 }
 
 /// `*` is the grant wildcard; a server or database literally named `*`

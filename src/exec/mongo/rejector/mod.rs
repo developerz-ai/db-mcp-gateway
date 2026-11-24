@@ -20,7 +20,12 @@
 //!     command at another database), `$readPreference`, `lsid`, `txnNumber`,
 //!     `autocommit`, `startTransaction`, `writeConcern` — none is listed, so
 //!     none passes.
-//!  3. The denied operators — `$out`, `$merge`, `$function`, `$where`,
+//!  3. A data read (`find`, `aggregate`, `count`, `distinct`) must not name
+//!     a `system.*` collection ([`is_system_collection`]): those hold server
+//!     state (`system.profile` keeps other sessions' queries, `system.js`
+//!     stored code), not application data. That holds for every collection
+//!     a pipeline stage reads too ([`namespace`]).
+//!  4. The denied operators — `$out`, `$merge`, `$function`, `$where`,
 //!     `$accumulator` — are rejected at *any* depth in the document tree.
 //!
 //! Mongo's wire format is BSON, but the gateway accepts the command as
@@ -30,6 +35,8 @@
 //! pulling extended-JSON's `{$date: ...}` ambiguity into the deny check.
 
 use serde_json::Value;
+
+mod namespace;
 
 /// Allowed top-level command names. The first JSON object key is the
 /// command name (mongo's wire convention). Anything outside this set is
@@ -126,8 +133,10 @@ const DENIED_OPERATORS: &[&str] = &["$out", "$merge", "$function", "$where", "$a
 /// audit signal; values stay in the original command for the audit row.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum RejectReason {
-    #[error("mongo command is not valid JSON")]
-    Malformed,
+    /// Where serde_json stopped reading: 1-based line and column. Its
+    /// message is not kept — it can quote the payload.
+    #[error("mongo command is not valid JSON at line {line}, column {column}")]
+    Malformed { line: usize, column: usize },
 
     #[error("mongo command must be a JSON object with at least one field")]
     EmptyCommand,
@@ -140,6 +149,20 @@ pub enum RejectReason {
 
     #[error("mongo command `{command}` does not allow top-level field `{field}`")]
     DisallowedField { command: String, field: String },
+
+    #[error("mongo command `{0}` may not read a `system.*` collection")]
+    SystemCollection(String),
+
+    #[error("mongo stage `{0}` must name a collection of this database")]
+    ForeignNamespace(&'static str),
+}
+
+impl RejectReason {
+    /// The payload is not a JSON object with a command in it (as opposed to
+    /// a command refused by policy): the caller's argument error.
+    pub fn is_malformed(&self) -> bool {
+        matches!(self, Self::Malformed { .. } | Self::EmptyCommand)
+    }
 }
 
 /// Read-only enforcement for a mongo command. Returns `Ok(())` iff the
@@ -147,7 +170,10 @@ pub enum RejectReason {
 /// its [`allowed_fields`], AND no [`DENIED_OPERATORS`] appear anywhere in
 /// the parsed tree.
 pub fn validate_command(json: &str) -> Result<(), RejectReason> {
-    let value: Value = serde_json::from_str(json).map_err(|_| RejectReason::Malformed)?;
+    let value: Value = serde_json::from_str(json).map_err(|err| RejectReason::Malformed {
+        line: err.line(),
+        column: err.column(),
+    })?;
     let object = value.as_object().ok_or(RejectReason::EmptyCommand)?;
 
     // Mongo wire convention: the first field is the command name.
@@ -167,7 +193,20 @@ pub fn validate_command(json: &str) -> Result<(), RejectReason> {
         });
     }
 
+    if let Some(Value::String(collection)) = object.get(command)
+        && command != "listIndexes"
+        && is_system_collection(collection)
+    {
+        return Err(RejectReason::SystemCollection(command.clone()));
+    }
+    namespace::check_namespaces(command, &value)?;
+
     walk_for_denied(&value)
+}
+
+/// A collection under Mongo's reserved `system.` prefix.
+pub fn is_system_collection(name: &str) -> bool {
+    name.starts_with("system.")
 }
 
 /// Recursive walk for any `$op` key in [`DENIED_OPERATORS`]. The walk is
@@ -204,3 +243,6 @@ fn denied_match(key: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod namespace_tests;

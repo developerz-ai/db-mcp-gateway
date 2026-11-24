@@ -26,11 +26,11 @@ and write `none` where nothing protects a surface at all.
 | `website/docs/**` path links | `onBrokenLinks: 'throw'` and `onBrokenMarkdownLinks: 'throw'` in `website/docusaurus.config.ts`, run by `npm run build` in `.github/workflows/pages.yml` (PRs touching `website/**` or `README.md`) and by `bin/ci`'s Pages job | that a link path resolves to a page — not what the page says |
 | `website/docs/**` heading fragments | `tests/bin/doc-anchors.test.sh`, run by `bin/ci` only (not by `ci.yml` or `pages.yml`) | that every `#fragment` matches a heading ID the build renders — not the heading's content |
 | the Pages artifact | the sensitive-asset denylist step in `.github/workflows/pages.yml` | that no `*.yaml`, `*.env`, `*.pem`, `*.key`, `*.toml` or `*.sql` file ships in the site build — not the docs' content |
-| `.dz/briefs/health.md` | `tests/brief_rows.rs` | that the signal table and its `## Rows` list agree in count, order and names — not that a command still works |
+| `.dz/schedules/health.md` | `tests/brief_rows.rs` | that the signal table and its `## Rows` list agree in count, order and names — not that a command still works |
 | `website/docs/initial-idea/**` (spec) | none | no test reads it; only the review lane's `path_instructions` and CodeRabbit's spec rule ask for a same-PR update |
 | `website/docs/usage/**`, `website/docs/deployment/**` | none beyond the link and anchor guards above | an env var, port, flag or error code named there is checked by no test |
 | `README.md`, `CONTRIBUTING.md`, `CLAUDE.md` | none | no test reads them; `README.md`'s version line is bumped by the `chore(release)` PR by hand |
-| `.dz/briefs/{release-due,security-release,improve}.md`, this file | none | no test reads them |
+| `.dz/schedules/{release-due,security-release,improve}.md`, this file | none | no test reads them |
 
 ## Relations no check covers
 
@@ -39,7 +39,7 @@ and write `none` where nothing protects a surface at all.
   drift finding under the spec surface, with the file and line on both sides.
 - **`docs-only` CI skip and the brief guard.** A PR that changes only `.md` files skips the `test`
   job (`ci.yml` `changes` filter), so `tests/brief_rows.rs` does not run on a PR that edits only
-  `.dz/briefs/health.md`. It runs on the next push to `main` and in `bin/ci`.
+  `.dz/schedules/health.md`. It runs on the next push to `main` and in `bin/ci`.
 - **Anchors in CI.** `tests/bin/doc-anchors.test.sh` runs in `bin/ci` alone; a broken fragment
   merged without a local `bin/ci` run surfaces only as a Docusaurus build warning.
 
@@ -71,5 +71,5 @@ drift: an absent guard is a fact about the registry, not a sentence that has gon
 - `link-paths` — Docusaurus `onBrokenLinks` / `onBrokenMarkdownLinks: 'throw'` still guard `website/docs/**` link paths.
 - `heading-anchors` — `tests/bin/doc-anchors.test.sh` still guards fragments, and still runs only from `bin/ci`.
 - `pages-artifact` — The Pages sensitive-asset denylist still runs before upload.
-- `health-brief-rows` — `tests/brief_rows.rs` still pins `.dz/briefs/health.md`'s table and rows.
+- `health-brief-rows` — `tests/brief_rows.rs` still pins `.dz/schedules/health.md`'s table and rows.
 - `unguarded` — The surfaces listed `none` are still unguarded; report them as such, not as drift.

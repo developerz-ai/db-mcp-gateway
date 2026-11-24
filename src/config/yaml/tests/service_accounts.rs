@@ -33,7 +33,10 @@ fn parses_service_accounts() {
     assert_eq!(account.group, "svc-ci");
     // The token is a `Password` (Deserialize-only secret ref) — match the
     // variant rather than ever printing it.
-    assert!(matches!(account.token, crate::config::Password::Literal(_)));
+    assert!(matches!(
+        account.tokens.as_slice(),
+        [crate::config::Password::Literal(_)]
+    ));
     assert_eq!(account.max_concurrent_requests, None);
     assert!(!account.require_upstream);
 }
@@ -144,5 +147,57 @@ fn load_aborts_on_unresolved_service_token_ref() {
     assert!(
         matches!(err, ConfigLoadError::Secret(SecretError::EnvNotSet(_))),
         "expected ConfigLoadError::Secret(EnvNotSet), got {err:?}"
+    );
+}
+
+const ONE_TOKEN: &str = "    token: dbmcp_svc_0123456789abcdef0123456789abcdef\n";
+
+fn with_token_lines(lines: &str) -> String {
+    SERVICE_YAML.replace(ONE_TOKEN, lines)
+}
+
+/// A16: `tokens:` lets one account carry several values (same-name rotation).
+#[test]
+fn parses_a_token_list() {
+    let yaml =
+        with_token_lines("    tokens:\n      - ${ENV:SVC_OLD}\n      - ${FILE:/run/svc-new}\n");
+    let config = ConfigFile::from_yaml_str(&yaml).expect("token list parses");
+    assert!(matches!(
+        config.service_accounts[0].tokens.as_slice(),
+        [
+            crate::config::Password::EnvVar(_),
+            crate::config::Password::File(_)
+        ]
+    ));
+}
+
+#[test]
+fn rejects_token_and_tokens_together_empty_list_and_neither() {
+    for (lines, needle) in [
+        (
+            "    token: ${ENV:A}\n    tokens: [\"${ENV:B}\"]\n",
+            "not both",
+        ),
+        ("    tokens: []\n", "at least one token"),
+        ("", "is required"),
+    ] {
+        let err = ConfigFile::from_yaml_str(&with_token_lines(lines)).expect_err(needle);
+        assert!(err.to_string().contains(needle), "{needle}: {err}");
+    }
+}
+
+#[test]
+fn production_rejects_a_literal_anywhere_in_the_token_list() {
+    let yaml = format!(
+        "gateway: {{ env: production }}\n{}",
+        with_token_lines(
+            "    tokens:\n      - ${ENV:SVC_OLD}\n      - dbmcp_svc_0123456789abcdef0123456789abcdef\n"
+        )
+    )
+    .replace("password: x", "password: \"${ENV:X}\"");
+    let err = ConfigFile::from_yaml_str(&yaml).expect_err("literal in tokens");
+    assert!(
+        err.to_string().contains("service_accounts[ci-bot].token"),
+        "{err}"
     );
 }

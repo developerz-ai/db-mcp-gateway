@@ -3,9 +3,12 @@
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
+use tracing::Subscriber;
 use tracing_appender::non_blocking::{ErrorCounter, WorkerGuard};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::Directive;
+use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::util::SubscriberInitExt;
 
 /// Used when `RUST_LOG` is unset or empty. Before this default the filter fell
 /// back to ERROR, so an unconfigured deploy shipped no operational logs at all.
@@ -20,6 +23,9 @@ const DROPPED_LINES_SAMPLE: Duration = Duration::from_secs(15);
 /// Install the global JSON-per-line stdout subscriber for Loki (see
 /// docs/deployment/logging.md for the field contract). `flatten_event` hoists
 /// event fields to the top level so Alloy needs no nested-field stage.
+/// `with_current_span(true)` adds the enclosing span as a `span` object, so a
+/// line logged deep inside a tool call (a target connect failure) still
+/// carries the `tool_dispatch` span's `request_id`, `tool`, `server` and `db`.
 /// `with_target(true)` keeps `target`, which `audit_stream` events set
 /// explicitly so operators route the SIEM export separately.
 ///
@@ -30,16 +36,24 @@ const DROPPED_LINES_SAMPLE: Duration = Duration::from_secs(15);
 pub(crate) fn init_logging() -> anyhow::Result<(WorkerGuard, ErrorCounter)> {
     let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
     let dropped = writer.error_counter();
+    let filter = env_filter(std::env::var("RUST_LOG").ok().as_deref())?;
+    json_subscriber(filter, writer).try_init()?;
+    Ok((guard, dropped))
+}
+
+fn json_subscriber<W>(filter: EnvFilter, writer: W) -> impl Subscriber + Send + Sync + 'static
+where
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
     tracing_subscriber::fmt()
-        .with_env_filter(env_filter(std::env::var("RUST_LOG").ok().as_deref())?)
+        .with_env_filter(filter)
         .json()
         .flatten_event(true)
-        .with_current_span(false)
+        .with_current_span(true)
         .with_span_list(false)
         .with_target(true)
         .with_writer(writer)
-        .init();
-    Ok((guard, dropped))
+        .finish()
 }
 
 /// Invalid `RUST_LOG` directives are skipped, as before — a typo in a log
@@ -116,6 +130,36 @@ mod tests {
             assert!(out.contains("audit-row"), "{unset:?}: {out}");
             assert!(!out.contains("agent_sql"), "{unset:?}: {out}");
         }
+    }
+
+    /// U6: a line with no fields of its own, logged inside the dispatch span,
+    /// still names the request, tool and server.
+    #[test]
+    fn events_inside_a_span_carry_the_span_fields() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let sink = buf.clone();
+        let subscriber = super::json_subscriber(env_filter(None).expect("filter"), move || {
+            BufSink(sink.clone())
+        });
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "tool_dispatch",
+                request_id = "req-1",
+                tool = "run_query",
+                server = "local",
+                db = "app"
+            );
+            span.in_scope(|| tracing::warn!(error_kind = "io", "target connection failed"));
+        });
+        let bytes = buf.lock().expect("buffer").clone();
+        let line: serde_json::Value = serde_json::from_slice(&bytes).expect("one json line");
+        assert_eq!(line["message"], "target connection failed", "{line}");
+        assert_eq!(line["error_kind"], "io", "{line}");
+        assert_eq!(line["span"]["name"], "tool_dispatch", "{line}");
+        assert_eq!(line["span"]["request_id"], "req-1", "{line}");
+        assert_eq!(line["span"]["tool"], "run_query", "{line}");
+        assert_eq!(line["span"]["server"], "local", "{line}");
+        assert_eq!(line["span"]["db"], "app", "{line}");
     }
 
     #[test]

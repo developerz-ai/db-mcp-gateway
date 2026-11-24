@@ -1,10 +1,11 @@
-"""Pins release.yml's reuse decision: red CI blocks, absent CI builds, green reuses."""
+"""Pins release.yml's reuse decision: green CI with its image reuses, anything else blocks."""
 
 import os
 import subprocess
 import sys
 import unittest
 
+sys.dont_write_bytecode = True  # a .pyc embeds the absolute path (public-tree)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from release_reuse_decision import decide  # noqa: E402
 
@@ -21,19 +22,28 @@ class Decide(unittest.TestCase):
             for image in ("unchecked", "present", "missing"):
                 self.assertEqual(action("completed", conclusion, image, True, True), "block")
 
-    def test_no_run_waits_out_the_grace_then_builds(self):
+    def test_no_run_waits_out_the_grace_then_blocks(self):
         self.assertEqual(action("none", "", "unchecked", False, False), "wait")
-        self.assertEqual(action("none", "", "unchecked", True, False), "build")
+        self.assertEqual(action("none", "", "unchecked", True, False), "block")
 
     def test_running_ci_waits_until_the_deadline_then_blocks(self):
         for status in ("queued", "in_progress", "waiting", "pending", "requested"):
             self.assertEqual(action(status, "", "unchecked", True, False), "wait")
             self.assertEqual(action(status, "", "unchecked", True, True), "block")
 
-    def test_green_ci_probes_then_reuses_or_builds(self):
+    def test_green_ci_probes_then_reuses_or_blocks(self):
         self.assertEqual(action("completed", "success", "unchecked", True, False), "check-image")
         self.assertEqual(action("completed", "success", "present", True, False), "reuse")
-        self.assertEqual(action("completed", "success", "missing", True, False), "build")
+        self.assertEqual(action("completed", "success", "missing", True, False), "block")
+
+    def test_no_decision_builds_from_the_tag(self):
+        for status in ("none", "queued", "completed"):
+            for conclusion in ("", "success", "failure"):
+                for image in ("unchecked", "present", "missing"):
+                    for grace in (False, True):
+                        for deadline in (False, True):
+                            verdict = action(status, conclusion, image, grace, deadline)
+                            self.assertIn(verdict, ("wait", "check-image", "reuse", "block"))
 
     def test_green_ci_is_reused_even_past_the_deadline(self):
         self.assertEqual(action("completed", "success", "present", True, True), "reuse")

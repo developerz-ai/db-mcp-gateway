@@ -1,0 +1,220 @@
+# db-mcp-gateway alerts over the series in src/startup/metrics/catalogue.rs.
+#
+# A plain Prometheus rules file (`rule_files:`) and, unchanged, the `spec:` of
+# a prometheus-operator PrometheusRule: the Helm chart wraps this very file
+# (deploy/helm/db-mcp-gateway/files/rules.yaml is a symlink to it).
+# tests/deploy_catalogue.rs pins every series and label named here to the
+# catalogue, every alert to a runbook section, and runs `promtool check rules`
+# when docker is available.
+#
+# The gateway's series carry no name prefix (`tool_calls`, `pool_size`): if
+# other jobs in the same Prometheus export a series of the same name, add a
+# `job` matcher to these expressions.
+groups:
+  - name: db-mcp-gateway.audit
+    rules:
+      - alert: GatewayAuditUnavailable
+        # increase() needs two samples of a series, so a refusal before a new
+        # pod's first scrape (its series born above 0) would never show: the
+        # second clause catches a series that is non-zero but absent 5m ago,
+        # from a process that booted in the last 10m. Absent 5m ago alone is
+        # also every series after a scrape outage longer than the lookback:
+        # without the boot gate a long-lived pod's old count fired again.
+        expr: sum(increase(tool_calls{outcome="audit_unavailable"}[5m])) > 0 or sum((tool_calls{outcome="audit_unavailable"} > 0 unless tool_calls{outcome="audit_unavailable"} offset 5m) and on (job, instance) (time() - process_start_time_seconds < 600)) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: Tool calls refused because the audit store refused a write.
+          description: '{{ $value | humanize }} tool calls answered audit_unavailable in 5m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
+      - alert: GatewayAuditWriteSlow
+        expr: histogram_quantile(0.95, sum by (le) (rate(audit_write_duration_seconds_bucket[5m]))) > 0.25
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Audit completion-row insert p95 above 250 ms.
+          description: 'Audit write p95 is {{ $value | humanizeDuration }}. Every response waits on this insert; at 15 s it becomes audit_unavailable.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditwriteslow
+      - alert: GatewayAuditFallbackFailures
+        # Second clause: a failure before a new pod's first scrape, gated on
+        # a boot in the last 20m, as in GatewayAuditUnavailable.
+        expr: sum(increase(audit_fallback_failures_total[15m])) > 0 or sum((audit_fallback_failures_total > 0 unless audit_fallback_failures_total offset 15m) and on (job, instance) (time() - process_start_time_seconds < 1200)) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Disconnect-path audit writes failed.
+          description: '{{ $value | humanize }} disconnect-path audit writes failed in 15m; those calls are recorded only once the reaper marks them abandoned.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditfallbackfailures
+      - alert: GatewayAuditAbandoned
+        expr: sum(increase(audit_abandoned_total[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: The reaper recorded calls with no completion row as abandoned.
+          description: '{{ $value | humanize }} intent rows became abandoned in 15m: a replica died or lost the state DB mid-call.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditabandoned
+      - alert: GatewayAuditReaperStale
+        # The reaper sweeps every 60 s; the gauge is absent until the first
+        # sweep completes, so a reaper that never succeeds also fires. Per
+        # deployment (`job`, `namespace`, `service`): on a shared Prometheus
+        # one healthy gateway must not hide another's stale or missing sweeps,
+        # and two releases in one namespace can share a `job` — their
+        # Services (the ServiceMonitor's `service` label) still differ. A
+        # deployment is a scraped `build_info` (set at boot).
+        expr: (time() - max by (job, namespace, service) (audit_reaper_last_success_timestamp) > 600) or (group by (job, namespace, service) (build_info) unless on (job, namespace, service) group by (job, namespace, service) (audit_reaper_last_success_timestamp))
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: No abandoned-call reaper sweep completed in 10 minutes.
+          description: Intent rows of crashed calls are not being closed as abandoned.
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditreaperstale
+      - alert: GatewayAuditPrunerStale
+        # Hourly prune (first run within 5 min of boot): three missed runs.
+        # Per deployment, like GatewayAuditReaperStale.
+        expr: (time() - max by (job, namespace, service) (audit_pruner_last_success_timestamp) > 10800) or (group by (job, namespace, service) (build_info) unless on (job, namespace, service) group by (job, namespace, service) (audit_pruner_last_success_timestamp))
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: No successful audit retention prune in 3 hours.
+          description: Audit rows past AUDIT_RETENTION_DAYS are not being deleted.
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditprunerstale
+      - alert: GatewayAuditStreamDropped
+        expr: sum by (sink) (increase(audit_stream_dropped_total[10m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Audit stream deliveries to {{ $labels.sink }} failed.
+          description: '{{ $value | humanize }} audit stream deliveries failed in 10m. The state DB row is the record; the SIEM copy has gaps.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditstreamdropped
+      - alert: GatewayLogLinesDropped
+        expr: sum(increase(log_lines_dropped_total[10m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: The non-blocking log queue dropped lines.
+          description: '{{ $value | humanize }} log lines dropped in 10m, stdout audit stream copies included.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayloglinesdropped
+
+  - name: db-mcp-gateway.runtime
+    rules:
+      - alert: GatewayConfigReloadFailed
+        expr: sum by (instance) (increase(config_reloads_total{result="error"}[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: A config reload on {{ $labels.instance }} was refused.
+          description: The replica keeps serving its previous config; the new file is invalid or a secret ref did not resolve.
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayconfigreloadfailed
+      - alert: GatewayHandlerPanics
+        expr: sum by (layer) (increase(handler_panics_total[10m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Panics caught in the {{ $labels.layer }} layer.
+          description: '{{ $value | humanize }} panics in 10m, answered as internal. Each is a bug.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayhandlerpanics
+      - alert: GatewayRequestsShed
+        expr: sum by (scope) (rate(requests_shed_total[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Requests refused by the {{ $labels.scope }} concurrency cap.
+          description: '{{ $value | humanize }} requests/s shed for 10m.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayrequestsshed
+      - alert: GatewayTlsCertExpiringSoon
+        expr: min(tls_cert_not_after_timestamp) - time() < 14 * 86400
+        labels:
+          severity: warning
+        annotations:
+          summary: The served TLS certificate expires in under 14 days.
+          description: 'Expires in {{ $value | humanizeDuration }}.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewaytlscertexpiringsoon
+      - alert: GatewayTlsCertExpiryCritical
+        expr: min(tls_cert_not_after_timestamp) - time() < 2 * 86400
+        labels:
+          severity: critical
+        annotations:
+          summary: The served TLS certificate expires in under 2 days.
+          description: 'Expires in {{ $value | humanizeDuration }}. Agents cannot connect once it lapses.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewaytlscertexpirycritical
+      - alert: GatewayLoginFailureSpike
+        expr: sum by (code) (increase(login_failures_total[15m])) > 10
+        labels:
+          severity: warning
+        annotations:
+          summary: Bridge logins refused with {{ $labels.code }}.
+          description: '{{ $value | humanize }} logins refused in 15m.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayloginfailurespike
+
+  - name: db-mcp-gateway.pools
+    rules:
+      - alert: GatewayPoolSaturated
+        expr: max by (db, pool_kind) (pool_connections_in_use / (pool_size > 0)) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Target pool {{ $labels.db }} ({{ $labels.pool_kind }}) above 90% in use.
+          description: 'Pool use is {{ $value | humanizePercentage }}. Waits past 5 s answer unavailable.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewaypoolsaturated
+      - alert: GatewayPoolAcquireSlow
+        expr: histogram_quantile(0.95, sum by (db, pool_kind, le) (rate(pool_acquire_wait_seconds_bucket[5m]))) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Target pool {{ $labels.db }} ({{ $labels.pool_kind }}) acquire wait p95 above 1 s.
+          description: 'Acquire wait p95 is {{ $value | humanizeDuration }}; the acquire timeout is 5 s.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewaypoolacquireslow
+      - alert: GatewayStateDbPoolSaturated
+        expr: max by (pool) (state_db_pool_connections_in_use / (state_db_pool_size > 0)) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: State DB pool {{ $labels.pool }} above 90% in use.
+          description: 'Pool use is {{ $value | humanizePercentage }}. Audit writes queue behind it.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewaystatedbpoolsaturated
+
+  - name: db-mcp-gateway.tools
+    rules:
+      - alert: GatewayTargetUnavailable
+        expr: sum by (db) (rate(tool_calls_by_db{outcome="unavailable"}[10m])) / sum by (db) (rate(tool_calls_by_db[10m])) > 0.25
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: Calls to {{ $labels.db }} answered unavailable.
+          description: '{{ $value | humanizePercentage }} of calls to {{ $labels.db }} answered unavailable for 10m.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewaytargetunavailable
+      - alert: GatewayToolServerErrorRatio
+        expr: sum(rate(tool_calls{outcome=~"internal|timeout|unavailable|audit_unavailable"}[10m])) / sum(rate(tool_calls[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Over 5% of tool calls failed on the gateway or target side.
+          description: '{{ $value | humanizePercentage }} of tool calls ended internal, timeout, unavailable or audit_unavailable.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewaytoolservererrorratio
+      - alert: GatewayToolDeniedRatio
+        expr: sum(rate(tool_calls{outcome=~"forbidden|forbidden_sql|permission_denied"}[30m])) / sum(rate(tool_calls[30m])) > 0.25
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: Over 25% of tool calls denied.
+          description: '{{ $value | humanizePercentage }} of tool calls ended forbidden, forbidden_sql or permission_denied: grants, target roles or agents are out of step.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewaytooldeniedratio
+      - alert: GatewayToolClientErrorRatio
+        expr: sum(rate(tool_calls{outcome=~"invalid_arguments|reason_required|syntax_error|undefined_object|unsupported_backend"}[30m])) / sum(rate(tool_calls[30m])) > 0.5
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: Over half of tool calls rejected as caller mistakes.
+          description: '{{ $value | humanizePercentage }} of tool calls ended with a client-side outcome: an agent is looping on a bad call.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewaytoolclienterrorratio

@@ -42,7 +42,7 @@ pub(crate) async fn spawn_gateway(pool: &PgPool, registry: ClientRegistry) -> St
 }
 
 /// [`spawn_gateway`] over the caller's code and refresh-token stores.
-async fn spawn_gateway_with(
+pub(crate) async fn spawn_gateway_with(
     pool: &PgPool,
     registry: ClientRegistry,
     codes: AuthCodes,
@@ -295,7 +295,7 @@ async fn resolving_every_unused_client_does_not_block_registration() {
 /// Make every COMMIT that inserted a refresh token of `sub` fail: the
 /// statements succeed, and the caller learns of the failure only from the
 /// COMMIT's reply — all it ever knows of a commit whose reply was lost.
-async fn fail_commits_minting_for(pool: &PgPool, trigger: &str, sub: &str) {
+pub(crate) async fn fail_commits_minting_for(pool: &PgPool, trigger: &str, sub: &str) {
     for ddl in [
         format!(
             "CREATE FUNCTION {trigger}() RETURNS trigger LANGUAGE plpgsql AS \
@@ -307,7 +307,10 @@ async fn fail_commits_minting_for(pool: &PgPool, trigger: &str, sub: &str) {
              EXECUTE FUNCTION {trigger}()"
         ),
     ] {
-        sqlx::query(&ddl).execute(pool).await.expect("install");
+        sqlx::query(sqlx::AssertSqlSafe(ddl))
+            .execute(pool)
+            .await
+            .expect("install");
     }
 }
 
@@ -319,7 +322,8 @@ async fn fail_commits_minting_for(pool: &PgPool, trigger: &str, sub: &str) {
 async fn a_mint_whose_commit_errored_keeps_the_code_spent() {
     let pool = state_pool().await;
     let sub = format!("commit-lost-{}", Uuid::new_v4().simple());
-    let codes = AuthCodes::default();
+    // The production code store: the spent code must stay spent in the table.
+    let codes = AuthCodes::with_db(pool.clone());
     let refresh = RefreshTokens::with_db(pool.clone(), std::time::Duration::from_secs(3600));
     let gateway =
         spawn_gateway_with(&pool, ClientRegistry::default(), codes.clone(), refresh).await;
@@ -329,14 +333,9 @@ async fn a_mint_whose_commit_errored_keeps_the_code_spent() {
         groups: vec!["engineers".into()],
     };
     let (challenge, redirect) = (PKCE_CHALLENGE.to_string(), CLIENT_REDIRECT.to_string());
+    let code = format!("lost-commit-{}", Uuid::new_v4().simple());
     codes
-        .insert(
-            "lost-commit-code",
-            identity,
-            challenge,
-            redirect,
-            "c1".into(),
-        )
+        .insert(&code, identity, challenge, redirect, "c1".into())
         .await
         .expect("code stored");
     let trigger = format!("fail_commit_{}", Uuid::new_v4().simple());
@@ -346,7 +345,7 @@ async fn a_mint_whose_commit_errored_keeps_the_code_spent() {
         .post(format!("{gateway}/token"))
         .form(&[
             ("grant_type", "authorization_code"),
-            ("code", "lost-commit-code"),
+            ("code", code.as_str()),
             ("redirect_uri", CLIENT_REDIRECT),
             ("code_verifier", PKCE_VERIFIER),
         ])
@@ -355,13 +354,16 @@ async fn a_mint_whose_commit_errored_keeps_the_code_spent() {
         .unwrap();
     let status = resp.status();
     let body: Value = resp.json().await.unwrap();
-    let code_left = codes.take("lost-commit-code").await;
+    let code_left = codes.take(&code).await.expect("state DB up");
 
     for ddl in [
         format!("DROP TRIGGER {trigger} ON oauth_refresh_tokens"),
         format!("DROP FUNCTION {trigger}()"),
     ] {
-        sqlx::query(&ddl).execute(&pool).await.expect("uninstall");
+        sqlx::query(sqlx::AssertSqlSafe(ddl))
+            .execute(&pool)
+            .await
+            .expect("uninstall");
     }
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"], "invalid_grant", "{body}");

@@ -4,9 +4,12 @@
 //! Lives in env for now; folds into the YAML schema with issue #16. Tests
 //! build `AuthConfig` directly against an in-process mock IdP (`tests/common/`).
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretSlice, SecretString};
+
+use crate::config::{BoolFlagError, bool_flag_from_env};
 
 use super::oauth::DEFAULT_REFRESH_TTL;
 use super::oidc::is_loopback;
@@ -77,6 +80,15 @@ pub enum AuthConfigError {
     /// would let anyone holding the public dev key mint bearers.
     #[error("ALLOW_INSECURE_SIGNING_KEY requires a loopback OIDC_ISSUER")]
     InsecureKeyWithRemoteIssuer,
+    /// A loopback issuer does not stop a forger: the dev key is public, so a
+    /// reachable listener accepts bearers minted by anyone who can reach it.
+    #[error(
+        "ALLOW_INSECURE_SIGNING_KEY requires a loopback GATEWAY_BIND, got `{0}`; \
+         set a unique SESSION_SIGNING_KEY of at least 32 bytes to listen beyond loopback"
+    )]
+    InsecureKeyWithPublicBind(SocketAddr),
+    #[error(transparent)]
+    Flag(#[from] BoolFlagError),
 }
 
 impl Default for AuthConfig {
@@ -128,8 +140,8 @@ impl AuthConfig {
         if let Ok(value) = std::env::var("SESSION_SIGNING_KEY") {
             config.session_signing_key = value.into_bytes().into();
         }
-        if let Ok(value) = std::env::var("ALLOW_INSECURE_SIGNING_KEY") {
-            config.allow_insecure_signing_key = matches!(value.as_str(), "1" | "true" | "TRUE");
+        if let Some(allow) = bool_flag_from_env("ALLOW_INSECURE_SIGNING_KEY")? {
+            config.allow_insecure_signing_key = allow;
         }
 
         check_signing_key(&config)?;
@@ -140,6 +152,15 @@ impl AuthConfig {
             );
         }
         Ok(config)
+    }
+
+    /// Refuse the insecure-key waiver on a listener reachable beyond loopback.
+    /// Separate from [`Self::from_env`] because the bind is `Config`'s, not ours.
+    pub fn check_bind(&self, bind: SocketAddr) -> Result<(), AuthConfigError> {
+        if self.allow_insecure_signing_key && !bind.ip().is_loopback() {
+            return Err(AuthConfigError::InsecureKeyWithPublicBind(bind));
+        }
+        Ok(())
     }
 }
 

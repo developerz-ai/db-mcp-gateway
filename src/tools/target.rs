@@ -56,12 +56,14 @@ pub(super) fn forbidden() -> Outcome {
 /// Commit the intent row for a call about to reach `target` — phase one of
 /// the two-phase audit. Every tool calls this after authz and before it
 /// opens the adapter; `Err` carries the `audit_unavailable` outcome and the
-/// target call MUST NOT happen.
+/// target call MUST NOT happen. `params` are the values a `run_query` /
+/// `explain` binds, kept so a reaped `abandoned` row still has them.
 pub(super) async fn record_intent(
     ctx: ToolCtx<'_>,
     header: &AuditHeader<'_>,
     target: &Target<'_>,
     access: Access,
+    params: Option<&[serde_json::Value]>,
 ) -> Result<(), Box<Outcome>> {
     let tool = header.tool;
     let intent = CallIntent {
@@ -78,7 +80,7 @@ pub(super) async fn record_intent(
         upstream_actor: ctx.request.upstream.actor(),
         upstream_run_id: ctx.request.upstream.run_id(),
     };
-    audit::intent::record(ctx.state_db, &intent)
+    audit::intent::record_with_params(ctx.state_db, &intent, params)
         .await
         .map_err(|err| {
             tracing::error!(

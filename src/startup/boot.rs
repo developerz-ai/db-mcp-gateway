@@ -1,4 +1,4 @@
-//! Boot-time construction: the state DB, the permissions store and the
+//! Boot-time construction: the permissions store, its listener and the
 //! `AppState` the router serves.
 
 use std::sync::Arc;
@@ -13,11 +13,11 @@ use db_mcp_gateway::auth::oauth::{
     AuthCodes, AuthFacade, ClientRegistry, PendingFlows, RefreshTokens,
 };
 use db_mcp_gateway::auth::{
-    AuthConfig, OidcClient, ServiceTokenStore, SessionCacheConfig, SessionStore,
+    AuthConfig, LoginOptions, OidcClient, ServiceTokenStore, SessionCacheConfig, SessionStore,
 };
 use db_mcp_gateway::authz::PermissionsCache;
 use db_mcp_gateway::config::{Config, ConfigFile, PermissionsStoreDriver};
-use db_mcp_gateway::exec::AdapterRegistry;
+use db_mcp_gateway::exec::{AdapterRegistry, pg};
 use db_mcp_gateway::state;
 use db_mcp_gateway::state::permissions::PermissionsRepo;
 use db_mcp_gateway::state::permissions::mysql::MysqlPermissionsRepo;
@@ -26,16 +26,7 @@ use db_mcp_gateway::transport::{AppState, McpState, OAuthState};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
-pub(crate) async fn connect_state_db(config: &Config) -> anyhow::Result<PgPool> {
-    let state_db = state::connect(&config.state_db.url, config.state_db.pool_size)
-        .await
-        .map_err(|err| boot_db_error("state DB", err))?;
-    tracing::info!(
-        pool_size = config.state_db.pool_size,
-        "state DB connected, migrations applied"
-    );
-    Ok(state_db)
-}
+use super::metrics;
 
 /// Wire every `AppState` dependency. Moves `config_file` and `auth_config` in.
 /// `stop` is the process shutdown token; probes go 503 once it is cancelled.
@@ -57,25 +48,22 @@ pub(crate) async fn build_app_state(
             ..SessionCacheConfig::default()
         },
     );
-    let oidc = OidcClient::new(auth_config.clone())?;
-    let permissions_repo = build_permissions_repo(&config_file, config, state_db).await?;
+    let oidc = OidcClient::with_options(auth_config.clone(), LoginOptions::from_env()?)?;
     // Captured before `auth_config` moves into the facade below.
     let refresh_ttl = auth_config.refresh_ttl;
     // One drain set: detached audit writes and target-side cancels both
     // finish (bounded) before shutdown closes the pools.
     let detached = DetachedTasks::new();
-    let permissions_cache = PermissionsCache::new(
-        permissions_repo.clone(),
-        Duration::from_secs(config.permissions_cache_ttl_seconds),
-    )
-    .with_detached(detached.clone());
-    if permissions_driver(&config_file) == PermissionsStoreDriver::Pg {
-        spawn_permissions_listener(state_db.clone(), permissions_cache.clone(), drained);
-    }
+    let (permissions_repo, permissions_cache) =
+        build_permissions(&config_file, config, state_db, &detached, drained).await?;
+    pg::init_cancel_pool_size_from_env()?;
+    metrics::preregister::register_targets(&config_file);
+    metrics::state_pools::spawn_state_pool_sampler("request", state_db.clone(), stop.clone());
     let mcp = McpState {
-        audit_sinks: Arc::new(ArcSwap::from_pointee(StreamSinks::from_config(
-            &config_file.logging.stream,
-        ))),
+        audit_sinks: Arc::new(ArcSwap::from_pointee(
+            StreamSinks::from_config(&config_file.logging.stream)
+                .map_err(|e| anyhow::Error::new(e).context("logging.stream: syslog sink"))?,
+        )),
         config: Arc::new(ArcSwap::from_pointee(config_file)),
         adapter_registry: AdapterRegistry::with_detached(detached.clone()),
         state_db: state_db.clone(),
@@ -83,14 +71,16 @@ pub(crate) async fn build_app_state(
         permissions_repo,
         detached,
     };
+    // Login state in the shared state DB (migration 0022): no sticky routing.
+    let flows = PendingFlows::with_db(state_db.clone(), &auth_config.session_signing_key);
     let oauth = OAuthState {
         auth: AuthFacade {
             jwt: SessionJwt::new(&auth_config.session_signing_key),
             config: Arc::new(auth_config),
             sessions,
             oidc,
-            flows: PendingFlows::default(),
-            codes: AuthCodes::default(),
+            flows,
+            codes: AuthCodes::with_db(state_db.clone()),
             // Persist refresh chains in the shared state DB: a chain is meant to
             // outlive the process (that is what `REFRESH_TTL_DAYS` buys), and an
             // in-memory store silently capped the real "stay signed in" window at
@@ -104,21 +94,61 @@ pub(crate) async fn build_app_state(
         client_registry: ClientRegistry::with_db(state_db.clone()),
         mcp_path: Arc::from(config.mcp_path.as_str()),
     };
-    Ok(AppState::new(mcp, oauth, stop))
+    let app_state = AppState::new(mcp, oauth, stop);
+    metrics::probes::probe_state().attach(app_state.clone());
+    Ok(app_state)
 }
 
-fn permissions_driver(config_file: &ConfigFile) -> PermissionsStoreDriver {
-    config_file
-        .permissions_store
-        .as_ref()
-        .map_or(PermissionsStoreDriver::Pg, |store| store.driver)
+/// Spec 12 §"Storage backends" / #59: the permissions store the YAML selects
+/// and the grant cache over it. The default (no `permissions_store:`) is the
+/// state DB, with the `LISTEN/NOTIFY` listener on its own pool; MySQL opens a
+/// separate pool keyed by `PERMISSIONS_DB_DSN` and relies on the cache TTL;
+/// `driver: none` (YAML-only) starts neither a store nor a listener.
+async fn build_permissions(
+    config_file: &ConfigFile,
+    config: &Config,
+    state_db: &PgPool,
+    detached: &DetachedTasks,
+    drained: CancellationToken,
+) -> anyhow::Result<(Arc<dyn PermissionsRepo>, PermissionsCache)> {
+    let ttl = Duration::from_secs(config.permissions_cache_ttl_seconds);
+    match config_file.permissions_store_driver() {
+        PermissionsStoreDriver::Pg => {
+            let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(state_db.clone()));
+            let cache = PermissionsCache::new(repo.clone(), ttl).with_detached(detached.clone());
+            let listener_db = state::connect_listener(&config.state_db.url)
+                .await
+                .map_err(|err| boot_db_error("permissions listener", err))?;
+            spawn_permissions_listener(listener_db, cache.clone(), drained);
+            Ok((repo, cache))
+        }
+        PermissionsStoreDriver::Mysql => {
+            let repo = connect_mysql_repo(config, drained.clone()).await?;
+            let cache = PermissionsCache::new(repo.clone(), ttl).with_detached(detached.clone());
+            Ok((repo, cache))
+        }
+        PermissionsStoreDriver::YamlOnly => {
+            // `McpState` requires a repo; this one is never read — the cache
+            // has no store and the admin API cannot be enabled in this mode.
+            // No listener, no store connection.
+            let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(state_db.clone()));
+            tracing::info!(
+                "permissions_store.driver = none: YAML-only grants, no store or listener"
+            );
+            Ok((
+                repo,
+                PermissionsCache::yaml_only().with_detached(detached.clone()),
+            ))
+        }
+    }
 }
 
 /// Cross-replica cache invalidation: apply every committed permissions change
 /// another replica announces over `LISTEN/NOTIFY`, until the drain ends — a
 /// revocation must still bite requests admitted before SIGTERM. Postgres
 /// store only — the MySQL store has no such channel and relies on the TTL.
-/// The listener holds one dedicated connection taken from `pool`.
+/// `pool` is the listener's own ([`state::connect_listener`]), never the
+/// request pool: the `LISTEN` connection is held for the life of the process.
 fn spawn_permissions_listener(pool: PgPool, cache: PermissionsCache, stop: CancellationToken) {
     tokio::spawn(async move {
         let listen = notify::listen(pool, move |change| {
@@ -132,31 +162,22 @@ fn spawn_permissions_listener(pool: PgPool, cache: PermissionsCache, stop: Cance
     });
 }
 
-/// Spec 12 §"Storage backends" / #59: pick the permissions repo based on YAML
-/// config. Default (None) is the pg path — the permissions tables live in the
-/// same state DB as sessions / audit_calls. Mysql opens a separate pool keyed
-/// by `PERMISSIONS_DB_DSN`.
-async fn build_permissions_repo(
-    config_file: &ConfigFile,
+async fn connect_mysql_repo(
     config: &Config,
-    state_db: &PgPool,
+    stop: CancellationToken,
 ) -> anyhow::Result<Arc<dyn PermissionsRepo>> {
-    match permissions_driver(config_file) {
-        PermissionsStoreDriver::Pg => Ok(Arc::new(PgPermissionsRepo::new(state_db.clone()))),
-        PermissionsStoreDriver::Mysql => {
-            let dsn = std::env::var("PERMISSIONS_DB_DSN").map_err(|_| {
-                anyhow::anyhow!("permissions_store.driver = mysql requires PERMISSIONS_DB_DSN env")
-            })?;
-            let pool = state::connect_permissions_mysql(&dsn, config.state_db.pool_size)
-                .await
-                .map_err(|err| boot_db_error("mysql permissions store", err))?;
-            tracing::info!(
-                pool_size = config.state_db.pool_size,
-                "mysql permissions store connected, migrations applied"
-            );
-            Ok(Arc::new(MysqlPermissionsRepo::new(pool)))
-        }
-    }
+    let dsn = std::env::var("PERMISSIONS_DB_DSN").map_err(|_| {
+        anyhow::anyhow!("permissions_store.driver = mysql requires PERMISSIONS_DB_DSN env")
+    })?;
+    let pool = state::connect_permissions_mysql(&dsn, config.state_db.pool_size)
+        .await
+        .map_err(|err| boot_db_error("mysql permissions store", err))?;
+    tracing::info!(
+        pool_size = config.state_db.pool_size,
+        "mysql permissions store connected, migrations applied"
+    );
+    metrics::state_pools::spawn_state_pool_sampler("permissions_mysql", pool.clone(), stop);
+    Ok(Arc::new(MysqlPermissionsRepo::new(pool)))
 }
 
 /// Collapse a boot-time database bring-up failure into a credential-free error.
@@ -174,7 +195,7 @@ async fn build_permissions_repo(
 /// travels in the returned message for exactly that reason. `Migrate` failures
 /// name only migration versions, never credentials, so they're surfaced in full
 /// for operator debugging. CLAUDE.md non-negotiable #1.
-fn boot_db_error(store: &'static str, err: state::StateDbError) -> anyhow::Error {
+pub(super) fn boot_db_error(store: &'static str, err: state::StateDbError) -> anyhow::Error {
     match err {
         state::StateDbError::Connect(source) => {
             let class = state::connect_error_class(&source);

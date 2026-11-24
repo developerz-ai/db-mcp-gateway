@@ -1,8 +1,8 @@
 # Connecting other MCP-aware agents
 
-The gateway speaks standard MCP over HTTP+SSE, so any client that supports the protocol works. This page collects the configuration shapes for the major ones. The Claude Code instructions live in [claude-code.md](claude-code.md).
+The gateway speaks MCP over Streamable HTTP (protocol `2025-06-18`): the client `POST`s JSON-RPC to one endpoint and gets JSON back. `GET` on that endpoint answers `405` — the gateway never opens a server-to-client stream, and the legacy HTTP+SSE transport is not served. Any client that supports Streamable HTTP with OAuth works. This page collects the configuration shapes for the major ones. The Claude Code instructions live in [claude-code.md](claude-code.md).
 
-Throughout, replace `https://db.internal.acme.com` with your gateway URL.
+Throughout, replace `https://db.internal.acme.com/mcp` with your gateway's MCP URL — the origin **plus `/mcp`** (or the operator's `MCP_PATH`). The bare origin has no route and answers `404`.
 
 ## Cursor
 
@@ -12,7 +12,7 @@ Throughout, replace `https://db.internal.acme.com` with your gateway URL.
 {
   "mcpServers": {
     "db-gateway": {
-      "url": "https://db.internal.acme.com",
+      "url": "https://db.internal.acme.com/mcp",
       "type": "http"
     }
   }
@@ -28,25 +28,15 @@ Cursor will prompt for SSO on first use.
 ```yaml
 mcpServers:
   - name: db-gateway
-    transport:
-      type: http
-      url: https://db.internal.acme.com
+    type: streamable-http
+    url: https://db.internal.acme.com/mcp
 ```
+
+Older Continue releases used a different shape; check your version's MCP docs if this one is rejected.
 
 ## Claude Desktop
 
-`~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) / `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
-
-```json
-{
-  "mcpServers": {
-    "db-gateway": {
-      "type": "http",
-      "url": "https://db.internal.acme.com"
-    }
-  }
-}
-```
+Add the gateway as a remote (custom) connector in Claude Desktop's settings, with `https://db.internal.acme.com/mcp` as the URL; the OAuth sign-in runs from there. `claude_desktop_config.json` launches local `stdio` servers — a remote `url` entry there is not how Desktop connects to a remote server. Custom connectors depend on your Claude plan and on the gateway being reachable from where the connector runs; check Anthropic's current connector docs before rolling this out.
 
 ## Generic MCP client
 
@@ -54,13 +44,13 @@ Any client implementing the spec accepts:
 
 | Field | Value |
 |---|---|
-| Transport | `http` (preferred) or `sse` |
-| URL | gateway URL, root path |
-| Auth | OIDC via the gateway — client should treat `401` responses as a trigger to open the `login_url` returned in the body |
+| Transport | Streamable HTTP (`POST` only). Legacy `sse` is not served |
+| URL | gateway origin + `/mcp` (the `MCP_PATH`) |
+| Auth | MCP Authorization (OAuth 2.1 + PKCE). A `401` carries `WWW-Authenticate` pointing at `/.well-known/oauth-protected-resource`; the client discovers `/authorize`, `/token` and `/register` from there. The gateway brokers the IdP login itself |
 
 ## What every client needs to know
 
-- **Token handling is opaque to the user.** The gateway issues short-lived JWTs (default 8h). The client caches them and re-auths when expired.
+- **Token handling is opaque to the user.** The gateway issues short-lived session JWTs (default 8h) plus a refresh token (chain lifetime default 1 day). The client caches them, refreshes, and re-auths when the chain ends.
 - **No client-side credentials.** You never paste a DB URL, password, or service-account file.
 - **Result size is server-capped.** If a result is truncated, the response carries `truncated: true` — the agent should surface that, not hide it.
 - **Reason capture happens via tool errors.** If a tool returns `reason_required`, the client should ask the user, then retry with `reason: "..."` in the args.
@@ -73,7 +63,7 @@ If your client runs unattended — a CI job, an agent runner, another service �
 {
   "mcpServers": {
     "db-gateway": {
-      "url": "https://db.internal.acme.com",
+      "url": "https://db.internal.acme.com/mcp",
       "type": "http",
       "headers": {
         "Authorization": "Bearer dbmcp_svc_..."

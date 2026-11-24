@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# bin/seed — load the demo data (examples/demo/seed.sql) into a `shop`
+# database on the dev target-db, creating it if needed, then provision the
+# SELECT-only `gateway_ro` login the dev gateway connects as
+# (bin/lib/target-ro-role.sql) on `shop` and on the tests' database. The
+# owner credentials stay here: psql runs inside the container as the owner;
+# only the read-only password (TARGET_DB_RO_PASSWORD) reaches the gateway.
+# Idempotent; the tests' tables are never written, only granted SELECT on.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+# shellcheck source=bin/lib/dotenv.sh
+. bin/lib/dotenv.sh
+
+compose=(docker compose -f docker-compose.dev.yml)
+user=${TARGET_DB_USER:-app}
+psql=("${compose[@]}" exec -T target-db psql -v ON_ERROR_STOP=1 -q -U "$user")
+
+# exec into the running container, never `up`: an `up` under different env
+# (another port in the shell than in .env) recreates a container in use.
+if ! "${compose[@]}" ps --status running --services | grep -qx target-db; then
+  echo "bin/seed: target-db is not running; start it with bin/dev up" >&2
+  exit 75
+fi
+if [[ $("${psql[@]}" -d "${TARGET_DB_NAME:-app}" -tAc "SELECT 1 FROM pg_database WHERE datname = 'shop'") != 1 ]]; then
+  "${psql[@]}" -d "${TARGET_DB_NAME:-app}" -c 'CREATE DATABASE shop'
+fi
+"${psql[@]}" -d shop < examples/demo/seed.sql
+# The password rides the exec environment (`-e NAME`, value not on argv).
+export RO_PASSWORD=${TARGET_DB_RO_PASSWORD:-gateway-ro-dev-only}
+for database in shop "${TARGET_DB_NAME:-app}"; do
+  "${compose[@]}" exec -T -e RO_PASSWORD target-db psql -v ON_ERROR_STOP=1 -q -U "$user" -d "$database" \
+    < bin/lib/target-ro-role.sql
+done
+echo "✓ seeded shop; gateway_ro reads shop + ${TARGET_DB_NAME:-app} (try: bin/mcp-call run_query '{\"server\":\"local\",\"database\":\"shop\",\"sql\":\"select * from orders\"}')"

@@ -1,0 +1,94 @@
+name: load-gate
+
+# The benchmark harness against the dev stack it boots itself, compared with a
+# baseline taken on this same runner class — absolute numbers from another
+# host mean nothing here. Weekly, not per PR: a release build plus the full run
+# is ~15 minutes. Shared runners are noisy, so one run decides nothing: three
+# independent runners measure, and the gate fails only when at least two of
+# the three regressed (load_gate.sh also reports drifted shapes as
+# inconclusive instead of gating on them).
+on:
+  schedule:
+    - cron: "30 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: load-gate-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  measure:
+    # One dead leg must not fail the run on its own: `verdict` counts a
+    # missing result as regressed and alone decides the 2-of-3.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        attempt: [1, 2, 3]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No rust-cache: one release build a week restored a ~1 GB entry that
+      # was evicted or a week stale by the next run, and saved another.
+      - name: install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
+      - name: run the benchmark harness
+        run: ./benchmarks/gateway_overhead.sh --out "benchmarks/results/ci-latest-${{ matrix.attempt }}.json"
+      - name: keep the result
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: load-gate-result-${{ matrix.attempt }}
+          path: benchmarks/results/ci-latest-${{ matrix.attempt }}.json
+
+  # 2-of-3: a missing result (a measuring leg that died) counts as a failure,
+  # so two dead runners fail the gate rather than passing on one sample.
+  verdict:
+    needs: [measure]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      BASELINE: benchmarks/baselines/ci-ubuntu-latest-postgres.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: benchmarks
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: load-gate-result-*
+          path: results
+          merge-multiple: true
+      - name: gate against the stored baseline (2 of 3)
+        run: |
+          set -uo pipefail
+          if [[ ! -f "$BASELINE" ]]; then
+            {
+              echo '## load gate: baseline captured on this run'
+              echo "No \`$BASELINE\` yet. Commit one \`load-gate-result-*\` artifact"
+              echo "of this run as that file; later runs gate against it."
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          failed=0
+          for attempt in 1 2 3; do
+            result="results/ci-latest-$attempt.json"
+            echo "## load gate, run $attempt" >> "$GITHUB_STEP_SUMMARY"
+            if [[ ! -f "$result" ]]; then
+              echo "no result (the measuring run failed)" | tee -a "$GITHUB_STEP_SUMMARY"
+              failed=$((failed + 1))
+            elif ! ./benchmarks/load_gate.sh "$result" "$BASELINE" | tee -a "$GITHUB_STEP_SUMMARY"; then
+              failed=$((failed + 1))
+            fi
+          done
+          echo "load gate: $failed of 3 runs regressed" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$failed" -lt 2 ]

@@ -121,6 +121,44 @@ pub enum SecretError {
     BackendNotImplemented(String),
 }
 
+/// Where a secret reference sits in the config: names the server, database
+/// and tier (or the service account), never the value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretSite {
+    /// `servers[].databases[].password` — the read tier's role.
+    ReadPassword { server: String, database: String },
+    /// `servers[].databases[].write_password` — the write tier's role.
+    WritePassword { server: String, database: String },
+    /// `service_accounts[].token` / `tokens[index]`.
+    ServiceToken { account: String, index: usize },
+}
+
+impl std::fmt::Display for SecretSite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReadPassword { server, database } => write!(
+                f,
+                "servers[{server}].databases[{database}].password (read tier)"
+            ),
+            Self::WritePassword { server, database } => write!(
+                f,
+                "servers[{server}].databases[{database}].write_password (write tier)"
+            ),
+            Self::ServiceToken { account, index } => {
+                write!(f, "service_accounts[{account}].tokens[{index}]")
+            }
+        }
+    }
+}
+
+/// A [`SecretError`] with the [`SecretSite`] it came from.
+#[derive(Debug, thiserror::Error)]
+#[error("{site}: {error}")]
+pub struct SiteSecretError {
+    pub site: SecretSite,
+    pub error: SecretError,
+}
+
 impl Password {
     /// Parse a raw YAML string into a `Password`. Fails closed: any `${…}`
     /// payload that isn't `ENV:` or `FILE:` is rejected so legacy / typo
@@ -171,7 +209,9 @@ impl Password {
             Password::Literal(s) => Ok(s.clone()),
             Password::EnvVar(name) => match std::env::var(name) {
                 // Spec 08: an empty ref aborts boot like an unset one — an
-                // empty password would otherwise reach the driver.
+                // empty password would otherwise reach the driver. Unlike a
+                // `${FILE:…}` value it is not trimmed: the environment holds
+                // the credential byte for byte.
                 Ok(v) if v.is_empty() => Err(SecretError::EnvNotSet(name.clone())),
                 Ok(v) => Ok(SecretString::from(v)),
                 Err(std::env::VarError::NotPresent) => Err(SecretError::EnvNotSet(name.clone())),

@@ -1,6 +1,7 @@
 //! `permissions_grants` SQL: pool reads, the resolver's one-query loader, and
 //! the transactional writes the admin API audits.
 
+use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -15,7 +16,10 @@ pub(super) async fn get_grant(
     let sql = format!(
         "SELECT {GRANT_COLUMNS} FROM permissions_grants WHERE id = $1 AND revoked_at IS NULL"
     );
-    let row = sqlx::query(&sql).bind(id).fetch_optional(pool).await?;
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
     row.as_ref().map(grant_from_row).transpose()
 }
 
@@ -33,7 +37,7 @@ pub(super) async fn list_grants(
            AND ($2::uuid IS NULL OR database_id = $2) \
          ORDER BY created_at, id LIMIT $3 OFFSET $4"
     );
-    let rows = sqlx::query(&sql)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(user_id)
         .bind(database_id)
         .bind(page.limit())
@@ -52,7 +56,7 @@ pub(super) async fn live_grants_for_sub(
 ) -> Result<Vec<LiveGrant>, RepoError> {
     let rows = sqlx::query(
         "SELECT g.id, COALESCE(g.server, d.server) AS server, d.db_name, g.action, \
-                g.constraints \
+                g.constraints, g.expires_at \
          FROM permissions_grants g \
          JOIN permissions_users u ON u.id = g.user_id \
          LEFT JOIN permissions_databases d ON d.id = g.database_id AND d.deleted_at IS NULL \
@@ -76,6 +80,7 @@ pub async fn tx_create_grant(
     target: &GrantTarget,
     action: GrantAction,
     constraints: &JsonValue,
+    expires_at: Option<DateTime<Utc>>,
 ) -> Result<Option<PermissionsGrant>, RepoError> {
     let (server, database_id, wildcard) = target.columns();
     let sql = format!(
@@ -84,18 +89,19 @@ pub async fn tx_create_grant(
               d AS (SELECT id FROM permissions_databases \
                     WHERE id = $3 AND deleted_at IS NULL FOR SHARE) \
          INSERT INTO permissions_grants \
-             (user_id, server, database_id, db_name_wildcard, action, constraints) \
-         SELECT u.id, $2, $3, $4, $5, $6 FROM u \
+             (user_id, server, database_id, db_name_wildcard, action, constraints, expires_at) \
+         SELECT u.id, $2, $3, $4, $5, $6, $7 FROM u \
          WHERE $3::uuid IS NULL OR EXISTS (SELECT 1 FROM d) \
          RETURNING {GRANT_COLUMNS}"
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(user_id)
         .bind(server)
         .bind(database_id)
         .bind(wildcard)
         .bind(action.as_db_str())
         .bind(constraints)
+        .bind(expires_at)
         .fetch_optional(&mut **tx)
         .await?;
     row.as_ref().map(grant_from_row).transpose()
@@ -110,27 +116,34 @@ pub async fn tx_lock_grant(
         "SELECT {GRANT_COLUMNS} FROM permissions_grants \
          WHERE id = $1 AND revoked_at IS NULL FOR UPDATE"
     );
-    let row = sqlx::query(&sql).bind(id).fetch_optional(&mut **tx).await?;
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?;
     row.as_ref().map(grant_from_row).transpose()
 }
 
-/// Set `action` (when given) and replace `constraints` with the already
-/// merged object. Returns `None` when the grant is missing or revoked.
+/// Set `action` (when given) and replace `constraints` and `expires_at` with
+/// the already merged values. Returns `None` when the grant is missing or
+/// revoked.
 pub async fn tx_update_grant(
     tx: &mut Transaction<'_, Postgres>,
     id: Uuid,
     action: Option<GrantAction>,
     constraints: &JsonValue,
+    expires_at: Option<DateTime<Utc>>,
 ) -> Result<Option<PermissionsGrant>, RepoError> {
     let sql = format!(
         "UPDATE permissions_grants \
-         SET action = COALESCE($2, action), constraints = $3, updated_at = now() \
+         SET action = COALESCE($2, action), constraints = $3, expires_at = $4, \
+             updated_at = now() \
          WHERE id = $1 AND revoked_at IS NULL RETURNING {GRANT_COLUMNS}"
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(id)
         .bind(action.map(GrantAction::as_db_str))
         .bind(constraints)
+        .bind(expires_at)
         .fetch_optional(&mut **tx)
         .await?;
     row.as_ref().map(grant_from_row).transpose()
@@ -176,7 +189,10 @@ async fn revoke_where(
         "UPDATE permissions_grants SET revoked_at = now() \
          WHERE {column} = $1 AND revoked_at IS NULL RETURNING {GRANT_COLUMNS}"
     );
-    let rows = sqlx::query(&sql).bind(id).fetch_all(&mut **tx).await?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(id)
+        .fetch_all(&mut **tx)
+        .await?;
     let mut grants = rows
         .iter()
         .map(grant_from_row)
@@ -198,6 +214,9 @@ pub(super) async fn list_grants_for_user(
         "SELECT {GRANT_COLUMNS} FROM permissions_grants \
          WHERE user_id = $1 AND revoked_at IS NULL ORDER BY created_at"
     );
-    let rows = sqlx::query(&sql).bind(user_id).fetch_all(pool).await?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
     rows.iter().map(grant_from_row).collect()
 }

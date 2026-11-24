@@ -4,7 +4,9 @@
 //! answer. `evaluate(action, server, database)` is the canonical per-call
 //! check — used by every action-gated tool from #4 onward. It returns either
 //! `Decision::Allow { constraints }` (merged most-restrictively across every
-//! matching grant) or `Decision::Deny`.
+//! matching grant) or `Decision::Deny`. "Matching" is scoped to the requested
+//! action: a grant whose action does not include it neither allows the call
+//! nor contributes constraints (`action_scope_proptests`).
 //!
 //! `evaluate_effective` / `can_see_server_effective` (since #49) fold a
 //! per-identity slice of DB-loaded grants into the same merge engine. The
@@ -16,6 +18,8 @@
 //! upgrade from group membership alone (spec 06 §Evaluation). Most-restrictive
 //! merging means being in two groups never *upgrades* your access.
 
+#[cfg(test)]
+mod action_scope_proptests;
 pub mod cache;
 #[cfg(test)]
 mod decision_proptests;
@@ -35,14 +39,20 @@ mod proptest_support;
 #[cfg(test)]
 mod resolver_proptests;
 #[cfg(test)]
+mod subject_proptests;
+#[cfg(test)]
 mod wildcard_proptests;
 
 pub use cache::PermissionsCache;
-pub use effective::{can_see_server_effective, evaluate_effective};
-pub use loader::{LoadError, load_db_grants_for};
+pub use effective::{
+    GrantSource, MatchedGrant, can_see_server_effective, decide, evaluate_effective,
+    evaluate_effective_at, matching_grants,
+};
+pub use loader::{LoadError, load_db_grants_for, to_config_grant};
 pub use patch::ConstraintsPatch;
 
-use crate::auth::Identity;
+use crate::auth::{Identity, IdentityKind};
+use crate::config::schema::Subject;
 use crate::config::{Action, Constraints, Grant, Permission, Server};
 
 /// Outcome of an `evaluate` call. `Allow` carries the merged constraints the
@@ -65,7 +75,7 @@ pub enum Decision {
 pub fn can_see_server(identity: &Identity, server: &Server, permissions: &[Permission]) -> bool {
     permissions
         .iter()
-        .filter(|perm| identity.groups.iter().any(|g| g == &perm.group))
+        .filter(|perm| subject_matches(&perm.subject, identity))
         .flat_map(|perm| perm.grants.iter())
         .any(|grant| grant_can_see(grant, server))
 }
@@ -91,15 +101,32 @@ pub fn grant_can_see(grant: &Grant, server: &Server) -> bool {
     if !server_match {
         return false;
     }
-    grant.database == "*" || server.databases.iter().any(|db| db.name == grant.database)
+    // A bare `*` keeps revealing a server that declares no database yet; an
+    // `except:` list reveals it only while some database escapes the list.
+    (grant.database == "*" && grant.except.is_empty())
+        || server
+            .databases
+            .iter()
+            .any(|db| grant.covers_database(&db.name))
 }
 
 /// Helper: check if a grant applies to an action on a server/database pair.
 /// Used by both evaluate variants.
 pub fn grant_applies(grant: &Grant, action: Action, server: &str, database: &str) -> bool {
     (grant.server == "*" || grant.server == server)
-        && (grant.database == "*" || grant.database == database)
+        && grant.covers_database(database)
         && grant.action.includes(action)
+}
+
+/// Does a `permissions:` block's subject cover `identity`? A group block
+/// matches a carried group claim; a `user:` block matches only an SSO
+/// session with that exact `sub` — a service identity's authority is its one
+/// YAML group, nothing keyed on its name (spec 14).
+pub fn subject_matches(subject: &Subject, identity: &Identity) -> bool {
+    match subject {
+        Subject::Group(group) => identity.groups.iter().any(|g| g == group),
+        Subject::User(sub) => identity.kind == IdentityKind::Sso && identity.user_sub == *sub,
+    }
 }
 
 /// Merge two `Constraints` most-restrictively. Pure — same inputs, same

@@ -146,7 +146,7 @@ async fn update_grant(
     constraints: serde_json::Value,
 ) -> Option<PermissionsGrant> {
     let mut tx = pool.begin().await.expect("begin");
-    let updated = grants::tx_update_grant(&mut tx, id, action, &constraints)
+    let updated = grants::tx_update_grant(&mut tx, id, action, &constraints, None)
         .await
         .expect("update grant");
     tx.commit().await.expect("commit");

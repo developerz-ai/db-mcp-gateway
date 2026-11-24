@@ -8,34 +8,47 @@
 //!     injects `Identity` into request extensions.
 //!  2. `require_admin_group` (this module) — confirms `Identity.groups` carries
 //!     the configured admin group and stashes [`AdminActor`] for handlers.
-//!     The `permissions_users` upsert is intentionally deferred to mutation
-//!     handlers so it runs inside the same transaction as the audit row.
+//!     The actor's `permissions_users` row (inserted if absent, never
+//!     rewritten) is deferred to mutation handlers so it is written in the
+//!     same transaction as the audit row.
 //!
 //! Every write commits a `permissions_audit` row in the same transaction as
 //! the data write ([`audited_tx`]). Audit failure rolls back. CLAUDE.md
 //! non-negotiable #4.
 
+pub mod audit_calls;
 mod audited_tx;
 pub mod databases;
 pub mod error;
+pub mod explain;
+mod grant_view;
 pub mod grants;
 pub mod middleware;
+pub mod openapi;
 pub mod page_query;
 mod payload;
+mod permissions_diff;
+pub mod permissions_doc;
+mod read_audit;
 pub mod users;
 mod validation;
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
+use axum::http::HeaderValue;
+use axum::http::header::CACHE_CONTROL;
 use axum::middleware as axum_mw;
+use axum::response::Response;
 use axum::routing::{get, post};
 use sqlx::PgPool;
 
 use crate::auth::SessionStore;
 use crate::authz::PermissionsCache;
-use crate::config::AdminGroup;
+use crate::config::{AdminGroup, ConfigFile};
 use crate::state::permissions::PermissionsRepo;
 
 use self::databases::DatabasesState;
@@ -62,6 +75,17 @@ pub struct AdminDeps {
     /// Server names the gateway config declares — the only legal targets of
     /// a wildcard grant or a database registration.
     pub known_servers: Arc<[String]>,
+    /// The live config: a database registration must name a database the
+    /// config declares *now*, not at boot — a reload can add or drop one.
+    pub config: Arc<ArcSwap<ConfigFile>>,
+}
+
+/// State of the audited read routes (explain, export/diff, audit stream).
+#[derive(Debug, Clone)]
+pub struct ReadState {
+    pub repo: Arc<dyn PermissionsRepo>,
+    pub state_db: PgPool,
+    pub config: Arc<ArcSwap<ConfigFile>>,
 }
 
 /// Build the `/admin/v1/*` router. Returned router is unmounted; the caller
@@ -77,6 +101,7 @@ pub fn router(deps: AdminDeps) -> Router {
         sessions,
         max_session_age,
         known_servers,
+        config,
     } = deps;
     let mw_state = AdminMiddlewareState {
         admin_group: group,
@@ -116,9 +141,28 @@ pub fn router(deps: AdminDeps) -> Router {
             state_db: state_db.clone(),
             cache: cache.clone(),
             known_servers: known_servers.clone(),
+            config: config.clone(),
+        });
+    let read_routes = Router::new()
+        .route("/admin/v1/explain", post(explain::explain))
+        .route("/admin/v1/permissions/export", get(permissions_doc::export))
+        .route(
+            "/admin/v1/permissions/diff",
+            post(permissions_doc::diff_document)
+                .layer(DefaultBodyLimit::max(permissions_doc::DIFF_BODY_LIMIT)),
+        )
+        .route("/admin/v1/audit/calls", get(audit_calls::stream))
+        .with_state(ReadState {
+            repo: repo.clone(),
+            state_db: state_db.clone(),
+            config,
         });
     let grants_routes = Router::new()
         .route("/admin/v1/grants", post(grants::create).get(grants::list))
+        .route(
+            "/admin/v1/grants/batch",
+            post(grants::batch).layer(DefaultBodyLimit::max(grants::BATCH_BODY_LIMIT)),
+        )
         .route(
             "/admin/v1/grants/:id",
             get(grants::get_one)
@@ -136,5 +180,17 @@ pub fn router(deps: AdminDeps) -> Router {
         .merge(users_routes)
         .merge(databases_routes)
         .merge(grants_routes)
+        .merge(read_routes)
+        .route("/admin/v1/openapi.json", get(openapi::document))
         .route_layer(axum_mw::from_fn_with_state(mw_state, require_admin_group))
+        .route_layer(axum_mw::map_response(no_store))
+}
+
+/// Admin bodies carry subjects, emails and grant sets: no shared or browser
+/// cache may keep one. Outermost, so the admin-group refusals carry it too.
+async fn no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }

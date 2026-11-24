@@ -35,13 +35,14 @@ use uuid::Uuid;
 use crate::config::{Database, Server, Tls};
 
 use super::adapter::{AdapterKind, DbAdapter, ExecError, ExecResult, effective_timeout_ms};
+use super::pg::pool_metrics::record_acquire_wait;
 use super::pg::resolve_password;
 use super::pool_sizing::{CallerSlots, PoolSizing};
 use super::query::{
     ActivityQuery, ExecQuery, ExplainQuery, SampleQuery, SchemaQuery, TableStatsQuery,
 };
 use bounded::{BoundError, Fetched};
-use error::connection_survives;
+use error::{connection_lost, connection_survives};
 use pool::{ConnPool, Lease};
 use rejector::Command;
 use shape::{Shaped, shape_reply};
@@ -129,7 +130,7 @@ impl RedisAdapter {
         }
         .map_err(|_| ExecError::Connection)?;
         Ok(Self {
-            pool: ConnPool::new(client, sizing),
+            pool: ConnPool::new(client, sizing, &db_label),
             callers: CallerSlots::new(sizing),
             db_label,
             role: database.role.clone(),
@@ -141,7 +142,10 @@ impl RedisAdapter {
     /// outside the statement budget, as on Postgres: a saturated pool is
     /// `unavailable`, never a `timeout` of the caller's command.
     async fn lease(&self) -> Result<Lease, ExecError> {
-        match tokio::time::timeout(POOL_ACQUIRE_TIMEOUT, self.pool.lease()).await {
+        let started = Instant::now();
+        let leased = tokio::time::timeout(POOL_ACQUIRE_TIMEOUT, self.pool.lease()).await;
+        record_acquire_wait(&self.db_label, "query", started.elapsed());
+        match leased {
             Ok(Ok(lease)) => Ok(lease),
             Ok(Err(err)) => Err(self.classify_connect(err)),
             Err(_elapsed) => {
@@ -152,7 +156,9 @@ impl RedisAdapter {
     }
 
     /// Run one accepted command bounded to `row_limit` and shape the reply.
-    /// The connection goes back to the pool only after complete replies; if
+    /// A pooled connection found closed is replaced once and the command run
+    /// again on the new one. The connection goes back to the pool only after
+    /// complete replies; if
     /// this future is dropped mid-command (timeout, agent disconnect) the
     /// lease drops with it and the connection is closed, never reused.
     async fn run(
@@ -162,7 +168,21 @@ impl RedisAdapter {
         row_limit: u32,
     ) -> Result<ExecResult, ExecError> {
         let started = Instant::now();
-        let fetched = match bounded::fetch(lease.conn(), &command, row_limit).await {
+        let mut outcome = bounded::fetch(lease.conn(), &command, row_limit).await;
+        if let Err(BoundError::Redis(err)) = &outcome
+            && lease.reused()
+            && connection_lost(err)
+        {
+            // The pooled connection was closed while idle. Every command the
+            // rejector admits is a read, so running it again is safe.
+            tracing::debug!(db = %self.db_label, "idle redis connection was closed; reconnecting");
+            lease
+                .reconnect()
+                .await
+                .map_err(|err| self.classify_connect(err))?;
+            outcome = bounded::fetch(lease.conn(), &command, row_limit).await;
+        }
+        let fetched = match outcome {
             Ok(fetched) => {
                 lease.release().await;
                 fetched
@@ -193,6 +213,7 @@ impl RedisAdapter {
         };
         Ok(ExecResult {
             columns: shaped.columns,
+            column_types: Vec::new(),
             rows: shaped.rows,
             truncated: shaped.truncated,
             elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),

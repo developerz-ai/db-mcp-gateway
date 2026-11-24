@@ -14,6 +14,9 @@ pub const INVALID_REQUEST: i32 = -32600;
 pub const METHOD_NOT_FOUND: i32 = -32601;
 pub const INVALID_PARAMS: i32 = -32602;
 pub const INTERNAL_ERROR: i32 = -32603;
+/// Implementation-defined server error (JSON-RPC reserves -32000..-32099):
+/// the request was shed by a concurrency budget; `data.code` says which.
+pub const SERVER_OVERLOADED: i32 = -32000;
 
 /// The JSON-RPC `id` member as observed on the wire.
 ///
@@ -186,6 +189,14 @@ impl ErrorObject {
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(INTERNAL_ERROR, message)
+    }
+
+    /// An error with a machine-readable `data` member.
+    pub fn with_data(code: i32, message: impl Into<String>, data: Value) -> Self {
+        Self {
+            data: Some(data),
+            ..Self::new(code, message)
+        }
     }
 
     fn new(code: i32, message: impl Into<String>) -> Self {

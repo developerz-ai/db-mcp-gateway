@@ -1,0 +1,6 @@
+# --check fixture: a value in an enum-typed field. The parser error names the
+# schema's alternatives and the position, never the value.
+servers:
+  - name: prod
+    kind: hunter2-not-a-kind
+    host: db.example.internal

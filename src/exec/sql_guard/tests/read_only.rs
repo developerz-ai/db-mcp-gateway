@@ -81,15 +81,15 @@ fn explain_without_analyze_still_allowed() {
 fn nested_explain_rejected_at_parse_time() {
     assert!(matches!(
         is_read_only("EXPLAIN EXPLAIN ANALYZE SELECT 1"),
-        Err(GuardError::Parse)
+        Err(GuardError::Parse(_))
     ));
     assert!(matches!(
         is_read_only("EXPLAIN EXPLAIN (ANALYZE) SELECT 1"),
-        Err(GuardError::Parse)
+        Err(GuardError::Parse(_))
     ));
     assert!(matches!(
         is_read_only("EXPLAIN EXPLAIN DELETE FROM users"),
-        Err(GuardError::Parse)
+        Err(GuardError::Parse(_))
     ));
 }
 
@@ -226,11 +226,32 @@ fn copy_rejected() {
     rejected_not_allowed("COPY users TO STDOUT", "COPY");
 }
 
+/// The agent is told where parsing stopped: coordinates only, never the
+/// parser's message (which quotes the statement).
+#[test]
+fn a_parse_error_carries_its_line_and_column() {
+    let err = is_read_only("SELECT 1\nFROM t WHERE 'secret' = = 1").expect_err("unparseable");
+    let at = err.location().expect("sqlparser located it");
+    assert_eq!((at.line, at.column), (2, 25));
+    assert_eq!(err.to_string(), "could not parse SQL at line 2, column 25");
+    assert!(!err.to_string().contains("secret"));
+    assert_eq!(is_read_only("").expect_err("empty").location(), None);
+    assert_eq!(
+        is_read_only("SELECT 1; SELECT 2")
+            .expect_err("two")
+            .location(),
+        None
+    );
+}
+
 #[test]
 fn unparseable_rejected_as_parse_error() {
-    assert!(matches!(is_read_only("SELEKT 1"), Err(GuardError::Parse)));
-    assert!(matches!(is_read_only(""), Err(GuardError::Parse)));
-    assert!(matches!(is_read_only("   "), Err(GuardError::Parse)));
+    assert!(matches!(
+        is_read_only("SELEKT 1"),
+        Err(GuardError::Parse(_))
+    ));
+    assert!(matches!(is_read_only(""), Err(GuardError::Parse(_))));
+    assert!(matches!(is_read_only("   "), Err(GuardError::Parse(_))));
 }
 
 #[test]

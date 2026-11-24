@@ -1,0 +1,408 @@
+{
+  "tools": [
+    {
+      "name": "list_servers",
+      "title": "List servers",
+      "description": "List the database servers you may use: logical name, kind (postgres, mongo, redis), description and `databases` — each with the actions, tools and limits your grants give you there. No connection info. Start here.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "list_databases",
+      "title": "List databases",
+      "description": "List the databases you may use on `server`, or on every server you can see when `server` is omitted: logical name, description, kind, your actions, whether writes can succeed, the tools that work there and the row/timeout/reason limits your grants enforce. No connection info.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "server": {
+            "type": "string",
+            "description": "Logical server name from list_servers; omit for all."
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "describe_schema",
+      "title": "Describe schema",
+      "description": "Tables, columns and types of a database. `detail`: `names` (tables and their kind), `columns` (default), `full` (real types, keys, indexes, comments, row estimates). Optional `schema` (default `public`) and `table` narrow the result; `search` keeps tables whose name or a column name contains the term, across every schema unless `schema` is given. Mongo: collections and their indexes (`schema` ignored); `full` also infers fields from a few sampled documents, which needs query_read. Not on Redis. Needs schema_read.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "server": {
+            "type": "string"
+          },
+          "database": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "table": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string",
+            "enum": [
+              "names",
+              "columns",
+              "full"
+            ],
+            "default": "columns"
+          },
+          "search": {
+            "type": "string",
+            "description": "Case-insensitive substring of a table or column name."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why you are making this call; required when the grant sets require_reason."
+          }
+        },
+        "required": [
+          "server",
+          "database"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "sample_table",
+      "title": "Sample table",
+      "description": "A few rows of one table — `SELECT * FROM \"<schema>\".\"<table>\" LIMIT n`, default 10 rows, at most 100,000; `columns` keeps only those. Mongo: a limited `find` on the collection, one `document` column per row (`columns` picks top-level fields). Not on Redis. Schema and table are plain identifiers (letters, digits, `_`; a Mongo collection may also hold `-` and `.`). Same result shape as run_query. Needs query_read.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "server": {
+            "type": "string"
+          },
+          "database": {
+            "type": "string"
+          },
+          "table": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "max_bytes": {
+            "type": "integer",
+            "minimum": 2,
+            "description": "Cap on the JSON size of the returned rows: the leading rows that fit are kept, truncated_by: byte_cap."
+          },
+          "max_cell_bytes": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Replace any cell whose JSON is longer with a {\"$dbmcp_truncated\": {bytes, preview}} marker; drops no row."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why you are making this call; required when the grant sets require_reason."
+          }
+        },
+        "required": [
+          "server",
+          "database",
+          "table"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "explain",
+      "title": "Explain query",
+      "description": "The query plan from `EXPLAIN (FORMAT JSON)`, plus a `summary`: the root's total_cost and plan_rows, seq_scans (relations read by a sequential scan) and node_count. Plain EXPLAIN never executes the statement; INSERT/UPDATE/DELETE need a query_write grant. `analyze: true` runs the statement for real timings — read statements only, inside a read-only transaction and the 30 s statement timeout. Postgres only.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "server": {
+            "type": "string"
+          },
+          "database": {
+            "type": "string"
+          },
+          "sql": {
+            "type": "string"
+          },
+          "analyze": {
+            "type": "boolean",
+            "default": false
+          },
+          "params": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {},
+            "description": "Postgres only: values bound to $1..$n, in order — never parsed as SQL. JSON null, boolean, integer, number, string, array/object bind as an untyped NULL, bool, int8, float8, text, jsonb; cast in the SQL for any other type ($1::date). At most 100, each at most 64 KiB of JSON."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why you are making this call; required when the grant sets require_reason."
+          }
+        },
+        "required": [
+          "server",
+          "database",
+          "sql"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "run_query",
+      "title": "Run query",
+      "description": "Run one statement under your grants. `sql` depends on the server kind (see its description). Returns columns, rows, truncated, row_limit, elapsed_ms and, for a write, rows_affected. Rows: default 1,000, `limit` up to 100,000, a grant may lower both; a result stops at 32 MiB. When `truncated`, `truncated_by` says which cap hit and `hint` how to page for the rest. Statement timeout 30 s (a grant may lower it). Read-only unless a query_write grant allows one INSERT/UPDATE/DELETE on Postgres; `dry_run: true` runs that write and rolls it back (triggers fire; sequences advance). Mongo and Redis are always read-only.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "server": {
+            "type": "string"
+          },
+          "database": {
+            "type": "string"
+          },
+          "sql": {
+            "type": "string",
+            "description": "By server kind: postgres — one SQL statement; mongo — a JSON command document, e.g. {\"find\":\"users\",\"filter\":{}}; redis — a JSON argv array, e.g. [\"HGETALL\",\"user:1\"]."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "params": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {},
+            "description": "Postgres only: values bound to $1..$n, in order — never parsed as SQL. JSON null, boolean, integer, number, string, array/object bind as an untyped NULL, bool, int8, float8, text, jsonb; cast in the SQL for any other type ($1::date). At most 100, each at most 64 KiB of JSON."
+          },
+          "dry_run": {
+            "type": "boolean",
+            "default": false
+          },
+          "max_bytes": {
+            "type": "integer",
+            "minimum": 2,
+            "description": "Cap on the JSON size of the returned rows: the leading rows that fit are kept, truncated_by: byte_cap."
+          },
+          "max_cell_bytes": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Replace any cell whose JSON is longer with a {\"$dbmcp_truncated\": {bytes, preview}} marker; drops no row."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why you are making this call; required when the grant sets require_reason."
+          }
+        },
+        "required": [
+          "server",
+          "database",
+          "sql"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "get_query_history",
+      "title": "Query history",
+      "description": "Your recent queries against a (server, database), newest first: SQL and its sql_sha256, timestamp, duration, row count and outcome; `sql_sha256` narrows to one statement's runs. Recovers context across sessions. Scoped to your authenticated identity, never to a client-supplied user; a service token that sends `x-dbmcp-run-id` sees only that run's entries. Needs history_read.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "server": {
+            "type": "string"
+          },
+          "database": {
+            "type": "string"
+          },
+          "since": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC 3339 timestamp; only entries occurred at or after this instant are returned."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000,
+            "description": "Max entries to return; clamped to the gateway ceiling."
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque `next_cursor` from a previous page; returns the entries after it."
+          },
+          "sql_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{64}$",
+            "description": "Hex SHA-256 of the stored SQL (an entry's sql_sha256); only its entries are returned."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why you are making this call; required when the grant sets require_reason."
+          }
+        },
+        "required": [
+          "server",
+          "database"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "table_stats",
+      "title": "Table stats",
+      "description": "Table health for a schema (default `public`) or one table: total size, row estimate, dead tuples, last vacuum/analyze, and per-index size + scan count. Postgres only. Needs schema_read.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "server": {
+            "type": "string"
+          },
+          "database": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "table": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why you are making this call; required when the grant sets require_reason."
+          }
+        },
+        "required": [
+          "server",
+          "database"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "db_activity",
+      "title": "Database activity",
+      "description": "Your own statements the gateway is running on this database right now: pid, request_id, pool, state, wait event and running_ms. No query text — see get_query_history. Postgres only. Needs schema_read.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "server": {
+            "type": "string"
+          },
+          "database": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why you are making this call; required when the grant sets require_reason."
+          }
+        },
+        "required": [
+          "server",
+          "database"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "cancel_query",
+      "title": "Cancel query",
+      "description": "Cancel one of your own running queries by its gateway `request_id` (from the error body, `x-request-id`, or db_activity). Postgres only. Needs query_read on the database.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "server": {
+            "type": "string"
+          },
+          "database": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why you are making this call; required when the grant sets require_reason."
+          }
+        },
+        "required": [
+          "server",
+          "database",
+          "request_id"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "whoami",
+      "title": "Who am I",
+      "description": "Your authenticated identity, groups, session expiry and the grants that apply to you. No database call.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    }
+  ]
+}

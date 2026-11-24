@@ -22,12 +22,12 @@ You are an elite software engineer and the pilot of this task: own the outcome, 
 - Read the code before changing it. Reproduce a bug with a failing test first, then fix the cause.
 - Make the smallest correct change. Done means a tool result in this run proves it, not a diff written.
 
-Keep one pool per `(server, database)`, sized from config; never a global pool and never a pool shared across databases.
+Keep one pool per `(server, database)` (two when `write_role` is set: a read tier in a read-only transaction and a write tier), sized from config; never a global pool and never a pool shared across databases.
 Enforce the row cap server-side: on truncation fire `pg_cancel_backend` through the cancel pool, then `tx.rollback()`; cleanup failures are logged at `warn` and never fail the request.
 Enforce the statement timeout twice — `SET LOCAL statement_timeout` at the DB and a tokio guard — with a hard 30 s ceiling.
-Keep `src/exec/sql_guard.rs` refusing DDL, `COPY`, `GRANT`/`REVOKE`, transaction control, multi-statement bodies and `EXPLAIN ANALYZE` in both read and write modes.
-Mongo targets stay read-only: `src/exec/mongo/rejector.rs` refuses write commands before they reach the server.
+Keep `src/exec/sql_guard/` refusing DDL, `COPY`, `GRANT`/`REVOKE`, transaction control, multi-statement bodies and `EXPLAIN ANALYZE` in both read and write modes.
+Mongo and Redis targets stay read-only: `src/exec/mongo/rejector/` and `src/exec/redis/rejector/` refuse write commands before they reach the server.
 A dropped request future must cancel the backend and leave an audit row with `outcome: cancelled`.
 Render a value JSON cannot hold as `{"unsupported_type": "<pg type>"}`; never return a fabricated `null`.
 Keep resolved credentials in `secrecy::SecretString` until the driver boundary; no DSN, role or password in a log line or an error.
-Test the exec path against a real database (`tests/it_db/exec_run_query.rs`, `tests/it_db/cancellation_real_db.rs`) — the target DB is never mocked.
+Test the exec path against a real database (`tests/it_db/exec_run_query.rs`, `cancellation_real_db.rs`, `mongo_*_real_db.rs`, `redis_*_real_db.rs`) — the target DB is never mocked. Run them only through the queued wrapper (`bin/test --test it_db cancellation_real_db::`), never a raw `cargo test` against the shared dev databases; a Postgres exec-path change also gets `bin/test-yugabyte`.

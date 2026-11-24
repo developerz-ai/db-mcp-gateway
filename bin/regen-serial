@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""bin/regen-serial — rewrite .config/nextest.toml's run-alone override.
+
+nextest runs each test in its own process, so `#[serial_test::serial(world)]`
+serialises nothing there. The override with
+`threads-required = "num-test-threads"` names every such test in
+tests/it_db/ (plus the whole `it_global` binary); this regenerates its
+`filter` from the attributes. `it_offline::isolation_guard` fails when the
+two drift and names this command.
+
+  bin/regen-serial          rewrite the filter in place
+  bin/regen-serial --check  exit 1 when the filter is stale, change nothing
+"""
+
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG = ROOT / ".config/nextest.toml"
+SERIAL = "#[serial_test::serial(world)]"
+EXCLUSIVE = 'threads-required = "num-test-threads"'
+OVERRIDE = "[[profile.default.overrides]]"
+FILTER = re.compile(r'filter = """\n.*?\n"""', re.S)
+
+
+def serial_tests(module, source):
+    """`module::fn` of every test whose attribute block carries serial(world).
+
+    Reads the same way it_offline::isolation_guard does: the first line after
+    the attribute that is neither an attribute nor a comment is the fn.
+    """
+    lines = [line.strip() for line in source.splitlines()]
+    names = []
+    for index, line in enumerate(lines):
+        if line != SERIAL:
+            continue
+        signature = next(
+            (l for l in lines[index:] if not l.startswith("#[") and not l.startswith("//")), ""
+        )
+        found = re.search(r"\bfn ([A-Za-z0-9_]+)", signature)
+        if not found:
+            raise SystemExit(f"regen-serial: {module}.rs: {SERIAL} is not followed by a fn")
+        names.append(f"{module}::{found.group(1)}")
+    return names
+
+
+def filter_for(names):
+    if not names:
+        return 'filter = """\nbinary(it_global)\n"""'
+    body = "\n".join(("    " if i == 0 else "  | ") + f"test(={n})" for i, n in enumerate(names))
+    return f'filter = """\nbinary(it_global) | (binary(it_db) & (\n{body}\n))\n"""'
+
+
+def regenerate(config, names):
+    """`config` with the run-alone override's filter rebuilt from `names`."""
+    blocks = config.split(OVERRIDE)
+    hits = [i for i, block in enumerate(blocks) if i > 0 and EXCLUSIVE in block]
+    if len(hits) != 1:
+        raise SystemExit(f"regen-serial: expected one override holding {EXCLUSIVE}, found {len(hits)}")
+    block = blocks[hits[0]]
+    if not FILTER.search(block):
+        raise SystemExit('regen-serial: the run-alone override has no filter = """…""" block')
+    blocks[hits[0]] = FILTER.sub(lambda _: filter_for(names), block, count=1)
+    return OVERRIDE.join(blocks)
+
+
+def main(argv):
+    if argv not in ([], ["--check"]):
+        print("usage: bin/regen-serial [--check]", file=sys.stderr)
+        return 2
+    names = sorted(
+        name
+        for path in sorted((ROOT / "tests/it_db").glob("*.rs"))
+        for name in serial_tests(path.stem, path.read_text(encoding="utf-8"))
+    )
+    config = CONFIG.read_text(encoding="utf-8")
+    updated = regenerate(config, names)
+    if updated == config:
+        print(f"regen-serial: up to date ({len(names)} serial(world) tests)")
+        return 0
+    if argv == ["--check"]:
+        print("regen-serial: .config/nextest.toml is stale; run bin/regen-serial", file=sys.stderr)
+        return 1
+    CONFIG.write_text(updated, encoding="utf-8")
+    print(f"regen-serial: wrote {len(names)} serial(world) tests to .config/nextest.toml")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

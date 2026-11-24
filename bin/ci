@@ -19,13 +19,18 @@
 # against the heading IDs the build renders: a fragment pointing at no
 # heading is only a WARNING in the Docusaurus build (onBrokenAnchors
 # defaults to 'warn'), so without this the dead anchor would ship.
-# A missing GATE-SCOPED toolchain — cargo-audit (the
-# audit job) or Node 20+/npm plus the installed website dependencies (the
-# Pages job) — makes that one job report 'NOT RUN' while every other job is
-# still graded. A skip is never silent: it is printed and repeated in the
+# A missing GATE-SCOPED toolchain — python3 (the public-tree guard),
+# cargo-audit (the audit job) or Node 20+/npm plus the installed website
+# dependencies (the Pages job) — makes that one job report 'NOT RUN' while
+# every other job is still graded. A skip is never silent: it is printed and repeated in the
 # final summary.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# shellcheck source=bin/lib/queue.sh
+. bin/lib/queue.sh
+queue_heavy_reexec bin/ci "$@"
+queue_lock heavy "bin/ci"
 
 skipped_jobs=()
 
@@ -34,6 +39,7 @@ skipped_jobs=()
 # names all of them, so no job is ever silently not run.
 pending_jobs=(
   'orchestration regression'
+  'public-tree guard'
   'fmt + clippy'
   'test'
   'cargo audit'
@@ -47,37 +53,6 @@ not_run() {
   local notice="NOT RUN: $1 - $2 ($3)"
   echo "$notice"
   skipped_jobs+=("$notice")
-}
-
-# Report the LOCATION of a secret-scan hit, never the hit itself: the
-# matched line IS the credential, and gate output is copied into PRs
-# (spec 13 — diagnostics must not disclose token-scanner output).
-# `git grep -n` prints `path:line:content`; only `path:line` is emitted.
-redact_token_hits() {
-  local hit path rest location
-  while IFS= read -r hit; do
-    [[ -n $hit ]] || continue
-    if [[ $hit != *:* ]]; then
-      # Not the `path:line:content` shape: report nothing about the content.
-      printf '  <match at an unparsable location>\n'
-      continue
-    fi
-    path=${hit%%:*}
-    rest=${hit#*:}
-    location="$path"
-    if [[ $rest == *:* ]]; then
-      location="$path:${rest%%:*}"
-    fi
-    # A path that carries tokens itself is masked too — every one of them: a
-    # single match+replace only cleared the first match, so a filename holding
-    # two different tokens still printed the second. Each pass removes every
-    # occurrence of one distinct token and shortens the location, so the loop
-    # terminates once no token remains.
-    while [[ $location =~ dbmcp_svc_[0-9a-f]{64} ]]; do
-      location=${location//${BASH_REMATCH[0]}/<redacted>}
-    done
-    printf '  %s\n' "$location"
-  done
 }
 
 # The gate reached a job: it leaves the pending list whether it passed or
@@ -128,6 +103,18 @@ job_reached 'orchestration regression'
 # tests/bin/check.test.sh replaces this entry in its own fixture; the real
 # script never recurses into the gate.
 bash tests/bin/check.test.sh
+echo '→ public-tree guard'
+job_reached 'public-tree guard'
+# ci.yml's public-tree job, before anything compiles: it reads only tracked
+# text, so a leak fails in a second instead of after the build. Locally the
+# PUBLIC_TREE_PRIVATE_WORDS secret is normally unset, and the guard says it
+# skipped those words. GATE-SCOPED: no python3 -> this job alone is NOT RUN.
+if command -v python3 >/dev/null 2>&1; then
+  python3 -I .github/scripts/test_public_tree.py
+  python3 -I .github/scripts/public_tree.py
+else
+  not_run 'public-tree guard' 'python3 is not on PATH' 'install: python3'
+fi
 job_reached 'fmt + clippy'
 bin/lint
 echo '→ actions are SHA-pinned'
@@ -175,11 +162,9 @@ bin/test
 echo '→ cargo audit'
 job_reached 'cargo audit'
 if command -v cargo-audit >/dev/null 2>&1; then
-  # CI's exact command (.github/workflows/ci.yml, audit job). The single
-  # ignore is the one .cargo/audit.toml already justifies; stating it on the
-  # command line keeps the local gate identical to CI instead of leaning on
-  # cargo-audit's config discovery.
-  cargo audit --ignore RUSTSEC-2023-0071
+  # CI's exact command (.github/workflows/ci.yml, audit job): no ignores, on
+  # the command line or in .cargo/audit.toml.
+  cargo audit
 else
   not_run 'cargo audit' 'cargo-audit is not on PATH' \
     'install: cargo install cargo-audit'
@@ -187,33 +172,17 @@ fi
 
 echo '→ secret-scan'
 job_reached 'secret-scan'
-# Port of ci.yml's secret-scan job (spec 14: no literal dbmcp_svc_ service
-# tokens in committed files; the loader accepts Password::Literal for dev/test
-# parity, so the gates enforce credential-free committed config — #190).
-# Fail-closed exactly as CI: rc=0 with matches fails, any rc other than 1
-# fails, and only rc=1 (no match) reads as clean. Regex and pathspec
-# exclusions are stated exactly as CI states them;
-# tests/bin/check.test.sh pins this command line against drift.
-# A hit is reported by LOCATION only — the matched line is the credential and
-# gate output is copied into PRs (spec 13).
-(
-  set +e
-  matches="$(git grep -nE "dbmcp_svc_[0-9a-f]{64}" \
-      -- ":!tests/**" ":!website/**" ":!config/example.yaml" \
-      ":!.github/**" ":!src/config/yaml/**")"
-  rc=$?
-  set -e
-  if [[ $rc -eq 0 && -n $matches ]]; then
-    echo 'literal dbmcp_svc_ service token(s) in committed config — reference the secret via ENV: or FILE: (spec 14)' >&2
-    redact_token_hits <<<"$matches" >&2
-    exit 1
-  fi
-  if [[ $rc -ne 1 ]]; then
-    echo "git grep tooling failure (rc=$rc) — secret-scan cannot read as clean (fail-closed, #190)" >&2
-    exit 1
-  fi
-  echo 'no literal service tokens in committed config (git grep rc=1)'
-)
+# ci.yml's secret-scan job, same script (spec 14: no literal dbmcp_svc_
+# service token in tracked contents, file names or symlink targets — #190).
+# Fail-closed: exit 1 is a token, 2 a scan that could not run; only 0 is
+# clean. A hit is reported by location only (spec 13).
+rc=0
+bin/secret-scan || rc=$?
+case $rc in
+  0) echo 'no literal service tokens in tracked files, names or link targets' ;;
+  1) echo 'literal dbmcp_svc_ service token(s) tracked — reference the secret via ENV: or FILE: (spec 14)' >&2; exit 1 ;;
+  *) echo "secret scan tooling failure (rc=$rc) — cannot read as clean (fail-closed, #190)" >&2; exit 1 ;;
+esac
 # The same regex regression CI runs: one script, one copy, both gates.
 bash tests/bin/secret-scan-regex.test.sh
 

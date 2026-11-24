@@ -5,10 +5,14 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 pub use error::ConfigError;
+pub use flag::{BoolFlagError, bool_flag_from_env};
 use mcp_path::validate_mcp_path;
+use session_ttl::parse_session_cache_ttl;
 
 mod error;
+mod flag;
 mod mcp_path;
+mod session_ttl;
 
 const DEFAULT_STATE_DB_URL: &str = "postgres://gateway:gateway-dev-only@localhost:5433/gateway";
 // Evaluated at compile time: a zero literal fails the build, never the process.
@@ -187,15 +191,8 @@ impl Config {
         if let Ok(value) = std::env::var("PERMISSIONS_CACHE_TTL_SECONDS") {
             config.permissions_cache_ttl_seconds = parse_cache_ttl(value)?;
         }
-        // 0 is valid here — it means "re-validate every request" (no caching).
         if let Ok(value) = std::env::var("SESSION_CACHE_TTL_SECONDS") {
-            config.session_cache_ttl_seconds =
-                value
-                    .parse()
-                    .map_err(|source| ConfigError::SessionCacheTtl {
-                        value: value.clone(),
-                        source,
-                    })?;
+            config.session_cache_ttl_seconds = parse_session_cache_ttl(&value)?;
         }
 
         config.tls = tls_from_env()?;
@@ -261,12 +258,8 @@ fn parse_pool_size(
 /// readability check here is cheap and catches the common "sealed-secret
 /// volume isn't mounted" failure before transport spins up.
 fn tls_from_env() -> Result<TlsConfig, ConfigError> {
-    if let Ok(raw) = std::env::var("TLS_DISABLED") {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" => return Ok(TlsConfig::Disabled),
-            "false" | "0" | "no" | "" => {}
-            _ => return Err(ConfigError::TlsDisabledFlag(raw)),
-        }
+    if bool_flag_from_env("TLS_DISABLED")? == Some(true) {
+        return Ok(TlsConfig::Disabled);
     }
 
     let cert = std::env::var("TLS_CERT_PATH").ok().map(PathBuf::from);

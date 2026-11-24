@@ -196,3 +196,37 @@ servers:
     let cfg = ConfigFile::from_yaml_str(yaml).expect("mongo target is dispatchable");
     assert_eq!(cfg.servers.len(), 1);
 }
+
+/// H4: `driver: none` is the explicit YAML-only mode — no store is read.
+#[test]
+fn accepts_yaml_only_store_and_defaults_absent_to_pg() {
+    let cfg = ConfigFile::from_yaml_str("permissions_store:\n  driver: none\n")
+        .expect("yaml-only parses");
+    assert_eq!(
+        cfg.permissions_store_driver(),
+        PermissionsStoreDriver::YamlOnly
+    );
+    let absent = ConfigFile::from_yaml_str("permissions: []\n").expect("absent parses");
+    assert_eq!(
+        absent.permissions_store_driver(),
+        PermissionsStoreDriver::Pg
+    );
+}
+
+/// The admin API writes the store; a YAML-only install has none to write.
+#[test]
+fn rejects_yaml_only_store_with_admin_enabled() {
+    let yaml = r#"
+permissions_store:
+  driver: none
+admin:
+  enabled: true
+  group: admins
+"#;
+    let err = ConfigFile::from_yaml_str(yaml).expect_err("yaml-only + admin must reject");
+    let ConfigFileError::Invalid(msg) = err else {
+        panic!("expected Invalid, got {err:?}");
+    };
+    assert!(msg.contains("driver = none"), "{msg}");
+    assert!(msg.contains("admin.enabled"), "{msg}");
+}

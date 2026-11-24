@@ -77,7 +77,7 @@ impl Fixture {
                  $$ BEGIN RAISE EXCEPTION 'refusing row %', v; END $$"
             ),
         ] {
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .execute(&fixture.owner)
                 .await
                 .unwrap_or_else(|err| panic!("fixture `{sql}`: {err}"));
@@ -90,7 +90,7 @@ impl Fixture {
             format!("DROP FUNCTION {}(text)", self.raise),
             format!("DROP TABLE {}", self.table),
         ] {
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .execute(&self.owner)
                 .await
                 .expect("drop fixture");
@@ -251,9 +251,9 @@ async fn a_name_the_caller_typed_is_still_named() {
 async fn a_cancel_refused_at_login_carries_no_server_text() {
     let owner = owner().await;
     let role = format!("dbmcp_rot_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE ROLE {role} LOGIN PASSWORD 'first-dev-only'"
-    ))
+    )))
     .execute(&owner)
     .await
     .expect("create role");
@@ -270,15 +270,17 @@ async fn a_cancel_refused_at_login_carries_no_server_text() {
     )
     .await
     .expect("opens with the first password");
-    sqlx::query(&format!("ALTER ROLE {role} PASSWORD 'second-dev-only'"))
-        .execute(&owner)
-        .await
-        .expect("rotate");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER ROLE {role} PASSWORD 'second-dev-only'"
+    )))
+    .execute(&owner)
+    .await
+    .expect("rotate");
 
     let outcome = a.cancel_request(Uuid::new_v4()).await;
     let stale = a.is_stale();
     drop(a);
-    sqlx::query(&format!("DROP ROLE {role}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP ROLE {role}")))
         .execute(&owner)
         .await
         .expect("drop role");

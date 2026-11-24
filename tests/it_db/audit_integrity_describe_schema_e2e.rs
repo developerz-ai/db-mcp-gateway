@@ -5,10 +5,10 @@
 //! Real Postgres throughout (`bin/dev up` → state DB :5433, target DB :5434).
 
 use crate::common;
-use std::time::Duration;
 
 use crate::common::gateway::{LoggedInGateway, spawn_logged_in};
 use crate::common::idp::MockUser;
+use crate::common::mcp::call_tool;
 use serde_json::{Value, json};
 
 const TOOL: &str = "describe_schema";
@@ -47,24 +47,7 @@ async fn boot_gateway() -> LoggedInGateway {
 }
 
 async fn call(booted: &LoggedInGateway, arguments: Value) -> Value {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .unwrap()
-        .post(format!("{}/mcp", booted.url))
-        .bearer_auth(&booted.bearer)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": { "name": TOOL, "arguments": arguments }
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap()
+    call_tool(booted, TOOL, arguments).await
 }
 
 fn payload(response: &Value) -> Value {

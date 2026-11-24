@@ -3,22 +3,6 @@
 use super::*;
 
 #[test]
-fn tool_error_payload_shape() {
-    let request_id = Uuid::new_v4();
-    let response = tool_error(Value::from(7), request_id, OutcomeCode::Forbidden, "nope");
-    let value = serde_json::to_value(&response).unwrap();
-    // The client's JSON-RPC id stays in the envelope only…
-    assert_eq!(value["id"], 7);
-    assert_eq!(value["result"]["isError"], true);
-    let text = value["result"]["content"][0]["text"].as_str().unwrap();
-    let body: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(body["code"], "forbidden");
-    assert_eq!(body["message"], "nope");
-    // …the body carries the gateway id that keys the audit row.
-    assert_eq!(body["request_id"], request_id.to_string());
-}
-
-#[test]
 fn tool_success_payload_shape() {
     let response = tool_success(Value::from(1), r#"{"hello":"world"}"#.to_string());
     let value = serde_json::to_value(&response).unwrap();
@@ -132,4 +116,60 @@ fn not_implemented_maps_to_unsupported_backend() {
         &messages,
     );
     assert_eq!(outcome.code, OutcomeCode::UnsupportedBackend);
+}
+
+#[test]
+fn a_write_is_applied_only_when_it_committed() {
+    let committed = Ok(ExecResult {
+        columns: vec![],
+        column_types: Vec::new(),
+        rows: vec![],
+        truncated: false,
+        elapsed_ms: 1,
+        rows_affected: Some(1),
+    });
+    assert_eq!(write_state(&committed, false), WriteState::Applied);
+    assert_eq!(write_state(&committed, true), WriteState::NotApplied);
+    for err in [
+        ExecError::Timeout,
+        ExecError::Cancelled,
+        ExecError::CommitIndeterminate,
+    ] {
+        assert_eq!(write_state(&Err(err), false), WriteState::Unknown);
+    }
+    assert_eq!(
+        write_state(&Err(ExecError::CommitIndeterminate), true),
+        WriteState::NotApplied
+    );
+    for err in [ExecError::Sql, ExecError::Connection, ExecError::Decode] {
+        assert_eq!(write_state(&Err(err), false), WriteState::NotApplied);
+    }
+}
+
+/// A DB rejection's position, hint and near misses ride to the body.
+#[test]
+fn a_rejection_keeps_what_the_db_pointed_at() {
+    let rejection = DbRejection::new("42703", "column \"emial\" does not exist", "app")
+        .with_position(Some(8))
+        .with_hint(Some("Perhaps you meant \"email\"."), "app")
+        .with_near_misses(vec!["email".to_string()]);
+    let outcome = outcome_from_exec_error(
+        ExecError::Rejected(rejection),
+        Instant::now(),
+        &ToolErrorMessages {
+            timeout: "t",
+            sql_rejected: "s",
+            forbidden_prefix: "q",
+        },
+    );
+    assert_eq!(outcome.code, OutcomeCode::UndefinedObject);
+    let Reply::Rejected(detail) = outcome.reply else {
+        panic!("no detail: {:?}", outcome.reply);
+    };
+    assert_eq!(detail.position, Some(8));
+    assert_eq!(
+        detail.db_hint.as_deref(),
+        Some("Perhaps you meant \"email\".")
+    );
+    assert_eq!(detail.near_misses, ["email"]);
 }

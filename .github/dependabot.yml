@@ -50,6 +50,8 @@ updates:
     schedule:
       interval: weekly
       day: monday
+      # After ci.yml's 04:00 UTC Monday warm run writes the week's cache.
+      time: "06:00"
     open-pull-requests-limit: 5
     cooldown:
       default-days: 14
@@ -69,6 +71,8 @@ updates:
     schedule:
       interval: weekly
       day: monday
+      # After ci.yml's 04:00 UTC Monday warm run writes the week's cache.
+      time: "06:00"
     open-pull-requests-limit: 3
     cooldown:
       default-days: 14
@@ -79,6 +83,12 @@ updates:
         update-types:
           - minor
           - patch
+      # One PR for every advisory fix in the tree, instead of one per package.
+      # Its gate is ci.yml's `website` job (`npm ci`, typecheck, build).
+      npm-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   # The builder base image in `Dockerfile`.
   #
@@ -97,3 +107,25 @@ updates:
       default-days: 14
     commit-message:
       prefix: "chore(docker)"
+
+  # docker-compose.dev.yml pins every dev-stack image by digest (tag kept for
+  # readers); this keeps those digests moving. One grouped PR a month: the
+  # stack is test infrastructure, and `test` runs against exactly it.
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 14
+    groups:
+      dev-stack:
+        patterns: ["*"]
+    ignore:
+      # A major (postgres 16 → 17, mongo 7 → 8) changes what the suite tests
+      # against: a reviewed PR by hand, not a monthly bump.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+      # The YugabyteDB version a production deployment runs (CLAUDE.md §CI).
+      - dependency-name: "yugabytedb/yugabyte"
+    commit-message:
+      prefix: "chore(dev-stack)"

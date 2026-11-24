@@ -94,7 +94,7 @@ fn write_mode_rejects_explain_analyse_spelling() {
     ] {
         let got = check_sql(sql, Access::ReadWrite);
         assert!(
-            matches!(got, Err(GuardError::Parse | GuardError::ExplainAnalyze)),
+            matches!(got, Err(GuardError::Parse(_) | GuardError::ExplainAnalyze)),
             "expected `{sql}` rejected, got {got:?}"
         );
     }

@@ -1,39 +1,16 @@
 use std::time::Instant;
 
 use serde_json::Value;
-use uuid::Uuid;
 
 use crate::audit::intent::WRITE_MAY_HAVE_COMMITTED;
-use crate::exec::{ExecError, RejectionKind};
+use crate::exec::adapter::effective_timeout_ms;
+use crate::exec::sql_guard::GuardError;
+use crate::exec::{DbRejection, ExecError, ExecResult, RejectionKind};
 use crate::mcp::jsonrpc::{ErrorObject, Response};
 use crate::mcp::protocol::{CallToolResult, TextContent};
 
-use super::{Outcome, OutcomeCode, Reply};
-
-/// Build a structured tool error response per spec 03 §Errors. The body's
-/// `request_id` is the gateway UUID — the value in `audit_calls.request_id`
-/// and the `x-request-id` header — so the id an agent pastes back to ops
-/// finds the row. `id` is the client's JSON-RPC id, echoed in the envelope
-/// only. Called only by the chokepoint, the one place that knows both.
-pub(super) fn tool_error(
-    id: Value,
-    request_id: Uuid,
-    code: OutcomeCode,
-    message: &str,
-) -> Response {
-    let body = serde_json::json!({
-        "request_id": request_id.to_string(),
-        "code": code.as_str(),
-        "message": message,
-    });
-    Response::result(
-        id,
-        &CallToolResult {
-            content: vec![TextContent::new(body.to_string())],
-            is_error: true,
-        },
-    )
-}
+use super::types::RejectionDetail;
+use super::{HitLimit, Outcome, OutcomeCode, Reply, WriteState};
 
 /// Build a successful tool result from a JSON-serialised payload string.
 pub fn tool_success(id: Value, text: String) -> Response {
@@ -117,6 +94,10 @@ pub fn outcome_from_exec_error(
     started: Instant,
     messages: &ToolErrorMessages,
 ) -> Outcome {
+    let detail = match &err {
+        ExecError::Rejected(rejection) => Some(rejection_detail(rejection)),
+        _ => None,
+    };
     let owned;
     let (code, message): (OutcomeCode, &str) = match err {
         ExecError::Timeout => (OutcomeCode::Timeout, messages.timeout),
@@ -181,8 +162,75 @@ pub fn outcome_from_exec_error(
         }
     };
     let mut outcome = error_outcome(code, message);
-    outcome.elapsed_ms = Some(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
+    outcome.elapsed_ms = Some(elapsed_ms_since(started));
+    if let Some(detail) = detail {
+        outcome.reply = Reply::Rejected(Box::new(detail));
+    }
     outcome
+}
+
+fn rejection_detail(rejection: &DbRejection) -> RejectionDetail {
+    RejectionDetail {
+        position: rejection.position(),
+        db_hint: rejection.hint().map(str::to_owned),
+        near_misses: rejection.near_misses().to_vec(),
+    }
+}
+
+/// A statement the SQL guard refused: `forbidden_sql`, with the body's
+/// `location` when the parser said where it stopped.
+pub(in crate::tools) fn guard_rejected(err: &GuardError) -> Outcome {
+    let mut outcome = error_outcome(
+        OutcomeCode::ForbiddenSql,
+        &format!("SQL rejected by gateway: {err}"),
+    );
+    if let Some(location) = err.location() {
+        outcome.reply = Reply::Unparsed(location);
+    }
+    outcome
+}
+
+/// A `timeout` outcome names the budget it ran out of — in the message and
+/// as the body's `limit` — and points at `explain`, so the agent's next call
+/// can be a narrower query rather than the same one. `grant_timeout_ms` is
+/// the merged grant's `statement_timeout_ms`; the budget the adapter applied
+/// is that clamped to the gateway ceiling. Any other outcome is untouched.
+pub(in crate::tools) fn note_timeout_limit(outcome: &mut Outcome, grant_timeout_ms: Option<u32>) {
+    if outcome.code != OutcomeCode::Timeout {
+        return;
+    }
+    let budget_ms = effective_timeout_ms(grant_timeout_ms);
+    if let Some(message) = outcome.error_message.as_mut() {
+        message.push_str(&format!(
+            " ({budget_ms} ms); check the plan with explain, or narrow the query"
+        ));
+    }
+    outcome.reply = Reply::LimitHit(HitLimit {
+        name: "statement_timeout_ms",
+        value: u64::from(budget_ms),
+    });
+}
+
+/// Milliseconds since `started`, as the audit row's `elapsed_ms` stores them.
+pub(in crate::tools) fn elapsed_ms_since(started: Instant) -> i64 {
+    i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+/// Whether a write's change is in the target, from how its execution ended.
+/// Only a statement cut off at or after the commit can have landed unseen:
+/// every other failure is raised before the commit and rolls back.
+pub(in crate::tools) fn write_state(
+    executed: &Result<ExecResult, ExecError>,
+    dry_run: bool,
+) -> WriteState {
+    match executed {
+        _ if dry_run => WriteState::NotApplied,
+        Ok(_) => WriteState::Applied,
+        Err(ExecError::Timeout | ExecError::Cancelled | ExecError::CommitIndeterminate) => {
+            WriteState::Unknown
+        }
+        Err(_) => WriteState::NotApplied,
+    }
 }
 
 /// Shortcut for the success shape with row/truncation metadata.

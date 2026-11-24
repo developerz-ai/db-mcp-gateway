@@ -9,9 +9,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-if [[ -f .env ]]; then
-  set -a; . ./.env; set +a
-fi
+# shellcheck source=bin/lib/dotenv.sh
+. bin/lib/dotenv.sh
+# shellcheck source=bin/lib/queue.sh
+. bin/lib/queue.sh
+queue_heavy_reexec bin/test-yugabyte "$@"
+queue_lock heavy "bin/test-yugabyte $*"
+queue_lock db "bin/test-yugabyte $*"
 
 compose=(docker compose -f docker-compose.dev.yml --profile yugabyte)
 services=(state-db target-yugabyte)

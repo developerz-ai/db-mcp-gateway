@@ -17,6 +17,7 @@ use redis::aio::MultiplexedConnection;
 use redis::{AsyncConnectionConfig, Client, RedisError};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
+use super::super::pg::pool_metrics::{self, PoolSample, permits_sample};
 use super::super::pool_sizing::PoolSizing;
 
 /// Bound on opening one connection (TCP, TLS and the `AUTH` handshake) — the
@@ -33,15 +34,17 @@ pub(super) struct ConnPool {
     client: Client,
     config: AsyncConnectionConfig,
     permits: Arc<Semaphore>,
+    max: u32,
     idle: Mutex<Vec<Idle>>,
     idle_timeout: Duration,
 }
 
 impl ConnPool {
     /// No connection is opened here: the first lease opens one. A background
-    /// sweep closes connections idle past `idle_timeout`, and stops once the
-    /// pool is dropped.
-    pub(super) fn new(client: Client, sizing: PoolSizing) -> Arc<Self> {
+    /// sweep closes connections idle past `idle_timeout`, and a sampler
+    /// publishes the pool gauges as `db_label`; both stop once the pool is
+    /// dropped.
+    pub(super) fn new(client: Client, sizing: PoolSizing, db_label: &str) -> Arc<Self> {
         let config = AsyncConnectionConfig::new()
             .set_connection_timeout(Some(CONNECT_TIMEOUT))
             // The adapter bounds every command with the gateway budget; a
@@ -52,11 +55,24 @@ impl ConnPool {
             client,
             config,
             permits: Arc::new(Semaphore::new(max)),
+            max: sizing.max_connections,
             idle: Mutex::new(Vec::new()),
             idle_timeout: sizing.idle_timeout,
         });
         tokio::spawn(sweep_idle(Arc::downgrade(&pool), sizing.idle_timeout));
+        let db_label = db_label.to_owned();
+        pool_metrics::spawn_sampler(Arc::downgrade(&pool), move |pool: &Self| {
+            pool_metrics::publish(&db_label, "query", pool.sample());
+        });
         pool
+    }
+
+    /// A sample that finds the idle list locked leaves `idle` out rather
+    /// than waiting on it.
+    fn sample(&self) -> PoolSample {
+        let idle = self.idle.try_lock().ok().map(|idle| idle.len());
+        let idle = idle.map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+        permits_sample(&self.permits, self.max, idle)
     }
 
     /// A connection for exclusive use: a fresh idle one, else a new one.
@@ -68,20 +84,22 @@ impl ConnPool {
             .acquire_owned()
             .await
             .map_err(|_| RedisError::from(std::io::Error::other("redis pool closed")))?;
-        let reused = self.take_fresh_idle().await;
-        let conn = match reused {
-            Some(conn) => conn,
-            None => {
-                self.client
-                    .get_multiplexed_async_connection_with_config(&self.config)
-                    .await?
-            }
+        let (conn, reused) = match self.take_fresh_idle().await {
+            Some(conn) => (conn, true),
+            None => (self.connect().await?, false),
         };
         Ok(Lease {
             pool: Arc::clone(self),
             conn,
+            reused,
             _permit: permit,
         })
+    }
+
+    async fn connect(&self) -> Result<MultiplexedConnection, RedisError> {
+        self.client
+            .get_multiplexed_async_connection_with_config(&self.config)
+            .await
     }
 
     async fn take_fresh_idle(&self) -> Option<MultiplexedConnection> {
@@ -121,12 +139,27 @@ async fn sweep_idle(pool: Weak<ConnPool>, every: Duration) {
 pub(super) struct Lease {
     pool: Arc<ConnPool>,
     conn: MultiplexedConnection,
+    /// Taken from the idle list rather than opened for this lease.
+    reused: bool,
     _permit: OwnedSemaphorePermit,
 }
 
 impl Lease {
     pub(super) fn conn(&mut self) -> &mut MultiplexedConnection {
         &mut self.conn
+    }
+
+    /// Whether the connection sat idle in the pool before this lease — the
+    /// only kind the server (or a proxy, a NAT) can have closed unseen.
+    pub(super) fn reused(&self) -> bool {
+        self.reused
+    }
+
+    /// Replace the connection with a freshly opened one, keeping the permit.
+    pub(super) async fn reconnect(&mut self) -> Result<(), RedisError> {
+        self.conn = self.pool.connect().await?;
+        self.reused = false;
+        Ok(())
     }
 
     /// Return the connection: call only after a complete reply was read.

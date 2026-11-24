@@ -117,9 +117,9 @@ logging:
 ## Resolution order
 
 1. File at `--config` flag, else `$DB_MCP_GATEWAY_CONFIG`. The binary has no default path — with neither set it exits. The published image sets `DB_MCP_GATEWAY_CONFIG=/etc/gateway/config.yml`.
-2. `${ENV:NAME}` placeholders expanded from process env; `${FILE:/path}` placeholders read from disk (trailing newline stripped). A `${ENV:…}` ref whose variable is unset or empty aborts boot, as does a missing or empty file.
+2. `${ENV:NAME}` placeholders expanded from process env; `${FILE:/path}` placeholders read from disk (trailing newline stripped from `${FILE:…}` values; a `${ENV:…}` value is used byte for byte). A `${ENV:…}` ref whose variable is unset or empty aborts boot, as does a missing or empty file.
 3. `vault:`, `aws-sm:`, `gcp-sm:` references resolved from the named backend (when backend integrations land — until then, recognised refs also abort boot rather than silently failing at first DB connect).
-4. Final config validated against the schema. Errors at this stage refuse to start the process — no half-loaded state.
+4. Final config validated against the schema. Errors at this stage refuse to start the process — no half-loaded state. Every validation error and every unresolved secret ref is reported in the one abort (each ref named by server, database and tier), not just the first.
 
 ## Validation rules (non-exhaustive)
 
@@ -141,7 +141,7 @@ logging:
 - Every server's `kind` must have a query adapter wired (today `postgres`, `mongo` and `redis`). YugabyteDB (YSQL) is a `postgres` target, not a kind of its own. A `mysql`/`mssql` target is rejected at boot rather than parsing clean and failing every query at runtime — these kinds are reserved for the roadmap adapters and only become valid when their adapters land.
 - `MCP_PATH` (env-driven for now, folded into YAML with #16) must not collide with a path the gateway already mounts. Reserved exact paths: `/healthz`, `/readyz`, `/metrics`, `/auth/login`, `/auth/callback`, `/auth/logout`, `/authorize`, `/token`, `/revoke`, `/register`. Reserved route families (the path and anything under `<prefix>/…`): `/admin` (owned by the admin API — reserved unconditionally so toggling `admin.enabled` can't turn a working config into a boot panic) and `/.well-known` (RFC 8414/9728 discovery metadata). Segment-based match: `/adminy` or `/tokens` are fine. Overlap surfaces as a typed boot error naming the offending path, not an axum router panic.
 - `admin.enabled` defaults to `false` — absent or false leaves `/admin/v1/*` unmounted (404). When `enabled: true`, `admin.group` is required and must be non-empty/non-whitespace, else boot aborts (every authenticated caller would otherwise be an admin); when disabled it is optional and ignored. Full surface in [12-dynamic-permissions.md](12-dynamic-permissions.md).
-- Auth env (until #16 folds it into YAML): `OIDC_ISSUER` and `OIDC_CLIENT_ID` are required (absent or blank aborts boot). `SESSION_TTL_HOURS` must be a whole number in `1..=168`, `REFRESH_TTL_DAYS` in `1..=366`; anything else — `0`, out of range, overflow, non-numeric — aborts boot with the variable named. `SESSION_SIGNING_KEY` must be at least 32 bytes and not the committed dev default, unless `ALLOW_INSECURE_SIGNING_KEY=true`, which is accepted only with a loopback `OIDC_ISSUER` (local dev against a mock or local IdP) and logs a `WARN` at boot; with any other issuer it aborts boot.
+- Auth env (until #16 folds it into YAML): `OIDC_ISSUER` and `OIDC_CLIENT_ID` are required (absent or blank aborts boot). `SESSION_TTL_HOURS` must be a whole number in `1..=168`, `REFRESH_TTL_DAYS` in `1..=366`; anything else — `0`, out of range, overflow, non-numeric — aborts boot with the variable named. `SESSION_SIGNING_KEY` must be at least 32 bytes and not the committed dev default, unless `ALLOW_INSECURE_SIGNING_KEY=true`, which is accepted only with a loopback `OIDC_ISSUER` (local dev against a mock or local IdP) **and** a loopback `GATEWAY_BIND`, and logs a `WARN` at boot; with any other issuer or bind it aborts boot. `ALLOW_INSECURE_SIGNING_KEY` and `TLS_DISABLED` share one strict boolean parser: `true`/`false`, `1`/`0` or `yes`/`no` (ASCII case-insensitive; empty reads as `false`), anything else aborts boot naming the variable. `SESSION_CACHE_TTL_SECONDS` above `300` is clamped to `300` with a `WARN`.
 - `permissions_store.driver: mysql` combined with `admin.enabled: true` is rejected at boot — admin handlers are pg-only today. Use `driver: pg` (the default when the block is absent) for the admin path, or `mysql` with YAML grants only.
 
 ## YAML parser
@@ -201,6 +201,16 @@ Outcomes count in `config_reloads_total{result="ok"|"error"}`. A `SIGHUP` with T
 - `permissions_store.driver`.
 
 Env-driven settings (listeners, state DB, TLS paths, OIDC) are read once at boot.
+
+## Operator CLI
+
+The binary is its own operator tool (reference: [deployment/cli](../deployment/cli.md)). Every mode below runs without booting — no state DB, listener or Sentry stream — and exits `0` success, `1` a negative answer, `2` usage, `3` could not run.
+
+- **`--check [--no-secrets]`** validates without booting: parse, validate, and (unless `--no-secrets`) resolve every secret ref, reporting every error; warnings for unverified/plaintext target TLS, constraints no tool under their action reads (`row_limit` on `schema_read`, `row_limit`/`statement_timeout_ms` on `history_read`), and set env vars that share a gateway prefix but are not read (typos); and the per-replica connection budget (read + write tiers + Postgres cancel pools per server; state DB request + background + listener pools). Messages carry field and object names, never values. A hand-written JSON Schema (`website/static/config.schema.json`) mirrors the keys; a test pins it to the parser through a fixture that uses every key.
+- **`--healthcheck`** GETs the local `/healthz` (from `GATEWAY_BIND`; TLS unverified on loopback, no credential sent) and exits `0`/`1` — the healthcheck for the distroless image.
+- **`login`, `grants list|apply`, `sessions revoke`, `audit query|export`** are clients of the audited admin API (spec 12) and hold no privilege of their own. `login` is the gateway's own OAuth flow run as a native app (RFC 8252: DCR with a loopback redirect, PKCE S256); the session token is stored in a `0600` file and a group- or world-readable one is refused.
+- **`mint-service-token <name>`** replaces the shell script's logic (spec 14); `bin/mint-service-token` is a wrapper.
+- **`roles`** prints the provisioning SQL for each configured database's read and write roles and never connects; **`doctor`** connects as each configured Postgres role and reports superuser/admin attributes, write or `CREATE` privileges on the read role, and in-scope relations it cannot read, plus `max_connections` against the budget. Doctor runs catalog reads in a rolled-back `READ ONLY` transaction. Neither grants anything (MUST #3).
 
 ## What is *not* in config
 

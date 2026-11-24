@@ -1,6 +1,7 @@
-//! The intent row carries the statement and reason (migration 0018), so the
-//! reaper's `abandoned` row says what may have run. A reaper sweep is global,
-//! so the test is `#[serial_test::serial(world)]` (see `tests/it_db/main.rs`).
+//! The intent row carries the statement and reason (migration 0018) and the
+//! bound params (migration 0025), so the reaper's `abandoned` row says what
+//! may have run. A reaper sweep is global, so the tests are
+//! `#[serial_test::serial(world)]` (see `tests/it_db/main.rs`).
 
 use std::time::Duration;
 
@@ -59,6 +60,60 @@ async fn abandoned_row_carries_the_intent_statement_and_reason() {
     assert_eq!(outcome, "abandoned");
     assert_eq!(sql.as_deref(), Some("DELETE FROM orders WHERE id = 7"));
     assert_eq!(reason.as_deref(), Some("OPS-9 cleanup"));
+
+    delete_audit_calls(&p, &user).await;
+}
+
+/// A parameterized write's placeholders alone do not say what ran: the
+/// intent carries the bound values (capped as the completion row caps them)
+/// and the `abandoned` row keeps them.
+#[tokio::test]
+#[serial_test::serial(world)]
+async fn abandoned_row_carries_the_intent_params() {
+    let p = state_pool().await;
+    let user = format!("integrity-params-{}", Uuid::new_v4().simple());
+    let request_id = Uuid::new_v4();
+    let params = [serde_json::json!(7), serde_json::json!("shipped")];
+    audit::intent::record_with_params(
+        &p,
+        &CallIntent {
+            request_id,
+            user_sub: &user,
+            user_email: "integrity@example.com",
+            tool: "run_query",
+            server: "prod",
+            database: "app",
+            db_type: Some("postgres"),
+            access: Access::ReadWrite,
+            sql: Some("UPDATE orders SET state = $2 WHERE id = $1"),
+            reason: None,
+            upstream_actor: None,
+            upstream_run_id: None,
+        },
+        Some(&params),
+    )
+    .await
+    .expect("intent commits");
+    sqlx::query(
+        "UPDATE audit_call_intents SET occurred_at = now() - interval '2 hours' \
+         WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .execute(&p)
+    .await
+    .expect("backdate intent");
+
+    reaper::run_once(&p, Duration::from_secs(3600), &mut ReapCursor::default())
+        .await
+        .expect("sweep runs");
+    let (outcome, stored): (String, Option<serde_json::Value>) =
+        sqlx::query_as("SELECT outcome, params FROM audit_calls WHERE request_id = $1")
+            .bind(request_id.to_string())
+            .fetch_one(&p)
+            .await
+            .expect("abandoned row written");
+    assert_eq!(outcome, "abandoned");
+    assert_eq!(stored, Some(serde_json::json!([7, "shipped"])));
 
     delete_audit_calls(&p, &user).await;
 }

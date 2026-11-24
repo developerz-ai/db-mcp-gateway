@@ -162,6 +162,7 @@ async fn boot_fixed_settings_are_refused_whole() {
 
 #[tokio::test]
 #[serial_test::parallel(world)]
+// audit-guard: exempt — the state pool is offline, so no row can land; the call under test is refused 401 at the bearer check, before any identity exists to audit
 async fn removed_service_account_gets_401_after_reload() {
     let gw = Harness::new(offline_pool(), &yaml("h1", true, true));
     let (before, _) = gw.list_databases().await;

@@ -13,21 +13,20 @@
 //! Permits are held for the request's lifetime and released when the response
 //! future completes or is dropped (client disconnect, timeout). Every shed
 //! logs, counts `requests_shed_total{scope}` and carries `Retry-After: 1`.
+//! On the MCP endpoint the shed body is a JSON-RPC error and every
+//! identity-capped answer carries the caller's budget headers (spec 03
+//! §Resource safety).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::{Request, State};
-use axum::http::header::RETRY_AFTER;
-use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
-use serde_json::json;
+use axum::response::Response;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
-use super::request_id::GatewayRequestId;
 use crate::auth::{Identity, ServicePolicy};
+use shed::{insert_budget, limited};
 
 /// Soft ceiling on tracked identities. `user_sub` values come from the SSO IdP,
 /// so real cardinality is the org's user count — but the map is still bounded so
@@ -79,6 +78,14 @@ impl IdentityPool {
     }
 }
 
+/// A per-identity permit and the budget it was taken from.
+#[derive(Debug)]
+struct IdentityPermit {
+    _permit: OwnedSemaphorePermit,
+    limit: usize,
+    remaining: usize,
+}
+
 /// Holds the global and per-identity permit pools for one budget.
 #[derive(Debug)]
 pub struct ConcurrencyLimiter {
@@ -87,6 +94,8 @@ pub struct ConcurrencyLimiter {
     per_identity: Mutex<HashMap<String, IdentityPool>>,
     per_identity_limit: usize,
     max_tracked: usize,
+    /// Requests to this path are MCP: shed as JSON-RPC, budget in headers.
+    mcp_path: Option<String>,
 }
 
 impl ConcurrencyLimiter {
@@ -113,7 +122,25 @@ impl ConcurrencyLimiter {
             per_identity: Mutex::new(HashMap::new()),
             per_identity_limit: per_identity,
             max_tracked,
+            mcp_path: None,
         }
+    }
+
+    /// Answer requests to `path` (the MCP endpoint) in MCP terms: a shed is
+    /// a JSON-RPC error, an admitted request reports its identity budget.
+    pub fn with_mcp_path(self, path: &str) -> Self {
+        Self {
+            mcp_path: Some(path.to_owned()),
+            ..self
+        }
+    }
+
+    fn is_mcp(&self, req: &Request) -> bool {
+        self.mcp_path.as_deref() == Some(req.uri().path())
+    }
+
+    fn identity_cap(&self, account_cap: Option<usize>) -> usize {
+        account_cap.unwrap_or(self.per_identity_limit)
     }
 
     /// A global permit, or `None` when this budget is saturated.
@@ -132,8 +159,8 @@ impl ConcurrencyLimiter {
         &self,
         user_sub: &str,
         account_cap: Option<usize>,
-    ) -> Option<OwnedSemaphorePermit> {
-        let cap = account_cap.unwrap_or(self.per_identity_limit);
+    ) -> Option<IdentityPermit> {
+        let cap = self.identity_cap(account_cap);
         // tokio::sync::Mutex on the request path; no `.await` inside the
         // critical section, so it stays a map lookup plus a try-acquire.
         let mut map = self.per_identity.lock().await;
@@ -151,7 +178,12 @@ impl ConcurrencyLimiter {
             // cap from now on.
             *pool = IdentityPool::new(cap);
         }
-        pool.permits.clone().try_acquire_owned().ok()
+        let permit = pool.permits.clone().try_acquire_owned().ok()?;
+        Some(IdentityPermit {
+            _permit: permit,
+            limit: cap,
+            remaining: pool.permits.available_permits(),
+        })
     }
 }
 
@@ -167,7 +199,7 @@ pub async fn enforce(
     // per-identity map. Held until this fn returns (response buffered) or the
     // task is dropped on disconnect.
     let Some(_global) = limiter.try_global() else {
-        return limited(&req, limiter.global_scope);
+        return limited(&req, limiter.global_scope, limiter.is_mcp(&req));
     };
 
     // `_per_identity` is held for the same lifetime as `_global`.
@@ -175,52 +207,30 @@ pub async fn enforce(
         .extensions()
         .get::<ServicePolicy>()
         .and_then(|policy| policy.max_concurrent_requests);
-    let _per_identity = match req.extensions().get::<Identity>() {
+    let per_identity = match req.extensions().get::<Identity>() {
         Some(identity) => match limiter.try_identity(&identity.user_sub, account_cap).await {
             Some(permit) => Some(permit),
-            None => return limited(&req, ShedScope::Identity),
+            None => {
+                let mut response = limited(&req, ShedScope::Identity, limiter.is_mcp(&req));
+                if limiter.is_mcp(&req) {
+                    insert_budget(&mut response, limiter.identity_cap(account_cap), 0);
+                }
+                return response;
+            }
         },
         None => None,
     };
 
-    next.run(req).await
+    let report_budget = limiter.is_mcp(&req);
+    let mut response = next.run(req).await;
+    if let Some(permit) = per_identity.as_ref().filter(|_| report_budget) {
+        insert_budget(&mut response, permit.limit, permit.remaining);
+    }
+    response
 }
 
-/// Stable-coded rejection body, mirroring the `{ error: { category, code } }`
-/// shape the auth middleware returns, plus the request id.
-fn limited(req: &Request, scope: ShedScope) -> Response {
-    let (status, category, code) = match scope {
-        ShedScope::Identity => (
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limited",
-            "concurrency_limit_exceeded",
-        ),
-        ShedScope::Global | ShedScope::Oauth => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "overloaded",
-            "service_overloaded",
-        ),
-    };
-    let request_id = GatewayRequestId::of(req);
-    tracing::warn!(
-        %request_id,
-        scope = scope.as_str(),
-        path = req.uri().path(),
-        "request shed by concurrency cap"
-    );
-    metrics::counter!("requests_shed_total", "scope" => scope.as_str()).increment(1);
-    let body = json!({
-        "error": { "category": category, "code": code },
-        "request_id": request_id.to_string(),
-    });
-    let mut response = (status, Json(body)).into_response();
-    // Coarse hint for well-behaved clients; permits free the instant in-flight
-    // requests finish, so a short delay is enough.
-    response
-        .headers_mut()
-        .insert(RETRY_AFTER, HeaderValue::from_static("1"));
-    response
-}
+#[path = "limit_shed.rs"]
+mod shed;
 
 #[cfg(test)]
 #[path = "limit_tests.rs"]

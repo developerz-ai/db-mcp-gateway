@@ -11,10 +11,11 @@ use crate::auth::{AuthError, pkce};
 
 use super::super::app_state::OAuthState;
 use super::helpers::{form_rejected, oauth_error, random_token};
+use super::resource;
 use super::urls::MCP_SCOPE;
-use crate::auth::oauth::{AuthFacade, IssuedTokens, MintError};
+use crate::auth::oauth::{AuthCode, AuthFacade, IssuedTokens, MintError, Refreshed};
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct TokenForm {
     grant_type: Option<String>,
     // authorization_code grant:
@@ -27,6 +28,19 @@ pub struct TokenForm {
     /// verify it matches the registered client that obtained the authorization
     /// code (prevents code-injection across clients).
     client_id: Option<String>,
+    /// RFC 8707: when sent, must name this gateway's MCP endpoint.
+    resource: Option<String>,
+}
+
+/// Every other field is a bearer value or half of one.
+impl std::fmt::Debug for TokenForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenForm")
+            .field("grant_type", &self.grant_type)
+            .field("client_id", &self.client_id)
+            .field("resource", &self.resource)
+            .finish_non_exhaustive()
+    }
 }
 
 /// `POST /token` — redeem an authorization code or a refresh token. For
@@ -50,6 +64,11 @@ pub async fn token(
             "supported grant types: authorization_code, refresh_token",
         );
     }
+    // Before a code or refresh token is consumed: the client retries with the
+    // right resource and the same grant.
+    if let Some(refusal) = resource::refusal(&state, form.resource.as_deref()) {
+        return refusal;
+    }
     if grant == Some("refresh_token") {
         token_refresh(&state.auth, form).await
     } else {
@@ -69,12 +88,16 @@ async fn token_authorization_code(state: &OAuthState, form: TokenForm) -> Respon
 
     // One-time: take() removes the code so a replay finds nothing, and every
     // refusal below for what the client sent leaves it consumed.
-    let Some(entry) = auth.codes.take(code).await else {
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_grant",
-            "authorization code is invalid or expired",
-        );
+    let entry = match auth.codes.take(code).await {
+        Ok(Some(entry)) => entry,
+        Ok(None) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "authorization code is invalid or expired",
+            );
+        }
+        Err(_) => return issue_failed(),
     };
 
     // client_id, when sent, must match the registrant (RFC 6749 §3.2.1).
@@ -126,12 +149,7 @@ async fn token_authorization_code(state: &OAuthState, form: TokenForm) -> Respon
         .await
         .is_err()
     {
-        auth.codes.restore(code, entry).await;
-        return oauth_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server_error",
-            "could not issue tokens; try again",
-        );
+        return restore_code(auth, code, entry, issue_failed()).await;
     }
 
     // Fresh authorization → fresh session + refresh-token chain. The identity
@@ -144,8 +162,7 @@ async fn token_authorization_code(state: &OAuthState, form: TokenForm) -> Respon
         Err(MintError::NotMinted(err)) => {
             // A retryable 503 with provably nothing issued, so the code —
             // proven by PKCE to be this client's — is put back for it.
-            auth.codes.restore(code, entry).await;
-            token_response(Err(err))
+            restore_code(auth, code, entry, token_response(Err(err))).await
         }
         Err(MintError::Unconfirmed) => {
             // The grant may exist: handing the code back would let the retry
@@ -157,6 +174,29 @@ async fn token_authorization_code(state: &OAuthState, form: TokenForm) -> Respon
                 "token issuance could not be confirmed; restart authorization",
             )
         }
+    }
+}
+
+/// Nothing was issued and the code is unchanged (or back): retry the request.
+fn issue_failed() -> Response {
+    oauth_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "server_error",
+        "could not issue tokens; try again",
+    )
+}
+
+/// Put a provably unused code back and answer `retry`. A code that could not
+/// be put back is spent: a "try again" would only meet `invalid_grant`, so
+/// the client is told to start over instead.
+async fn restore_code(auth: &AuthFacade, code: &str, entry: AuthCode, retry: Response) -> Response {
+    match auth.codes.restore(code, entry).await {
+        Ok(()) => retry,
+        Err(_) => oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "could not issue tokens; restart authorization",
+        ),
     }
 }
 
@@ -172,14 +212,27 @@ async fn token_refresh(auth: &AuthFacade, form: TokenForm) -> Response {
     // its paired session revoked, a fresh pair minted. A replayed (already
     // rotated) token finds nothing.
     match auth.rotate_tokens(token, random_token()).await {
-        Ok(Some(issued)) => token_response(Ok(issued)),
-        Ok(None) => oauth_error(
+        Ok(Refreshed::Issued(issued)) => token_response(Ok(issued)),
+        Ok(Refreshed::Refused) => oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
             "refresh token is invalid or expired",
         ),
+        Ok(Refreshed::ReloginRequired) => relogin_required(),
         Err(err) => token_response(Err(err)),
     }
+}
+
+/// The login behind the refresh token is older than `GROUPS_MAX_AGE`.
+/// `invalid_grant` is what sends an OAuth client back to `/authorize`; the
+/// extra `code` member tells this refusal from a spent or unknown token.
+fn relogin_required() -> Response {
+    let body = json!({
+        "error": "invalid_grant",
+        "error_description": "sign-in is older than the gateway allows; sign in again",
+        "code": "relogin_required",
+    });
+    (StatusCode::BAD_REQUEST, Json(body)).into_response()
 }
 
 /// Render the OAuth token response (`Cache-Control: no-store`), or a 503 when

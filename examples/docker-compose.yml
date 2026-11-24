@@ -1,29 +1,30 @@
 # Production-like gateway deployment with local Postgres state DB.
-# For development, use docker-compose.dev.yml in the repo root instead.
+# For a one-command local try-out, use examples/demo/ instead; for development,
+# docker-compose.dev.yml in the repo root.
 #
 # Security: secrets come from your orchestrator (K8s secrets, Vault, etc.), not .env.
-# Never commit .env or secret values. See docs/deployment/quickstart.md#4-bring-it-up-with-docker-compose.
+# Never commit .env or secret values. See website/docs/deployment/quickstart.md.
 #
 # Usage:
 #   # Copy examples/gateway.yaml → ./config.yml and edit
 #   cp examples/gateway.yaml ./config.yml
 #
-#   # Set environment variables before `docker compose up`:
+#   # Set environment variables before `docker compose up` (every one is required):
 #   export STATE_DB_PW=...
-#   export SESSION_SIGNING_KEY=...   # unique per deploy; gateway refuses the dev default
+#   export SESSION_SIGNING_KEY=...   # unique per deploy (openssl rand -hex 32); the dev default aborts boot
 #   export OIDC_ISSUER=https://your-idp.example.com
 #   export OIDC_CLIENT_ID=...
 #   export OIDC_CLIENT_SECRET=...
-#   export PROD_APP_RO_PASSWORD=...
+#   export OIDC_REDIRECT_URL=https://db.internal.example.com/auth/callback   # = the IdP app's redirect URI
+#   export PROD_APP_RO_PASSWORD=...      # config.yml: ${ENV:PROD_APP_RO_PASSWORD}
+#   export STAGING_APP_RO_PASSWORD=...   # config.yml: ${ENV:STAGING_APP_RO_PASSWORD}
 #
 #   docker compose up -d
 #   docker compose logs -f gateway
 
-version: '3.8'
-
 services:
   gateway:
-    image: ghcr.io/developerz-ai/db-mcp-gateway:1.0.0  # pin to a version in production
+    image: ghcr.io/developerz-ai/db-mcp-gateway:2.3.1  # pin a release; never :latest in production
     container_name: db-mcp-gateway
     ports:
       - "8443:8443"  # HTTPS MCP endpoint
@@ -35,11 +36,11 @@ services:
       # State DB (gateway's own Postgres for sessions + audit log)
       STATE_DB_URL: postgres://gateway:${STATE_DB_PW}@state-db:5432/gateway
 
-      # OIDC / SSO (required for real deployments; see docs/deployment/quickstart.md#2-register-an-oidc-application)
+      # OIDC / SSO (required for real deployments; see website/docs/deployment/quickstart.md)
       OIDC_ISSUER: ${OIDC_ISSUER}
       OIDC_CLIENT_ID: ${OIDC_CLIENT_ID}
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET}
-      OIDC_REDIRECT_URL: https://db.internal.acme.com/auth/callback  # must match IdP app redirect URI
+      OIDC_REDIRECT_URL: ${OIDC_REDIRECT_URL}  # must match the IdP app's redirect URI
       OIDC_GROUPS_CLAIM: groups
 
       # Session security: HMAC key for gateway-issued session JWTs. Injected from
@@ -55,7 +56,7 @@ services:
       PROD_APP_RO_PASSWORD: ${PROD_APP_RO_PASSWORD}
       STAGING_APP_RO_PASSWORD: ${STAGING_APP_RO_PASSWORD}
 
-      # Optional: audit log retention and sinks (see docs/deployment/logging.md)
+      # Optional: audit log retention and sinks (see website/docs/deployment/logging.md)
       AUDIT_RETENTION_DAYS: "90"
       SESSION_CACHE_TTL_SECONDS: "30"
 
@@ -70,12 +71,10 @@ services:
       state-db:
         condition: service_healthy
 
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8443/healthz"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
+    # No compose healthcheck: the distroless image ships no shell, wget or curl,
+    # and the binary has no self-probe flag. Probe from outside instead — a
+    # Kubernetes httpGet on /healthz (liveness) and /readyz (readiness, checks
+    # the state DB), or your load balancer's HTTP health check.
 
     restart: unless-stopped
     networks:
@@ -93,7 +92,8 @@ services:
     volumes:
       - state-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U gateway"]
+      # TCP, not the unix socket: first-boot init runs a socket-only temporary server.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U gateway"]
       interval: 5s
       timeout: 5s
       retries: 10

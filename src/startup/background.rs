@@ -6,15 +6,21 @@
 //! lockstep, and so a crash-looping pod does not prune on every boot.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sqlx::PgPool;
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tokio_util::sync::CancellationToken;
 
+use arc_swap::ArcSwap;
 use db_mcp_gateway::audit;
+use db_mcp_gateway::audit::drain::DetachedTasks;
+use db_mcp_gateway::audit::stream::StreamSinks;
 use db_mcp_gateway::auth::SessionStore;
 use db_mcp_gateway::auth::oauth::{AuthCodes, ClientRegistry, PendingFlows, RefreshTokens};
+
+use super::metrics::held::{held, unix_now_secs};
 
 const PRUNE_EVERY: Duration = Duration::from_secs(3600);
 const PRUNE_MAX_JITTER: Duration = Duration::from_secs(300);
@@ -66,15 +72,23 @@ pub(crate) fn spawn_audit_pruner(pool: PgPool, ttl_days: u32, shutdown: Cancella
     });
 }
 
-/// Two-phase audit reaper (`audit::reaper::run`) on the background pool:
-/// intent rows with no completion become `abandoned`.
-pub(crate) fn spawn_audit_reaper(pool: PgPool, shutdown: CancellationToken) {
+/// Two-phase audit reaper (`audit::reaper::run_streaming`) on the background
+/// pool: intent rows with no completion become `abandoned`, and each reaped
+/// row reaches the stream sinks current at that sweep.
+pub(crate) fn spawn_audit_reaper(
+    pool: PgPool,
+    sinks: Arc<ArcSwap<StreamSinks>>,
+    tasks: DetachedTasks,
+    shutdown: CancellationToken,
+) {
     supervise("audit_reaper", shutdown, move |shutdown| {
         let pool = pool.clone();
+        let sinks = sinks.clone();
+        let tasks = tasks.clone();
         async move {
             tokio::select! {
                 _ = shutdown.cancelled() => {}
-                _ = audit::reaper::run(pool) => {}
+                _ = audit::reaper::run_streaming(pool, sinks, tasks) => {}
             }
         }
     });
@@ -84,7 +98,12 @@ async fn prune_once(pool: &PgPool, ttl_days: u32) {
     match audit::pruner::run_once(pool, ttl_days).await {
         Ok(rows) => {
             metrics::counter!("audit_pruner_runs_total", "result" => "ok").increment(1);
-            metrics::gauge!("audit_pruner_last_success_timestamp").set(unix_now_secs());
+            // Held: the prune runs hourly, exactly the recorder's idle timeout.
+            held().set(
+                "audit_pruner_last_success_timestamp",
+                Vec::new(),
+                unix_now_secs(),
+            );
             if rows > 0 {
                 tracing::info!(rows, ttl_days, "pruned old audit rows");
             }
@@ -109,7 +128,7 @@ pub(crate) struct AuthGcTargets {
 /// tokens and dynamic client registrations (state-DB I/O). Logs only when it
 /// deleted something; the stores log their own DB failures.
 pub(crate) fn spawn_auth_state_gc(targets: AuthGcTargets, shutdown: CancellationToken) {
-    let targets = std::sync::Arc::new(targets);
+    let targets = Arc::new(targets);
     supervise("auth_state_gc", shutdown, move |shutdown| {
         let targets = targets.clone();
         async move {
@@ -161,13 +180,6 @@ fn jitter(max: Duration) -> Duration {
         ^ std::process::id();
     let max_ms = u64::try_from(max.as_millis()).unwrap_or(u64::MAX).max(1);
     Duration::from_millis(u64::from(seed) % max_ms)
-}
-
-fn unix_now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

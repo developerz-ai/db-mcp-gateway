@@ -25,7 +25,7 @@ pub enum StateDbError {
     /// — and therefore the password — in its `Display` on a malformed-URL or
     /// auth failure. NEVER render this variant's source into a log, response, or
     /// process-exit message; log its *type* and emit a generic error instead
-    /// (see `boot_db_error` in `main.rs`). CLAUDE.md non-negotiable #1.
+    /// (see `boot_db_error` in `startup/boot.rs`). CLAUDE.md non-negotiable #1.
     #[error("failed to connect to state DB")]
     Connect(#[source] sqlx::Error),
     #[error("failed to run state DB migrations")]
@@ -45,14 +45,31 @@ const BACKGROUND_SESSION_SQL: &str =
 /// Background work (pruner, GC, reaper) is sequential and low-rate; two
 /// connections keep it off the request pool without competing with it.
 const BACKGROUND_POOL_SIZE: u32 = 2;
-const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The permissions listener pins one connection for `LISTEN` and briefly
+/// takes a second for its liveness ping.
+const LISTENER_POOL_SIZE: u32 = 2;
+/// How long a state-DB caller waits for a pooled connection.
+pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connect the **request** pool to the state DB and run pending migrations.
 /// Sessions, authz and the audit insert share it; background jobs use
 /// [`connect_background`] so a long prune never takes a request's connection.
 /// Postgres-only, never re-pointed at a target DB.
 pub async fn connect(url: &str, pool_size: NonZeroU32) -> Result<PgPool, StateDbError> {
-    let pool = open_pg(url, pool_size.get(), REQUEST_SESSION_SQL).await?;
+    connect_with_timeout(url, pool_size, ACQUIRE_TIMEOUT).await
+}
+
+/// Bound the first connect by `timeout` without interrupting migrations once
+/// they start. The pool keeps [`ACQUIRE_TIMEOUT`]: `timeout` is the boot
+/// retry's per-attempt slice, too short for the requests the pool serves.
+pub async fn connect_with_timeout(
+    url: &str,
+    pool_size: NonZeroU32,
+    timeout: Duration,
+) -> Result<PgPool, StateDbError> {
+    let pool = tokio::time::timeout(timeout, open_pg(url, pool_size.get(), REQUEST_SESSION_SQL))
+        .await
+        .map_err(|_| StateDbError::Connect(sqlx::Error::PoolTimedOut))??;
 
     migrate::state_db(&pool)
         .await
@@ -65,6 +82,15 @@ pub async fn connect(url: &str, pool_size: NonZeroU32) -> Result<PgPool, StateDb
 /// Call after [`connect`]: it does not migrate.
 pub async fn connect_background(url: &str) -> Result<PgPool, StateDbError> {
     open_pg(url, BACKGROUND_POOL_SIZE, BACKGROUND_SESSION_SQL).await
+}
+
+/// Connect the **listener** pool: the permissions `LISTEN` connection and its
+/// liveness ping. Its own pool because the listener holds its connection for
+/// the life of the process — taken from the request pool, it deadlocked every
+/// request at `STATE_DB_POOL_SIZE=1`. Call after [`connect`]: it does not
+/// migrate.
+pub async fn connect_listener(url: &str) -> Result<PgPool, StateDbError> {
+    open_pg(url, LISTENER_POOL_SIZE, BACKGROUND_SESSION_SQL).await
 }
 
 /// The timeouts are `SET` per connection in `after_connect`, not sent as the
@@ -140,7 +166,7 @@ pub async fn ping(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
 /// What the boot seam can actually produce is narrower than this `match`, and
 /// the difference matters when reading a class in Loki. `sqlx`'s pool swallows
 /// `Io(ConnectionRefused)` and transient `Database` errors and retries them
-/// until the acquire deadline (`sqlx-core-0.8.6/src/pool/inner.rs:374`), so at
+/// until the acquire deadline (`sqlx-core-0.9.1/src/pool/inner.rs:391`), so at
 /// boot a server that is down, unroutable or not yet listening arrives as
 /// **`pool_timed_out`**, never as `io/ConnectionRefused`. `io/*` is reached
 /// only by the io kinds that bubble immediately, and a rejected password —
@@ -173,6 +199,28 @@ mod tests {
     //! Pure classification — no database, no network.
 
     use super::connect_error_class;
+
+    #[tokio::test]
+    async fn request_pool_connection_obeys_the_supplied_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let url = format!("postgres://user:password@{addr}/state?sslmode=disable");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::connect_with_timeout(
+                &url,
+                std::num::NonZeroU32::new(1).unwrap(),
+                std::time::Duration::from_millis(50),
+            ),
+        )
+        .await;
+        server.abort();
+        assert!(matches!(result, Ok(Err(super::StateDbError::Connect(_)))));
+    }
 
     /// Minimal [`sqlx::error::DatabaseError`] so the `Database` arm — the only
     /// one that reads a value back out of a driver-supplied object — can be

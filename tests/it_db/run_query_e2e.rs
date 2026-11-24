@@ -156,6 +156,23 @@ async fn run_query_full_acceptance() {
     assert_eq!(body["code"], "timeout", "{body}");
     assert_audit_outcome(pool, sub, "run_query", "timeout", "pg_sleep timeout").await;
 
+    // 2b. The same timeout on the second attempt of a read whose
+    //     `pg_node_tree` column the driver could not take: the timeout is the
+    //     answer, not the first refusal.
+    let resp = call_run_query(
+        url,
+        bearer,
+        "target",
+        "app",
+        "SELECT ev_action, pg_sleep(2) FROM pg_rewrite LIMIT 1",
+        None,
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], true, "{resp}");
+    let body = payload(&resp);
+    assert_eq!(body["code"], "timeout", "{body}");
+    assert_audit_outcome(pool, sub, "run_query", "timeout", "recast timeout").await;
+
     // 3. Row cap: generate 1000 rows with caller limit=10 → grant cap 50 →
     //    effective 10 → truncated=true. Audit row: outcome=success (the
     //    query itself succeeded; truncation is a flag, not an error).
@@ -318,9 +335,9 @@ async fn run_query_write_grant_commits_data_but_not_schema() {
         .await
         .expect("target-db reachable; run `bin/dev up`");
     let table = format!("write_e2e_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE \"{table}\" (id bigint PRIMARY KEY, note text)"
-    ))
+    )))
     .execute(&target)
     .await
     .expect("create scratch table");
@@ -441,10 +458,12 @@ async fn run_query_write_grant_commits_data_but_not_schema() {
     }
 
     // Cleanup.
-    sqlx::query(&format!("DROP TABLE IF EXISTS \"{table}\""))
-        .execute(&target)
-        .await
-        .expect("drop scratch table");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TABLE IF EXISTS \"{table}\""
+    )))
+    .execute(&target)
+    .await
+    .expect("drop scratch table");
 }
 
 /// A read-only (`query_read`) caller must NOT be able to write, even though the
@@ -727,6 +746,7 @@ async fn error_response_request_id_matches_the_audit_row() {
 /// was ever written for this user/tool.
 #[tokio::test]
 #[serial_test::parallel(world)]
+// audit-guard: exempt — a notification is never dispatched; the test asserts no audit row exists
 async fn tools_call_as_notification_does_not_execute() {
     let booted = boot_gateway().await;
     let (url, bearer, pool, sub) = (
@@ -775,6 +795,7 @@ async fn tools_call_as_notification_does_not_execute() {
 /// the omitted-id case and still hit the DB.
 #[tokio::test]
 #[serial_test::parallel(world)]
+// audit-guard: exempt — a null id is refused before dispatch; the test asserts no audit row exists
 async fn tools_call_with_null_id_is_invalid_request_and_does_not_execute() {
     let booted = boot_gateway().await;
     let (url, bearer, pool, sub) = (
@@ -835,14 +856,15 @@ async fn tools_call_with_null_id_is_invalid_request_and_does_not_execute() {
 /// Builds a minimal axum app that:
 /// 1. Injects a fixed `Identity` (so the per-identity limiter activates).
 /// 2. Applies `limit::enforce` with caller-supplied caps.
-/// 3. Exposes a `/test` POST handler that parks for 5 s (never reached by the
-///    second request — the cap fires first).
+/// 3. Exposes a `/test` POST handler that signals `entered` — it then holds
+///    its permit — and parks for 5 s (never reached by the second request —
+///    the cap fires first).
 ///
-/// Returns `(base_url, reqwest_client)`.
+/// Returns `(base_url, reqwest_client, entered)`.
 async fn concurrency_test_server(
     max_global: usize,
     max_per_identity: usize,
-) -> (String, reqwest::Client) {
+) -> (String, reqwest::Client, Arc<tokio::sync::Notify>) {
     let limiter = Arc::new(limit::ConcurrencyLimiter::with_caps(
         max_global,
         max_per_identity,
@@ -865,12 +887,17 @@ async fn concurrency_test_server(
         next.run(req).await
     }
 
-    // Slow handler: parks for 5 s so the first request holds the permit
-    // long enough for the second request's cap-check to fire.
-    async fn slow() -> axum::Json<Value> {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        axum::Json(json!({"ok": true}))
-    }
+    // Slow handler: reports it holds the permit, then parks for 5 s so the
+    // second request's cap-check fires while it is still held.
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let slow = {
+        let entered = entered.clone();
+        move || async move {
+            entered.notify_one();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            axum::Json(json!({"ok": true}))
+        }
+    };
 
     let app = Router::new()
         .route("/test", post(slow))
@@ -889,7 +916,7 @@ async fn concurrency_test_server(
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap();
-    (url, c)
+    (url, c, entered)
 }
 
 /// Per-identity cap: once a single in-flight request holds the sole permit,
@@ -899,20 +926,23 @@ async fn concurrency_test_server(
 #[serial_test::parallel(world)]
 async fn per_identity_concurrency_cap_returns_429() {
     // 1 global slot, 1 per-identity slot — one request fills both caps.
-    let (url, client) = concurrency_test_server(10, 1).await;
+    let (url, client, entered) = concurrency_test_server(10, 1).await;
 
     // Start a slow request in the background — this holds the per-identity
     // permit until the handler parks for 5 s.
     let url_bg = url.clone();
     let client_bg = client.clone();
-    tokio::spawn(async move {
-        // Fire-and-forget: we don't need the response; we just need the
-        // permit to be held when the second request arrives.
-        let _ = client_bg.post(format!("{url_bg}/test")).send().await;
-    });
+    // The handle is kept so a first request that never reaches the handler
+    // fails the test with its own error instead of hanging it.
+    let first = tokio::spawn(async move { client_bg.post(format!("{url_bg}/test")).send().await });
 
-    // Give the first request enough time to acquire the permit.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The first request is inside the handler, so it holds the permit.
+    if tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .is_err()
+    {
+        panic!("first request never entered the handler: {:?}", first.await);
+    }
 
     // Second request from the same identity → 429.
     let resp = client
@@ -944,16 +974,19 @@ async fn per_identity_concurrency_cap_returns_429() {
 #[serial_test::parallel(world)]
 async fn global_concurrency_cap_returns_503() {
     // 1 global slot, many per-identity slots — one request fills the global cap.
-    let (url, client) = concurrency_test_server(1, 100).await;
+    let (url, client, entered) = concurrency_test_server(1, 100).await;
 
     // Hold the only global slot.
     let url_bg = url.clone();
     let client_bg = client.clone();
-    tokio::spawn(async move {
-        let _ = client_bg.post(format!("{url_bg}/test")).send().await;
-    });
+    let first = tokio::spawn(async move { client_bg.post(format!("{url_bg}/test")).send().await });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    if tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .is_err()
+    {
+        panic!("first request never entered the handler: {:?}", first.await);
+    }
 
     // Second request — different perspective, same global cap.
     let resp = client

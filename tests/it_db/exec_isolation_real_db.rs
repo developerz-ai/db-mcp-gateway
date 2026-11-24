@@ -143,7 +143,7 @@ async fn write(adapter: &PgAdapter, sql: &str) -> Result<ExecResult, ExecError> 
 async fn a_sequence_value_drawn_by_one_caller_does_not_reach_the_next() {
     let owner = owner().await;
     let sequence = format!("dbmcp_iso_seq_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE SEQUENCE {sequence}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SEQUENCE {sequence}")))
         .execute(&owner)
         .await
         .expect("create sequence");
@@ -156,7 +156,7 @@ async fn a_sequence_value_drawn_by_one_caller_does_not_reach_the_next() {
     .await;
     let next = write(&a, "SELECT lastval()").await;
     let after = write(&a, "SELECT pg_backend_pid()").await;
-    sqlx::query(&format!("DROP SEQUENCE {sequence}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SEQUENCE {sequence}")))
         .execute(&owner)
         .await
         .expect("drop sequence");
@@ -201,14 +201,18 @@ async fn a_temporary_table_made_by_one_caller_does_not_reach_the_next() {
 async fn a_finished_write_commits_even_when_its_text_no_longer_parses() {
     let owner = owner().await;
     let table = format!("dbmcp_iso_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE TABLE {table} (v int NOT NULL)"))
-        .execute(&owner)
-        .await
-        .expect("create table");
-    sqlx::query(&format!("INSERT INTO {table} VALUES (0)"))
-        .execute(&owner)
-        .await
-        .expect("seed");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE {table} (v int NOT NULL)"
+    )))
+    .execute(&owner)
+    .await
+    .expect("create table");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {table} VALUES (0)"
+    )))
+    .execute(&owner)
+    .await
+    .expect("seed");
 
     let a = writable_adapter().await;
     let sql = format!(
@@ -224,14 +228,24 @@ async fn a_finished_write_commits_even_when_its_text_no_longer_parses() {
         .expect("the update runs");
     assert_eq!(result.rows_affected, Some(1));
 
-    let v: i32 = sqlx::query_scalar(&format!("SELECT v FROM {table}"))
+    let v: i32 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT v FROM {table}")))
         .fetch_one(&owner)
         .await
         .expect("read back");
-    sqlx::query(&format!("DROP TABLE {table}"))
-        .execute(&owner)
-        .await
-        .expect("drop table");
+    // A concurrent test's GRANT on the same catalog rows can race the DROP
+    // ("tuple concurrently updated"); the cleanup retries that race only.
+    for attempt in 1.. {
+        match sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {table}")))
+            .execute(&owner)
+            .await
+        {
+            Ok(_) => break,
+            Err(err) if attempt < 5 && err.to_string().contains("concurrently") => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(err) => panic!("drop table: {err}"),
+        }
+    }
     assert_eq!(v, 1, "reported as written, so it must be written");
 }
 

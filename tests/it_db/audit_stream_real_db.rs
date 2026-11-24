@@ -6,11 +6,10 @@
 //! Exercises the production code path: real `audit_dispatch` call against a
 //! real state DB, tracing output captured for the call's duration.
 
-use std::sync::{Arc, Mutex};
-
 use crate::common::audit::{DispatchSinks, latest_audit};
 use crate::common::cleanup::delete_audit_calls;
 use crate::common::env::state_pool;
+use crate::common::log_capture::BufWriter;
 use db_mcp_gateway::auth::{Identity, SessionId};
 use db_mcp_gateway::config::StreamSinkConfig;
 use db_mcp_gateway::tools::audit_dispatch::{
@@ -28,26 +27,6 @@ fn identity(user_sub: &str) -> Identity {
         groups: vec!["test".to_string()],
         issued_at: chrono::Utc::now(),
         kind: db_mcp_gateway::auth::IdentityKind::Sso,
-    }
-}
-
-#[derive(Clone, Default)]
-struct BufWriter(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for BufWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for BufWriter {
-    type Writer = Self;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
     }
 }
 
@@ -135,7 +114,7 @@ async fn configured_stdout_sink_streams_and_still_writes_the_durable_row() {
     // `audit_dispatch` emits (the "tool dispatched" summary line rides the
     // same subscriber). Filtering by target is why we assert the structured
     // contract — substring matches could latch onto unrelated events.
-    let raw = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    let raw = buf.contents();
     let event = raw
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -271,7 +250,7 @@ async fn no_configured_sinks_streams_nothing() {
     )
     .await;
 
-    let streamed = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    let streamed = buf.contents();
     assert!(!streamed.contains("audit_stream"), "{streamed}");
 
     // Durable write still lands. The empty-sink path must NOT skip
@@ -325,6 +304,8 @@ async fn configured_syslog_sink_delivers_udp_and_still_writes_the_durable_row() 
         DispatchSinks::new(&[StreamSinkConfig::Syslog {
             host: "127.0.0.1".to_string(),
             port,
+            transport: Default::default(),
+            ca_file: None,
         }])
         .store(&p),
         std::future::ready(outcome),

@@ -4,13 +4,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use serde::Deserialize;
 
-use crate::auth::pkce;
-
 use super::super::app_state::OAuthState;
 use super::helpers::{oauth_error, query_rejected, random_token};
 use super::register::{
     is_loopback_redirect_uri, redirect_uri_matches, redirect_uris_acceptable, registry_error,
 };
+use super::resource;
 use crate::auth::oauth::{ClientRecord, OAuthBridge};
 
 /// Upper bound on a `client_id` the gateway will *adopt* at `/authorize` (as
@@ -191,6 +190,9 @@ pub async fn authorize(
     {
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", violation);
     }
+    if let Some(refusal) = resource::refusal(&state, p.resource.as_deref()) {
+        return refusal;
+    }
     let client = match registered {
         Some(client) => client,
         None => {
@@ -219,11 +221,10 @@ pub async fn authorize(
     // gateway runs its *own* PKCE against the IdP (separate from the client's
     // `code_challenge` above) since IdPs increasingly require it.
     let csrf_state = random_token();
-    let nonce = random_token();
-    let (idp_verifier, idp_challenge) = pkce::generate();
+    let secrets = auth.flows.login_secrets(&csrf_state);
     let idp_url = match auth
         .oidc
-        .authorize_url(&csrf_state, &nonce, &idp_challenge)
+        .authorize_url(&csrf_state, &secrets.nonce, &secrets.idp_challenge())
         .await
     {
         Ok(url) => url,
@@ -235,11 +236,10 @@ pub async fn authorize(
             );
         }
     };
-    auth.flows
+    let stored = auth
+        .flows
         .insert_bridge(
-            csrf_state,
-            nonce,
-            idp_verifier,
+            &csrf_state,
             OAuthBridge {
                 client_id: client_id.to_owned(),
                 client_name: client.client_name,
@@ -250,6 +250,15 @@ pub async fn authorize(
             },
         )
         .await;
+    // Before the IdP leg: a login whose callback would find no flow is
+    // refused while the client can still simply retry.
+    if stored.is_err() {
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+            "sign-in is temporarily unavailable; retry",
+        );
+    }
 
     Redirect::to(idp_url.as_str()).into_response()
 }

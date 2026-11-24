@@ -1,0 +1,18 @@
+{{- if and .Values.tls.enabled .Values.tls.certManager.enabled }}
+{{- if not .Values.tls.certManager.dnsNames }}
+{{- fail "tls.certManager.dnsNames: list at least one DNS name for the Certificate (the gateway's public host)" }}
+{{- end }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "gateway.fullname" . }}
+  labels:
+    {{- include "gateway.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "gateway.tlsSecretName" . }}
+  issuerRef:
+    kind: {{ .Values.tls.certManager.issuerRef.kind }}
+    name: {{ required "tls.certManager.issuerRef.name is required" .Values.tls.certManager.issuerRef.name }}
+  dnsNames:
+    {{- toYaml .Values.tls.certManager.dnsNames | nindent 4 }}
+{{- end }}

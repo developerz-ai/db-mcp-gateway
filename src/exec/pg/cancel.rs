@@ -12,7 +12,7 @@
 //! pool** — a pool that is deliberately separate from the query pool. Using
 //! the query pool would have `execute` queue on `acquire()` behind the very
 //! connections the cancels are trying to free (see
-//! [`super::CANCEL_POOL_MAX_CONNECTIONS`]).
+//! [`super::cancel_pool`]).
 //!
 //! Why the identity check: a PID alone is not an identity. A cancel that
 //! lands late — the detached drop task, or a truncation cancel racing a

@@ -176,6 +176,22 @@ fn resolve_env_var_rejects_empty_value() {
     }
 }
 
+/// An env value is the credential byte for byte: a password that really ends
+/// in CR/LF must keep connecting after an upgrade. Only `${FILE:…}` trims.
+#[test]
+fn resolve_env_var_keeps_trailing_newlines() {
+    let name = format!("DB_MCP_SECRET_TEST_{}", uuid::Uuid::new_v4().simple());
+    // SAFETY: unique name per test — nothing else reads it.
+    unsafe {
+        std::env::set_var(&name, "pw\r\n");
+    }
+    let result = Password::EnvVar(name.clone()).resolve();
+    unsafe {
+        std::env::remove_var(&name);
+    }
+    assert_eq!(result.unwrap().expose_secret(), "pw\r\n");
+}
+
 /// Defends the no-creds-in-Display rule across every error variant.
 /// Includes a `Malformed` case to defend the no-payload contract: even if
 /// a typo'd ref were the literal plaintext (e.g. `${hunter2}`), the error

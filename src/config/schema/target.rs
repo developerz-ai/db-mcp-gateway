@@ -7,11 +7,14 @@ use serde::Deserialize;
 
 use super::super::pool::PoolConfig;
 use super::super::secret::Password;
+use super::database::{DatabaseDefaults, DatabaseEntry};
+
+pub use super::database::Database;
 
 /// Deserialized through [`ServerSpec`], so an omitted `port` resolves to the
 /// kind's own default ([`ServerKind::default_port`]).
 #[derive(Debug, Clone, Deserialize)]
-#[serde(from = "ServerSpec")]
+#[serde(try_from = "ServerSpec")]
 pub struct Server {
     pub name: String,
     pub kind: ServerKind,
@@ -33,9 +36,11 @@ pub struct Server {
 /// key (e.g. `databasses:` instead of `databases:`) into a boot-time error
 /// pointing at the line, instead of silently dropping the value — see issue
 /// #16. `ConfigFile` and every other section deny unknown keys too.
-#[derive(Deserialize)]
+/// `RawConfigFile` converts these itself so a resolution error keeps its
+/// message (a parse error drops it — it could quote the file).
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ServerSpec {
+pub(crate) struct ServerSpec {
     name: String,
     kind: ServerKind,
     #[serde(default)]
@@ -49,13 +54,31 @@ struct ServerSpec {
     tls_ca_file: Option<PathBuf>,
     #[serde(default)]
     pool: Option<PoolConfig>,
+    /// Default read role for every database entry that names none.
     #[serde(default)]
-    databases: Vec<Database>,
+    role: Option<String>,
+    /// Default password for `role`, same reference rules as a database's.
+    #[serde(default)]
+    password: Option<Password>,
+    #[serde(default)]
+    databases: Vec<DatabaseEntry>,
 }
 
-impl From<ServerSpec> for Server {
-    fn from(spec: ServerSpec) -> Self {
-        Self {
+impl TryFrom<ServerSpec> for Server {
+    type Error = String;
+
+    fn try_from(spec: ServerSpec) -> Result<Self, String> {
+        let defaults = DatabaseDefaults {
+            server: &spec.name,
+            role: spec.role.as_deref(),
+            password: spec.password.as_ref(),
+        };
+        let databases = spec
+            .databases
+            .into_iter()
+            .map(|entry| entry.resolve(defaults))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
             port: spec.port.unwrap_or_else(|| spec.kind.default_port()),
             name: spec.name,
             kind: spec.kind,
@@ -64,8 +87,8 @@ impl From<ServerSpec> for Server {
             tls: spec.tls,
             tls_ca_file: spec.tls_ca_file,
             pool: spec.pool,
-            databases: spec.databases,
-        }
+            databases,
+        })
     }
 }
 
@@ -129,47 +152,6 @@ pub enum Tls {
     VerifyFull,
     /// Plaintext. Boot logs a warning per server.
     Insecure,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Database {
-    pub name: String,
-    pub role: String,
-    pub password: Password,
-    #[serde(default)]
-    pub description: String,
-    /// Optional authentication database for backends where the role lives
-    /// somewhere other than the target database (mongo's `authSource`).
-    /// `None` falls back to `name` — the least-privilege per-db user
-    /// pattern. Operators set this to `"admin"` when bootstrapping with
-    /// the container's root user. Ignored by pg (which authenticates
-    /// against the connected database).
-    #[serde(default)]
-    pub auth_database: Option<String>,
-    /// Pool sizing for this database; overrides the server's `pool:` per field.
-    /// The write pool (when `write_role` is set) is sized the same.
-    #[serde(default)]
-    pub pool: Option<PoolConfig>,
-    /// Role a `query_write` grant runs as. Absent → the database is read-only
-    /// through the gateway whatever the grants say: reads always use `role`,
-    /// so the read tier can never reach a write-capable role. Set together
-    /// with `write_password` (boot-checked); postgres targets only.
-    #[serde(default)]
-    pub write_role: Option<String>,
-    #[serde(default)]
-    pub write_password: Option<Password>,
-}
-
-impl Database {
-    /// The write role and its password, when both are configured. Boot
-    /// validation rejects one without the other.
-    pub fn write_credentials(&self) -> Option<(&str, &Password)> {
-        match (&self.write_role, &self.write_password) {
-            (Some(role), Some(password)) => Some((role, password)),
-            _ => None,
-        }
-    }
 }
 
 #[cfg(test)]

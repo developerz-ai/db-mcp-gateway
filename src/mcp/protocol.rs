@@ -26,6 +26,7 @@ pub const GET_QUERY_HISTORY_TOOL: &str = "get_query_history";
 pub const TABLE_STATS_TOOL: &str = "table_stats";
 pub const DB_ACTIVITY_TOOL: &str = "db_activity";
 pub const CANCEL_QUERY_TOOL: &str = "cancel_query";
+pub const WHOAMI_TOOL: &str = "whoami";
 
 /// Response to `initialize` — the MCP handshake greeting.
 #[derive(Debug, Serialize)]
@@ -35,7 +36,14 @@ pub struct InitializeResult {
     pub capabilities: ServerCapabilities,
     #[serde(rename = "serverInfo")]
     pub server_info: ServerInfo,
+    /// How to use the tools: the agent's system-prompt hint (MCP
+    /// `InitializeResult.instructions`).
+    pub instructions: &'static str,
 }
+
+/// The `initialize` instructions (built in `super::instructions`), rendered
+/// once from the gateway's real limits.
+pub static INSTRUCTIONS: LazyLock<String> = LazyLock::new(super::instructions::build);
 
 impl InitializeResult {
     pub fn new() -> Self {
@@ -48,6 +56,7 @@ impl InitializeResult {
                 name: SERVER_NAME,
                 version: SERVER_VERSION,
             },
+            instructions: INSTRUCTIONS.as_str(),
         }
     }
 }
@@ -80,9 +89,45 @@ pub struct EmptyResult {}
 #[derive(Debug, Serialize)]
 pub struct Tool {
     pub name: &'static str,
-    pub description: &'static str,
+    pub title: &'static str,
+    pub description: String,
     #[serde(rename = "inputSchema")]
     pub input_schema: Value,
+    pub annotations: ToolAnnotations,
+}
+
+/// MCP tool hints. Untrusted by clients, so they only describe what the
+/// gateway already enforces; every target here is a configured database, so
+/// none is open-world.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolAnnotations {
+    read_only_hint: bool,
+    /// Meaningful only when `read_only_hint` is false (MCP 2025-06-18).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    destructive_hint: Option<bool>,
+    open_world_hint: bool,
+}
+
+impl ToolAnnotations {
+    /// The tool never changes anything in a target or the gateway.
+    pub const fn read_only() -> Self {
+        Self {
+            read_only_hint: true,
+            destructive_hint: None,
+            open_world_hint: false,
+        }
+    }
+
+    /// The tool can change state; `destructive` when that change can delete
+    /// or overwrite data.
+    pub const fn mutating(destructive: bool) -> Self {
+        Self {
+            read_only_hint: false,
+            destructive_hint: Some(destructive),
+            open_world_hint: false,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

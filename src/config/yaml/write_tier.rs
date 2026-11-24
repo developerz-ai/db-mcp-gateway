@@ -39,7 +39,14 @@ pub(super) fn validate_write_role(db: &Database, server: &Server) -> Result<(), 
             where_()
         )));
     }
-    validate_role(role).map_err(ConfigFileError::Invalid)?;
+    // Never echo the value: a password pasted into `write_role` must not
+    // reach the boot log.
+    if validate_role(role).is_err() {
+        return Err(invalid(format!(
+            "{} : `write_role` must match ^[a-zA-Z_][a-zA-Z0-9_]*$",
+            where_()
+        )));
+    }
     reject_superuser_role(role, server.kind, &db.name, &server.name)?;
     if role == &db.role {
         return Err(invalid(format!(
@@ -68,14 +75,14 @@ pub(super) fn validate_write_grants(
                 .iter()
                 .filter(|s| grant.server == "*" || grant.server == s.name)
                 .flat_map(|s| s.databases.iter().map(move |d| (s, d)))
-                .filter(|(_, d)| grant.database == "*" || grant.database == d.name)
+                .filter(|(_, d)| grant.covers_database(&d.name))
                 .find(|(_, d)| d.write_credentials().is_none());
             if let Some((server, db)) = read_only {
                 return Err(invalid(format!(
-                    "permission group `{}` grants `query_write` on database `{}` of \
+                    "permission {} grants `query_write` on database `{}` of \
                      server `{}`, which has no `write_role`; add `write_role` + \
                      `write_password` or narrow the grant",
-                    permission.group, db.name, server.name
+                    permission.subject, db.name, server.name
                 )));
             }
         }

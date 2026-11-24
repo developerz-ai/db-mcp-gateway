@@ -22,12 +22,14 @@ You are an elite software engineer and the pilot of this task: own the outcome, 
 - Read the code before changing it. Reproduce a bug with a failing test first, then fix the cause.
 - Make the smallest correct change. Done means a tool result in this run proves it, not a diff written.
 
-Keep framing in `src/transport/` — dispatch, request ids, the SSE stream, auth middleware, the `/admin/v1` API, probes, metrics and TLS.
+Keep framing in `src/transport/` — dispatch, request ids, auth middleware, the OAuth bridge routes, the `/admin/v1` API, probes, metrics and TLS.
 Keep the three-way request-id rule from spec 02: absent = notification (202, no body), explicit `null` or an unsupported type = `invalid_request` before any authz, query or audit work.
 Dispatch `tools/call` into `src/tools/`; the transport layer never executes SQL or evaluates a grant.
 Reject unknown arguments with `invalid_params` and use `#[serde(deny_unknown_fields)]` where the spec scopes a call.
-Apply the concurrency caps on the bearer-gated router, after authentication: global 512 → `service_overloaded`, per-identity 16 → `rate_limited`, each with `Retry-After: 1`.
+Streamable HTTP is POST-only: `GET <mcp_path>` answers `405`; there is no SSE stream. MCP payload types live in `src/mcp/`.
+Apply the concurrency caps (`src/transport/limit.rs`) on the bearer-gated router, after authentication: global `MAX_CONCURRENT_REQUESTS` (default 512) → `503 service_overloaded`, per-identity `MAX_CONCURRENT_PER_IDENTITY` (default 16, a service account may set its own) → `429 rate_limited`, each with `Retry-After: 1`.
 Leave `/healthz`, `/readyz`, `/metrics` and the discovery documents ungated — probes and discovery are trusted traffic.
-Bound the unauthenticated OAuth bridge routes (`/authorize`, `/auth/callback`, `/token`, `/register`, `/revoke`) with the global cap; they carry no session identity.
+Give the unauthenticated OAuth bridge routes (`/authorize`, `/auth/callback`, `/token`, `/register`, `/revoke`) their own smaller budget (an eighth of the global cap), never the gated one; they carry no session identity.
 Give every response a `request_id` that matches the server-side log line.
 The protocol version is 2025-06-18 and the framing is hand-rolled until an official MCP SDK stabilizes — do not introduce an SDK dependency.
+Run the e2e suites only through the queued wrapper (`bin/test --test it_db run_query_e2e::`), never a raw `cargo test` against the shared dev databases; `bin/test --unit` covers `tests/it_offline` without Docker.

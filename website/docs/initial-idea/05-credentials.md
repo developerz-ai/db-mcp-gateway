@@ -81,7 +81,7 @@ Per `(server, database)`:
 - Max connections in config (default 4, sized from the 2026-11-12 production baseline: per-database concurrency 0–1)
 - Min connections 0 and idle timeout 5 min: the pool opens on first use and an idle gateway holds no target connection
 - Acquire timeout 5 s — fail fast so the agent gets `unavailable`. It is spent before the statement timeout starts, never counted against it
-- A separate cancel pool (2 connections, lazy) carries `pg_cancel_backend`, so cancels never queue behind the queries they are cancelling
+- A separate cancel pool (`PG_CANCEL_POOL_SIZE` connections, default 2, lazy) carries `pg_cancel_backend`, so cancels never queue behind the queries they are cancelling
 - Mongo: the same sizing, plus a 5 s server-selection and connect timeout
 - Redis: `max_connections` and `idle_timeout_s` as above; `min_connections` is ignored (nothing is opened ahead of use). One connection per in-flight command (no shared multiplexed connection). A connection returns to the pool only after a complete reply or a server error reply; one hit by a timeout, a client disconnect or an I/O error is closed, never reused — its reply may still be in flight. A connection the server closed while idle fails that one call with `unavailable`; there is no retry
 - YugabyteDB (as `kind: postgres`): the Postgres pool unchanged. On release a connection gets the same reset as Postgres; a server without advisory locks rejects the unlock as `feature_not_supported`, and the gateway then repeats the resets without the unlock and keeps the connection (since 2.0.1)
@@ -89,7 +89,7 @@ Per `(server, database)`:
 
 ## Rotation
 
-A rotated password needs no restart. When the target rejects the credentials (SQLSTATE class `28` on Postgres and YugabyteDB, an authentication error on Mongo, `WRONGPASS` / `NOAUTH` at connect on Redis), the adapter for that `(server, database)` is marked stale and the registry replaces it on the next call, resolving the password reference again — so a rewritten `${FILE:…}` mount takes effect on its own. The call that hit the rejection fails `unavailable`; the next one uses the new password.
+A rotated password needs no restart. When the target rejects the credentials (SQLSTATE class `28` on Postgres and YugabyteDB, an authentication error on Mongo, `WRONGPASS` / `NOAUTH` at connect on Redis), the adapter for that `(server, database)` is marked stale and the registry replaces it on the next call, resolving the password reference again — so a rewritten `${FILE:…}` mount takes effect on its own. The call that hit the rejection fails `unavailable`; the next one uses the new password. On Postgres the two tiers of a database with a `write_role` go stale apart: the write tier resolves `write_password` when the first call needs it (a write, or a `db_activity` / `cancel_query` reaching another replica's writes) and is replaced on its own when the target refuses it, so a write credential that does not resolve or is rejected fails writes only — reads, and the read tier's pool, are untouched.
 
 Credentials are re-read from their source on `SIGHUP` (config reload). Live connections aren't killed — new connections will use the new credential, old ones drain naturally. For forced rotation, restart the gateway; with two replicas, this is zero-downtime.
 

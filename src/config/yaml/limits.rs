@@ -86,9 +86,9 @@ pub(super) fn validate_constraint_values(permission: &Permission) -> Result<(), 
         ] {
             if *value == Some(0) {
                 return Err(invalid(format!(
-                    "permission group `{}` grant on `{}`/`{}` has `{field}: 0`; \
+                    "permission {} grant on `{}`/`{}` has `{field}: 0`; \
                      omit the constraint or set a positive value",
-                    permission.group, grant.server, grant.database
+                    permission.subject, grant.server, grant.database
                 )));
             }
         }

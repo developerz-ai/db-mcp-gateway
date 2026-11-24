@@ -53,7 +53,7 @@ handoff:
   ask_reporter_first: false
 
 pr:
-  wait_for_other_bots: [coderabbit]
+  wait_for_other_bots: []
   # The `main-protection` ruleset's required checks, named so the agent knows which red check is
   # the author's to fix. Re-check against the ruleset when either changes; this list is not the
   # ruleset. `secret-scan` is advisory in ci.yml and not required.
@@ -130,7 +130,7 @@ release:
   # `none`: there is no release manager. Empty channels: the agent publishes nothing itself.
   # The release is a `chore(release): <next>` PR that bumps Cargo.toml, Cargo.lock and README.md;
   # once it merges, an annotated `v<next>` tag on the merge commit runs release.yml, which pushes
-  # the image to GHCR and DOCR and cuts the GitHub Release. See `.dz/briefs/release-due.md`.
+  # the image to GHCR and DOCR and cuts the GitHub Release. See `.dz/schedules/release-due.md`.
   manager: none
   channels: []
 

@@ -13,8 +13,8 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 - **Audit benefit:** Credential rotation only required at gateway, not across every developer's machine
 
 ### Token-Based Authentication
-- **What it does:** Clients authenticate via SSO and receive short-lived JWT tokens (8h default)
-- **How it works:** OIDC-compliant SSO flow (Google Workspace, Okta, Microsoft Entra, Authentik, Keycloak)
+- **What it does:** Clients authenticate via SSO and receive short-lived gateway-signed session JWTs (8h default) plus a refresh token
+- **How it works:** Generic OIDC authorization-code flow with PKCE against any IdP whose ID token carries a verified `email` and a groups claim — see the [IdP guides](deployment/idp/okta.md)
 - **Security benefit:** No shared passwords, tokens expire automatically, no credential cleanup required
 - **Operations benefit:** SSO integration leverages existing corporate directory and group memberships
 
@@ -24,7 +24,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 
 ### End-to-End User Identity
 - **What it does:** Every database query is attributed to the specific SSO user who initiated it
-- **How it works:** JWT token contains user identity and group memberships, propagated to audit log
+- **How it works:** The session (stored in the state DB, referenced by the JWT) carries the user identity and the group snapshot taken at login; both land on every audit row
 - **Security benefit:** Complete attribution for compliance and security investigations
 - **Operations benefit:** No more "who ran this query?" investigations
 
@@ -40,19 +40,19 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 
 ### Read-Only Enforcement
 - **What it does:** All queries default to read-only access unless explicitly granted write permissions
-- **How it works:** Gateway uses read-only database roles and enforces read-only at query analysis layer
+- **How it works:** On Postgres, every read runs as the database's read-only role inside a `READ ONLY` transaction, and a statement guard rejects writes and DDL first; Mongo and Redis targets run only allowlisted read commands
 - **Security benefit:** AI agents cannot accidentally modify data, even if prompted incorrectly
 - **Operations benefit:** Production data protection without monitoring every agent conversation
 
 ### Statement Timeouts
 - **What it does:** Every query has an execution time limit — 30,000 ms by default, which is also the ceiling; a grant's `statement_timeout_ms` can only tighten it
-- **How it works:** Timeout enforced both at gateway level and via PostgreSQL `statement_timeout`
+- **How it works:** A gateway-side deadline on every backend, plus `SET LOCAL statement_timeout` on Postgres and `maxTimeMS` on Mongo (Redis has only the gateway deadline)
 - **Performance benefit:** Prevents runaway queries from impacting database performance
 - **Operations benefit:** No more "who locked up production?" incidents
 
 ### Row Limits
-- **What it does:** Result sets automatically truncated after configurable row count (default 1000 rows)
-- **How it works:** Gateway applies `LIMIT` clauses and/or truncates results after execution
+- **What it does:** Result sets are truncated at the effective row cap (grant `row_limit`, caller `limit`, else 1000 rows) or at a result-size cap, and flagged `truncated: true`
+- **How it works:** The gateway stops returning rows at the cap — it never rewrites your SQL to add a `LIMIT`. On Postgres a **read** the adapter cuts (row cap or the 32 MiB budget) is cancelled; one cut only by the caller's `max_bytes` has already finished, and shaping just drops rows. A write with truncated `RETURNING` rows runs to completion and commits — unless it is a `dry_run`, which always rolls back — so the cap limits what the agent sees, never how many rows a write changes
 - **Performance benefit:** Prevents large result sets from overwhelming network or agent context
 - **Operations benefit:** Cost control on databases that charge per query byte
 
@@ -67,9 +67,9 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 ## 📋 Permissions and Configuration
 
 ### YAML-Based Configuration
-- **What it does:** All permissions defined in human-readable YAML files reviewed via PR
+- **What it does:** Permissions defined in human-readable YAML reviewed via PR — or, when enabled, through the SSO-gated, synchronously audited [admin API](deployment/admin-api.md)
 - **How it works:** Config file maps groups → servers → databases → actions with constraints
-- **Operations benefit:** No admin UI to maintain, permissions tracked in git history
+- **Operations benefit:** No admin UI to maintain; YAML changes tracked in git history, admin-API changes in `permissions_audit`
 - **Security benefit:** Changes require code review, not ad-hoc admin panel clicks
 
 ### Granular Grant System
@@ -125,6 +125,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
   - `get_query_history` - Retrieve a user's own recent queries from the audit log
   - `table_stats` - Table and index sizes, row estimates, scan and vacuum statistics
   - `db_activity` - The caller's own statements the gateway is running right now
+  - `whoami` - Your identity, groups, session expiry and grants
   - `cancel_query` - Cancel one of the caller's own running statements by `request_id`
 
 ### Multi-Database Support
@@ -142,20 +143,20 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 
 ## 🏗️ Deployment and Operations
 
-### Single-Command Deployment
-- **What it does:** Gateway runs as single Docker container with one Postgres dependency
+### Small Deployment Footprint
+- **What it does:** Gateway runs as a single Docker container with one Postgres dependency (plus your IdP)
 - **How it works:** `docker pull` + YAML config + Postgres state database
 - **Operations benefit:** No complex multi-service deployments or Kubernetes clusters required
 - **Testing benefit:** Easy to run locally for development and testing
 
 ### Health and Readiness Endpoints
 - **What it does:** `/readyz` endpoint for load balancer health checks (state-DB reachable + not shutting down); `/healthz` is a plain liveness probe (200 if the binary is up)
-- **How it works:** Returns 200 if gateway can accept queries, 503 if database connection fails
+- **How it works:** `/readyz` returns 200 when the gateway's **state DB** answers `SELECT 1` within 2 s, 503 otherwise or while shutting down. It does not probe target databases — a target outage shows as `unavailable` on tool calls, not as an unready pod
 - **Operations benefit:** Standard load balancer integration for high availability
 
-### Reproducible Builds
-- **What it does:** Every `v*` git tag produces reproducible OCI images
-- **How it works:** Multi-arch builds (amd64 + arm64) with content-addressable digests
+### Tested Release Images
+- **What it does:** Every `v*` git tag publishes the multi-arch image CI already built and tested for that commit
+- **How it works:** The release re-tags the tested per-arch images (amd64 + arm64) by digest; it rebuilds only when no tested image exists. Builds are pinned (`--locked`, digest-pinned base images) but not bit-for-bit reproducible
 - **Security benefit:** Pin production to an exact version tag or digest; the moving `latest`, `X` and `X.Y` tags only ever move forward ([releasing](deployment/releasing.md))
 - **Operations benefit:** Consistent behavior across development, testing, and production
 
@@ -203,9 +204,9 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 ## 🚫 Security by Design
 
 ### No Admin UI
-- **What it does:** Permissions managed exclusively via YAML files, not web interfaces
-- **Security benefit:** No SQL injection via admin panels, no ad-hoc permission changes
-- **Operations benefit:** All permission changes tracked in git history with code review
+- **What it does:** Permissions change only through reviewed YAML or the SSO-gated admin API — there is no web interface
+- **Security benefit:** Every admin-API change commits a `permissions_audit` row in the same transaction, or does not happen
+- **Operations benefit:** YAML changes have code review and git history; API changes have an audit row naming the admin
 
 ### No Credential Exposure
 - **What it does:** Database credentials never appear in logs, error messages, or API responses

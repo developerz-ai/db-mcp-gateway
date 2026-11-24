@@ -29,9 +29,6 @@ const FLEET_TOKEN: &str =
     "dbmcp_svc_6666666666666666666666666666666666666666666666666666666666666666";
 const TIGHT_CAP: usize = 2;
 
-/// Time for stalled requests to pass `bearer_auth` and take their permits.
-const SETTLE: Duration = Duration::from_millis(300);
-
 /// The per-identity cap a caller without its own gets.
 fn default_cap() -> usize {
     Config::default().max_concurrent_per_identity
@@ -95,8 +92,35 @@ async fn stall(gw: &TestGateway, token: &str, count: usize) -> Vec<TcpStream> {
         stream.write_all(head.as_bytes()).await.expect("send head");
         streams.push(stream);
     }
-    tokio::time::sleep(SETTLE).await;
     streams
+}
+
+/// Poll until `token`'s account (cap `cap`) has exactly `held` requests in
+/// flight, read off a probe's own admission: a 429 once the cap is full,
+/// else the `x-dbmcp-concurrency-remaining` it was admitted with.
+async fn await_in_flight(gw: &TestGateway, token: &str, cap: usize, held: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let probe = list_servers(gw, token).await;
+        let remaining = probe
+            .headers()
+            .get("x-dbmcp-concurrency-remaining")
+            .and_then(|v| v.to_str().ok()?.parse::<usize>().ok());
+        let settled = if held >= cap {
+            probe.status() == StatusCode::TOO_MANY_REQUESTS
+        } else {
+            probe.status() == StatusCode::OK && remaining == Some(cap - held - 1)
+        };
+        if settled {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{held} of {cap} never in flight (last: {} remaining {remaining:?})",
+            probe.status()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 async fn list_servers(gw: &TestGateway, token: &str) -> reqwest::Response {
@@ -118,7 +142,7 @@ async fn assert_shed(response: reqwest::Response, label: &str) {
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{label}");
     let body: Value = response.json().await.expect("429 body is JSON");
     assert_eq!(
-        body["error"]["code"], "concurrency_limit_exceeded",
+        body["error"]["data"]["code"], "concurrency_limit_exceeded",
         "{label}: {body}"
     );
 }
@@ -140,6 +164,7 @@ async fn account_cap_below_the_default_sheds_only_that_account() {
     let fleet = format!("service:{account}-fleet");
 
     let held = stall(&gw, TIGHT_TOKEN, TIGHT_CAP).await;
+    await_in_flight(&gw, TIGHT_TOKEN, TIGHT_CAP, TIGHT_CAP).await;
     assert_shed(
         list_servers(&gw, TIGHT_TOKEN).await,
         "tight account at its cap",
@@ -154,7 +179,7 @@ async fn account_cap_below_the_default_sheds_only_that_account() {
     .await;
 
     drop(held);
-    tokio::time::sleep(SETTLE).await;
+    await_in_flight(&gw, TIGHT_TOKEN, TIGHT_CAP, 0).await;
     assert_admitted(&gw, TIGHT_TOKEN, &tight, "tight account after release").await;
 
     delete_audit_calls(&gw.state_db, &tight).await;
@@ -168,9 +193,11 @@ async fn account_cap_above_the_default_admits_past_it() {
     let fleet = format!("service:{account}-fleet");
 
     let mut held = stall(&gw, FLEET_TOKEN, default_cap()).await;
+    await_in_flight(&gw, FLEET_TOKEN, fleet_cap(), default_cap()).await;
     assert_admitted(&gw, FLEET_TOKEN, &fleet, "fleet past the default cap").await;
 
     held.extend(stall(&gw, FLEET_TOKEN, fleet_cap() - default_cap()).await);
+    await_in_flight(&gw, FLEET_TOKEN, fleet_cap(), fleet_cap()).await;
     assert_shed(list_servers(&gw, FLEET_TOKEN).await, "fleet at its own cap").await;
 
     drop(held);

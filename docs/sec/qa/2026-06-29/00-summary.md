@@ -6,6 +6,8 @@
 
 > **Remediation status (2026-06-30):** All 22 findings closed. See per-finding status column below and per-report banners in 01–06. Exploit payloads redacted from sub-reports; full strings visible in git history at `ac43a61` (original audit commit).
 
+> **Paths as of `9250579`.** Every `file:line` in this report and in 01–06 points at the tree at that commit (v0.1.0). The code has moved since — `src/exec/sql_guard.rs` is now the `src/exec/sql_guard/` module, for one — so read a cited path with `git show 9250579:<path>`, not against `main`.
+
 ## Bottom line
 
 The gateway is well-built. The hard invariants the project cares most about — credential confinement, group-based authz, synchronous in-transaction audit, parameterized SQL, fail-closed admin gating — hold. **No credential leak, no auth bypass, and no authz escalation was confirmed.**

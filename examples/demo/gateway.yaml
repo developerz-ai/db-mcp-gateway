@@ -1,0 +1,35 @@
+# Demo gateway config — one seeded Postgres target, one service account,
+# one SSO group. Every secret is a reference; the compose file supplies them.
+gateway:
+  env: production
+
+servers:
+  - name: demo
+    kind: postgres
+    host: target-db
+    port: 5432
+    tls: insecure            # compose-internal network; never in production
+    databases:
+      - name: shop
+        role: mcp_demo_ro
+        password: ${ENV:DEMO_RO_PASSWORD}
+        description: "Demo shop: customers, products, orders"
+
+permissions:
+  # Static Dex user (profile `sso`, config/dex.yaml).
+  - group: devs
+    grants:
+      - { server: demo, database: shop, action: query_read, constraints: { row_limit: 1000 } }
+      - { server: demo, database: shop, action: history_read }
+
+  # The service account below (spec 14).
+  - group: svc-demo
+    grants:
+      - { server: demo, database: shop, action: query_read, constraints: { row_limit: 1000 } }
+      - { server: demo, database: shop, action: history_read }
+
+service_accounts:
+  - name: demo
+    group: svc-demo
+    # Minted on first `docker compose up` by the `mint-token` service.
+    token: ${FILE:/run/demo-secrets/service-token}

@@ -1,0 +1,10 @@
+db-mcp-gateway {{ .Chart.AppVersion }} — {{ include "gateway.fullname" . }} in {{ .Release.Namespace }}.
+
+MCP endpoint (inside the cluster):
+  {{ ternary "https" "http" .Values.tls.enabled }}://{{ include "gateway.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}/mcp
+
+Prometheus scrape: {{ include "gateway.fullname" . }}-metrics:{{ .Values.metrics.port }}/metrics
+Alerts and runbook: deploy/prometheus/rules.yaml, deploy/runbook.md.
+
+Kubernetes sends no SIGHUP: a config change rolls the pods (checksum
+annotation); a renewed TLS Secret needs a restart or a reloader.

@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# bin/run — run the gateway from source against the dev stack.
+#   bin/run [--idp] [cargo run flags…]     e.g. bin/run --release
+# Starts state-db + target-db (--idp: also Dex, compose profile `idp`), runs
+# bin/seed (idempotent: the demo `shop` data and the SELECT-only `gateway_ro`
+# login the gateway connects as), mints a dev service token once into
+# target/dev/service-token (bin/mcp-call reads it), then `cargo run` with
+# config/dev.yaml. The defaults below are dev-only;
+# .env and the shell override them (the shell wins).
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+# shellcheck source=bin/lib/dotenv.sh
+. bin/lib/dotenv.sh
+
+compose=(docker compose -f docker-compose.dev.yml)
+services=(state-db target-db)
+if [[ ${1:-} == --idp ]]; then
+  shift
+  compose+=(--profile idp)
+  services+=(dex)
+fi
+
+: "${STATE_DB_URL:=postgres://${STATE_DB_USER:-gateway}:${STATE_DB_PASSWORD:-gateway-dev-only}@localhost:${STATE_DB_PORT:-5433}/${STATE_DB_NAME:-gateway}}"
+: "${TARGET_DB_RO_PASSWORD:=gateway-ro-dev-only}"
+: "${TLS_DISABLED:=true}"
+: "${OIDC_ISSUER:=http://localhost:5556}"
+: "${OIDC_CLIENT_ID:=dev}"
+: "${OIDC_CLIENT_SECRET:=dev-only-oidc-secret}"
+: "${ALLOW_INSECURE_SIGNING_KEY:=true}"
+export STATE_DB_URL TARGET_DB_RO_PASSWORD TLS_DISABLED OIDC_ISSUER OIDC_CLIENT_ID \
+  OIDC_CLIENT_SECRET ALLOW_INSECURE_SIGNING_KEY
+
+target_port=${TARGET_DB_PORT:-5434}
+[[ $target_port =~ ^[0-9]+$ ]] || { echo "bin/run: TARGET_DB_PORT must be a port number" >&2; exit 2; }
+
+mkdir -p target/dev
+token_file=target/dev/service-token
+if [[ ! -s $token_file ]]; then
+  # Into a temp file beside it, then one rename: an openssl failure or an
+  # interrupt never leaves a partial token that the -s check above would keep.
+  partial=$(umask 077 && mktemp "$token_file.XXXXXX")
+  trap 'rm -f "$partial"' EXIT
+  if ! hex=$(openssl rand -hex 32) || [[ ! $hex =~ ^[0-9a-f]{64}$ ]]; then
+    echo "bin/run: openssl rand failed; no token minted" >&2
+    exit 1
+  fi
+  printf 'dbmcp_svc_%s' "$hex" > "$partial"
+  mv -f "$partial" "$token_file"
+  trap - EXIT
+fi
+DBMCP_DEV_SERVICE_TOKEN=$(<"$token_file")
+export DBMCP_DEV_SERVICE_TOKEN
+
+# YAML has no interpolation for ports: render a copy when .env moved the target.
+config=config/dev.yaml
+if [[ $target_port != 5434 ]]; then
+  config=target/dev/config.yaml
+  sed "s/^    port: 5434\$/    port: ${target_port}/" config/dev.yaml > "$config"
+fi
+
+# Start only what is not running: `up` on a running service under different
+# env (another port in the shell than in .env) would recreate it under you.
+running=$("${compose[@]}" ps --status running --services)
+missing=()
+for service in "${services[@]}"; do
+  grep -qx "$service" <<<"$running" || missing+=("$service")
+done
+if (( ${#missing[@]} )); then
+  echo "→ starting ${missing[*]}"
+  "${compose[@]}" up -d --wait "${missing[@]}"
+fi
+# Running is not ready: a container started a moment ago (by us or anyone) can
+# still be in its init phase, whose server listens on the unix socket only —
+# which the compose healthcheck probes. Ask over TCP, in the container, so a
+# running service is never re-upped.
+wait_for_tcp() {
+  local service=$1 user=$2
+  for _ in $(seq 60); do
+    "${compose[@]}" exec -T "$service" pg_isready -q -h 127.0.0.1 -U "$user" && return 0
+    sleep 1
+  done
+  echo "bin/run: $service does not accept TCP connections after 60 s" >&2
+  exit 1
+}
+wait_for_tcp state-db "${STATE_DB_USER:-gateway}"
+wait_for_tcp target-db "${TARGET_DB_USER:-app}"
+bin/seed
+# The owner password is bin/seed's alone: the gateway connects as the
+# read-only login, even when the shell or .env exports the owner's.
+unset TARGET_DB_PASSWORD
+exec cargo run --bin db-mcp-gateway "$@" -- --config "$config"

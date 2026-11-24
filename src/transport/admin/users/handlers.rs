@@ -21,10 +21,10 @@ use super::super::middleware::AdminActor;
 use super::super::page_query::{PageQuery, invalid_query};
 use super::super::payload::{grant_payload, user_payload};
 use super::super::validation::{
-    check_unchanged, internal, invalid_body, invalid_id, not_found, store_error, trimmed_non_empty,
+    check_unchanged, internal, invalid_body, invalid_id, not_found, store_error,
 };
 use super::{CreateUserRequest, UpdateUserRequest, UserResponse, UsersState};
-use super::{sso_subject, validate_groups};
+use super::{sso_subject, valid_email, validate_groups};
 
 const USER: PermissionsAuditTargetType = PermissionsAuditTargetType::User;
 
@@ -34,9 +34,9 @@ pub async fn create(
     body: Result<Json<CreateUserRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, AdminError> {
     let rid = actor.request_id.as_str();
-    let Json(body) = body.map_err(|_| invalid_body(rid))?;
+    let Json(body) = body.map_err(|rejection| invalid_body(&rejection, rid))?;
     let user_sub = sso_subject(&body.user_sub, rid)?;
-    let user_email = trimmed_non_empty(&body.user_email, "user_email", rid)?;
+    let user_email = valid_email(&body.user_email, rid)?;
     let groups = validate_groups(&body.groups, rid)?;
 
     let mut atx = AuditedTx::begin(&state.state_db, &actor).await?;
@@ -118,7 +118,7 @@ pub async fn patch(
 ) -> Result<Json<UserResponse>, AdminError> {
     let rid = actor.request_id.as_str();
     let Path(id) = id.map_err(|_| invalid_id("user", rid))?;
-    let Json(body) = body.map_err(|_| invalid_body(rid))?;
+    let Json(body) = body.map_err(|rejection| invalid_body(&rejection, rid))?;
     if body.user_email.is_none() && body.groups.is_none() {
         return Err(
             AdminError::invalid("PATCH body must set at least one of user_email, groups")
@@ -128,7 +128,7 @@ pub async fn patch(
     let user_email = body
         .user_email
         .as_deref()
-        .map(|e| trimmed_non_empty(e, "user_email", rid))
+        .map(|e| valid_email(e, rid))
         .transpose()?;
     let groups = body
         .groups

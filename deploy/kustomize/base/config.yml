@@ -1,0 +1,5 @@
+# Replace in an overlay: servers + permissions (website/docs/initial-idea/08-config.md).
+gateway:
+  env: production
+servers: []
+permissions: []

@@ -21,11 +21,12 @@ Tool coverage per target:
 | Tool | Postgres / YugabyteDB | MongoDB | Redis |
 |---|---|---|---|
 | `run_query` | yes (writes with `query_write`) | yes, read-only | yes, read-only |
-| `describe_schema` | yes | yes (collections + indexes) | `unsupported_backend` |
+| `describe_schema` | yes (`names` / `columns` / `full`, `search`) | yes (collections + indexes; `full` adds sampled fields) | `unsupported_backend` |
 | `sample_table` | yes | yes (limited `find`) | `unsupported_backend` |
 | `explain` | yes | `unsupported_backend` | `unsupported_backend` |
 | `table_stats`, `db_activity`, `cancel_query` | yes | `unsupported_backend` | `unsupported_backend` |
 | `get_query_history` | yes | yes | yes |
+| `list_servers`, `list_databases`, `whoami` | yes | yes | yes |
 
 ## What the LLM sees
 
@@ -50,7 +51,7 @@ Claude: [calls list_servers]
 | MongoDB | a JSON-encoded command document, e.g. `{"find":"users","filter":{"active":true}}` |
 | Redis, Dragonfly | a JSON array — the command and its arguments, e.g. `["HGETALL","user:1"]` |
 
-Same tool, three payload shapes. Modern LLMs pick the right one from the `kind` label in `list_servers`.
+Same tool, three payload shapes. The agent does not have to guess: the gateway's `initialize` instructions and the `run_query` `sql` argument description both spell out the shape per kind, and each tool's description says which kinds offer it.
 
 ## YugabyteDB
 
@@ -117,7 +118,7 @@ Six top-level commands pass the rejector:
 | `listCollections` | List the database's collections |
 | `listIndexes` | List one collection's indexes |
 
-Each command also has its own allowlist of top-level fields (shape and read options only — no `$db`, no session or transaction fields, no `writeConcern`). Anything else — `insert`, `update`, `delete`, `findAndModify`, `bulkWrite`, `createIndex`, `drop`, `dropDatabase`, … — is rejected at the gateway with tool error code `forbidden_sql` (mirroring pg's `sql_guard` posture). The mongo wire layer never sees them.
+Each command also has its own allowlist of top-level fields (shape and read options only — no `$db`, no session or transaction fields, no `writeConcern`). Anything else — `insert`, `update`, `delete`, `findAndModify`, `bulkWrite`, `createIndex`, `drop`, `dropDatabase`, … — is rejected at the gateway with tool error code `forbidden_sql` (mirroring pg's `sql_guard` posture). The mongo wire layer never sees them. A `sql` that is not a JSON object naming a command is the caller's argument error, `invalid_arguments`, before any connection is opened.
 
 ## Blocked mongo operators
 
@@ -150,6 +151,7 @@ Mongo-specific types render via the **relaxed extended JSON** form — matches w
 | `ObjectId(…)` | `{"$oid":"507f…"}` |
 | `Date(…)` | `{"$date":"2026-06-18T12:00:00Z"}` |
 | `Decimal128(…)` | `{"$numberDecimal":"123.45"}` |
+| `Double` NaN, ±Infinity | `{"$numberDouble":"NaN"}`, `{"$numberDouble":"Infinity"}`, `{"$numberDouble":"-Infinity"}` — JSON has no number for them; never `null` |
 
 ## Declaring a redis target
 

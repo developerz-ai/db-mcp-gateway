@@ -1,14 +1,18 @@
 //! db-mcp-gateway — entry point: logging, config, signals, graceful shutdown.
+//! Every other mode (`--check`, `--healthcheck`, the operator subcommands) is
+//! dispatched to `cli` before any of that starts.
 
+mod cli;
 mod sentry_scrub;
 mod startup;
 
-use std::path::PathBuf;
+use std::path::Path;
+use std::process::ExitCode;
 
 use clap::Parser;
 use db_mcp_gateway::audit::drain::DRAIN_TIMEOUT;
 use db_mcp_gateway::auth::{AuthConfig, ServiceTokenStore};
-use db_mcp_gateway::config::{Config, ConfigFile, ServerKind, Tls};
+use db_mcp_gateway::config::{Config, ConfigFile};
 use db_mcp_gateway::state;
 use db_mcp_gateway::transport::tls;
 use tokio_util::sync::CancellationToken;
@@ -19,16 +23,13 @@ use startup::{
     spawn_metrics_listener,
 };
 
-#[derive(Debug, Parser)]
-#[command(name = "db-mcp-gateway", version, about)]
-struct Cli {
-    /// Path to the YAML config file (servers + permissions). Required; spec
-    /// 08-config.md says no half-loaded state.
-    #[arg(long, env = "DB_MCP_GATEWAY_CONFIG")]
-    config: PathBuf,
-}
-
-fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<ExitCode> {
+    // Parsed before Sentry and the runtime: a CLI run (`--check`, `login`, …)
+    // is a short-lived tool that must not open an error stream or a log sink.
+    let config_path = match cli::Cli::parse().into_action()? {
+        cli::Action::Serve(path) => path,
+        cli::Action::Tool(tool) => return Ok(cli::run(tool)),
+    };
     // GlitchTip/Sentry initializes FIRST, before the tokio runtime exists, so a
     // panic during runtime construction or `run()` is still captured. The guard
     // flushes its send queue on drop — bind it to a named local (never `let _ = …`)
@@ -55,7 +56,7 @@ fn main() -> anyhow::Result<()> {
             return Err(err.into());
         }
     };
-    let result = runtime.block_on(run());
+    let result = runtime.block_on(run(&config_path));
 
     // `run()` returns `Err` for config-load / DB-connect / bind failures. Those
     // are normal returns, not panics, so the sentry `panic` integration never
@@ -69,10 +70,10 @@ fn main() -> anyhow::Result<()> {
         let err_ref: &(dyn std::error::Error + Send + Sync + 'static) = err.as_ref();
         sentry::capture_error(err_ref);
     }
-    result
+    result.map(|()| ExitCode::SUCCESS)
 }
 
-async fn run() -> anyhow::Result<()> {
+async fn run(config_path: &Path) -> anyhow::Result<()> {
     // Bound for the whole of `run` so the non-blocking log queue drains on
     // shutdown — see `init_logging`.
     let (_log_guard, dropped_log_lines) = init_logging()?;
@@ -81,14 +82,14 @@ async fn run() -> anyhow::Result<()> {
     // path touches `RustlsConfig` (issue #12).
     tls::install_crypto_provider();
 
-    let cli = Cli::parse();
-
-    // Spec 05 §"resolved at config load": `load` parses, validates, AND
-    // resolves every ${ENV:…} / ${FILE:…} ref in one shot. A boot abort is a
-    // clearer operator signal than the user's first query failing on connect.
-    let config_file = ConfigFile::load(&cli.config)?;
+    // Spec 05 §"resolved at config load": parse, validate (every error at
+    // once), and resolve every ${ENV:…} / ${FILE:…} ref, reporting each one
+    // that fails with its server/database/tier. A boot abort is a clearer
+    // operator signal than the user's first query failing on connect.
+    let config_file = ConfigFile::from_file(config_path)?;
+    config_file.resolve_all_secrets()?;
     tracing::info!(
-        path = %cli.config.display(),
+        path = %config_path.display(),
         servers = config_file.servers.len(),
         permissions = config_file.permissions.len(),
         "config loaded; all secret refs resolved"
@@ -108,6 +109,7 @@ async fn run() -> anyhow::Result<()> {
 
     let config = Config::from_env()?;
     let auth_config = AuthConfig::from_env()?;
+    auth_config.check_bind(config.bind)?;
 
     // One token stops everything that is not the request path: background
     // loops, metrics upkeep and listener, the SIGHUP loop. Cancelled by the
@@ -153,7 +155,13 @@ async fn run() -> anyhow::Result<()> {
         config.audit_retention_days,
         stop.clone(),
     );
-    spawn_audit_reaper(background_db.clone(), stop.clone());
+    spawn_audit_reaper(
+        background_db.clone(),
+        app_state.mcp.audit_sinks.clone(),
+        app_state.mcp.detached.clone(),
+        stop.clone(),
+    );
+    startup::spawn_state_pool_sampler("background", background_db.clone(), stop.clone());
     let auth = &app_state.oauth.auth;
     spawn_auth_state_gc(
         AuthGcTargets {
@@ -169,7 +177,7 @@ async fn run() -> anyhow::Result<()> {
     // drained after the listener stops, and the request pool closed after that.
     let detached = app_state.mcp.detached.clone();
 
-    let served = serve(&config, app_state, cli.config.clone(), stop.clone()).await;
+    let served = serve(&config, app_state, config_path.to_path_buf(), stop.clone()).await;
 
     // `serve` returns once the drain window closes. Stop the background loops,
     // let detached audit writes finish (bounded), then close the pools so
@@ -196,68 +204,10 @@ async fn close_pool(name: &'static str, pool: sqlx::PgPool) {
     }
 }
 
-/// Postgres `tls: required` encrypts without verifying the server certificate
-/// (`sslmode=require`; Mongo's and Redis' `required` do verify), and `tls: insecure` is
-/// plaintext. Neither should go unnoticed in a deploy log.
+/// Insecure target TLS should not go unnoticed in a deploy log; `--check`
+/// prints the same lines.
 fn warn_unverified_target_tls(config_file: &ConfigFile) {
-    for server in &config_file.servers {
-        match (server.kind, server.tls) {
-            (ServerKind::Postgres, Tls::Required) => tracing::warn!(
-                server = %server.name,
-                "target TLS is encrypted but the server certificate is NOT verified"
-            ),
-            (_, Tls::Insecure) => tracing::warn!(
-                server = %server.name,
-                "target TLS is disabled: credentials and results cross the network in plaintext"
-            ),
-            _ => {}
-        }
-    }
-}
-
-#[cfg(test)]
-mod cli_tests {
-    use super::Cli;
-    use clap::Parser;
-    use std::path::PathBuf;
-
-    /// `--config` is required user-facing behavior. Cover the full contract in
-    /// one test so we don't race on the shared `DB_MCP_GATEWAY_CONFIG` env var
-    /// (clap reads it from the process env at parse time).
-    #[test]
-    fn cli_parses_required_config_with_env_fallback() {
-        const ENV: &str = "DB_MCP_GATEWAY_CONFIG";
-
-        // Baseline: nothing set, no flag → parse fails (required arg).
-        // SAFETY: this test is the sole touch-point for $ENV in the bin
-        // test binary; no other test reads or writes it.
-        unsafe {
-            std::env::remove_var(ENV);
-        }
-        assert!(
-            Cli::try_parse_from(["db-mcp-gateway"]).is_err(),
-            "missing --config and env var must fail parse"
-        );
-
-        // Flag-only path: PathBuf comes from argv.
-        let cli = Cli::try_parse_from(["db-mcp-gateway", "--config", "/tmp/flag.yaml"])
-            .expect("flag-only parse succeeds");
-        assert_eq!(cli.config, PathBuf::from("/tmp/flag.yaml"));
-
-        // Env fallback: no flag, but $ENV set → that value wins.
-        unsafe {
-            std::env::set_var(ENV, "/tmp/from-env.yaml");
-        }
-        let cli = Cli::try_parse_from(["db-mcp-gateway"]).expect("env fallback parse succeeds");
-        assert_eq!(cli.config, PathBuf::from("/tmp/from-env.yaml"));
-
-        // Precedence: explicit flag beats env.
-        let cli = Cli::try_parse_from(["db-mcp-gateway", "--config", "/tmp/flag-wins.yaml"])
-            .expect("flag+env parse succeeds");
-        assert_eq!(cli.config, PathBuf::from("/tmp/flag-wins.yaml"));
-
-        unsafe {
-            std::env::remove_var(ENV);
-        }
+    for warning in cli::tls_warnings(config_file) {
+        tracing::warn!("{warning}");
     }
 }

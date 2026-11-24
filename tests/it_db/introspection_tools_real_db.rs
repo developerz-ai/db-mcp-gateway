@@ -135,10 +135,12 @@ async fn table_stats_reports_a_table_and_is_audited() {
         .await
         .expect("target-db reachable; run `bin/dev up`");
     let table = format!("stats_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE TABLE \"{table}\" (id bigint PRIMARY KEY)"))
-        .execute(&target)
-        .await
-        .expect("create scratch table");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE \"{table}\" (id bigint PRIMARY KEY)"
+    )))
+    .execute(&target)
+    .await
+    .expect("create scratch table");
 
     let resp = fx.call("table_stats", json!({ "table": table })).await;
     assert_eq!(resp["result"]["isError"], false, "{resp}");
@@ -158,7 +160,7 @@ async fn table_stats_reports_a_table_and_is_audited() {
     assert_eq!(row.outcome, "success");
     assert_eq!(row.sql.as_deref(), Some(format!("public.{table}").as_str()));
 
-    sqlx::query(&format!("DROP TABLE \"{table}\""))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE \"{table}\"")))
         .execute(&target)
         .await
         .expect("drop scratch table");

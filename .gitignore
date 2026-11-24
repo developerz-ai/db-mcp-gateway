@@ -1,7 +1,6 @@
 # Rust
 /target
 **/*.rs.bk
-Cargo.lock.bak
 
 # Local dev / secrets — never commit
 .env
@@ -17,6 +16,7 @@ Cargo.lock.bak
 !tests/data/*.key
 
 # Local config overrides
+/config.yml
 config/local.yaml
 config/*.local.yaml
 
@@ -35,9 +35,6 @@ config/*.local.yaml
 # Claude Code per-machine settings (project-shared settings live in .claude/)
 .claude/settings.local.json
 
-# claudetm (claude-task-master) per-repo state — pid, task logs, etc.
-.claude-task-master/
-
 # CodeGraph local index (per-developer; indexing is opt-in)
 .codegraph/
 
@@ -46,21 +43,19 @@ config/*.local.yaml
 *.profraw
 *.profdata
 
-.claude-task-master/
-claudetm.log
-goal.txt
-
 # cargo-chef writes this inside the builder stage; only a local
 # `cargo chef prepare` would leave one in the working tree.
 recipe.json
 
 # Benchmark output. latest.json — the harness's default --out — is local
-# scratch, overwritten every run. The named evidence files (postgres.json,
-# mongo.json, instances4.json, REPORT.md) are committed as the evidence behind
-# the numbers published in website/docs/benchmarks.md.
+# scratch, overwritten every run. The named evidence files (*.json.gz,
+# REPORT.md) are committed as the evidence behind the numbers published in
+# website/docs/benchmarks.md.
 benchmarks/results/latest.json
 
-# developerz.ai maintainer agent — scratch it writes for itself while it works
-# (staged CI logs, run artifacts, run provenance). Written BY the agent FOR the
-# agent, cleared and rewritten on every run; never repo content.
-tmp/dz/
+# Local scratch, including the developerz.ai maintainer agent's tmp/dz/ (staged
+# CI logs, run artifacts, run provenance); never repo content.
+/tmp/
+
+# Python bytecode from the .claude/hooks and .github/scripts tests.
+__pycache__/

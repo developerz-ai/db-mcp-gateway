@@ -37,7 +37,18 @@ pub struct CallIntent<'a> {
 /// Commit the intent row, under the same deadline as the completion write.
 /// Callers MUST refuse the target call on `Err`.
 pub async fn record(pool: &PgPool, intent: &CallIntent<'_>) -> Result<(), AuditError> {
-    let write = crate::state::audit::insert_intent(pool, intent);
+    record_with_params(pool, intent, None).await
+}
+
+/// [`record`] for a call that binds positional `params`: stored capped as
+/// the completion row stores them, so an `abandoned` row keeps the values.
+pub async fn record_with_params(
+    pool: &PgPool,
+    intent: &CallIntent<'_>,
+    params: Option<&[serde_json::Value]>,
+) -> Result<(), AuditError> {
+    let params = params.map(super::cap_stored_params);
+    let write = crate::state::audit::insert_intent(pool, intent, params.as_ref());
     match tokio::time::timeout(AUDIT_WRITE_TIMEOUT, write).await {
         Ok(result) => result.map_err(AuditError::Write),
         Err(_) => Err(AuditError::Timeout(AUDIT_WRITE_TIMEOUT)),

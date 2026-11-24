@@ -225,14 +225,18 @@ async fn explain_plans_dml_under_a_write_grant() {
         .await
         .expect("target-db reachable; run `bin/dev up`");
     let table = format!("explain_dml_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!("CREATE TABLE \"{table}\" (id bigint PRIMARY KEY)"))
-        .execute(&target)
-        .await
-        .expect("create scratch table");
-    sqlx::query(&format!("INSERT INTO \"{table}\" VALUES (1)"))
-        .execute(&target)
-        .await
-        .expect("seed scratch row");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE \"{table}\" (id bigint PRIMARY KEY)"
+    )))
+    .execute(&target)
+    .await
+    .expect("create scratch table");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO \"{table}\" VALUES (1)"
+    )))
+    .execute(&target)
+    .await
+    .expect("seed scratch row");
 
     let sql = format!("DELETE FROM \"{table}\" WHERE id = 1");
     let resp = call_explain(url, bearer, &sql).await;
@@ -247,12 +251,14 @@ async fn explain_plans_dml_under_a_write_grant() {
     )
     .await;
 
-    let left: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{table}\""))
-        .fetch_one(&target)
-        .await
-        .unwrap();
+    let left: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM \"{table}\""
+    )))
+    .fetch_one(&target)
+    .await
+    .unwrap();
     assert_eq!(left, 1, "plain EXPLAIN must not execute the DELETE");
-    sqlx::query(&format!("DROP TABLE \"{table}\""))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE \"{table}\"")))
         .execute(&target)
         .await
         .expect("drop scratch table");

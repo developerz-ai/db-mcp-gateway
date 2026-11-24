@@ -67,16 +67,15 @@ async fn login_via_mock_idp_then_call_tool() {
     let client = no_redirect_client();
 
     // 1. Start the flow: gateway hands back the IdP authorize URL.
-    let login: Value = client
+    let login = client
         .post(format!("{gateway_url}/auth/login"))
         .send()
         .await
         .unwrap()
         .error_for_status()
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    assert_no_store(&login, "/auth/login");
+    let login: Value = login.json().await.unwrap();
     let login_url = login["login_url"]
         .as_str()
         .expect("login_url string")
@@ -94,16 +93,15 @@ async fn login_via_mock_idp_then_call_tool() {
         .to_string();
 
     // 3. Our callback: exchange + verify + mint session JWT.
-    let cb: Value = client
+    let cb = client
         .get(&callback)
         .send()
         .await
         .unwrap()
         .error_for_status()
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    assert_no_store(&cb, "/auth/callback");
+    let cb: Value = cb.json().await.unwrap();
     let session_token = cb["session_token"]
         .as_str()
         .expect("session_token string")
@@ -219,6 +217,13 @@ async fn login_via_mock_idp_then_call_tool() {
 struct GatewayHandle {
     url: String,
     client: reqwest::Client,
+}
+
+/// A bearer or login secret in a body must not be cached (RFC 6749 §5.1).
+fn assert_no_store(response: &reqwest::Response, route: &str) {
+    let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok());
+    assert_eq!(header("cache-control"), Some("no-store"), "{route}");
+    assert_eq!(header("pragma"), Some("no-cache"), "{route}");
 }
 
 async fn spawn_gateway(pool: sqlx::PgPool, idp: &common::idp::MockIdpHandle) -> GatewayHandle {

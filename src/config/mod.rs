@@ -13,14 +13,14 @@ pub mod secret;
 pub mod yaml;
 
 pub use env::{
-    Config, ConfigError, DEFAULT_MAX_CONCURRENT_PER_IDENTITY, DEFAULT_MAX_CONCURRENT_REQUESTS,
-    StateDbConfig, TlsConfig,
+    BoolFlagError, Config, ConfigError, DEFAULT_MAX_CONCURRENT_PER_IDENTITY,
+    DEFAULT_MAX_CONCURRENT_REQUESTS, StateDbConfig, TlsConfig, bool_flag_from_env,
 };
 pub use pool::PoolConfig;
 pub use schema::ServiceAccount;
 pub use schema::{
     Action, Constraints, Database, Grant, LoggingBlock, Permission, Server, ServerKind,
-    StreamSinkConfig, Tls,
+    StreamSinkConfig, SyslogTransportKind, Tls,
 };
 pub use secret::{Password, SecretError};
 pub use yaml::{

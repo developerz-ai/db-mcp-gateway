@@ -10,6 +10,9 @@
 //!   inside retention;
 //! - a logout on A rejects the subject's sessions on B.
 //!
+//! A write running on one replica, listed and cancelled from another, is in
+//! `pg_write_tier_real_db` (target-side, no state DB needed).
+//!
 //! `/authorize` → `/token` is NOT covered: pending flows and authorization
 //! codes are in-process, so a login must stay on one replica (sticky
 //! sessions, or one replica serving login).

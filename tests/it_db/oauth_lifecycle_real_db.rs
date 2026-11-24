@@ -149,11 +149,13 @@ async fn cleanup_sub(pool: &PgPool, sub: &str, chains: &[uuid::Uuid]) {
         .await
         .expect("cleanup tombstones");
     for table in ["oauth_refresh_tokens", "sessions"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE user_sub = $1"))
-            .bind(sub)
-            .execute(pool)
-            .await
-            .expect("cleanup");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_sub = $1"
+        )))
+        .bind(sub)
+        .execute(pool)
+        .await
+        .expect("cleanup");
     }
 }
 

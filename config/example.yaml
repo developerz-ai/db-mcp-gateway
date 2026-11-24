@@ -1,4 +1,8 @@
-# Example gateway config. Copy to config.yaml, fill in, point the gateway at it with --config.
+# Example gateway config. Copy to config.yml, fill in, point the gateway at it with --config.
+# Every secret below is an ${ENV:…} reference, so a copy boots once these are set:
+#   PROD_APP_RO_PASSWORD, PROD_BILLING_RO_PASSWORD, STAGING_APP_RO_PASSWORD,
+#   ANALYTICS_SANDBOX_RO_PASSWORD, ANALYTICS_SANDBOX_RW_PASSWORD
+# (target pools open lazily: the hosts are not contacted at boot).
 # Schema and validation rules: website/docs/initial-idea/08-config.md
 #
 # Secret references (resolved at startup; unresolved refs abort boot):
@@ -25,7 +29,7 @@ servers:
     databases:
       - name: app
         role: mcp_gateway_prod_app_ro
-        password: vault:secret/prod/db/app_ro_password
+        password: ${ENV:PROD_APP_RO_PASSWORD}
         description: "Main customer-facing app DB"
         # `sql_capture` is in the spec but not yet enforced; the parser rejects it.
         # sql_capture: redacted          # planned: full | redacted | metadata_only
@@ -38,7 +42,7 @@ servers:
 
       - name: billing
         role: mcp_gateway_prod_billing_ro
-        password: vault:secret/prod/db/billing_ro_password
+        password: ${ENV:PROD_BILLING_RO_PASSWORD}
         # sql_capture: metadata_only      # planned — see comment above
         pool: { max_connections: 3 }
 
@@ -50,9 +54,10 @@ servers:
     databases:
       - name: app
         role: mcp_gateway_staging_app_ro
-        # File mount: pair with a Kubernetes Secret + volumeMount or a
-        # sealed-secret. Refer to deployment docs for the helm/kustomize bit.
-        password: ${FILE:/run/secrets/staging-app-ro-password}
+        # In Kubernetes prefer a file mount (Secret volume or sealed-secret):
+        #   password: ${FILE:/run/secrets/staging-app-ro-password}
+        # A file ref is re-read on SIGHUP; an env ref needs a pod restart.
+        password: ${ENV:STAGING_APP_RO_PASSWORD}
         pool: { max_connections: 5 }
 
   # Analytics server with a write-capable sandbox DB. Two roles, two pools:
@@ -71,9 +76,9 @@ servers:
     databases:
       - name: sandbox
         role: mcp_gateway_analytics_sandbox_ro
-        password: vault:secret/analytics/db/sandbox_ro_password
+        password: ${ENV:ANALYTICS_SANDBOX_RO_PASSWORD}
         write_role: mcp_gateway_analytics_sandbox_rw
-        write_password: vault:secret/analytics/db/sandbox_rw_password
+        write_password: ${ENV:ANALYTICS_SANDBOX_RW_PASSWORD}
         description: "Scratch DB — data-platform writers land here"
 
   # YugabyteDB (YSQL) is a Postgres target: declare it `kind: postgres`. Its
@@ -91,7 +96,7 @@ servers:
   #   databases:
   #     - name: ledger
   #       role: mcp_gateway_ledger_ro
-  #       password: vault:secret/prod/db/ledger_ro_password
+  #       password: ${ENV:LEDGER_RO_PASSWORD}
 
   # Redis-protocol target (Redis, Dragonfly, Valkey, KeyDB). Read-only
   # whatever the grant: `run_query` takes a JSON argv such as
@@ -112,7 +117,7 @@ servers:
   #   databases:
   #     - name: "0"
   #       role: gateway_ro
-  #       password: vault:secret/prod/redis/gateway_ro_password
+  #       password: ${FILE:/run/secrets/redis-gateway-ro-password}
   #       pool: { max_connections: 4 }
 
 # Spec 12 §"Admin API". Default off — turn on only when you need the

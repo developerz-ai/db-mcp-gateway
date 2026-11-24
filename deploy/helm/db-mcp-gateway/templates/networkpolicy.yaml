@@ -1,0 +1,57 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $egress := .Values.networkPolicy.egress }}
+{{- range $egress.targets }}
+{{- if not .to }}
+{{- fail "networkPolicy.egress.targets: every rule needs a non-empty `to`; an empty one opens its ports to every destination (use networkPolicy.egress.anyTarget.enabled to mean that)" }}
+{{- end }}
+{{- end }}
+{{- if and $egress.anyTarget.enabled $egress.stateDb.to }}
+{{- fail "networkPolicy.egress.anyTarget opens 5432 to every destination, undoing the stateDb.to fence: list scoped networkPolicy.egress.targets instead" }}
+{{- end }}
+{{- if not (or $egress.targets $egress.anyTarget.enabled) }}
+{{- fail "networkPolicy.egress: no target egress; list scoped networkPolicy.egress.targets or opt in with networkPolicy.egress.anyTarget.enabled" }}
+{{- end }}
+{{- $ingress := .Values.networkPolicy.ingress }}
+{{- $anySource := eq (toString $ingress.gatewayFrom) "any" }}
+{{- if not (or $anySource (and (kindIs "slice" $ingress.gatewayFrom) $ingress.gatewayFrom)) }}
+{{- fail "networkPolicy.ingress.gatewayFrom: list the NetworkPolicy peers allowed to reach the gateway port (ingress controller, agent namespaces), or set it to `any` to open it to every source" }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "gateway.fullname" . }}
+  labels:
+    {{- include "gateway.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "gateway.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports:
+        - { port: gateway, protocol: TCP }
+      {{- if not $anySource }}
+      from:
+        {{- toYaml $ingress.gatewayFrom | nindent 8 }}
+      {{- end }}
+    {{- /* An empty list means no scraper: a `from: []` would admit every source. */}}
+    {{- with $ingress.metricsFrom }}
+    - ports:
+        - { port: metrics, protocol: TCP }
+      from:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+  egress:
+    {{- include "gateway.egressRule" $egress.dns | nindent 4 }}
+    {{- include "gateway.egressRule" $egress.stateDb | nindent 4 }}
+    {{- include "gateway.egressRule" $egress.idp | nindent 4 }}
+    {{- range $egress.targets }}
+    {{- include "gateway.egressRule" . | nindent 4 }}
+    {{- end }}
+    {{- if $egress.anyTarget.enabled }}
+    {{- include "gateway.egressRule" (dict "ports" $egress.anyTarget.ports) | nindent 4 }}
+    {{- end }}
+    {{- range $egress.extra }}
+    {{- include "gateway.egressRule" . | nindent 4 }}
+    {{- end }}
+{{- end }}

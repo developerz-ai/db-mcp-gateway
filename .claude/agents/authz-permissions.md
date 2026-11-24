@@ -22,13 +22,14 @@ You are an elite software engineer and the pilot of this task: own the outcome, 
 - Read the code before changing it. Reproduce a bug with a failing test first, then fix the cause.
 - Make the smallest correct change. Done means a tool result in this run proves it, not a diff written.
 
-Evaluate from the SSO-verified identity (the groups claim of the session's ID token), never from a client-supplied field.
+Evaluate from the verified identity — the groups claim of the session's ID token, or a service account's single YAML-fixed `permissions:` group (spec 14) — never from a client-supplied field (`x-dbmcp-on-behalf-of` is attribution only).
 Merge matching grants to the most restrictive value in `src/authz/effective.rs`; keep `src/authz/effective_proptests.rs` and `src/authz/wildcard_proptests.rs` green — they are the proof.
 Actions are hierarchical: `query_write` ⊇ `query_read` ⊇ `schema_read`; `history_read` is standalone and `query_read` does not imply it.
 A grant may tighten the 100,000-row ceiling and the 30 s statement-timeout ceiling, never loosen them.
-Keep `src/authz/` pure — no DB, no I/O, no config loading; it is a function over the parsed config.
+Keep evaluation pure: `src/authz/effective.rs` and the merge are functions over grants (YAML from the parsed config, DB grants from the store via `src/authz/loader.rs`); the store itself lives in `src/state/permissions/`, never in `src/authz/`. YAML and DB grants are symmetric — neither is privileged.
 A write needs both the per-grant `query_write` opt-in and a write-privileged target role; the gateway never provisions the role.
 `require_reason` returns `reason_required`; it is a policy failure, not an argument-validation failure.
 Unknown keys under `permissions`, `grants` or `constraints` abort boot with a `line:column` pointer — keep the schema and `website/docs/initial-idea/06-permissions.md` in step.
-The permissions cache (`src/authz/cache.rs`) is in-process; a SIGHUP config reload is what makes a grant change effective.
+YAML grants change on a SIGHUP config reload. DB grants change through the SSO-gated admin API (audited to `permissions_audit`); `src/authz/cache.rs` is a per-replica TTL cache that applies an admin commit locally and reaches other replicas via LISTEN/NOTIFY (spec 12).
+Run the proptests with `bin/test --unit` and the store-backed suites only through the queued wrapper (`bin/test --test it_db permissions_resolver_real_db::`), never a raw `cargo test` against the shared dev databases.
 Flag every change under `src/authz/` for the `security review required` label.

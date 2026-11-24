@@ -118,9 +118,9 @@ pub struct PermissionsUser {
     pub id: Uuid,
     pub user_sub: String,
     pub user_email: String,
-    /// Group snapshot cached from the last login. JWT is the live source of
-    /// truth; this is here so the admin API can list users without minting
-    /// tokens for them.
+    /// Groups as the users API (or an admin's first audited write, from its
+    /// session) last stored them. The JWT is the live source of truth; this
+    /// is here so the admin API can list users without minting tokens.
     pub groups: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -151,6 +151,9 @@ pub struct PermissionsGrant {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// Evaluation ignores the grant from this instant on; the row stays live
+    /// so the admin API can list it as expired. `None` never expires.
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// One live grant resolved for the authz loader: user live, grant not
@@ -163,6 +166,7 @@ pub struct LiveGrant {
     pub db_name: Option<String>,
     pub action: GrantAction,
     pub constraints: JsonValue,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// A bounded window over a list endpoint's results.

@@ -1,0 +1,31 @@
+# --check fixture: boots, but reads like it does something it does not.
+servers:
+  - name: prod
+    kind: postgres
+    host: db.example.internal
+    tls: required
+    databases:
+      - name: app
+        role: mcp_app_ro
+        password: ${ENV:CHECK_APP_RO_PASSWORD}
+  - name: legacy
+    kind: mongo
+    host: mongo.example.internal
+    tls: insecure
+    databases:
+      - name: app
+        role: mcp_app_ro
+        password: ${ENV:CHECK_APP_RO_PASSWORD}
+permissions:
+  - group: engineers
+    grants:
+      - server: prod
+        database: app
+        action: schema_read
+        constraints:
+          row_limit: 10
+      - server: "*"
+        database: app
+        action: history_read
+        constraints:
+          statement_timeout_ms: 1000

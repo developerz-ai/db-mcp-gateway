@@ -20,8 +20,9 @@ use crate::mcp::jsonrpc::Response;
 use super::ToolCtx;
 use super::args::parse_arguments;
 use super::audit_dispatch::{
-    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, audit_outcome, error_outcome,
-    invalid_arguments, outcome_from_exec_error, reject_arguments, run_audited, success_outcome,
+    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, audit_outcome, elapsed_ms_since,
+    error_outcome, invalid_arguments, outcome_from_exec_error, reject_arguments, run_audited,
+    success_outcome,
 };
 use super::target::{Target, ensure_reason, forbidden, record_intent, resolve_target};
 
@@ -104,7 +105,7 @@ async fn compute_outcome(
     if let Err(rejected) = ensure_owned(ctx, &target, victim).await {
         return *rejected;
     }
-    if let Err(refused) = record_intent(ctx, header, &target, Access::ReadOnly).await {
+    if let Err(refused) = record_intent(ctx, header, &target, Access::ReadOnly, None).await {
         return *refused;
     }
 
@@ -119,7 +120,7 @@ async fn compute_outcome(
     };
     match adapter.cancel_request(victim).await {
         Ok(cancelled) => {
-            let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+            let elapsed = elapsed_ms_since(started);
             let Ok(text) = serde_json::to_string(&SuccessPayload { cancelled }) else {
                 return error_outcome(OutcomeCode::Internal, "failed to serialize result");
             };

@@ -4,7 +4,9 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use serde_json::Value;
 use sqlx::postgres::types::PgInterval;
-use sqlx::postgres::{PgValueFormat, PgValueRef};
+
+use super::json::RowWeight;
+use super::wire::Refused;
 
 /// Key of the marker object returned for a cell this gateway can't render.
 const UNSUPPORTED_TYPE_KEY: &str = "unsupported_type";
@@ -32,11 +34,18 @@ pub(super) fn float(v: f64) -> Value {
 
 pub(super) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
-    bytes.iter().fold(String::from("\\x"), |mut out, b| {
+    let mut prefixed = String::with_capacity(hex_len(bytes));
+    prefixed.push_str("\\x");
+    bytes.iter().fold(prefixed, |mut out, b| {
         // Writing to a String is infallible.
         let _ = write!(out, "{b:02x}");
         out
     })
+}
+
+/// How long [`hex`] renders `bytes`: the `\x` prefix, two digits a byte.
+pub(super) fn hex_len(bytes: &[u8]) -> usize {
+    bytes.len().saturating_mul(2).saturating_add(2)
 }
 
 /// ISO-8601 duration. Postgres keeps months, days and microseconds apart
@@ -88,13 +97,9 @@ fn seconds(micros: i64) -> String {
 }
 
 /// `inet` / `cidr` without the `ipnetwork` feature: the binary wire form is
-/// `family, bits, is_cidr, length, address bytes`. Text form passes through.
-pub(super) fn inet(raw: &PgValueRef<'_>) -> Option<String> {
-    if raw.format() == PgValueFormat::Text {
-        return raw.as_str().ok().map(str::to_string);
-    }
-    let bytes = raw.as_bytes().ok()?;
-    let (&[family, bits, is_cidr, len], addr) = bytes.split_first_chunk::<4>()?;
+/// `family, bits, is_cidr, length, address bytes`.
+pub(super) fn inet(wire: &[u8]) -> Option<String> {
+    let (&[family, bits, is_cidr, len], addr) = wire.split_first_chunk::<4>()?;
     if addr.len() != usize::from(len) {
         return None;
     }
@@ -116,6 +121,72 @@ pub(super) fn inet(raw: &PgValueRef<'_>) -> Option<String> {
     } else {
         ip
     })
+}
+
+/// A `"char"` as Postgres prints it: nothing for the zero byte, the
+/// character for ASCII, a backslash and three octal digits above it.
+pub(super) fn catalog_char(byte: u8) -> String {
+    match byte {
+        0 => String::new(),
+        byte if byte.is_ascii() => char::from(byte).to_string(),
+        byte => format!("\\{byte:03o}"),
+    }
+}
+
+/// A WAL position the way Postgres prints it: two hex halves.
+pub(super) fn lsn(position: u64) -> String {
+    format!("{:X}/{:X}", position >> 32, position & 0xFFFF_FFFF)
+}
+
+/// A `tsvector` in Postgres' text form: `'lexeme':1A,2 'other'`. The wire
+/// form is a count, then per lexeme its NUL-terminated text, a position
+/// count and the positions — 14 bits of position under 2 bits of weight.
+/// Each lexeme is charged before it is appended: escaping can double it.
+pub(super) fn tsvector(wire: &[u8], weight: &mut RowWeight<'_>) -> Result<String, Refused> {
+    let (count, mut rest) = wire.split_first_chunk::<4>().ok_or(Refused::Undecodable)?;
+    let mut out = String::new();
+    let mut lexeme = String::new();
+    for index in 0..u32::from_be_bytes(*count) {
+        lexeme.clear();
+        rest = tsvector_lexeme(rest, &mut lexeme).ok_or(Refused::Undecodable)?;
+        let separator = usize::from(index > 0);
+        if !weight.charge(separator + lexeme.len()) {
+            return Err(Refused::OverBudget);
+        }
+        if separator > 0 {
+            out.push(' ');
+        }
+        out.push_str(&lexeme);
+    }
+    if rest.is_empty() {
+        Ok(out)
+    } else {
+        Err(Refused::Undecodable)
+    }
+}
+
+/// One lexeme and its positions rendered into `out`; the wire left after it.
+fn tsvector_lexeme<'w>(wire: &'w [u8], out: &mut String) -> Option<&'w [u8]> {
+    let end = wire.iter().position(|&byte| byte == 0)?;
+    let text = std::str::from_utf8(&wire[..end]).ok()?;
+    let (positions, mut rest) = wire[end + 1..].split_first_chunk::<2>()?;
+    out.push('\'');
+    out.push_str(&text.replace('\'', "''").replace('\\', "\\\\"));
+    out.push('\'');
+    for nth in 0..u16::from_be_bytes(*positions) {
+        let (position, after) = rest.split_first_chunk::<2>()?;
+        rest = after;
+        let position = u16::from_be_bytes(*position);
+        out.push(if nth == 0 { ':' } else { ',' });
+        out.push_str(&(position & 0x3FFF).to_string());
+        match position >> 14 {
+            3 => out.push('A'),
+            2 => out.push('B'),
+            1 => out.push('C'),
+            _ => {}
+        }
+    }
+    Some(rest)
 }
 
 #[cfg(test)]
@@ -149,5 +220,48 @@ mod tests {
         assert_eq!(iv(0, 0, 1_500_000), "PT1.5S");
         assert_eq!(iv(0, -1, -30_000_000), "P-1DT-30S");
         assert_eq!(iv(1, 0, 0), "P1M");
+    }
+
+    #[test]
+    fn catalog_chars_print_as_postgres_prints_them() {
+        assert_eq!(catalog_char(b'r'), "r");
+        assert_eq!(catalog_char(0), "");
+        assert_eq!(catalog_char(0xE9), "\\351");
+    }
+
+    #[test]
+    fn lsn_is_two_hex_halves() {
+        assert_eq!(lsn(0x16_B374_D848), "16/B374D848");
+        assert_eq!(lsn(0), "0/0");
+    }
+
+    #[test]
+    fn tsvector_prints_lexemes_positions_and_weights() {
+        let mut wire = 2u32.to_be_bytes().to_vec();
+        wire.extend(b"it's\0");
+        wire.extend(2u16.to_be_bytes());
+        wire.extend(((3u16 << 14) | 1).to_be_bytes());
+        wire.extend(7u16.to_be_bytes());
+        wire.extend(b"plain\0");
+        wire.extend(0u16.to_be_bytes());
+        let budget = crate::exec::budget::ResultBudget::new(1);
+        let mut weight = RowWeight::new(&budget);
+        let mut render = |wire: &[u8]| tsvector(wire, &mut weight);
+        assert_eq!(render(&wire).as_deref(), Ok("'it''s':1A,7 'plain'"));
+        assert_eq!(render(&wire[..wire.len() - 1]), Err(Refused::Undecodable));
+        assert_eq!(render(&0u32.to_be_bytes()).as_deref(), Ok(""));
+    }
+
+    #[test]
+    fn inet_prints_the_mask_only_when_it_says_something() {
+        assert_eq!(
+            inet(&[2, 32, 0, 4, 10, 0, 0, 1]).as_deref(),
+            Some("10.0.0.1")
+        );
+        assert_eq!(
+            inet(&[2, 8, 1, 4, 10, 0, 0, 0]).as_deref(),
+            Some("10.0.0.0/8")
+        );
+        assert_eq!(inet(&[2, 32, 0, 3, 10, 0, 0]), None);
     }
 }

@@ -1,16 +1,25 @@
 //! Input validation and error mapping shared by every `/admin/v1/*` handler,
 //! so the three entity families cannot drift apart on wording or redaction.
 
+use axum::extract::rejection::JsonRejection;
+use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 
+use crate::config::ConfigFile;
 use crate::state::permissions::RepoError;
 
 use super::error::AdminError;
 
-/// A malformed or non-JSON body, surfaced in the stable admin envelope
-/// instead of Axum's default 400/422.
-pub(super) fn invalid_body(request_id: &str) -> AdminError {
-    AdminError::invalid("invalid JSON body").with_request_id(request_id)
+/// A body the JSON extractor refused, surfaced in the stable admin envelope
+/// instead of Axum's default: `payload_too_large` (413) past the route's
+/// byte bound, `invalid_request` (400) for anything malformed.
+pub(super) fn invalid_body(rejection: &JsonRejection, request_id: &str) -> AdminError {
+    let error = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        AdminError::payload_too_large()
+    } else {
+        AdminError::invalid("invalid JSON body")
+    };
+    error.with_request_id(request_id)
 }
 
 /// A malformed UUID in `:id`.
@@ -69,6 +78,30 @@ pub(super) fn declared_server(
         AdminError::invalid("server must name a server declared in the gateway config")
             .with_request_id(request_id),
     )
+}
+
+/// A `(server, db_name)` pair the live gateway config declares. A row naming
+/// any other database would grant nothing today and silently start granting
+/// when a later reload added that database.
+pub(super) fn declared_database(
+    config: &ConfigFile,
+    server: &str,
+    db_name: &str,
+    request_id: &str,
+) -> Result<(), AdminError> {
+    let declared = config
+        .servers
+        .iter()
+        .filter(|s| s.name == server)
+        .flat_map(|s| &s.databases)
+        .any(|db| db.name == db_name);
+    if declared {
+        return Ok(());
+    }
+    Err(AdminError::invalid(format!(
+        "db_name `{db_name}` is not a database the gateway config declares on server `{server}`"
+    ))
+    .with_request_id(request_id))
 }
 
 /// Optimistic-concurrency precondition: when the caller names the

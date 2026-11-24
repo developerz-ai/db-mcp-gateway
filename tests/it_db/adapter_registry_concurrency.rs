@@ -21,6 +21,7 @@
 //! `tests/it_db/run_query_e2e.rs` and `tests/it_db/cancellation_real_db.rs`).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::common::mongo_target;
@@ -45,15 +46,33 @@ const FAILED_OPEN_TTL: Duration = Duration::from_secs(5);
 /// Postgres client blocks waiting for a startup response that never comes.
 /// The accept loop holds each connection open for the life of the test.
 pub(crate) async fn spawn_blackhole() -> u16 {
+    spawn_counted_blackhole().await.0
+}
+
+/// [`spawn_blackhole`], plus how many connections it has accepted — so a
+/// test can wait for a client to be parked in the handshake.
+async fn spawn_counted_blackhole() -> (u16, Arc<AtomicUsize>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
     tokio::spawn(async move {
         let mut held = Vec::new();
         while let Ok((stream, _)) = listener.accept().await {
             held.push(stream);
+            counter.fetch_add(1, Ordering::SeqCst);
         }
     });
-    port
+    (port, accepted)
+}
+
+/// Poll `done` every 10 ms; fail naming `what` past `within`.
+async fn wait_until(what: &str, within: Duration, mut done: impl AsyncFnMut() -> bool) {
+    let deadline = Instant::now() + within;
+    while !done().await {
+        assert!(Instant::now() < deadline, "{what} after {within:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 fn config_for(first_port: u16, second_port: u16) -> ConfigFile {
@@ -110,7 +129,8 @@ fn target<'a>(config: &'a ConfigFile, server: &str) -> (&'a Server, &'a Database
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn opens_for_different_databases_do_not_serialize() {
-    let config = config_for(spawn_blackhole().await, spawn_blackhole().await);
+    let (first_port, first_accepted) = spawn_counted_blackhole().await;
+    let config = config_for(first_port, spawn_blackhole().await);
     let registry = AdapterRegistry::new();
 
     // Park a task inside `PgAdapter::open` against `first`. Pre-fix it holds
@@ -125,9 +145,13 @@ async fn opens_for_different_databases_do_not_serialize() {
         })
     };
 
-    // Give the spawned task time to reach the connect. A loopback TCP
-    // handshake is sub-millisecond, so this is far longer than it needs.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The first open is parked once `first` has accepted its connection.
+    wait_until(
+        "first never connected",
+        Duration::from_secs(5),
+        async || first_accepted.load(Ordering::SeqCst) > 0,
+    )
+    .await;
 
     let (server, database) = target(&config, "second");
     let started = Instant::now();
@@ -179,13 +203,28 @@ async fn a_failed_open_is_cached_briefly_then_retried() {
         started.elapsed()
     );
 
-    tokio::time::sleep(FAILED_OPEN_TTL).await;
-    let started = Instant::now();
-    assert!(registry.get_or_open(server, database).await.is_err());
+    // Poll the slot: answers stay instant while the failure is cached, and
+    // the first slow one is a real open attempted again after the TTL.
+    let cached_since = Instant::now();
+    let mut retried_after = None;
+    wait_until(
+        "the failed open was never retried",
+        FAILED_OPEN_TTL * 3,
+        async || {
+            let started = Instant::now();
+            assert!(registry.get_or_open(server, database).await.is_err());
+            let retried = started.elapsed() >= POOL_ACQUIRE_TIMEOUT / 2;
+            if retried {
+                retried_after = Some(started - cached_since);
+            }
+            retried
+        },
+    )
+    .await;
+    let retried_after = retried_after.expect("retried");
     assert!(
-        started.elapsed() >= POOL_ACQUIRE_TIMEOUT / 2,
-        "after the TTL the open is attempted again: {:?}",
-        started.elapsed()
+        retried_after + Duration::from_millis(600) >= FAILED_OPEN_TTL,
+        "retried before the TTL: {retried_after:?}"
     );
 }
 

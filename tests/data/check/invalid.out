@@ -1,0 +1,9 @@
+config: tests/data/check/invalid.yaml
+error: invalid config: database `app` in server `prod`: `role` must match ^[a-zA-Z_][a-zA-Z0-9_]*$
+error: database `admin` in server `prod` connects as `postgres`, the stock superuser for `Postgres`. The gateway must never hold a superuser credential — create a per-database read-only role and use that instead (see https://developerz-ai.github.io/db-mcp-gateway/docs/initial-idea/credentials)
+error: invalid config: duplicate server name `prod`
+error: invalid config: server `old` has kind `Mysql`, which has no query adapter yet (supported kinds: postgres, mongo, redis)
+error: invalid config: permission group `engineers` grants on unknown server `nowhere`
+error: logging.stream[0] syslog `host` must be non-blank — a blank host deserializes cleanly but fails DNS on every audit event inside the detached delivery task, which drops silently
+error: invalid config: servers[prod].databases[admin].password is an inline literal, which `gateway.env: production` rejects — use `${ENV:NAME}` or `${FILE:/path}`
+result: invalid (7 error(s), 0 warning(s))

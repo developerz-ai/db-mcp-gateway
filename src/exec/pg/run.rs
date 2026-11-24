@@ -5,16 +5,18 @@
 
 use std::time::{Duration, Instant};
 
-use sqlx::{Column, Connection, Executor, PgConnection, PgPool, Postgres, Transaction};
+use sqlx::{Connection, Executor, PgConnection, PgPool};
 use tokio::sync::Semaphore;
 
 use crate::audit::drain::DetachedTasks;
 
 use super::super::adapter::{ExecError, ExecResult, effective_timeout_ms};
-use super::super::query::ExecQuery;
+use super::super::query::{ExecQuery, QueryParam};
 use super::super::sql_guard::Access;
 use super::cancel::{Backend, BackendTag, CancelOnDrop};
-use super::error::{classify, classify_commit};
+use super::describe::describe_columns;
+use super::error::{Origin, classify, classify_commit};
+use super::recast;
 use super::stream::stream_rows;
 use super::truncate::cancel_and_rollback;
 
@@ -22,23 +24,54 @@ use super::truncate::cancel_and_rollback;
 /// execution; this only bounds a target that stalls on it.
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// What one run needs besides the query: where cancels go and run, the role
-/// name to redact from server messages, and the adapter's large-row gate.
+/// What one run needs besides the query: where cancels go and run, where its
+/// errors are logged from (and the role name to redact from server
+/// messages), and the adapter's large-row gate.
 pub(super) struct RunCtx<'a> {
     pub(super) cancel_pool: &'a PgPool,
-    pub(super) role: &'a str,
+    pub(super) origin: Origin<'a>,
     pub(super) detached: &'a DetachedTasks,
     pub(super) large_rows: &'a Semaphore,
 }
 
-pub(super) async fn run_query_inner(
+/// Run `query` in its own transaction. A read the target refused because a
+/// column's type has no binary form is run once more with those columns
+/// cast to text (see [`recast`]); when that is not possible, or the target
+/// refuses the second statement too, the first refusal is the answer. The
+/// second attempt is the one that ran, so its timeout, cancel or lost
+/// connection is the answer. `params` are bound to both attempts.
+pub(super) async fn run_query(
     conn: &mut PgConnection,
     ctx: &RunCtx<'_>,
     query: &ExecQuery<'_>,
+    params: &[QueryParam],
+) -> Result<ExecResult, ExecError> {
+    let refused = match run_query_inner(conn, ctx, query, params).await {
+        Err(err) if recast::may_apply(&err, query) => err,
+        done => return done,
+    };
+    let Some(sql) = recast::text_cast_sql(conn, ctx, query, params).await else {
+        return Err(refused);
+    };
+    let recast = ExecQuery {
+        sql: &sql,
+        ..*query
+    };
+    match run_query_inner(conn, ctx, &recast, params).await {
+        Err(ExecError::Sql | ExecError::Rejected(_)) => Err(refused),
+        done => done,
+    }
+}
+
+async fn run_query_inner(
+    conn: &mut PgConnection,
+    ctx: &RunCtx<'_>,
+    query: &ExecQuery<'_>,
+    params: &[QueryParam],
 ) -> Result<ExecResult, ExecError> {
     let started = Instant::now();
-    let role = ctx.role;
-    let mut tx = conn.begin().await.map_err(|e| classify(e, role, ""))?;
+    let origin = &ctx.origin;
+    let mut tx = conn.begin().await.map_err(|e| classify(e, origin, ""))?;
 
     // One round trip, before any other statement: `SET TRANSACTION` must
     // precede the transaction's first query. The read-only transaction is the
@@ -59,21 +92,29 @@ pub(super) async fn run_query_inner(
          SET LOCAL standard_conforming_strings = on",
         tag.as_str()
     );
-    tx.execute(setup.as_str())
+    tx.execute(sqlx::AssertSqlSafe(setup))
         .await
-        .map_err(|e| classify(e, role, ""))?;
+        .map_err(|e| classify(e, origin, ""))?;
 
     // Capture this connection's backend so a drop (agent disconnect) can
     // cancel the exact backend running our query — dropping `tx` alone won't
     // stop it. The guard holds the *cancel* pool so the cancel can always
     // acquire, even when every connection in the query pool is pinned.
     // Unnamed, like every statement on a query connection: nothing is left
-    // prepared on it for `reset_on_release` to close.
-    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .persistent(false)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| classify(e, role, ""))?;
+    // prepared on it for `reset_on_release` to close. The same round trip
+    // asks how many of a `money` value's digits are its fraction: the wire
+    // form is a bare count of minor units, and `lc_monetary` says the rest.
+    let (pid, money_digits): (i32, i32) =
+        sqlx::query_as("SELECT pg_backend_pid(), scale(1::money::numeric)")
+            .persistent(false)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| classify(e, origin, ""))?;
+    // Postgres itself falls back to 2 outside 0..=10.
+    let money_digits = u8::try_from(money_digits)
+        .ok()
+        .filter(|d| *d <= 10)
+        .unwrap_or(2);
     let backend = Backend { pid, tag };
     let mut cancel = CancelOnDrop::armed(
         ctx.cancel_pool.clone(),
@@ -87,16 +128,18 @@ pub(super) async fn run_query_inner(
     // / outer `tokio::time::timeout`): the one case where the backend is
     // still running and must be cancelled.
     let result = async {
-        let collected = stream_rows(&mut tx, query, role, ctx.large_rows).await?;
-        let mut columns = collected.columns;
+        let collected =
+            stream_rows(&mut tx, query, params, origin, ctx.large_rows, money_digits).await?;
+        let (mut columns, mut column_types) = (collected.columns, collected.column_types);
         // Reads only. Inside a write's transaction a failed lookup would
         // abort it, and the `COMMIT` that follows would then roll the write
         // back while reporting success.
         let mut in_step = true;
         if columns.is_empty() && query.access == Access::ReadOnly {
             let left = Duration::from_millis(u64::from(ms)).saturating_sub(started.elapsed());
-            match describe_columns(&mut tx, query.sql, left.min(DESCRIBE_TIMEOUT)).await {
-                Some(described) => columns = described,
+            let budget = left.min(DESCRIBE_TIMEOUT);
+            match describe_columns(&mut tx, query.sql, params, budget).await {
+                Some(described) => (columns, column_types) = described,
                 None => in_step = false,
             }
         }
@@ -114,7 +157,7 @@ pub(super) async fn run_query_inner(
             // as undone unless it was.
             tx.rollback()
                 .await
-                .map_err(|e| classify(e, role, query.sql))?;
+                .map_err(|e| classify(e, origin, query.sql))?;
         } else {
             // A write is never cut short: the stream was drained, so the
             // statement completed, and it commits whether or not the
@@ -122,11 +165,12 @@ pub(super) async fn run_query_inner(
             // never success after a rollback.
             tx.commit()
                 .await
-                .map_err(|e| classify_commit(e, query.access, role, query.sql))?;
+                .map_err(|e| classify_commit(e, query.access, origin, query.sql))?;
         }
         let rows_affected = (query.access == Access::ReadWrite).then_some(collected.rows_affected);
         Ok(ExecResult {
             columns,
+            column_types,
             rows: collected.rows,
             truncated: collected.truncated,
             elapsed_ms: started.elapsed().as_millis() as u64,
@@ -148,33 +192,6 @@ fn cancelled_before_budget(err: ExecError, elapsed: Duration, budget_ms: u32) ->
         }
         other => other,
     }
-}
-
-/// Column names for a zero-row read. Without them the caller cannot tell
-/// "your filter matched nothing" from "that table has no such columns"
-/// (#136). Parse/Describe only — the statement does not run again. The
-/// driver can only describe through a named statement; `reset_on_release`
-/// closes it before the connection serves anyone else.
-///
-/// Best-effort on purpose: the read already succeeded, so a failure here
-/// answers no columns, never an error. `None` means `budget` ran out with
-/// the lookup still in flight on the connection.
-async fn describe_columns(
-    tx: &mut Transaction<'_, Postgres>,
-    sql: &str,
-    budget: Duration,
-) -> Option<Vec<String>> {
-    let described = tokio::time::timeout(budget, (&mut **tx).describe(sql))
-        .await
-        .ok()?;
-    Some(match described {
-        Ok(described) => described
-            .columns()
-            .iter()
-            .map(|c| c.name().to_string())
-            .collect(),
-        Err(_) => Vec::new(),
-    })
 }
 
 #[cfg(test)]

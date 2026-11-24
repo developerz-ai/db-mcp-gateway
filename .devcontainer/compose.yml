@@ -1,0 +1,15 @@
+# Dev-container workspace, merged over ../docker-compose.dev.yml (paths are
+# relative to the repo root: the first compose file sets the project dir).
+# `name` matches the project `bin/dev up` creates, so opening the container
+# joins a running dev stack instead of starting a second one on the same ports.
+name: db-mcp-gateway
+
+services:
+  workspace:
+    image: mcr.microsoft.com/devcontainers/rust:2.0.2-bookworm
+    # Host network: the stack publishes on 127.0.0.1 and the tests, .env and
+    # bin/ scripts all address it as localhost.
+    network_mode: host
+    command: ["sleep", "infinity"]
+    volumes:
+      - .:/workspaces/db-mcp-gateway:cached

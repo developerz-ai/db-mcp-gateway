@@ -29,14 +29,15 @@ pub use self::redis::{RedisAdapter, RedisDbIndex};
 pub use adapter::{
     AdapterKind, DEFAULT_STATEMENT_TIMEOUT_MS, DbAdapter, ExecError, ExecResult, MAX_RESULT_BYTES,
 };
-pub use ident::{IDENTIFIER_PATTERN, Identifier, InvalidIdentifier};
+pub use ident::{COLLECTION_PATTERN, IDENTIFIER_PATTERN, Identifier, InvalidIdentifier};
 pub use mongo::MongoAdapter;
 pub use pg::PgAdapter;
 pub use pool_sizing::{
     DEFAULT_POOL_IDLE_TIMEOUT, DEFAULT_POOL_MAX_CONNECTIONS, InvalidPoolSizing, PoolSizing,
 };
 pub use query::{
-    ActivityQuery, ExecQuery, ExplainQuery, SampleQuery, SchemaQuery, TableStatsQuery,
+    ActivityQuery, ExecQuery, ExplainQuery, QueryParam, SampleQuery, SchemaDetail, SchemaQuery,
+    TableStatsQuery,
 };
 pub use registry::AdapterRegistry;
 pub use rejection::{DbRejection, RejectionKind};

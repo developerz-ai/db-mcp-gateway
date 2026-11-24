@@ -10,18 +10,24 @@ use super::super::Identifier;
 use super::super::adapter::{
     DbAdapter, ExecError, ExecResult, TOKIO_TIMEOUT_SLACK_MS, effective_timeout_ms,
 };
-use super::super::query::{ExecQuery, SampleQuery, SchemaQuery};
+use super::super::budget::ResultBudget;
+use super::super::query::{ExecQuery, SampleQuery, SchemaDetail, SchemaQuery};
+use super::super::rejection::RejectionKind;
 use super::super::sql_guard::Access;
 use super::MongoAdapter;
+use super::infer::infer_fields;
+use super::rejector::is_system_collection;
 
 /// Indexes listed per collection. Mongo allows 64; the cap only bounds a
 /// pathological reply.
 const MAX_INDEXES: u32 = 64;
 
 impl MongoAdapter {
-    /// One row per collection: `[database, collection, type, indexes]`. The
-    /// whole listing — one `listCollections` plus one `listIndexes` per
-    /// collection — shares a single time budget.
+    /// One row per collection: `[database, collection, type]`, plus
+    /// `indexes` at `columns` and `full`, plus `sample` (see
+    /// [`infer_fields`]) at `full`. The whole listing — one
+    /// `listCollections`, then per collection one `listIndexes` and the
+    /// sample's `find` — shares a single time budget.
     pub(super) async fn describe(&self, query: SchemaQuery<'_>) -> Result<ExecResult, ExecError> {
         let effective_ms = effective_timeout_ms(query.statement_timeout_ms);
         let budget = Duration::from_millis(u64::from(effective_ms) + TOKIO_TIMEOUT_SLACK_MS);
@@ -40,32 +46,115 @@ impl MongoAdapter {
         let command = json!({ "listCollections": 1, "nameOnly": false, "filter": filter });
         let listed = self.read(&command, query.row_limit, query).await?;
 
+        // Each command is capped on its own; the assembled rows share one
+        // budget too, so many wide collections cannot outgrow a response.
+        let mut budget = ResultBudget::new(query.row_limit);
+        let mut truncated = listed.truncated;
         let mut rows = Vec::with_capacity(listed.rows.len());
         for document in listed.rows.iter().filter_map(|row| row.first()) {
             let name = string_field(document, "name")?;
             let kind = string_field(document, "type")?;
-            let indexes = if kind == "collection" {
-                self.indexes(name, query).await?
-            } else {
-                Value::Array(Vec::new())
+            let Some(row) = self.describe_one(name, kind, query).await? else {
+                continue;
             };
-            rows.push(vec![
-                Value::from(self.database_name.as_str()),
-                Value::from(name),
-                Value::from(kind),
-                indexes,
-            ]);
+            if !budget.admit(&row) {
+                truncated = true;
+                break;
+            }
+            rows.push(row);
         }
         rows.sort_by(|a, b| a[1].as_str().cmp(&b[1].as_str()));
+        let mut columns = vec!["database", "collection", "type"];
+        match query.detail {
+            SchemaDetail::Schemas | SchemaDetail::Names => {}
+            SchemaDetail::Columns => columns.push("indexes"),
+            SchemaDetail::Full => columns.extend(["indexes", "sample"]),
+        }
         Ok(ExecResult {
-            columns: ["database", "collection", "type", "indexes"]
-                .map(String::from)
-                .to_vec(),
+            columns: columns.into_iter().map(String::from).collect(),
+            column_types: Vec::new(),
             rows,
-            truncated: listed.truncated,
+            truncated,
             elapsed_ms: started.elapsed().as_millis() as u64,
             rows_affected: None,
         })
+    }
+
+    /// One collection's row at `query.detail`, or `None` when `query.search`
+    /// matches neither its name nor (at `full`) a sampled field.
+    async fn describe_one(
+        &self,
+        name: &str,
+        kind: &str,
+        query: &SchemaQuery<'_>,
+    ) -> Result<Option<Vec<Value>>, ExecError> {
+        let term = query.search.map(str::to_lowercase);
+        let named = term
+            .as_deref()
+            .is_none_or(|term| name.to_lowercase().contains(term));
+        let mut row = vec![
+            Value::from(self.database_name.as_str()),
+            Value::from(name),
+            Value::from(kind),
+        ];
+        let sample = match query.detail {
+            SchemaDetail::Full if is_system_collection(name) => {
+                Some(withheld_sample("system collection"))
+            }
+            SchemaDetail::Full => Some(self.sample(name, query).await?),
+            _ => None,
+        };
+        let field_named = |sample: &Value| {
+            let fields = sample["fields"].as_array().into_iter().flatten();
+            term.as_deref().is_some_and(|term| {
+                fields
+                    .filter_map(|field| field["name"].as_str())
+                    .any(|field| field.to_lowercase().contains(term))
+            })
+        };
+        if !named && !sample.as_ref().is_some_and(field_named) {
+            return Ok(None);
+        }
+        if matches!(query.detail, SchemaDetail::Columns | SchemaDetail::Full) {
+            row.push(if kind == "collection" {
+                self.indexes(name, query).await?
+            } else {
+                Value::Array(Vec::new())
+            });
+        }
+        row.extend(sample);
+        Ok(Some(row))
+    }
+
+    /// The inferred fields of `collection`'s sample. A collection the role
+    /// may list but not read is still listed, its sample withheld: one
+    /// unreadable collection never sinks the whole listing.
+    async fn sample(&self, collection: &str, query: &SchemaQuery<'_>) -> Result<Value, ExecError> {
+        match self.sample_documents(collection, query).await {
+            Ok(documents) => Ok(infer_fields(&documents)),
+            Err(ExecError::Rejected(rejection))
+                if rejection.kind() == RejectionKind::PermissionDenied =>
+            {
+                Ok(withheld_sample("not readable by the database role"))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Up to `query.sample_limit` documents of `collection`, through
+    /// `execute` like any `find` the caller could run.
+    async fn sample_documents(
+        &self,
+        collection: &str,
+        query: &SchemaQuery<'_>,
+    ) -> Result<Vec<Value>, ExecError> {
+        let command = json!({ "find": collection, "filter": {} });
+        let found = self.read(&command, query.sample_limit, query).await?;
+        Ok(found
+            .rows
+            .into_iter()
+            .filter_map(|row| row.into_iter().next())
+            .collect())
     }
 
     /// `[{name, key, unique}]` for one collection.
@@ -124,6 +213,12 @@ impl MongoAdapter {
         })
         .await
     }
+}
+
+/// The `sample` of a collection that is not read: a `system.*` one (server
+/// state, not application data — see the rejector), or one the role cannot.
+fn withheld_sample(why: &str) -> Value {
+    json!({ "sampled": 0, "fields": [], "truncated": false, "withheld": why })
 }
 
 /// The `find` a sample runs. `sample_table` stores it as the audit row's

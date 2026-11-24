@@ -23,15 +23,15 @@ Self-hosted MCP gateway. AI agents get audited, SSO-gated, read-only DB access. 
 
 | Concern | Choice |
 |---|---|
-| Lang | Rust 2024 — toolchain channel `1.96.0` (`rust-toolchain.toml`: rustfmt + clippy), MSRV `1.88` (`Cargo.toml`); deps pinned to latest stable at implementation time |
+| Lang | Rust 2024 — toolchain channel `1.96.0` (`rust-toolchain.toml`: rustfmt + clippy), MSRV `1.94.1` (`Cargo.toml`); deps pinned to latest stable at implementation time |
 | Runtime / HTTP | tokio; axum (+ axum-server, rustls) |
-| DB driver | sqlx 0.8 — Postgres + MySQL (YugabyteDB YSQL rides the Postgres path, CI-tested); mongodb 3.7 for the Mongo target; redis 1.8 for the Redis/Dragonfly target |
+| DB driver | sqlx 0.9 (`=0.9.1`; 0.9.0 clobbers the unnamed statement) — Postgres + MySQL (YugabyteDB YSQL rides the Postgres path, CI-tested); mongodb 3.10 for the Mongo target; redis 1.8 for the Redis/Dragonfly target |
 | MCP | hand-rolled JSON-RPC over Streamable HTTP (POST; `GET /mcp` → 405) → swap for SDK when one stabilizes |
 | Config | serde + serde-saphyr (not serde_yaml), validated at boot |
 | State store | Postgres (co-deployed): sessions, audit log, denylist. Permissions store `pg` (`src/state/permissions/pg.rs`) or `mysql` (`src/state/permissions/mysql/`) |
 | Error tracking | GlitchTip (Sentry protocol), credential-scrubbed by `src/sentry_scrub/` |
 | Metrics | `metrics` + Prometheus exporter on `/metrics` |
-| Distribution | `ghcr.io/developerz-ai/db-mcp-gateway` **and** `registry.digitalocean.com/developerz-ai/db-mcp-gateway` — `.github/workflows/ci.yml` (`build` + `merge`) pushes per-arch images and the multi-arch manifest to both registries on pushes to `main`; `.github/workflows/release.yml` re-tags that tested `sha-<7>` manifest on a `v*` tag (full build only as fallback) with semver + `:latest` and cuts the GitHub release |
+| Distribution | `ghcr.io/developerz-ai/db-mcp-gateway` **and** `registry.digitalocean.com/developerz-ai/db-mcp-gateway`: `ci.yml` pushes `sha-<7>` + `main` on every `main` push; `release.yml` re-tags that tested manifest on a `v*` tag with semver + `:latest` |
 
 ## Commands
 
@@ -45,16 +45,27 @@ Self-hosted MCP gateway. AI agents get audited, SSO-gated, read-only DB access. 
 | ysqlsh — target YugabyteDB (compose profile `yugabyte`) | `bin/dev ysqlsh` |
 | Full test (unit + integration; cargo-nextest when installed, else `cargo test`) | `bin/test` |
 | Postgres query-path suite against YugabyteDB (starts `state-db` + `target-yugabyte`, nextest profile `yugabyte`) | `bin/test-yugabyte` |
-| Single test by pattern | `bin/test --test <binary> <module>::` (e.g. `bin/test --test it_db run_query_e2e::`) or `cargo test <pattern>` |
-| Format | `bin/fmt` |
-| Lint (fmt-check + clippy -D warnings) | `bin/lint` |
+| Single test by pattern (several filters OK, no `--` needed) | `bin/test --test <binary> <module>::` (e.g. `bin/test --test it_db run_query_e2e:: explain_e2e::`) |
+| Format / only your changed `.rs` files (vs `origin/main` + untracked) | `bin/fmt` / `bin/fmt --changed` |
+| Lint (fmt-check + clippy -D warnings) / fast lib + bins pass | `bin/lint` / `bin/lint --lib` |
+| Check your files against HEAD while the shared tree is mid-edit (own target dir; `-- <cmd>` overrides clippy + unit tests) | `bin/snapshot-check <files…> [-- cargo test --test it_offline <filter>]` |
+| Regenerate nextest's run-alone list after adding/removing `#[serial_test::serial(world)]` | `bin/regen-serial` |
+| Validate `deploy/` (promtool, helm lint, kubeconform; Docker only) | `bin/check-deploy` |
 | Reproduce CI locally / one-command check (2 build jobs by default; `CARGO_BUILD_JOBS=$(nproc) bin/check` on a dedicated box) | `bin/ci` / `bin/check` |
 | Assert scrubber regex features in the shipping graph | `bin/check-scrub-features` |
+| Scan the git index for service tokens (contents, file names, symlink targets; CI and the pre-commit hook run it) | `bin/secret-scan` (`--staged` for the index only) |
 | Mint a static service bearer token | `bin/mint-service-token <name>` |
-| Run the binary (after `bin/dev up`; `config/example.yaml` is a reference — its `vault:` refs abort boot) | write the minimal `config.yml` from `website/docs/deployment/quickstart.md#run-it-locally`, then `TLS_DISABLED=true OIDC_ISSUER=http://localhost:5556 OIDC_CLIENT_ID=dev ALLOW_INSECURE_SIGNING_KEY=true TARGET_DB_PASSWORD=app-dev-only cargo run -- --config config.yml` |
+| Run the gateway from source (dev stack + committed `config/dev.yaml`; `--idp` adds Dex) | `bin/run` |
+| Seed the demo `shop` DB on the dev target | `bin/seed` |
+| One MCP tool call as the dev service token | `bin/mcp-call <tool> '<json>'` (`--list` for tools) |
+| Unit loop, no Docker | `bin/test --unit` |
+| One-command demo (Docker only, no Rust) | `cd examples/demo && docker compose up -d` |
+| Enable git hooks (pre-commit fmt + scans; pre-push clippy + unit) | `bin/setup --hooks` |
 | Build release image locally | `docker build -t db-mcp-gateway:dev .` |
 
-Secrets and local config: copy `.env.example` → `.env`. `.env` is gitignored.
+Secrets and local config: copy `.env.example` → `.env`. `.env` is gitignored; shell env beats `.env`.
+
+**Concurrency.** Many agents share one box. Build and test only through the `bin/` wrappers (`bin/test`, `bin/test-yugabyte`, `bin/lint`, `bin/check`, `bin/ci`): they queue on `.git/dbmcp-heavy.lock` (plus `.git/dbmcp-db.lock` for the shared dev DBs), print `queued: waiting for …`, and run under `heavy` when it is on `PATH`. Never raw `cargo test` against the DB suites. Never `bin/dev up`/`down` or `docker compose up` the dev stack while others use it — `up` under different env recreates containers. Stop `target-yugabyte` only with a 120 s grace (`docker stop -t 120`; compose uses its `stop_grace_period`) — a SIGKILL wedges its tablets. To verify your own files while others' edits break the build, `bin/snapshot-check` (HEAD + your files, separate target dir, `--slot` to run beside another agent). `DBMCP_NO_QUEUE=1` opts out.
 
 ## Layers
 
@@ -77,7 +88,7 @@ The bar: idiomatic, boring, readable Rust. No spaghetti, no premature abstractio
 
 | Rule | Meaning |
 |---|---|
-| Typed errors | `thiserror` for domain; `anyhow` only at the `src/main.rs` boundary. Every client error has a stable code (see `website/docs/initial-idea/03-mcp-tools.md`). |
+| Typed errors | `thiserror` for domain; `anyhow` only at the boot boundary (`src/main.rs`, `src/startup/`, `src/cli/`): those errors print on exit and never reach a client. Every client error has a stable code (see `website/docs/initial-idea/03-mcp-tools.md`). |
 | No panics | No `unwrap`/`expect` outside `src/main.rs` and tests — a panic in a hot path crashes every user. Propagate with `?`; branch with `match`/`if let`/`let ... else`. |
 | Newtypes | Newtype over bare primitives when a value has meaning (`RequestId(String)`, not `String`). Make illegal states unrepresentable — `enum` over contradictory `bool`+`Option`. Validate input into a type once at the edge; don't re-validate downstream. |
 | Derive | Derive, don't hand-roll (`Debug`, `Clone`, serde). Every public type derives `Debug` at minimum. Keep the `pub` surface minimal. |
@@ -88,16 +99,9 @@ The bar: idiomatic, boring, readable Rust. No spaghetti, no premature abstractio
 | Per-DB pools | Sized by config (`pool:` on server/database). Lazy (min 0, idle 5 min), replaced on credential rejection or reload. Two pools per `(server, database)` when `write_role` is set (read tier runs as `role` in a read-only transaction, write tier as `write_role`). Never one global pool. Never share a pool across `(server, database)`. |
 | Async end-to-end | No `std::sync::Mutex` on the request path — use `tokio::sync`. No `block_on`, no blocking I/O in async fns (offload with `spawn_blocking`). Never hold a `std::sync` guard across `.await`. A slow query on DB A must never block DB B. One noisy user must not starve others. |
 | Cancellation safety | Agent disconnect → tokio task dropped → `pg_cancel_backend` → audit row `outcome: cancelled`. Test it; easy to write code that holds the conn until the query finishes anyway. |
-| Size | Files ≤300 LOC. Split by responsibility. No backwards-compat shims pre-v1. |
+| Size | Files under `src/` ≤300 LOC — split by responsibility. `tests/` and `benchmarks/` are exempt (one file per scenario reads better); keep each test fn focused. No backwards-compat shims pre-v1. |
 | Comments | Comment the non-obvious *why*, never the *what*. Rename until code doesn't need the *what*. `///` on public items whose contract isn't obvious from the signature. Architecture decisions go in `website/docs/initial-idea/`, not code comments. |
-| Dependency graph | `Cargo.lock` is what ships, not what compiles. Read §Dependency graph before changing a feature set or re-resolving the lock. |
-
-### Dependency graph
-
-- **An optional dependency enters `Cargo.lock` as soon as an enabled feature references it — even weakly (`dep?/feat`).** sqlx's `migrate`/`json`/`chrono`/`uuid` features each reference `sqlx-sqlite?/…`, so the SQLite driver landed in the lock with `libsqlite3-sys` 0.30.1 (RUSTSEC-2026-0459) while never being compiled: `cargo tree -i libsqlite3-sys` was empty before the fix, only the lock entry was vulnerable. `cargo audit` reads the lock, so it flags crates this project never builds.
-- **`third_party/sqlx-sqlite-noop` stands in for that driver** — a no-op crate named `sqlx-sqlite`, patched in via `[patch.crates-io]` in the root `Cargo.toml` and declared as a workspace member, because `cargo chef` restores only workspace members into the Docker builder stage. Bump its version in lockstep with sqlx: a version that no longer satisfies sqlx's requirement makes cargo warn `patch not used`, the real driver returns to the lock, and the advisory returns with it. The root manifest pins `sqlx = "=0.8.6"` exactly for that reason — `cargo update` cannot move sqlx off the version the stub satisfies, so the two are bumped together in one commit, never apart.
-- **The repo is a two-crate workspace** — the root package plus that stub — but the stub is a workspace member, **not** a default member. With a root package present and no `default-members`, Cargo's default members are the root package alone (Cargo Book, §"The default-members field": "When unspecified, the root package will be used"), so a plain `cargo build` from the root never compiles the stub. Only a workspace-wide package selection (`cargo build --workspace`, or its `--all` alias) builds it, and no gate passes either — `bin/lint`, `bin/ci` and `ci.yml` all run root-package-only commands (`cargo clippy --all-targets --all-features`, `cargo test --all-targets --all-features`; `--all-targets`/`--all-features` select targets and features, not workspace members). `bin/lint`'s `cargo fmt --all` formats the stub but never compiles it. The stub's whole job is to exist: in the lock, and in the Docker builder stage, where `cargo chef` restores it.
-- **Re-resolve narrowly.** `cargo update -p sqlx --precise 0.8.6` is not the narrowest way to re-resolve here — it collapses windows-sys 0.48.0/0.59.0 into 0.61.2, whereas a plain re-resolve (`cargo metadata`) produced a lock diff with zero version changes to unrelated crates.
+| Dependency graph | `Cargo.lock` is what ships, not what compiles. Read [`third_party/CLAUDE.md`](third_party/CLAUDE.md) before changing a feature set or re-resolving the lock. |
 
 ## Testing
 
@@ -110,26 +114,7 @@ The bar: idiomatic, boring, readable Rust. No spaghetti, no premature abstractio
 
 ## CI
 
-GitHub Actions on GitHub-hosted runners — `ubuntu-latest` default (`ubuntu-24.04-arm` for arm64). `test` runs against `docker-compose.dev.yml` (state + target Postgres, MySQL, Mongo, Redis, Dragonfly) — the stack `bin/test` uses locally — started in the background so its boot overlaps the compile. Rust jobs install the toolchain `rust-toolchain.toml` pins with the runner's `rustup` (no `dtolnay/rust-toolchain`); jobs with a rust-cache uninstall the runner's `stable`, because rust-cache keys on every installed toolchain. Workflows in `.github/workflows/`; `bin/ci` reproduces them locally.
-
-| Job | Does |
-|---|---|
-| `fmt` | `cargo fmt --check`; every action pinned to a 40-hex SHA |
-| `changes` | path filter: docs-only PRs (`website/**`, `docs/**`, `.claude/**`, `*.md` — never `.dz/**`, which `tests/brief_rows.rs` reads) skip `clippy`/`test` via per-job `if:` (a skipped required job reads as passed; the skip needs an explicit `code=false`, so a failed `changes` runs them) |
-| `clippy` | `clippy -D warnings` (all-targets + release cfg, `--profile ci`) + `bin/check-scrub-features` |
-| `test` | `cargo nextest run --profile ci --cargo-profile ci --all-targets --all-features` (`--no-run` first, then after the dev stack is healthy); JUnit uploaded (`.config/nextest.toml`) |
-| `yugabyte` | `bin/test-yugabyte` against `yugabytedb/yugabyte:2.25.2.0-b359` (the version a production deployment runs; compose profile `yugabyte`, YSQL on 5435); the Postgres query-path `it_db` modules minus the NOTIFY tests YB ignores (excluded with reasons in `.config/nextest.toml`) |
-| `audit` | `cargo audit --ignore RUSTSEC-2023-0071` |
-| `secret-scan` | advisory — `git grep -nE` over every tracked file for `dbmcp_svc_[0-9a-f]{64}`; exempt paths: `tests/**`, `website/**`, `config/example.yaml`, `.github/**`, `src/config/yaml/**` |
-| `public-tree` | `cargo test --test public_tree` on every PR, docs-only included (no `changes` gate): no internal host, private repo, private CI provider, setup-mode name or home path in any tracked file |
-| `scripts` | the gate's own regression scripts (`tests/bin/*.test.sh`; `secret-scan` runs the fifth) |
-| `weekly` (`weekly.yml`) | Mondays: `cargo audit` on `main` + `cargo update --dry-run` report |
-| `build` + `merge` | on `main`: per-arch image → multi-arch manifest, pushed to GHCR **and** DOCR. `build` starts with the quality jobs; `merge` (which writes `sha-<7>` + `main`) needs `build`, `fmt`, `clippy`, `test`, `yugabyte`, `audit`, `secret-scan`, `public-tree` and `scripts` — the publish gate. `tests/` is out of the Docker context (`.dockerignore`), so adding a test no longer busts the cargo-chef dependency layer |
-| `release` (`release.yml`) | on `v*`: `preflight` → `reuse` waits for `ci.yml`'s push run on the tagged commit and, when green, `merge` re-tags its `sha-<7>` manifest (per-arch digests = the tested ones; the index digest differs only by the release annotations; release version/revision/source as index annotations); red CI blocks the release; no CI run (or a missing image) falls back to the per-arch `build` with a warning. The fallback reads `main`'s gha layer cache but never writes one (a tag-scoped cache is unreadable by any later run) |
-| `workflow-lint` (`workflow-lint.yml`) | advisory — actionlint (pinned image digest) + the hook tests (`python3 -I .claude/hooks/test_hooks.py`) + the release reuse-decision test (`python3 -I .github/scripts/test_release_reuse_decision.py`) on PRs and `main` pushes touching `.github/workflows/**`, `.github/scripts/**` or `.claude/hooks/**` |
-| `release-smoke` (`release-smoke.yml`) | advisory, post-publish — after each successful `release`, Tuesdays on the Latest release, and by hand: pulls the published GHCR image per arch (amd64 + arm64), checks its platform and that `--version` reports the tag, and on the scheduled run that `:latest` is the Latest release |
-
-Every workflow declares a `concurrency` group, and every job sets `timeout-minutes` (~2× measured p95: clippy 15, test 20, small jobs 5, CI image build 30; the release per-arch build gets 60 to cover a cold compile). Each Rust job keeps its own `Swatinem/rust-cache` key — never a shared key: it made `test` restore clippy's check-only artifacts and rebuild the graph. `ci.yml` cancels superseded **PR** runs only — pushes to `main` get a per-SHA concurrency group and never cancel (a shared group would still drop a *pending* run when a third merge queues), because the Image Updater pins the short SHA, so cancelling the first of two closely-landed merges would leave that commit with no image at its tag (`main` is a moving convenience tag). `release.yml`, `pages.yml` (a half-applied Pages deploy), `weekly.yml` and `release-smoke.yml` are hard `cancel-in-progress: false`. Workflow rules for editing `.github/`: [`.github/CLAUDE.md`](.github/CLAUDE.md); Claude Code hooks: [`.claude/README.md`](.claude/README.md). Public repo, so GitHub-hosted runners only.
+GitHub Actions, GitHub-hosted runners only (public repo); `bin/ci` reproduces it locally. Job table, caches and the rules for editing workflows: [`.github/CLAUDE.md`](.github/CLAUDE.md). Claude Code hooks: [`.claude/README.md`](.claude/README.md).
 
 ## Security review required
 
@@ -153,7 +138,7 @@ src/
   audit/            # writer, pruner, archive, sinks
   state/            # state DB queries, permissions store (pg.rs, permissions/mysql/); no central errors.rs — each layer owns its typed error
 migrations/         # state-DB schema (sqlx, Postgres); migrations-mysql/ = MySQL permissions store
-tests/              # integration tests, one binary per group dir: it_db/ (real DBs, never a mocked target DB), it_offline/, it_global/ (process-global installs); public_tree.rs, brief_rows.rs standalone
+tests/              # integration tests, one binary per group dir: it_db/ (real DBs, never a mocked target DB), it_offline/, it_global/ (process-global installs); brief_rows.rs, doc_drift.rs standalone
 benchmarks/         # load harness (feature-gated, never shipped)
 config/             # example.yaml (commented), permissions.yml (deployable)
 docs/               # internal notes (security QA)
@@ -170,7 +155,7 @@ docker-compose.dev.yml
 | Add an admin web UI for permissions. | Permissions change by reviewed YAML or the audited admin API only (MUST #5). |
 | Mock the target DB in query-path tests. | A mock cannot prove timeouts, row caps or cancellation. |
 | Skip the audit write for performance. | Audit is synchronous; a failed audit write fails the request (MUST #4). |
-| Add a "service account" auth path without a permissions group + audit identity. | The shipped path is `service_accounts:` (spec 14, `src/auth/service_token.rs`): a static `dbmcp_svc_` bearer mapped to exactly one `permissions:` group, audited as `service:<name>`, boot-gated off the admin group, with no in-band mint/revoke. A boot-validated service identity is the one explicit exception to the per-call SSO-verification rule (rule 2): its identity is fixed in YAML at boot, so the audit row attributes the dispatch to `service:<name>` with no fresh IdP round-trip. Upstream headers (`x-dbmcp-run-id`, `x-dbmcp-on-behalf-of`) are claimed and stored for attribution only — never authz. The exception preserves four properties — the audit contract (synchronous write, `service:<name>` identity, `user_email` synthesized), the YAML-only configuration contract (no in-band grant edits), the single non-admin permissions group, and the no-in-band-mint/revoke rule. Any future service-auth mechanism must carry the same four and land with a spec update; spec 14 and the auth/audit tests enforce them. |
+| Add a "service account" auth path without a permissions group + audit identity. | The shipped path is `service_accounts:` (spec 14): a static `dbmcp_svc_` bearer mapped to exactly one non-admin `permissions:` group, audited as `service:<name>`, YAML-only, no in-band mint/revoke — the one boot-validated exception to rule 2. Upstream headers (`x-dbmcp-run-id`, `x-dbmcp-on-behalf-of`) are attribution only, never authz. Any new service-auth mechanism keeps those four properties and lands with a spec 14 update. |
 | Promote a request from one user's session to another. | The session identity is the audit subject (MUST #2). |
 | Run as DB superuser. Per-DB read-only roles, full stop. | The per-DB role is the blast radius. |
 | Serve a write path without an explicit per-grant opt-in **and** a target-DB role holding write privileges. | Read-only by default; the gateway will NOT provision write grants (MUST #3). |

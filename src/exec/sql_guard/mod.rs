@@ -57,6 +57,7 @@ mod tests;
 use sqlparser::ast::{Statement, UtilityOption, Visit};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
+use sqlparser::tokenizer::Location;
 use std::ops::ControlFlow;
 
 use lexical::check_lexical;
@@ -73,10 +74,39 @@ pub enum Access {
     ReadWrite,
 }
 
+/// Where in the statement the parser gave up: 1-based line and column, as
+/// sqlparser reports them. Coordinates only — the parser's message, which
+/// quotes the statement, is never kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct SqlLocation {
+    pub line: u64,
+    pub column: u64,
+}
+
+impl SqlLocation {
+    /// From sqlparser's location; line `0` marks an empty span, no place.
+    fn of(location: Location) -> Option<Self> {
+        (location.line > 0).then_some(Self {
+            line: location.line,
+            column: location.column,
+        })
+    }
+
+    /// The ` at Line: L, Column: C` suffix sqlparser ends a message with.
+    fn from_message(message: &str) -> Option<Self> {
+        let (_, at) = message.rsplit_once(" at Line: ")?;
+        let (line, column) = at.split_once(", Column: ")?;
+        Self::of(Location::new(line.parse().ok()?, column.parse().ok()?))
+    }
+}
+
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum GuardError {
-    #[error("could not parse SQL")]
-    Parse,
+    #[error(
+        "could not parse SQL{}",
+        .0.map(|at| format!(" at line {}, column {}", at.line, at.column)).unwrap_or_default()
+    )]
+    Parse(Option<SqlLocation>),
     #[error("multiple statements are not allowed (got {0})")]
     MultiStatement(usize),
     #[error(
@@ -102,6 +132,16 @@ pub enum GuardError {
     /// Stable error code: `GUARD_DENIED_FUNCTION`.
     #[error("function `{0}` is not allowed (high-privilege server-side function)")]
     DeniedFunction(&'static str),
+}
+
+impl GuardError {
+    /// Where an unparseable statement stopped parsing, when the parser said.
+    pub fn location(&self) -> Option<SqlLocation> {
+        match self {
+            Self::Parse(at) => *at,
+            _ => None,
+        }
+    }
 }
 
 /// Read-only guard — the `query_read` default. Equivalent to
@@ -153,13 +193,14 @@ fn guard(sql: &str, access: Access) -> Result<Access, GuardError> {
     check_lexical(sql)?;
     let dialect = PostgreSqlDialect {};
     let statements = Parser::parse_sql(&dialect, sql).map_err(|e| match e {
-        ParserError::ParserError(_)
-        | ParserError::TokenizerError(_)
-        | ParserError::RecursionLimitExceeded => GuardError::Parse,
+        ParserError::ParserError(message) | ParserError::TokenizerError(message) => {
+            GuardError::Parse(SqlLocation::from_message(&message))
+        }
+        ParserError::RecursionLimitExceeded => GuardError::Parse(None),
     })?;
 
     match statements.len() {
-        0 => return Err(GuardError::Parse),
+        0 => return Err(GuardError::Parse(None)),
         1 => {}
         n => return Err(GuardError::MultiStatement(n)),
     }
@@ -187,6 +228,41 @@ fn guard(sql: &str, access: Access) -> Result<Access, GuardError> {
         ControlFlow::Continue(()) => Ok(required_access(stmt)),
         ControlFlow::Break(e) => Err(e),
     }
+}
+
+/// `sql` from its first token to the end of its last, leading and
+/// terminating `;`s dropped: the text that nests as a subquery. Read off
+/// Postgres's own token boundaries, so a comment after the `;` (`… ; --
+/// note`) cannot hide it, and a `;` inside a string or comment is never
+/// taken for it. `None` when the text does not scan (the guard has then
+/// refused it already) or holds no statement.
+pub(crate) fn statement_body(sql: &str) -> Option<&str> {
+    let lexemes = pg_scan::scan(sql).ok()?;
+    // Lexemes that are nothing but `;` are skipped at both ends, and the
+    // `;`s at the edge of the first and last that are not (adjacent symbols
+    // merge, as in `);` or `;(`).
+    let text = |lexeme: &pg_scan::Lexeme| &sql[lexeme.start..lexeme.end];
+    let is_symbols = |lexeme: &pg_scan::Lexeme| matches!(lexeme.kind, pg_scan::Kind::Symbols);
+    let trimmed = |lexeme: &pg_scan::Lexeme| {
+        if is_symbols(lexeme) {
+            text(lexeme).trim_matches(';').len()
+        } else {
+            lexeme.end - lexeme.start
+        }
+    };
+    let first = lexemes.iter().find(|lexeme| trimmed(lexeme) > 0)?;
+    let last = lexemes.iter().rev().find(|lexeme| trimmed(lexeme) > 0)?;
+    let start = if is_symbols(first) {
+        first.end - text(first).trim_start_matches(';').len()
+    } else {
+        first.start
+    };
+    let end = if is_symbols(last) {
+        last.start + text(last).trim_end_matches(';').len()
+    } else {
+        last.end
+    };
+    sql.get(start..end)
 }
 
 /// Only a `Query` reads; every other admitted shape is a data write.

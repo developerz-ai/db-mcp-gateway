@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Cache warm run: every Rust cache key carries the ISO week, so the week's
+  # first entry is written here, before Dependabot's Monday 06:00 UTC PRs
+  # (dependabot.yml) restore it. Scheduled runs use the default branch, so the
+  # entries they save are readable by every PR.
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
 
 concurrency:
   # PRs: one group per ref, superseded runs cancelled. Pushes to main: one
@@ -22,46 +29,111 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Docs-only PRs skip the Rust jobs. The skip is per job, not a workflow-level
-  # `paths-ignore`: `clippy` and `test` are required checks, and a workflow that
-  # never starts leaves them pending forever, while a job skipped by `if:`
-  # reports as passed. So the skip needs an explicit `code=false`: if
-  # `changes` itself fails, its output is empty and the Rust jobs run. Pushes to `main` always run everything — `merge` needs
-  # them. Docs guards (pages.yml) run on their own path filter.
+  # Path filters for the jobs that may skip. The skip is per job, not a
+  # workflow-level `paths-ignore`: a workflow that never starts leaves its
+  # checks pending forever. Each filtered job needs an explicit `false` from
+  # here, so a failed `changes` (empty outputs) runs them all, and `gate` reads
+  # a skip as passed only when `changes` succeeded and ordered it.
   #
-  # Docs = `website/`, `docs/`, `.claude/` (agent config; its hooks are tested
-  # by workflow-lint.yml) and `*.md` — except under `.dz/`: tests/brief_rows.rs
-  # reads `.dz/briefs/health.md`, so a `.dz/` change always runs `test`.
-  # public-tree scans every tracked file and runs regardless.
+  #   code     the PR or push touches more than docs. Docs = `website/`,
+  #            `docs/`, `.claude/` (its hooks are tested by workflow-lint.yml)
+  #            and `*.md`, except under `.dz/` (tests/brief_rows.rs reads it).
+  #            PRs only: a `main` push always runs the Rust jobs, because
+  #            `build` publishes this commit's image and the previous commit's
+  #            run may have failed (nothing here proves it passed).
+  #   deps     the lock, a manifest or the audit config changed: `audit`
+  #            blocks only then (owner decision H8); audit.yml audits `main`
+  #            daily for advisories published without a commit here.
+  #   image    what the Dockerfile builds changed (PRs only; main builds the
+  #            image itself).
+  #   msrv     a manifest, the lock, build.rs or shipped Rust source changed.
+  #   website  the docs site's sources changed (PRs only; pages.yml builds and
+  #            deploys on main).
+  #   deploy   the manifests under `deploy/`, the metric catalogue their rules
+  #            and dashboard name, or the job's own script changed; every
+  #            `main` push runs it.
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       code: ${{ steps.diff.outputs.code }}
+      deps: ${{ steps.diff.outputs.deps }}
+      image: ${{ steps.diff.outputs.image }}
+      msrv: ${{ steps.diff.outputs.msrv }}
+      website: ${{ steps.diff.outputs.website }}
+      deploy: ${{ steps.diff.outputs.deploy }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # A PR checkout is the merge commit; its first parent is the base tip,
-          # so HEAD^1..HEAD is exactly what the PR changes.
+          # A PR checkout is the merge commit, whose first parent is the base
+          # tip, so HEAD^1..HEAD is exactly what the PR changes. A push diffs
+          # from `github.event.before`, fetched below: one push may carry
+          # several commits.
           fetch-depth: 2
       - id: diff
+        env:
+          BEFORE: ${{ github.event.before }}
         run: |
-          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
+          # Raw NUL-delimited paths (`-z`, `grep -z`): Git's display output
+          # quotes a non-ASCII or newline-bearing name ("website/\303…"),
+          # which no prefix rule below would match. Read from a file, never
+          # piped: grep's early exit cannot SIGPIPE a writer into a miss.
+          changed=$RUNNER_TEMP/changed
+          matches() { grep -qzE "$1" "$changed"; }
+          everything() {
+            printf '%s\n' code=true deps=true image=true msrv=true website=true deploy=true >> "$GITHUB_OUTPUT"
             exit 0
+          }
+          case "$GITHUB_EVENT_NAME" in
+            pull_request|push) ;;
+            *)
+              # Scheduled warm run / manual dispatch: the Rust jobs and audit.
+              printf '%s\n' code=true deps=true image=false msrv=false website=false deploy=false >> "$GITHUB_OUTPUT"
+              exit 0 ;;
+          esac
+          # The base: HEAD^1 on a PR; on a push, the ref's previous tip. A new
+          # branch (all-zero `before`) or a `before` that no longer resolves
+          # (force-push) reads as "everything changed".
+          base=HEAD^1
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            if [ -z "$BEFORE" ] || [ -z "${BEFORE//0/}" ] \
+                || ! git fetch --quiet --no-tags --depth=1 origin "$BEFORE"; then
+              everything
+            fi
+            base=$BEFORE
           fi
           # --no-renames: a rename would list only its destination, so moving a
           # source file to a docs path would read as docs-only.
-          changed=$(git diff --name-only --no-renames HEAD^1 HEAD)
-          code=false
-          if printf '%s\n' "$changed" | grep -qE '^\.dz/' \
-            || printf '%s\n' "$changed" \
-              | grep -vE '^(website/|docs/|\.claude/)|\.md$' | grep -q .; then
-            code=true
+          git diff --name-only -z --no-renames "$base" HEAD > "$changed" || everything
+          code=true deps=false image=false msrv=false website=false deploy=true
+          # Docs-only skips on a PR alone (see `code` above). An empty diff is
+          # not docs-only: it runs everything.
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] && [ -s "$changed" ] \
+              && ! matches '^\.dz/' && ! grep -qvzE '^(website/|docs/|\.claude/)|\.md$' "$changed"; then
+            code=false
           fi
-          echo "code=$code" >> "$GITHUB_OUTPUT"
-          echo "code-affecting changes: $code"
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            if matches '^(Dockerfile|\.dockerignore|Cargo\.(toml|lock)|rust-toolchain\.toml|src/|migrations/|migrations-mysql/|third_party/|config/example\.yaml$)'; then
+              image=true
+            fi
+            if matches '^(website/|README\.md$)'; then
+              website=true
+            fi
+            if ! matches '^(deploy/|src/startup/metrics/catalogue\.rs$|bin/check-deploy$|\.github/workflows/ci\.yml$)'; then
+              deploy=false
+            fi
+          fi
+          if matches '^(Cargo\.(toml|lock)|third_party/.*Cargo\.toml|\.cargo/|(audit|deny)\.toml$|\.github/workflows/(ci|audit)\.yml$)'; then
+            deps=true
+          fi
+          # Shipped Rust source too: a new std API compiles on the pinned
+          # toolchain and only the MSRV build catches it.
+          if matches '^(Cargo\.(toml|lock)$|build\.rs$|src/|third_party/)'; then
+            msrv=true
+          fi
+          printf '%s\n' "code=$code" "deps=$deps" "image=$image" "msrv=$msrv" "website=$website" "deploy=$deploy" \
+            | tee -a "$GITHUB_OUTPUT"
 
   fmt:
     # GitHub-hosted runner: this repository is public.
@@ -102,11 +174,19 @@ jobs:
             exit 1
           fi
 
-  # Rust cache: the default rust-cache key is job id + rustc version +
-  # Cargo.lock/Cargo.toml hashes, so clippy (check artifacts) and test (full
-  # builds) each restore their own warm dependency cache. Saved from `main`
-  # only. A shared key made both jobs race to save one entry, and the loser
-  # restored the other job's artifacts — a cold build in disguise.
+  # Rust cache. Every key carries the ISO week (`%G-W%V`): on a prefix hit (a
+  # PR whose lock differs from every saved entry) rust-cache restores the
+  # newest entry and then deletes artifacts older than seven days
+  # (cleanTargetDir's timestamp check), so an entry from an older week came
+  # back nearly empty and dependency PRs compiled cold. A weekly key keeps
+  # every restorable entry younger than the week; the Monday warm run (`on:
+  # schedule`) writes it first. Saved from `main` only (pushes and the warm
+  # run).
+  #
+  # `clippy` keeps its own key (check artifacts); `test` and `yugabyte` share
+  # `ci-<week>` (yugabyte's graph is a subset of test's) and only `test` saves
+  # it — two savers raced for one entry and the loser restored the other's
+  # artifacts.
   #
   # No `cargo clean -p db-mcp-gateway`: restored local-crate artifacts can't go
   # stale (rust-cache drops workspace crates before saving, and checkout mtimes
@@ -132,16 +212,24 @@ jobs:
           if rustup toolchain list | grep -q '^stable'; then
             rustup toolchain uninstall stable
           fi
+      - id: week
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@f4371d1ec7179bfbd04a82a81e3b3af7f720750f # v2
         with:
+          key: ${{ steps.week.outputs.week }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --profile ci --all-targets --all-features -- -D warnings
       # --all-targets enables cfg(test), which makes imports used only by
-      # #[cfg(any(test, debug_assertions))] helpers look live. The release
-      # configuration compiles those helpers out, so the same code emitted
-      # unused-import warnings that only ever surfaced in a `docker build`.
-      # Lint the shipping configuration too.
-      - run: cargo clippy --release --all-features -- -D warnings
+      # #[cfg(any(test, debug_assertions))] helpers look live, and the `ci`
+      # profile has debug assertions on. The shipping configuration has
+      # neither, so the same code emitted unused-import warnings that only
+      # surfaced in a `docker build`. Lint lib + bins once more with debug
+      # assertions off. The flag goes after `--`: cargo hands those args to
+      # clippy-driver for workspace crates only, so the dependency graph
+      # checked above is reused as-is (one graph; `--release` built a second).
+      # The integration tests use those helpers, so the profile itself cannot
+      # turn debug assertions off.
+      - run: cargo clippy --profile ci --all-features -- -D warnings -C debug-assertions=off
       # The credential scrubber compiles its regexes at runtime, so a `regex`
       # feature missing from the *shipping* graph passes fmt, clippy and
       # `cargo test` and only surfaces in production. It did: `unicode-case`
@@ -153,6 +241,9 @@ jobs:
     needs: [changes]
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # the cache lookup in `week`
     # ~2x the measured p95 (cold, Cargo.lock-changing run: 471 s).
     timeout-minutes: 20
     # The dev stack (docker-compose.dev.yml) instead of `services:`. Service
@@ -180,8 +271,27 @@ jobs:
           if rustup toolchain list | grep -q '^stable'; then
             rustup toolchain uninstall stable
           fi
+      # ISO-week rollover: until this week's entry exists (`main`'s `test` or the
+      # Monday warm run writes it), restore last week's — an exact-key hit, so
+      # nothing is pruned — instead of compiling cold. `main` itself keys on
+      # the current week: its save is what creates the entry.
+      - id: week
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FALLBACK: ${{ github.ref != 'refs/heads/main' }}
+        run: |
+          week=$(date -u +%G-W%V)
+          if [ "$FALLBACK" = true ]; then
+            if ! found=$(gh api "repos/$GITHUB_REPOSITORY/actions/caches?key=v0-rust-ci-$week-&per_page=1" --jq .total_count); then
+              echo "::warning::cache lookup failed; keeping ci-$week"
+            elif [ "$found" = 0 ]; then
+              week=$(date -u -d '7 days ago' +%G-W%V)
+            fi
+          fi
+          echo "week=$week" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@f4371d1ec7179bfbd04a82a81e3b3af7f720750f # v2
         with:
+          shared-key: ci-${{ steps.week.outputs.week }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: install cargo-nextest
         uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
@@ -207,7 +317,9 @@ jobs:
             docker compose -f docker-compose.dev.yml ps -a
             exit 1
           fi
-      - run: cargo nextest run --profile ci --cargo-profile ci --all-targets --all-features
+      # promtool is the `deploy` job's (bin/check-deploy): run here it pulled
+      # the Prometheus image into every Rust PR. Locally bin/test still runs it.
+      - run: cargo nextest run --profile ci --cargo-profile ci --all-targets --all-features -E 'not (binary(deploy_catalogue) & test(=promtool_accepts_the_rules))'
       - name: upload JUnit report
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -225,6 +337,9 @@ jobs:
     needs: [changes]
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # the cache lookup in `week`
     # ~2x a cold run: `test`'s cold compile (471 s p95) bounds it; the
     # Yugabyte pull and boot (~25 s) overlap the compile.
     timeout-minutes: 20
@@ -245,10 +360,23 @@ jobs:
           if rustup toolchain list | grep -q '^stable'; then
             rustup toolchain uninstall stable
           fi
+      # Never saves, so it may always fall back to last week's entry (see `test`).
+      - id: week
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          week=$(date -u +%G-W%V)
+          if ! found=$(gh api "repos/$GITHUB_REPOSITORY/actions/caches?key=v0-rust-ci-$week-&per_page=1" --jq .total_count); then
+            echo "::warning::cache lookup failed; keeping ci-$week"
+          elif [ "$found" = 0 ]; then
+            week=$(date -u -d '7 days ago' +%G-W%V)
+          fi
+          echo "week=$week" >> "$GITHUB_OUTPUT"
+      # Restores `test`'s entry; never saves (see the cache note above clippy).
       - uses: Swatinem/rust-cache@f4371d1ec7179bfbd04a82a81e3b3af7f720750f # v2
         with:
-          key: yugabyte
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: ci-${{ steps.week.outputs.week }}
+          save-if: false
       - name: install cargo-nextest
         uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
         with:
@@ -279,38 +407,49 @@ jobs:
           path: target/nextest/ci-yugabyte/junit.xml
           if-no-files-found: ignore
 
-  audit:
+  # deploy/ against the real tools: promtool, helm lint, kubeconform on the
+  # rendered chart and kustomize base (bin/check-deploy, digest-pinned images,
+  # no Rust). Only when `deploy` says so: a PR touching the manifests, the
+  # metric catalogue or this file, and every `main` push.
+  deploy:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.deploy != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions:
-      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bin/check-deploy
+
+  # Blocks only a change that can move the advisory picture: the lock, a
+  # manifest or the audit config (owner decision H8). An advisory published
+  # against an unchanged lock is audit.yml's daily run, which opens an issue,
+  # instead of a red check on every unrelated PR and a `main` with no image.
+  audit:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.deps != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install --no-self-update
-      # Prebuilt cargo-audit binary instead of `cargo install` (source compile
-      # every run). taiki-e/install-action pulls the release binary; the audit
-      # invocation and audit.toml ignore semantics below are unchanged.
+      # Prebuilt binary, version pinned: a new cargo-audit release can change
+      # what the same lock reports, which is a reviewed bump, not a surprise.
       - name: install cargo-audit
         uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
         with:
-          tool: cargo-audit
-      # RUSTSEC-2023-0071 (rsa via sqlx-mysql). NOT unreachable — MySQL is a
-      # supported permissions_store driver and CI exercises it. rsa 0.10 is
-      # fixed upstream, but sqlx 0.9 requires Rust 1.94 and cannot preserve the
-      # project's Rust 1.88 MSRV. See .cargo/audit.toml for the MSRV-raise plus
-      # sqlx-upgrade removal trigger.
-      - run: cargo audit --ignore RUSTSEC-2023-0071
+          tool: cargo-audit@0.23.0
+      # No ignores, here or in .cargo/audit.toml: a new one is a reviewed change.
+      - run: cargo audit
 
   # Spec 14 invariant: no literal dbmcp_svc_ service tokens in committed YAML.
   # The loader deliberately accepts Password::Literal for dev/test parity with
   # Database.password (issue #190), so it cannot enforce credential-free
   # committed config at boot — this job enforces it at the CI layer instead.
-  # Standalone today: it reports PR status but is not wired into build.needs
-  # and is not a required check (do not make it required without also running
-  # it on every PR, or it hard-locks merges).
   secret-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -319,41 +458,25 @@ jobs:
         with:
           persist-credentials: false
       - name: reject literal service tokens in committed config
-        # git grep scans every TRACKED file (not just YAML) — the credential
-        # surface is broader than .yaml/.yml (.env.example, JSON, shell
-        # scripts, Dockerfile all commit). Exit codes: 0 = match (FAIL),
-        # 1 = no match (the ONLY pass), anything else incl. 128 fatal (FAIL —
-        # a broken grep must NEVER read as clean; fail-closed rule, #190;
-        # verified empirically — git grep returns 128, not 2, on a fatal
-        # regex error, so the lens-suggested `rc -eq 2` check was still
-        # fail-open). Pathspec exclusions are the
-        # only places a literal token legitimately lives: test fixtures,
-        # spec/docs examples, the example config, this workflow, the loader
-        # unit-test fixtures.
+        # bin/secret-scan reads the index: every tracked file's contents (as
+        # bytes), every tracked file NAME and every symlink TARGET (git grep
+        # alone scans neither). The pre-commit hook runs the same script over
+        # the staged change. Exit 1 = a token, 2 = the scan could not run —
+        # both fail (fail-closed, #190); only 0 reads as clean. This log is
+        # public: a hit is reported as `path:line` or a masked path, never
+        # the value.
         run: |
-          set +e
-          matches="$(git grep -nE "dbmcp_svc_[0-9a-f]{64}" \
-              -- ":!tests/**" ":!website/**" ":!config/example.yaml" \
-              ":!.github/**" ":!src/config/yaml/**")"
-          rc=$?
-          set -e
-          if [ "$rc" -eq 0 ] && [ -n "$matches" ]; then
-            echo "::error::literal dbmcp_svc_ service token(s) in committed config — reference the secret via ENV: or FILE: (spec 14). ADVISORY guard: it fails this job; block merges by making secret-scan a required branch-protection check (#190 follow-up)."
-            printf '%s\n' "$matches"
-            exit 1
-          fi
-          if [ "$rc" -ne 1 ]; then
-            echo "::error::git grep tooling failure (rc=$rc) — secret-scan cannot read as clean (fail-closed, #190)"
-            exit 1
-          fi
-          echo "no literal service tokens in committed config (git grep rc=1)"
-      - name: secret-scan regex regression
-        # Pins the guard regex intent (#190) so a future loosening is caught.
-        # Wired into CI so it actually runs (was dead code otherwise).
-        run: bash tests/bin/secret-scan-regex.test.sh
+          rc=0
+          bin/secret-scan || rc=$?
+          case $rc in
+            0) echo 'no literal service tokens in tracked files, names or link targets' ;;
+            1) echo '::error::literal dbmcp_svc_ service token(s) tracked — reference the secret via ENV: or FILE: (spec 14). Locations above (value withheld).'; exit 1 ;;
+            *) echo "::error::secret scan tooling failure (rc=$rc) — cannot read as clean (fail-closed, #190)"; exit 1 ;;
+          esac
 
-  # The gate's own regression scripts. `bin/ci` runs them too, but nothing in CI
-  # did, which let a red pages guard merge to main. secret-scan runs the fifth.
+  # The gate's own regression scripts: every tests/bin/*.test.sh (a glob, so a
+  # new script is never left out — a red pages guard once merged because
+  # nothing in CI ran it) and every .github/scripts/test_*.py. stdlib python.
   scripts:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -361,47 +484,153 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: bash tests/bin/check.test.sh
-      - run: bash tests/bin/doc-anchors.test.sh
-      - run: bash tests/bin/mint-service-token.test.sh
-      - run: bash tests/bin/pages-workflow.test.sh
+      - name: shell regression scripts
+        run: |
+          shopt -s nullglob
+          scripts=(tests/bin/*.test.sh)
+          (( ${#scripts[@]} > 0 )) || { echo '::error::no tests/bin/*.test.sh found'; exit 1; }
+          failed=0
+          for script in "${scripts[@]}"; do
+            echo "::group::$script"
+            bash "$script" || { echo "::error::$script failed"; failed=1; }
+            echo '::endgroup::'
+          done
+          exit "$failed"
+      - name: python script tests
+        run: |
+          shopt -s nullglob
+          for test in .github/scripts/test_*.py; do
+            python3 -I "$test" -v
+          done
 
-  # The public-tree guard (tests/public_tree.rs) runs on every PR, docs-only
-  # included: the leaks it catches live mostly in markdown, which the
-  # `changes` filter keeps out of `test`. Reads tracked files only — no
-  # service containers.
+  # The public-tree guard runs on every PR, docs-only included: the leaks it
+  # catches live mostly in markdown. Plain python over `git ls-files`, no
+  # toolchain (the cargo test it replaced compiled for up to 387 s to scan
+  # text); its rules are pinned by .github/scripts/test_public_tree.py in
+  # `scripts`.
   public-tree:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # rust-cache keys on every installed toolchain, so the runner image's
-      # preinstalled `stable` would re-key (cold-start) this cache whenever
-      # the image picks up a new release. Only the pinned toolchain stays.
-      - name: install pinned toolchain (rust-toolchain.toml)
+      # The private words come from a secret so the guard never publishes them
+      # (public_tree.py, module docs); a fork's PR gets none and the scan says
+      # it skipped them. The count line (files read, how many private words;
+      # never a word) proves the secret reached it.
+      - run: python3 -I .github/scripts/public_tree.py
+        env:
+          PUBLIC_TREE_PRIVATE_WORDS: ${{ secrets.PUBLIC_TREE_PRIVATE_WORDS }}
+          # Required on this repository's own runs (anything but a PR, or a PR
+          # from a branch here), where the secret exists: empty there is red.
+          # A fork's PR and Dependabot's get no Actions secrets, so they skip.
+          PUBLIC_TREE_PRIVATE_WORDS_REQUIRED: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.actor != 'dependabot[bot]' && '1' || '' }}
+
+  # The Dockerfile build a PR would otherwise first meet on `main` (C8):
+  # amd64 only, never pushed. Reads `build`'s gha layer cache, never writes
+  # one (a PR-scoped cache entry is unreadable by main and later PRs).
+  image-check:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.image != 'false' }}
+    runs-on: ubuntu-latest
+    # The main-push build's budget: a recipe change cooks cold.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: build (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          cache-from: type=gha,scope=linux-amd64
+          push: false
+          build-args: GIT_SHA=${{ github.sha }}
+
+  # The declared MSRV (`rust-version` in Cargo.toml, read here, never
+  # restated) still builds the lock: a dependency bump that needs a newer
+  # compiler fails on its PR. Lib + bins, default features — the shipped code.
+  msrv:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.msrv != 'false' }}
+    runs-on: ubuntu-latest
+    # A cold check of the whole graph (no cache restored across a lock change).
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: msrv
         run: |
-          rustup toolchain install --no-self-update
+          version=$(sed -n 's/^rust-version = "\([0-9.]*\)"$/\1/p' Cargo.toml)
+          if [ -z "$version" ]; then
+            echo '::error::Cargo.toml declares no rust-version'
+            exit 1
+          fi
+          rustup toolchain install "$version" --profile minimal --no-self-update
           if rustup toolchain list | grep -q '^stable'; then
             rustup toolchain uninstall stable
           fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - id: week
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@f4371d1ec7179bfbd04a82a81e3b3af7f720750f # v2
         with:
-          key: public-tree
+          key: ${{ steps.week.outputs.week }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # The private words come from a secret so the guard never publishes them
-      # (tests/public_tree.rs, module docs); a fork's PR gets none and the scan
-      # says it skipped them. --show-output prints the scan's count line (files
-      # read, how many private words; never a word) so the log proves the
-      # secret reached it.
-      - run: cargo test --profile ci --test public_tree -- --show-output
+      # `+<version>` overrides rust-toolchain.toml.
+      - run: cargo "+${{ steps.msrv.outputs.version }}" check --locked
+
+  # The docs site builds (docusaurus.config.ts throws on a broken link) for a
+  # PR that touches it, Dependabot's npm PRs included: `npm ci && build` is the
+  # website's whole gate. pages.yml builds and deploys on `main`.
+  website:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.website != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "20"
+      # Restore only: pages.yml saves this key on `main`. A PR-saved entry is
+      # readable by that PR alone, and one per npm bump filled half the cache.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('website/package-lock.json') }}
+          restore-keys: npm-${{ runner.os }}-
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+
+  # The single required check (ruleset, SET-3). GitHub reads a skipped
+  # required job as passed, so each job above required on its own let a failed
+  # `changes` merge a PR that ran nothing. `gate` always runs and passes only
+  # when every job succeeded or was skipped by a `changes` filter that said
+  # `false` (.github/scripts/ci_gate.py, pinned by test_ci_gate.py).
+  gate:
+    needs: [changes, fmt, clippy, test, yugabyte, deploy, audit, image-check, msrv, website, secret-scan, scripts, public-tree]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - run: python3 -I .github/scripts/ci_gate.py
         env:
-          PUBLIC_TREE_PRIVATE_WORDS: ${{ secrets.PUBLIC_TREE_PRIVATE_WORDS }}
-          # Required on this repository's own runs (a push to main, a PR from a
-          # branch here), where the secret exists: empty there is red. A fork's
-          # PR and Dependabot's get no Actions secrets, so they skip.
-          PUBLIC_TREE_PRIVATE_WORDS_REQUIRED: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && github.actor != 'dependabot[bot]' && '1' || '' }}
+          NEEDS: ${{ toJSON(needs) }}
 
   # Publish a multi-arch image on push to main, tagged with the short commit
   # SHA (what Argo Image Updater pins to, #17) + a moving `main` tag.
@@ -412,7 +641,7 @@ jobs:
   # path. A red commit still never gets an image at a tag anything consumes:
   # only its per-arch `linux-<arch>-<sha>` refs exist, Image Updater matches
   # `^sha-[0-9a-f]{7}$` alone, and `sha-*`/`main` are written by `merge`,
-  # which needs every quality job green. release.yml reuses `sha-*` the same
+  # which needs `gate` green. release.yml reuses `sha-*` the same
   # way, so it inherits the gate.
   #
   # Built on NATIVE per-arch runners in parallel (amd64 + arm64), each pushed at
@@ -498,26 +727,39 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
           tags: ${{ steps.meta.outputs.tags }}
           push: true
+          build-args: GIT_SHA=${{ github.sha }}
+          # BuildKit attestations ride in the per-arch index and survive the
+          # `merge` stitch: an SPDX SBOM and max-mode SLSA provenance.
+          sbom: true
+          provenance: mode=max
 
   # Stitch the per-arch digests into one multi-arch manifest under the real
-  # tags. Skipped automatically when `build` is skipped (PRs), any arch fails,
-  # or any quality job fails — this is the publish gate.
+  # tags: the publish gate. Runs only when both arches built and `gate` passed.
+  # `needs` lists every quality job besides `gate` so the graph shows what
+  # publishing waits on; the `if:` is explicit because a filtered job
+  # (`audit`, `msrv`) may skip, and a skipped need would skip `merge` with it.
   # DUAL-PUSH: the same multi-arch manifest list is created in BOTH registries
   # so the short-SHA + main tags are pullable from whichever Image Updater (or
   # any external client) is configured to read.
   merge:
-    needs: [build, fmt, clippy, test, yugabyte, audit, secret-scan, public-tree, scripts]
+    needs: [build, gate, changes, fmt, clippy, test, yugabyte, deploy, audit, image-check, msrv, website, secret-scan, scripts, public-tree]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.gate.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
       contents: read
       packages: write
+      # Keyless cosign signing and the provenance attestation: the run's OIDC
+      # identity is the signer.
+      id-token: write
+      attestations: write
     steps:
       - name: derive short sha
         id: sha
         # Mirror the build job's derive so both read the same per-arch tag.
         run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       - name: log in to ghcr
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
@@ -530,6 +772,53 @@ jobs:
           registry: registry.digitalocean.com
           username: ${{ secrets.DOCR_TOKEN }}
           password: ${{ secrets.DOCR_TOKEN }}
+      # The index is staged under `index-<sha7>` (no deployable pattern
+      # matches it), signed and attested by digest, and only then are the
+      # deployable tags written onto that same digest: a failed signature or
+      # attestation leaves `sha-*` and `main` where they were.
+      - name: stage the indexes
+        id: digest
+        env:
+          SHORT: ${{ steps.sha.outputs.short }}
+          GHCR_IMAGE: ghcr.io/${{ github.repository }}
+          DOCR_IMAGE: registry.digitalocean.com/developerz-ai/db-mcp-gateway
+        run: |
+          set -euo pipefail
+          # Called inside `$(…)`, where bash clears errexit: without the
+          # explicit return, a failed create on a rerun would fall through to
+          # inspecting the previous run's index tag and sign that digest.
+          stage() {
+            docker buildx imagetools create -t "$1:index-$SHORT" \
+              "$1:linux-amd64-$SHORT" "$1:linux-arm64-$SHORT" >&2 || return 1
+            docker buildx imagetools inspect "$1:index-$SHORT" --format '{{json .Manifest}}' | jq -er .digest
+          }
+          # Assigned first: a failure inside `echo "…$(…)"` would not stop the step.
+          ghcr=$(stage "$GHCR_IMAGE")
+          docr=$(stage "$DOCR_IMAGE")
+          printf '%s\n' "ghcr=$ghcr" "docr=$docr" >> "$GITHUB_OUTPUT"
+      # Keyless: the signature binds the digest to this run's OIDC identity
+      # (`cosign verify --certificate-identity-regexp
+      # 'github.com/<repo>/.github/workflows/ci.yml@refs/heads/main'`).
+      - name: sign the index (cosign keyless)
+        env:
+          GHCR_REF: ghcr.io/${{ github.repository }}@${{ steps.digest.outputs.ghcr }}
+          DOCR_REF: registry.digitalocean.com/developerz-ai/db-mcp-gateway@${{ steps.digest.outputs.docr }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "$GHCR_REF"
+          cosign sign --yes "$DOCR_REF"
+      - name: attest provenance (ghcr)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.digest.outputs.ghcr }}
+          push-to-registry: true
+      - name: attest provenance (docr)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: registry.digitalocean.com/developerz-ai/db-mcp-gateway
+          subject-digest: ${{ steps.digest.outputs.docr }}
+          push-to-registry: true
       - name: derive ghcr image metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -546,13 +835,6 @@ jobs:
             type=sha,format=short
             type=sha,prefix=,format=short
             type=raw,value=main
-      - name: create ghcr manifest list & push
-        run: |
-          # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            "ghcr.io/${{ github.repository }}:linux-amd64-${{ steps.sha.outputs.short }}" \
-            "ghcr.io/${{ github.repository }}:linux-arm64-${{ steps.sha.outputs.short }}"
       - name: derive docr image metadata
         id: meta-docr
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -564,20 +846,26 @@ jobs:
             type=sha,format=short
             type=sha,prefix=,format=short
             type=raw,value=main
-      - name: create docr manifest list & push
+      # One source and no annotations: imagetools copies the signed index as
+      # is, so every tag lands on the digest the signature covers.
+      - name: publish the deployable tags
         env:
-          # docker/metadata-action@v5 auto-sets only `DOCKER_METADATA_OUTPUT_JSON`
-          # (shared name, no per-step suffix); with two metadata steps in the same
-          # job the second overwrites the first. Mirror the DOCR step's `json`
-          # output into a step-scoped env var so the jq below reads the right
-          # tag set.
-          DOCR_METADATA_JSON: ${{ steps.meta-docr.outputs.json }}
+          # docker/metadata-action sets one shared `DOCKER_METADATA_OUTPUT_JSON`
+          # (the second step overwrites the first), so each registry reads its
+          # own step's `json` output.
+          GHCR_JSON: ${{ steps.meta.outputs.json }}
+          DOCR_JSON: ${{ steps.meta-docr.outputs.json }}
+          GHCR_REF: ghcr.io/${{ github.repository }}@${{ steps.digest.outputs.ghcr }}
+          DOCR_REF: registry.digitalocean.com/developerz-ai/db-mcp-gateway@${{ steps.digest.outputs.docr }}
         run: |
-          # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCR_METADATA_JSON") \
-            "registry.digitalocean.com/developerz-ai/db-mcp-gateway:linux-amd64-${{ steps.sha.outputs.short }}" \
-            "registry.digitalocean.com/developerz-ai/db-mcp-gateway:linux-arm64-${{ steps.sha.outputs.short }}"
+          set -euo pipefail
+          publish() {
+            local tags
+            mapfile -t tags < <(jq -r '.tags[] | "-t", .' <<< "$1")
+            docker buildx imagetools create "${tags[@]}" "$2"
+          }
+          publish "$GHCR_JSON" "$GHCR_REF"
+          publish "$DOCR_JSON" "$DOCR_REF"
       - name: inspect
         run: |
           docker buildx imagetools inspect \

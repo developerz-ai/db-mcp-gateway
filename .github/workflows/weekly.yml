@@ -1,8 +1,8 @@
 name: weekly
 
-# Cheap checks off the PR path, against `main` (scheduled runs use the default
-# branch). A new advisory lands without any commit here, so the PR-time
-# `audit` job alone would only notice it on the next unrelated PR.
+# Checks off the PR path, against `main` (scheduled runs use the default
+# branch). The advisory audit is daily, in audit.yml; the load gate is its own
+# workflow (load-gate.yml).
 on:
   schedule:
     - cron: "0 6 * * 1"
@@ -19,24 +19,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  audit:
-    # GitHub-hosted runner: this repository is public.
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: install pinned toolchain (rust-toolchain.toml)
-        run: rustup toolchain install --no-self-update
-      - name: install cargo-audit
-        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
-        with:
-          tool: cargo-audit
-      # Same ignore as ci.yml's `audit` job; .cargo/audit.toml holds its
-      # removal trigger.
-      - run: cargo audit --ignore RUSTSEC-2023-0071
-
   # Report only: what `cargo update` would move. Applying it is a reviewed PR
   # (Dependabot, or by hand narrowly — CLAUDE.md §Dependency graph; sqlx stays
   # pinned with its sqlx-sqlite stub).
@@ -59,52 +41,72 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-  # Load gate (plan 101 slice 13 step 10): the benchmark harness against the
-  # dev stack it boots itself, compared with a baseline taken on this same
-  # runner class — absolute numbers from another host mean nothing here.
-  # Weekly, not per PR: a release build plus the full run is ~15 minutes and
-  # shared runners are noisy (load_gate.sh reports drifted shapes as
-  # inconclusive instead of gating on them).
-  load-gate:
+  # Advisory: what the published image ships that a scanner flags. Scans the
+  # `:latest` multi-arch image from the public registry (no credential); a
+  # HIGH/CRITICAL finding with a fixed version fails the run, for a
+  # maintainer to ship as the next patch. Not a gate on anything. Every
+  # published platform is scanned: the arm64 image ships its own packages.
+  image-scan:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: trivy image scan (ghcr :latest, ${{ matrix.platform }})
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:latest"
+          {
+            echo "## trivy: $image ($PLATFORM)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          rc=0
+          docker run --rm \
+            aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c \
+            image --no-progress --platform "$PLATFORM" --ignore-unfixed --severity HIGH,CRITICAL --exit-code 1 "$image" \
+            | tee -a "$GITHUB_STEP_SUMMARY" || rc=$?
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+  # Advisory line coverage of the full suite (unit + integration against the
+  # dev stack), as a report: no threshold, nothing gates on it. The number is
+  # for finding untested code, not for chasing.
+  coverage:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      BASELINE: benchmarks/baselines/ci-ubuntu-latest-postgres.json
-      RESULT: benchmarks/results/ci-latest.json
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # As in ci.yml: only the pinned toolchain, so the runner image's
-      # `stable` never re-keys the rust-cache entry below.
-      - name: install pinned toolchain (rust-toolchain.toml)
+      - name: start the dev stack
+        run: docker compose -f docker-compose.dev.yml up -d --wait
+      - name: install pinned toolchain (rust-toolchain.toml) + llvm-tools
         run: |
           rustup toolchain install --no-self-update
-          if rustup toolchain list | grep -q '^stable'; then
-            rustup toolchain uninstall stable
-          fi
-      - uses: Swatinem/rust-cache@f4371d1ec7179bfbd04a82a81e3b3af7f720750f # v2
-      - name: run the benchmark harness
-        run: ./benchmarks/gateway_overhead.sh --out "$RESULT"
-      - name: gate against the stored baseline
+          rustup component add llvm-tools-preview
+      - name: install cargo-llvm-cov + cargo-nextest
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
+        with:
+          tool: cargo-llvm-cov@0.9.1,cargo-nextest@0.9.151
+      - name: coverage
         run: |
           set -o pipefail
-          if [[ ! -f "$BASELINE" ]]; then
-            {
-              echo '## load gate: baseline captured on this run'
-              echo "No \`$BASELINE\` yet. Commit the \`load-gate-result\` artifact"
-              echo "of this run as that file; later runs gate against it."
-            } | tee -a "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
+          cargo llvm-cov nextest --all-targets --all-features --no-fail-fast \
+            --lcov --output-path lcov.info
           {
-            echo '## load gate'
-            ./benchmarks/load_gate.sh "$RESULT" "$BASELINE"
+            echo '## coverage (advisory, no threshold)'
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: keep the result
+      - name: keep the report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: load-gate-result
-          path: benchmarks/results/ci-latest.json
+          name: coverage-lcov
+          path: lcov.info
           if-no-files-found: ignore

@@ -1,0 +1,23 @@
+{
+  "name": "db-mcp-gateway",
+  "dockerComposeFile": ["../docker-compose.dev.yml", "compose.yml"],
+  "service": "workspace",
+  "runServices": [
+    "workspace",
+    "state-db",
+    "target-db",
+    "target-mongo",
+    "target-redis",
+    "target-dragonfly",
+    "permissions-mysql"
+  ],
+  "workspaceFolder": "/workspaces/db-mcp-gateway",
+  "shutdownAction": "none",
+  "remoteUser": "vscode",
+  "postCreateCommand": "rustup show active-toolchain && cargo fetch --locked",
+  "customizations": {
+    "vscode": {
+      "extensions": ["rust-lang.rust-analyzer", "tamasfe.even-better-toml"]
+    }
+  }
+}

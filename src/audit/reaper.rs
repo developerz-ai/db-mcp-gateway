@@ -15,14 +15,17 @@
 //! is ever skipped. It lives in process memory; a restarted replica starts
 //! from the oldest intent and catches up batch by batch.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use sqlx::PgPool;
 
 use crate::exec::DEFAULT_STATEMENT_TIMEOUT_MS;
 use crate::state::audit::{IntentKey, reap_abandoned_batch};
 
-use super::drain::DRAIN_TIMEOUT;
+use super::drain::{DRAIN_TIMEOUT, DetachedTasks};
+use super::stream::StreamSinks;
 use super::{AUDIT_WRITE_TIMEOUT, AuditError};
 
 /// Advisory-lock key for the sweep — arbitrary, fixed, unique to the reaper.
@@ -31,6 +34,17 @@ const REAPER_LOCK_KEY: i64 = 0x6462_6d63_7072_6170; // "dbmcprap"
 /// Calls the reaper recorded as `abandoned`: each one reached the target with
 /// no recorded outcome, so an alert on any increase is warranted.
 const ABANDONED_TOTAL: &str = "audit_abandoned_total";
+
+/// Gauge: Unix seconds of the last sweep that reached the end of the eligible
+/// intents (rows or not). Every replica sets it; alert on the max.
+const REAPER_LAST_SUCCESS: &str = "audit_reaper_last_success_timestamp";
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or_default()
+}
 
 /// Intents one batch examines: a short index range plus key probes, so a
 /// batch stays far below the background pool's statement timeout.
@@ -60,15 +74,59 @@ pub const REAPER_GRACE: Duration = Duration::from_secs(
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReapCursor(Option<IntentKey>);
 
-/// One sweep from `cursor`, batch by batch until the aged intents run out.
-/// `Ok(None)` when another replica held the lock before any batch ran;
-/// otherwise the number of `abandoned` rows written. `grace` is
-/// [`REAPER_GRACE`] in production; tests pass zero.
+/// [`sweep`] with no stream sinks: the abandoned rows land in `audit_calls`
+/// only. For callers that check the durable rows alone.
 pub async fn run_once(
     pool: &PgPool,
     grace: Duration,
     cursor: &mut ReapCursor,
 ) -> Result<Option<u64>, AuditError> {
+    sweep(
+        pool,
+        grace,
+        cursor,
+        &StreamSinks::default(),
+        &DetachedTasks::new(),
+    )
+    .await
+}
+
+/// What one sweep did: rows written, and whether it walked every eligible
+/// intent. A sweep that found the lock taken — before its first batch or
+/// between two — `finished` nothing, whatever it wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepReport {
+    /// `None` when another replica held the lock before any batch ran.
+    pub reaped: Option<u64>,
+    pub finished: bool,
+}
+
+/// One sweep from `cursor`, batch by batch until the aged intents run out.
+/// Each committed batch's `abandoned` rows go to `sinks` like any other
+/// audit row — after the commit, never before. `Ok(None)` when another
+/// replica held the lock before any batch ran; otherwise the number of
+/// `abandoned` rows written. `grace` is [`REAPER_GRACE`] in production;
+/// tests pass zero.
+pub async fn sweep(
+    pool: &PgPool,
+    grace: Duration,
+    cursor: &mut ReapCursor,
+    sinks: &StreamSinks,
+    tasks: &DetachedTasks,
+) -> Result<Option<u64>, AuditError> {
+    sweep_report(pool, grace, cursor, sinks, tasks)
+        .await
+        .map(|report| report.reaped)
+}
+
+/// [`sweep`], also saying whether it reached the end of the eligible intents.
+pub async fn sweep_report(
+    pool: &PgPool,
+    grace: Duration,
+    cursor: &mut ReapCursor,
+    sinks: &StreamSinks,
+    tasks: &DetachedTasks,
+) -> Result<SweepReport, AuditError> {
     let mut reaped: Option<u64> = None;
     loop {
         let batch = reap_abandoned_batch(
@@ -81,33 +139,58 @@ pub async fn run_once(
         .await
         .map_err(AuditError::Write)?;
         let Some(batch) = batch else {
-            return Ok(reaped);
+            return Ok(SweepReport {
+                reaped,
+                finished: false,
+            });
         };
-        reaped = Some(reaped.unwrap_or(0) + batch.reaped);
+        for row in &batch.reaped {
+            sinks.send(row, tasks);
+        }
+        let written = u64::try_from(batch.reaped.len()).unwrap_or(u64::MAX);
+        reaped = Some(reaped.unwrap_or(0) + written);
         if let Some(last) = batch.last {
             cursor.0 = Some(last);
         }
         if batch.scanned < u64::from(REAP_BATCH_ROWS) {
-            return Ok(reaped);
+            return Ok(SweepReport {
+                reaped,
+                finished: true,
+            });
         }
     }
 }
 
-/// Sweep every [`REAP_INTERVAL`] forever. Spawned once at boot beside the
-/// retention pruner; a failed sweep is logged and retried next tick.
+/// [`run_streaming`] with no stream sinks.
 pub async fn run(pool: PgPool) {
+    let no_sinks = Arc::new(ArcSwap::from_pointee(StreamSinks::default()));
+    run_streaming(pool, no_sinks, DetachedTasks::new()).await;
+}
+
+/// Sweep every [`REAP_INTERVAL`] forever, streaming abandoned rows to the
+/// sinks current at each sweep (a SIGHUP swaps them). Spawned once at boot
+/// beside the retention pruner; a failed sweep is logged and retried next
+/// tick.
+pub async fn run_streaming(pool: PgPool, sinks: Arc<ArcSwap<StreamSinks>>, tasks: DetachedTasks) {
     let mut ticker = tokio::time::interval(REAP_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut cursor = ReapCursor::default();
     loop {
         ticker.tick().await;
-        match run_once(&pool, REAPER_GRACE, &mut cursor).await {
-            Ok(Some(0) | None) => {}
-            Ok(Some(n)) => {
-                // Only the lock holder writes rows, so summing across replicas
-                // counts each abandoned call once.
-                metrics::counter!(ABANDONED_TOTAL).increment(n);
-                tracing::warn!(rows = n, "audit reaper: recorded abandoned calls");
+        let current = sinks.load_full();
+        match sweep_report(&pool, REAPER_GRACE, &mut cursor, &current, &tasks).await {
+            Ok(SweepReport { reaped, finished }) => {
+                // A replica that lost the lock vouches for nothing: the
+                // holder may yet fail, and the gauge must then go stale.
+                if finished {
+                    metrics::gauge!(REAPER_LAST_SUCCESS).set(unix_now());
+                }
+                if let Some(n @ 1..) = reaped {
+                    // Only the lock holder writes rows, so summing across
+                    // replicas counts each abandoned call once.
+                    metrics::counter!(ABANDONED_TOTAL).increment(n);
+                    tracing::warn!(rows = n, "audit reaper: recorded abandoned calls");
+                }
             }
             Err(err) => tracing::error!(
                 %err,

@@ -29,9 +29,46 @@ fn parses_syslog_stream_sink() {
         config.logging.stream,
         vec![crate::config::StreamSinkConfig::Syslog {
             host: "syslog.internal".to_string(),
-            port: 514
+            port: 514,
+            transport: crate::config::SyslogTransportKind::Udp,
+            ca_file: None,
         }]
     );
+}
+
+#[test]
+fn parses_syslog_tls_sink_with_ca_file() {
+    let config = ConfigFile::from_yaml_str(
+        "logging:\n  stream:\n    - { kind: syslog, host: s, port: 6514, transport: tls, ca_file: /etc/ca.pem }\n",
+    )
+    .expect("tls sink with ca_file parses");
+    assert!(matches!(
+        &config.logging.stream[0],
+        crate::config::StreamSinkConfig::Syslog {
+            transport: crate::config::SyslogTransportKind::Tls,
+            ca_file: Some(path),
+            ..
+        } if path.as_os_str() == "/etc/ca.pem"
+    ));
+}
+
+#[test]
+fn rejects_tls_without_ca_file_and_ca_file_without_tls() {
+    let tls_bare =
+        "logging:\n  stream:\n    - { kind: syslog, host: s, port: 6514, transport: tls }\n";
+    assert!(matches!(
+        ConfigFile::from_yaml_str(tls_bare),
+        Err(ConfigFileError::SyslogSinkTlsNeedsCaFile { index: 0 })
+    ));
+    for transport in ["udp", "tcp"] {
+        let yaml = format!(
+            "logging:\n  stream:\n    - {{ kind: syslog, host: s, port: 514, transport: {transport}, ca_file: /etc/ca.pem }}\n"
+        );
+        assert!(matches!(
+            ConfigFile::from_yaml_str(&yaml),
+            Err(ConfigFileError::SyslogSinkCaFileWithoutTls { index: 0 })
+        ));
+    }
 }
 
 #[test]

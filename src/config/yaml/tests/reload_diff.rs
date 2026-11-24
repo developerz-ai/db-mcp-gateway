@@ -83,6 +83,11 @@ fn admin_and_store_driver_are_boot_fixed() {
     assert_eq!(admin.boot_fixed_change(&regrouped), Some("admin"));
     let store = config("", "", "${ENV:D}", "permissions_store: { driver: pg }\n");
     assert_eq!(base().boot_fixed_change(&store), Some("permissions_store"));
+    let yaml_only = config("", "", "${ENV:D}", "permissions_store: { driver: none }\n");
+    assert_eq!(
+        store.boot_fixed_change(&yaml_only),
+        Some("permissions_store")
+    );
     // Disabled admin is the same as absent.
     let off = config("", "", "${ENV:D}", "admin: { enabled: false, group: x }\n");
     assert_eq!(base().boot_fixed_change(&off), None);

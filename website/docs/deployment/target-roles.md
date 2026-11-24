@@ -4,6 +4,8 @@ The gateway never creates, widens or owns a database role (MUST #3); you provisi
 
 Store each password in your secret manager and reference it as `${ENV:…}` or `${FILE:…}` in `databases[].password`.
 
+`db-mcp-gateway roles --config config.yml` prints these statements filled in from your config (print only), and `db-mcp-gateway doctor --config config.yml` connects as each configured Postgres role and reports superuser attributes, write privileges on a read role and tables it cannot read — see the [operator CLI](cli.md). Neither grants anything.
+
 ## PostgreSQL
 
 `app_owner` stands for the role that owns your tables (the one migrations run as).
@@ -101,7 +103,7 @@ An ACL user, never `default`. The full recipe and the meaning of each part is in
 ACL SETUSER gateway_ro on #<sha256-of-password> resetkeys %R~app:* resetchannels -@all +@read -keys
 ```
 
-Add `-scan -dbsize` when key names are sensitive, `+select` for a database index other than `0`. Persist it (`ACL SAVE` or your config file) so a restart does not drop the user.
+`db-mcp-gateway roles` prints a stricter form: `reset` first, then an explicit command allowlist without `SCAN`, `DBSIZE` or `KEYS`. Re-running `ACL SETUSER` on an existing user only adds to it: without `reset`, every ACL selector (`(…)`) the user had keeps allowing its commands. Dragonfly has no selectors and rejects `reset`: drop it there. Otherwise add `-scan -dbsize` when key names are sensitive, `+select` for a database index other than `0`. Persist it (`ACL SAVE` or your config file) so a restart does not drop the user.
 
 ## MySQL, MSSQL
 

@@ -211,6 +211,7 @@ mod tests {
             password: Password::Literal("pw".into()),
             description: String::new(),
             auth_database: None,
+            connect_name: None,
             pool: database,
             write_role: None,
             write_password: None,

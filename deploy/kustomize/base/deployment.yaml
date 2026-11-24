@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db-mcp-gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: db-mcp-gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # 10 s preStop sleep + the gateway's 120 s worst-case drain after SIGTERM.
+      terminationGracePeriodSeconds: 130
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: ghcr.io/developerz-ai/db-mcp-gateway
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - name: gateway
+              containerPort: 8443
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: db-mcp-gateway-env
+          env:
+            - name: DB_MCP_GATEWAY_CONFIG
+              value: /etc/gateway/config/config.yml
+            - name: GATEWAY_BIND
+              value: "0.0.0.0:8443"
+            - name: METRICS_BIND
+              value: "0.0.0.0:9090"
+            - name: STATE_DB_CONNECT_TIMEOUT_SECONDS
+              value: "60"
+            - name: STATE_DB_URL
+              valueFrom:
+                secretKeyRef: { name: db-mcp-gateway, key: STATE_DB_URL }
+            - name: SESSION_SIGNING_KEY
+              valueFrom:
+                secretKeyRef: { name: db-mcp-gateway, key: SESSION_SIGNING_KEY }
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: { name: db-mcp-gateway, key: OIDC_CLIENT_SECRET, optional: true }
+            - name: TLS_CERT_PATH
+              value: /etc/gateway/tls/tls.crt
+            - name: TLS_KEY_PATH
+              value: /etc/gateway/tls/tls.key
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 10
+          startupProbe:
+            httpGet: { path: /healthz, port: gateway, scheme: HTTPS }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            # 120 s: STATE_DB_CONNECT_TIMEOUT_SECONDS (60) + 60 s margin.
+            failureThreshold: 24
+          livenessProbe:
+            httpGet: { path: /healthz, port: gateway, scheme: HTTPS }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: gateway, scheme: HTTPS }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/gateway/config, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+            - { name: tls, mountPath: /etc/gateway/tls, readOnly: true }
+      volumes:
+        - name: config
+          configMap:
+            name: db-mcp-gateway-config
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: tls
+          secret:
+            secretName: db-mcp-gateway-tls

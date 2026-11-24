@@ -13,7 +13,7 @@ permissions group and audit attribution.
 ### Token type
 
 Opaque static bearer, shape `dbmcp_svc_<64 hex chars>` (32 bytes of CSPRNG
-entropy), minted operator-side by `bin/mint-service-token <name>`.
+entropy), minted operator-side by `db-mcp-gateway mint-service-token <name>` (in the image; `bin/mint-service-token` wraps it in a checkout).
 
 The prefix is enforced at boot, and it is load-bearing, not cosmetic:
 
@@ -141,32 +141,35 @@ about tokens is callable over HTTP — the lifecycle is GitOps:
   Under `gateway.env: production` an inline literal token is rejected at
   boot (the error names the field, never the value); the default
   `development` accepts one for dev/test parity with `Database.password`.
-  Committed config is also guarded at the CI layer: the `secret-scan` job in `.github/workflows/ci.yml` scans
-  every tracked file (not just YAML) and FAILS on any literal
-  `dbmcp_svc_<64hex>` token (test fixtures under `tests/**` are excluded).
+  Committed config is also guarded at the CI layer: the `secret-scan` job in `.github/workflows/ci.yml` runs
+  `bin/secret-scan` over the git index — every tracked file's contents (not
+  just YAML), every tracked file name and every symlink target — and FAILS on
+  any literal `dbmcp_svc_<64hex>` token (test fixtures under `tests/**` are
+  excluded); `.githooks/pre-commit` runs the same script over the staged change.
   It is ADVISORY — it fails the job on every PR, but does not by itself
   block a merge until made a required branch-protection check (#190
   follow-up).
-- **Rotate** — overlap is mandatory, because each entry carries exactly one
-  token, AND the YAML validator (`src/config/yaml/service_accounts.rs`) rejects duplicate
-  service-account names — the new value cannot reuse the original `<name>`.
-  Sequence: (1) mint a new value under a DISTINCT temporary name
-  (`<name>-next` is the recommended convention); (2) add a *second*
-  `service_accounts:` entry (with its own matching `permissions:` block)
-  to the gateway YAML; (3) `kill -HUP` every pod (or roll the deployment)
-  and wait until it completes — a reload rebuilds the token store, but a
-  `${ENV:…}` ref reads the pod's environment, which only changes on a
-  restart, so a value delivered as a new env var needs a roll, while one
-  delivered as a mounted file (`${FILE:…}`) is picked up by `SIGHUP`; (4)
-  update every client to use the new value; (5) remove the old
-  `service_accounts:` entry and roll or `SIGHUP` again. **Audit-identity trade-off**: because the
-  temporary entry uses a different name, audit rows for the rotation
-  window attribute to `service:<name>-next` instead of `service:<name>` —
-  pick deliberately and document the trade-off in the PR. If preserving
-  the exact `service:<name>` audit identity across rotation is required,
-  configuration support for multiple tokens under one name must be added
-  first; until then same-name rotation is not supported and must not be
-  documented.
+- **Rotate** — same name, overlap window, no audit-identity change. An
+  account carries either one `token:` or a `tokens:` list (setting both,
+  neither, or an empty list aborts boot); every entry of the list follows
+  the `token` rules (secret reference, shape, production literal ban) and
+  authenticates as the **same** `service:<name>`, group, `max_concurrent_requests`
+  and `require_upstream` — so audit rows across the rotation window all
+  attribute to `service:<name>`. A value repeated inside the list, or shared
+  with another account, aborts boot. Sequence: (1) mint a new value
+  (`bin/mint-service-token <name>`) and store it in the secret store; (2)
+  turn the stanza's `token:` into `tokens: ["<old ref>", "<new ref>"]`
+  — each `${ENV:…}` / `${FILE:…}` ref quoted, since unquoted braces are
+  invalid inside a YAML flow list (or use a block list, one `- ` per ref); (3)
+  `kill -HUP` every pod (or roll the deployment) and wait until it
+  completes — a reload rebuilds the token store, but a `${ENV:…}` ref reads
+  the pod's environment, which only changes on a restart, so a value
+  delivered as a new env var needs a roll, while one delivered as a mounted
+  file (`${FILE:…}`) is picked up by `SIGHUP`; (4) move every client to the
+  new value; (5) drop the old ref (back to `token: <new ref>`, or a
+  one-entry `tokens:`) and roll or `SIGHUP` again — from then on the old
+  value gets 401. Both values share the account's concurrency cap: they are
+  one identity.
 - **Revoke** — remove the complete `service_accounts:` stanza (the name,
   the group, and the token reference together) and `kill -HUP` every pod
   (or roll). A reload rebuilds the token store in the same swap as the

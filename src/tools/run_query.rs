@@ -5,6 +5,7 @@
 //! Audit + response envelope are handled by `tools::audit_dispatch` — this
 //! file only does the compute step.
 
+use std::num::NonZeroU32;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -12,16 +13,19 @@ use serde_json::Value;
 
 use crate::audit::intent::WRITE_MAY_HAVE_COMMITTED;
 use crate::config::{Action, Grant, ServerKind};
-use crate::exec::redis::rejector as redis_rejector;
-use crate::exec::{Access, ExecQuery, ExecResult, GuardedSql};
+use crate::exec::{Access, ExecQuery, ExecResult, QueryParam};
 use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
-use super::args::parse_arguments;
+use super::args::{LIMIT_AT_LEAST_ONE, parse_arguments};
 use super::audit_dispatch::{
-    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, WriteEffect, error_outcome,
-    invalid_arguments, outcome_from_exec_error, reject_arguments, run_audited, success_outcome,
+    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, WriteEffect, audit_outcome,
+    invalid_arguments, note_timeout_limit, outcome_from_exec_error, reject_arguments,
+    run_audited_with_params, write_state,
 };
+use super::query_params::{parse_params, unsupported_for};
+use super::tabular::caps::{ByteCaps, MaxBytes, RowLimit};
+use super::tabular::{RowShaping, rows_outcome};
 use super::target::{effective_row_limit, ensure_reason, forbidden, record_intent, resolve_target};
 
 const TOOL_NAME: &str = "run_query";
@@ -48,14 +52,20 @@ pub struct Arguments {
     /// Run a write, report `rows_affected`, roll it back.
     #[serde(default)]
     pub dry_run: bool,
+    /// Cap on the JSON size of the returned rows (spec 03 §Results).
+    #[serde(default)]
+    pub max_bytes: Option<MaxBytes>,
+    /// Cap on one cell's JSON size; a larger cell becomes a marker.
+    #[serde(default)]
+    pub max_cell_bytes: Option<NonZeroU32>,
+    /// Values bound to `$1..$n` (Postgres only); see `query_params`.
+    #[serde(default)]
+    pub params: Vec<Value>,
 }
 
+/// `run_query`'s fields beside the shared row-result ones.
 #[derive(Debug, Serialize)]
-struct SuccessPayload<'a> {
-    columns: &'a [String],
-    rows: &'a [Vec<Value>],
-    truncated: bool,
-    elapsed_ms: u64,
+struct WriteFields {
     /// Rows the write changed; absent for a read.
     #[serde(skip_serializing_if = "Option::is_none")]
     rows_affected: Option<u64>,
@@ -81,9 +91,21 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
         reason: args.reason.as_deref(),
         db_type: super::db_type_for_server(ctx.config, &args.server),
     };
-    let args = &args;
-    run_audited(ctx, id, header, |id, grants| async move {
-        compute_outcome(ctx, id, &grants, &header, args).await
+    if args.limit == Some(0) {
+        let outcome = invalid_arguments(id.clone(), LIMIT_AT_LEAST_ONE);
+        return audit_outcome(ctx, id, header, outcome).await;
+    }
+    let params = match parse_params(&args.params) {
+        Ok(params) => params,
+        Err(message) => {
+            let outcome = invalid_arguments(id.clone(), &message);
+            return audit_outcome(ctx, id, header, outcome).await;
+        }
+    };
+    let (args, params) = (&args, &params);
+    let stored = (!args.params.is_empty()).then_some(args.params.as_slice());
+    run_audited_with_params(ctx, id, header, stored, |id, grants| async move {
+        compute_outcome(ctx, id, &grants, &header, args, params).await
     })
     .await
 }
@@ -94,6 +116,7 @@ async fn compute_outcome(
     db_grants: &[Grant],
     header: &AuditHeader<'_>,
     args: &Arguments,
+    params: &[QueryParam],
 ) -> Outcome {
     // Constraints come from the read-level merge: it matches *every* grant that
     // applies to this (server, db) — `query_write` included, since it implies
@@ -125,14 +148,17 @@ async fn compute_outcome(
     if let Err(rejected) = ensure_reason(constraints, args.reason.as_deref()) {
         return *rejected;
     }
+    if let Some(message) = unsupported_for(server.kind).filter(|_| !params.is_empty()) {
+        return invalid_arguments(id, &message);
+    }
 
     // Defense-in-depth on top of the DB role: the guard refuses anything the
     // grant doesn't cover before it hits the pool, and names the access the
     // statement itself needs — so a write-tier caller's SELECT still runs as
-    // the read role. Mongo commands are not SQL: `MongoAdapter::execute` runs
-    // its own read-only rejector, and Mongo writes are not offered at all.
-    // Redis is the same, but its argv is checked here too, so a malformed one
-    // is `invalid_arguments` and a refused one never opens a connection.
+    // the read role. Mongo and Redis commands are not SQL: each adapter runs
+    // its own read-only rejector (Mongo writes are not offered at all), but
+    // the command is checked here too, so a malformed one is
+    // `invalid_arguments`.
     let access = match server.kind {
         ServerKind::Postgres => match statement_access(&args.sql, writes_allowed) {
             Ok(access) => access,
@@ -142,13 +168,28 @@ async fn compute_outcome(
             Ok(access) => access,
             Err(rejected) => return *rejected,
         },
-        ServerKind::Mysql | ServerKind::Mssql | ServerKind::Mongo => Access::ReadOnly,
+        ServerKind::Mongo => match mongo_access(id.clone(), &args.sql) {
+            Ok(access) => access,
+            Err(rejected) => return *rejected,
+        },
+        ServerKind::Mysql | ServerKind::Mssql => Access::ReadOnly,
     };
     if args.dry_run && access != Access::ReadWrite {
         return invalid_arguments(id, DRY_RUN_NEEDS_WRITE);
     }
 
     let row_limit = effective_row_limit(args.limit, constraints.row_limit, DEFAULT_ROW_LIMIT);
+    let shaping = RowShaping {
+        limit: RowLimit {
+            effective: row_limit,
+            asked: args.limit.unwrap_or(DEFAULT_ROW_LIMIT),
+        },
+        caps: ByteCaps {
+            max_bytes: args.max_bytes,
+            max_cell_bytes: args.max_cell_bytes,
+        },
+        kind: server.kind,
+    };
     let timeout_ms = constraints.statement_timeout_ms;
 
     // Emit `request_id` explicitly. The production formatter (main.rs) sets
@@ -167,7 +208,9 @@ async fn compute_outcome(
         "tool.run_query.dispatch"
     );
 
-    if let Err(refused) = record_intent(ctx, header, &target, access).await {
+    // The intent keeps the params too, so an `abandoned` row has them.
+    let stored = (!args.params.is_empty()).then_some(args.params.as_slice());
+    if let Err(refused) = record_intent(ctx, header, &target, access, stored).await {
         return *refused;
     }
 
@@ -175,11 +218,6 @@ async fn compute_outcome(
     // unavailable, syntax_error) still surface `duration_ms` in the audit
     // row — spec 07 requires it for every tool invocation.
     let started = Instant::now();
-    let adapter = match ctx.registry.get_or_open(server, database).await {
-        Ok(a) => a,
-        Err(err) => return outcome_from_exec_error(err, started, &ERROR_MESSAGES),
-    };
-
     let query = ExecQuery {
         sql: &args.sql,
         binds: &[],
@@ -189,16 +227,29 @@ async fn compute_outcome(
         dry_run: args.dry_run,
         request_id: ctx.request.request_id,
     };
-    let (mut outcome, rows_affected) = match adapter.execute(query).await {
-        Ok(result) => (
-            result_outcome(id, &result, args.dry_run),
-            result.rows_affected,
-        ),
-        Err(err) => (outcome_from_exec_error(err, started, &ERROR_MESSAGES), None),
+    let executed = match ctx.registry.get_or_open(server, database).await {
+        Ok(adapter) => adapter.execute_with_params(query, params).await,
+        Err(err) => Err(err),
+    };
+    let state = write_state(&executed, args.dry_run);
+    let (mut outcome, rows_affected) = match executed {
+        Ok(result) => {
+            let rows_affected = result.rows_affected;
+            (
+                result_outcome(id, result, shaping, args.dry_run),
+                rows_affected,
+            )
+        }
+        Err(err) => {
+            let mut outcome = outcome_from_exec_error(err, started, &ERROR_MESSAGES);
+            note_timeout_limit(&mut outcome, timeout_ms);
+            (outcome, None)
+        }
     };
     if access == Access::ReadWrite {
         outcome.write = Some(WriteEffect {
             rows_affected: rows_affected.map(|rows| i64::try_from(rows).unwrap_or(i64::MAX)),
+            state,
         });
         note_indeterminate_write(&mut outcome, args.dry_run);
     }
@@ -219,66 +270,21 @@ fn note_indeterminate_write(outcome: &mut Outcome, dry_run: bool) {
     }
 }
 
-/// The access `sql` needs, after the guard at the caller's grant level:
-/// `ReadWrite` only for a data write under a `query_write` grant.
-fn statement_access(sql: &str, writes_allowed: bool) -> Result<Access, Box<Outcome>> {
-    let grant = if writes_allowed {
-        Access::ReadWrite
-    } else {
-        Access::ReadOnly
-    };
-    GuardedSql::parse(sql, grant)
-        .map(|guarded| guarded.required_access())
-        .map_err(|err| {
-            Box::new(error_outcome(
-                OutcomeCode::ForbiddenSql,
-                &format!("SQL rejected by gateway: {err}"),
-            ))
-        })
-}
-
-/// The Redis rejector, run at the tool edge: a malformed argv is the
-/// caller's argument error, a well-formed but refused command `forbidden_sql`.
-/// `RedisAdapter::execute` runs the same check again before any network call.
-fn redis_access(id: Value, argv: &str) -> Result<Access, Box<Outcome>> {
-    match redis_rejector::validate_command(argv) {
-        Ok(_) => Ok(Access::ReadOnly),
-        Err(err) if err.is_malformed() => {
-            Err(Box::new(invalid_arguments(id, &format!("`sql`: {err}"))))
-        }
-        Err(err) => Err(Box::new(error_outcome(
-            OutcomeCode::ForbiddenSql,
-            &format!("command rejected by gateway: {err}"),
-        ))),
-    }
-}
-
-fn result_outcome(id: Value, result: &ExecResult, dry_run: bool) -> Outcome {
-    let elapsed = i64::try_from(result.elapsed_ms).unwrap_or(i64::MAX);
-    let row_count = i64::try_from(result.rows.len()).unwrap_or(i64::MAX);
-    let payload = SuccessPayload {
-        columns: &result.columns,
-        rows: &result.rows,
-        truncated: result.truncated,
-        elapsed_ms: result.elapsed_ms,
+fn result_outcome(id: Value, result: ExecResult, shaping: RowShaping, dry_run: bool) -> Outcome {
+    let fields = WriteFields {
         rows_affected: result.rows_affected,
         dry_run,
     };
-    let Ok(text) = serde_json::to_string(&payload) else {
-        return error_outcome(OutcomeCode::Internal, "failed to serialize result");
-    };
-    let mut outcome = success_outcome(
-        id,
-        text,
-        Some(elapsed),
-        Some(row_count),
-        Some(result.truncated),
-    );
-    if dry_run {
+    let mut outcome = rows_outcome(id, result, shaping, fields);
+    if dry_run && outcome.code == OutcomeCode::Success {
         outcome.code = OutcomeCode::DryRun;
     }
     outcome
 }
+
+#[path = "run_query_access.rs"]
+mod access;
+use access::{mongo_access, redis_access, statement_access};
 
 #[cfg(test)]
 #[path = "run_query_tests.rs"]

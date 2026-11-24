@@ -92,7 +92,7 @@ async fn compute_outcome(
     if let Err(rejected) = ensure_reason(&target.constraints, args.reason.as_deref()) {
         return *rejected;
     }
-    if let Err(refused) = record_intent(ctx, header, &target, Access::ReadOnly).await {
+    if let Err(refused) = record_intent(ctx, header, &target, Access::ReadOnly, None).await {
         return *refused;
     }
 

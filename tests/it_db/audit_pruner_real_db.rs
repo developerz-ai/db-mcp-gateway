@@ -34,6 +34,7 @@ fn audit_row(user_sub: &str, request_id: &str) -> AuditRow {
         upstream_run_id: None,
         rows_affected: None,
         sql_truncated: false,
+        params: None,
     }
 }
 

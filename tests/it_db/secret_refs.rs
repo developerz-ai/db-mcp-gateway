@@ -220,10 +220,12 @@ async fn rotated_password_file_is_picked_up_without_restart() {
         .expect("target-db reachable; run `bin/dev up`");
     let role = format!("rot_{}", uuid::Uuid::new_v4().simple());
     let set_password = |pw: &str| format!("ALTER ROLE \"{role}\" PASSWORD '{pw}'");
-    sqlx::query(&format!("CREATE ROLE \"{role}\" LOGIN PASSWORD 'first-pw'"))
-        .execute(&probe)
-        .await
-        .expect("create rotation role");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE ROLE \"{role}\" LOGIN PASSWORD 'first-pw'"
+    )))
+    .execute(&probe)
+    .await
+    .expect("create rotation role");
 
     let mut file = tempfile::NamedTempFile::new().expect("tempfile");
     write!(file, "first-pw").expect("write first password");
@@ -253,7 +255,7 @@ async fn rotated_password_file_is_picked_up_without_restart() {
 
     run(registry.clone()).await.expect("first password works");
 
-    sqlx::query(&set_password("second-pw"))
+    sqlx::query(sqlx::AssertSqlSafe(set_password("second-pw")))
         .execute(&probe)
         .await
         .expect("rotate password");
@@ -268,9 +270,11 @@ async fn rotated_password_file_is_picked_up_without_restart() {
     // connection; it marks the adapter stale. The next one must succeed.
     let first = run(registry.clone()).await;
     let second = run(registry.clone()).await;
-    let _ = sqlx::query(&format!("DROP ROLE IF EXISTS \"{role}\""))
-        .execute(&probe)
-        .await;
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP ROLE IF EXISTS \"{role}\""
+    )))
+    .execute(&probe)
+    .await;
     if let Err(err) = &first {
         assert!(
             matches!(err, ExecError::Connection | ExecError::Unavailable),

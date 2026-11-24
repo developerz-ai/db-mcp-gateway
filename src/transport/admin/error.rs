@@ -18,7 +18,7 @@ use serde_json::{Value as JsonValue, json};
 
 /// Admin-API failure modes. Variants map 1:1 to stable JSON error codes:
 /// `forbidden`, `unauthorized`, `not_found`, `invalid_request`, `conflict`,
-/// `internal`, `session_too_old`.
+/// `internal`, `session_too_old`, `audit_unavailable`, `payload_too_large`.
 #[derive(Debug)]
 pub enum AdminErrorKind {
     /// Caller authenticated but is not in the configured admin group.
@@ -33,10 +33,15 @@ pub enum AdminErrorKind {
     NotFound,
     /// Request body fails validation (empty fields, malformed UUID, etc.).
     Invalid(String),
+    /// The body passed the route's byte bound (64 KiB on most routes).
+    PayloadTooLarge,
     /// The write raced another one: an `expected_updated_at` precondition
     /// failed, or Postgres aborted the transaction to break a deadlock. Safe
     /// to re-read and retry.
     Conflict(String),
+    /// The audit row for an admin read could not be written, so the read is
+    /// refused (CLAUDE.md MUST #4). Retryable once the state DB recovers.
+    AuditUnavailable,
     /// Anything we can't classify — DB outage, audit-write failure, encoder
     /// bug. Logged with the source; the user-facing body is generic.
     Internal,
@@ -79,12 +84,32 @@ impl AdminError {
         Self::new(AdminErrorKind::Invalid(msg.into()))
     }
 
+    pub const fn payload_too_large() -> Self {
+        Self::new(AdminErrorKind::PayloadTooLarge)
+    }
+
     pub fn conflict(msg: impl Into<String>) -> Self {
         Self::new(AdminErrorKind::Conflict(msg.into()))
     }
 
+    pub const fn audit_unavailable() -> Self {
+        Self::new(AdminErrorKind::AuditUnavailable)
+    }
+
     pub const fn internal() -> Self {
         Self::new(AdminErrorKind::Internal)
+    }
+
+    /// Prefix an `invalid_request` message (e.g. with the batch entry it came
+    /// from); every other kind is returned unchanged.
+    pub fn prefixed(self, prefix: &str) -> Self {
+        match self.kind {
+            AdminErrorKind::Invalid(msg) => Self {
+                kind: AdminErrorKind::Invalid(format!("{prefix}{msg}")),
+                request_id: self.request_id,
+            },
+            kind => Self { kind, ..self },
+        }
     }
 
     /// Stamp the per-request id onto this error. Idempotent — the most recent
@@ -103,7 +128,9 @@ impl AdminError {
             AdminErrorKind::SessionTooOld => StatusCode::FORBIDDEN,
             AdminErrorKind::NotFound => StatusCode::NOT_FOUND,
             AdminErrorKind::Invalid(_) => StatusCode::BAD_REQUEST,
+            AdminErrorKind::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             AdminErrorKind::Conflict(_) => StatusCode::CONFLICT,
+            AdminErrorKind::AuditUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             AdminErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -115,7 +142,9 @@ impl AdminError {
             AdminErrorKind::SessionTooOld => "session_too_old",
             AdminErrorKind::NotFound => "not_found",
             AdminErrorKind::Invalid(_) => "invalid_request",
+            AdminErrorKind::PayloadTooLarge => "payload_too_large",
             AdminErrorKind::Conflict(_) => "conflict",
+            AdminErrorKind::AuditUnavailable => "audit_unavailable",
             AdminErrorKind::Internal => "internal",
         }
     }
@@ -128,9 +157,15 @@ impl AdminError {
                 "session is too old for admin operations; re-authenticate".to_string()
             }
             AdminErrorKind::NotFound => "not found".to_string(),
+            AdminErrorKind::PayloadTooLarge => {
+                "request body exceeds this route's size limit".to_string()
+            }
             // The constructors of `Invalid` / `Conflict` are responsible for
             // not embedding sensitive values — field-name level only.
             AdminErrorKind::Invalid(msg) | AdminErrorKind::Conflict(msg) => msg.clone(),
+            AdminErrorKind::AuditUnavailable => {
+                "audit log unavailable; the read was not performed".to_string()
+            }
             AdminErrorKind::Internal => "internal error".to_string(),
         }
     }

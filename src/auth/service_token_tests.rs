@@ -6,7 +6,7 @@ fn account(name: &str, group: &str, token: &str) -> ServiceAccount {
     ServiceAccount {
         name: name.to_string(),
         group: group.to_string(),
-        token: Password::Literal(SecretString::from(token)),
+        tokens: vec![Password::Literal(SecretString::from(token))],
         max_concurrent_requests: None,
         require_upstream: false,
     }
@@ -151,7 +151,7 @@ fn unresolved_reference_is_a_boot_error_without_material() {
     let accounts = [ServiceAccount {
         name: "ci-bot".to_string(),
         group: "svc-ci".to_string(),
-        token: Password::EnvVar(missing.clone()),
+        tokens: vec![Password::EnvVar(missing.clone())],
         max_concurrent_requests: None,
         require_upstream: false,
     }];
@@ -221,5 +221,65 @@ fn authenticate_caller_carries_the_account_policy() {
             require_upstream: true,
             max_concurrent_requests: Some(64),
         }
+    );
+}
+
+/// A16: rotation under one name — every token of an account authenticates as
+/// the same `service:<name>` identity, group and policy.
+#[test]
+fn every_token_of_an_account_is_the_same_identity() {
+    let mut rotating = account("ci-bot", "svc-ci", &good_token("a1"));
+    rotating
+        .tokens
+        .push(Password::Literal(SecretString::from(good_token("a2"))));
+    rotating.require_upstream = true;
+    let store = ServiceTokenStore::from_config(&[rotating]).expect("two tokens build");
+    let (old, old_policy) = store.authenticate_caller(&good_token("a1")).expect("old");
+    let (new, new_policy) = store.authenticate_caller(&good_token("a2")).expect("new");
+    assert_eq!(old.user_sub, "service:ci-bot");
+    assert_eq!(new.user_sub, old.user_sub);
+    assert_eq!(new.user_email, old.user_email);
+    assert_eq!(new.groups, old.groups);
+    assert_eq!(new_policy, old_policy);
+}
+
+#[test]
+fn a_token_repeated_within_one_account_is_rejected_at_boot() {
+    let mut twice = account("ci-bot", "svc-ci", &good_token("a"));
+    twice
+        .tokens
+        .push(Password::Literal(SecretString::from(good_token("a"))));
+    let err = ServiceTokenStore::from_config(&[twice]).expect_err("repeat must fail");
+    assert!(
+        matches!(err, ServiceTokenError::DuplicateToken(..)),
+        "{err:?}"
+    );
+    assert!(!err.to_string().contains(&good_token("a")));
+}
+
+#[test]
+fn a_weak_second_token_is_rejected_at_boot() {
+    let mut rotating = account("ci-bot", "svc-ci", &good_token("a"));
+    rotating
+        .tokens
+        .push(Password::Literal(SecretString::from("dbmcp_svc_short")));
+    let err = ServiceTokenStore::from_config(&[rotating]).expect_err("weak must fail");
+    assert!(matches!(err, ServiceTokenError::WeakToken(name) if name == "ci-bot"));
+}
+
+#[test]
+fn a_large_rotation_list_loads_in_linear_time() {
+    // A pairwise duplicate check is ~2·10⁸ compares here: minutes, not the
+    // milliseconds a digest set takes.
+    let mut fleet = account("ci-bot", "svc-ci", &good_token("0"));
+    fleet.tokens = (1..=20_000u32)
+        .map(|i| Password::Literal(SecretString::from(good_token(&format!("{i:x}")))))
+        .collect();
+    let started = std::time::Instant::now();
+    ServiceTokenStore::from_config(&[fleet]).expect("distinct tokens load");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
     );
 }

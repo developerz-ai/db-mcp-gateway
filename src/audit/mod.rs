@@ -103,6 +103,9 @@ pub struct AuditRow {
     pub rows_affected: Option<i64>,
     /// `sql` was cut at [`AUDIT_SQL_MAX_BYTES`] before it was stored.
     pub sql_truncated: bool,
+    /// The positional `params` of `run_query` / `explain`, as stored by
+    /// [`cap_stored_params`]. `None` without params. Migration 0024.
+    pub params: Option<serde_json::Value>,
 }
 
 /// Bytes of `sql` one audit row stores. The SIEM export and the history read
@@ -115,6 +118,19 @@ pub const AUDIT_SQL_MAX_BYTES: usize = 64 * 1024;
 pub fn cap_stored_sql(sql: &str) -> (String, bool) {
     let kept = prefix_at_char_boundary(sql, AUDIT_SQL_MAX_BYTES);
     (kept.to_owned(), kept.len() < sql.len())
+}
+
+/// `params` as one audit row stores them, under the same byte cap as `sql`:
+/// the array itself, or, when its JSON is longer than
+/// [`AUDIT_SQL_MAX_BYTES`], that JSON's prefix (on a char boundary) as a JSON
+/// string. A string in the column is therefore a cut array.
+pub fn cap_stored_params(params: &[serde_json::Value]) -> serde_json::Value {
+    let array = serde_json::Value::Array(params.to_vec());
+    let text = array.to_string();
+    if text.len() <= AUDIT_SQL_MAX_BYTES {
+        return array;
+    }
+    serde_json::Value::String(prefix_at_char_boundary(&text, AUDIT_SQL_MAX_BYTES).to_owned())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -181,5 +197,25 @@ mod tests {
         let exact = "x".repeat(AUDIT_SQL_MAX_BYTES);
         assert_eq!(cap_stored_sql(&exact), (exact.clone(), false));
         assert_eq!(cap_stored_sql("SELECT 1"), ("SELECT 1".to_owned(), false));
+    }
+
+    #[test]
+    fn stored_params_past_the_cap_are_the_cut_json_text() {
+        let params = vec![
+            serde_json::json!(1),
+            serde_json::json!("x"),
+            serde_json::Value::Null,
+        ];
+        assert_eq!(
+            cap_stored_params(&params),
+            serde_json::json!([1, "x", null])
+        );
+
+        let long = vec![serde_json::Value::String("é".repeat(AUDIT_SQL_MAX_BYTES))];
+        let serde_json::Value::String(cut) = cap_stored_params(&long) else {
+            panic!("a cut array is stored as a string");
+        };
+        assert!(cut.len() <= AUDIT_SQL_MAX_BYTES);
+        assert!(serde_json::Value::Array(long).to_string().starts_with(&cut));
     }
 }

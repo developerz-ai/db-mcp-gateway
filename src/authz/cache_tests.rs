@@ -56,6 +56,7 @@ impl PermissionsRepo for CountingRepo {
             db_name: None,
             action: GrantAction::QueryRead,
             constraints: serde_json::json!({}),
+            expires_at: None,
         }])
     }
 }
@@ -165,6 +166,17 @@ async fn service_identity_never_reads_the_store() {
     let grants = cache.get_for(&service).await.unwrap();
     assert!(grants.is_empty());
     assert_eq!(repo.loads.load(Ordering::SeqCst), 0);
+}
+
+/// YAML-only mode has no store to reach: every subject's DB-grant set is
+/// empty, nothing is cached, and an invalidation is a no-op.
+#[tokio::test]
+async fn yaml_only_cache_answers_empty_without_a_store() {
+    let cache = PermissionsCache::yaml_only();
+    assert!(cache.get_for(&identity("alice")).await.unwrap().is_empty());
+    cache.apply(&PermissionsChange::All).await;
+    assert!(cache.get_for(&identity("alice")).await.unwrap().is_empty());
+    assert_eq!(cache.slot_count().await, 0);
 }
 
 #[tokio::test]

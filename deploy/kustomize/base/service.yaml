@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: db-mcp-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: db-mcp-gateway
+  ports:
+    - { name: https, port: 443, targetPort: gateway, protocol: TCP }
+---
+# /metrics labels name every configured database: never behind an Ingress.
+apiVersion: v1
+kind: Service
+metadata:
+  name: db-mcp-gateway-metrics
+  labels:
+    app.kubernetes.io/component: metrics
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: db-mcp-gateway
+  ports:
+    - { name: metrics, port: 9090, targetPort: metrics, protocol: TCP }

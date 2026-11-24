@@ -83,7 +83,11 @@ fn write_role_is_shape_and_superuser_checked() {
         "app",
         "query_read",
     ));
-    assert!(msg.contains("bad-role"), "{msg}");
+    assert!(msg.contains("`write_role` must match"), "{msg}");
+    assert!(
+        !msg.contains("bad-role"),
+        "the value must never be echoed: {msg}"
+    );
     let err = ConfigFile::from_yaml_str(&yaml(
         ", write_role: postgres, write_password: y",
         "app",

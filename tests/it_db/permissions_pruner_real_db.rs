@@ -54,9 +54,9 @@ async fn grant(
 }
 
 async fn exists(p: &PgPool, table: &str, id: Uuid) -> bool {
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT EXISTS (SELECT 1 FROM {table} WHERE id = $1)"
-    ))
+    )))
     .bind(id)
     .fetch_one(p)
     .await

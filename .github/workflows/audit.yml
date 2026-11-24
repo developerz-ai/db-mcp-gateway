@@ -1,0 +1,118 @@
+name: audit
+
+# Daily advisory audit of `main` (owner decision H8). An advisory lands without
+# any commit here, so ci.yml's `audit` (which blocks only lock- and
+# config-changing PRs) never sees it; this run does, and opens an issue (or
+# comments on the open one) instead of turning every PR red. It closes the
+# issue once `main` audits clean. A manual run on another branch audits that
+# branch but never touches the issue: only `issue` holds `issues: write`, and
+# it runs on `refs/heads/main` alone.
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  audit:
+    # GitHub-hosted runner: this repository is public.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rc: ${{ steps.audit.outputs.rc }}
+      report: ${{ steps.audit.outputs.report }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update
+      # Same pin as ci.yml's `audit` job.
+      - name: install cargo-audit
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
+        with:
+          tool: cargo-audit@0.23.0
+      # Same command as ci.yml's `audit` job: no ignores. The report's tail
+      # rides a job output (well under the 1 MB cap) to the `issue` job.
+      - id: audit
+        run: |
+          rc=0
+          cargo audit > "$RUNNER_TEMP/audit.txt" 2>&1 || rc=$?
+          cat "$RUNNER_TEMP/audit.txt"
+          delim="EOF_$(openssl rand -hex 16)"
+          {
+            echo "rc=$rc"
+            echo "report<<$delim"
+            tail -c 60000 "$RUNNER_TEMP/audit.txt"
+            echo
+            echo "$delim"
+          } >> "$GITHUB_OUTPUT"
+      - if: steps.audit.outputs.rc != '0'
+        run: |
+          echo "::error::cargo audit exited ${{ steps.audit.outputs.rc }}"
+          exit 1
+
+  issue:
+    needs: audit
+    # Runs whatever `audit` concluded (a red audit is the case that writes);
+    # only a `main` run speaks for `main`.
+    if: always() && github.ref == 'refs/heads/main' && needs.audit.outputs.rc != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: open, update or close the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          AUDIT_RC: ${{ needs.audit.outputs.rc }}
+          REPORT: ${{ needs.audit.outputs.report }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ISSUE_TITLE: "cargo audit fails on main"
+          # The issue this workflow owns: opened by github-actions[bot] and
+          # carrying this marker. A title alone is anyone's to copy.
+          MARKER: "<!-- db-mcp-gateway:audit.yml:cargo-audit-main -->"
+        run: |
+          # A re-run of an older `main` run audited a commit `main` has moved
+          # past: its verdict no longer speaks for `main`, so it never opens,
+          # comments on or closes the issue.
+          tip=$(gh api "repos/$GH_REPO/commits/main" --jq .sha)
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "::notice::audited $GITHUB_SHA, but main is now $tip: the issue is left as it is"
+            exit 0
+          fi
+          # Captured whole, never piped into `head`: under pipefail an early
+          # close would fail gh with SIGPIPE.
+          owned=$(gh api --paginate "repos/$GH_REPO/issues?state=open&creator=github-actions%5Bbot%5D&per_page=100" \
+            --jq '.[] | select(.pull_request == null and .user.login == "github-actions[bot]"
+                     and ((.body // "") | contains(env.MARKER))) | .number')
+          open=${owned%%$'\n'*}
+          if [ "$AUDIT_RC" = 0 ]; then
+            if [ -n "$open" ]; then
+              gh issue close "$open" --comment "\`main\` audits clean again: $RUN_URL"
+            fi
+            exit 0
+          fi
+          {
+            echo "$MARKER"
+            echo "\`cargo audit\` on \`main\` exited $AUDIT_RC: $RUN_URL"
+            echo
+            echo '```'
+            printf '%s\n' "$REPORT"
+            echo '```'
+          } > "$RUNNER_TEMP/body.md"
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body-file "$RUNNER_TEMP/body.md"
+          else
+            gh issue create --title "$ISSUE_TITLE" --body-file "$RUNNER_TEMP/body.md"
+          fi

@@ -21,6 +21,8 @@
 
 mod args;
 
+use std::time::Instant;
+
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
@@ -32,14 +34,14 @@ use crate::config::{Action, ConfigFile, Grant};
 use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
-use super::args::parse_arguments;
+use super::args::{LIMIT_AT_LEAST_ONE, parse_arguments};
 use super::audit_dispatch::{
-    AuditHeader, Outcome, OutcomeCode, audit_outcome, error_outcome, invalid_arguments,
-    reject_arguments, run_audited, success_outcome,
+    AuditHeader, Outcome, OutcomeCode, audit_outcome, elapsed_ms_since, error_outcome,
+    invalid_arguments, reject_arguments, run_audited, success_outcome,
 };
 use super::target::{ensure_reason, forbidden};
 pub use args::Arguments;
-use args::{effective_limit, limit_was_clamped, parse_since};
+use args::{effective_limit, limit_was_clamped, parse_since, parse_sql_sha256};
 
 const TOOL_NAME: &str = "get_query_history";
 
@@ -59,11 +61,13 @@ struct SuccessPayload {
     next_cursor: Option<String>,
 }
 
-/// The validated query window: `since` and `cursor` parsed, `limit` clamped.
+/// The validated query window: `since`, `cursor` and `sql_sha256` parsed,
+/// `limit` clamped.
 #[derive(Debug, Clone, Copy)]
-struct Window {
+struct Window<'a> {
     since: Option<DateTime<Utc>>,
     before: Option<HistoryCursor>,
+    sql_sha256: Option<&'a str>,
     limit: u32,
 }
 
@@ -76,9 +80,8 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
     // Build the header before any post-deserialisation validation so a
     // `since` / `limit` rejection is still audited. Missing that row would
     // leave the boundary probes (a caller sweeping bad `limit` values
-    // against another user's server) undetectable — .coderabbit.yaml
-    // §src/audit: "flag any code path that completes a tool call without an
-    // audit row".
+    // against another user's server) undetectable: no code path completes a
+    // tool call without an audit row.
     let header = AuditHeader {
         tool: TOOL_NAME,
         server: Some(&args.server),
@@ -103,7 +106,7 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
     // error. Validated once, at the edge, like `since`, and audited the same
     // way so a `limit: 0` sweep leaves a trail.
     if args.limit == Some(0) {
-        let outcome = invalid_arguments(id.clone(), "`limit` must be at least 1");
+        let outcome = invalid_arguments(id.clone(), LIMIT_AT_LEAST_ONE);
         return audit_outcome(ctx, id, header, outcome).await;
     }
     let before = match args.cursor.as_deref().map(HistoryCursor::parse).transpose() {
@@ -113,9 +116,14 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
             return audit_outcome(ctx, id, header, outcome).await;
         }
     };
+    let Ok(sql_sha256) = parse_sql_sha256(args.sql_sha256.as_deref()) else {
+        let outcome = invalid_arguments(id.clone(), "`sql_sha256` must be 64 hex digits");
+        return audit_outcome(ctx, id, header, outcome).await;
+    };
     let window = Window {
         since,
         before,
+        sql_sha256: sql_sha256.as_deref(),
         limit: effective_limit(args.limit),
     };
     let args = &args;
@@ -164,8 +172,9 @@ async fn compute_outcome(
     id: Value,
     db_grants: &[Grant],
     args: &Arguments,
-    window: Window,
+    window: Window<'_>,
 ) -> Outcome {
+    let started = Instant::now();
     if let Err(rejected) = authorize(ctx.identity, ctx.config, db_grants, args) {
         return *rejected;
     }
@@ -175,6 +184,7 @@ async fn compute_outcome(
         server: &args.server,
         database: &args.database,
         upstream_run_id: ctx.request.upstream.run_id(),
+        sql_sha256: window.sql_sha256,
         since: window.since,
         before: window.before,
         limit: window.limit,
@@ -200,7 +210,8 @@ async fn compute_outcome(
         Ok(t) => t,
         Err(_) => return error_outcome(OutcomeCode::Internal, "failed to serialize result"),
     };
-    success_outcome(id, text, None, None, Some(truncated))
+    let elapsed = Some(elapsed_ms_since(started));
+    success_outcome(id, text, elapsed, None, Some(truncated))
 }
 
 #[cfg(test)]
@@ -248,6 +259,7 @@ permissions:
             since: None,
             limit: None,
             cursor: None,
+            sql_sha256: None,
             reason: reason.map(str::to_string),
         }
     }

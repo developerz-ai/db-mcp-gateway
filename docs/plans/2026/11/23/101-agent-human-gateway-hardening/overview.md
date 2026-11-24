@@ -11,7 +11,7 @@ Make the gateway great for agents (fewer failed calls, self-explaining limits) a
 - Evidence level per row: **V** = re-read by the coordinator or executed; **R** = read by one agent; **P** = plausible, reproducing test first. Line refs are `ad833b7`; re-verify before trusting.
 
 ## Public-tree rules for this plan
-- `SET-n` rows and slice 02: detail lives in the owner's private notes (ask the owner), not here.
+- `SET-n` rows: detail lives in the owner's private notes (ask the owner), not here. Slice 02 was published after 2.3.1 shipped.
 - Deployment and consumer-platform slices exist in their own repositories; nothing about them here.
 
 ## Plan files (execute in order)

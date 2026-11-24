@@ -35,8 +35,9 @@ use uuid::Uuid;
 
 const ADMIN_GROUP: &str = "db-mcp-gateway-admins";
 
-/// Databases may only be registered on a config-declared server, so declare
-/// every server these tests register on.
+/// Databases may only be registered when the config declares them, so declare
+/// every server these tests register on. [`admin_yaml`] adds each harness's
+/// own database names.
 const ADMIN_YAML: &str = "servers:
   - name: prod
     kind: postgres
@@ -73,14 +74,41 @@ async fn mint_session(
     jwt::issue(signing_key, session.id, user_sub, Duration::from_secs(600)).expect("issue JWT")
 }
 
+/// Database names each harness declares per server; [`Harness::fresh_db`]
+/// hands them out.
+const DECLARED_PER_HARNESS: usize = 4;
+
+/// [`ADMIN_YAML`] plus `db-<run>-<n>` on every server: unique per harness, so
+/// parallel tests never collide on the live `(server, db_name)` index.
+fn admin_yaml(run: &str) -> String {
+    let app = "      - { name: app, role: ro, password: hunter2 }\n";
+    let mut dbs = app.to_string();
+    for n in 0..DECLARED_PER_HARNESS {
+        dbs.push_str(&format!(
+            "      - {{ name: db-{run}-{n}, role: ro, password: hunter2 }}\n"
+        ));
+    }
+    ADMIN_YAML.replace(app, &dbs)
+}
+
 struct Harness {
     base_url: String,
     pool: PgPool,
+    run: String,
+    next_db: usize,
     cleanup_db_ids: Vec<Uuid>,
     cleanup_admin_subs: Vec<String>,
 }
 
 impl Harness {
+    /// A database name the config declares and no other test uses.
+    fn fresh_db(&mut self) -> String {
+        assert!(self.next_db < DECLARED_PER_HARNESS, "declare more names");
+        let name = format!("db-{}-{}", self.run, self.next_db);
+        self.next_db += 1;
+        name
+    }
+
     fn track_db(&mut self, id: Uuid) {
         self.cleanup_db_ids.push(id);
     }
@@ -103,7 +131,8 @@ impl Harness {
 async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
     let pool = state_pool().await;
     let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
-    let gw = GatewayBuilder::new(ADMIN_YAML)
+    let run = Uuid::new_v4().simple().to_string();
+    let gw = GatewayBuilder::new(&admin_yaml(&run))
         .admin(ADMIN_GROUP, true)
         .repo(repo)
         .spawn(pool)
@@ -112,6 +141,8 @@ async fn spawn_gateway() -> (Harness, AuthConfig, SessionStore) {
         Harness {
             base_url: gw.url,
             pool: gw.state_db,
+            run,
+            next_db: 0,
             cleanup_db_ids: Vec::new(),
             cleanup_admin_subs: Vec::new(),
         },
@@ -179,7 +210,7 @@ async fn admin_creates_database_and_audit_row_recorded() {
         .bearer_auth(&jwt)
         .json(&json!({
             "server": "prod",
-            "db_name": format!("app-{}", Uuid::new_v4().simple()),
+            "db_name": h.fresh_db(),
             "db_type": "postgres",
         }))
         .send()
@@ -222,7 +253,7 @@ async fn post_with_dsn_field_is_rejected() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
 
-    let target_name = format!("app-{}", Uuid::new_v4().simple());
+    let target_name = h.fresh_db();
 
     for forbidden_field in ["connection_string", "dsn", "password", "role"] {
         let body = json!({
@@ -274,7 +305,7 @@ async fn patch_with_dsn_field_is_rejected() {
         .bearer_auth(&jwt)
         .json(&json!({
             "server": "prod",
-            "db_name": format!("app-{}", Uuid::new_v4().simple()),
+            "db_name": h.fresh_db(),
             "db_type": "postgres",
         }))
         .send()
@@ -330,7 +361,7 @@ async fn mongo_db_type_is_accepted() {
         .bearer_auth(&jwt)
         .json(&json!({
             "server": "docs",
-            "db_name": format!("events-{}", Uuid::new_v4().simple()),
+            "db_name": h.fresh_db(),
             "db_type": "mongo",
         }))
         .send()
@@ -356,7 +387,7 @@ async fn unknown_db_type_is_rejected() {
         .bearer_auth(&jwt)
         .json(&json!({
             "server": "prod",
-            "db_name": format!("app-{}", Uuid::new_v4().simple()),
+            "db_name": h.fresh_db(),
             "db_type": "sqlite",
         }))
         .send()
@@ -468,7 +499,7 @@ async fn wildcard_sentinel_server_is_rejected() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
 
-    let db_name = format!("app-{}", Uuid::new_v4().simple());
+    let db_name = h.fresh_db();
     let resp = client()
         .post(format!("{}/admin/v1/databases", h.base_url))
         .bearer_auth(&jwt)
@@ -545,7 +576,7 @@ async fn patch_to_wildcard_sentinel_db_name_is_rejected() {
         .bearer_auth(&jwt)
         .json(&json!({
             "server": "prod",
-            "db_name": format!("app-{}", Uuid::new_v4().simple()),
+            "db_name": h.fresh_db(),
             "db_type": "postgres",
         }))
         .send()
@@ -579,7 +610,7 @@ async fn patch_updates_and_audits_before_and_after() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
 
-    let original_name = format!("app-{}", Uuid::new_v4().simple());
+    let original_name = h.fresh_db();
     let create: Value = client()
         .post(format!("{}/admin/v1/databases", h.base_url))
         .bearer_auth(&jwt)
@@ -599,7 +630,7 @@ async fn patch_updates_and_audits_before_and_after() {
     let id: Uuid = create["id"].as_str().unwrap().parse().unwrap();
     h.track_db(id);
 
-    let renamed = format!("renamed-{}", Uuid::new_v4().simple());
+    let renamed = h.fresh_db();
     let resp = client()
         .patch(format!("{}/admin/v1/databases/{}", h.base_url, id))
         .bearer_auth(&jwt)
@@ -637,7 +668,7 @@ async fn delete_soft_deletes_and_audits() {
         .bearer_auth(&jwt)
         .json(&json!({
             "server": "prod",
-            "db_name": format!("app-{}", Uuid::new_v4().simple()),
+            "db_name": h.fresh_db(),
             "db_type": "postgres",
         }))
         .send()
@@ -681,8 +712,8 @@ async fn list_excludes_soft_deleted() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
 
-    let alive_name = format!("alive-{}", Uuid::new_v4().simple());
-    let dead_name = format!("dead-{}", Uuid::new_v4().simple());
+    let alive_name = h.fresh_db();
+    let dead_name = h.fresh_db();
 
     let alive: Value = client()
         .post(format!("{}/admin/v1/databases", h.base_url))
@@ -759,7 +790,7 @@ async fn non_admin_gets_403_and_no_writes() {
     )
     .await;
 
-    let body_name = format!("app-{}", Uuid::new_v4().simple());
+    let body_name = h.fresh_db();
     let resp = client()
         .post(format!("{}/admin/v1/databases", h.base_url))
         .bearer_auth(&jwt)
@@ -821,7 +852,7 @@ async fn duplicate_server_db_name_is_400_not_500() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
 
-    let db_name = format!("app-{}", Uuid::new_v4().simple());
+    let db_name = h.fresh_db();
     let body = json!({ "server": "prod", "db_name": db_name, "db_type": "postgres" });
 
     let first = client()
@@ -874,7 +905,7 @@ async fn soft_deleted_pair_can_be_registered_again() {
     let (mut h, auth_cfg, sessions) = spawn_gateway().await;
     let (jwt, _) = admin_jwt(&sessions, &auth_cfg, &mut h).await;
 
-    let db_name = format!("app-{}", Uuid::new_v4().simple());
+    let db_name = h.fresh_db();
     let body = json!({ "server": "prod", "db_name": db_name, "db_type": "postgres" });
 
     let created: Value = client()
@@ -927,7 +958,7 @@ async fn patch_renaming_onto_an_existing_pair_is_400_not_500() {
     let mut ids = Vec::new();
     let mut names = Vec::new();
     for _ in 0..2 {
-        let db_name = format!("app-{}", Uuid::new_v4().simple());
+        let db_name = h.fresh_db();
         let created: Value = client()
             .post(format!("{}/admin/v1/databases", h.base_url))
             .bearer_auth(&jwt)

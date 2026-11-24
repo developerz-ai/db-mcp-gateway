@@ -70,6 +70,11 @@ RUN for attempt in 1 2 3 4 5; do \
     done
 
 COPY . .
+# `build_info{git_sha}` (src/startup/metrics/loaded.rs) reads GIT_SHA at
+# compile time. Declared after `cargo chef cook`, so a new SHA never busts the
+# cached dependency layer — only this final build, which `COPY . .` busts anyway.
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
 RUN cargo build --release --locked
 
 # ---- runtime ----

@@ -66,7 +66,7 @@ fn fingerprint(server: &Server, db: &Database) -> Option<String> {
         return None;
     }
     Some(format!(
-        "{}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        "{}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
         server.host,
         server.port,
         server.tls,
@@ -74,6 +74,7 @@ fn fingerprint(server: &Server, db: &Database) -> Option<String> {
         server.pool,
         db.role,
         db.auth_database,
+        db.connect_name,
         db.pool,
         db.password,
         db.write_role,

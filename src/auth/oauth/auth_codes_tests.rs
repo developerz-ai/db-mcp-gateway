@@ -8,18 +8,32 @@ fn identity() -> GrantIdentity {
     }
 }
 
+async fn insert(store: &AuthCodes, code: &str) -> Result<(), StoreError> {
+    store
+        .insert(
+            code,
+            identity(),
+            "challenge".into(),
+            "https://app/cb".into(),
+            "client-1".into(),
+        )
+        .await
+}
+
+async fn take(store: &AuthCodes, code: &str) -> Option<AuthCode> {
+    store.take(code).await.expect("memory take")
+}
+
 /// Insert a code with an explicit expiry, bypassing the real `CODE_TTL` (60s)
 /// so tests can manufacture already-expired entries without sleeping.
-async fn insert_with_expiry(store: &AuthCodes, code: &str, expires_at: Instant) {
-    let mut map = store.inner.lock().await;
-    map.insert(
+async fn insert_with_expiry(store: &AuthCodes, code: &str, expires_at: DateTime<Utc>) {
+    let Backend::Memory(map) = &store.backend else {
+        panic!("memory backend");
+    };
+    map.lock().await.insert(
         hash_secret(code),
         AuthCode {
-            identity: GrantIdentity {
-                sub: "test".into(),
-                email: "test@example.com".into(),
-                groups: vec![],
-            },
+            identity: identity(),
             code_challenge: "challenge".into(),
             redirect_uri: "https://app/cb".into(),
             client_id: "client".into(),
@@ -31,107 +45,61 @@ async fn insert_with_expiry(store: &AuthCodes, code: &str, expires_at: Instant) 
 #[tokio::test]
 async fn auth_code_round_trips_by_raw_code_and_is_consumed_once() {
     let store = AuthCodes::default();
-    store
-        .insert(
-            "raw-code",
-            identity(),
-            "challenge".into(),
-            "https://app/cb".into(),
-            "client-1".into(),
-        )
-        .await
-        .unwrap();
+    insert(&store, "raw-code").await.unwrap();
 
-    let entry = store.take("raw-code").await.expect("code is live");
+    let entry = take(&store, "raw-code").await.expect("code is live");
     assert_eq!(entry.client_id, "client-1");
-    assert!(store.take("raw-code").await.is_none());
+    assert!(take(&store, "raw-code").await.is_none());
 }
 
 #[tokio::test]
-async fn auth_codes_gc_removes_expired_entries() {
+async fn restored_code_is_redeemable_again() {
     let store = AuthCodes::default();
-    store
-        .insert(
-            "code1",
-            identity(),
-            "ch".into(),
-            "uri".into(),
-            "client".into(),
-        )
-        .await
-        .unwrap();
+    insert(&store, "raw-code").await.unwrap();
+    let entry = take(&store, "raw-code").await.expect("code is live");
+    store.restore("raw-code", entry).await.unwrap();
+    assert!(take(&store, "raw-code").await.is_some());
+}
 
-    // Code exists.
-    assert!(store.take("code1").await.is_some());
+#[tokio::test]
+async fn auth_codes_gc_removes_only_expired_entries() {
+    let store = AuthCodes::default();
+    insert_with_expiry(&store, "stale", Utc::now() - Duration::seconds(1)).await;
+    insert(&store, "live").await.unwrap();
+    assert_eq!(store.gc_expired().await, 1);
+    assert!(take(&store, "stale").await.is_none());
+    assert!(take(&store, "live").await.is_some());
+}
 
-    // Re-insert and run gc.
-    store
-        .insert(
-            "code2",
-            identity(),
-            "ch".into(),
-            "uri".into(),
-            "client".into(),
-        )
-        .await
-        .unwrap();
-    store.gc_expired().await;
-    // Code2 is still within TTL.
-    assert!(store.take("code2").await.is_some());
+#[tokio::test]
+async fn expired_code_is_not_returned() {
+    let store = AuthCodes::default();
+    insert_with_expiry(&store, "stale", Utc::now() - Duration::seconds(1)).await;
+    assert!(take(&store, "stale").await.is_none());
 }
 
 #[tokio::test]
 async fn auth_codes_rejects_when_full() {
     let store = AuthCodes::default();
-    // Fill to the limit.
     for i in 0..AUTH_CODES_MAX_SIZE {
-        let code = format!("code-{i}");
-        store
-            .insert(
-                &code,
-                identity(),
-                "challenge".into(),
-                "uri".into(),
-                "client".into(),
-            )
-            .await
-            .unwrap();
+        insert(&store, &format!("code-{i}")).await.unwrap();
     }
-
-    // Next insert should fail.
-    let result = store
-        .insert(
-            "overflow",
-            identity(),
-            "challenge".into(),
-            "uri".into(),
-            "client".into(),
-        )
-        .await;
-    assert_eq!(result, Err(StoreError::StoreFull));
+    assert_eq!(insert(&store, "overflow").await, Err(StoreError::StoreFull));
 }
 
-/// Same opportunistic-GC regression as `PendingFlows`, for `AuthCodes`.
+/// A burst of codes that has since expired must not wedge new logins until
+/// the periodic sweep.
 #[tokio::test]
 async fn auth_codes_opportunistic_gc_reclaims_room_at_cap() {
     let store = AuthCodes::default();
-    let already_expired = Instant::now() - Duration::from_secs(1);
+    let already_expired = Utc::now() - Duration::seconds(1);
     for i in 0..AUTH_CODES_MAX_SIZE {
         insert_with_expiry(&store, &format!("expired-{i}"), already_expired).await;
     }
 
-    let result = store
-        .insert(
-            "real-code",
-            identity(),
-            "challenge".into(),
-            "uri".into(),
-            "client".into(),
-        )
-        .await;
     assert!(
-        result.is_ok(),
+        insert(&store, "real-code").await.is_ok(),
         "opportunistic GC must free room for a real code at cap"
     );
-    assert!(store.take("real-code").await.is_some());
+    assert!(take(&store, "real-code").await.is_some());
 }

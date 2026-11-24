@@ -7,47 +7,57 @@
 //! step below can overflow, and spelled the way `chrono` spells the values
 //! it can hold.
 
-use sqlx::postgres::{PgValueFormat, PgValueRef};
-
 const MICROS_PER_SECOND: i64 = 1_000_000;
 const MICROS_PER_DAY: i64 = 86_400 * MICROS_PER_SECOND;
 /// Days from 1970-01-01 to Postgres' epoch, 2000-01-01.
 const PG_EPOCH_DAYS: i64 = 10_957;
 
 /// `YYYY-MM-DD`.
-pub(super) fn date(raw: &PgValueRef<'_>) -> Option<String> {
-    render(raw, |wire| Some(date_text(i32::from_be_bytes(wire))))
+pub(super) fn date(wire: &[u8]) -> Option<String> {
+    Some(date_text(i32::from_be_bytes(wire.try_into().ok()?)))
 }
 
 /// ISO-8601 with the `T` separator and no zone.
-pub(super) fn timestamp(raw: &PgValueRef<'_>) -> Option<String> {
-    render(raw, |wire| {
-        Some(timestamp_text(i64::from_be_bytes(wire), ""))
-    })
+pub(super) fn timestamp(wire: &[u8]) -> Option<String> {
+    Some(timestamp_text(
+        i64::from_be_bytes(wire.try_into().ok()?),
+        "",
+    ))
 }
 
 /// RFC 3339 in UTC, which is how Postgres sends a `timestamptz`.
-pub(super) fn timestamptz(raw: &PgValueRef<'_>) -> Option<String> {
-    render(raw, |wire| {
-        Some(timestamp_text(i64::from_be_bytes(wire), "+00:00"))
-    })
+pub(super) fn timestamptz(wire: &[u8]) -> Option<String> {
+    let micros = i64::from_be_bytes(wire.try_into().ok()?);
+    Some(timestamp_text(micros, "+00:00"))
 }
 
 /// `HH:MM:SS[.ffffff]`.
-pub(super) fn time(raw: &PgValueRef<'_>) -> Option<String> {
-    render(raw, |wire| time_text(i64::from_be_bytes(wire)))
+pub(super) fn time(wire: &[u8]) -> Option<String> {
+    time_text(i64::from_be_bytes(wire.try_into().ok()?))
 }
 
-/// A text-format cell is already Postgres' own rendering; a binary one is a
-/// fixed-width integer. Any other length is not this type.
-fn render<const N: usize>(
-    raw: &PgValueRef<'_>,
-    binary: impl FnOnce([u8; N]) -> Option<String>,
-) -> Option<String> {
-    if raw.format() == PgValueFormat::Text {
-        return raw.as_str().ok().map(str::to_string);
+/// `HH:MM:SS[.ffffff]±HH:MM`: the time of day, then the zone it was given
+/// in. Postgres sends the zone as seconds *west* of UTC.
+pub(super) fn timetz(wire: &[u8]) -> Option<String> {
+    let (micros, west) = wire.split_first_chunk::<8>()?;
+    let west = i32::from_be_bytes(west.try_into().ok()?);
+    Some(format!(
+        "{}{}",
+        time_text(i64::from_be_bytes(*micros))?,
+        offset_text(-i64::from(west))
+    ))
+}
+
+/// A UTC offset in seconds east; the seconds are printed only when there
+/// are any (zones before standard time had them).
+fn offset_text(east: i64) -> String {
+    let sign = if east < 0 { '-' } else { '+' };
+    let east = east.unsigned_abs();
+    let (h, m, s) = (east / 3_600, east / 60 % 60, east % 60);
+    match s {
+        0 => format!("{sign}{h:02}:{m:02}"),
+        s => format!("{sign}{h:02}:{m:02}:{s:02}"),
     }
-    binary(raw.as_bytes().ok()?.try_into().ok()?)
 }
 
 /// `days` since 2000-01-01; the two extremes are Postgres' infinities.
@@ -147,6 +157,28 @@ mod tests {
             timestamp_text(-1, "+00:00"),
             "1999-12-31T23:59:59.999999+00:00"
         );
+    }
+
+    #[test]
+    fn a_time_with_a_zone_keeps_the_zone() {
+        let wire = |micros: i64, west: i32| {
+            [micros.to_be_bytes().as_slice(), &west.to_be_bytes()].concat()
+        };
+        let noon = 12 * 3_600 * MICROS_PER_SECOND;
+        assert_eq!(timetz(&wire(noon, 0)).as_deref(), Some("12:00:00+00:00"));
+        assert_eq!(
+            timetz(&wire(noon + 500_000, -19_800)).as_deref(),
+            Some("12:00:00.500+05:30")
+        );
+        assert_eq!(
+            timetz(&wire(MICROS_PER_DAY, 28_800)).as_deref(),
+            Some("24:00:00-08:00")
+        );
+        assert_eq!(
+            timetz(&wire(0, 1_172)).as_deref(),
+            Some("00:00:00-00:19:32")
+        );
+        assert_eq!(timetz(&wire(noon, 0)[..11]), None);
     }
 
     #[test]

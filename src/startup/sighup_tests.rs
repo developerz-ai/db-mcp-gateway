@@ -30,7 +30,9 @@ async fn sighup_with_tls_off_reloads_and_keeps_running() {
         .connect_lazy_with(sqlx::postgres::PgConnectOptions::new().host("offline.invalid"));
     let targets = ReloadTargets {
         path: file.path().to_path_buf(),
-        audit_sinks: Arc::new(ArcSwap::from_pointee(StreamSinks::from_config(&[]))),
+        audit_sinks: Arc::new(ArcSwap::from_pointee(
+            StreamSinks::from_config(&[]).expect("no sinks"),
+        )),
         config: Arc::new(ArcSwap::from_pointee(config)),
         service_tokens: Arc::new(ArcSwap::from_pointee(ServiceTokenStore::default())),
         permissions_cache: PermissionsCache::new(

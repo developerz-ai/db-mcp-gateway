@@ -2,34 +2,103 @@
 //!
 //! `can_see_server_effective` and `evaluate_effective` extend the YAML-only
 //! versions with a per-identity DB-grant slice. Both sources merge
-//! most-restrictively — neither is privileged. This module encapsulates
-//! that logic and its tests.
+//! most-restrictively — neither is privileged. [`matching_grants`] is the one
+//! place a grant is judged to apply; evaluation, discovery and the admin
+//! `explain` route all read it, so they cannot drift.
 //!
 //! Resolver-level safety proofs live in `effective_proptests` (#50, test-only module).
 
+use chrono::{DateTime, Utc};
+
 use crate::auth::Identity;
+use crate::config::schema::Subject;
 use crate::config::{Action, Constraints, Grant, Permission, Server};
 
-use super::{Decision, grant_applies, merge};
+use super::{Decision, grant_applies, merge, subject_matches};
 
 /// `can_see_server` extended with a per-identity DB-grant slice (#49).
 /// Symmetric merge: a server is visible if YAML *or* DB grants make it so.
+/// An expired DB grant reveals nothing.
 pub fn can_see_server_effective(
     identity: &Identity,
     server: &Server,
     yaml_permissions: &[Permission],
     db_grants_for_identity: &[Grant],
 ) -> bool {
+    let now = Utc::now();
     super::can_see_server(identity, server, yaml_permissions)
         || db_grants_for_identity
             .iter()
-            .any(|grant| super::grant_can_see(grant, server))
+            .any(|grant| grant.is_live_at(now) && super::grant_can_see(grant, server))
 }
 
-/// `evaluate` extended with a per-identity DB-grant slice (#49).
-///
-/// YAML grants are group-keyed; DB grants are user-keyed and pre-resolved to
-/// this `identity` by the loader, so they bypass the group filter. Both sets
+/// Where a matched grant came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantSource<'a> {
+    /// A `permissions:` block, by its subject.
+    Yaml(&'a Subject),
+    /// Index into the DB-grant slice the caller passed.
+    Db(usize),
+}
+
+/// One grant that applies to a request.
+#[derive(Debug, Clone, Copy)]
+pub struct MatchedGrant<'a> {
+    pub source: GrantSource<'a>,
+    pub grant: &'a Grant,
+}
+
+/// Every grant that applies to `(action, server, database)` for `identity`
+/// at `now`: YAML blocks whose subject matches the identity, then the DB
+/// grants (pre-resolved to this identity by the loader, so they skip the
+/// subject filter). Expired grants never match.
+pub fn matching_grants<'a>(
+    identity: &'a Identity,
+    action: Action,
+    target: (&'a str, &'a str),
+    yaml_permissions: &'a [Permission],
+    db_grants_for_identity: &'a [Grant],
+    now: DateTime<Utc>,
+) -> impl Iterator<Item = MatchedGrant<'a>> + 'a {
+    let (server, database) = target;
+    let applies = move |g: &Grant| g.is_live_at(now) && grant_applies(g, action, server, database);
+    let yaml = yaml_permissions
+        .iter()
+        .filter(|p| subject_matches(&p.subject, identity))
+        .flat_map(|p| {
+            p.grants.iter().map(|grant| MatchedGrant {
+                source: GrantSource::Yaml(&p.subject),
+                grant,
+            })
+        });
+    let db = db_grants_for_identity
+        .iter()
+        .enumerate()
+        .map(|(index, grant)| MatchedGrant {
+            source: GrantSource::Db(index),
+            grant,
+        });
+    yaml.chain(db).filter(move |m| applies(m.grant))
+}
+
+/// Fold matched grants into a decision: allowed iff at least one matched,
+/// constraints merged most-restrictively.
+pub fn decide<'a>(matches: impl IntoIterator<Item = MatchedGrant<'a>>) -> Decision {
+    let mut merged: Option<Constraints> = None;
+    for m in matches {
+        let c = &m.grant.constraints;
+        merged = Some(match merged {
+            Some(acc) => merge(&acc, c),
+            None => merge(&Constraints::default(), c),
+        });
+    }
+    match merged {
+        Some(constraints) => Decision::Allow { constraints },
+        None => Decision::Deny,
+    }
+}
+
+/// `evaluate` extended with a per-identity DB-grant slice (#49). Both sets
 /// feed the same most-restrictive merge — there is no priority between them.
 pub fn evaluate_effective(
     identity: &Identity,
@@ -39,246 +108,89 @@ pub fn evaluate_effective(
     yaml_permissions: &[Permission],
     db_grants_for_identity: &[Grant],
 ) -> Decision {
-    let yaml_matches = yaml_permissions
-        .iter()
-        .filter(|p| identity.groups.iter().any(|g| g == &p.group))
-        .flat_map(|p| p.grants.iter())
-        .filter(|g| grant_applies(g, action, server, database));
+    evaluate_effective_at(
+        identity,
+        action,
+        (server, database),
+        yaml_permissions,
+        db_grants_for_identity,
+        Utc::now(),
+    )
+}
 
-    let db_matches = db_grants_for_identity
-        .iter()
-        .filter(|g| grant_applies(g, action, server, database));
+/// [`evaluate_effective`] at a fixed instant — what expiry tests pin.
+pub fn evaluate_effective_at(
+    identity: &Identity,
+    action: Action,
+    target: (&str, &str),
+    yaml_permissions: &[Permission],
+    db_grants_for_identity: &[Grant],
+    now: DateTime<Utc>,
+) -> Decision {
+    decide(matching_grants(
+        identity,
+        action,
+        target,
+        yaml_permissions,
+        db_grants_for_identity,
+        now,
+    ))
+}
 
-    let mut merged_some = false;
-    let mut merged = Constraints::default();
-    for c in yaml_matches.chain(db_matches).map(|g| &g.constraints) {
-        merged = merge(&merged, c);
-        merged_some = true;
-    }
-    if merged_some {
-        Decision::Allow {
-            constraints: merged,
-        }
-    } else {
-        Decision::Deny
-    }
+/// Every action a grant can name, in hierarchy order — the questions
+/// [`held_actions`] asks [`evaluate_effective`].
+pub const ALL_ACTIONS: [Action; 4] = [
+    Action::SchemaRead,
+    Action::QueryRead,
+    Action::QueryWrite,
+    Action::HistoryRead,
+];
+
+/// One action `identity` holds on a `(server, database)`, with the merged
+/// constraints evaluation enforces for exactly that action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldAction {
+    pub action: Action,
+    pub constraints: Constraints,
+}
+
+/// What [`evaluate_effective`] answers for each of [`ALL_ACTIONS`] on
+/// `(server, database)`: the allowed ones, in that order. Empty means no
+/// access. The discovery tools report this, so what they show is what a
+/// call is held to — there is no second evaluation path to drift.
+pub fn held_actions(
+    identity: &Identity,
+    server: &str,
+    database: &str,
+    yaml_permissions: &[Permission],
+    db_grants_for_identity: &[Grant],
+) -> Vec<HeldAction> {
+    let now = Utc::now();
+    ALL_ACTIONS
+        .into_iter()
+        .filter_map(|action| {
+            match evaluate_effective_at(
+                identity,
+                action,
+                (server, database),
+                yaml_permissions,
+                db_grants_for_identity,
+                now,
+            ) {
+                Decision::Allow { constraints } => Some(HeldAction {
+                    action,
+                    constraints,
+                }),
+                Decision::Deny => None,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::auth::SessionId;
-    use crate::config::{Database, Password, ServerKind, Tls};
+#[path = "effective_tests.rs"]
+mod tests;
 
-    fn identity(groups: &[&str]) -> Identity {
-        Identity {
-            session_id: SessionId::new(),
-            user_sub: "test-sub".to_string(),
-            user_email: "test@example.com".to_string(),
-            groups: groups.iter().map(|g| g.to_string()).collect(),
-            issued_at: chrono::Utc::now(),
-            kind: crate::auth::IdentityKind::Sso,
-        }
-    }
-
-    fn database(name: &str) -> Database {
-        Database {
-            name: name.to_string(),
-            role: "ro".to_string(),
-            password: Password::Literal("pw".into()),
-            description: String::new(),
-            auth_database: None,
-            pool: None,
-            write_role: None,
-            write_password: None,
-        }
-    }
-
-    fn server(name: &str) -> Server {
-        Server {
-            name: name.to_string(),
-            kind: ServerKind::Postgres,
-            description: String::new(),
-            host: "h".to_string(),
-            port: 5432,
-            tls: Tls::Required,
-            tls_ca_file: None,
-            pool: None,
-            databases: vec![database("app")],
-        }
-    }
-
-    fn grant(server: &str, database: &str, action: Action) -> Grant {
-        Grant {
-            server: server.to_string(),
-            database: database.to_string(),
-            action,
-            constraints: Constraints::default(),
-        }
-    }
-
-    fn grant_with(server: &str, database: &str, action: Action, constraints: Constraints) -> Grant {
-        Grant {
-            server: server.to_string(),
-            database: database.to_string(),
-            action,
-            constraints,
-        }
-    }
-
-    fn permission(group: &str, server: &str, action: Action) -> Permission {
-        Permission {
-            group: group.to_string(),
-            grants: vec![grant(server, "*", action)],
-        }
-    }
-
-    // --- can_see_server_effective ---
-
-    #[test]
-    fn db_grant_alone_makes_server_visible() {
-        let id = identity(&["nobody"]);
-        let server = server("prod");
-        let db_grants = vec![grant("prod", "app", Action::QueryRead)];
-        assert!(can_see_server_effective(&id, &server, &[], &db_grants));
-    }
-
-    #[test]
-    fn db_grant_respects_database_existence() {
-        let id = identity(&["nobody"]);
-        let server = server("prod"); // databases = [app]
-        let db_grants = vec![grant("prod", "missing", Action::QueryRead)];
-        assert!(!can_see_server_effective(&id, &server, &[], &db_grants));
-    }
-
-    #[test]
-    fn yaml_and_db_grants_merge_visibly() {
-        let id = identity(&["engineers"]);
-        let server = server("prod");
-        let yaml_perms = vec![permission("engineers", "staging", Action::QueryRead)];
-        let db_grants = vec![grant("prod", "app", Action::QueryRead)];
-        // Visible because DB grant covers prod, even though YAML doesn't.
-        assert!(can_see_server_effective(
-            &id,
-            &server,
-            &yaml_perms,
-            &db_grants
-        ));
-    }
-
-    // --- evaluate_effective ---
-
-    #[test]
-    fn db_grant_alone_grants_access() {
-        let id = identity(&["nobody"]);
-        let db_grants = vec![grant("prod", "app", Action::QueryRead)];
-        let decision = evaluate_effective(&id, Action::QueryRead, "prod", "app", &[], &db_grants);
-        assert_eq!(
-            decision,
-            Decision::Allow {
-                constraints: Constraints::default()
-            }
-        );
-    }
-
-    #[test]
-    fn db_grant_respects_action_hierarchy() {
-        let id = identity(&["nobody"]);
-        let db_grants = vec![grant("prod", "app", Action::SchemaRead)];
-        // SchemaRead grant doesn't cover QueryRead.
-        let decision = evaluate_effective(&id, Action::QueryRead, "prod", "app", &[], &db_grants);
-        assert_eq!(decision, Decision::Deny);
-    }
-
-    #[test]
-    fn yaml_and_db_grants_merge_constraints() {
-        let id = identity(&["oncall"]);
-        let yaml_perms = vec![Permission {
-            group: "oncall".to_string(),
-            grants: vec![grant_with(
-                "prod",
-                "app",
-                Action::QueryRead,
-                Constraints {
-                    require_reason: false,
-                    row_limit: Some(10_000),
-                    statement_timeout_ms: None,
-                },
-            )],
-        }];
-        let db_grants = vec![grant_with(
-            "prod",
-            "app",
-            Action::QueryRead,
-            Constraints {
-                require_reason: true,
-                row_limit: Some(1_000),
-                statement_timeout_ms: Some(5_000),
-            },
-        )];
-        let decision = evaluate_effective(
-            &id,
-            Action::QueryRead,
-            "prod",
-            "app",
-            &yaml_perms,
-            &db_grants,
-        );
-        assert_eq!(
-            decision,
-            Decision::Allow {
-                constraints: Constraints {
-                    require_reason: true,
-                    row_limit: Some(1_000),
-                    statement_timeout_ms: Some(5_000),
-                }
-            }
-        );
-    }
-
-    #[test]
-    fn evaluate_merges_yaml_and_db_most_restrictive() {
-        let id = identity(&["engineers"]);
-        let yaml_perms = vec![Permission {
-            group: "engineers".to_string(),
-            grants: vec![grant_with(
-                "*",
-                "*",
-                Action::QueryRead,
-                Constraints {
-                    require_reason: false,
-                    row_limit: Some(50_000),
-                    statement_timeout_ms: Some(30_000),
-                },
-            )],
-        }];
-        let db_grants = vec![grant_with(
-            "prod",
-            "app",
-            Action::QueryRead,
-            Constraints {
-                require_reason: false,
-                row_limit: Some(100),
-                statement_timeout_ms: Some(1_000),
-            },
-        )];
-        let decision = evaluate_effective(
-            &id,
-            Action::QueryRead,
-            "prod",
-            "app",
-            &yaml_perms,
-            &db_grants,
-        );
-        assert_eq!(
-            decision,
-            Decision::Allow {
-                constraints: Constraints {
-                    require_reason: false,
-                    row_limit: Some(100),              // most restrictive
-                    statement_timeout_ms: Some(1_000), // most restrictive
-                }
-            }
-        );
-    }
-}
+#[cfg(test)]
+#[path = "held_actions_proptests.rs"]
+mod held_actions_proptests;

@@ -144,7 +144,7 @@ impl Fixture {
     }
 
     async fn exec(&self, sql: &str) {
-        sqlx::query(sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql))
             .execute(&self.owner)
             .await
             .unwrap_or_else(|e| panic!("fixture SQL failed ({sql}): {e}"));

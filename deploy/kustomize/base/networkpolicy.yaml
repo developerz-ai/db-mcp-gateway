@@ -1,0 +1,43 @@
+# Rules without `from`/`to` allow any peer on their ports: narrow them in an
+# overlay — the gateway port to the ingress controller and agent namespaces,
+# egress to the state DB, target and IdP CIDRs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-mcp-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: db-mcp-gateway
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports:
+        - { port: gateway, protocol: TCP }
+    - ports:
+        - { port: metrics, protocol: TCP }
+      from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+  egress:
+    - ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+    # State DB
+    - ports:
+        - { port: 5432, protocol: TCP }
+    # IdP: discovery, JWKS, token exchange
+    - ports:
+        - { port: 443, protocol: TCP }
+    # Targets: Postgres, MySQL, Mongo, Redis
+    - ports:
+        - { port: 3306, protocol: TCP }
+        - { port: 27017, protocol: TCP }
+        - { port: 6379, protocol: TCP }

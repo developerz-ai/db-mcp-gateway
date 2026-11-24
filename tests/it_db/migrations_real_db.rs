@@ -54,7 +54,9 @@ async fn migrations_apply_from_empty_and_rerun_as_a_no_op() {
         .expect("admin connection");
     let database = format!("migrations_{}", Uuid::new_v4().simple());
     admin
-        .execute(format!("CREATE DATABASE \"{database}\"").as_str())
+        .execute(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE \"{database}\""
+        )))
         .await
         .expect("create scratch database");
     let url = url_for(&state_db_url(), &database);
@@ -93,9 +95,19 @@ async fn migrations_apply_from_empty_and_rerun_as_a_no_op() {
         }
     }
 
+    let params_type: Option<String> = sqlx::query_scalar(
+        "SELECT data_type::text FROM information_schema.columns \
+         WHERE table_name = 'audit_calls' AND column_name = 'params'",
+    )
+    .fetch_optional(&fresh)
+    .await
+    .expect("information_schema lookup");
+
     fresh.close().await;
     admin
-        .execute(format!("DROP DATABASE \"{database}\" WITH (FORCE)").as_str())
+        .execute(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE \"{database}\" WITH (FORCE)"
+        )))
         .await
         .expect("drop scratch database");
     admin.close().await.expect("close admin connection");
@@ -118,6 +130,11 @@ async fn migrations_apply_from_empty_and_rerun_as_a_no_op() {
         );
     }
     assert!(intents_idx, "0010 index missing");
+    assert_eq!(
+        params_type.as_deref(),
+        Some("jsonb"),
+        "0024 audit_calls.params"
+    );
     assert!(history_idx, "0011 index missing");
     assert!(superseded_idx.is_empty(), "0015 left {superseded_idx:?}");
     assert!(
@@ -138,7 +155,9 @@ async fn newer_schema_boots_and_an_edited_migration_still_refuses() {
         .expect("admin connection");
     let database = format!("migrations_{}", Uuid::new_v4().simple());
     admin
-        .execute(format!("CREATE DATABASE \"{database}\"").as_str())
+        .execute(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE \"{database}\""
+        )))
         .await
         .expect("create scratch database");
     let url = url_for(&state_db_url(), &database);
@@ -164,7 +183,9 @@ async fn newer_schema_boots_and_an_edited_migration_still_refuses() {
         p.close().await;
     }
     admin
-        .execute(format!("DROP DATABASE \"{database}\" WITH (FORCE)").as_str())
+        .execute(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE \"{database}\" WITH (FORCE)"
+        )))
         .await
         .expect("drop scratch database");
     admin.close().await.expect("close admin connection");

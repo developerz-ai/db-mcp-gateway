@@ -1,8 +1,10 @@
 //! State-DB queries for the OAuth bridge: refresh-token chains
 //! (`oauth_refresh_tokens`, migration 0009; rotated-token tombstones in
-//! `oauth_refresh_rotated`, migration 0017) and Dynamic-Client-Registration
-//! clients (`oauth_clients`, migrations 0008 and 0019, in [`clients`]). Queries only — TTL, cap and
-//! fail-closed policy stay with the callers in `crate::auth::oauth`.
+//! `oauth_refresh_rotated`, migration 0017), Dynamic-Client-Registration
+//! clients (`oauth_clients`, migrations 0008 and 0019, in [`clients`]), and
+//! login state (migration 0022): pending logins and consents in
+//! [`login_flows`], authorization codes in [`auth_codes`]. Queries only — TTL,
+//! cap and fail-closed policy stay with the callers in `crate::auth::oauth`.
 //!
 //! Every function returns the raw `sqlx::Error`; callers must never render it,
 //! because its `Display` can embed the DSN (see `state::connect`).
@@ -12,11 +14,21 @@ use sqlx::types::Json;
 use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
+mod auth_codes;
 mod clients;
+mod login_flows;
 
+pub use auth_codes::{
+    AuthCodeRow, NewAuthCode, delete_expired_auth_codes, insert_auth_code_capped,
+    restore_auth_code, take_auth_code,
+};
 pub use clients::{
     ClientRow, LiveClient, delete_expired_clients, find_client, insert_client_capped,
     lock_client_registry, promote_client,
+};
+pub use login_flows::{
+    ConsentCaps, ConsentRow, NewConsent, delete_expired_login_flows, insert_consent, insert_flow,
+    take_consent, take_flow,
 };
 
 /// A refresh-token row to upsert. `token_hash` is the SHA-256 of the bearer

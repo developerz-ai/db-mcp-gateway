@@ -49,7 +49,11 @@ impl ConfigFile {
             }
         }
         for account in &self.service_accounts {
-            if matches!(account.token, Password::Literal(_)) {
+            if account
+                .tokens
+                .iter()
+                .any(|token| matches!(token, Password::Literal(_)))
+            {
                 return Err(literal_error(format!(
                     "service_accounts[{}].token",
                     account.name
