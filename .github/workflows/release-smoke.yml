@@ -140,10 +140,20 @@ jobs:
           docker run -d --name state --network smoke \
             -e POSTGRES_USER=gateway -e POSTGRES_PASSWORD=smoke-only -e POSTGRES_DB=gateway \
             postgres:16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d
+          # Over TCP: on a fresh volume the image's init server listens on the
+          # unix socket only, which a socket probe would call ready.
+          ready=false
           for _ in $(seq 60); do
-            docker exec state pg_isready -U gateway -d gateway -q && break
+            if docker exec state pg_isready -h 127.0.0.1 -U gateway -d gateway -q; then
+              ready=true
+              break
+            fi
             sleep 1
           done
+          if [ "$ready" != true ]; then
+            echo "::error::the smoke state DB never accepted TCP connections"
+            exit 1
+          fi
           config="$RUNNER_TEMP/config.yml"
           cat > "$config" <<'YAML'
           servers:

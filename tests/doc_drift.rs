@@ -1,17 +1,17 @@
 //! Doc drift: the names the docs tell an operator or an agent to type must
 //! exist in the code. Offline and fast — it reads files, never boots anything.
 //!
-//! - the pinned image version in the docs and in every example compose file
-//!   (including a `${VAR:-image:tag}` default) is `Cargo.toml`'s;
-//! - every env var in the quickstart table is read by the code, and every env
-//!   var the code reads is in that table;
+//! - every numeric image tag in the docs (GHCR and DOCR) and in every example
+//!   compose file (including a `${VAR:-image:tag}` default) is `Cargo.toml`'s;
+//! - every env var in the quickstart table is read by shipped code, and every
+//!   env var shipped code reads is in that table;
 //! - every documented `METHOD /path` is mounted with that method, and every
 //!   other documented gateway path is mounted;
 //! - the tool lists name exactly the advertised tools;
 //! - the log contract lists every audit outcome code, and no doc uses a
 //!   retired one;
-//! - every metric in the catalogue is emitted;
-//! - every documented MCP client URL ends in the MCP path;
+//! - every metric in the catalogue is named by shipped code;
+//! - every documented or shipped MCP client URL ends in the MCP path;
 //! - every gateway config under `examples/` parses.
 
 // CLAUDE.md §Conventions: tests may panic; `[lints.clippy]` denies it for shipped code.
@@ -22,6 +22,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use db_mcp_gateway::config::ConfigFile;
+use db_mcp_gateway::mcp::protocol::TOOLS_LIST;
 use regex::Regex;
 
 /// The default `MCP_PATH`, which every client URL in the docs must carry.
@@ -30,6 +31,8 @@ const QUICKSTART: &str = "website/docs/deployment/quickstart.md";
 const LOGGING: &str = "website/docs/deployment/logging.md";
 /// Codes that once appeared in docs but were never (or are no longer) emitted.
 const RETIRED_CODES: &[&str] = &["row_limit_exceeded"];
+/// Read only by the `admin` CLI to find its session file, never by the gateway.
+const CLI_ONLY_ENV: &[&str] = &["HOME", "XDG_CONFIG_HOME"];
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -77,10 +80,42 @@ fn docs() -> Vec<(String, String)> {
 
 /// All Rust sources under `src/`, concatenated.
 fn src() -> String {
-    let paths = files_under("src", &["rs"]);
-    paths
+    shipped_files().into_iter().map(|(_, text)| text).collect()
+}
+
+/// Every `src/` file that ships, with its unit tests and comments removed: a
+/// name left behind in a test, a comment or a commented-out call is not code
+/// the gateway runs.
+fn shipped_files() -> Vec<(PathBuf, String)> {
+    files_under("src", &["rs"])
+        .into_iter()
+        .filter(|p| !is_test_file(p))
+        .map(|p| {
+            let text = shipped_text(&fs::read_to_string(&p).unwrap());
+            (p, text)
+        })
+        .collect()
+}
+
+fn is_test_file(path: &Path) -> bool {
+    let name = path.file_name().unwrap().to_string_lossy();
+    name.ends_with("tests.rs") || path.components().any(|c| c.as_os_str() == "tests")
+}
+
+/// `text` up to its `#[cfg(test)] mod`, without comment lines.
+fn shipped_text(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let test_mod = (0..lines.len()).find(|&i| {
+        lines[i].trim() == "#[cfg(test)]"
+            && lines[i + 1..]
+                .iter()
+                .find(|l| !l.trim_start().starts_with("#["))
+                .is_some_and(|l| l.trim_start().starts_with("mod "))
+    });
+    lines[..test_mod.unwrap_or(lines.len())]
         .iter()
-        .map(|p| fs::read_to_string(p).unwrap())
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(|l| [*l, "\n"])
         .collect()
 }
 
@@ -113,10 +148,15 @@ fn first_column_names(doc: &str, heading: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// A gateway image pinned to a release tag in either published registry. The
+/// whole tag is captured, so `2.3.1-rc1` is not read as `2.3.1`.
+const PINNED_IMAGE: &str =
+    r"(?:ghcr\.io|registry\.digitalocean\.com)/developerz-ai/db-mcp-gateway:(\d[0-9A-Za-z.+-]*)";
+
 #[test]
 fn pinned_image_version_is_the_crate_version() {
     let version = env!("CARGO_PKG_VERSION");
-    let pin = Regex::new(r"ghcr\.io/developerz-ai/db-mcp-gateway:(\d+\.\d+\.\d+)").unwrap();
+    let pin = Regex::new(PINNED_IMAGE).unwrap();
     for (rel, text) in docs() {
         for c in pin.captures_iter(&text) {
             assert_eq!(&c[1], version, "{rel} pins another image version");
@@ -174,6 +214,17 @@ fn example_compose_images_are_the_crate_version() {
 }
 
 #[test]
+fn pinned_image_reads_the_whole_tag_in_both_registries() {
+    let pin = Regex::new(PINNED_IMAGE).unwrap();
+    let tag = |text: &str| pin.captures(text).map(|c| c[1].to_string());
+    let ghcr = "ghcr.io/developerz-ai/db-mcp-gateway:2.3.1-rc1`";
+    assert_eq!(tag(ghcr).as_deref(), Some("2.3.1-rc1"));
+    let docr = "registry.digitalocean.com/developerz-ai/db-mcp-gateway:9.9.9 ";
+    assert_eq!(tag(docr).as_deref(), Some("9.9.9"));
+    assert_eq!(tag("ghcr.io/developerz-ai/db-mcp-gateway:latest"), None);
+}
+
+#[test]
 fn image_default_unwraps_compose_defaults() {
     assert_eq!(
         image_default("${GATEWAY_IMAGE:-ghcr.io/x:1.0.0}"),
@@ -190,19 +241,50 @@ fn documented_env_vars_match_the_code() {
         "### The environment variables the gateway reads",
     );
     assert!(documented.len() > 20, "env table not found: {documented:?}");
-    let code = src();
-    for name in &documented {
-        assert!(code.contains(&format!("\"{name}\"")), "{name}: never read");
-    }
-    let read_by_code = captures(
-        r#"(?:env::var|required|env\s*=)\(?\s*"([A-Z][A-Z0-9_]+)""#,
-        &code,
+    let read_by_code = env_reads();
+    let never_read: Vec<_> = documented.difference(&read_by_code).collect();
+    assert!(
+        never_read.is_empty(),
+        "documented, never read: {never_read:?}"
     );
-    let undocumented: Vec<_> = read_by_code.difference(&documented).collect();
+    let undocumented: Vec<_> = read_by_code
+        .difference(&documented)
+        .filter(|name| !CLI_ONLY_ENV.contains(&name.as_str()))
+        .collect();
     assert!(
         undocumented.is_empty(),
         "not in {QUICKSTART}: {undocumented:?}"
     );
+}
+
+/// Every env var name shipped code passes to a reader: a literal argument to
+/// `env::var`/`env::var_os`/`required`/`bool_flag_from_env` or clap's `env =`,
+/// a same-file `const` passed to `env::var`/`env::var_os`, or a `*_VARS`
+/// array the code loops over into `env::var`.
+fn env_reads() -> BTreeSet<String> {
+    let literal = Regex::new(
+        r#"(?:env::var(?:_os)?\(|required\(|bool_flag_from_env\(|env\s*=\s*)\s*"([A-Z][A-Z0-9_]+)""#,
+    )
+    .unwrap();
+    let constant = Regex::new(r#"const ([A-Z_]+): &str = "([A-Z][A-Z0-9_]+)""#).unwrap();
+    let array = Regex::new(r"(?s)const ([A-Z_]+_VARS): \[&str; \d+\] = \[(.*?)\];").unwrap();
+    let mut names = BTreeSet::new();
+    for (_, text) in shipped_files() {
+        names.extend(literal.captures_iter(&text).map(|c| c[1].to_string()));
+        for c in constant.captures_iter(&text) {
+            let passed = Regex::new(&format!(r"env::var(?:_os)?\({}\)", &c[1])).unwrap();
+            if passed.is_match(&text) {
+                names.insert(c[2].to_string());
+            }
+        }
+        for c in array.captures_iter(&text) {
+            let looped = format!("in {}", &c[1]);
+            if text.contains(&looped) && text.contains("std::env::var(var)") {
+                names.extend(captures(r#""([A-Z][A-Z0-9_]+)""#, &c[2]));
+            }
+        }
+    }
+    names
 }
 
 /// A documented path with its parameter segments (`:id`, `<id>`, `{id}`, `…`)
@@ -302,12 +384,27 @@ fn documented_routes_are_mounted() {
 }
 
 #[test]
-fn tool_lists_name_the_advertised_tools() {
-    let tools = captures(
-        r#"pub const [A-Z_]+_TOOL: &str = "([a-z_]+)";"#,
-        &read("src/mcp/protocol.rs"),
+fn shipped_text_drops_comments_and_the_test_module() {
+    let text = "let r = Router::new()\n    // .route(\"/gone\", get(gone))\n    .route(\"/kept\", get(kept));\n\
+                #[cfg(test)]\n#[path = \"x_tests.rs\"]\nmod tests;\nconst T: &str = \"TEST_ONLY\";\n";
+    let shipped = shipped_text(text);
+    let routes = mounted_routes(&shipped);
+    assert!(routes.contains(&("GET".to_string(), "/kept".to_string())));
+    assert!(
+        !routes.iter().any(|(_, path)| path == "/gone"),
+        "{routes:?}"
     );
-    assert_eq!(tools.len(), 11, "tool constants changed: {tools:?}");
+    assert!(!shipped.contains("TEST_ONLY"));
+}
+
+#[test]
+fn tool_lists_name_the_advertised_tools() {
+    let tools: BTreeSet<String> = TOOLS_LIST
+        .tools
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect();
+    assert!(tools.len() >= 10, "tools/list shrank: {tools:?}");
     let readme = read("README.md");
     let line = readme
         .lines()
@@ -375,7 +472,7 @@ fn documented_client_urls_end_in_the_mcp_path() {
         r"(?m)^\s+db-gateway\s+(https?://\S+)",
     ];
     let mut checked = 0;
-    for (rel, text) in docs() {
+    for (rel, text) in docs().into_iter().chain(client_configs()) {
         for re in patterns {
             for url in captures(re, &text) {
                 checked += 1;
@@ -392,6 +489,31 @@ fn documented_client_urls_end_in_the_mcp_path() {
         let url = server["url"].as_str().expect("server URL");
         assert!(url.ends_with(MCP_PATH), "{name}: {url} lacks {MCP_PATH}");
     }
+}
+
+/// The shipped MCP client configs (`examples/**/*.json`), each of which must
+/// name at least one server URL so the check above cannot skip it.
+fn client_configs() -> Vec<(String, String)> {
+    let configs: Vec<(String, String)> = files_under("examples", &["json"])
+        .into_iter()
+        .map(|p| {
+            let rel = p.strip_prefix(root()).unwrap().display().to_string();
+            (rel, fs::read_to_string(&p).unwrap())
+        })
+        .collect();
+    assert!(
+        configs.iter().any(|(rel, _)| rel == "examples/.mcp.json"),
+        "examples/.mcp.json not found: {configs:?}"
+    );
+    for (rel, text) in &configs {
+        let json: serde_json::Value =
+            serde_json::from_str(text).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        let urls = json["mcpServers"].as_object().map_or(0, |servers| {
+            servers.values().filter(|s| s["url"].is_string()).count()
+        });
+        assert!(urls > 0, "{rel} names no MCP server url");
+    }
+    configs
 }
 
 #[test]

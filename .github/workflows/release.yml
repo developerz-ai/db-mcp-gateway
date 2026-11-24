@@ -216,6 +216,9 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Never an automatic `latest` (a semver rule adds one by default):
+          # only the gated step below moves it, after signing.
+          flavor: latest=false
           # v1.4.5 → 1.4.5, plus 1.4 and 1 where preflight says this is the
           # newest release in that line. `:latest` moves in its own step below.
           tags: |
@@ -227,6 +230,9 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.DOCR_REGISTRY }}/${{ env.DOCR_IMAGE_NAME }}
+          # Never an automatic `latest` (a semver rule adds one by default):
+          # only the gated step below moves it, after signing.
+          flavor: latest=false
           # Mirror the GHCR tag set so the same refs work in DOCR.
           tags: |
             type=semver,pattern={{version}}

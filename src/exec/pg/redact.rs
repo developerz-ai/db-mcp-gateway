@@ -127,18 +127,23 @@ pub(super) fn name_at<'s>(sqlstate: &str, sql: &'s str, position: usize) -> Opti
 
 /// The server's hint, when it can only be about the statement: a parse or
 /// analysis diagnostic (class `42`) located in the caller's statement, not
-/// on a cast operand. Those hints name catalog objects and fixed advice
-/// (`Perhaps you meant to reference the column "users.email".`); a hint
-/// raised at run time, over data, has no position and is dropped.
+/// on a cast operand. Those hints name statement objects and fixed advice
+/// (`No function matches the given name and argument types.`); a hint
+/// raised at run time, over data, has no position and is dropped. A column
+/// diagnostic's hint is dropped too: Postgres picks the column it suggests
+/// from the whole relation, column grants aside — `near_misses` is the
+/// privilege-filtered answer.
 pub(super) fn safe_hint<'h>(
     sqlstate: &str,
     position: Option<usize>,
     sql: &str,
     hint: Option<&'h str>,
 ) -> Option<&'h str> {
+    if COLUMN_REFERENCE.contains(&sqlstate) {
+        return None;
+    }
     let at = position.filter(|_| is_parser_diagnostic(sqlstate))?;
-    let on_cast = identifier_at(sql, at)
-        .is_some_and(|(name, after)| is_cast(name, after) && !COLUMN_REFERENCE.contains(&sqlstate));
+    let on_cast = identifier_at(sql, at).is_some_and(|(name, after)| is_cast(name, after));
     if on_cast { None } else { hint }
 }
 

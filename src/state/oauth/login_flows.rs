@@ -80,13 +80,18 @@ pub struct ConsentCaps {
 
 /// Insert a consent, first evicting the subject's soonest-expiring consents
 /// down to `per_subject - 1` and then the table's down to `total - 1`, in
-/// `tx` so the evictions and the insert land together.
+/// `tx` so the evictions and the insert land together. An advisory lock held
+/// to the end of `tx` serialises consent inserts across replicas: without it
+/// two racing inserts each evict for themselves and both caps overshoot.
 pub async fn insert_consent(
     tx: &mut Transaction<'_, Postgres>,
     consent: &NewConsent<'_>,
     ttl: chrono::Duration,
     caps: ConsentCaps,
 ) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('oauth_pending_consents', 0))")
+        .execute(&mut **tx)
+        .await?;
     sqlx::query(
         "DELETE FROM oauth_pending_consents WHERE consent_hash IN ( \
            SELECT consent_hash FROM oauth_pending_consents WHERE user_sub = $1 \

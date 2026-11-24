@@ -33,6 +33,13 @@ fn the_body_ends_before_the_terminator_whatever_trails_it() {
     assert_eq!(body("SELECT (1);\n ; "), "SELECT (1)");
     assert_eq!(body("SELECT ';' -- all;"), "SELECT ';'");
     assert_eq!(body("SELECT $1 /* ; */"), "SELECT $1");
+    // Leading empty statements are cut too: the body nests.
+    assert_eq!(
+        body("; SELECT relacl FROM pg_class"),
+        "SELECT relacl FROM pg_class"
+    );
+    assert_eq!(body(" ;; -- c\n ;(SELECT 1);"), "(SELECT 1)");
+    assert_eq!(statement_body(" ; "), None);
 }
 
 #[test]

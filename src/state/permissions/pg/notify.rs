@@ -5,8 +5,12 @@
 //! commits. [`listen`] feeds each delivery to the caller. A dropped listener
 //! connection loses notifications, so from the drop until `LISTEN` is back
 //! the listener reports [`PermissionsChange::All`] at once and then every
-//! [`Liveness::ping_every`], and once more on resubscribing — the bound is
-//! one beat, not the TTL and not the length of the outage.
+//! [`Liveness::ping_every`], and once more on resubscribing — once a drop is
+//! noticed, the bound is one beat, not the TTL and not the length of the
+//! outage. Noticing is the other half: an announced drop is seen at once, a
+//! silent one only after [`Liveness::deadline`] (15 s in production), so a
+//! revoke right after a silent drop can stay in force on that replica for up
+//! to the deadline, then one beat.
 //!
 //! A drop is not always announced: a NAT or firewall can discard the
 //! connection without a FIN, and a receive on it then waits forever. So the

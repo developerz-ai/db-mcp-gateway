@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::config::{Action, Grant, ServerKind};
+use crate::exec::adapter::effective_timeout_ms;
 use crate::exec::{Access, DbAdapter, ExecError, SchemaDetail, SchemaQuery};
 use crate::mcp::jsonrpc::Response;
 
@@ -169,7 +170,7 @@ async fn compute_outcome(
         return *rejected;
     }
 
-    if let Err(refused) = record_intent(ctx, header, &target, Access::ReadOnly).await {
+    if let Err(refused) = record_intent(ctx, header, &target, Access::ReadOnly, None).await {
         return *refused;
     }
 
@@ -208,18 +209,26 @@ async fn compute_outcome(
         sample_limit: sampling.map_or(0, |s| s.documents),
         request_id: ctx.request.request_id,
     };
-    let schemas = match (mongo, args.schema.is_none()) {
+    // Schema discovery and the catalog read share one statement budget.
+    let (schemas, spent_ms) = match (mongo, args.schema.is_none()) {
         (false, true) => match schema_names(adapter.as_ref(), &query).await {
-            Ok(names) => Some(names),
+            Ok((names, spent_ms)) => (Some(names), spent_ms),
             Err(err) => return outcome_from_exec_error(err, started, &ERROR_MESSAGES),
         },
-        _ => None,
+        _ => (None, 0),
+    };
+    let query = match remaining_budget(query.statement_timeout_ms, spent_ms) {
+        Ok(left_ms) => SchemaQuery {
+            statement_timeout_ms: Some(left_ms),
+            ..query
+        },
+        Err(err) => return outcome_from_exec_error(err, started, &ERROR_MESSAGES),
     };
     let result = match adapter.describe_schema(query).await {
         Ok(result) => result,
         Err(err) => return outcome_from_exec_error(err, started, &ERROR_MESSAGES),
     };
-    let elapsed = i64::try_from(result.elapsed_ms).unwrap_or(i64::MAX);
+    let elapsed = i64::try_from(result.elapsed_ms.saturating_add(spent_ms)).unwrap_or(i64::MAX);
     let rendered = if mongo {
         let omitted = args.detail == Detail::Full && sampling.is_none();
         mongo::render(detail, &result, omitted)
@@ -236,20 +245,37 @@ async fn compute_outcome(
     success_outcome(id, text, Some(elapsed), Some(count), Some(result.truncated))
 }
 
-/// The schemas the read role may use, for a call that named none.
+/// The schemas the read role may use, for a call that named none, and the
+/// milliseconds the lookup took.
 async fn schema_names(
     adapter: &dyn DbAdapter,
     query: &SchemaQuery<'_>,
-) -> Result<Vec<String>, ExecError> {
+) -> Result<(Vec<String>, u64), ExecError> {
     let listed = adapter
         .describe_schema(SchemaQuery {
             detail: SchemaDetail::Schemas,
             ..*query
         })
         .await?;
-    Ok(listed
+    let names = listed
         .rows
         .iter()
         .filter_map(|row| row.first()?.as_str().map(str::to_owned))
-        .collect())
+        .collect();
+    Ok((names, listed.elapsed_ms))
 }
+
+/// What is left of the statement budget (`grant`, clamped as the adapter
+/// clamps it) after `spent_ms`; none left is a timeout.
+fn remaining_budget(grant: Option<u32>, spent_ms: u64) -> Result<u32, ExecError> {
+    let budget = effective_timeout_ms(grant);
+    let spent = u32::try_from(spent_ms).unwrap_or(u32::MAX);
+    match budget.saturating_sub(spent) {
+        0 => Err(ExecError::Timeout),
+        left => Ok(left),
+    }
+}
+
+#[cfg(test)]
+#[path = "budget_tests.rs"]
+mod budget_tests;

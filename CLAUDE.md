@@ -61,7 +61,7 @@ Self-hosted MCP gateway. AI agents get audited, SSO-gated, read-only DB access. 
 
 Secrets and local config: copy `.env.example` → `.env`. `.env` is gitignored; shell env beats `.env`.
 
-**Concurrency.** Many agents share one box. Build and test only through the `bin/` wrappers (`bin/test`, `bin/test-yugabyte`, `bin/lint`, `bin/check`, `bin/ci`): they queue on `target/.dbmcp-heavy.lock` (plus `target/.dbmcp-db.lock` for the shared dev DBs), print `queued: waiting for …`, and run under `heavy` when it is on `PATH`. Never raw `cargo test` against the DB suites. Never `bin/dev up`/`down` or `docker compose up` the dev stack while others use it — `up` under different env recreates containers. `DBMCP_NO_QUEUE=1` opts out.
+**Concurrency.** Many agents share one box. Build and test only through the `bin/` wrappers (`bin/test`, `bin/test-yugabyte`, `bin/lint`, `bin/check`, `bin/ci`): they queue on `.git/dbmcp-heavy.lock` (plus `.git/dbmcp-db.lock` for the shared dev DBs), print `queued: waiting for …`, and run under `heavy` when it is on `PATH`. Never raw `cargo test` against the DB suites. Never `bin/dev up`/`down` or `docker compose up` the dev stack while others use it — `up` under different env recreates containers. `DBMCP_NO_QUEUE=1` opts out.
 
 ## Layers
 

@@ -162,7 +162,9 @@ autoscaling:
   targetCPUUtilizationPercentage: 70
 
 # Every egress rule is `{ to: [peers], ports: [...] }`; an empty `to` allows
-# any destination on those ports — narrow it to your CIDRs or selectors.
+# any destination on those ports — narrow it to your CIDRs or selectors. With
+# the policy on, target egress must be chosen: scoped `targets` or the
+# `anyTarget` opt-in; the chart fails to render with neither.
 networkPolicy:
   enabled: true
   ingress:
@@ -194,13 +196,19 @@ networkPolicy:
       to: []
       ports:
         - { port: 443, protocol: TCP }
-    # One rule per target set; default: Postgres, MySQL, Mongo, Redis ports.
-    targets:
-      - to: []
-        ports:
-          - { port: 5432, protocol: TCP }
-          - { port: 3306, protocol: TCP }
-          - { port: 27017, protocol: TCP }
-          - { port: 6379, protocol: TCP }
+    # One rule per target set, each with a non-empty `to` (the chart refuses
+    # an empty one), e.g.
+    #   - to: [{ ipBlock: { cidr: 10.30.0.0/16 } }]
+    #     ports: [{ port: 5432, protocol: TCP }]
+    targets: []
+    # Opt-in: the target ports to EVERY destination. Refused alongside a fenced
+    # `stateDb.to`: it would reopen the state DB's 5432 to anywhere.
+    anyTarget:
+      enabled: false
+      ports:
+        - { port: 5432, protocol: TCP }
+        - { port: 3306, protocol: TCP }
+        - { port: 27017, protocol: TCP }
+        - { port: 6379, protocol: TCP }
     # Audit syslog sinks, GlitchTip, …
     extra: []

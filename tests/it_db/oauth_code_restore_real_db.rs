@@ -4,6 +4,8 @@
 //! (A mint whose COMMIT errored keeps it spent:
 //! `oauth_client_ttl_e2e::a_mint_whose_commit_errored_keeps_the_code_spent`.)
 //!
+//! A code from an old replica's in-memory store is `invalid_grant` on a new one.
+//!
 //! The mint-failure test is `#[serial_test::serial(world)]` (it adds a
 //! trigger to `oauth_refresh_tokens`); the promotion test touches only its
 //! own rows.
@@ -155,4 +157,29 @@ async fn delete_grants(pool: &PgPool, sub: &str) {
         .execute(pool)
         .await
         .expect("cleanup grants");
+}
+
+/// Rolling from a release that kept codes in process memory: a code the old
+/// replica minted is unknown to the shared store, so a `/token` that lands on
+/// a new replica is a clean `invalid_grant` (restart authorization), never a
+/// 5xx and never a grant.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_code_minted_in_an_old_replicas_memory_is_invalid_grant() {
+    let pool = state_pool().await;
+    let old_replica = AuthCodes::default();
+    let (code, sub) = seed_code(&old_replica).await;
+    let new_replica = spawn_gateway_with(
+        &pool,
+        ClientRegistry::with_db(pool.clone()),
+        AuthCodes::with_db(pool.clone()),
+        refresh(&pool),
+    )
+    .await;
+
+    let (status, body) = redeem(&new_replica, &code).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_grant");
+    delete_grants(&pool, &sub).await;
 }

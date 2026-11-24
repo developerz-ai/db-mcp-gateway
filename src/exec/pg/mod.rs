@@ -40,6 +40,7 @@ mod catalog;
 mod catalog_full;
 mod config;
 mod decode;
+mod describe;
 mod error;
 mod explain;
 mod introspect;

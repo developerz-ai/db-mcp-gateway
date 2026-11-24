@@ -154,18 +154,25 @@ impl AuthCodes {
     /// anything was issued: the client is told to retry, so the retry must
     /// find the code. Never after a mint whose COMMIT was sent. `Err` means the
     /// code is gone for good: the caller must not tell the client to retry.
+    /// The cap applies as on insert: the take freed the code's slot, and a
+    /// new code may have taken it since.
     pub async fn restore(&self, code: &str, entry: AuthCode) -> Result<(), StoreError> {
         let code_hash = hash_secret(code);
-        match &self.backend {
-            Backend::Db(pool) => {
-                db::restore_auth_code(pool, &entry.row(&code_hash), entry.expires_at)
-                    .await
-                    .map_err(|_| backend_error("restore"))
-            }
-            Backend::Memory(map) => {
-                map.lock().await.insert(code_hash, entry);
-                Ok(())
-            }
+        let restored = match &self.backend {
+            Backend::Db(pool) => db::restore_auth_code(
+                pool,
+                &entry.row(&code_hash),
+                entry.expires_at,
+                AUTH_CODES_MAX_SIZE as i64,
+            )
+            .await
+            .map_err(|_| backend_error("restore"))?,
+            Backend::Memory(map) => insert_mem(&mut *map.lock().await, code_hash, entry),
+        };
+        if restored {
+            Ok(())
+        } else {
+            Err(StoreError::StoreFull)
         }
     }
 

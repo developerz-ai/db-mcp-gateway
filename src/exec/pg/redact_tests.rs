@@ -100,13 +100,17 @@ fn unlisted_codes_fall_back_to_class_then_generic_wording() {
 
 #[test]
 fn a_hint_passes_only_for_a_located_parser_diagnostic_off_a_cast() {
-    let hint = Some("Perhaps you meant to reference the column \"users.email\".");
+    let hint = Some("No function matches the given name and argument types.");
     let sql = "SELECT emial FROM users";
-    assert_eq!(safe_hint("42703", Some(8), sql, hint), hint);
+    assert_eq!(safe_hint("42883", Some(8), sql, hint), hint);
+    // A column hint can name a column outside the role's column grants.
+    let column = Some("Perhaps you meant to reference the column \"users.email\".");
+    assert_eq!(safe_hint("42703", Some(8), sql, column), None);
+    assert_eq!(safe_hint("42702", Some(8), sql, column), None);
     // A syntax error located on no identifier still keeps its hint.
     assert_eq!(safe_hint("42601", Some(10), "SELECT 1 2", hint), hint);
     // Raised at run time (no position), or outside class 42: dropped.
-    assert_eq!(safe_hint("42703", None, sql, hint), None);
+    assert_eq!(safe_hint("42883", None, sql, hint), None);
     assert_eq!(safe_hint("22P02", Some(8), sql, hint), None);
     assert_eq!(safe_hint("P0001", Some(8), sql, hint), None);
     // On a cast operand the lookup ran over row data.

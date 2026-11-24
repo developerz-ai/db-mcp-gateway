@@ -114,7 +114,7 @@
           },
           "max_bytes": {
             "type": "integer",
-            "minimum": 1,
+            "minimum": 2,
             "description": "Cap on the JSON size of the returned rows: the leading rows that fit are kept, truncated_by: byte_cap."
           },
           "max_cell_bytes": {
@@ -216,7 +216,7 @@
           },
           "max_bytes": {
             "type": "integer",
-            "minimum": 1,
+            "minimum": 2,
             "description": "Cap on the JSON size of the returned rows: the leading rows that fit are kept, truncated_by: byte_cap."
           },
           "max_cell_bytes": {

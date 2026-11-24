@@ -116,3 +116,41 @@ async fn a_failing_change_rolls_back_the_whole_batch() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "an empty batch is refused");
     h.cleanup().await;
 }
+
+/// A batch at its 500-change maximum is past the 64 KiB every other admin
+/// body gets; it has its own byte bound, and a body past that is refused as
+/// `413 payload_too_large`, not mistaken for malformed JSON.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_full_batch_fits_its_body_bound_and_a_larger_body_is_413() {
+    let mut h = O10::spawn().await;
+    let (a, _) = h.user("o10-batch-full", &[]).await;
+    let changes: Vec<_> = (0..500).map(|_| wildcard_upsert(a, 5)).collect();
+    let full = json!({ "changes": changes });
+    assert!(full.to_string().len() > 64 * 1024);
+
+    let (status, body) = h.post("/admin/v1/grants/batch", &full).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"].as_array().map(Vec::len), Some(500));
+
+    // Valid JSON, one change, padded past the bound with whitespace.
+    let padded = format!(
+        "{{\"changes\": [{}]{}}}",
+        wildcard_upsert(a, 5),
+        " ".repeat(1024 * 1024 + 1)
+    );
+    let resp = h
+        .http()
+        .post(format!("{}/admin/v1/grants/batch", h.url))
+        .bearer_auth(&h.admin)
+        .header("content-type", "application/json")
+        .body(padded)
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body: serde_json::Value = resp.json().await.expect("json error body");
+    assert_eq!(body["error"]["code"], "payload_too_large", "{body}");
+    assert!(body["error"]["request_id"].is_string(), "{body}");
+    h.cleanup().await;
+}

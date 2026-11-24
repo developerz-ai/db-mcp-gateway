@@ -121,6 +121,15 @@ async fn unverified_email_page_says_so_and_links_back_to_the_client() {
 }
 
 #[tokio::test]
+async fn a_return_link_that_is_not_http_is_not_rendered() {
+    let page = page_context("https://gw.example/auth/callback", None);
+    for back in ["javascript:alert(1)", "data:text/html,x", "not a url"] {
+        let body = body_of(email_unverified(&page, Some(back))).await;
+        assert!(!body.contains("<a href"), "{back}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn operator_text_is_escaped() {
     let page = page_context("https://gw.example/auth/callback", Some("<b>ops</b> & co"));
     let body = body_of(login_expired(&page)).await;

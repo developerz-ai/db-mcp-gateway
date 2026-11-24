@@ -23,9 +23,16 @@ use super::permissions_diff::{DocGrant, Entry, desired_entry, diff, entry};
 use super::read_audit::{AdminRead, ReadScope, audit_read};
 use super::validation::{internal, invalid_body};
 
-/// Grants one diff request may carry — far above any real install, low
-/// enough that a runaway client cannot make the gateway sort millions.
+/// Grants one diff request may carry when the store holds fewer — far above
+/// any real install, low enough that a runaway client cannot make the gateway
+/// sort millions. A larger store raises it to its own size, so an export
+/// always posts back to diff.
 const MAX_DESIRED_GRANTS: usize = 10_000;
+
+/// Body limit of `POST /admin/v1/permissions/diff`: an export of
+/// [`MAX_DESIRED_GRANTS`] grants with full constraints, with room to spare,
+/// where every other admin body is one record.
+pub(super) const DIFF_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 /// Every grant evaluation can use: YAML blocks, then every live DB grant
 /// (expired ones included, flagged — they are rows an operator still owns).
@@ -112,13 +119,7 @@ pub async fn diff_document(
     body: Result<Json<DiffRequest>, JsonRejection>,
 ) -> Result<Json<JsonValue>, AdminError> {
     let rid = actor.request_id.as_str();
-    let Json(body) = body.map_err(|_| invalid_body(rid))?;
-    if body.grants.len() > MAX_DESIRED_GRANTS {
-        return Err(
-            AdminError::invalid(format!("at most {MAX_DESIRED_GRANTS} grants per diff"))
-                .with_request_id(rid),
-        );
-    }
+    let Json(body) = body.map_err(|rejection| invalid_body(&rejection, rid))?;
     let desired = body
         .grants
         .into_iter()
@@ -130,6 +131,12 @@ pub async fn diff_document(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let effective = load_effective(&state, rid).await?;
+    let cap = MAX_DESIRED_GRANTS.max(effective.len());
+    if desired.len() > cap {
+        return Err(
+            AdminError::invalid(format!("at most {cap} grants per diff")).with_request_id(rid),
+        );
+    }
     let scope = ReadScope {
         row_count: i64::try_from(effective.len()).ok(),
         ..ReadScope::default()

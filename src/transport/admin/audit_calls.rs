@@ -4,9 +4,12 @@
 //! exclusive) and capped by `limit` (default 1000, clamped to 1..=10 000).
 //!
 //! The statement text and its bound `params` stay out unless the caller asks
-//! with `include_sql=true`. The read is audited (`admin.audit_calls`) before the
-//! first byte streams. A failure after streaming started ends the body with
-//! one `{"error": …}` line instead of a row.
+//! with `include_sql=true`. The read is audited (`admin.audit_calls`, the
+//! filters and `include_sql` in its `params`) before the first byte streams.
+//! Rows are read in bounded keyset batches and no state-DB connection is held
+//! while a line waits for the reader, so a stalled client pins nothing the
+//! audit write path needs. A failure after streaming started ends the body
+//! with one `{"error": …}` line instead of a row.
 
 use axum::body::Body;
 use axum::extract::rejection::QueryRejection;
@@ -14,7 +17,6 @@ use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 use sqlx::Row;
@@ -71,10 +73,14 @@ const SELECT: &str = "SELECT id, request_id, occurred_at, user_sub, user_email, 
        AND ($5::text IS NULL OR outcome = $5) \
        AND ($6::timestamptz IS NULL OR occurred_at >= $6) \
        AND ($7::timestamptz IS NULL OR occurred_at < $7) \
+       AND ($10::timestamptz IS NULL OR (occurred_at, id) < ($10, $11)) \
      ORDER BY occurred_at DESC, id DESC LIMIT $8";
 
 /// Lines buffered between the query task and the response body.
 const LINE_BUFFER: usize = 64;
+
+/// Rows one query reads before its connection goes back to the pool.
+const BATCH_ROWS: i64 = 200;
 
 pub async fn stream(
     State(state): State<ReadState>,
@@ -93,10 +99,12 @@ pub async fn stream(
     {
         return Err(AdminError::invalid("since must be before until").with_request_id(rid));
     }
+    let request = requested(&query);
     let scope = ReadScope {
         server: query.server.as_deref(),
         database: query.db.as_deref(),
         row_count: None,
+        request: Some(&request),
     };
     audit_read(&state.state_db, &actor, AdminRead::AuditCalls, scope).await?;
 
@@ -117,32 +125,35 @@ pub async fn stream(
     Ok(response)
 }
 
-/// Run the query and push one line per row. A closed channel means the
-/// client went away: stop reading. `request_id` only labels the log line.
+/// What the read asked for, as its audit row records it.
+fn requested(q: &AuditCallsQuery) -> JsonValue {
+    json!({
+        "user": q.user,
+        "server": q.server,
+        "db": q.db,
+        "tool": q.tool,
+        "outcome": q.outcome,
+        "since": q.since,
+        "until": q.until,
+        "limit": q.limit,
+        "include_sql": q.include_sql,
+    })
+}
+
+/// Run the query batch by batch and push one line per row. A closed channel
+/// means the client went away: stop reading. `request_id` only labels the
+/// log line.
 async fn produce(
     pool: sqlx::PgPool,
     q: AuditCallsQuery,
     tx: mpsc::Sender<String>,
     request_id: String,
 ) {
-    let limit = i64::from(q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT));
-    let mut rows = sqlx::query(SELECT)
-        .bind(q.user)
-        .bind(q.server)
-        .bind(q.db)
-        .bind(q.tool)
-        .bind(q.outcome)
-        .bind(q.since)
-        .bind(q.until)
-        .bind(limit)
-        .bind(q.include_sql)
-        .fetch(&pool);
-    while let Some(row) = rows.next().await {
-        let line = match row
-            .map_err(|_| ())
-            .and_then(|r| row_json(&r).map_err(|_| ()))
-        {
-            Ok(value) => value,
+    let mut remaining = i64::from(q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT));
+    let mut after: Option<(DateTime<Utc>, uuid::Uuid)> = None;
+    while remaining > 0 {
+        let batch = match fetch_batch(&pool, &q, after, remaining.min(BATCH_ROWS)).await {
+            Ok(batch) => batch,
             Err(()) => {
                 // The cause can carry row text; only the stage is logged.
                 tracing::error!(%request_id, "admin audit stream failed mid-body");
@@ -150,10 +161,61 @@ async fn produce(
                 return;
             }
         };
-        if tx.send(format!("{line}\n")).await.is_err() {
+        let full =
+            i64::try_from(batch.lines.len()).unwrap_or(i64::MAX) == remaining.min(BATCH_ROWS);
+        remaining -= i64::try_from(batch.lines.len()).unwrap_or(i64::MAX);
+        for line in batch.lines {
+            if tx.send(line).await.is_err() {
+                return;
+            }
+        }
+        if !full {
             return;
         }
+        after = batch.last;
     }
+}
+
+#[derive(Debug)]
+struct Batch {
+    lines: Vec<String>,
+    /// Keyset position of the batch's last row.
+    last: Option<(DateTime<Utc>, uuid::Uuid)>,
+}
+
+/// One page, read whole: its connection is back in the pool before any line
+/// is sent.
+async fn fetch_batch(
+    pool: &sqlx::PgPool,
+    q: &AuditCallsQuery,
+    after: Option<(DateTime<Utc>, uuid::Uuid)>,
+    limit: i64,
+) -> Result<Batch, ()> {
+    let rows = sqlx::query(SELECT)
+        .bind(q.user.as_deref())
+        .bind(q.server.as_deref())
+        .bind(q.db.as_deref())
+        .bind(q.tool.as_deref())
+        .bind(q.outcome.as_deref())
+        .bind(q.since)
+        .bind(q.until)
+        .bind(limit)
+        .bind(q.include_sql)
+        .bind(after.map(|(at, _)| at))
+        .bind(after.map(|(_, id)| id))
+        .fetch_all(pool)
+        .await
+        .map_err(|_| ())?;
+    let mut last = None;
+    let mut lines = Vec::with_capacity(rows.len());
+    for row in &rows {
+        lines.push(format!("{}\n", row_json(row).map_err(|_| ())?));
+        last = Some((
+            row.try_get("occurred_at").map_err(|_| ())?,
+            row.try_get("id").map_err(|_| ())?,
+        ));
+    }
+    Ok(Batch { lines, last })
 }
 
 fn error_line() -> String {

@@ -80,6 +80,9 @@
           "400": {
             "$ref": "#/components/responses/Error"
           },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
           "401": {
             "$ref": "#/components/responses/Error"
           },
@@ -104,7 +107,8 @@
                 "$ref": "#/components/schemas/CreateUser"
               }
             }
-          }
+          },
+          "description": "At most 64 KiB; a larger body is 413 `payload_too_large`."
         }
       },
       "get": {
@@ -226,6 +230,9 @@
           "400": {
             "$ref": "#/components/responses/Error"
           },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
           "401": {
             "$ref": "#/components/responses/Error"
           },
@@ -250,7 +257,8 @@
                 "$ref": "#/components/schemas/UpdateUser"
               }
             }
-          }
+          },
+          "description": "At most 64 KiB; a larger body is 413 `payload_too_large`."
         },
         "parameters": [
           {
@@ -368,6 +376,9 @@
           "400": {
             "$ref": "#/components/responses/Error"
           },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
           "401": {
             "$ref": "#/components/responses/Error"
           },
@@ -392,7 +403,8 @@
                 "$ref": "#/components/schemas/CreateDatabase"
               }
             }
-          }
+          },
+          "description": "At most 64 KiB; a larger body is 413 `payload_too_large`."
         }
       },
       "get": {
@@ -514,6 +526,9 @@
           "400": {
             "$ref": "#/components/responses/Error"
           },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
           "401": {
             "$ref": "#/components/responses/Error"
           },
@@ -538,7 +553,8 @@
                 "$ref": "#/components/schemas/UpdateDatabase"
               }
             }
-          }
+          },
+          "description": "At most 64 KiB; a larger body is 413 `payload_too_large`."
         },
         "parameters": [
           {
@@ -609,6 +625,9 @@
           "400": {
             "$ref": "#/components/responses/Error"
           },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
           "401": {
             "$ref": "#/components/responses/Error"
           },
@@ -633,7 +652,8 @@
                 "$ref": "#/components/schemas/CreateGrant"
               }
             }
-          }
+          },
+          "description": "At most 64 KiB; a larger body is 413 `payload_too_large`."
         }
       },
       "get": {
@@ -726,6 +746,9 @@
           "400": {
             "$ref": "#/components/responses/Error"
           },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
           "401": {
             "$ref": "#/components/responses/Error"
           },
@@ -750,7 +773,8 @@
                 "$ref": "#/components/schemas/BatchRequest"
               }
             }
-          }
+          },
+          "description": "At most 1 MiB; a larger body is 413 `payload_too_large`."
         }
       }
     },
@@ -817,6 +841,9 @@
           "400": {
             "$ref": "#/components/responses/Error"
           },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
           "401": {
             "$ref": "#/components/responses/Error"
           },
@@ -841,7 +868,8 @@
                 "$ref": "#/components/schemas/UpdateGrant"
               }
             }
-          }
+          },
+          "description": "At most 64 KiB; a larger body is 413 `payload_too_large`."
         },
         "parameters": [
           {
@@ -912,6 +940,9 @@
           "400": {
             "$ref": "#/components/responses/Error"
           },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
           "401": {
             "$ref": "#/components/responses/Error"
           },
@@ -939,7 +970,8 @@
                 "$ref": "#/components/schemas/ExplainRequest"
               }
             }
-          }
+          },
+          "description": "At most 64 KiB; a larger body is 413 `payload_too_large`."
         }
       }
     },
@@ -1000,6 +1032,9 @@
           "400": {
             "$ref": "#/components/responses/Error"
           },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
           "401": {
             "$ref": "#/components/responses/Error"
           },
@@ -1027,7 +1062,8 @@
                 "$ref": "#/components/schemas/PermissionsDocument"
               }
             }
-          }
+          },
+          "description": "At most 16 MiB; a larger body is 413 `payload_too_large`."
         }
       }
     },
@@ -1190,6 +1226,7 @@
                   "session_too_old",
                   "not_found",
                   "invalid_request",
+                  "payload_too_large",
                   "conflict",
                   "audit_unavailable",
                   "internal"
@@ -1527,22 +1564,7 @@
             "items": {
               "oneOf": [
                 {
-                  "allOf": [
-                    {
-                      "type": "object",
-                      "required": [
-                        "op"
-                      ],
-                      "properties": {
-                        "op": {
-                          "const": "upsert"
-                        }
-                      }
-                    },
-                    {
-                      "$ref": "#/components/schemas/CreateGrant"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BatchUpsert"
                 },
                 {
                   "type": "object",
@@ -1565,6 +1587,51 @@
             }
           }
         }
+      },
+      "BatchUpsert": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "op",
+          "user_id",
+          "action"
+        ],
+        "properties": {
+          "op": {
+            "const": "upsert"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "database_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "server": {
+            "type": "string"
+          },
+          "db_name_wildcard": {
+            "type": "boolean"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "schema_read",
+              "query_read",
+              "query_write",
+              "history_read"
+            ]
+          },
+          "constraints": {
+            "$ref": "#/components/schemas/Constraints"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "description": "one batch upsert: `op` plus the CreateGrant fields; exactly one target: database_id, or server + db_name_wildcard: true"
       },
       "BatchResponse": {
         "type": "object",
@@ -1725,6 +1792,15 @@
             "items": {
               "type": "string"
             }
+          },
+          "groups_source": {
+            "type": "string",
+            "enum": [
+              "stored",
+              "assumed",
+              "group"
+            ],
+            "description": "Where `groups` came from: `stored` (the user's last-login snapshot) or `assumed` (the request body) make the answer a simulation, which a live session holding other claims can contradict; `group` for a group question."
           },
           "server": {
             "type": "string"

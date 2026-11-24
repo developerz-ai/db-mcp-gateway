@@ -31,7 +31,7 @@ pub async fn create(
     body: Result<Json<CreateDatabaseRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, AdminError> {
     let rid = actor.request_id.as_str();
-    let Json(body) = body.map_err(|_| invalid_body(rid))?;
+    let Json(body) = body.map_err(|rejection| invalid_body(&rejection, rid))?;
     let server = routing_name(&body.server, "server", rid)?;
     let server = declared_server(server, &state.known_servers, rid)?;
     let db_name = routing_name(&body.db_name, "db_name", rid)?;
@@ -91,7 +91,7 @@ pub async fn patch(
 ) -> Result<Json<DatabaseResponse>, AdminError> {
     let rid = actor.request_id.as_str();
     let Path(id) = id.map_err(|_| invalid_id("database", rid))?;
-    let Json(body) = body.map_err(|_| invalid_body(rid))?;
+    let Json(body) = body.map_err(|rejection| invalid_body(&rejection, rid))?;
     if body.server.is_none() && body.db_name.is_none() && body.db_type.is_none() {
         return Err(AdminError::invalid(
             "PATCH body must set at least one of server, db_name, db_type",

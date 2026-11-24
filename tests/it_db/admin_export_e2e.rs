@@ -109,3 +109,28 @@ async fn export_is_yaml_union_db_and_diffs_clean_against_itself() {
     );
     h.cleanup().await;
 }
+
+/// An export is meant to post back to diff unchanged, so diff's body limit is
+/// sized for a document of `MAX_DOCUMENT_GRANTS`, not the admin API's
+/// one-grant bodies: a desired set far past 64 KiB still diffs.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_large_desired_document_diffs() {
+    let h = O10::spawn().await;
+    let prefix = format!("o10-large-{}", uuid::Uuid::new_v4().simple());
+    let grants: Vec<Value> = (0..1_500)
+        .map(|i| {
+            json!({ "subject": { "user": format!("{prefix}-{i}") }, "server": "prod",
+                    "database": "app", "action": "query_read",
+                    "constraints": { "row_limit": 10 } })
+        })
+        .collect();
+    let desired = json!({ "grants": grants });
+    assert!(desired.to_string().len() > 128 * 1024);
+
+    let (status, diff) = h.post("/admin/v1/permissions/diff", &desired).await;
+
+    assert_eq!(status, StatusCode::OK, "{diff}");
+    assert_eq!(diff["add"].as_array().map(Vec::len), Some(1_500));
+    h.cleanup().await;
+}

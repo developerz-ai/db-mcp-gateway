@@ -932,14 +932,17 @@ async fn per_identity_concurrency_cap_returns_429() {
     // permit until the handler parks for 5 s.
     let url_bg = url.clone();
     let client_bg = client.clone();
-    tokio::spawn(async move {
-        // Fire-and-forget: we don't need the response; we just need the
-        // permit to be held when the second request arrives.
-        let _ = client_bg.post(format!("{url_bg}/test")).send().await;
-    });
+    // The handle is kept so a first request that never reaches the handler
+    // fails the test with its own error instead of hanging it.
+    let first = tokio::spawn(async move { client_bg.post(format!("{url_bg}/test")).send().await });
 
     // The first request is inside the handler, so it holds the permit.
-    entered.notified().await;
+    if tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .is_err()
+    {
+        panic!("first request never entered the handler: {:?}", first.await);
+    }
 
     // Second request from the same identity → 429.
     let resp = client
@@ -976,11 +979,14 @@ async fn global_concurrency_cap_returns_503() {
     // Hold the only global slot.
     let url_bg = url.clone();
     let client_bg = client.clone();
-    tokio::spawn(async move {
-        let _ = client_bg.post(format!("{url_bg}/test")).send().await;
-    });
+    let first = tokio::spawn(async move { client_bg.post(format!("{url_bg}/test")).send().await });
 
-    entered.notified().await;
+    if tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .is_err()
+    {
+        panic!("first request never entered the handler: {:?}", first.await);
+    }
 
     // Second request — different perspective, same global cap.
     let resp = client

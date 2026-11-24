@@ -102,14 +102,51 @@ git -C "$repo" reset -q --hard
 git -C "$repo" rm -q "config/$token.yaml" config/leaked.yaml
 git -C "$repo" commit -q --no-verify -m cleanup
 
+# A newline inside a staged file name stays one path: split, its halves are
+# pathspecs that match nothing and the blob is never scanned.
+nl_name=$'config/a\nb.yaml'
+printf 'token: %s\n' "$token" > "$repo/$nl_name"
+git -C "$repo" add "$nl_name"
+if hook pre-commit; then fail 'token in a file whose name holds a newline accepted'; fi
+! grep -qF "$token" "$work/output" || fail 'newline-name refusal echoed the token'
+git -C "$repo" rm -q --cached "$nl_name"
+rm "$repo/$nl_name"
+
 # A scanner that errors is a refusal, never a clean pass.
-mkdir -p "$work/badgrep"
-printf '#!/usr/bin/env bash\nexit 2\n' > "$work/badgrep/grep"
-chmod +x "$work/badgrep/grep"
-if (cd "$repo" && PATH="$work/badgrep:$work/tools:$PATH" CALLS="$work/calls" bash .githooks/pre-commit) > "$work/output" 2>&1; then
+mkdir -p "$work/badgit"
+real_git=$(command -v git)
+cat > "$work/badgit/git" <<STUB
+#!/usr/bin/env bash
+for arg in "\$@"; do [[ \$arg == grep ]] && exit 2; done
+exec "$real_git" "\$@"
+STUB
+chmod +x "$work/badgit/git"
+printf 'clean: true\n' > "$repo/config/scanned.yaml"
+git -C "$repo" add config/scanned.yaml
+if (cd "$repo" && PATH="$work/badgit:$work/tools:$PATH" CALLS="$work/calls" bash .githooks/pre-commit) > "$work/output" 2>&1; then
   fail 'a failing scanner was read as a clean scan'
 fi
 grep -qF 'secret scan could not run' "$work/output" || fail "scanner error not reported: $(<"$work/output")"
+git -C "$repo" rm -q --cached config/scanned.yaml
+
+# ShellCheck sees shell scripts only: `*.sh` and the extensionless wrappers,
+# never a SQL file under bin/.
+cat > "$work/tools/shellcheck" <<'STUB'
+#!/usr/bin/env bash
+printf 'shellcheck %s\n' "$*" >> "$CALLS"
+STUB
+chmod +x "$work/tools/shellcheck"
+mkdir -p "$repo/bin/lib"
+printf -- '-- sql\n' > "$repo/bin/lib/role.sql"
+printf '#!/usr/bin/env bash\n' > "$repo/bin/lib/q.sh"
+printf '#!/usr/bin/env bash\n' > "$repo/bin/wrapper"
+git -C "$repo" add bin
+hook pre-commit || fail "shell scripts refused: $(<"$work/output")"
+grep -qxF 'shellcheck -x -- bin/lib/q.sh bin/wrapper' "$work/calls" \
+  || fail "shellcheck got the wrong files: $(<"$work/calls")"
+git -C "$repo" rm -q --cached -r bin
+rm -rf "$repo/bin/lib" "$repo/bin/wrapper"
+rm "$work/tools/shellcheck"
 
 printf 'const T: &str = "%s";\n' "$token" > "$repo/tests/fixture.rs"
 git -C "$repo" add tests/fixture.rs

@@ -12,8 +12,9 @@ use crate::audit::{HistoryCursor, HistoryEntry, HistoryPage, HistoryQuery, cap_h
 /// service caller that claims one, its run id. Keyset
 /// pagination on `(occurred_at, id)`: one extra row is fetched to learn
 /// whether a next page exists. `audit_calls_history_idx` (migration 0011)
-/// covers the WHERE and the ORDER BY; the `sql_sha256` filter is computed
-/// over the rows it narrows to, the caller's own.
+/// covers the WHERE and the ORDER BY; with a `sql_sha256` filter,
+/// `audit_calls_history_sha_idx` (0027) seeks the stored digest (0026), so a
+/// rare hash costs its matches, not the caller's whole history.
 pub async fn select_user_history(
     pool: &PgPool,
     query: &HistoryQuery<'_>,
@@ -26,14 +27,13 @@ pub async fn select_user_history(
     let rows = sqlx::query(
         "SELECT id, request_id, sql, sql_truncated, reason, outcome, elapsed_ms, row_count, \
                 rows_affected, occurred_at, \
-                encode(sha256(convert_to(sql, 'UTF8')), 'hex') AS sql_sha256 \
+                encode(sql_sha256, 'hex') AS sql_sha256 \
          FROM audit_calls \
          WHERE user_sub = $1 AND server_name = $2 AND database_name = $3 \
            AND ($4::timestamptz IS NULL OR occurred_at >= $4::timestamptz) \
            AND ($5::timestamptz IS NULL OR (occurred_at, id) < ($5::timestamptz, $6::uuid)) \
            AND ($8::text IS NULL OR upstream_run_id = $8::text) \
-           AND ($9::text IS NULL \
-                OR encode(sha256(convert_to(sql, 'UTF8')), 'hex') = $9::text) \
+           AND ($9::text IS NULL OR sql_sha256 = decode($9::text, 'hex')) \
          ORDER BY occurred_at DESC, id DESC \
          LIMIT $7",
     )

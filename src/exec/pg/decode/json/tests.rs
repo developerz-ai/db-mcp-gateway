@@ -100,3 +100,20 @@ fn malformed_text_is_invalid_not_over_budget() {
     let mut weight = RowWeight::new(&budget);
     assert_eq!(parse(b"7", &mut weight), JsonCell::Value(json!(7)));
 }
+
+/// A valid JSON number past `f64` (`jsonb` numbers are `numeric`) keeps its
+/// numeral as text, like one `f64` cannot hold exactly — it never sinks the
+/// whole cell.
+#[test]
+fn a_number_past_f64_keeps_its_numeral() {
+    let text = br#"{"big": 1e400, "neg": [-2.5E+999, 1.5], "s": "1e400", "tiny": 1e-400}"#;
+    let budget = ResultBudget::new(10);
+    let mut weight = RowWeight::new(&budget);
+    let JsonCell::Value(parsed) = parse(text, &mut weight) else {
+        panic!("a valid document parses");
+    };
+    assert_eq!(
+        parsed,
+        json!({"big": "1e400", "neg": ["-2.5E+999", 1.5], "s": "1e400", "tiny": "1e-400"})
+    );
+}

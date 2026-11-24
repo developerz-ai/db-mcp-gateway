@@ -57,7 +57,7 @@ cp .env.example .env
 
 `bin/setup` checks Cargo and Docker before installing missing host packages and tools, fetches Rust dependencies with `cargo fetch --locked`, and starts all six dependency services, waiting for health. Tool output goes to `target/setup.log`; a failed stage prints its message and the log's last 20 lines. The log stays local — it can hold environment values, so never paste it publicly. Without `--hooks` it leaves your git config alone and prints how to opt in.
 
-Just want to try the gateway, no Rust toolchain? `cd examples/demo && docker compose up -d` runs the published image with a seeded database and a dev-only service token, then `docker compose logs ready` prints the `claude mcp add` line.
+Just want to try the gateway, no Rust toolchain? `cd examples/demo && docker compose up -d --wait` runs the published image with a seeded database and a dev-only service token, then `docker compose run --rm ready` prints the `claude mcp add` line.
 
 `bin/dev` defaults to `up`. Running it after setup is safe: it ensures the same dependency services are up, not a second stack. This spins up:
 - State PostgreSQL (gateway metadata, sessions, audit log): `localhost:5433`
@@ -75,7 +75,7 @@ YugabyteDB is **not** in the default stack (it boots in ~21 s and takes ~0.5–0
 
 **SSO path:** `bin/run --idp` also starts Dex (compose profile `idp`, [`config/dex.yaml`](config/dex.yaml)) at `http://localhost:5556`, the `OIDC_ISSUER` in `.env.example`. Sign in as `dev@example.com` / `dev-only-password` (group `devs`). The demo's `sso` profile uses the same port, so run one at a time.
 
-**Shared box:** `bin/test`, `bin/test-yugabyte`, `bin/lint` (clippy) and `bin/check` queue behind each other on this checkout (`flock` on `target/.dbmcp-heavy.lock`; suites that touch the dev databases also take `target/.dbmcp-db.lock`). A waiting run prints `queued: waiting for <pid: command> (lock <path>)`. Full-suite runs go through the machine-wide `heavy` ledger when it is on `PATH`. Run DB-backed suites through these wrappers, never raw `cargo test`, so two suites never share the dev databases at once. `DBMCP_NO_QUEUE=1` opts out.
+**Shared box:** `bin/test`, `bin/test-yugabyte`, `bin/lint` (clippy) and `bin/check` queue behind each other on this checkout (`flock` on `.git/dbmcp-heavy.lock`; suites that touch the dev databases also take `.git/dbmcp-db.lock` — in git's dir, so `cargo clean` never unlinks a held lock). A waiting run prints `queued: waiting for <pid: command> (lock <path>)`. Full-suite runs go through the machine-wide `heavy` ledger when it is on `PATH`. Run DB-backed suites through these wrappers, never raw `cargo test`, so two suites never share the dev databases at once. `DBMCP_NO_QUEUE=1` opts out.
 
 **`.env` vs your shell:** every `bin/` script loads `.env` but only fills in variables your shell has not exported, so `TARGET_DB_PORT=5444 bin/test` wins over the file.
 

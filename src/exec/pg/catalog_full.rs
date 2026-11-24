@@ -8,7 +8,9 @@
 //! read, so each is listed only when the role sees every column it touches:
 //! a primary key or index with a hidden column is left out whole (never
 //! listed with the column dropped, which would misstate it), as is a foreign
-//! key with a hidden column on either side.
+//! key with a hidden column on either side. A column's `default` — for a
+//! generated column, its generation expression — is left out when it reads
+//! a hidden column.
 
 /// `[schema, table, kind, comment, row_estimate, columns, primary_key,
 /// foreign_keys, indexes]`. `row_estimate` is `reltuples`, `NULL` for a view
@@ -31,7 +33,12 @@ pub(super) const FULL_SELECT: &str = "SELECT n.nspname::text AS schema, c.relnam
          'name', a.attname, \
          'data_type', format_type(a.atttypid, a.atttypmod), \
          'nullable', NOT a.attnotnull, \
-         'default', pg_get_expr(d.adbin, d.adrelid), \
+         'default', CASE WHEN pg_has_role(c.relowner, 'USAGE') OR NOT EXISTS ( \
+           SELECT 1 FROM pg_depend g WHERE g.classid = 'pg_attrdef'::regclass AND g.objid = d.oid \
+             AND g.refclassid = 'pg_class'::regclass AND g.refobjid = c.oid AND g.refobjsubid > 0 \
+             AND NOT has_column_privilege(c.oid, g.refobjsubid::int2, \
+               'SELECT, INSERT, UPDATE, REFERENCES')) \
+           THEN pg_get_expr(d.adbin, d.adrelid) END, \
          'comment', col_description(c.oid, a.attnum), \
          'element_type', CASE WHEN t.typcategory = 'A' THEN format_type(t.typelem, NULL) END, \
          'enum_values', (SELECT json_agg(e.enumlabel ORDER BY e.enumsortorder) FROM pg_enum e \

@@ -148,9 +148,10 @@ pub enum PermissionsStoreDriver {
 ///
 /// `location()` is unaffected, so operators still get `:line:column`.
 ///
-/// `pub(super)` so sibling modules that parse config types reach for the same
-/// options rather than the leaky default — see the note on `from_yaml_str`.
-pub(super) fn non_leaking_options() -> serde_saphyr::Options {
+/// Public so every module that parses config YAML (the schema's own tests,
+/// the `config_info` hash) reaches for the same options rather than the leaky
+/// default — see the note on `from_yaml_str`.
+pub fn non_leaking_options() -> serde_saphyr::Options {
     serde_saphyr::options! {
         with_snippet: false,
     }

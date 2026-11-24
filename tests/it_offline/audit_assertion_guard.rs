@@ -168,6 +168,23 @@ fn code_only(body: &str) -> String {
     code
 }
 
+/// The lines above the first `fn` item's attribute block: where a file-wide
+/// exemption lives. A marker in that block exempts only that item.
+fn file_header(source: &str) -> String {
+    let lines: Vec<&str> = source.lines().collect();
+    let first_fn = lines
+        .iter()
+        .position(|l| !l.trim_start().starts_with("//") && l.contains("fn "))
+        .unwrap_or(lines.len());
+    let attrs = lines[..first_fn]
+        .iter()
+        .rev()
+        .map(|l| l.trim())
+        .take_while(|l| l.starts_with("#[") || l.starts_with("//"))
+        .count();
+    lines[..first_fn - attrs].join("\n")
+}
+
 /// Every `fn` in `source` with its attribute block's test/exempt flags.
 fn items(file: &str, source: &str) -> Vec<Item> {
     let lines: Vec<&str> = source.lines().collect();
@@ -299,8 +316,7 @@ fn every_tools_call_test_asserts_an_audit_row() {
             .display()
             .to_string();
         let source = fs::read_to_string(&path).expect("test source is UTF-8");
-        let header: Vec<&str> = source.lines().take_while(|l| !l.contains("fn ")).collect();
-        if is_exempt(&header.join("\n")) {
+        if is_exempt(&file_header(&source)) {
             exempt_files.insert(file.clone());
         }
         all.extend(items(&file, &source));
@@ -312,6 +328,24 @@ fn every_tools_call_test_asserts_an_audit_row() {
         "these tests send `tools/call` but never assert an audit row via \
          {ASSERTIONS:?} (CLAUDE.md §Testing): {offenders:?}"
     );
+}
+
+#[test]
+fn an_exempt_first_test_does_not_exempt_its_siblings() {
+    let source = r##"//! A test module.
+use std::fs;
+
+#[tokio::test]
+// audit-guard: exempt — refused before dispatch
+async fn excused() { post("tools/call").await; }
+#[tokio::test]
+async fn forgot() { post("tools/call").await; }
+"##;
+    assert!(!is_exempt(&file_header(source)), "{}", file_header(source));
+    let file_wide = format!("// audit-guard: exempt — no identity\n{source}");
+    assert!(is_exempt(&file_header(&file_wide)));
+    let found = items("x.rs", source);
+    assert_eq!(unasserted(&found, &BTreeSet::new()), vec!["x.rs::forgot"]);
 }
 
 #[test]

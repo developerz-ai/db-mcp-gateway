@@ -122,3 +122,42 @@ fn every_mounted_path_is_documented() {
     assert!(!mounted.is_empty());
     assert_eq!(mounted, documented, "router paths vs openapi.json paths");
 }
+
+fn keys(value: &Value) -> BTreeSet<String> {
+    value
+        .as_object()
+        .map(|map| map.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// `allOf` with the closed `CreateGrant` would reject the `op` every upsert
+/// carries, so the upsert is its own closed object: `op` beside every grant
+/// field, and nothing else.
+#[test]
+fn a_batch_upsert_is_one_closed_object_with_op_and_the_grant_fields() {
+    let doc: Value = serde_json::from_str(DOCUMENT).expect("openapi.json is JSON");
+    let schemas = &doc["components"]["schemas"];
+    let items = &schemas["BatchRequest"]["properties"]["changes"]["items"]["oneOf"];
+    assert_eq!(items[0]["$ref"], "#/components/schemas/BatchUpsert");
+
+    let upsert = &schemas["BatchUpsert"];
+    let create = &schemas["CreateGrant"];
+    assert_eq!(upsert["additionalProperties"], false);
+    assert_eq!(upsert["properties"]["op"]["const"], "upsert");
+    let mut expected = keys(&create["properties"]);
+    expected.insert("op".into());
+    assert_eq!(keys(&upsert["properties"]), expected);
+    for field in expected.iter().filter(|field| *field != "op") {
+        assert_eq!(
+            upsert["properties"][field], create["properties"][field],
+            "{field} differs from CreateGrant"
+        );
+    }
+    let required: BTreeSet<&str> = upsert["required"]
+        .as_array()
+        .expect("required")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(required, BTreeSet::from(["op", "user_id", "action"]));
+}

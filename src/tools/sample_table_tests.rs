@@ -58,3 +58,18 @@ fn audited_read_names_the_table_or_the_mongo_find() {
         .expect("the Mongo read is a JSON command");
     assert_eq!(find, serde_json::json!({ "find": "orders", "filter": {} }));
 }
+
+/// `columns` keeps the caller's order and refuses a repeat, however long
+/// the list.
+#[test]
+fn parse_columns_keeps_order_and_refuses_a_repeat() {
+    let named: Vec<String> = (0..50_000).rev().map(|i| format!("c{i}")).collect();
+    let parsed = parse_columns(Some(&named)).expect("all unique");
+    assert_eq!(parsed.first(), Some(&"c49999"));
+    assert_eq!(parsed.last(), Some(&"c0"));
+    let repeated = ["b", "a", "b"].map(String::from);
+    assert_eq!(
+        parse_columns(Some(&repeated)),
+        Err("`columns` names `b` twice".to_owned())
+    );
+}

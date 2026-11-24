@@ -16,7 +16,7 @@ fixture() {
   cp bin/run "$work/repo/bin/"
   cp bin/lib/dotenv.sh "$work/repo/bin/lib/"
   cp config/dev.yaml "$work/repo/config/"
-  for tool in bash dirname grep sed mkdir cat mktemp mv rm; do
+  for tool in bash dirname grep sed mkdir cat mktemp mv rm seq; do
     ln -s "$(command -v "$tool")" "$work/tools/$tool"
   done
   cat > "$work/tools/stub" <<'STUB'
@@ -26,6 +26,7 @@ name=${0##*/}
 printf '%s %s\n' "$name" "$*" >> "$CALLS"
 case "$name $*" in
   'docker compose '*' ps --status running --services') printf '%s\n' ${RUNNING:-} ;;
+  'docker compose '*' exec -T '*' pg_isready '*) [[ -z ${NOT_READY:-} ]] ;;
   'openssl rand -hex 32')
     # A failing openssl may still have written part of its output.
     if [[ -n ${OPENSSL_FAIL:-} ]]; then printf 'abc'; exit 1; fi
@@ -39,7 +40,7 @@ case "$name $*" in
 esac
 STUB
   chmod +x "$work/tools/stub"
-  for tool in docker cargo openssl; do ln -s stub "$work/tools/$tool"; done
+  for tool in docker cargo openssl sleep; do ln -s stub "$work/tools/$tool"; done
   cat > "$work/repo/bin/seed" <<'STUB'
 #!/usr/bin/env bash
 echo bin/seed >> "$CALLS"
@@ -89,6 +90,18 @@ reject_call 'up -d --wait'
 : > "$work/calls"
 run RUNNING='state-db' || fail 'bin/run failed with target-db stopped'
 expect_call 'docker compose -f docker-compose.dev.yml up -d --wait target-db'
+
+# Running is not ready: both databases are asked over TCP before seeding,
+# running or just started; one that never answers boots nothing.
+: > "$work/calls"
+run RUNNING='state-db target-db' || fail 'bin/run failed with the stack running'
+expect_call 'docker compose -f docker-compose.dev.yml exec -T state-db pg_isready -q -h 127.0.0.1 -U gateway'
+expect_call 'docker compose -f docker-compose.dev.yml exec -T target-db pg_isready -q -h 127.0.0.1 -U app'
+: > "$work/calls"
+if run RUNNING='state-db target-db' NOT_READY=1; then fail 'bin/run booted with a database not ready'; fi
+reject_call 'bin/seed'
+reject_call 'cargo'
+grep -qF 'state-db does not accept TCP connections' "$work/output" || fail "no readiness error: $(<"$work/output")"
 
 # .env fills unset values; the shell wins over .env; a moved port renders a copy.
 fixture

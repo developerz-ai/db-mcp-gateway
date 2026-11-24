@@ -1,12 +1,13 @@
 //! The file `login` stores the gateway session in: owner-only (0600) like an
 //! SSH key, and refused on read when anyone else may read it.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write as _;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::super::CliError;
 
@@ -45,33 +46,48 @@ pub fn default_path() -> Result<PathBuf, CliError> {
     Ok(base.join("db-mcp-gateway").join("session.json"))
 }
 
+/// Written to a fresh owner-only file beside `path`, then renamed over it: a
+/// reader that already holds the old file open never sees the new bearer.
 pub fn save(path: &Path, session: &StoredSession) -> Result<(), CliError> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|err| CliError::io(describe("create", dir), err))?;
-    }
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    fs::create_dir_all(dir).map_err(|err| CliError::io(describe("create", dir), err))?;
     let body = serde_json::to_vec_pretty(session)
         .map_err(|err| CliError::io("encode the session", std::io::Error::other(err)))?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|err| CliError::io(describe("write", path), err))?;
-    // `mode` applies only when the file is created; an older file keeps its
-    // bits until this.
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .and_then(|()| file.write_all(&body))
-        .map_err(|err| CliError::io(describe("write", path), err))
+    let temp = dir.join(format!(".session.{}.tmp", Uuid::new_v4().simple()));
+    let written = write_new_private(&temp, &body).and_then(|()| fs::rename(&temp, path));
+    if written.is_err() {
+        // Best effort: the temp file holds the bearer, but is owner-only.
+        let _ = fs::remove_file(&temp);
+    }
+    written.map_err(|err| CliError::io(describe("write", path), err))
 }
 
+/// `create_new` with mode 0600: never an existing file, never wider bits.
+pub fn write_new_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(body)?;
+    file.sync_all()
+}
+
+/// The permission check and the read use one handle, so a path swapped
+/// between them cannot slip an unchecked file in.
 pub fn load(path: &Path) -> Result<StoredSession, CliError> {
-    let metadata = fs::metadata(path).map_err(|err| {
+    let mut file = File::open(path).map_err(|err| {
         CliError::io(
             format!("read {} (run `db-mcp-gateway login`)", path.display()),
             err,
         )
     })?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| CliError::io(describe("read", path), err))?;
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(CliError::Invalid(format!(
             "{} is readable by other users; run `chmod 600 {}` or log in again",
@@ -79,7 +95,9 @@ pub fn load(path: &Path) -> Result<StoredSession, CliError> {
             path.display()
         )));
     }
-    let raw = fs::read(path).map_err(|err| CliError::io(describe("read", path), err))?;
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw)
+        .map_err(|err| CliError::io(describe("read", path), err))?;
     serde_json::from_slice(&raw).map_err(|_| {
         CliError::Invalid(format!(
             "{} is not a session file; run `db-mcp-gateway login`",
@@ -125,6 +143,22 @@ mod tests {
         save(&path, &session()).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn save_replaces_the_file_so_an_open_reader_keeps_the_old_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut reader = File::open(&path).unwrap();
+        save(&path, &session()).unwrap();
+        let mut seen = String::new();
+        reader.read_to_string(&mut seen).unwrap();
+        assert_eq!(seen, "old");
+        assert_eq!(load(&path).unwrap().access_token, "bearer-value");
+        let leftovers = fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(leftovers, 1, "no temp file left behind");
     }
 
     #[test]

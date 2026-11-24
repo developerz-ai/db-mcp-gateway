@@ -24,6 +24,9 @@ env:
 
 jobs:
   measure:
+    # One dead leg must not fail the run on its own: `verdict` counts a
+    # missing result as regressed and alone decides the 2-of-3.
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:

@@ -209,18 +209,11 @@ impl Password {
             Password::Literal(s) => Ok(s.clone()),
             Password::EnvVar(name) => match std::env::var(name) {
                 // Spec 08: an empty ref aborts boot like an unset one — an
-                // empty password would otherwise reach the driver.
-                // Trimmed like a `${FILE:…}` value: a value set from a file
-                // (`$(cat secret)`, a k8s `env` from a ConfigMap) keeps its
-                // trailing newline, which is never part of the credential.
-                Ok(v) => {
-                    let raw = Zeroizing::new(v);
-                    let trimmed = raw.trim_end_matches(['\n', '\r']);
-                    if trimmed.is_empty() {
-                        return Err(SecretError::EnvNotSet(name.clone()));
-                    }
-                    Ok(SecretString::from(trimmed))
-                }
+                // empty password would otherwise reach the driver. Unlike a
+                // `${FILE:…}` value it is not trimmed: the environment holds
+                // the credential byte for byte.
+                Ok(v) if v.is_empty() => Err(SecretError::EnvNotSet(name.clone())),
+                Ok(v) => Ok(SecretString::from(v)),
                 Err(std::env::VarError::NotPresent) => Err(SecretError::EnvNotSet(name.clone())),
                 Err(std::env::VarError::NotUnicode(_)) => {
                     Err(SecretError::EnvNotUtf8(name.clone()))

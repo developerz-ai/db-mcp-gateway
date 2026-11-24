@@ -53,7 +53,15 @@ impl Fixture {
             ),
             format!("CREATE INDEX orders_account_idx ON {s}.orders (account_id)"),
             format!("CREATE INDEX orders_include_idx ON {s}.orders (account_id) INCLUDE (hidden)"),
+            format!(
+                "CREATE TABLE {s}.ledger (id bigint, payroll_code text, \
+                 code_len int GENERATED ALWAYS AS (length(payroll_code)) STORED, \
+                 id_twice bigint GENERATED ALWAYS AS (id * 2) STORED)"
+            ),
+            format!("CREATE TABLE {s}.vault (id bigint, salary_band text)"),
             format!("GRANT USAGE ON SCHEMA {s} TO {r}"),
+            format!("GRANT SELECT (id, code_len, id_twice) ON {s}.ledger TO {r}"),
+            format!("GRANT SELECT (id) ON {s}.vault TO {r}"),
             format!("GRANT SELECT (id) ON {s}.accounts TO {r}"),
             format!("GRANT SELECT (id, account_id, account_ssn) ON {s}.orders TO {r}"),
         ] {
@@ -80,6 +88,16 @@ impl Fixture {
 /// The `full` payload for the fixture schema, read as the fixture's role,
 /// and the audit row's `(outcome, sql)`.
 async fn describe_full(fixture: &Fixture) -> (Value, String, Option<String>) {
+    describe(fixture, "full", None).await
+}
+
+/// One `describe_schema` call over the fixture schema at `detail`, searched
+/// for `search` when given, as the fixture's role.
+async fn describe(
+    fixture: &Fixture,
+    detail: &str,
+    search: Option<&str>,
+) -> (Value, String, Option<String>) {
     let yaml = format!(
         r#"
 servers:
@@ -105,6 +123,12 @@ permissions:
         groups: vec!["engineers".to_string()],
     };
     let gateway = spawn_logged_in(&config_yaml(&yaml), user).await;
+    let mut arguments = json!({
+        "server": "target", "database": "app",
+        "schema": fixture.schema, "detail": detail });
+    if let Some(search) = search {
+        arguments["search"] = json!(search);
+    }
     let response: Value = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
@@ -113,9 +137,7 @@ permissions:
         .bearer_auth(&gateway.bearer)
         .json(&json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": { "name": "describe_schema", "arguments": {
-                "server": "target", "database": "app",
-                "schema": fixture.schema, "detail": "full" } }
+            "params": { "name": "describe_schema", "arguments": arguments }
         }))
         .send()
         .await
@@ -130,7 +152,7 @@ permissions:
         &gateway.state_db,
         &gateway.user_sub,
         "describe_schema",
-        "full",
+        detail,
     )
     .await;
     (
@@ -194,4 +216,58 @@ async fn keys_and_indexes_on_hidden_columns_are_left_out() {
     // `orders_pkey` and the INCLUDE index touch `hidden`.
     assert_eq!(names(&orders["indexes"]), ["orders_account_idx"]);
     assert!(!orders.to_string().contains("hidden"), "{orders}");
+}
+
+/// A search term matches only names the role can see: `vault` holds a
+/// hidden `salary_band`, so searching `salary` must not list it.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn search_never_matches_a_hidden_column() {
+    let fixture = Fixture::create().await;
+    let mut found = Vec::new();
+    for detail in ["names", "full", "columns"] {
+        let (payload, outcome, _) = describe(&fixture, detail, Some("salary")).await;
+        assert_eq!(outcome, "success", "{detail}: {payload}");
+        found.push((detail, payload));
+    }
+    let (visible, _, _) = describe(&fixture, "names", Some("code_len")).await;
+    fixture.drop().await;
+
+    for (detail, payload) in found {
+        assert!(
+            !payload.to_string().contains("vault"),
+            "{detail}: {payload}"
+        );
+    }
+    assert!(visible.to_string().contains("ledger"), "{visible}");
+}
+
+/// A visible generated column whose expression reads a hidden column has
+/// no `default`: the expression would name the hidden column.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_generated_expression_over_a_hidden_column_is_left_out() {
+    let fixture = Fixture::create().await;
+    let (payload, outcome, _) = describe_full(&fixture).await;
+    fixture.drop().await;
+
+    assert_eq!(outcome, "success", "{payload}");
+    let ledger = table(&payload, "ledger");
+    assert_eq!(names(&ledger["columns"]), ["code_len", "id", "id_twice"]);
+    assert!(!ledger.to_string().contains("payroll"), "{ledger}");
+    let column = |name: &str| {
+        ledger["columns"]
+            .as_array()
+            .and_then(|c| c.iter().find(|c| c["name"] == name))
+            .cloned()
+            .unwrap_or_else(|| panic!("no column {name}: {ledger}"))
+    };
+    assert_eq!(column("code_len").get("default"), None, "{ledger}");
+    // Every column `id_twice` reads is visible: its expression stays.
+    assert!(
+        column("id_twice")["default"]
+            .as_str()
+            .is_some_and(|d| d.contains("id")),
+        "{ledger}"
+    );
 }

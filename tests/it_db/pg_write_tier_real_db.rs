@@ -146,11 +146,13 @@ async fn a_broken_write_credential_leaves_the_read_tier_alone() {
             .await
             .unwrap_or_else(|err| panic!("{label}: read after a failed write: {err:?}"));
         assert_eq!(read.rows, vec![vec![json!(1)]], "{label}");
-        // Activity still answers, from the read tier.
-        adapter
+        // Activity still answers, from the read tier — marked incomplete,
+        // since the write tier's backends were never listed.
+        let listing = adapter
             .db_activity(activity())
             .await
             .unwrap_or_else(|err| panic!("{label}: activity: {err:?}"));
+        assert!(listing.truncated, "{label}: an unlisted write tier");
     }
 }
 

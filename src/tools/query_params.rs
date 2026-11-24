@@ -13,6 +13,12 @@ pub(super) const MAX_PARAMS: usize = 100;
 /// Longest one param's JSON may be.
 pub(super) const MAX_PARAM_BYTES: usize = 64 * 1024;
 
+/// 2^63: a float this large is an integer the JSON parser could not hold
+/// exactly, or a float written past int8 — either way not bound as given.
+const INT8_BOUND: f64 = 9_223_372_036_854_775_808.0;
+
+const PAST_INT8: &str = "integer past int8; pass it as a string and cast it, e.g. `$1::numeric`";
+
 /// `raw` as typed params, or the `invalid_arguments` message naming the
 /// first one refused.
 pub(super) fn parse_params(raw: &[Value]) -> Result<Vec<QueryParam>, String> {
@@ -39,14 +45,15 @@ fn parse_param(value: &Value) -> Result<QueryParam, String> {
         Value::Null => QueryParam::Null,
         Value::Bool(flag) => QueryParam::Bool(*flag),
         Value::Number(number) => {
+            let float = number.as_f64().ok_or("not a number")?;
             if let Some(int) = number.as_i64() {
                 QueryParam::Int(int)
-            } else if number.is_u64() {
-                return Err("integer past int8; pass it as a string and cast it, \
-                            e.g. `$1::numeric`"
-                    .to_owned());
+            } else if number.is_u64() || float.abs() >= INT8_BOUND {
+                // An integer token past u64 or below i64 arrives already
+                // rounded to a float: refused like one in u64.
+                return Err(PAST_INT8.to_owned());
             } else {
-                QueryParam::Float(number.as_f64().ok_or("not a number")?)
+                QueryParam::Float(float)
             }
         }
         Value::String(text) => QueryParam::Text(text.clone()),
@@ -104,6 +111,20 @@ mod tests {
         assert!(
             err.starts_with("`params[1]` ($2): integer past int8"),
             "{err}"
+        );
+        // Past u64 (or below i64) the JSON parser already holds a rounded
+        // float: refused all the same, signed and unsigned.
+        let parsed: Vec<Value> =
+            serde_json::from_str("[18446744073709551617, -9223372036854775809, 1e19]")
+                .expect("JSON");
+        for (at, value) in parsed.iter().enumerate() {
+            let err = parse_params(std::slice::from_ref(value)).unwrap_err();
+            assert!(err.contains("integer past int8"), "{at}: {err}");
+        }
+        // Inside the range a float stays a float.
+        assert_eq!(
+            parse_params(&[json!(-9.2e18), json!(4.5e15)]),
+            Ok(vec![QueryParam::Float(-9.2e18), QueryParam::Float(4.5e15)])
         );
     }
 

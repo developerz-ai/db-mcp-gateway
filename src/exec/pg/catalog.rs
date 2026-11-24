@@ -4,7 +4,8 @@
 //!
 //! Visibility matches `information_schema`: a relation is listed when the
 //! read role owns it or holds a privilege on one of its columns, a column
-//! when the role owns its relation or holds a privilege on it.
+//! when the role owns its relation or holds a privilege on it. A search
+//! term matches a column only under that same column rule.
 
 use super::super::query::{SchemaDetail, SchemaQuery};
 use super::catalog_full::FULL_SELECT;
@@ -64,6 +65,8 @@ pub(super) fn schema_query<'a>(query: &SchemaQuery<'a>) -> (String, Vec<&'a str>
                     " AND (strpos(lower(c.relname), lower({term})) > 0 \
                      OR EXISTS (SELECT 1 FROM pg_attribute m WHERE m.attrelid = c.oid \
                        AND m.attnum > 0 AND NOT m.attisdropped \
+                       AND (pg_has_role(c.relowner, 'USAGE') \
+                         OR has_column_privilege(c.oid, m.attnum, 'SELECT, INSERT, UPDATE, REFERENCES')) \
                        AND strpos(lower(m.attname), lower({term})) > 0))"
                 ));
             }

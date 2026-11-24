@@ -38,8 +38,8 @@ async fn an_admin_session_older_than_the_yaml_cap_is_session_too_old() {
         email: "admin-age@example.com".to_string(),
         groups: vec!["gateway-admins".to_string()],
     };
-    let gw = spawn_logged_in(YAML, user).await;
     let logged_in = Instant::now();
+    let gw = spawn_logged_in(YAML, user).await;
     let (fresh, body) = list_users(&gw).await;
     assert_eq!(fresh, StatusCode::OK, "a fresh admin session lists: {body}");
 

@@ -1,5 +1,16 @@
 {{- if .Values.networkPolicy.enabled }}
 {{- $egress := .Values.networkPolicy.egress }}
+{{- range $egress.targets }}
+{{- if not .to }}
+{{- fail "networkPolicy.egress.targets: every rule needs a non-empty `to`; an empty one opens its ports to every destination (use networkPolicy.egress.anyTarget.enabled to mean that)" }}
+{{- end }}
+{{- end }}
+{{- if and $egress.anyTarget.enabled $egress.stateDb.to }}
+{{- fail "networkPolicy.egress.anyTarget opens 5432 to every destination, undoing the stateDb.to fence: list scoped networkPolicy.egress.targets instead" }}
+{{- end }}
+{{- if not (or $egress.targets $egress.anyTarget.enabled) }}
+{{- fail "networkPolicy.egress: no target egress; list scoped networkPolicy.egress.targets or opt in with networkPolicy.egress.anyTarget.enabled" }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -28,6 +39,9 @@ spec:
     {{- include "gateway.egressRule" $egress.idp | nindent 4 }}
     {{- range $egress.targets }}
     {{- include "gateway.egressRule" . | nindent 4 }}
+    {{- end }}
+    {{- if $egress.anyTarget.enabled }}
+    {{- include "gateway.egressRule" (dict "ports" $egress.anyTarget.ports) | nindent 4 }}
     {{- end }}
     {{- range $egress.extra }}
     {{- include "gateway.egressRule" . | nindent 4 }}

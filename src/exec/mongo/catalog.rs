@@ -10,7 +10,9 @@ use super::super::Identifier;
 use super::super::adapter::{
     DbAdapter, ExecError, ExecResult, TOKIO_TIMEOUT_SLACK_MS, effective_timeout_ms,
 };
+use super::super::budget::ResultBudget;
 use super::super::query::{ExecQuery, SampleQuery, SchemaDetail, SchemaQuery};
+use super::super::rejection::RejectionKind;
 use super::super::sql_guard::Access;
 use super::MongoAdapter;
 use super::infer::infer_fields;
@@ -44,13 +46,22 @@ impl MongoAdapter {
         let command = json!({ "listCollections": 1, "nameOnly": false, "filter": filter });
         let listed = self.read(&command, query.row_limit, query).await?;
 
+        // Each command is capped on its own; the assembled rows share one
+        // budget too, so many wide collections cannot outgrow a response.
+        let mut budget = ResultBudget::new(query.row_limit);
+        let mut truncated = listed.truncated;
         let mut rows = Vec::with_capacity(listed.rows.len());
         for document in listed.rows.iter().filter_map(|row| row.first()) {
             let name = string_field(document, "name")?;
             let kind = string_field(document, "type")?;
-            if let Some(row) = self.describe_one(name, kind, query).await? {
-                rows.push(row);
+            let Some(row) = self.describe_one(name, kind, query).await? else {
+                continue;
+            };
+            if !budget.admit(&row) {
+                truncated = true;
+                break;
             }
+            rows.push(row);
         }
         rows.sort_by(|a, b| a[1].as_str().cmp(&b[1].as_str()));
         let mut columns = vec!["database", "collection", "type"];
@@ -63,7 +74,7 @@ impl MongoAdapter {
             columns: columns.into_iter().map(String::from).collect(),
             column_types: Vec::new(),
             rows,
-            truncated: listed.truncated,
+            truncated,
             elapsed_ms: started.elapsed().as_millis() as u64,
             rows_affected: None,
         })
@@ -87,8 +98,10 @@ impl MongoAdapter {
             Value::from(kind),
         ];
         let sample = match query.detail {
-            SchemaDetail::Full if is_system_collection(name) => Some(withheld_sample()),
-            SchemaDetail::Full => Some(infer_fields(&self.sample_documents(name, query).await?)),
+            SchemaDetail::Full if is_system_collection(name) => {
+                Some(withheld_sample("system collection"))
+            }
+            SchemaDetail::Full => Some(self.sample(name, query).await?),
             _ => None,
         };
         let field_named = |sample: &Value| {
@@ -111,6 +124,21 @@ impl MongoAdapter {
         }
         row.extend(sample);
         Ok(Some(row))
+    }
+
+    /// The inferred fields of `collection`'s sample. A collection the role
+    /// may list but not read is still listed, its sample withheld: one
+    /// unreadable collection never sinks the whole listing.
+    async fn sample(&self, collection: &str, query: &SchemaQuery<'_>) -> Result<Value, ExecError> {
+        match self.sample_documents(collection, query).await {
+            Ok(documents) => Ok(infer_fields(&documents)),
+            Err(ExecError::Rejected(rejection))
+                if rejection.kind() == RejectionKind::PermissionDenied =>
+            {
+                Ok(withheld_sample("not readable by the database role"))
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Up to `query.sample_limit` documents of `collection`, through
@@ -187,10 +215,10 @@ impl MongoAdapter {
     }
 }
 
-/// The `sample` of a `system.*` collection, which is never read: server
-/// state, not application data (see the rejector).
-fn withheld_sample() -> Value {
-    json!({ "sampled": 0, "fields": [], "truncated": false, "withheld": "system collection" })
+/// The `sample` of a collection that is not read: a `system.*` one (server
+/// state, not application data — see the rejector), or one the role cannot.
+fn withheld_sample(why: &str) -> Value {
+    json!({ "sampled": 0, "fields": [], "truncated": false, "withheld": why })
 }
 
 /// The `find` a sample runs. `sample_table` stores it as the audit row's

@@ -23,7 +23,8 @@
 //!  3. A data read (`find`, `aggregate`, `count`, `distinct`) must not name
 //!     a `system.*` collection ([`is_system_collection`]): those hold server
 //!     state (`system.profile` keeps other sessions' queries, `system.js`
-//!     stored code), not application data.
+//!     stored code), not application data. That holds for every collection
+//!     a pipeline stage reads too ([`namespace`]).
 //!  4. The denied operators — `$out`, `$merge`, `$function`, `$where`,
 //!     `$accumulator` — are rejected at *any* depth in the document tree.
 //!
@@ -34,6 +35,8 @@
 //! pulling extended-JSON's `{$date: ...}` ambiguity into the deny check.
 
 use serde_json::Value;
+
+mod namespace;
 
 /// Allowed top-level command names. The first JSON object key is the
 /// command name (mongo's wire convention). Anything outside this set is
@@ -149,6 +152,9 @@ pub enum RejectReason {
 
     #[error("mongo command `{0}` may not read a `system.*` collection")]
     SystemCollection(String),
+
+    #[error("mongo stage `{0}` must name a collection of this database")]
+    ForeignNamespace(&'static str),
 }
 
 impl RejectReason {
@@ -193,6 +199,7 @@ pub fn validate_command(json: &str) -> Result<(), RejectReason> {
     {
         return Err(RejectReason::SystemCollection(command.clone()));
     }
+    namespace::check_namespaces(command, &value)?;
 
     walk_for_denied(&value)
 }
@@ -236,3 +243,6 @@ fn denied_match(key: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod namespace_tests;

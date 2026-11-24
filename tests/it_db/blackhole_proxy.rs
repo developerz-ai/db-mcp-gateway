@@ -53,13 +53,16 @@ async fn forward(mut client: TcpStream, upstream: (String, u16), conn: Arc<Conn>
         return;
     };
     let (mut from_client, mut from_server) = ([0u8; 8192], [0u8; 8192]);
+    let mut seen = ListenScan::default();
     loop {
         tokio::select! {
+            // Once frozen, never forward another byte, even if a socket is ready.
+            biased;
             // Holds both sockets open and silent until the test ends.
             () = conn.frozen.cancelled() => std::future::pending::<()>().await,
             read = client.read(&mut from_client) => {
                 let Ok(n @ 1..) = read else { return };
-                if from_client[..n].windows(6).any(|w| w == b"LISTEN") {
+                if seen.feed(&from_client[..n]) {
                     conn.is_listener.store(true, Ordering::SeqCst);
                 }
                 if server.write_all(&from_client[..n]).await.is_err() {
@@ -74,4 +77,31 @@ async fn forward(mut client: TcpStream, upstream: (String, u16), conn: Arc<Conn>
             }
         }
     }
+}
+
+const LISTEN: &[u8] = b"LISTEN";
+
+/// Finds `LISTEN` in a byte stream even when TCP splits it across reads.
+#[derive(Default)]
+struct ListenScan {
+    tail: Vec<u8>,
+}
+
+impl ListenScan {
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        self.tail.extend_from_slice(bytes);
+        let found = self.tail.windows(LISTEN.len()).any(|w| w == LISTEN);
+        let keep = self.tail.len().saturating_sub(LISTEN.len() - 1);
+        self.tail.drain(..keep);
+        found
+    }
+}
+
+#[test]
+#[serial_test::parallel(world)]
+fn listen_scan_matches_across_read_boundaries() {
+    let mut scan = ListenScan::default();
+    assert!(!scan.feed(b"Q\0\0\0\x1cLIS"));
+    assert!(scan.feed(b"TEN permissions_changed\0"));
+    assert!(!ListenScan::default().feed(b"SELECT 1"));
 }

@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::common::audit::latest_audit;
 use crate::common::gateway::spawn_logged_in;
 use crate::common::idp::MockUser;
-use crate::common::pg_target::{adapter, config_yaml, owner_url, writable_adapter};
+use crate::common::pg_target::{READ_ROLE, adapter, config_yaml, owner_url, writable_adapter};
 
 async fn owner() -> PgPool {
     PgPoolOptions::new()
@@ -102,10 +102,7 @@ async fn a_typo_gets_its_position_hint_and_near_misses() {
         "{column:?}"
     );
     assert!(column.near_misses().len() <= 5, "{column:?}");
-    assert!(
-        column.hint().is_none_or(|hint| hint.contains("email")),
-        "a column hint names catalog columns only: {column:?}"
-    );
+    assert_eq!(column.hint(), None, "{column:?}");
 
     assert_eq!(relation.sqlstate(), "42P01");
     assert_eq!(relation.position(), Some(16));
@@ -116,8 +113,8 @@ async fn a_typo_gets_its_position_hint_and_near_misses() {
     assert!(syntax.near_misses().is_empty());
 }
 
-/// The parser's hint passes through: Postgres names the column the caller
-/// probably meant.
+/// The parser's hint passes through — except a column diagnostic's, which
+/// near misses replace.
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn the_parser_hint_is_passed_on() {
@@ -130,9 +127,9 @@ async fn the_parser_hint_is_passed_on() {
 
     assert_eq!(rejection.sqlstate(), "42703");
     assert_eq!(rejection.position(), Some(8));
-    assert_eq!(
-        rejection.hint(),
-        Some("Perhaps you meant to reference the column \"t.email\"."),
+    assert_eq!(rejection.hint(), None, "{rejection:?}");
+    assert!(
+        rejection.near_misses().iter().any(|n| n == "email"),
         "{rejection:?}"
     );
     assert_eq!(missing.sqlstate(), "42883");
@@ -194,6 +191,33 @@ async fn near_misses_are_only_names_the_read_role_can_see() {
             .any(|n| n.contains("ledger_rows")),
         "{rejection:?}"
     );
+}
+
+/// Postgres suggests a column for a typo from the whole relation, column
+/// grants aside: the server's hint for an undefined column is never passed
+/// on, so a column the read role cannot see is never named.
+// Parallel: the grants touch only this test's own schema and table.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn an_undefined_column_hint_never_names_a_hidden_column() {
+    let a = writable_adapter().await;
+    let owner = owner().await;
+    let schema = format!("hcol{}", &Uuid::new_v4().simple().to_string()[..8]);
+    for sql in [
+        format!("CREATE SCHEMA {schema}"),
+        format!("CREATE TABLE {schema}.payroll (id int, salary_band text)"),
+        format!("GRANT USAGE ON SCHEMA {schema} TO {READ_ROLE}"),
+        format!("GRANT SELECT (id) ON {schema}.payroll TO {READ_ROLE}"),
+    ] {
+        exec(&owner, &sql).await;
+    }
+    let sql = format!("SELECT t.salary_bnad FROM {schema}.payroll t");
+    let rejection = rejected(&a, &sql).await;
+    exec(&owner, &format!("DROP SCHEMA {schema} CASCADE")).await;
+
+    assert_eq!(rejection.sqlstate(), "42703");
+    let told = format!("{:?}", (rejection.hint(), rejection.near_misses()));
+    assert!(!told.contains("salary_band"), "{rejection:?}");
 }
 
 /// Raised over row data: a row holds a name one edit from a real table, and

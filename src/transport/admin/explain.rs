@@ -2,7 +2,11 @@
 //! action)` is allowed or denied: the grants that matched and the merged
 //! constraints, computed by the evaluator itself
 //! ([`authz::matching_grants`] + [`authz::decide`]), so the answer is the
-//! decision a real call would get. Read-only; audited as `admin.explain`.
+//! decision a real call would get — for the groups it assumed. It never
+//! reads a live session, so `groups_source` says where the groups came from:
+//! `stored` (the user's last-login snapshot) and `assumed` (from the body)
+//! are simulations, which a session holding other claims can contradict.
+//! Read-only; audited as `admin.explain`.
 
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
@@ -47,31 +51,34 @@ pub async fn explain(
     body: Result<Json<ExplainRequest>, JsonRejection>,
 ) -> Result<Json<JsonValue>, AdminError> {
     let rid = actor.request_id.as_str();
-    let Json(body) = body.map_err(|_| invalid_body(rid))?;
+    let Json(body) = body.map_err(|rejection| invalid_body(&rejection, rid))?;
     let subject = parse_subject(&body, rid)?;
     let server = trimmed_non_empty(&body.server, "server", rid)?;
     let database = trimmed_non_empty(&body.database, "database", rid)?;
 
-    let (identity, db_rows) = match &subject {
+    let (identity, db_rows, groups_source) = match &subject {
         Subject::User(sub) => {
-            let groups = match body.groups.clone() {
-                Some(groups) => groups,
-                None => live_user_by_sub(&state.state_db, sub)
-                    .await
-                    .map_err(|err| internal("explain user", err, rid))?
-                    .map(|u| u.groups)
-                    .unwrap_or_default(),
+            let (groups, source) = match body.groups.clone() {
+                Some(groups) => (groups, "assumed"),
+                None => {
+                    let stored = live_user_by_sub(&state.state_db, sub)
+                        .await
+                        .map_err(|err| internal("explain user", err, rid))?
+                        .map(|u| u.groups)
+                        .unwrap_or_default();
+                    (stored, "stored")
+                }
             };
             let rows = state
                 .repo
                 .live_grants_for_sub(sub)
                 .await
                 .map_err(|err| internal("explain grants", err, rid))?;
-            (identity(sub, groups), rows)
+            (identity(sub, groups), rows, source)
         }
         // No `user:` block can match an empty subject (boot rejects blank
         // ones), so a group question sees group grants only.
-        Subject::Group(group) => (identity("", vec![group.clone()]), Vec::new()),
+        Subject::Group(group) => (identity("", vec![group.clone()]), Vec::new(), "group"),
     };
     let db_ids: Vec<_> = db_rows.iter().map(|r| r.id).collect();
     let db_grants = db_rows
@@ -117,6 +124,7 @@ pub async fn explain(
             server: Some(&server),
             database: Some(&database),
             row_count: i64::try_from(matched.len()).ok(),
+            ..ReadScope::default()
         },
     )
     .await?;
@@ -129,6 +137,7 @@ pub async fn explain(
         "constraints": constraints,
         "subject": subject_json(&subject),
         "groups": identity.groups,
+        "groups_source": groups_source,
         "server": server,
         "database": database,
         "action": body.action.as_str(),

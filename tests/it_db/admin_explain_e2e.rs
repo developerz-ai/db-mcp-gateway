@@ -28,6 +28,10 @@ async fn explain_merges_yaml_group_and_db_user_grants_most_restrictive() {
         "most restrictive wins"
     );
     assert_eq!(body["groups"], json!(["o10-eng"]), "cached groups used");
+    assert_eq!(
+        body["groups_source"], "stored",
+        "a live session may carry other claims: this is a simulation"
+    );
     let matched = body["matched"].as_array().expect("matched");
     assert_eq!(matched.len(), 2, "{body}");
     assert_eq!(matched[0]["source"], "yaml");
@@ -55,7 +59,16 @@ async fn explain_merges_yaml_group_and_db_user_grants_most_restrictive() {
         .await;
     assert_eq!(body["decision"], "deny");
     assert_eq!(body["constraints"], json!(null));
-    assert_eq!(h.admin_reads("admin.explain").await, 3);
+    assert_eq!(body["groups_source"], "group");
+    let (_, body) = h
+        .post(
+            "/admin/v1/explain",
+            &json!({ "user": sub, "groups": ["o10-eng"], "server": "prod",
+                     "database": "app", "action": "query_read" }),
+        )
+        .await;
+    assert_eq!(body["groups_source"], "assumed");
+    assert_eq!(h.admin_reads("admin.explain").await, 4);
     h.cleanup().await;
 }
 

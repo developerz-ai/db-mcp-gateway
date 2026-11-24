@@ -5,9 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use sqlx::{
-    Column, Connection, Executor, PgConnection, PgPool, Postgres, SqlSafeStr, Transaction, TypeInfo,
-};
+use sqlx::{Connection, Executor, PgConnection, PgPool};
 use tokio::sync::Semaphore;
 
 use crate::audit::drain::DetachedTasks;
@@ -16,6 +14,7 @@ use super::super::adapter::{ExecError, ExecResult, effective_timeout_ms};
 use super::super::query::{ExecQuery, QueryParam};
 use super::super::sql_guard::Access;
 use super::cancel::{Backend, BackendTag, CancelOnDrop};
+use super::describe::describe_columns;
 use super::error::{Origin, classify, classify_commit};
 use super::recast;
 use super::stream::stream_rows;
@@ -138,7 +137,8 @@ async fn run_query_inner(
         let mut in_step = true;
         if columns.is_empty() && query.access == Access::ReadOnly {
             let left = Duration::from_millis(u64::from(ms)).saturating_sub(started.elapsed());
-            match describe_columns(&mut tx, query.sql, left.min(DESCRIBE_TIMEOUT)).await {
+            let budget = left.min(DESCRIBE_TIMEOUT);
+            match describe_columns(&mut tx, query.sql, params, budget).await {
                 Some(described) => (columns, column_types) = described,
                 None => in_step = false,
             }
@@ -192,36 +192,6 @@ fn cancelled_before_budget(err: ExecError, elapsed: Duration, budget_ms: u32) ->
         }
         other => other,
     }
-}
-
-/// Column names and types for a zero-row read. Without them the caller cannot tell
-/// "your filter matched nothing" from "that table has no such columns"
-/// (#136). Parse/Describe only — the statement does not run again. The
-/// driver can only describe through a named statement; `reset_on_release`
-/// closes it before the connection serves anyone else.
-///
-/// Best-effort on purpose: the read already succeeded, so a failure here
-/// answers no columns, never an error. `None` means `budget` ran out with
-/// the lookup still in flight on the connection.
-async fn describe_columns(
-    tx: &mut Transaction<'_, Postgres>,
-    sql: &str,
-    budget: Duration,
-) -> Option<(Vec<String>, Vec<String>)> {
-    let described = tokio::time::timeout(
-        budget,
-        (&mut **tx).describe(sqlx::AssertSqlSafe(sql).into_sql_str()),
-    )
-    .await
-    .ok()?;
-    Some(match described {
-        Ok(described) => described
-            .columns()
-            .iter()
-            .map(|c| (c.name().to_string(), c.type_info().name().to_string()))
-            .unzip(),
-        Err(_) => (Vec::new(), Vec::new()),
-    })
 }
 
 #[cfg(test)]

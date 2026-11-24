@@ -105,9 +105,10 @@ async fn max_cell_bytes_replaces_an_oversized_cell_with_the_marker() {
 #[serial_test::parallel(world)]
 async fn a_zero_byte_cap_is_an_argument_error() {
     let agent = Agent::boot().await;
-    for cap in ["max_bytes", "max_cell_bytes"] {
+    // `max_bytes: 1` cannot hold even `[]`.
+    for (cap, value) in [("max_bytes", 0), ("max_bytes", 1), ("max_cell_bytes", 0)] {
         let mut args = json!({"server": "target", "database": "app", "sql": "SELECT 1"});
-        args[cap] = json!(0);
+        args[cap] = json!(value);
         let called = agent.call("run_query", args).await;
         assert_eq!(
             called.response["error"]["code"], -32602,

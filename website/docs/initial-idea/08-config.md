@@ -117,7 +117,7 @@ logging:
 ## Resolution order
 
 1. File at `--config` flag, else `$DB_MCP_GATEWAY_CONFIG`. The binary has no default path — with neither set it exits. The published image sets `DB_MCP_GATEWAY_CONFIG=/etc/gateway/config.yml`.
-2. `${ENV:NAME}` placeholders expanded from process env; `${FILE:/path}` placeholders read from disk (trailing newline stripped from both). A `${ENV:…}` ref whose variable is unset or empty aborts boot, as does a missing or empty file.
+2. `${ENV:NAME}` placeholders expanded from process env; `${FILE:/path}` placeholders read from disk (trailing newline stripped from `${FILE:…}` values; a `${ENV:…}` value is used byte for byte). A `${ENV:…}` ref whose variable is unset or empty aborts boot, as does a missing or empty file.
 3. `vault:`, `aws-sm:`, `gcp-sm:` references resolved from the named backend (when backend integrations land — until then, recognised refs also abort boot rather than silently failing at first DB connect).
 4. Final config validated against the schema. Errors at this stage refuse to start the process — no half-loaded state. Every validation error and every unresolved secret ref is reported in the one abort (each ref named by server, database and tier), not just the first.
 

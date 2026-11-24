@@ -71,6 +71,21 @@ if (( ${#missing[@]} )); then
   echo "→ starting ${missing[*]}"
   "${compose[@]}" up -d --wait "${missing[@]}"
 fi
+# Running is not ready: a container started a moment ago (by us or anyone) can
+# still be in its init phase, whose server listens on the unix socket only —
+# which the compose healthcheck probes. Ask over TCP, in the container, so a
+# running service is never re-upped.
+wait_for_tcp() {
+  local service=$1 user=$2
+  for _ in $(seq 60); do
+    "${compose[@]}" exec -T "$service" pg_isready -q -h 127.0.0.1 -U "$user" && return 0
+    sleep 1
+  done
+  echo "bin/run: $service does not accept TCP connections after 60 s" >&2
+  exit 1
+}
+wait_for_tcp state-db "${STATE_DB_USER:-gateway}"
+wait_for_tcp target-db "${TARGET_DB_USER:-app}"
 bin/seed
 # The owner password is bin/seed's alone: the gateway connects as the
 # read-only login, even when the shell or .env exports the owner's.

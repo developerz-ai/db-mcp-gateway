@@ -40,19 +40,25 @@ impl<'t> Numerals<'t> {
         self.next_token()
     }
 
-    /// Outside a string, only a number starts with a digit or a minus sign.
     fn next_token(&mut self) -> Option<&'t str> {
+        let (start, end) = self.next_span()?;
+        std::str::from_utf8(&self.text[start..end]).ok()
+    }
+
+    /// Outside a string, only a number starts with a digit or a minus sign.
+    fn next_span(&mut self) -> Option<(usize, usize)> {
         while let Some(&byte) = self.text.get(self.at) {
             match byte {
                 b'"' => self.skip_string(),
                 b'-' | b'0'..=b'9' => {
-                    let rest = &self.text[self.at..];
+                    let start = self.at;
+                    let rest = &self.text[start..];
                     let len = rest
                         .iter()
                         .position(|b| !matches!(b, b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E'))
                         .unwrap_or(rest.len());
                     self.at += len;
-                    return std::str::from_utf8(&rest[..len]).ok();
+                    return Some((start, start + len));
                 }
                 _ => self.at += 1,
             }
@@ -70,6 +76,34 @@ impl<'t> Numerals<'t> {
             }
         }
     }
+}
+
+/// `text` with every number token past `f64`'s range (`1e400`; `serde_json`
+/// refuses those outright) turned into a string of its numeral — what the
+/// visitor keeps for any number an `f64` cannot hold. `None` when there is
+/// none, the common case: nothing is copied.
+pub(super) fn quote_out_of_range(text: &[u8]) -> Option<Vec<u8>> {
+    let mut numerals = Numerals::new(text);
+    let mut quoted: Option<Vec<u8>> = None;
+    let mut copied = 0;
+    while let Some((start, end)) = numerals.next_span() {
+        let finite = std::str::from_utf8(&text[start..end])
+            .ok()
+            .and_then(|numeral| numeral.parse::<f64>().ok())
+            .is_none_or(f64::is_finite);
+        if finite {
+            continue;
+        }
+        let out = quoted.get_or_insert_with(|| Vec::with_capacity(text.len() + 2));
+        out.extend_from_slice(&text[copied..start]);
+        out.push(b'"');
+        out.extend_from_slice(&text[start..end]);
+        out.push(b'"');
+        copied = end;
+    }
+    let mut out = quoted?;
+    out.extend_from_slice(&text[copied..]);
+    Some(out)
 }
 
 /// Whether two JSON numerals name the same number: `1.10`, `11e-1` and `1.1`

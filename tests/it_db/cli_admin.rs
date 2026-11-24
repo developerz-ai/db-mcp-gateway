@@ -262,6 +262,7 @@ async fn audit_query_and_export_stream_ndjson() {
             .success()
     );
 
+    let user_param = format!("user={}", admin.sub);
     let queried = run(args(&[
         "audit",
         "query",
@@ -269,26 +270,44 @@ async fn audit_query_and_export_stream_ndjson() {
         &token_arg,
         "--param",
         "limit=5",
+        "--param",
+        &user_param,
     ]))
     .await;
     assert!(queried.status.success(), "{queried:?}");
-    for line in String::from_utf8(queried.stdout).unwrap().lines() {
-        serde_json::from_str::<Value>(line).expect("each line is one JSON row");
-    }
+    assert_own_audit_read(&String::from_utf8(queried.stdout).unwrap(), &admin.sub);
     let out = dir.path().join("audit.ndjson");
     let exported = run(args(&[
         "audit",
         "export",
         "--token-file",
         &token_arg,
+        "--param",
+        &user_param,
         "--out",
         &out.display().to_string(),
     ]))
     .await;
     assert!(exported.status.success(), "{exported:?}");
     assert_eq!(file_mode(&out), 0o600);
+    assert_own_audit_read(&std::fs::read_to_string(&out).unwrap(), &admin.sub);
 
     delete_permissions_user(&pool, &admin.sub).await;
+}
+
+/// Every line is one JSON row, and the admin's own audited read is among
+/// them: `admin.audit_calls` writes its row before streaming, so it is the
+/// known seed.
+fn assert_own_audit_read(ndjson: &str, sub: &str) {
+    let rows: Vec<Value> = ndjson
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line is one JSON row"))
+        .collect();
+    assert!(
+        rows.iter()
+            .any(|r| r["user_sub"] == sub && r["tool"] == "admin.audit_calls"),
+        "{ndjson}"
+    );
 }
 
 fn file_mode(path: &Path) -> u32 {

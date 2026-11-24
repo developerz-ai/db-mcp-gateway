@@ -7,6 +7,10 @@ fn cap(n: u32) -> Option<NonZeroU32> {
     NonZeroU32::new(n)
 }
 
+fn max_bytes(n: u32) -> Option<MaxBytes> {
+    Some(MaxBytes::try_from(n).expect("a valid max_bytes"))
+}
+
 fn rows(n: i64) -> Vec<Vec<Value>> {
     (0..n).map(|i| vec![json!(i)]).collect()
 }
@@ -75,7 +79,7 @@ fn adapter_truncation_short_of_the_row_limit_is_the_byte_cap() {
 fn max_bytes_keeps_the_leading_rows_whose_json_fits() {
     // `[[0],[1],[2]]` is 13 bytes; `[[0],[1]]` 9.
     let caps = ByteCaps {
-        max_bytes: cap(12),
+        max_bytes: max_bytes(12),
         ..ByteCaps::default()
     };
     let (kept, sizing) = shape(rows(3), false, ASKED_10, caps, ServerKind::Postgres);
@@ -84,7 +88,7 @@ fn max_bytes_keeps_the_leading_rows_whose_json_fits() {
     assert!(sizing.truncated);
 
     let exact = ByteCaps {
-        max_bytes: cap(13),
+        max_bytes: max_bytes(13),
         ..ByteCaps::default()
     };
     let (kept, sizing) = shape(rows(3), false, ASKED_10, exact, ServerKind::Postgres);
@@ -119,15 +123,56 @@ fn an_oversized_cell_is_replaced_by_the_marker() {
     assert!(!sizing.truncated, "capping a cell drops no row");
 }
 
+/// Three rows of 12 MiB each: 36 MiB of JSON, past the 32 MiB ceiling.
+fn oversized_rows() -> Vec<Vec<Value>> {
+    let cell = "x".repeat(12 * 1024 * 1024);
+    (0..3).map(|_| vec![json!(cell)]).collect()
+}
+
 #[test]
 fn caller_max_bytes_is_clamped_to_the_gateway_budget() {
     let caps = ByteCaps {
-        max_bytes: cap(u32::MAX),
+        max_bytes: max_bytes(u32::MAX),
         ..ByteCaps::default()
     };
-    let (kept, sizing) = shape(rows(3), false, ASKED_10, caps, ServerKind::Postgres);
-    assert_eq!(kept.len(), 3);
-    assert!(!sizing.truncated);
+    let (kept, sizing) = shape(
+        oversized_rows(),
+        false,
+        ASKED_10,
+        caps,
+        ServerKind::Postgres,
+    );
+    assert_eq!(kept.len(), 2, "the third row crosses 32 MiB");
+    assert_eq!(sizing.truncated_by, Some(TruncatedBy::ByteCap));
+}
+
+/// Shaping can grow a result (a marker outweighs a short cell, escaping a
+/// raw byte): the ceiling holds without a caller `max_bytes` too.
+#[test]
+fn the_gateway_ceiling_holds_without_a_caller_max_bytes() {
+    let (kept, sizing) = shape(
+        oversized_rows(),
+        false,
+        ASKED_10,
+        ByteCaps::default(),
+        ServerKind::Postgres,
+    );
+    assert_eq!(kept.len(), 2);
+    assert!(sizing.truncated);
+    assert_eq!(sizing.truncated_by, Some(TruncatedBy::ByteCap));
+}
+
+/// `[]` is two bytes: a smaller cap could never be met.
+#[test]
+fn max_bytes_below_an_empty_rows_array_is_refused() {
+    assert!(MaxBytes::try_from(0).is_err());
+    assert!(MaxBytes::try_from(1).is_err());
+    assert!(MaxBytes::try_from(2).is_ok());
+    let err = serde_json::from_value::<MaxBytes>(json!(1)).expect_err("too small");
+    assert!(
+        err.to_string().contains("`max_bytes` must be at least 2"),
+        "{err}"
+    );
 }
 
 #[test]

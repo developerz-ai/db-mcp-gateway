@@ -25,13 +25,17 @@ use crate::mcp::jsonrpc::{self, ErrorObject};
 
 const ALLOWED_ORIGINS_VAR: &str = "MCP_ALLOWED_ORIGINS";
 
-/// An `MCP_ALLOWED_ORIGINS` entry that is not a bare `http(s)://host[:port]`.
+/// An `MCP_ALLOWED_ORIGINS` entry that is not a bare `http(s)://host[:port]`,
+/// named by its 1-based position: the text itself may be a pasted URL with
+/// credentials in it, so it is never kept.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "invalid {ALLOWED_ORIGINS_VAR} entry `{0}`: expected a comma-separated list of \
-     `https://host[:port]` origins (no path, query or wildcard)"
+    "invalid {ALLOWED_ORIGINS_VAR} entry {entry}: expected a comma-separated list of \
+     `https://host[:port]` origins (no userinfo, path, query or wildcard)"
 )]
-pub struct AllowedOriginsError(String);
+pub struct AllowedOriginsError {
+    entry: usize,
+}
 
 /// Which browser origins may call the MCP endpoint. `Default` allows none,
 /// which is also what a router built without this extension enforces.
@@ -56,7 +60,10 @@ impl AllowedOrigins {
             Vec::new()
         } else {
             raw.split(',')
-                .map(|entry| parse_listed(entry.trim()))
+                .enumerate()
+                .map(|(index, entry)| {
+                    parse_listed(entry.trim()).ok_or(AllowedOriginsError { entry: index + 1 })
+                })
                 .collect::<Result<_, _>>()?
         };
         Ok(Self {
@@ -74,9 +81,8 @@ impl AllowedOrigins {
     }
 }
 
-fn parse_listed(entry: &str) -> Result<String, AllowedOriginsError> {
-    let url = parse_origin(entry).ok_or_else(|| AllowedOriginsError(entry.to_owned()))?;
-    Ok(url.origin().ascii_serialization())
+fn parse_listed(entry: &str) -> Option<String> {
+    parse_origin(entry).map(|url| url.origin().ascii_serialization())
 }
 
 /// An origin is `scheme://host[:port]` with an http(s) scheme, no userinfo,
@@ -223,6 +229,20 @@ mod tests {
                 "{bad:?} accepted"
             );
         }
+    }
+
+    #[test]
+    fn a_rejected_entry_is_reported_by_position_not_text() {
+        let err = AllowedOrigins::parse(
+            "https://claude.ai, https://admin:hunter2@claude.ai",
+            public_bind(),
+        )
+        .unwrap_err();
+        for rendered in [err.to_string(), format!("{err:?}")] {
+            assert!(!rendered.contains("hunter2"), "{rendered}");
+            assert!(!rendered.contains("admin"), "{rendered}");
+        }
+        assert!(err.to_string().contains("entry 2"), "{err}");
     }
 
     #[test]

@@ -44,23 +44,30 @@ jobs:
   # Advisory: what the published image ships that a scanner flags. Scans the
   # `:latest` multi-arch image from the public registry (no credential); a
   # HIGH/CRITICAL finding with a fixed version fails the run, for a
-  # maintainer to ship as the next patch. Not a gate on anything.
+  # maintainer to ship as the next patch. Not a gate on anything. Every
+  # published platform is scanned: the arm64 image ships its own packages.
   image-scan:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: trivy image scan (ghcr :latest)
+      - name: trivy image scan (ghcr :latest, ${{ matrix.platform }})
+        env:
+          PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY,,}:latest"
           {
-            echo "## trivy: $image"
+            echo "## trivy: $image ($PLATFORM)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           rc=0
           docker run --rm \
             aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c \
-            image --no-progress --ignore-unfixed --severity HIGH,CRITICAL --exit-code 1 "$image" \
+            image --no-progress --platform "$PLATFORM" --ignore-unfixed --severity HIGH,CRITICAL --exit-code 1 "$image" \
             | tee -a "$GITHUB_STEP_SUMMARY" || rc=$?
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"

@@ -34,7 +34,7 @@ pub async fn create(
     body: Result<Json<CreateGrantRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, AdminError> {
     let rid = actor.request_id.as_str();
-    let Json(body) = body.map_err(|_| invalid_body(rid))?;
+    let Json(body) = body.map_err(|rejection| invalid_body(&rejection, rid))?;
     let target = parse_grant_target(&body, &state.known_servers, rid)?;
     let action = parse_action(&body.action, rid)?;
     positive_bounds(&body.constraints, rid)?;
@@ -110,7 +110,7 @@ pub async fn patch(
 ) -> Result<Json<GrantResponse>, AdminError> {
     let rid = actor.request_id.as_str();
     let Path(id) = id.map_err(|_| invalid_id("grant", rid))?;
-    let Json(body) = body.map_err(|_| invalid_body(rid))?;
+    let Json(body) = body.map_err(|rejection| invalid_body(&rejection, rid))?;
     let patch = body.constraints.unwrap_or_default();
     if body.action.is_none() && patch.is_empty() && body.expires_at.is_none() {
         return Err(AdminError::invalid(

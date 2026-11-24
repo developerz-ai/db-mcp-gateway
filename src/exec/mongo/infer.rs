@@ -75,24 +75,41 @@ fn type_name(value: &Value) -> &'static str {
     }
 }
 
+/// The BSON type a one-key object is the extended JSON of, when its value
+/// has that wrapper's shape. A stored subdocument may itself use a `$` key
+/// (`{"$oid": {"x": 1}}`); one whose value does not fit is walked as the
+/// object it is.
 fn extended_json_type(map: &Map<String, Value>) -> Option<&'static str> {
-    let mut keys = map.keys();
-    let (Some(key), None) = (keys.next(), keys.next()) else {
+    let mut entries = map.iter();
+    let (Some((key, value)), None) = (entries.next(), entries.next()) else {
         return None;
     };
-    Some(match key.as_str() {
-        "$oid" => "objectId",
-        "$date" => "date",
-        "$numberDecimal" => "decimal",
-        "$numberLong" => "long",
-        "$numberDouble" => "double",
-        "$binary" | "$uuid" => "binary",
-        "$timestamp" => "timestamp",
-        "$regularExpression" => "regex",
-        "$minKey" => "minKey",
-        "$maxKey" => "maxKey",
+    let is_string = value.is_string();
+    let has = |fields: &[&str]| {
+        value
+            .as_object()
+            .is_some_and(|o| o.len() == fields.len() && fields.iter().all(|f| o.contains_key(*f)))
+    };
+    let (kind, fits) = match key.as_str() {
+        "$oid" => (
+            "objectId",
+            value
+                .as_str()
+                .is_some_and(|hex| hex.len() == 24 && hex.bytes().all(|b| b.is_ascii_hexdigit())),
+        ),
+        "$date" => ("date", is_string || has(&["$numberLong"])),
+        "$numberDecimal" => ("decimal", is_string),
+        "$numberLong" => ("long", is_string),
+        "$numberDouble" => ("double", is_string),
+        "$binary" => ("binary", has(&["base64", "subType"])),
+        "$uuid" => ("binary", is_string),
+        "$timestamp" => ("timestamp", has(&["t", "i"])),
+        "$regularExpression" => ("regex", has(&["pattern", "options"])),
+        "$minKey" => ("minKey", value == &Value::from(1)),
+        "$maxKey" => ("maxKey", value == &Value::from(1)),
         _ => return None,
-    })
+    };
+    fits.then_some(kind)
 }
 
 #[cfg(test)]
@@ -102,9 +119,9 @@ mod tests {
     #[test]
     fn paths_types_and_counts_never_values() {
         let documents = vec![
-            json!({ "_id": { "$oid": "65f0c0ffee" }, "email": "alice@example.com",
+            json!({ "_id": { "$oid": "65f0c0ffee0000000000abcd" }, "email": "alice@example.com",
                     "address": { "city": "Oslo", "geo": { "lat": 1.5 } }, "tags": ["a"] }),
-            json!({ "_id": { "$oid": "65f0c0ffef" }, "email": null, "age": 41,
+            json!({ "_id": { "$oid": "65f0c0ffef0000000000abcd" }, "email": null, "age": 41,
                     "created": { "$date": "2024-01-01T00:00:00Z" } }),
         ];
         let inferred = infer_fields(&documents);
@@ -130,6 +147,26 @@ mod tests {
         for value in ["alice@example.com", "Oslo", "65f0c0ffee", "2024-01-01"] {
             assert!(!rendered.contains(value), "{value} leaked: {rendered}");
         }
+    }
+
+    /// A stored subdocument whose one key is `$oid` but whose value is not
+    /// an ObjectId's is an object, and its child field is walked.
+    #[test]
+    fn a_dollar_key_subdocument_is_not_taken_for_a_wrapper() {
+        let documents = vec![json!({ "ref": { "$oid": { "inner": 1 } },
+                                     "when": { "$date": { "$numberLong": "1" } } })];
+        let inferred = infer_fields(&documents);
+        let types = |name: &str| {
+            inferred["fields"]
+                .as_array()
+                .and_then(|fields| fields.iter().find(|f| f["name"] == name))
+                .map(|f| f["types"].clone())
+                .unwrap_or(Value::Null)
+        };
+        assert_eq!(types("ref"), json!(["object"]));
+        assert_eq!(types("ref.$oid"), json!(["object"]));
+        assert_eq!(types("ref.$oid.inner"), json!(["int"]));
+        assert_eq!(types("when"), json!(["date"]));
     }
 
     #[test]

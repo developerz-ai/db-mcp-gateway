@@ -26,7 +26,9 @@ use sqlx::PgPool;
 use crate::authz::PermissionsCache;
 use crate::state::permissions::PermissionsRepo;
 
-pub use batch::{BatchChange, BatchRequest, BatchResult, MAX_BATCH_CHANGES, batch};
+pub use batch::{
+    BATCH_BODY_LIMIT, BatchChange, BatchRequest, BatchResult, MAX_BATCH_CHANGES, batch,
+};
 pub use dto::{CreateGrantRequest, GrantResponse, ListGrantsQuery, UpdateGrantRequest};
 pub use handlers::{create, delete, get_one, list, patch};
 

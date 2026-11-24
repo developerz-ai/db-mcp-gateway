@@ -115,6 +115,44 @@ async fn doctor_reports_privilege_drift_on_the_real_target() {
         .unwrap();
 }
 
+/// `has_table_privilege` ignores column grants; a read role that may
+/// `UPDATE (col)` can still write. Serial: concurrent `GRANT CONNECT` on one
+/// database races in the catalog ("tuple concurrently updated").
+#[tokio::test]
+#[serial_test::serial(world)]
+async fn doctor_reports_a_column_only_write_grant() {
+    let schema = format!("dbmcp_doctor_col_{}", Uuid::new_v4().simple());
+    let mut owner = owner().await;
+    for statement in [
+        format!(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{ROLE}') \
+             THEN CREATE ROLE {ROLE} LOGIN PASSWORD '{ROLE_PASSWORD}'; END IF; END $$"
+        ),
+        format!("GRANT CONNECT ON DATABASE {TARGET_DB} TO {ROLE}"),
+        format!("CREATE SCHEMA {schema}"),
+        format!("CREATE TABLE {schema}.notes (id int, body text)"),
+        format!("GRANT USAGE ON SCHEMA {schema} TO {ROLE}"),
+        format!("GRANT SELECT ON {schema}.notes TO {ROLE}"),
+        format!("GRANT UPDATE (body) ON {schema}.notes TO {ROLE}"),
+    ] {
+        owner.execute(sqlx::AssertSqlSafe(statement)).await.unwrap();
+    }
+    let (code, out) = doctor(&config(ROLE, ROLE_PASSWORD), &schema).await;
+    owner
+        .execute(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .await
+        .unwrap();
+    assert_eq!(code, Some(1), "{out}");
+    // Other tests' fixtures may share the finding line; ours must be on it.
+    assert!(
+        out.lines().any(|line| line
+            .trim_start()
+            .starts_with("finding: read role can write: ")
+            && line.contains(&format!("{schema}.notes"))),
+        "{out}"
+    );
+}
+
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn doctor_names_the_site_of_an_unresolved_secret() {

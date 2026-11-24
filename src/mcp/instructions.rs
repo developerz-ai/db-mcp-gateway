@@ -42,11 +42,11 @@ const ON_ERROR: [(OutcomeCode, &str); 13] = [
     (OutcomeCode::Cancelled, "cancel_query stopped it"),
     (
         OutcomeCode::Unavailable,
-        "transient; retry in a few seconds",
+        "transient; retry only if `retryable`, else check whether a write landed",
     ),
     (
         OutcomeCode::AuditUnavailable,
-        "not recorded, so refused; retry later",
+        "audit failed; retry later only if `retryable`, else check whether a write landed",
     ),
     (OutcomeCode::Internal, "give the operator the request_id"),
 ];
@@ -72,7 +72,7 @@ pub(super) fn build() -> String {
          \n\
          Pass `reason` (why you are calling) when the grant sets require_reason.\n\
          \n\
-         Errors are tool results with isError and {{request_id, code, message}}. `write`: \
+         Errors are tool results with isError and {{request_id, code, message, retryable}}. `write`: \
          unknown or applied means the change may have landed; check before retrying. Codes:\n",
         default = run_query_default_rows(),
         ceiling = row_ceiling(),
@@ -110,6 +110,21 @@ mod tests {
             timeout_ceiling(),
         ] {
             assert!(text.contains(&limit), "missing {limit}");
+        }
+    }
+
+    /// A write may have committed before either failure, so the advice
+    /// must defer to `retryable` rather than say "retry".
+    #[test]
+    fn transient_codes_defer_to_retryable() {
+        for (code, advice) in ON_ERROR {
+            if matches!(
+                code,
+                OutcomeCode::Unavailable | OutcomeCode::AuditUnavailable
+            ) {
+                assert!(advice.contains("`retryable`"), "{code}: {advice}");
+                assert!(advice.contains("check"), "{code}: {advice}");
+            }
         }
     }
 }

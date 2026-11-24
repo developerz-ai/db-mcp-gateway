@@ -51,6 +51,33 @@ fn golden(path: &Path) -> String {
     path.display().to_string()
 }
 
+/// `--config` from the flag or `DB_MCP_GATEWAY_CONFIG`, the flag winning;
+/// neither is a usage error. Each case is its own process environment.
+#[test]
+fn config_comes_from_the_flag_or_the_env_var() {
+    let good = format!("{FIXTURES}/good.yaml");
+    let other = format!("{FIXTURES}/warnings.yaml");
+    let env = [
+        ("TLS_DISABLED", "true"),
+        ("DB_MCP_GATEWAY_CONFIG", good.as_str()),
+    ];
+    let from_env = stdout(&gateway(&["--check", "--no-secrets"], &env));
+    assert!(
+        from_env.starts_with(&format!("config: {good}\n")),
+        "{from_env}"
+    );
+    let flag_wins = stdout(&gateway(
+        &["--config", &other, "--check", "--no-secrets"],
+        &env,
+    ));
+    assert!(
+        flag_wins.starts_with(&format!("config: {other}\n")),
+        "{flag_wins}"
+    );
+    let neither = gateway(&["--check"], &[("TLS_DISABLED", "true")]);
+    assert_eq!(neither.status.code(), Some(2), "{neither:?}");
+}
+
 #[test]
 fn valid_config_without_secrets_passes() {
     let (code, out) = check("good", &["--no-secrets"], &[]);
@@ -67,10 +94,10 @@ fn unresolved_secrets_are_all_reported_with_their_site() {
     assert_eq!(code, 1, "{out}");
 }
 
-/// `${ENV:…}` is trimmed of its trailing newline like `${FILE:…}`: a value
-/// that is only a newline is empty, one with a trailing newline resolves.
+/// `${ENV:…}` is the credential byte for byte (only `${FILE:…}` trims): a
+/// value with a trailing newline, even one that is only a newline, resolves.
 #[test]
-fn env_values_are_trimmed_like_file_values() {
+fn env_values_are_used_byte_for_byte() {
     let (code, out) = check(
         "good",
         &[],
@@ -79,14 +106,10 @@ fn env_values_are_trimmed_like_file_values() {
             ("CHECK_CACHE_PASSWORD", "cache-pw\r\n"),
         ],
     );
+    // The fixture's write tier is a `${FILE:…}` that does not exist.
     assert_eq!(code, 1, "{out}");
-    assert!(
-        out.contains(
-            "error: servers[prod].databases[app].password (read tier): env var \
-             `CHECK_APP_RO_PASSWORD` referenced in config is unset or empty"
-        ),
-        "{out}"
-    );
+    assert!(out.contains("write_password (write tier)"), "{out}");
+    assert!(!out.contains("CHECK_APP_RO_PASSWORD"), "{out}");
     assert!(!out.contains("CHECK_CACHE_PASSWORD"), "{out}");
 }
 

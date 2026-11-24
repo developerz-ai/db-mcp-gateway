@@ -58,12 +58,13 @@ fn array_names(claim: &str, items: &[Value]) -> Vec<String> {
 }
 
 /// Zitadel: `{"<role>": {"<org id>": "<org domain>"}}`. A key is a grant
-/// only when its value is an assignment (an object) or literally `true`; a
-/// role mapped to `false`, `null` or anything else is not held.
+/// only when its value is literally `true` or an assignment naming at least
+/// one organisation; a role mapped to `{}`, `false`, `null` or anything else
+/// is not held.
 fn object_names(claim: &str, roles: &serde_json::Map<String, Value>) -> Vec<String> {
     let names: Vec<String> = roles
         .iter()
-        .filter(|(_, assignment)| matches!(assignment, Value::Object(_) | Value::Bool(true)))
+        .filter(|(_, assignment)| is_held(assignment))
         .map(|(role, _)| role.clone())
         .collect();
     let skipped = roles.len() - names.len();
@@ -75,6 +76,16 @@ fn object_names(claim: &str, roles: &serde_json::Map<String, Value>) -> Vec<Stri
         );
     }
     names
+}
+
+fn is_held(assignment: &Value) -> bool {
+    match assignment {
+        Value::Bool(held) => *held,
+        Value::Object(orgs) => orgs.iter().any(|(org_id, domain)| {
+            !org_id.is_empty() && domain.as_str().is_some_and(|d| !d.is_empty())
+        }),
+        _ => false,
+    }
 }
 
 /// Keep the groups that start with `prefix`, without it. A group that is the
@@ -169,6 +180,19 @@ mod tests {
     }
 
     #[test]
+    fn an_object_assignment_needs_a_nonempty_org_id_and_domain() {
+        let claim = json!({
+            "db-admins": {},
+            "db-oncall": {"": "acme.zitadel.cloud"},
+            "db-auditors": {"2901": ""},
+            "db-writers": {"2901": true},
+            "db-ops": {"2901": {"domain": "acme.zitadel.cloud"}},
+            "db-readers": {"2901": "", "3377": "partner.example"},
+        });
+        assert_eq!(from_claim(CLAIM, Some(&claim), None), ["db-readers"]);
+    }
+
+    #[test]
     fn any_other_shape_is_no_groups() {
         for claim in [json!("db-oncall"), json!(7), json!(true), Value::Null] {
             assert!(
@@ -193,7 +217,7 @@ mod tests {
             from_claim(CLAIM, Some(&array), Some(&prefix)),
             ["oncall", "readers"]
         );
-        let object = json!({"dbmcp-oncall": {}, "billing": {}});
+        let object = json!({"dbmcp-oncall": {"2901": "acme.zitadel.cloud"}, "billing": true});
         assert_eq!(from_claim(CLAIM, Some(&object), Some(&prefix)), ["oncall"]);
         assert!(from_claim(CLAIM, Some(&json!(["hr-admins"])), Some(&prefix)).is_empty());
     }

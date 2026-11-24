@@ -10,7 +10,8 @@
 //! Numbers keep their value. One that is not a 64-bit integer reaches the
 //! visitor as an `f64`; when that `f64` is not the number the document
 //! spells — a `jsonb` number is a `numeric` — the cell carries the numeral
-//! as a string instead, the way a `numeric` column does.
+//! as a string instead, the way a `numeric` column does — as does one past
+//! `f64`'s range (`1e400`), which `serde_json` would refuse outright.
 
 use std::fmt;
 
@@ -19,7 +20,7 @@ use serde_json::{Map, Number, Value};
 
 use crate::exec::budget::ResultBudget;
 
-use super::numeral::{Numerals, same_number};
+use super::numeral::{Numerals, quote_out_of_range, same_number};
 
 /// Decoded bytes one row's JSON cells have claimed, against what the result
 /// budget has left. Weighed the way [`ResultBudget::admit`] weighs the
@@ -61,6 +62,8 @@ pub(super) enum JsonCell {
 }
 
 pub(super) fn parse(text: &[u8], weight: &mut RowWeight<'_>) -> JsonCell {
+    let quoted = quote_out_of_range(text);
+    let text = quoted.as_deref().unwrap_or(text);
     let mut de = serde_json::Deserializer::from_slice(text);
     let mut numerals = Numerals::new(text);
     let parsed = Budgeted {

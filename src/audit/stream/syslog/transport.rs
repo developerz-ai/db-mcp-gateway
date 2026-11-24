@@ -95,13 +95,7 @@ impl Connection {
             }
             SyslogTransport::Tcp => Ok(Self::Tcp(connect(&addrs).await?)),
             SyslogTransport::Tls(tls) => {
-                let name =
-                    ServerName::try_from(host.to_owned()).map_err(|_| DeliveryError::ServerName)?;
-                let tcp = connect(&addrs).await?;
-                let stream = step("TLS handshake", tls.connector().connect(name, tcp))
-                    .await?
-                    .map_err(DeliveryError::Handshake)?;
-                Ok(Self::Tls(Box::new(stream)))
+                Ok(Self::Tls(Box::new(tls_connect(&addrs, host, tls).await?)))
             }
         }
     }
@@ -131,18 +125,54 @@ async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, DeliveryError
 }
 
 /// The first of `addrs` that accepts, in resolver order, all within one
-/// [`STEP_TIMEOUT`]. Each address gets an even share of the time left, so a
-/// black-holed first address cannot starve a healthy second one.
+/// [`STEP_TIMEOUT`].
 async fn connect(addrs: &[SocketAddr]) -> Result<TcpStream, DeliveryError> {
+    first_established(addrs, "TCP connect", |tcp| async { Ok(tcp) }).await
+}
+
+/// The first of `addrs` that accepts and completes a verified handshake: an
+/// address that takes TCP but fails TLS (a stale node, a wrong certificate)
+/// falls through to the next, connect and handshake sharing one deadline.
+pub(super) async fn tls_connect(
+    addrs: &[SocketAddr],
+    host: &str,
+    tls: &SyslogTls,
+) -> Result<TlsStream<TcpStream>, DeliveryError> {
+    let name = ServerName::try_from(host.to_owned()).map_err(|_| DeliveryError::ServerName)?;
+    first_established(addrs, "TCP connect or TLS handshake", |tcp| {
+        // The connector consumes its name; each address needs its own.
+        let handshake = tls.connector().connect(name.clone(), tcp);
+        async { handshake.await.map_err(DeliveryError::Handshake) }
+    })
+    .await
+}
+
+/// Each address gets an even share of the time left, so a black-holed first
+/// address cannot starve a healthy second one.
+async fn first_established<T, F, Fut>(
+    addrs: &[SocketAddr],
+    what: &'static str,
+    mut establish: F,
+) -> Result<T, DeliveryError>
+where
+    F: FnMut(TcpStream) -> Fut,
+    Fut: Future<Output = Result<T, DeliveryError>>,
+{
     let deadline = Instant::now() + STEP_TIMEOUT;
     let mut last = DeliveryError::NoAddress;
     for (tried, addr) in addrs.iter().enumerate() {
         let untried = u32::try_from(addrs.len() - tried).unwrap_or(u32::MAX);
         let share = deadline.saturating_duration_since(Instant::now()) / untried;
-        last = match tokio::time::timeout(share, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(err)) => DeliveryError::Connect(err),
-            Err(_) => DeliveryError::TimedOut("TCP connect"),
+        let attempt = async {
+            let tcp = TcpStream::connect(addr)
+                .await
+                .map_err(DeliveryError::Connect)?;
+            establish(tcp).await
+        };
+        last = match tokio::time::timeout(share, attempt).await {
+            Ok(Ok(established)) => return Ok(established),
+            Ok(Err(err)) => err,
+            Err(_) => DeliveryError::TimedOut(what),
         };
     }
     Err(last)

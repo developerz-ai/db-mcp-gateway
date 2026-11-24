@@ -8,9 +8,12 @@
 #       Re-run the calling script under the machine-wide `heavy` ledger when it
 #       is on PATH. For the outer full-suite runs only (bin/check, full bin/test).
 #   queue_lock heavy|db "<what>"
-#       Hold target/.dbmcp-<name>.lock for the rest of the process — the fd is
+#       Hold <git dir>/dbmcp-<name>.lock for the rest of the process — the fd is
 #       inherited, so an `exec cargo …` keeps holding it. `heavy` = a compile
 #       or test run; `db` = anything that touches the dev-stack databases.
+#       The lock lives in git's common dir, never in Cargo's `target/`: a
+#       `cargo clean` there would unlink it under a holder, and the next run
+#       would lock a fresh file and share the dev databases with it.
 #
 # A nested bin/ script skips a lock its caller already holds (DBMCP_QUEUE_HELD),
 # so bin/check → bin/ci → bin/test never deadlocks on itself.
@@ -35,8 +38,11 @@ queue_lock() {
     echo "queue: flock(1) not found; running without the $name queue" >&2
     return 0
   fi
-  mkdir -p target
-  lock=target/.dbmcp-$name.lock
+  if ! lock=$(git rev-parse --git-common-dir 2>/dev/null); then
+    echo "queue: not in a git checkout; cannot place the $name lock" >&2
+    return 2
+  fi
+  lock=$lock/dbmcp-$name.lock
   eval "exec $fd>>\"\$lock\""
   if ! flock -n "$fd"; then
     holder=$(cat "$lock.holder" 2>/dev/null) || holder='an unknown holder'

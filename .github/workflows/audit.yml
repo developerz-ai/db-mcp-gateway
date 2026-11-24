@@ -83,6 +83,14 @@ jobs:
           # carrying this marker. A title alone is anyone's to copy.
           MARKER: "<!-- db-mcp-gateway:audit.yml:cargo-audit-main -->"
         run: |
+          # A re-run of an older `main` run audited a commit `main` has moved
+          # past: its verdict no longer speaks for `main`, so it never opens,
+          # comments on or closes the issue.
+          tip=$(gh api "repos/$GH_REPO/commits/main" --jq .sha)
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "::notice::audited $GITHUB_SHA, but main is now $tip: the issue is left as it is"
+            exit 0
+          fi
           # Captured whole, never piped into `head`: under pipefail an early
           # close would fail gh with SIGPIPE.
           owned=$(gh api --paginate "repos/$GH_REPO/issues?state=open&creator=github-actions%5Bbot%5D&per_page=100" \

@@ -1,18 +1,18 @@
 //! `grants`, `sessions` and `audit`: one admin API route each.
 
-use std::fs::OpenOptions;
-use std::io::Write as _;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use reqwest::Method;
+use reqwest::{Method, Response};
 use serde_json::Value;
 use uuid::Uuid;
 
 use super::super::{CliError, EXIT_OK};
 use super::client::AdminClient;
-use super::{AuditCommand, GrantsCommand, SessionsCommand};
+use super::{AuditCommand, GrantsCommand, SessionsCommand, UserField};
 
 /// The admin API's page ceiling (`Page::MAX_LIMIT`).
 const USERS_PAGE: usize = 1000;
@@ -65,12 +65,9 @@ async fn apply_grants(client: &AdminClient, file: &Path) -> Result<u8, CliError>
 }
 
 pub async fn sessions(command: SessionsCommand) -> Result<u8, CliError> {
-    let SessionsCommand::Revoke { target, user } = command;
+    let SessionsCommand::Revoke { target, by, user } = command;
     let client = target.client()?;
-    let id = match Uuid::parse_str(&user) {
-        Ok(id) => id,
-        Err(_) => find_user(&client, &user).await?,
-    };
+    let id = find_user(&client, &user, by).await?;
     let request = client.request(
         Method::POST,
         &format!("/admin/v1/users/{id}/revoke-sessions"),
@@ -78,8 +75,16 @@ pub async fn sessions(command: SessionsCommand) -> Result<u8, CliError> {
     print_json(&client.json("revoke sessions", request).await?)
 }
 
-/// Page through `/admin/v1/users` for an exact `user_sub` or email match.
-async fn find_user(client: &AdminClient, user: &str) -> Result<Uuid, CliError> {
+/// Page through `/admin/v1/users` for exact matches on the selected field
+/// (every field when `by` is `None`). A value that names two different users
+/// — a UUID-shaped `user_sub` equal to another user's id — is refused rather
+/// than guessed.
+async fn find_user(
+    client: &AdminClient,
+    user: &str,
+    by: Option<UserField>,
+) -> Result<Uuid, CliError> {
+    let mut found: Vec<Uuid> = Vec::new();
     for page in 0.. {
         let offset = (page * USERS_PAGE).to_string();
         let request = client
@@ -90,23 +95,46 @@ async fn find_user(client: &AdminClient, user: &str) -> Result<Uuid, CliError> {
                 "/admin/v1/users did not return a list".into(),
             ));
         };
-        let found = users.iter().find(|row| {
-            row["user_sub"].as_str() == Some(user)
-                || row["user_email"]
-                    .as_str()
-                    .is_some_and(|email| email.eq_ignore_ascii_case(user))
-        });
-        if let Some(id) = found.and_then(|row| row["id"].as_str()) {
-            return Uuid::parse_str(id)
-                .map_err(|_| CliError::Invalid("/admin/v1/users returned a bad id".into()));
+        for row in users.iter().filter(|row| user_matches(row, user, by)) {
+            let id = row["id"]
+                .as_str()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .ok_or_else(|| CliError::Invalid("/admin/v1/users returned a bad id".into()))?;
+            if !found.contains(&id) {
+                found.push(id);
+            }
         }
         if users.len() < USERS_PAGE {
             break;
         }
     }
-    Err(CliError::Invalid(format!(
-        "no user with id, user_sub or email `{user}`"
-    )))
+    only_user(&found, user)
+}
+
+fn user_matches(row: &Value, user: &str, by: Option<UserField>) -> bool {
+    let field = |name: &str| row[name].as_str();
+    let id = || field("id") == Some(user);
+    let sub = || field("user_sub") == Some(user);
+    let email = || field("user_email").is_some_and(|email| email.eq_ignore_ascii_case(user));
+    match by {
+        Some(UserField::Id) => id(),
+        Some(UserField::Sub) => sub(),
+        Some(UserField::Email) => email(),
+        None => id() || sub() || email(),
+    }
+}
+
+fn only_user(found: &[Uuid], user: &str) -> Result<Uuid, CliError> {
+    match found {
+        [id] => Ok(*id),
+        [] => Err(CliError::Invalid(format!(
+            "no user with id, user_sub or email `{user}`"
+        ))),
+        _ => Err(CliError::Invalid(format!(
+            "`{user}` matches {} users; pick one with --by id|sub|email",
+            found.len()
+        ))),
+    }
 }
 
 pub async fn audit(command: AuditCommand) -> Result<u8, CliError> {
@@ -114,13 +142,14 @@ pub async fn audit(command: AuditCommand) -> Result<u8, CliError> {
         AuditCommand::Query { target, params } => {
             let client = target.client()?;
             let request = client.request(Method::GET, AUDIT_CALLS).query(&params);
-            let body = client
-                .send("query the audit log", request)
-                .await?
-                .text()
-                .await
-                .map_err(|err| CliError::unreachable(client.base(), &err))?;
-            print!("{body}");
+            let response = client.send("query the audit log", request).await?;
+            copy_body(
+                &client,
+                response,
+                &mut std::io::stdout().lock(),
+                "write stdout",
+            )
+            .await?;
             Ok(EXIT_OK)
         }
         AuditCommand::Export {
@@ -131,36 +160,84 @@ pub async fn audit(command: AuditCommand) -> Result<u8, CliError> {
     }
 }
 
-/// Streamed chunk by chunk: an export can be larger than memory should hold.
-/// Owner-only, like the session file — audit rows carry identities and SQL.
+/// Streamed into an owner-only temp file beside `out` (audit rows carry
+/// identities and SQL), published at `out` only once complete: a failed
+/// export leaves nothing at `out` and a retry to the same path works.
 async fn export(
     client: &AdminClient,
     params: &[(String, String)],
     out: &Path,
 ) -> Result<u8, CliError> {
+    if out.symlink_metadata().is_ok() {
+        return Err(CliError::Invalid(format!(
+            "{} already exists",
+            out.display()
+        )));
+    }
     let request = client
         .request(Method::GET, AUDIT_CALLS)
         .query(params)
         .timeout(EXPORT_TIMEOUT);
-    let mut response = client.send("export the audit log", request).await?;
+    let response = client.send("export the audit log", request).await?;
+    let temp = partial_path(out);
+    let result = write_then_publish(client, response, &temp, out).await;
+    // Best effort: whether published (a second link) or failed, the temp
+    // name has to go; its contents are owner-only either way.
+    let _ = fs::remove_file(&temp);
+    let bytes = result?;
+    println!("exported {bytes} bytes to {}", out.display());
+    Ok(EXIT_OK)
+}
+
+async fn write_then_publish(
+    client: &AdminClient,
+    response: Response,
+    temp: &Path,
+    out: &Path,
+) -> Result<usize, CliError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(out)
+        .open(temp)
+        .map_err(|err| CliError::io(format!("create {}", temp.display()), err))?;
+    let what = format!("write {}", temp.display());
+    let bytes = copy_body(client, response, &mut file, &what).await?;
+    file.sync_all().map_err(|err| CliError::io(what, err))?;
+    // A hard link never replaces an existing `out`, unlike a rename.
+    fs::hard_link(temp, out)
         .map_err(|err| CliError::io(format!("create {}", out.display()), err))?;
+    Ok(bytes)
+}
+
+fn partial_path(out: &Path) -> PathBuf {
+    let name = out
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    out.with_file_name(format!(".{name}.{}.partial", Uuid::new_v4().simple()))
+}
+
+/// Chunk by chunk: the body can be larger than memory should hold.
+async fn copy_body(
+    client: &AdminClient,
+    mut response: Response,
+    sink: &mut impl Write,
+    what: &str,
+) -> Result<usize, CliError> {
     let mut bytes = 0usize;
     while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|err| CliError::unreachable(client.base(), &err))?
     {
-        file.write_all(&chunk)
-            .map_err(|err| CliError::io(format!("write {}", out.display()), err))?;
+        sink.write_all(&chunk)
+            .map_err(|err| CliError::io(what.to_string(), err))?;
         bytes += chunk.len();
     }
-    println!("exported {bytes} bytes to {}", out.display());
-    Ok(EXIT_OK)
+    sink.flush()
+        .map_err(|err| CliError::io(what.to_string(), err))?;
+    Ok(bytes)
 }
 
 fn print_json(value: &Value) -> Result<u8, CliError> {
@@ -169,3 +246,7 @@ fn print_json(value: &Value) -> Result<u8, CliError> {
     println!("{text}");
     Ok(EXIT_OK)
 }
+
+#[cfg(test)]
+#[path = "commands_tests.rs"]
+mod tests;

@@ -37,6 +37,9 @@ pub(super) struct ReadScope<'a> {
     pub server: Option<&'a str>,
     pub database: Option<&'a str>,
     pub row_count: Option<i64>,
+    /// What the caller asked for (filters, disclosure flags), stored in the
+    /// row's `params` so two reads of one scope stay distinguishable.
+    pub request: Option<&'a serde_json::Value>,
 }
 
 pub(super) async fn audit_read(
@@ -55,7 +58,7 @@ pub(super) async fn audit_read(
         server: scope.server.map(str::to_string),
         database: scope.database.map(str::to_string),
         sql: None,
-        params: None,
+        params: scope.request.cloned(),
         reason: None,
         outcome: OutcomeCode::Success,
         elapsed_ms: None,

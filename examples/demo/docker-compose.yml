@@ -3,7 +3,7 @@
 # never a deployment (that is examples/docker-compose.yml).
 #
 #   cd examples/demo && docker compose up -d --wait
-#   docker compose wait ready && docker compose logs ready   # the `claude mcp add …` line
+#   docker compose run --rm ready   # prints the `claude mcp add …` line
 #
 # Then ask Claude: "list the servers you can see, then the 5 latest orders".
 #
@@ -64,8 +64,13 @@ services:
         condition: service_healthy
       mint-token:
         condition: service_completed_successfully
-    # No healthcheck: the distroless image has no shell, wget or curl, and the
-    # binary has no self-probe. `ready` below polls /healthz over the network.
+    # The distroless image has no wget: the probe runs mint-token's busybox
+    # from the volume, so `up --wait` returns once /healthz answers.
+    healthcheck:
+      test: ["CMD", "/run/demo-secrets/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8443/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
 
   state-db:
     image: postgres:16-alpine
@@ -122,26 +127,22 @@ services:
         chmod 0400 service-token session-signing-key
         cp /bin/busybox busybox.new && chmod 0555 busybox.new && mv -f busybox.new busybox
 
-  # Waits for the gateway, then prints the one line to paste.
+  # Prints the one line to paste: `docker compose run --rm ready`. A one-shot
+  # under its own profile, so `up --wait` never races its exit.
   ready:
     image: busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6
+    profiles: ["ready"]
     environment:
       DEMO_PORT: ${DEMO_PORT:-8443}
     volumes:
       - demo-secrets:/run/demo-secrets:ro
     depends_on:
       gateway:
-        condition: service_started
+        condition: service_healthy
     command:
       - sh
       - -euc
       - |
-        i=0
-        until wget -q -O /dev/null http://gateway:8443/healthz 2>/dev/null; do
-          i=$$((i + 1))
-          [ "$$i" -lt 60 ] || { echo 'gateway not healthy after 60 s: docker compose logs gateway' >&2; exit 1; }
-          sleep 1
-        done
         echo
         echo 'Gateway is up. Add it to Claude Code (dev-only token):'
         echo

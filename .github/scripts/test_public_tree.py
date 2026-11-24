@@ -198,5 +198,30 @@ class Scan(unittest.TestCase):
             (2, ["blob.bin: private word (from the secret)"]),
         )
 
+    def test_a_path_is_scanned_and_redacted_in_every_report(self):
+        host = ".".join(["svc", "developerz", "ai"])
+        root = repo_with(
+            self,
+            {
+                "docs/quimtel-notes.md": "public",
+                "x/quimtel-run.md": "cd " + "/".join(["", "home", "someone"]),
+                f"{host}.md": "public",
+            },
+        )
+        _, failures = scan(root, tracked_entries(root), private_words("quimtel"))
+        self.assertEqual(
+            sorted(failures),
+            sorted([
+                "docs/<redacted>-notes.md: private word (from the secret) in the file name",
+                "x/<redacted>-run.md: home directory path",
+                "x/<redacted>-run.md: private word (from the secret) in the file name",
+                "<path withheld: its name breaks a rule>: internal host on our own domain in the file name",
+            ]),
+        )
+        joined = "".join(failures).lower()
+        self.assertNotIn("quimtel", joined)
+        self.assertNotIn(host, joined)
+
+
 if __name__ == "__main__":
     unittest.main()

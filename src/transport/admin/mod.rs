@@ -38,6 +38,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderValue;
 use axum::http::header::CACHE_CONTROL;
 use axum::middleware as axum_mw;
@@ -147,7 +148,8 @@ pub fn router(deps: AdminDeps) -> Router {
         .route("/admin/v1/permissions/export", get(permissions_doc::export))
         .route(
             "/admin/v1/permissions/diff",
-            post(permissions_doc::diff_document),
+            post(permissions_doc::diff_document)
+                .layer(DefaultBodyLimit::max(permissions_doc::DIFF_BODY_LIMIT)),
         )
         .route("/admin/v1/audit/calls", get(audit_calls::stream))
         .with_state(ReadState {
@@ -157,7 +159,10 @@ pub fn router(deps: AdminDeps) -> Router {
         });
     let grants_routes = Router::new()
         .route("/admin/v1/grants", post(grants::create).get(grants::list))
-        .route("/admin/v1/grants/batch", post(grants::batch))
+        .route(
+            "/admin/v1/grants/batch",
+            post(grants::batch).layer(DefaultBodyLimit::max(grants::BATCH_BODY_LIMIT)),
+        )
         .route(
             "/admin/v1/grants/:id",
             get(grants::get_one)

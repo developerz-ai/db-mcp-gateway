@@ -52,7 +52,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
 
 ### Row Limits
 - **What it does:** Result sets are truncated at the effective row cap (grant `row_limit`, caller `limit`, else 1000 rows) or at a result-size cap, and flagged `truncated: true`
-- **How it works:** The gateway never rewrites your SQL to add a `LIMIT`. On Postgres, a truncated read is cancelled; a write with `RETURNING` is drained and committed, even when its returned rows are truncated.
+- **How it works:** The gateway stops returning rows at the cap — it never rewrites your SQL to add a `LIMIT`. On Postgres a truncated **read** is cancelled; a write with truncated `RETURNING` rows runs to completion and commits, so the cap limits what the agent sees, never how many rows a write changes
 - **Performance benefit:** Prevents large result sets from overwhelming network or agent context
 - **Operations benefit:** Cost control on databases that charge per query byte
 

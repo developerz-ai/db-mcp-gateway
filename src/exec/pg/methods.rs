@@ -118,15 +118,18 @@ impl DbAdapter for PgAdapter {
         };
         match write {
             Ok(write) => Ok(introspect::merge_activity(read, write, query.row_limit)),
-            // A write tier that cannot be reached (its credentials do not
-            // resolve or are refused, the target is saturated) runs nothing
-            // through this gateway. The read listing stands; the failed
-            // attempt is already on the log.
+            // A write tier this replica cannot reach (its credentials do
+            // not resolve or are refused, its pool is full) may still run
+            // writes — another replica's, or this one's. The read listing
+            // stands, marked incomplete; the failed attempt is on the log.
             Err(
                 ExecError::Connection
                 | ExecError::Unavailable
                 | ExecError::PasswordUnresolved { .. },
-            ) => Ok(read),
+            ) => Ok(ExecResult {
+                truncated: true,
+                ..read
+            }),
             Err(other) => Err(other),
         }
     }

@@ -15,14 +15,16 @@ compose=(docker compose -p "db-mcp-gateway-demo-test-$$")
 export DEMO_PORT=$port
 trap '"${compose[@]}" --profile sso down -v >/dev/null 2>&1 || true' EXIT
 
-fail() { printf 'FAIL: %s\n' "$1" >&2; "${compose[@]}" logs gateway ready >&2 || true; exit 1; }
+# Never dumps container logs: `ready` prints the bearer token, and the leak
+# checks below fail precisely when a log holds a secret.
+fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
 "${compose[@]}" up -d --wait >/dev/null 2>&1 || fail 'demo did not come up'
 
-# The walkthrough's order: wait for `ready` to finish, then read its log.
-"${compose[@]}" wait ready >/dev/null 2>&1 || fail 'the ready service did not exit 0'
-line=$("${compose[@]}" logs --no-log-prefix ready 2>/dev/null | grep -F 'claude mcp add') \
-  || fail 'no claude mcp add line printed'
+# The walkthrough's order: `up --wait` returned on a healthy gateway; the
+# one-shot `ready` prints the line.
+printed=$("${compose[@]}" run --rm -T ready 2>/dev/null) || fail 'the ready service did not exit 0'
+line=$(grep -F 'claude mcp add' <<<"$printed") || fail 'no claude mcp add line printed'
 # Without the sso profile nothing publishes Dex's port.
 [[ -z $("${compose[@]}" ps -q dex-port) ]] || fail 'dex-port runs without the sso profile'
 ! "${compose[@]}" port gateway 5556 >/dev/null 2>&1 || fail 'the gateway publishes 5556 without the sso profile'
@@ -48,7 +50,7 @@ key=$("${compose[@]}" run --rm --no-deps -T --entrypoint sh mint-token -c 'cat /
 config_env=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$("${compose[@]}" ps -q gateway)")
 [[ $config_env != *SESSION_SIGNING_KEY* ]] || fail 'the signing key is in the container configuration'
 gateway_log=$("${compose[@]}" logs gateway 2>&1)
-[[ $gateway_log != *"$key"* ]] || fail 'the gateway logged the signing key'
+[[ $gateway_log != *"$key"* ]] || fail 'leak found at the gateway log: it holds the signing key'
 
 # SSO profile, the walkthrough's way (a fresh `--profile sso up`): a new
 # volume mints a new key; Dex answers through the published loopback port,

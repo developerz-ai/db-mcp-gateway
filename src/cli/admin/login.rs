@@ -21,6 +21,9 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 /// A callback request line plus headers fits well inside this.
 const MAX_CALLBACK_REQUEST: usize = 16 * 1024;
 const CALLBACK_PATH: &str = "/callback";
+/// A browser sends its callback request at once; a connection that stays
+/// silent longer is dropped so it cannot hold up the one queued behind it.
+const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub async fn run(gateway: &str) -> Result<StoredSession, CliError> {
     let gateway = gateway.trim_end_matches('/');
@@ -97,7 +100,12 @@ async fn receive_code(listener: &TcpListener, state: &str) -> Result<String, Cli
             .accept()
             .await
             .map_err(|err| CliError::io("accept the login callback", err))?;
-        let Some(params) = read_callback(&mut stream).await else {
+        let Ok(read) =
+            tokio::time::timeout(CALLBACK_READ_TIMEOUT, read_callback(&mut stream)).await
+        else {
+            continue;
+        };
+        let Some(params) = read else {
             respond(&mut stream, "400 Bad Request", "Not a login callback.").await;
             continue;
         };
@@ -187,4 +195,31 @@ async fn redeem(
         refresh_token: body["refresh_token"].as_str().map(str::to_string),
         expires_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_idle_connection_does_not_block_the_callback_behind_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _idle = TcpStream::connect(addr).await.unwrap();
+        let browser = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"GET /callback?state=s1&code=c1 HTTP/1.1\r\nhost: x\r\n\r\n")
+                .await
+                .unwrap();
+            let mut answer = Vec::new();
+            let _ = stream.read_to_end(&mut answer).await;
+        });
+        let code = tokio::time::timeout(Duration::from_secs(10), receive_code(&listener, "s1"))
+            .await
+            .expect("the queued callback completes")
+            .unwrap();
+        assert_eq!(code, "c1");
+        browser.await.unwrap();
+    }
 }

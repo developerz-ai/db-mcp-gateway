@@ -50,7 +50,11 @@ pub struct O10 {
 
 impl O10 {
     pub async fn spawn() -> Self {
-        let pool = state_pool().await;
+        Self::spawn_with(state_pool().await).await
+    }
+
+    /// [`Self::spawn`] on a state pool the caller sized.
+    pub async fn spawn_with(pool: PgPool) -> Self {
         let repo = Arc::new(PgPermissionsRepo::new(pool.clone()));
         let gw = GatewayBuilder::new(YAML)
             .admin(ADMIN_GROUP, true)

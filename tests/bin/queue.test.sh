@@ -23,6 +23,9 @@ while [[ -n ${HOLD:-} && -e $HOLD ]]; do sleep 0.05; done
 echo "end $1" >> "$LOG"
 JOB
 chmod +x "$work/job"
+# The locks live in git's common dir (never Cargo's target/, which `cargo
+# clean` empties under a holder).
+git init -q "$work"
 # Run as a fresh caller: a gate that runs this test already holds the lock.
 unset DBMCP_QUEUE_HELD DBMCP_NO_QUEUE DBMCP_IN_HEAVY
 job() { (cd "$work" && LIB="$lib" LOG="$work/log" "$@"); }
@@ -39,7 +42,7 @@ wait_for 'start A' "$work/log"
 job ./job B 2> "$work/b.err" &
 b=$!
 for _ in $(seq 100); do [[ -s $work/b.err ]] && break; sleep 0.05; done
-grep -qE '^queued: waiting for pid [0-9]+: job A \(lock target/\.dbmcp-heavy\.lock\)$' "$work/b.err" \
+grep -qE '^queued: waiting for pid [0-9]+: job A \(lock \.git/dbmcp-heavy\.lock\)$' "$work/b.err" \
   || fail "waiter line wrong: $(<"$work/b.err")"
 ! grep -qxF 'start B' "$work/log" || fail 'B started while A held the lock'
 rm "$work/hold"
@@ -101,5 +104,8 @@ PATH="$work/tools:$PATH" job ./outer-full x
 : > "$work/log"
 PATH="$work/tools:$PATH" DBMCP_NO_QUEUE=1 job ./outer-full y
 [[ $(<"$work/log") == 'ran y' ]] || fail 'opt-out still used heavy'
+
+# `cargo clean` cannot unlink a held lock: nothing of it lives under target/.
+[[ -e $work/.git/dbmcp-heavy.lock && ! -e $work/target ]] || fail 'the lock is not in the git dir'
 
 echo 'ok: bin/lib/queue.sh'

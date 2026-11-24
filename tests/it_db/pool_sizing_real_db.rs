@@ -10,9 +10,10 @@ use std::time::Duration;
 
 use db_mcp_gateway::audit::drain::DetachedTasks;
 use db_mcp_gateway::config::{Database, Password};
-use db_mcp_gateway::exec::{PgAdapter, PoolSizing};
+use db_mcp_gateway::exec::{Access, DbAdapter, ExecQuery, PgAdapter, PoolSizing};
 use redis::aio::MultiplexedConnection;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::common::pg_target::{database, owner_url, server};
 use crate::common::redis_target::{self, Flavor, admin, admin_cmd, unique_key};
@@ -105,13 +106,39 @@ async fn pg_idle_connections_close_after_the_idle_timeout() {
         idle_timeout: Duration::from_millis(300),
     };
     let adapter = open(IDLE_ROLE, sizing).await;
+    // A lazy pool has nothing to reap until a query opens a backend: the query
+    // names its own backend, which must then close while the adapter lives.
+    let query = ExecQuery {
+        sql: "SELECT pg_backend_pid()",
+        binds: &[],
+        statement_timeout_ms: Some(10_000),
+        row_limit: 1,
+        access: Access::ReadOnly,
+        dry_run: false,
+        request_id: Uuid::new_v4(),
+    };
+    let result = adapter
+        .execute(query)
+        .await
+        .expect("query as the pool role");
+    let pid = result.rows[0][0]
+        .as_i64()
+        .expect("pg_backend_pid is an int");
     eventually(
         IDLE_ROLE,
-        async || backends(&owner, IDLE_ROLE).await,
+        async || backend_alive(&owner, pid).await,
         |n| n == 0,
     )
     .await;
     drop(adapter);
+}
+
+async fn backend_alive(owner: &PgPool, pid: i64) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE pid = $1")
+        .bind(i32::try_from(pid).expect("pid fits int4"))
+        .fetch_one(owner)
+        .await
+        .expect("pg_stat_activity")
 }
 
 /// Every client the server lists but `side` itself.

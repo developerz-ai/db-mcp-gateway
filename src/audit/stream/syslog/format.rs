@@ -24,13 +24,17 @@ pub(in crate::audit::stream) const TRUNCATION_MARKER: &str = "...[truncated]";
 /// as JSON (same data the durable `audit_calls` row holds — see
 /// [`AuditRow`]'s `Serialize` doc).
 pub(in crate::audit::stream) fn format_rfc5424(row: &AuditRow) -> String {
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
-    let pid = std::process::id();
     // `unwrap_or_default()` can't actually trigger for this struct (no
     // non-string map keys, no NaN floats) but keeps a serialization
     // regression from panicking the fire-and-forget path — same reasoning
     // as `send_stdout`'s `groups` encoding.
     let body = serde_json::to_string(row).unwrap_or_default();
+    envelope(&body)
+}
+
+fn envelope(body: &str) -> String {
+    let timestamp = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
+    let pid = std::process::id();
     // <PRI>VERSION TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG
     // HOSTNAME and STRUCTURED-DATA are RFC 5424 NILVALUE ("-") — the
     // gateway doesn't track its own hostname, and the JSON body already
@@ -39,8 +43,9 @@ pub(in crate::audit::stream) fn format_rfc5424(row: &AuditRow) -> String {
 }
 
 /// [`format_rfc5424`], cut to [`MAX_MESSAGE_BYTES`]. The `sql` field is cut
-/// first, then `params`. If other metadata is too large, emit a small JSON
-/// truncation notice rather than an invalid partial object.
+/// first when it alone can absorb the excess, then `params`, then the other
+/// free text; the body stays valid JSON
+/// throughout, and a row that still does not fit is sent as its identity.
 pub(in crate::audit::stream) fn message(row: &AuditRow) -> String {
     let message = format_rfc5424(row);
     let Some(excess) = message.len().checked_sub(MAX_MESSAGE_BYTES) else {
@@ -50,9 +55,8 @@ pub(in crate::audit::stream) fn message(row: &AuditRow) -> String {
     // control character six, so a raw-length cut can leave the body too big.
     let mut shrunk = row.clone();
     if let Some(sql) = row.sql.as_deref()
-        && json_len(sql) > TRUNCATION_MARKER.len()
+        && let Some(keep) = json_len(sql).checked_sub(excess + TRUNCATION_MARKER.len())
     {
-        let keep = json_len(sql).saturating_sub(excess + TRUNCATION_MARKER.len());
         shrunk.sql = Some(format!(
             "{}{TRUNCATION_MARKER}",
             prefix_within_json_len(sql, keep)
@@ -62,33 +66,64 @@ pub(in crate::audit::stream) fn message(row: &AuditRow) -> String {
             return message;
         }
     }
-    if let Some(params) = shrunk.params.as_ref().map(ToString::to_string) {
-        // A cut array becomes a JSON string, as in `audit_calls.params`. Its
-        // escapes make the string's encoding longer than the raw prefix, so
-        // the cut shrinks by each overshoot until the body fits.
-        let excess = format_rfc5424(&shrunk)
-            .len()
-            .saturating_sub(MAX_MESSAGE_BYTES);
-        let mut keep = params
-            .len()
-            .saturating_sub(excess + TRUNCATION_MARKER.len());
-        loop {
-            shrunk.params = Some(serde_json::Value::String(format!(
-                "{}{TRUNCATION_MARKER}",
-                prefix_at_char_boundary(&params, keep)
-            )));
-            let message = format_rfc5424(&shrunk);
-            match message.len().checked_sub(MAX_MESSAGE_BYTES) {
-                None | Some(0) => return message,
-                Some(_) if keep == 0 => break,
-                Some(over) => keep = keep.saturating_sub(over),
-            }
+    if let Some(message) = cut_params(&mut shrunk) {
+        return message;
+    }
+    for text in [
+        &mut shrunk.reason,
+        &mut shrunk.error_message,
+        &mut shrunk.agent_client,
+        &mut shrunk.upstream_actor,
+        &mut shrunk.upstream_run_id,
+    ] {
+        if text.is_some() {
+            *text = Some(TRUNCATION_MARKER.to_owned());
         }
     }
-    let header = message
-        .split_once(" audit - ")
-        .map_or("", |(header, _)| header);
-    format!("{header} audit - {{\"truncated\":true}}")
+    let message = format_rfc5424(&shrunk);
+    if message.len() <= MAX_MESSAGE_BYTES {
+        return message;
+    }
+    identity_only(row)
+}
+
+/// Cut `params` until the message fits; `None` if even an empty cut does not.
+fn cut_params(shrunk: &mut AuditRow) -> Option<String> {
+    let params = shrunk.params.as_ref().map(ToString::to_string)?;
+    // A cut array becomes a JSON string, as in `audit_calls.params`. Its
+    // escapes make the string's encoding longer than the raw prefix, so the
+    // cut shrinks by each overshoot until the body fits.
+    let excess = format_rfc5424(shrunk)
+        .len()
+        .saturating_sub(MAX_MESSAGE_BYTES);
+    let mut keep = params
+        .len()
+        .saturating_sub(excess + TRUNCATION_MARKER.len());
+    loop {
+        shrunk.params = Some(serde_json::Value::String(format!(
+            "{}{TRUNCATION_MARKER}",
+            prefix_at_char_boundary(&params, keep)
+        )));
+        let message = format_rfc5424(shrunk);
+        match message.len().checked_sub(MAX_MESSAGE_BYTES) {
+            None | Some(0) => return Some(message),
+            Some(_) if keep == 0 => return None,
+            Some(over) => keep = keep.saturating_sub(over),
+        }
+    }
+}
+
+/// The last resort for a row whose fixed fields (groups, email) alone pass
+/// the cap: enough to find the durable `audit_calls` row, still one object.
+fn identity_only(row: &AuditRow) -> String {
+    let body = serde_json::json!({
+        "id": row.id,
+        "request_id": prefix_at_char_boundary(&row.request_id, 128),
+        "tool": prefix_at_char_boundary(&row.tool, 128),
+        "outcome": row.outcome,
+        "message_truncated": true,
+    });
+    envelope(&body.to_string())
 }
 
 /// The bytes `text` takes inside a JSON string, quotes excluded.

@@ -38,14 +38,15 @@ jobs:
   #   code     the PR or push touches more than docs. Docs = `website/`,
   #            `docs/`, `.claude/` (its hooks are tested by workflow-lint.yml)
   #            and `*.md`, except under `.dz/` (tests/brief_rows.rs reads it).
-  #            A docs-only `main` push skips the Rust jobs too; `merge` reads
-  #            a skip `changes` ordered as passed (through `gate`).
+  #            PRs only: a `main` push always runs the Rust jobs, because
+  #            `build` publishes this commit's image and the previous commit's
+  #            run may have failed (nothing here proves it passed).
   #   deps     the lock, a manifest or the audit config changed: `audit`
   #            blocks only then (owner decision H8); audit.yml audits `main`
   #            daily for advisories published without a commit here.
   #   image    what the Dockerfile builds changed (PRs only; main builds the
   #            image itself).
-  #   msrv     a manifest or the lock changed.
+  #   msrv     a manifest, the lock or shipped Rust source changed.
   #   website  the docs site's sources changed (PRs only; pages.yml builds and
   #            deploys on main).
   changes:
@@ -70,9 +71,12 @@ jobs:
         env:
           BEFORE: ${{ github.event.before }}
         run: |
-          # Here-strings, not `printf | grep -q`: under pipefail grep's early
-          # exit can SIGPIPE the writer and turn a match into a miss.
-          matches() { grep -qE "$1" <<<"$changed"; }
+          # Raw NUL-delimited paths (`-z`, `grep -z`): Git's display output
+          # quotes a non-ASCII or newline-bearing name ("website/\303…"),
+          # which no prefix rule below would match. Read from a file, never
+          # piped: grep's early exit cannot SIGPIPE a writer into a miss.
+          changed=$RUNNER_TEMP/changed
+          matches() { grep -qzE "$1" "$changed"; }
           everything() {
             printf '%s\n' code=true deps=true image=true msrv=true website=true >> "$GITHUB_OUTPUT"
             exit 0
@@ -97,12 +101,12 @@ jobs:
           fi
           # --no-renames: a rename would list only its destination, so moving a
           # source file to a docs path would read as docs-only.
-          changed=$(git diff --name-only --no-renames "$base" HEAD) || everything
+          git diff --name-only -z --no-renames "$base" HEAD > "$changed" || everything
           code=true deps=false image=false msrv=false website=false
-          # Docs-only on a PR and on a `main` push alike: `build` still runs on
-          # main (Image Updater pins every short SHA), and its source is the
-          # previous commit's, which the Rust jobs already passed.
-          if ! matches '^\.dz/' && ! grep -qvE '^(website/|docs/|\.claude/)|\.md$' <<<"$changed"; then
+          # Docs-only skips on a PR alone (see `code` above). An empty diff is
+          # not docs-only: it runs everything.
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] && [ -s "$changed" ] \
+              && ! matches '^\.dz/' && ! grep -qvzE '^(website/|docs/|\.claude/)|\.md$' "$changed"; then
             code=false
           fi
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
@@ -116,7 +120,9 @@ jobs:
           if matches '^(Cargo\.(toml|lock)|third_party/.*Cargo\.toml|\.cargo/|(audit|deny)\.toml$|\.github/workflows/(ci|audit)\.yml$)'; then
             deps=true
           fi
-          if matches '^(Cargo\.(toml|lock)|third_party/.*Cargo\.toml)$'; then
+          # Shipped Rust source too: a new std API compiles on the pinned
+          # toolchain and only the MSRV build catches it.
+          if matches '^(Cargo\.(toml|lock)$|src/|third_party/)'; then
             msrv=true
           fi
           printf '%s\n' "code=$code" "deps=$deps" "image=$image" "msrv=$msrv" "website=$website" \
@@ -439,18 +445,27 @@ jobs:
         # only places a literal token legitimately lives: test fixtures,
         # spec/docs examples, the example config, this workflow, the loader
         # unit-test fixtures.
+        #
+        # This log is public: a hit is reported as `path:line` only, never the
+        # matched line (it IS the credential), and a token inside a path is
+        # masked. `-z` NUL-separates path, line and content so a `:` in a path
+        # cannot shift the cut; the content field is dropped before printing.
         run: |
+          hits="$RUNNER_TEMP/secret-scan-hits"
           set +e
-          matches="$(git grep -nE "dbmcp_svc_[0-9a-f]{64}" \
+          git grep -n -z -E "dbmcp_svc_[0-9a-f]{64}" \
               -- ":!tests/**" ":!website/**" ":!config/example.yaml" \
-              ":!.github/**" ":!src/config/yaml/**")"
+              ":!.github/**" ":!src/config/yaml/**" > "$hits"
           rc=$?
           set -e
-          if [ "$rc" -eq 0 ] && [ -n "$matches" ]; then
-            echo "::error::literal dbmcp_svc_ service token(s) in committed config — reference the secret via ENV: or FILE: (spec 14)."
-            printf '%s\n' "$matches"
+          if [ "$rc" -eq 0 ] && [ -s "$hits" ]; then
+            echo "::error::literal dbmcp_svc_ service token(s) in committed config — reference the secret via ENV: or FILE: (spec 14). Locations (content withheld):"
+            tr '\0' '\037' < "$hits" | cut -d "$(printf '\037')" -f1,2 --output-delimiter=: \
+              | sed -E 's/dbmcp_svc_[0-9a-f]{64}/<redacted>/g; s/^/  /'
+            rm -f "$hits"
             exit 1
           fi
+          rm -f "$hits"
           if [ "$rc" -ne 1 ]; then
             echo "::error::git grep tooling failure (rc=$rc) — secret-scan cannot read as clean (fail-closed, #190)"
             exit 1
@@ -755,64 +770,27 @@ jobs:
           registry: registry.digitalocean.com
           username: ${{ secrets.DOCR_TOKEN }}
           password: ${{ secrets.DOCR_TOKEN }}
-      - name: derive ghcr image metadata
-        id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: ghcr.io/${{ github.repository }}
-          # Three tags per commit:
-          #   sha-a1b2c3d — what ArgoCD Image Updater tracks. Its allow-tags is
-          #     `regexp:^sha-[0-9a-f]{7}$`, so the `sha-` prefix is load-bearing:
-          #     without it the updater matches nothing and the cluster silently
-          #     never rolls forward.
-          #   a1b2c3d — bare form, kept for anything already pinning it.
-          #   main — moving convenience tag.
-          tags: |
-            type=sha,format=short
-            type=sha,prefix=,format=short
-            type=raw,value=main
-      - name: create ghcr manifest list & push
-        run: |
-          # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            "ghcr.io/${{ github.repository }}:linux-amd64-${{ steps.sha.outputs.short }}" \
-            "ghcr.io/${{ github.repository }}:linux-arm64-${{ steps.sha.outputs.short }}"
-      - name: derive docr image metadata
-        id: meta-docr
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: registry.digitalocean.com/developerz-ai/db-mcp-gateway
-          # Mirror the GHCR tag set exactly. DOCR is the registry Image Updater
-          # actually reads, so `sha-<7>` must exist here above all.
-          tags: |
-            type=sha,format=short
-            type=sha,prefix=,format=short
-            type=raw,value=main
-      - name: create docr manifest list & push
-        env:
-          # docker/metadata-action@v5 auto-sets only `DOCKER_METADATA_OUTPUT_JSON`
-          # (shared name, no per-step suffix); with two metadata steps in the same
-          # job the second overwrites the first. Mirror the DOCR step's `json`
-          # output into a step-scoped env var so the jq below reads the right
-          # tag set.
-          DOCR_METADATA_JSON: ${{ steps.meta-docr.outputs.json }}
-        run: |
-          # shellcheck disable=SC2046  # word-splitting is intentional: one -t per tag
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCR_METADATA_JSON") \
-            "registry.digitalocean.com/developerz-ai/db-mcp-gateway:linux-amd64-${{ steps.sha.outputs.short }}" \
-            "registry.digitalocean.com/developerz-ai/db-mcp-gateway:linux-arm64-${{ steps.sha.outputs.short }}"
-      - name: index digests
+      # The index is staged under `index-<sha7>` (no deployable pattern
+      # matches it), signed and attested by digest, and only then are the
+      # deployable tags written onto that same digest: a failed signature or
+      # attestation leaves `sha-*` and `main` where they were.
+      - name: stage the indexes
         id: digest
         env:
           SHORT: ${{ steps.sha.outputs.short }}
           GHCR_IMAGE: ghcr.io/${{ github.repository }}
+          DOCR_IMAGE: registry.digitalocean.com/developerz-ai/db-mcp-gateway
         run: |
           set -euo pipefail
-          digest() { docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' | jq -er .digest; }
-          echo "ghcr=$(digest "$GHCR_IMAGE:sha-$SHORT")" >> "$GITHUB_OUTPUT"
-          echo "docr=$(digest "registry.digitalocean.com/developerz-ai/db-mcp-gateway:sha-$SHORT")" >> "$GITHUB_OUTPUT"
+          stage() {
+            docker buildx imagetools create -t "$1:index-$SHORT" \
+              "$1:linux-amd64-$SHORT" "$1:linux-arm64-$SHORT" >&2
+            docker buildx imagetools inspect "$1:index-$SHORT" --format '{{json .Manifest}}' | jq -er .digest
+          }
+          # Assigned first: a failure inside `echo "…$(…)"` would not stop the step.
+          ghcr=$(stage "$GHCR_IMAGE")
+          docr=$(stage "$DOCR_IMAGE")
+          printf '%s\n' "ghcr=$ghcr" "docr=$docr" >> "$GITHUB_OUTPUT"
       # Keyless: the signature binds the digest to this run's OIDC identity
       # (`cosign verify --certificate-identity-regexp
       # 'github.com/<repo>/.github/workflows/ci.yml@refs/heads/main'`).
@@ -836,6 +814,53 @@ jobs:
           subject-name: registry.digitalocean.com/developerz-ai/db-mcp-gateway
           subject-digest: ${{ steps.digest.outputs.docr }}
           push-to-registry: true
+      - name: derive ghcr image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # Three tags per commit:
+          #   sha-a1b2c3d — what ArgoCD Image Updater tracks. Its allow-tags is
+          #     `regexp:^sha-[0-9a-f]{7}$`, so the `sha-` prefix is load-bearing:
+          #     without it the updater matches nothing and the cluster silently
+          #     never rolls forward.
+          #   a1b2c3d — bare form, kept for anything already pinning it.
+          #   main — moving convenience tag.
+          tags: |
+            type=sha,format=short
+            type=sha,prefix=,format=short
+            type=raw,value=main
+      - name: derive docr image metadata
+        id: meta-docr
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: registry.digitalocean.com/developerz-ai/db-mcp-gateway
+          # Mirror the GHCR tag set exactly. DOCR is the registry Image Updater
+          # actually reads, so `sha-<7>` must exist here above all.
+          tags: |
+            type=sha,format=short
+            type=sha,prefix=,format=short
+            type=raw,value=main
+      # One source and no annotations: imagetools copies the signed index as
+      # is, so every tag lands on the digest the signature covers.
+      - name: publish the deployable tags
+        env:
+          # docker/metadata-action sets one shared `DOCKER_METADATA_OUTPUT_JSON`
+          # (the second step overwrites the first), so each registry reads its
+          # own step's `json` output.
+          GHCR_JSON: ${{ steps.meta.outputs.json }}
+          DOCR_JSON: ${{ steps.meta-docr.outputs.json }}
+          GHCR_REF: ghcr.io/${{ github.repository }}@${{ steps.digest.outputs.ghcr }}
+          DOCR_REF: registry.digitalocean.com/developerz-ai/db-mcp-gateway@${{ steps.digest.outputs.docr }}
+        run: |
+          set -euo pipefail
+          publish() {
+            local tags
+            mapfile -t tags < <(jq -r '.tags[] | "-t", .' <<< "$1")
+            docker buildx imagetools create "${tags[@]}" "$2"
+          }
+          publish "$GHCR_JSON" "$GHCR_REF"
+          publish "$DOCR_JSON" "$DOCR_REF"
       - name: inspect
         run: |
           docker buildx imagetools inspect \

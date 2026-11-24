@@ -105,8 +105,9 @@ async fn authorize_accepts_the_advertised_resource() {
     let ours = advertised_resource(&base).await;
     // No IdP is reachable here, so the request fails later; what matters is
     // that the resource check let it through.
-    let (_, body) = authorize(&base, &client_id, &ours).await;
-    assert_ne!(body["error"], "invalid_target", "{body}");
+    let (status, body) = authorize(&base, &client_id, &ours).await;
+    assert_eq!(status, 502, "{body}");
+    assert_eq!(body["error"], "server_error", "{body}");
 }
 
 #[tokio::test]

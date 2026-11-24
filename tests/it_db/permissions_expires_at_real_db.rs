@@ -112,6 +112,20 @@ async fn mysql_expires_at_is_nullable_and_reaches_the_resolver() {
     let live = repo.live_grants_for_sub(&user_sub).await.expect("live");
     assert_eq!(live[0].expires_at, Some(at));
 
+    // Past MySQL's TIMESTAMP range (2038-01-19): the column is DATETIME(6),
+    // read back as UTC, as Postgres keeps any date.
+    let far = chrono::DateTime::parse_from_rfc3339("2040-06-01T12:00:00.123456Z")
+        .expect("timestamp")
+        .with_timezone(&Utc);
+    sqlx::query("UPDATE permissions_grants SET expires_at = ? WHERE id = ?")
+        .bind(far)
+        .bind(id.to_string())
+        .execute(&pool)
+        .await
+        .expect("an expiry after 2038 is stored");
+    let live = repo.live_grants_for_sub(&user_sub).await.expect("live");
+    assert_eq!(live[0].expires_at, Some(far));
+
     sqlx::query("DELETE FROM permissions_grants WHERE id = ?")
         .bind(id.to_string())
         .execute(&pool)

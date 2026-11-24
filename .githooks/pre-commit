@@ -19,31 +19,49 @@ token_re='dbmcp_svc_[0-9a-f]{64}'
 exempt=(':!tests/**' ':!website/**' ':!config/example.yaml' ':!.github/**' ':!src/config/yaml/**')
 scan_error() { echo "pre-commit: secret scan could not run ($1) — refusing the commit." >&2; exit 2; }
 
-names_file=$(mktemp)
-trap 'rm -f "$names_file"' EXIT
-git diff --cached --name-only -z --diff-filter=ACMRT -- . "${exempt[@]}" > "$names_file" \
-  || scan_error 'git diff --name-only failed'
-mapfile -d '' -t staged < "$names_file"
-by_name=$(tr '\0' '\n' < "$names_file" | grep -E "$token_re") || (( $? == 1 )) || scan_error 'grep failed'
+# Paths stay NUL-delimited end to end: a newline inside a staged file name
+# would otherwise split it into pathspecs that match nothing, and its blob would
+# never be scanned.
+staged_paths() {
+  local list
+  list=$(mktemp) || scan_error 'mktemp failed'
+  if ! git diff --cached --name-only -z --diff-filter="$1" -- "${@:2}" > "$list"; then
+    rm -f "$list"
+    scan_error 'git diff --name-only failed'
+  fi
+  mapfile -d '' -t paths < "$list"
+  rm -f "$list"
+}
+staged_paths ACMRT . "${exempt[@]}"
+staged=("${paths[@]}")
+by_name=()
+for path in "${staged[@]}"; do
+  if [[ $path =~ $token_re ]]; then by_name+=("$path"); fi
+done
 by_content=''
 if (( ${#staged[@]} )); then
-  # Captured, not piped: grep's early exit cannot SIGPIPE git into a pass.
+  # Captured, not piped: an early exit downstream cannot SIGPIPE git into a pass.
   by_content=$(git --literal-pathspecs grep --cached --text -l -E "$token_re" -- "${staged[@]}") \
     || (( $? == 1 )) || scan_error 'git grep failed'
 fi
-if [[ -n $by_content || -n $by_name ]]; then
+if [[ -n $by_content || ${#by_name[@]} -gt 0 ]]; then
   # File names only — a token inside a file name is redacted too.
   echo 'pre-commit: the staged change adds a service-token value (dbmcp_svc_…) in:' >&2
-  printf '%s\n%s\n' "$by_content" "$by_name" | sed '/^$/d' | sort -u \
+  printf '%s\n' "$by_content" "${by_name[@]}" | sed '/^$/d' | sort -u \
     | sed -E "s/${token_re}/dbmcp_svc_<redacted>/g" >&2
   echo "Reference it as \${ENV:…} or \${FILE:…} instead (spec 14)." >&2
   exit 1
 fi
 
 if command -v shellcheck >/dev/null 2>&1; then
-  mapfile -t scripts < <(git diff --cached --name-only --diff-filter=ACMR -- 'bin/*' '.githooks/*' 'tests/bin/*.sh')
+  # Shell only: `*.sh` plus the extensionless wrappers (bin/lib/*.sql is not).
+  staged_paths ACMR 'bin/*' '.githooks/*' 'tests/bin/*.sh'
+  scripts=()
+  for path in "${paths[@]}"; do
+    if [[ $path == *.sh || ${path##*/} != *.* ]]; then scripts+=("$path"); fi
+  done
   if (( ${#scripts[@]} )); then
     echo '→ shellcheck (staged scripts)'
-    shellcheck -x "${scripts[@]}"
+    shellcheck -x -- "${scripts[@]}"
   fi
 fi

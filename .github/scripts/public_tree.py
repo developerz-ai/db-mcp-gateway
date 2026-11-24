@@ -19,7 +19,9 @@ use for and that nothing here needs to build, test or use the project.
 
 The one forbidden value this file knows itself, the setup mode's name, is
 assembled from parts so the guard does not trip over itself. A failure names
-the file and the rule, never the matched text: CI logs are public.
+the file and the rule, never the matched text: CI logs are public. A tracked
+path is scanned too, and a reported path has every private or forbidden word
+masked (or is withheld whole when a host, repository or home path is left).
 
 Git is the oracle for "tracked", after checking that git answers for this
 checkout and not for an outer repository. The scan reads each tracked blob from
@@ -229,6 +231,27 @@ def _next_blob(proc, blob):
     return content
 
 
+def path_violations(path, private):
+    """The rules a tracked path's own name breaks: a name is as public as a blob."""
+    rules = [f"{rule} in the file name" for rule in violations("", path)]
+    if names_private_word(path, private):
+        rules.append("private word (from the secret) in the file name")
+    return rules
+
+
+WITHHELD_PATH = "<path withheld: its name breaks a rule>"
+
+
+def shown_path(path, private):
+    """`path` as a public log may print it: every private or forbidden word
+    masked, and the whole name withheld when what is left still breaks a rule
+    (a host, repository or home path has no single word to mask)."""
+    shown = path
+    for word in (*private, *(word for _, word in FORBIDDEN_WORDS)):
+        shown = word.sub("<redacted>", shown)
+    return WITHHELD_PATH if path_violations(shown, private) else shown
+
+
 def scan(root, entries, private):
     """(blobs read, failures as `path: rule`) over index entries (path, blob)."""
     entries = [(path, blob) for path, blob in entries if not platform_owned(path)]
@@ -243,8 +266,13 @@ def scan(root, entries, private):
             rules = violations(path, content)
             if private_hit:
                 rules.append("private word (from the secret)")
+            rules.extend(path_violations(path, private))
             rules_by_entry[path, blob] = rules
-    failures = [f"{path}: {rule}" for path, blob in entries for rule in rules_by_entry[path, blob]]
+    failures = [
+        f"{shown_path(path, private)}: {rule}"
+        for path, blob in entries
+        for rule in rules_by_entry[path, blob]
+    ]
     return len(entries), failures
 
 

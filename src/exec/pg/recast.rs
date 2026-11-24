@@ -169,7 +169,7 @@ async fn prepare(tx: &mut Transaction<'_, Postgres>, sql: &str) -> Option<()> {
 
 /// The `PREPARE` type list for the types `params` run with (see
 /// [`QueryParam`]), empty without params. Every name is a constant.
-fn param_types(params: &[QueryParam]) -> String {
+pub(super) fn param_types(params: &[QueryParam]) -> String {
     if params.is_empty() {
         return String::new();
     }
@@ -188,7 +188,7 @@ fn param_types(params: &[QueryParam]) -> String {
 }
 
 /// `EXECUTE name` with `count` NULL arguments.
-fn execute_with_nulls(name: &str, count: usize) -> String {
+pub(super) fn execute_with_nulls(name: &str, count: usize) -> String {
     match count {
         0 => format!("EXECUTE {name}"),
         _ => format!("EXECUTE {name}({})", vec!["NULL"; count].join(", ")),

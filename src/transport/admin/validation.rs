@@ -1,6 +1,8 @@
 //! Input validation and error mapping shared by every `/admin/v1/*` handler,
 //! so the three entity families cannot drift apart on wording or redaction.
 
+use axum::extract::rejection::JsonRejection;
+use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 
 use crate::config::ConfigFile;
@@ -8,10 +10,16 @@ use crate::state::permissions::RepoError;
 
 use super::error::AdminError;
 
-/// A malformed or non-JSON body, surfaced in the stable admin envelope
-/// instead of Axum's default 400/422.
-pub(super) fn invalid_body(request_id: &str) -> AdminError {
-    AdminError::invalid("invalid JSON body").with_request_id(request_id)
+/// A body the JSON extractor refused, surfaced in the stable admin envelope
+/// instead of Axum's default: `payload_too_large` (413) past the route's
+/// byte bound, `invalid_request` (400) for anything malformed.
+pub(super) fn invalid_body(rejection: &JsonRejection, request_id: &str) -> AdminError {
+    let error = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        AdminError::payload_too_large()
+    } else {
+        AdminError::invalid("invalid JSON body")
+    };
+    error.with_request_id(request_id)
 }
 
 /// A malformed UUID in `:id`.

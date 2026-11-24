@@ -6,7 +6,7 @@
 //! Audit assertion intentionally skipped: these drive the adapter directly,
 //! never the tool-dispatch path that writes audit rows.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use redis::aio::MultiplexedConnection;
 use serde_json::json;
@@ -16,10 +16,10 @@ use crate::common::redis_target::{
 };
 use db_mcp_gateway::exec::PoolSizing;
 
-/// The ids of the clients the server lists, minus `side`'s own, that are
-/// not known to be another ACL user. Redis prints `user=`; Dragonfly does
-/// not, so there the id set alone tells connections apart.
-async fn gateway_client_ids(side: &mut MultiplexedConnection) -> BTreeSet<String> {
+/// The clients the server lists, minus `side`'s own, that are not known to
+/// be another ACL user, as `id → CLIENT LIST line`. Redis prints `user=`;
+/// Dragonfly does not, so there the id set alone tells connections apart.
+async fn gateway_clients(side: &mut MultiplexedConnection) -> BTreeMap<String, String> {
     let own = match admin_cmd(side, &["CLIENT", "ID"]).await {
         redis::Value::Int(id) => id.to_string(),
         other => panic!("CLIENT ID: {other:?}"),
@@ -30,29 +30,35 @@ async fn gateway_client_ids(side: &mut MultiplexedConnection) -> BTreeSet<String
         other => panic!("CLIENT LIST: {other:?}"),
     };
     list.lines()
-        .filter(|line| {
-            line.split(' ')
-                .find_map(|field| field.strip_prefix("user="))
-                .is_none_or(|user| user == READ_USER)
-        })
-        .filter_map(|line| line.split(' ').find_map(|field| field.strip_prefix("id=")))
-        .filter(|id| *id != own)
-        .map(str::to_string)
+        .filter(|line| field(line, "user=").is_none_or(|user| user == READ_USER))
+        .filter_map(|line| Some((field(line, "id=")?.to_string(), line.to_string())))
+        .filter(|(id, _)| *id != own)
         .collect()
 }
 
-/// Close only the connections that appeared since `before`: the adapter's.
-/// Every other client of the shared server keeps its connection.
-async fn kill_new_clients(side: &mut MultiplexedConnection, before: &BTreeSet<String>) -> usize {
-    let new: Vec<String> = gateway_client_ids(side)
+fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    line.split(' ').find_map(|field| field.strip_prefix(key))
+}
+
+/// Close the one connection that appeared since `before` and last ran a
+/// `GET` (where the server reports the last command): the adapter's. Every
+/// other client of the shared server keeps its connection.
+async fn kill_new_client(side: &mut MultiplexedConnection, before: &BTreeMap<String, String>) {
+    let candidates: Vec<String> = gateway_clients(side)
         .await
-        .difference(before)
-        .cloned()
+        .into_iter()
+        .filter(|(id, line)| {
+            !before.contains_key(id)
+                && field(line, "cmd=").is_none_or(|cmd| cmd.eq_ignore_ascii_case("get"))
+        })
+        .map(|(id, _)| id)
         .collect();
-    for id in &new {
-        admin_cmd(side, &["CLIENT", "KILL", "ID", id]).await;
-    }
-    new.len()
+    assert_eq!(
+        candidates.len(),
+        1,
+        "exactly the adapter's connection is new: {candidates:?}"
+    );
+    admin_cmd(side, &["CLIENT", "KILL", "ID", &candidates[0]]).await;
 }
 
 #[tokio::test]
@@ -67,7 +73,7 @@ async fn a_read_on_a_connection_closed_while_idle_reconnects_once() {
             ..PoolSizing::default()
         };
         let mut side = admin(flavor).await;
-        let before = gateway_client_ids(&mut side).await;
+        let before = gateway_clients(&mut side).await;
         let a = adapter(flavor, sizing).await;
         let key = unique_key("idle");
         admin_cmd(&mut side, &["SET", &key, "still here"]).await;
@@ -75,17 +81,12 @@ async fn a_read_on_a_connection_closed_while_idle_reconnects_once() {
 
         // Opens the pool's one connection and leaves it idle.
         ok(&a, flavor, &get, 10).await;
-        let killed = kill_new_clients(&mut side, &before).await;
+        kill_new_client(&mut side, &before).await;
         let after = ok(&a, flavor, &get, 10).await;
         // The replacement went back to the pool and keeps serving.
         let again = ok(&a, flavor, &get, 10).await;
         delete_keys(&mut side, &[&key]).await;
 
-        assert!(
-            killed >= 1,
-            "{}: no gateway connection to kill",
-            flavor.name()
-        );
         assert_eq!(
             after.rows,
             vec![vec![json!("still here")]],

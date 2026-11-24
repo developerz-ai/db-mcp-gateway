@@ -48,8 +48,11 @@ groups:
           runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditabandoned
       - alert: GatewayAuditReaperStale
         # The reaper sweeps every 60 s; the gauge is absent until the first
-        # sweep completes, so a reaper that never succeeds also fires.
-        expr: (time() - max(audit_reaper_last_success_timestamp) > 600) or absent(audit_reaper_last_success_timestamp)
+        # sweep completes, so a reaper that never succeeds also fires. Per
+        # deployment (`job`, `namespace`): on a shared Prometheus one healthy
+        # gateway must not hide another's stale or missing sweeps. A
+        # deployment is a scraped `build_info` (set at boot).
+        expr: (time() - max by (job, namespace) (audit_reaper_last_success_timestamp) > 600) or (group by (job, namespace) (build_info) unless on (job, namespace) group by (job, namespace) (audit_reaper_last_success_timestamp))
         for: 15m
         labels:
           severity: warning
@@ -59,7 +62,8 @@ groups:
           runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditreaperstale
       - alert: GatewayAuditPrunerStale
         # Hourly prune (first run within 5 min of boot): three missed runs.
-        expr: (time() - max(audit_pruner_last_success_timestamp) > 10800) or absent(audit_pruner_last_success_timestamp)
+        # Per deployment, like GatewayAuditReaperStale.
+        expr: (time() - max by (job, namespace) (audit_pruner_last_success_timestamp) > 10800) or (group by (job, namespace) (build_info) unless on (job, namespace) group by (job, namespace) (audit_pruner_last_success_timestamp))
         for: 15m
         labels:
           severity: warning

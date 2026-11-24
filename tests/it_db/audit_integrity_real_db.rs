@@ -12,8 +12,10 @@ use std::time::Duration;
 use crate::common::audit::{DispatchSinks, calls_for_request, find_audit};
 use crate::common::cleanup::delete_audit_calls;
 use crate::common::env::{state_db_url, state_pool};
+use db_mcp_gateway::audit::drain::DetachedTasks;
 use db_mcp_gateway::audit::intent::WRITE_MAY_HAVE_COMMITTED;
 use db_mcp_gateway::audit::reaper::{self, ReapCursor};
+use db_mcp_gateway::audit::stream::StreamSinks;
 use db_mcp_gateway::audit::{self, CallIntent, pruner};
 use db_mcp_gateway::auth::{Identity, IdentityKind, SessionId};
 use db_mcp_gateway::exec::Access;
@@ -149,6 +151,19 @@ async fn reaper_cursor_resumes_without_rescanning_or_skipping() {
         .expect("contended sweep returns");
     assert_eq!(contended, None);
     assert_eq!(cursor, before, "a sweep that ran no batch keeps its cursor");
+    let report = reaper::sweep_report(
+        &p,
+        grace,
+        &mut cursor,
+        &StreamSinks::default(),
+        &DetachedTasks::new(),
+    )
+    .await
+    .expect("contended sweep returns");
+    assert!(
+        !report.finished,
+        "a sweep that lost the lock did not finish"
+    );
     peer.rollback().await.expect("peer releases the lock");
 
     // A newer aged intent is past the cursor and is reaped.

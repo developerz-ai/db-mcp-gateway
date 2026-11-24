@@ -230,21 +230,39 @@ fn guard(sql: &str, access: Access) -> Result<Access, GuardError> {
     }
 }
 
-/// `sql` up to the end of its last token, a terminating `;` dropped: the
-/// text that nests as a subquery. Read off Postgres's own token boundaries,
-/// so a comment after the `;` (`… ; -- note`) cannot hide it, and a `;`
-/// inside a string or comment is never taken for it. `None` when the text
-/// does not scan (the guard has then refused it already).
+/// `sql` from its first token to the end of its last, leading and
+/// terminating `;`s dropped: the text that nests as a subquery. Read off
+/// Postgres's own token boundaries, so a comment after the `;` (`… ; --
+/// note`) cannot hide it, and a `;` inside a string or comment is never
+/// taken for it. `None` when the text does not scan (the guard has then
+/// refused it already) or holds no statement.
 pub(crate) fn statement_body(sql: &str) -> Option<&str> {
     let lexemes = pg_scan::scan(sql).ok()?;
-    // Past every lexeme that is nothing but `;`, then the `;`s ending the
-    // last that is not (adjacent symbols merge, as in `);`).
-    let kept = |lexeme: &pg_scan::Lexeme| match lexeme.kind {
-        pg_scan::Kind::Symbols => sql[lexeme.start..lexeme.end].trim_end_matches(';').len(),
-        _ => lexeme.end - lexeme.start,
+    // Lexemes that are nothing but `;` are skipped at both ends, and the
+    // `;`s at the edge of the first and last that are not (adjacent symbols
+    // merge, as in `);` or `;(`).
+    let text = |lexeme: &pg_scan::Lexeme| &sql[lexeme.start..lexeme.end];
+    let is_symbols = |lexeme: &pg_scan::Lexeme| matches!(lexeme.kind, pg_scan::Kind::Symbols);
+    let trimmed = |lexeme: &pg_scan::Lexeme| {
+        if is_symbols(lexeme) {
+            text(lexeme).trim_matches(';').len()
+        } else {
+            lexeme.end - lexeme.start
+        }
     };
-    let last = lexemes.iter().rev().find(|lexeme| kept(lexeme) > 0)?;
-    Some(&sql[..last.start + kept(last)])
+    let first = lexemes.iter().find(|lexeme| trimmed(lexeme) > 0)?;
+    let last = lexemes.iter().rev().find(|lexeme| trimmed(lexeme) > 0)?;
+    let start = if is_symbols(first) {
+        first.end - text(first).trim_start_matches(';').len()
+    } else {
+        first.start
+    };
+    let end = if is_symbols(last) {
+        last.start + text(last).trim_end_matches(';').len()
+    } else {
+        last.end
+    };
+    sql.get(start..end)
 }
 
 /// Only a `Query` reads; every other admitted shape is a data write.

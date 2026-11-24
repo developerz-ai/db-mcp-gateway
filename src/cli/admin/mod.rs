@@ -9,7 +9,7 @@ mod session_file;
 
 use std::path::PathBuf;
 
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 use super::{CliError, EXIT_OK};
@@ -29,7 +29,8 @@ pub struct LoginArgs {
 /// Which gateway, as whom.
 #[derive(Debug, Args)]
 pub struct Target {
-    /// Gateway base URL. Default: the one `login` stored.
+    /// Gateway base URL. Default: the one `login` stored; any other is
+    /// refused, so the stored bearer never goes to a different gateway.
     #[arg(long)]
     pub url: Option<String>,
     /// Session file. Default: `$XDG_CONFIG_HOME/db-mcp-gateway/session.json`
@@ -70,9 +71,21 @@ pub enum SessionsCommand {
     Revoke {
         #[command(flatten)]
         target: Target,
+        /// Match `user` against this field only. Default: any of them, and
+        /// a value that names two different users is refused.
+        #[arg(long, value_enum)]
+        by: Option<UserField>,
         /// The user's id, `user_sub` or email.
         user: String,
     },
+}
+
+/// Which field of a user `sessions revoke` matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum UserField {
+    Id,
+    Sub,
+    Email,
 }
 
 #[derive(Debug, Subcommand)]
@@ -127,7 +140,38 @@ impl Target {
             None => session_file::default_path()?,
         };
         let session = session_file::load(&path)?;
-        let url = self.url.as_deref().unwrap_or(&session.url);
+        let url = session_url(self.url.as_deref(), &session.url)?;
         AdminClient::new(url, session.access_token)
+    }
+}
+
+/// The session's own gateway; `--url` may only restate it.
+fn session_url<'a>(flag: Option<&str>, stored: &'a str) -> Result<&'a str, CliError> {
+    let stored = stored.trim_end_matches('/');
+    match flag.map(|url| url.trim_end_matches('/')) {
+        Some(url) if url != stored => Err(CliError::Usage(format!(
+            "--url {url} is not the gateway this session belongs to ({stored}); \
+             log in to it with its own --token-file"
+        ))),
+        _ => Ok(stored),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_override_must_match_the_session_gateway() {
+        let stored = "https://gw.example.com/";
+        assert_eq!(session_url(None, stored).unwrap(), "https://gw.example.com");
+        assert_eq!(
+            session_url(Some("https://gw.example.com"), stored).unwrap(),
+            "https://gw.example.com"
+        );
+        assert!(matches!(
+            session_url(Some("https://evil.example.com"), stored),
+            Err(CliError::Usage(_))
+        ));
     }
 }

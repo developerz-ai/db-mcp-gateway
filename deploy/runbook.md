@@ -57,7 +57,7 @@ Every agent-facing error carries a `request_id`; it matches `audit_calls.request
 
 ### GatewayAuditReaperStale
 
-**Means.** No reaper sweep completed in 10 minutes (`audit_reaper_last_success_timestamp`, 60 s interval), or none since boot. Crashed calls stay open intents.
+**Means.** No reaper sweep completed in 10 minutes (`audit_reaper_last_success_timestamp`, 60 s interval), or none since boot, in one gateway deployment (`job`, `namespace`; a healthy deployment on the same Prometheus never hides it). Crashed calls stay open intents.
 
 **First checks.** Gateway logs for `audit_reaper` errors or `background task panicked; restarting`; the background state-DB pool (fixed size 2) blocked by a long lock on `audit_call_intents`.
 
@@ -65,7 +65,7 @@ Every agent-facing error carries a `request_id`; it matches `audit_calls.request
 
 ### GatewayAuditPrunerStale
 
-**Means.** No successful retention prune in 3 hours (hourly, first run within 5 minutes of boot), or none since boot. Rows past `AUDIT_RETENTION_DAYS` stay; the audit tables grow.
+**Means.** No successful retention prune in 3 hours (hourly, first run within 5 minutes of boot), or none since boot, in one gateway deployment (`job`, `namespace`). Rows past `AUDIT_RETENTION_DAYS` stay; the audit tables grow.
 
 **First checks.** `audit_pruner_runs_total{result="error"}`; gateway logs at `ERROR` from the pruner. The usual cause: `STATE_DB_URL`'s role lacks `DELETE` on `audit_calls`, `audit_call_intents` or `permissions_audit`.
 

@@ -27,3 +27,8 @@ networkPolicy:
         - ipBlock: { cidr: 10.20.0.0/24 }
       ports:
         - { port: 5432, protocol: TCP }
+    targets:
+      - to:
+          - ipBlock: { cidr: 10.30.0.0/16 }
+        ports:
+          - { port: 5432, protocol: TCP }

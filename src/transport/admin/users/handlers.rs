@@ -34,7 +34,7 @@ pub async fn create(
     body: Result<Json<CreateUserRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, AdminError> {
     let rid = actor.request_id.as_str();
-    let Json(body) = body.map_err(|_| invalid_body(rid))?;
+    let Json(body) = body.map_err(|rejection| invalid_body(&rejection, rid))?;
     let user_sub = sso_subject(&body.user_sub, rid)?;
     let user_email = valid_email(&body.user_email, rid)?;
     let groups = validate_groups(&body.groups, rid)?;
@@ -118,7 +118,7 @@ pub async fn patch(
 ) -> Result<Json<UserResponse>, AdminError> {
     let rid = actor.request_id.as_str();
     let Path(id) = id.map_err(|_| invalid_id("user", rid))?;
-    let Json(body) = body.map_err(|_| invalid_body(rid))?;
+    let Json(body) = body.map_err(|rejection| invalid_body(&rejection, rid))?;
     if body.user_email.is_none() && body.groups.is_none() {
         return Err(
             AdminError::invalid("PATCH body must set at least one of user_email, groups")

@@ -264,9 +264,10 @@ fn oversized_params_are_cut_to_a_marked_string_with_valid_json() {
     assert_eq!(body["sql"], "SELECT 1");
 }
 
-/// Oversized metadata is replaced by an explicit valid JSON notice.
+/// No `sql` to shorten (an oversized error message, say): the free text is
+/// cut to the marker, so the body stays one parseable object.
 #[test]
-fn oversized_row_without_sql_is_a_valid_truncation_notice() {
+fn oversized_row_without_sql_cuts_free_text_to_the_marker() {
     let mut row = sample_row();
     row.sql = None;
     row.error_message = Some("e".repeat(20_000));
@@ -276,7 +277,8 @@ fn oversized_row_without_sql_is_a_valid_truncation_notice() {
     assert!(message.len() <= MAX_MESSAGE_BYTES);
     let body: serde_json::Value =
         serde_json::from_str(&message[message.find('{').unwrap()..]).expect("body is JSON");
-    assert_eq!(body["truncated"], true);
+    assert_eq!(body["error_message"], TRUNCATION_MARKER);
+    assert_eq!(body["request_id"].as_str(), Some("req-stream-1"));
 }
 
 #[test]

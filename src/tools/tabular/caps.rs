@@ -10,7 +10,7 @@
 use std::io;
 use std::num::NonZeroU32;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::audit::prefix_at_char_boundary;
@@ -21,10 +21,34 @@ use crate::exec::MAX_RESULT_BYTES;
 /// `{"$dbmcp_truncated": {"bytes": <JSON size of the cell>, "preview": "…"}}`.
 pub(in crate::tools) const CELL_MARKER: &str = "$dbmcp_truncated";
 
-/// The caller's byte caps, both optional and both at least 1.
+/// The smallest `max_bytes`: the JSON of an empty `rows` array, `[]`.
+const MIN_MAX_BYTES: u32 = 2;
+
+/// A caller's `max_bytes`, at least [`MIN_MAX_BYTES`]: a smaller cap could
+/// never be met, so it is refused before the target is read.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(try_from = "u32")]
+pub struct MaxBytes(u32);
+
+#[derive(Debug, thiserror::Error)]
+#[error("`max_bytes` must be at least {MIN_MAX_BYTES}, the size of an empty `rows` array")]
+pub struct MaxBytesTooSmall;
+
+impl TryFrom<u32> for MaxBytes {
+    type Error = MaxBytesTooSmall;
+
+    fn try_from(bytes: u32) -> Result<Self, Self::Error> {
+        if bytes < MIN_MAX_BYTES {
+            return Err(MaxBytesTooSmall);
+        }
+        Ok(Self(bytes))
+    }
+}
+
+/// The caller's byte caps, both optional.
 #[derive(Debug, Clone, Copy, Default)]
 pub(in crate::tools) struct ByteCaps {
-    pub max_bytes: Option<NonZeroU32>,
+    pub max_bytes: Option<MaxBytes>,
     pub max_cell_bytes: Option<NonZeroU32>,
 }
 
@@ -81,9 +105,14 @@ pub(in crate::tools) fn shape(
     let cells_truncated = caps
         .max_cell_bytes
         .map_or(0, |cap| cap_cells(&mut rows, cap));
-    let byte_capped = caps
+    // The ceiling holds even with no caller cap: shaping can grow a result.
+    let byte_cap = caps
         .max_bytes
-        .is_some_and(|cap| keep_within(&mut rows, cap));
+        .map_or(MAX_RESULT_BYTES, |cap| {
+            usize::try_from(cap.0).unwrap_or(usize::MAX)
+        })
+        .min(MAX_RESULT_BYTES);
+    let byte_capped = keep_within(&mut rows, byte_cap);
     // Rows run out at the row limit only when every row was kept; otherwise
     // a byte budget cut first (the gateway's when the adapter stopped short).
     let truncated_by = match (byte_capped, exec_truncated) {
@@ -154,13 +183,10 @@ fn marker(cell: &Value, bytes: usize, cap: usize) -> Value {
     })
 }
 
-/// Keep the leading rows whose JSON array fits in `cap` (clamped to the
-/// gateway budget); `true` when a row was dropped.
-fn keep_within(rows: &mut Vec<Vec<Value>>, cap: NonZeroU32) -> bool {
-    let cap = usize::try_from(cap.get())
-        .unwrap_or(usize::MAX)
-        .min(MAX_RESULT_BYTES);
-    // `[` and `]`, then each row plus its separating comma.
+/// Keep the leading rows whose JSON array fits in `cap` bytes; `true` when
+/// a row was dropped.
+fn keep_within(rows: &mut Vec<Vec<Value>>, cap: usize) -> bool {
+    // `[ and `]`, then each row plus its separating comma.
     let mut used: usize = 2;
     let keep = rows
         .iter()

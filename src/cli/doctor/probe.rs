@@ -77,7 +77,9 @@ pub async fn privileges(
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relkind IN ('r', 'p', 'v', 'f') AND ",
             user_schemas!(),
-            " AND has_table_privilege(c.oid, 'INSERT, UPDATE, DELETE, TRUNCATE') \
+            // A column-level grant writes too; `has_table_privilege` ignores it.
+            " AND (has_table_privilege(c.oid, 'INSERT, UPDATE, DELETE, TRUNCATE') \
+             OR has_any_column_privilege(c.oid, 'INSERT, UPDATE')) \
              ORDER BY 1 LIMIT 20"
         ),
         None,

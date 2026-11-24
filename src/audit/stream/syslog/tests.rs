@@ -189,6 +189,27 @@ async fn tls_sink_delivers_to_a_receiver_signed_by_the_pinned_ca() {
     assert!(frame.contains("req-tls"), "{frame}");
 }
 
+/// An address that accepts TCP but presents an untrusted certificate does
+/// not sink the row: the next resolved address, with the right one, gets it.
+#[tokio::test]
+async fn tls_connect_falls_through_an_address_that_fails_the_handshake() {
+    let (wrong_port, _wrong) = tls_receiver(pki("127.0.0.1")).await;
+    let server = pki("127.0.0.1");
+    let ca = ca_file(&server.ca_pem);
+    let (right_port, _right) = tls_receiver(server).await;
+    let tls = SyslogTls::from_ca_file(ca.path()).expect("CA loads");
+    let addrs: Vec<std::net::SocketAddr> = [wrong_port, right_port]
+        .iter()
+        .map(|port| ([127, 0, 0, 1], *port).into())
+        .collect();
+
+    let stream = super::transport::tls_connect(&addrs, "127.0.0.1", &tls)
+        .await
+        .expect("second address completes the handshake");
+
+    assert_eq!(stream.get_ref().0.peer_addr().unwrap().port(), right_port);
+}
+
 /// A receiver whose certificate chains to another CA gets no row.
 #[tokio::test]
 async fn tls_sink_refuses_a_receiver_outside_the_pinned_ca() {
@@ -241,25 +262,26 @@ fn escape_heavy_sql_is_cut_by_its_encoded_size() {
     }
 }
 
+/// Whatever overflows — free text beside a short statement, or a field the
+/// cuts never touch — the message stays within the cap and its body stays a
+/// parseable object that still names the request.
 #[test]
-fn oversized_sql_and_params_are_truncated_together_as_json() {
+fn an_oversized_row_always_yields_a_json_body() {
     use super::format::{MAX_MESSAGE_BYTES, message};
-    let mut row = row("req-both");
-    row.sql = Some("\u{1}".repeat(3_000));
-    row.params = Some(serde_json::json!(["x".repeat(20_000)]));
-    let message = message(&row);
-    assert!(message.len() <= MAX_MESSAGE_BYTES);
-    let body = &message[message.find('{').unwrap()..];
-    let body: serde_json::Value = serde_json::from_str(body).expect("complete JSON body");
-    assert_eq!(body["request_id"], "req-both");
-}
+    let long = "\u{1}".repeat(3_000);
+    let mut short_sql = row("req-overflow");
+    short_sql.sql = Some(format!("SELECT '{long}'"));
+    short_sql.reason = Some(long.clone());
+    short_sql.error_message = Some(long.clone());
+    let mut huge_groups = row("req-overflow");
+    huge_groups.groups = vec![long; 4];
 
-#[test]
-fn oversized_metadata_remains_valid_json() {
-    let mut row = row("req-metadata");
-    row.user_sub = "x".repeat(20_000);
-    let message = super::format::message(&row);
-    assert!(message.len() <= super::format::MAX_MESSAGE_BYTES);
-    let body = &message[message.find('{').unwrap()..];
-    let _: serde_json::Value = serde_json::from_str(body).expect("complete JSON body");
+    for row in [short_sql, huge_groups] {
+        let message = message(&row);
+
+        assert!(message.len() <= MAX_MESSAGE_BYTES, "{}", message.len());
+        let body = &message[message.find('{').expect("JSON body")..];
+        let body: serde_json::Value = serde_json::from_str(body).expect("body is JSON");
+        assert_eq!(body["request_id"], "req-overflow");
+    }
 }

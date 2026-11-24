@@ -58,7 +58,7 @@ pub(super) fn tool_error(id: Value, request_id: Uuid, body: ToolErrorBody<'_>) -
         "code": body.code.as_str(),
         "message": body.message,
         "retryable": retryable(body.code, body.write),
-        "hint": hint(body.code),
+        "hint": write_hint(body.write).unwrap_or_else(|| hint(body.code)),
     });
     if let Some(write) = body.write {
         wire["write"] = serde_json::json!(write);
@@ -102,6 +102,20 @@ fn retryable(code: OutcomeCode, write: Option<WriteState>) -> bool {
         code,
         OutcomeCode::Unavailable | OutcomeCode::AuditUnavailable | OutcomeCode::Cancelled
     )
+}
+
+/// The next step when a write may already be in the target: whatever went
+/// wrong, resending could write twice, so the caller checks first.
+fn write_hint(write: Option<WriteState>) -> Option<&'static str> {
+    match write? {
+        WriteState::Applied => {
+            Some("the write committed; do not resend it — check the target state before any retry")
+        }
+        WriteState::Unknown => {
+            Some("the write may have committed; check the target state before resending it")
+        }
+        WriteState::NotApplied => None,
+    }
 }
 
 /// The next step for each code, short enough to act on without the spec.

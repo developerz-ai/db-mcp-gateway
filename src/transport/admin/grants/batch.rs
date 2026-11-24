@@ -37,6 +37,11 @@ const GRANT: PermissionsAuditTargetType = PermissionsAuditTargetType::Grant;
 /// Changes one batch may carry; larger sets hold their row locks too long.
 pub const MAX_BATCH_CHANGES: usize = 500;
 
+/// Body bound of this route, where every other admin body gets 64 KiB:
+/// [`MAX_BATCH_CHANGES`] maximal upserts (255-byte server name),
+/// pretty-printed, take about 310 KiB (the unit test below computes it).
+pub const BATCH_BODY_LIMIT: usize = 1024 * 1024;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BatchRequest {
@@ -78,7 +83,7 @@ pub async fn batch(
     body: Result<Json<BatchRequest>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, AdminError> {
     let rid = actor.request_id.as_str();
-    let Json(body) = body.map_err(|_| invalid_body(rid))?;
+    let Json(body) = body.map_err(|rejection| invalid_body(&rejection, rid))?;
     if body.changes.is_empty() || body.changes.len() > MAX_BATCH_CHANGES {
         return Err(AdminError::invalid(format!(
             "changes must hold 1..={MAX_BATCH_CHANGES} entries"
@@ -236,4 +241,40 @@ async fn change_for_users(
         .await
         .map_err(|err| store_error("user_sub", err, rid))?;
     Ok(sub.map_or(PermissionsChange::All, PermissionsChange::User))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// The largest valid upsert: a 255-byte server name, every constraint at
+    /// its widest, a nanosecond expiry with an offset.
+    fn maximal_upsert() -> JsonValue {
+        json!({
+            "op": "upsert",
+            "user_id": Uuid::max(),
+            "server": "s".repeat(255),
+            "db_name_wildcard": true,
+            "action": "history_read",
+            "constraints": {
+                "require_reason": false,
+                "row_limit": u32::MAX,
+                "statement_timeout_ms": u32::MAX,
+            },
+            "expires_at": "2099-12-31T23:59:59.999999999+14:00",
+        })
+    }
+
+    #[test]
+    fn a_full_batch_of_maximal_changes_fits_the_body_bound() {
+        let changes = vec![maximal_upsert(); MAX_BATCH_CHANGES];
+        let body =
+            serde_json::to_string_pretty(&json!({ "changes": changes })).expect("serialises");
+        assert!(body.len() <= BATCH_BODY_LIMIT, "{} bytes", body.len());
+        assert!(body.len() * 4 > BATCH_BODY_LIMIT, "bound far above need");
+        let parsed: BatchRequest = serde_json::from_str(&body).expect("a valid batch");
+        assert_eq!(parsed.changes.len(), MAX_BATCH_CHANGES);
+    }
 }

@@ -56,6 +56,9 @@ networkPolicy:
     stateDb:
       to: [{ ipBlock: { cidr: 10.20.0.0/24 } }]
       ports: [{ port: 5432, protocol: TCP }]
+    targets:
+      - to: [{ ipBlock: { cidr: 10.30.0.0/16 } }]
+        ports: [{ port: 5432, protocol: TCP }]
 ```
 
 ```bash
@@ -77,7 +80,7 @@ Validate the config before it reaches the cluster: `db-mcp-gateway --check --no-
 | Secrets | `secrets.existingSecret` → `STATE_DB_URL`, `SESSION_SIGNING_KEY`, `OIDC_CLIENT_SECRET` (optional key) as env vars; `secretMounts` → read-only files for `${FILE:…}` refs (re-read on every pool open, so a rotated password needs only a pool reopen); `extraEnv` for anything else in the [env table](quickstart.md#the-environment-variables-the-gateway-reads) |
 | TLS | `tls.secretName` (a `kubernetes.io/tls` Secret) mounted at `/etc/gateway/tls`. `tls.certManager.enabled` adds a cert-manager `Certificate` writing that Secret. The gateway re-reads the PEMs only on `SIGHUP` or restart: wire a reloader annotation (`podAnnotations`) or restart on renewal — `GatewayTlsCertExpiringSoon` catches a renewal that never reached the pod |
 | Metrics | `METRICS_BIND=0.0.0.0:9090` behind its own `<release>-metrics` ClusterIP Service — never route an Ingress to it: its labels name every configured database. `metrics.serviceMonitor.enabled` and `metrics.prometheusRule.enabled` add the prometheus-operator resources |
-| NetworkPolicy | On by default. Ingress: the gateway port from `networkPolicy.ingress.gatewayFrom` (empty = anyone), the metrics port only from `metricsFrom` (default: namespace `monitoring`). Egress: DNS to kube-dns, then `stateDb`, `idp`, `targets[]`, `extra[]` — each `{ to, ports }`. An empty `to` allows every destination on those ports: narrow each to CIDRs or selectors. Syslog audit sinks and GlitchTip go in `extra` |
+| NetworkPolicy | On by default. Ingress: the gateway port from `networkPolicy.ingress.gatewayFrom` (empty = anyone), the metrics port only from `metricsFrom` (default: namespace `monitoring`). Egress: DNS to kube-dns, then `stateDb`, `idp`, `targets[]`, `extra[]` — each `{ to, ports }`. An empty `to` allows every destination on those ports: narrow each to CIDRs or selectors. Syslog audit sinks and GlitchTip go in `extra`. Target egress must be chosen: scoped `targets[]` (each with a non-empty `to`) or `anyTarget.enabled`; the chart refuses neither, an empty `to`, or `anyTarget` alongside a fenced `stateDb.to` |
 
 Every value is documented in [`values.yaml`](https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/helm/db-mcp-gateway/values.yaml). Pin the image by digest with `image.digest`.
 

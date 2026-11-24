@@ -24,7 +24,7 @@ use super::audit_dispatch::{
     run_audited_with_params, write_state,
 };
 use super::query_params::{parse_params, unsupported_for};
-use super::tabular::caps::{ByteCaps, RowLimit};
+use super::tabular::caps::{ByteCaps, MaxBytes, RowLimit};
 use super::tabular::{RowShaping, rows_outcome};
 use super::target::{effective_row_limit, ensure_reason, forbidden, record_intent, resolve_target};
 
@@ -54,7 +54,7 @@ pub struct Arguments {
     pub dry_run: bool,
     /// Cap on the JSON size of the returned rows (spec 03 §Results).
     #[serde(default)]
-    pub max_bytes: Option<NonZeroU32>,
+    pub max_bytes: Option<MaxBytes>,
     /// Cap on one cell's JSON size; a larger cell becomes a marker.
     #[serde(default)]
     pub max_cell_bytes: Option<NonZeroU32>,
@@ -208,7 +208,9 @@ async fn compute_outcome(
         "tool.run_query.dispatch"
     );
 
-    if let Err(refused) = record_intent(ctx, header, &target, access).await {
+    // The intent keeps the params too, so an `abandoned` row has them.
+    let stored = (!args.params.is_empty()).then_some(args.params.as_slice());
+    if let Err(refused) = record_intent(ctx, header, &target, access, stored).await {
         return *refused;
     }
 

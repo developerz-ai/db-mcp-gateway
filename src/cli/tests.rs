@@ -5,36 +5,19 @@ use clap::Parser;
 use super::check::env_names::{GATEWAY_ENV_PREFIXES, KNOWN_ENV};
 use super::{Action, Cli, Command, Tool};
 
-const ENV: &str = "DB_MCP_GATEWAY_CONFIG";
-
 fn action(args: &[&str]) -> Action {
     Cli::try_parse_from(args).unwrap().into_action().unwrap()
 }
 
-/// `--config` is required to serve, from the flag or the env var, the flag
-/// winning. One test, so nothing races on the shared env var (clap reads it
-/// at parse time); no other test in this binary touches it.
+/// The `DB_MCP_GATEWAY_CONFIG` fallback is tested in child processes
+/// (`it_offline::cli_check`): clap reads the environment at parse time, so a
+/// test here that set it would race every other parse in this binary.
 #[test]
-fn serve_requires_config_with_env_fallback() {
-    // SAFETY: this test is the sole reader/writer of $ENV in this binary.
-    unsafe { std::env::remove_var(ENV) };
-    assert!(Cli::try_parse_from(["db-mcp-gateway"]).is_err());
+fn serve_takes_config_and_tools_do_not_need_it() {
     assert!(matches!(
         action(&["db-mcp-gateway", "--config", "/tmp/flag.yaml"]),
         Action::Serve(path) if path == Path::new("/tmp/flag.yaml")
     ));
-    unsafe { std::env::set_var(ENV, "/tmp/from-env.yaml") };
-    assert!(matches!(
-        action(&["db-mcp-gateway"]),
-        Action::Serve(path) if path == Path::new("/tmp/from-env.yaml")
-    ));
-    assert!(matches!(
-        action(&["db-mcp-gateway", "--config", "/tmp/flag-wins.yaml"]),
-        Action::Serve(path) if path == Path::new("/tmp/flag-wins.yaml")
-    ));
-    unsafe { std::env::remove_var(ENV) };
-
-    // Neither the probe nor a subcommand needs the serve config.
     assert!(matches!(
         action(&["db-mcp-gateway", "--healthcheck"]),
         Action::Tool(Tool::Healthcheck)

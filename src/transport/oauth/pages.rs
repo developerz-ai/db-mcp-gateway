@@ -88,12 +88,15 @@ impl Notice<'_> {
     fn html(&self, page: &PageContext) -> String {
         let heading = escape_html(self.heading);
         let message = escape_html(self.message);
-        let link = self.return_to_client.map_or_else(String::new, |url| {
-            format!(
-                "<p><a href=\"{}\">Return to your application</a> to finish there.</p>",
-                escape_html(url)
-            )
-        });
+        let link = self
+            .return_to_client
+            .filter(|url| is_web_url(url))
+            .map_or_else(String::new, |url| {
+                format!(
+                    "<p><a href=\"{}\">Return to your application</a> to finish there.</p>",
+                    escape_html(url)
+                )
+            });
         let footer = page.footer();
         format!(
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
@@ -204,6 +207,13 @@ pub(super) fn with_page_headers(mut response: Response, redirect_origin: Option<
         HeaderValue::from_static("nosniff"),
     );
     response
+}
+
+/// A link target must be `http(s)`: escaping stops attribute breakout but
+/// not a `javascript:` URL. Registration already admits only https and
+/// loopback http; this keeps the page safe on its own.
+fn is_web_url(raw: &str) -> bool {
+    Url::parse(raw).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
 }
 
 pub(super) fn escape_html(raw: &str) -> String {

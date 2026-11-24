@@ -154,18 +154,39 @@ async fn grant_changes_land_while_the_listener_cannot_reconnect() {
         ping_every: Duration::from_millis(250),
         deadline: Duration::from_secs(2),
     };
+    let (heard_tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
     let listener = tokio::spawn({
         let cache = cache.clone();
         notify::listen_with(listener_pool, liveness, move |change| {
             let cache = cache.clone();
+            let _ = heard_tx.send(change.clone());
             async move { cache.apply(&change).await }
         })
     });
-    // Subscribed: a committed revoke arrives by NOTIFY.
-    eventually("listener subscribed", || async {
-        grant_count(&cache, &sub).await == 1
+    // Subscribed: only a delivered NOTIFY yields `User` (the flush loop
+    // emits `All`), so keep notifying until one comes back.
+    tokio::time::timeout(CONVERGE_WITHIN, async {
+        loop {
+            let mut tx = p.begin().await.unwrap();
+            notify::tx_notify(&mut tx, &PermissionsChange::User(sub.clone()))
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            let wait = tokio::time::timeout(Duration::from_millis(200), async {
+                while let Some(change) = heard.recv().await {
+                    if matches!(&change, PermissionsChange::User(s) if *s == sub) {
+                        return;
+                    }
+                }
+            });
+            if wait.await.is_ok() {
+                return;
+            }
+        }
     })
-    .await;
+    .await
+    .expect("listener subscribed");
+    assert_eq!(grant_count(&cache, &sub).await, 1);
 
     proxy.go_down();
     // Revoked with its NOTIFY, which the dead connection never delivers.

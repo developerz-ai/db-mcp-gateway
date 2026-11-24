@@ -12,7 +12,7 @@
 //! The lookup is best-effort under its own small budget: a slow or failed
 //! one answers no names, never an error.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
@@ -81,14 +81,16 @@ impl PgAdapter {
             "42P01" => RELATIONS_SQL,
             _ => COLUMNS_SQL,
         };
+        let deadline = Instant::now() + LOOKUP_BUDGET;
         let lookup = self.candidates(catalog, &typed, request_id);
         let near = match tokio::time::timeout(LOOKUP_BUDGET, lookup).await {
-            Ok(Ok(candidates)) => closest(&typed, &candidates),
-            Ok(Err(_)) | Err(_) => {
-                tracing::debug!(%request_id, "near-miss lookup gave up");
-                Vec::new()
-            }
+            Ok(Ok(candidates)) => score_off_worker(typed, candidates, deadline).await,
+            Ok(Err(_)) | Err(_) => None,
         };
+        let near = near.unwrap_or_else(|| {
+            tracing::debug!(%request_id, "near-miss lookup gave up");
+            Vec::new()
+        });
         Err(ExecError::Rejected(rejection.with_near_misses(near)))
     }
 
@@ -161,25 +163,45 @@ fn max_distance(typed: &str) -> usize {
     (typed.chars().count() / 3).max(2)
 }
 
+/// [`closest`] on the blocking pool — scoring thousands of names is CPU
+/// work a Tokio worker must not carry — under the lookup's own deadline.
+async fn score_off_worker(
+    typed: String,
+    candidates: Vec<(String, String)>,
+    deadline: Instant,
+) -> Option<Vec<String>> {
+    let scoring = tokio::task::spawn_blocking(move || closest(&typed, &candidates, deadline));
+    let left = deadline.saturating_duration_since(Instant::now());
+    match tokio::time::timeout(left, scoring).await {
+        Ok(Ok(near)) => near,
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
 /// Up to [`MAX_NEAR_MISSES`] candidates within [`max_distance`] of `typed`,
-/// case-insensitively, closest first.
-fn closest(typed: &str, candidates: &[(String, String)]) -> Vec<String> {
+/// case-insensitively, closest first; `None` once `deadline` passes.
+fn closest(typed: &str, candidates: &[(String, String)], deadline: Instant) -> Option<Vec<String>> {
     let typed = typed.to_lowercase();
     let limit = max_distance(&typed);
-    let mut scored: Vec<(usize, &str)> = candidates
-        .iter()
-        .filter_map(|(spelled, name)| {
-            let distance = edit_distance(&typed, &name.to_lowercase());
-            (distance <= limit).then_some((distance, spelled.as_str()))
-        })
-        .collect();
+    let mut scored: Vec<(usize, &str)> = Vec::new();
+    for (spelled, name) in candidates {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let distance = edit_distance(&typed, &name.to_lowercase());
+        if distance <= limit {
+            scored.push((distance, spelled.as_str()));
+        }
+    }
     scored.sort_unstable();
     scored.dedup_by(|a, b| a.1 == b.1);
-    scored
-        .into_iter()
-        .take(MAX_NEAR_MISSES)
-        .map(|(_, spelled)| spelled.to_owned())
-        .collect()
+    Some(
+        scored
+            .into_iter()
+            .take(MAX_NEAR_MISSES)
+            .map(|(_, spelled)| spelled.to_owned())
+            .collect(),
+    )
 }
 
 /// Optimal-string-alignment distance: insertions, deletions, substitutions
@@ -232,14 +254,34 @@ mod tests {
         .iter()
         .map(|name| (name.to_string(), name.to_string()))
         .collect();
-        let near = closest("Usres", &candidates);
+        let later = Instant::now() + Duration::from_secs(60);
+        let near = closest("Usres", &candidates, later).expect("in time");
         assert_eq!(near.first().map(String::as_str), Some("users"));
         assert!(near.len() <= MAX_NEAR_MISSES);
         assert!(!near.contains(&"orders".to_string()), "{near:?}");
         assert!(!near.contains(&"u".to_string()), "{near:?}");
         // The spelling is what is offered: a mixed-case name stays quoted.
         let quoted = vec![("\"Users\"".to_string(), "Users".to_string())];
-        assert_eq!(closest("users", &quoted), vec!["\"Users\"".to_string()]);
-        assert!(closest("zzzzzz", &candidates).is_empty());
+        assert_eq!(
+            closest("users", &quoted, later),
+            Some(vec!["\"Users\"".to_string()])
+        );
+        assert_eq!(closest("zzzzzz", &candidates, later), Some(Vec::new()));
+    }
+
+    /// Scoring stops at the lookup's deadline and offers nothing, rather
+    /// than holding a thread past the budget.
+    #[test]
+    fn scoring_past_the_deadline_offers_nothing() {
+        let candidates = vec![("users".to_string(), "users".to_string())];
+        assert_eq!(closest("usres", &candidates, Instant::now()), None);
+    }
+
+    #[tokio::test]
+    async fn scoring_runs_off_the_async_worker() {
+        let candidates = vec![("users".to_string(), "users".to_string())];
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let near = score_off_worker("usres".into(), candidates, deadline).await;
+        assert_eq!(near, Some(vec!["users".to_string()]));
     }
 }

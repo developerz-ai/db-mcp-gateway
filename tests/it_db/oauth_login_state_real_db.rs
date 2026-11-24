@@ -166,11 +166,18 @@ async fn concurrent_takes_of_one_code_have_exactly_one_winner() {
     let pool = state_pool().await;
     let code = unique("race-code");
     insert_code(&AuthCodes::with_db(pool.clone()), &code, "race-user").await;
-    let takes = (0..8).map(|_| {
-        let replica = AuthCodes::with_db(pool.clone());
-        let code = code.clone();
-        tokio::spawn(async move { replica.take(&code).await })
-    });
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+    let takes: Vec<_> = (0..8)
+        .map(|_| {
+            let replica = AuthCodes::with_db(pool.clone());
+            let code = code.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                replica.take(&code).await
+            })
+        })
+        .collect();
     let mut winners = 0;
     for take in takes {
         if take.await.unwrap().expect("store up").is_some() {

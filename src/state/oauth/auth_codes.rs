@@ -27,14 +27,17 @@ impl std::fmt::Debug for NewAuthCode<'_> {
 }
 
 /// Insert a code expiring `ttl` from now (DB clock) unless `cap` live codes
-/// already exist, in one statement. `false` when the cap refused it; lapsed
-/// codes do not count against it.
+/// already exist. `false` when the cap refused it; lapsed codes do not count
+/// against it. The count and the insert run under one advisory lock, so
+/// replicas racing for the last slot admit one code, not one each.
 pub async fn insert_auth_code_capped(
-    conn: impl PgExecutor<'_>,
+    pool: &PgPool,
     code: &NewAuthCode<'_>,
     ttl: chrono::Duration,
     cap: i64,
 ) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    lock_auth_codes(&mut *tx).await?;
     let result = sqlx::query(
         "INSERT INTO oauth_auth_codes \
            (code_hash, user_sub, email, groups, code_challenge, redirect_uri, client_id, \
@@ -51,23 +54,31 @@ pub async fn insert_auth_code_capped(
     .bind(code.client_id)
     .bind(ttl)
     .bind(cap)
-    .execute(conn)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 
-/// Put back a taken code with the deadline it was taken with. A code already
-/// back (or never gone) is left as it is.
+/// Put back a taken code with the deadline it was taken with, under the same
+/// lock and `cap` as [`insert_auth_code_capped`]: the slot it held was freed
+/// by the take and may since have gone to a new code. `false` when the cap
+/// refused it. A code already back (or never gone) is left as it is and
+/// counts as restored.
 pub async fn restore_auth_code(
-    conn: impl PgExecutor<'_>,
+    pool: &PgPool,
     code: &NewAuthCode<'_>,
     expires_at: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
+    cap: i64,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    lock_auth_codes(&mut *tx).await?;
     sqlx::query(
         "INSERT INTO oauth_auth_codes \
            (code_hash, user_sub, email, groups, code_challenge, redirect_uri, client_id, \
             expires_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8 \
+         WHERE (SELECT count(*) FROM oauth_auth_codes WHERE expires_at > now()) < $9 \
          ON CONFLICT (code_hash) DO NOTHING",
     )
     .bind(code.code_hash)
@@ -78,8 +89,24 @@ pub async fn restore_auth_code(
     .bind(code.redirect_uri)
     .bind(code.client_id)
     .bind(expires_at)
-    .execute(conn)
+    .bind(cap)
+    .execute(&mut *tx)
     .await?;
+    let present: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM oauth_auth_codes WHERE code_hash = $1)")
+            .bind(code.code_hash)
+            .fetch_one(&mut *tx)
+            .await?;
+    tx.commit().await?;
+    Ok(present)
+}
+
+/// Serialises every admission to `oauth_auth_codes` across replicas until
+/// the transaction ends.
+async fn lock_auth_codes(conn: impl PgExecutor<'_>) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('oauth_auth_codes', 0))")
+        .execute(conn)
+        .await?;
     Ok(())
 }
 

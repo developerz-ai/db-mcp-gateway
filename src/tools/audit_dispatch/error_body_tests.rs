@@ -72,6 +72,34 @@ fn tool_error_of_a_write_carries_its_state() {
     }
 }
 
+/// A write that may be in the target is never told to call again: the hint
+/// says to check the target first, whatever the code.
+#[test]
+fn a_landed_or_uncertain_write_is_told_to_verify_not_resend() {
+    use OutcomeCode::*;
+    for code in [AuditUnavailable, Unavailable, Cancelled, Timeout, Internal] {
+        for state in [WriteState::Unknown, WriteState::Applied] {
+            let body = ToolErrorBody {
+                write: Some(state),
+                ..read_error(code)
+            };
+            let body = body_of(&tool_error(Value::from(1), Uuid::new_v4(), body));
+            let hint = body["hint"].as_str().unwrap_or_default();
+            assert!(
+                hint.contains("check the target"),
+                "{code} {state:?}: {hint}"
+            );
+            assert!(!hint.contains("call again"), "{code} {state:?}: {hint}");
+        }
+        let body = ToolErrorBody {
+            write: Some(WriteState::NotApplied),
+            ..read_error(code)
+        };
+        let body = body_of(&tool_error(Value::from(1), Uuid::new_v4(), body));
+        assert_eq!(body["hint"], hint(code), "{code}");
+    }
+}
+
 #[test]
 fn tool_error_names_the_cap_and_the_time_spent() {
     let body = ToolErrorBody {

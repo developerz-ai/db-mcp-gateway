@@ -54,7 +54,7 @@ Every admin response, success or error, carries `Cache-Control: no-store`: the b
 
 ## Errors
 
-Every error body has one shape, and carries the gateway-minted request id, also in the matching log line. Correlate failed writes with that log line: a rolled-back write has no `permissions_audit` row. Successful writes record the id in `permissions_audit.request_id`:
+Every error body has one shape, and carries the gateway-minted request id. Correlate an error by that id in the gateway's logs: a failed write rolls back with its audit row, so a `permissions_audit.request_id` match exists only for a mutation that committed (and an audited read's `audit_calls` row for the read endpoints).
 
 ```json
 { "error": { "code": "conflict", "message": "row changed since expected_updated_at; re-read and retry", "request_id": "…" } }
@@ -68,12 +68,13 @@ Every error body has one shape, and carries the gateway-minted request id, also 
 | 403 | `session_too_old` | Session older than `admin.session_max_age_secs` |
 | 404 | `not_found` | Missing or soft-deleted row. (With the admin API off, every `/admin/*` path is a plain `404` with no body.) |
 | 409 | `conflict` | `expected_updated_at` mismatch, or the database aborted the write to break a deadlock / serialization conflict. Re-read and retry |
+| 413 | `payload_too_large` | Body past the route's byte bound: 1 MiB for `grants/batch`, 16 MiB for `permissions/diff`, 64 KiB for every other route |
 | 503 | `audit_unavailable` | An audited read (`explain`, `permissions/export`, `permissions/diff`, `audit/calls`) could not write its `audit_calls` row; nothing was returned. Retry once the state DB recovers |
 | 500 | `internal` | Anything else, including a failed audit write; the body never carries the cause |
 
 ## Pagination
 
-`GET` on `/users`, `/databases` and `/grants` takes `?limit=&offset=`. `limit` defaults to `100` and is clamped to `1..=1000`; `offset` defaults to `0`. The body is a bare JSON array — no total, no cursor: keep paging until a page comes back shorter than the effective, clamped limit. Advance the offset by that limit. Order is stable: users and grants by `(created_at, id)`, databases by `(server, db_name)`.
+`GET` on `/users`, `/databases` and `/grants` takes `?limit=&offset=`. `limit` defaults to `100` and is clamped to `1..=1000`; `offset` defaults to `0`. The body is a bare JSON array — no total, no cursor. Advance `offset` by the number of rows received, and stop when a page comes back shorter than the **clamped** limit (`min(limit, 1000)`): a `limit=2000` request returns at most 1000 rows, and a full 1000-row page is not the end. Order is stable: users and grants by `(created_at, id)`, databases by `(server, db_name)`.
 
 ## Optimistic concurrency
 
@@ -96,7 +97,7 @@ Audit shape (one row per write):
 | `request_id` | Threaded from the HTTP request for join-back to operator dashboards |
 | `ts` | Server-side, assigned at write time (not monotonic — ordering uses `(ts, id)` as the tie-breaker). |
 
-Reads that disclose grants or audit history — `explain`, `permissions/export`, `permissions/diff`, `audit/calls` — write one `audit_calls` row each (`tool` = `admin.explain`, `admin.permissions_export`, `admin.permissions_diff`, `admin.audit_calls`; the admin as `user_sub`) **before** the response goes out. If it cannot be written the read fails with `503 audit_unavailable`. A request refused as invalid reads nothing and writes no row.
+Reads that disclose grants or audit history — `explain`, `permissions/export`, `permissions/diff`, `audit/calls` — write one `audit_calls` row each (`tool` = `admin.explain`, `admin.permissions_export`, `admin.permissions_diff`, `admin.audit_calls`; the admin as `user_sub`) **before** the response goes out. An `admin.audit_calls` row's `params` holds what was asked — `user`, `server`, `db`, `tool`, `outcome`, `since`, `until`, `limit` and `include_sql` — so a read that disclosed statements and bound values is told apart from a metadata-only one. If it cannot be written the read fails with `503 audit_unavailable`. A request refused as invalid reads nothing and writes no row.
 
 Query examples (run as the state DB superuser):
 
@@ -216,7 +217,7 @@ Foreign-key violations (`user_id` or `database_id` not in the tables) and CHECK 
 
 `DELETE /admin/v1/grants/:id` — revoke. Sets `revoked_at`; the cache invalidates for the affected user post-commit (`tests/it_db/admin_grants_e2e.rs::live_grant_change_invalidates_cache_for_user`).
 
-`POST /admin/v1/grants/batch` — apply up to 500 changes in **one** transaction, all or nothing:
+`POST /admin/v1/grants/batch` — apply up to 500 changes in **one** transaction, all or nothing. The body may be up to 1 MiB (500 maximal changes take about 310 KiB pretty-printed); past that it is `413 payload_too_large`:
 
 ```json
 { "changes": [
@@ -236,17 +237,17 @@ An `upsert` carries the `POST /admin/v1/grants` fields and is keyed by `(user_id
 { "user": "okta|00u123", "server": "prod", "database": "app", "action": "query_read" }
 ```
 
-Exactly one of `user` (SSO subject) or `group`. With `user`, `groups` (optional) overrides the group claims assumed; by default the groups cached on the user's `permissions_users` row are used. Response: `decision` (`allow` / `deny`), merged `constraints` (or `null`), `matched` (each grant with `source: yaml` + its `subject`, or `source: db` + `grant_id`), `expired` (DB grants that would match but for their expiry), `groups`, and `target_declared` (whether the config declares that database at all).
+Exactly one of `user` (SSO subject) or `group`. With `user`, `groups` (optional) overrides the group claims assumed; by default the groups cached on the user's `permissions_users` row are used. Response: `decision` (`allow` / `deny`), merged `constraints` (or `null`), `matched` (each grant with `source: yaml` + its `subject`, or `source: db` + `grant_id`), `expired` (DB grants that would match but for their expiry), `groups`, `groups_source`, and `target_declared` (whether the config declares that database at all). Explain never reads a live session, so for a `user` it is a simulation: `groups_source` is `stored` (the last-login snapshot on `permissions_users`) or `assumed` (the `groups` you sent), and a session whose current IdP claims differ can be decided differently; `group` for a group question.
 
 ### Export and diff
 
 `GET /admin/v1/permissions/export` — every grant evaluation can use, YAML ∪ DB, as `{"generated_at", "grants": [{source, subject, server, database, action, constraints, except?, profile?, expires_at?, expired?, grant_id?}]}`. DB grants appear with `subject: {"user": "<sub>"}`.
 
-`POST /admin/v1/permissions/diff` — post a desired document in the same shape (an edited export works; export-only keys are ignored) and get `{add, remove, change, unchanged}` against the effective permissions, keyed by `(subject, server, database, action)`. Read-only: nothing is written.
+`POST /admin/v1/permissions/diff` — post a desired document in the same shape (an edited export works; export-only keys are ignored) and get `{add, remove, change, unchanged}` against the effective permissions, keyed by `(subject, server, database, action)`. Read-only: nothing is written. Export and diff share one size contract: diff takes a body of up to 16 MiB and up to 10,000 grants — or as many as the store currently exports, when that is more — so an unedited export always posts back while it fits 16 MiB. A store whose export passes 16 MiB has no scoped comparison yet.
 
 ### Audit calls
 
-`GET /admin/v1/audit/calls?user=&server=&db=&tool=&outcome=&since=&until=&limit=&include_sql=` — `audit_calls` rows as NDJSON (`Content-Type: application/x-ndjson`), newest first. `user` matches `user_sub` or `user_email`; `since` is inclusive, `until` exclusive (RFC 3339); `outcome` must be a spec 03 code; `limit` defaults to 1000 and is clamped to 1–10 000. The statement text and its bound parameters (`sql`, `sql_truncated`, `params`) are included only with `include_sql=true`. If the stream breaks after it started, the last line is `{"error": {"code": "internal", …}}`.
+`GET /admin/v1/audit/calls?user=&server=&db=&tool=&outcome=&since=&until=&limit=&include_sql=` — `audit_calls` rows as NDJSON (`Content-Type: application/x-ndjson`), newest first. `user` matches `user_sub` or `user_email`; `since` is inclusive, `until` exclusive (RFC 3339); `outcome` must be a spec 03 code; `limit` defaults to 1000 and is clamped to 1–10 000. The statement text and its bound parameters (`sql`, `sql_truncated`, `params`) are included only with `include_sql=true`. If the stream breaks after it started, the last line is `{"error": {"code": "internal", …}}`. Rows are read in batches of 200 with no state-DB connection held while the client reads, so a stalled reader pins nothing.
 
 ```bash
 curl -sN -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -304,18 +305,26 @@ Alice can now `list_servers` from Claude Code and see `prod/billing`.
 { "revoked_sessions": 2, "revoked_refresh_tokens": 3 }
 ```
 
-The `permissions_audit` row is an `update` of the user, with `before`/`after` carrying `live_sessions` and `refresh_tokens`. Grants are untouched — the user can sign in again, and that new session gets whatever their groups and grants allow then. To keep them out, also remove them from the IdP group or delete the user. The replica that served the call stops honouring the sessions at once; other replicas within `SESSION_CACHE_TTL_SECONDS` (default 30 s).
+The `permissions_audit` row is an `update` of the user, with `before`/`after` carrying `live_sessions` and `refresh_tokens`. Grants are untouched — the user can sign in again, and that new session gets whatever their groups and grants allow then. Deleting the user's permissions-store row does not keep them out on its own: a YAML `permissions:` grant naming their `user:` or one of their groups still matches their next session. To keep them out, revoke their sessions **and** remove every grant that applies to them — store grants, YAML grants (by PR) and their IdP group memberships — or disable their sign-in at the IdP. The replica that served the call stops honouring the sessions at once; other replicas within `SESSION_CACHE_TTL_SECONDS` (default 30 s).
 
 ## Storage backend
 
 Default is pg — the permissions tables live in the same state DB as `audit_calls` and `sessions`. To split them off:
 
+Pick exactly one `driver`:
+
 ```yaml
 permissions_store:
   driver: pg     # default; same DB as state DB
-  # OR
+```
+
+```yaml
+permissions_store:
   driver: mysql  # opens a separate pool via PERMISSIONS_DB_DSN env at startup
-  # OR
+```
+
+```yaml
+permissions_store:
   driver: none   # YAML-only: no permissions store at all
 ```
 

@@ -35,7 +35,7 @@ a test pins its keys to the parser's.
 |---|---|---|---|
 | `gateway` | `{ env: production \| development }` | no (defaults `development`) | `production` rejects inline literal secrets (DB passwords, service tokens) at boot. |
 | `servers` | list of [Server](#server) | no (defaults `[]`) | Target DBs the gateway can dispatch to. |
-| `permissions` | list of [Permission](#permission) | no (defaults `[]`) | Group (or single-user) → grant mapping. Empty list means no caller can reach anything. |
+| `permissions` | list of [Permission](#permission) | no (defaults `[]`) | Group (or single-user) → grant mapping. An empty list removes only the YAML grants: with a permissions store (`pg`, the default, or `mysql`) its grants still apply, so an empty list denies every caller only with `permissions_store.driver: none`. |
 | `constraint_profiles` | map of name → [Constraints](#constraints) | no (defaults `{}`) | Named constraint sets a [Grant](#grant) references with `profile:`. See [Constraint profiles](#constraint-profiles). |
 | `admin` | [Admin](#admin) | no | `/admin/v1/*` surface gating — see [admin-api.md](admin-api.md). |
 | `permissions_store` | [PermissionsStore](#permissionsstore) | no | Storage backend for users/databases/grants. Absent → state DB (pg). |
@@ -362,8 +362,8 @@ Boot-time guarantees (issue #15):
 
 - Missing env var → boot abort with `EnvNotSet(name)`.
 - Missing or empty file → boot abort with `FileUnreadable` / `FileEmpty(path)`.
-- Both forms drop trailing `\n` / `\r` from the value (an env var set from a
-  file keeps its newline); a value that is only a newline counts as empty.
+- A `${FILE:…}` value drops its trailing `\n` / `\r`; a file that is only a
+  newline counts as empty. A `${ENV:…}` value is used byte for byte.
 - Every unresolved ref is reported in one abort, each naming its site:
   `servers[<server>].databases[<db>].password (read tier)`,
   `….write_password (write tier)`, `service_accounts[<name>].tokens[<i>]`.

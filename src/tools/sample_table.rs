@@ -8,6 +8,7 @@
 //! (a collection name) and to the target's own rule after: an ungranted
 //! caller gets the same answer for every server, configured or not.
 
+use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::time::Instant;
 
@@ -30,7 +31,7 @@ use super::audit_dispatch::{
     error_outcome, invalid_arguments, note_timeout_limit, outcome_from_exec_error,
     reject_arguments, run_audited,
 };
-use super::tabular::caps::{ByteCaps, RowLimit};
+use super::tabular::caps::{ByteCaps, MaxBytes, RowLimit};
 use super::tabular::columns::project;
 use super::tabular::{RowShaping, rows_outcome};
 use super::target::{effective_row_limit, ensure_reason, forbidden, record_intent, resolve_target};
@@ -64,7 +65,7 @@ pub struct Arguments {
     pub columns: Option<Vec<String>>,
     /// Cap on the JSON size of the returned rows (spec 03 §Results).
     #[serde(default)]
-    pub max_bytes: Option<NonZeroU32>,
+    pub max_bytes: Option<MaxBytes>,
     /// Cap on one cell's JSON size; a larger cell becomes a marker.
     #[serde(default)]
     pub max_cell_bytes: Option<NonZeroU32>,
@@ -143,11 +144,12 @@ fn parse_columns(columns: Option<&[String]>) -> Result<Vec<&str>, String> {
         return Err("`columns` must name at least one column".to_owned());
     }
     let mut names: Vec<&str> = Vec::with_capacity(columns.len());
+    let mut seen: HashSet<&str> = HashSet::with_capacity(columns.len());
     for column in columns {
         let name = Identifier::parse(column)
             .map_err(|_| format!("every `columns` entry must match {IDENTIFIER_PATTERN}"))?
             .as_str();
-        if names.contains(&name) {
+        if !seen.insert(name) {
             return Err(format!("`columns` names `{name}` twice"));
         }
         names.push(name);
@@ -219,7 +221,7 @@ async fn compute_outcome(
     }
     let row_limit = effective_row_limit(args.limit, constraints.row_limit, DEFAULT_SAMPLE_LIMIT);
 
-    if let Err(refused) = record_intent(ctx, header, &target, Access::ReadOnly).await {
+    if let Err(refused) = record_intent(ctx, header, &target, Access::ReadOnly, None).await {
         return *refused;
     }
 

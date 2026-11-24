@@ -91,7 +91,9 @@ fn post_to(url: String) -> tokio::task::JoinHandle<reqwest::Response> {
 async fn hold(base: &str, gate: &Gate, path: &str) -> tokio::task::JoinHandle<reqwest::Response> {
     let entered = gate.entered.notified();
     let request = post_to(format!("{base}{path}"));
-    entered.await;
+    tokio::time::timeout(Duration::from_secs(10), entered)
+        .await
+        .expect("first request did not reach the held handler");
     request
 }
 

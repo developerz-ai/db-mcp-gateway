@@ -39,10 +39,10 @@ pub fn run(args: &RolesArgs) -> Result<u8, CliError> {
             "no configured database matches --server/--database".to_string(),
         ));
     }
-    let blocks: Vec<String> = targets
+    let blocks = targets
         .into_iter()
         .map(|(server, db)| render(server, db, args))
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     print!("{}", blocks.join("\n"));
     Ok(EXIT_OK)
 }
@@ -63,29 +63,58 @@ pub fn selected<'a>(
         .collect()
 }
 
-fn render(server: &Server, db: &Database, args: &RolesArgs) -> String {
+fn render(server: &Server, db: &Database, args: &RolesArgs) -> Result<String, CliError> {
     match server.kind {
         ServerKind::Postgres => postgres(server, db, args),
-        ServerKind::Mongo => mongo(server, db),
+        ServerKind::Mongo => Ok(mongo(server, db)),
         ServerKind::Redis => redis(server, db),
-        ServerKind::Mysql | ServerKind::Mssql => format!(
-            "-- server `{}`, database `{}`: {:?} is not a query target\n",
-            server.name, db.name, server.kind
-        ),
+        ServerKind::Mysql | ServerKind::Mssql => Ok(format!(
+            "-- {}: {:?} is not a query target\n",
+            label(server, db),
+            server.kind
+        )),
     }
 }
 
-fn postgres(server: &Server, db: &Database, args: &RolesArgs) -> String {
-    let database = quote_ident(&db.name);
+/// `server `a`, database `b``, safe inside a one-line comment: a name with a
+/// line break cannot end the comment and start a statement.
+fn label(server: &Server, db: &Database) -> String {
+    format!(
+        "server `{}`, database `{}`",
+        server.name.escape_debug(),
+        db.name.escape_debug()
+    )
+}
+
+/// A name that lands unquoted on a command line (a psql meta-command, a
+/// redis-cli argument) must not carry a line break or other control
+/// character, or it would end that line.
+fn plain_line_arg<'a>(what: &str, value: &'a str) -> Result<&'a str, CliError> {
+    if value.chars().any(char::is_control) {
+        return Err(CliError::Invalid(format!(
+            "{what} `{}` has a control character; provision it by hand",
+            value.escape_debug()
+        )));
+    }
+    Ok(value)
+}
+
+/// `CREATE ROLE` and `GRANT CONNECT` are cluster-wide; every other grant
+/// lands in the database psql is connected to, so the recipe `\connect`s to
+/// the configured one first.
+fn postgres(server: &Server, db: &Database, args: &RolesArgs) -> Result<String, CliError> {
+    let database = quote_ident(plain_line_arg("database", &db.name)?);
     let read = quote_ident(&db.role);
     let owner = quote_ident(&args.owner);
+    let connect = format!("\\connect {database}\n");
     let mut sql = format!(
-        "-- server `{}`, database `{}`: read role\n\
+        "-- {}: read role\n\
          -- set the password out of band (psql: \\password {read}) and store it where\n\
          -- the config's `password:` reference points\n\
          CREATE ROLE {read} LOGIN;\n\
-         GRANT CONNECT ON DATABASE {database} TO {read};\n",
-        server.name, db.name
+         GRANT CONNECT ON DATABASE {database} TO {read};\n\
+         {connect}",
+        label(server, db)
     );
     for schema in args.schemas.iter().map(|s| quote_ident(s)) {
         let _ = write!(
@@ -107,7 +136,8 @@ fn postgres(server: &Server, db: &Database, args: &RolesArgs) -> String {
             sql,
             "-- write role (`write_role`): narrow the table list to what writes need\n\
              CREATE ROLE {write} LOGIN;\n\
-             GRANT CONNECT ON DATABASE {database} TO {write};\n"
+             GRANT CONNECT ON DATABASE {database} TO {write};\n\
+             {connect}"
         );
         for schema in args.schemas.iter().map(|s| quote_ident(s)) {
             let _ = write!(
@@ -122,29 +152,102 @@ fn postgres(server: &Server, db: &Database, args: &RolesArgs) -> String {
             "ALTER ROLE {write} SET statement_timeout = '{DEFAULT_STATEMENT_TIMEOUT_MS}ms';"
         );
     }
-    sql
+    Ok(sql)
 }
 
 fn mongo(server: &Server, db: &Database) -> String {
     let auth_db = db.auth_database.as_deref().unwrap_or(&db.name);
     format!(
-        "// server `{}`, database `{}`: read user — mongosh, as an admin\n\
-         use {auth_db}\n\
+        "// {}: read user — mongosh, as an admin\n\
+         db = db.getSiblingDB({})\n\
          db.createUser({{ user: {}, pwd: passwordPrompt(), roles: [ {{ role: \"read\", db: {} }} ] }})\n",
-        server.name,
-        db.name,
+        label(server, db),
+        json_string(auth_db),
         json_string(&db.role),
         json_string(&db.name),
     )
 }
 
-fn redis(server: &Server, db: &Database) -> String {
+/// The gateway's read commands (`exec::redis` rejector) by name, minus
+/// `SCAN` and `DBSIZE`: key patterns do not filter either, so they would
+/// reveal key names and counts outside `%R~…`. `KEYS` is never granted.
+const REDIS_READ_COMMANDS: &[&str] = &[
+    "get",
+    "mget",
+    "strlen",
+    "getrange",
+    "substr",
+    "getbit",
+    "bitcount",
+    "bitpos",
+    "exists",
+    "type",
+    "ttl",
+    "pttl",
+    "expiretime",
+    "pexpiretime",
+    "hget",
+    "hmget",
+    "hgetall",
+    "hkeys",
+    "hvals",
+    "hlen",
+    "hexists",
+    "hstrlen",
+    "hrandfield",
+    "hscan",
+    "lrange",
+    "llen",
+    "lindex",
+    "lpos",
+    "smembers",
+    "sismember",
+    "smismember",
+    "scard",
+    "srandmember",
+    "sscan",
+    "sinter",
+    "sunion",
+    "sdiff",
+    "sintercard",
+    "zrange",
+    "zrangebyscore",
+    "zrangebylex",
+    "zrevrange",
+    "zrevrangebyscore",
+    "zrevrangebylex",
+    "zscore",
+    "zmscore",
+    "zcard",
+    "zcount",
+    "zlexcount",
+    "zrank",
+    "zrevrank",
+    "zrandmember",
+    "zscan",
+    "xrange",
+    "xrevrange",
+    "xlen",
+];
+
+fn redis(server: &Server, db: &Database) -> Result<String, CliError> {
+    let user = plain_line_arg("role", &db.role)?;
+    if user.contains(char::is_whitespace) {
+        return Err(CliError::Invalid(format!(
+            "redis role `{user}` has whitespace; provision it by hand"
+        )));
+    }
     let select = if db.name == "0" { "" } else { " +select" };
-    format!(
-        "# server `{}`, database `{}`: ACL user — narrow `%R~*` to the key patterns agents may read\n\
-         ACL SETUSER {} on #<sha256-of-password> resetkeys %R~* resetchannels -@all +@read -keys{select}\n",
-        server.name, db.name, db.role
-    )
+    let commands: String = REDIS_READ_COMMANDS
+        .iter()
+        .map(|command| format!(" +{command}"))
+        .collect();
+    Ok(format!(
+        "# {}: ACL user — narrow `%R~*` to the key patterns agents may read;\n\
+         # SCAN/DBSIZE/KEYS stay off: they would list keys outside those patterns\n\
+         ACL SETUSER {user} on #<sha256-of-password> resetkeys %R~* resetchannels -@all{commands}{select}\n",
+        label(server, db)
+    ))
 }
 
 /// Postgres identifier quoting: always quoted, so a mixed-case role keeps
@@ -158,12 +261,4 @@ fn json_string(value: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::quote_ident;
-
-    #[test]
-    fn identifiers_are_quoted_and_escaped() {
-        assert_eq!(quote_ident("AppRo"), "\"AppRo\"");
-        assert_eq!(quote_ident("we\"ird"), "\"we\"\"ird\"");
-    }
-}
+mod tests;

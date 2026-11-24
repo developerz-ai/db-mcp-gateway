@@ -151,7 +151,9 @@ async fn compute_outcome(
         return error_outcome(OutcomeCode::ForbiddenSql, ANALYZE_NEEDS_READ);
     }
 
-    if let Err(refused) = record_intent(ctx, header, &target, access).await {
+    // The intent keeps the params too, so an `abandoned` row has them.
+    let stored = (!args.params.is_empty()).then_some(args.params.as_slice());
+    if let Err(refused) = record_intent(ctx, header, &target, access, stored).await {
         return *refused;
     }
 

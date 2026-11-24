@@ -27,7 +27,7 @@ The gateway is stable (2.x) and in production use; [../initial-idea/11-roadmap.m
 ```bash
 git clone https://github.com/developerz-ai/db-mcp-gateway && cd db-mcp-gateway/examples/demo
 docker compose up -d --wait
-docker compose wait ready && docker compose logs ready   # waits for `ready` to finish, then prints the `claude mcp add …` line
+docker compose run --rm ready   # prints the `claude mcp add …` line
 ```
 
 `docker compose --profile sso up -d --wait` adds a local Dex IdP for the browser-login path. Loopback and plain HTTP only — a demo, never a deployment. The walkthrough below builds the same thing by hand against the dev stack.
@@ -464,7 +464,7 @@ Names are fixed — dashboards and alerts are written against them. No label car
 | `login_failures_total` | counter | `code` (`email_unverified`, `id_token`, `idp_exchange`, `state_unavailable`) |
 | `config_reloads_total` | counter | `result` (`ok`/`error`) |
 | `config_reload_last_success_timestamp` | gauge (unix seconds) | — (boot load or last successful SIGHUP reload) |
-| `config_info` | gauge (`1`) | `hash` (first 12 hex of the SHA-256 of the config file as on disk, `${…}` references unresolved) |
+| `config_info` | gauge (`1`) | `hash` (first 12 hex of the SHA-256 of the parsed config with every credential field (`password`, `write_password`, `token`, `tokens`) removed; `${…}` references are never resolved) |
 | `tls_cert_not_after_timestamp` | gauge (unix seconds) | — (the served leaf certificate; absent with `TLS_DISABLED`) |
 | `build_info` | gauge (`1`) | `version`, `git_sha` (`unknown` when the build had no `GIT_SHA`) |
 | `log_lines_dropped_total` | counter | — |
