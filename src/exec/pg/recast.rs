@@ -4,10 +4,10 @@
 //! The driver asks for every result in binary and looks every unfamiliar
 //! column type up in the catalog first. Two kinds of type defeat that, and
 //! with it the whole statement, before anything ran: a type with no binary
-//! output function (`aclitem` — so `SELECT * FROM pg_class` — or an
-//! extension type that never wrote one), which the server refuses at `Bind`
-//! (`42883`); and an internal type (category `Z`: `pg_node_tree`,
-//! `pg_ndistinct` …), whose catalog row the driver cannot read. Those
+//! output function (an extension type that never wrote one), which the
+//! server refuses at `Bind` (`42883`); and an internal type (category `Z`:
+//! `pg_node_tree`, as in `pg_class.relpartbound`, or `pg_ndistinct` …),
+//! whose catalog row the driver cannot read. Those
 //! columns, and only those, are cast to `text` by wrapping the caller's
 //! statement:
 //!
@@ -28,14 +28,17 @@
 //! smuggled into the text. So the statement is first `PREPARE`d over the
 //! extended protocol, which refuses more than one: the text is proven a
 //! single statement before it is ever nested. Everything runs in a
-//! read-only transaction that is rolled back.
+//! read-only transaction that is rolled back, tagged and guarded like the
+//! read itself: `cancel_query` finds the probe, and a dropped call cancels it.
 
 use sqlx::postgres::types::Oid;
 use sqlx::{Column, Connection, Executor, PgConnection, Postgres, Transaction};
 
-use super::super::adapter::ExecError;
+use super::super::adapter::{ExecError, effective_timeout_ms};
 use super::super::query::ExecQuery;
 use super::super::sql_guard::Access;
+use super::cancel::{Backend, BackendTag, CancelOnDrop};
+use super::run::RunCtx;
 
 /// SQLSTATE `42883`: what `Bind` raises for a result column whose type has
 /// no binary output function. A misspelt function raises it too; that
@@ -43,8 +46,8 @@ use super::super::sql_guard::Access;
 const NO_BINARY_OUTPUT: &str = "42883";
 
 /// Bound on the probe's statements, which plan the caller's statement but
-/// read no row of it.
-const PROBE_SETUP: &str = "SET TRANSACTION READ ONLY; SET LOCAL statement_timeout = 2000";
+/// read no row of it; the caller's own budget when that is shorter.
+const PROBE_TIMEOUT_MS: u32 = 2_000;
 
 /// Whether `err`, raised by `query`, may be a column the driver cannot
 /// take: the server's `42883`, or the driver's own opaque failure. Reads
@@ -58,20 +61,55 @@ pub(super) fn may_apply(err: &ExecError, query: &ExecQuery<'_>) -> bool {
         }
 }
 
-/// `sql` with every column the driver cannot take cast to text, or `None`
-/// when the statement does not prepare or has no such column.
-pub(super) async fn text_cast_sql(conn: &mut PgConnection, sql: &str) -> Option<String> {
-    let body = statement_body(sql);
+/// `query`'s statement with every column the driver cannot take cast to
+/// text, or `None` when the statement does not prepare or has no such
+/// column.
+pub(super) async fn text_cast_sql(
+    conn: &mut PgConnection,
+    ctx: &RunCtx<'_>,
+    query: &ExecQuery<'_>,
+) -> Option<String> {
     let mut tx = conn.begin().await.ok()?;
-    let wrapped = probe(&mut tx, body).await;
+    let wrapped = guarded_probe(&mut tx, ctx, query).await;
     // Read-only and nothing to keep; a failed rollback is the release
     // hook's to clean up (`release`).
     let _ = tx.rollback().await;
     wrapped
 }
 
+/// The probe under the same tag, budget and drop guard as a read of
+/// `query`. The interpolated values are a number and a [`BackendTag`],
+/// which contains no quote.
+async fn guarded_probe(
+    tx: &mut Transaction<'_, Postgres>,
+    ctx: &RunCtx<'_>,
+    query: &ExecQuery<'_>,
+) -> Option<String> {
+    let tag = BackendTag::for_request(query.request_id);
+    let ms = effective_timeout_ms(query.statement_timeout_ms).min(PROBE_TIMEOUT_MS);
+    let setup = format!(
+        "SET TRANSACTION READ ONLY; SET LOCAL statement_timeout = {ms}; \
+         SET LOCAL application_name = '{}'; \
+         SET LOCAL standard_conforming_strings = on",
+        tag.as_str()
+    );
+    tx.execute(sqlx::AssertSqlSafe(setup)).await.ok()?;
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .persistent(false)
+        .fetch_one(&mut **tx)
+        .await
+        .ok()?;
+    let mut cancel = CancelOnDrop::armed(
+        ctx.cancel_pool.clone(),
+        Backend { pid, tag },
+        ctx.detached.clone(),
+    );
+    let wrapped = probe(tx, statement_body(query.sql)).await;
+    cancel.disarm();
+    wrapped
+}
+
 async fn probe(tx: &mut Transaction<'_, Postgres>, body: &str) -> Option<String> {
-    tx.execute(PROBE_SETUP).await.ok()?;
     // Extended protocol: a second statement in `body` is refused here.
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "PREPARE dbmcp_recast AS\n{body}"

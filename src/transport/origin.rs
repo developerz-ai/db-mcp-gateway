@@ -76,18 +76,19 @@ impl AllowedOrigins {
 }
 
 fn parse_listed(entry: &str) -> Result<String, AllowedOriginsError> {
-    let url = parse_origin(entry)
-        .filter(|url| url.path() == "/" && !entry.ends_with('/'))
-        .ok_or_else(|| AllowedOriginsError(entry.to_owned()))?;
+    let url = parse_origin(entry).ok_or_else(|| AllowedOriginsError(entry.to_owned()))?;
     Ok(url.origin().ascii_serialization())
 }
 
 /// An origin is `scheme://host[:port]` with an http(s) scheme, no userinfo,
-/// query or fragment. Anything else — `null` included — is not one.
+/// path, query or fragment — the same rule for a listed entry and for an
+/// incoming header. Anything else — `null` included — is not one.
 fn parse_origin(raw: &str) -> Option<Url> {
     let url = Url::parse(raw).ok()?;
     let plain = matches!(url.scheme(), "http" | "https")
         && url.host().is_some()
+        && url.path() == "/"
+        && !raw.ends_with('/')
         && url.username().is_empty()
         && url.password().is_none()
         && url.query().is_none()
@@ -209,6 +210,20 @@ mod tests {
                 "{bad:?} accepted"
             );
         }
+    }
+
+    #[test]
+    fn an_incoming_origin_with_a_path_is_not_an_origin() {
+        let policy = AllowedOrigins::parse("https://claude.ai", public_bind()).unwrap();
+        for bad in [
+            "https://claude.ai/",
+            "https://claude.ai/path",
+            "https://claude.ai/%2e%2e/x",
+        ] {
+            assert!(!policy.allows(bad), "{bad:?} allowed");
+        }
+        let loopback = AllowedOrigins::parse("", loopback_bind()).unwrap();
+        assert!(!loopback.allows("http://localhost:3000/app"));
     }
 
     #[test]

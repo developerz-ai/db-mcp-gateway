@@ -156,6 +156,23 @@ async fn run_query_full_acceptance() {
     assert_eq!(body["code"], "timeout", "{body}");
     assert_audit_outcome(pool, sub, "run_query", "timeout", "pg_sleep timeout").await;
 
+    // 2b. The same timeout on the second attempt of a read whose
+    //     `pg_node_tree` column the driver could not take: the timeout is the
+    //     answer, not the first refusal.
+    let resp = call_run_query(
+        url,
+        bearer,
+        "target",
+        "app",
+        "SELECT ev_action, pg_sleep(2) FROM pg_rewrite LIMIT 1",
+        None,
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], true, "{resp}");
+    let body = payload(&resp);
+    assert_eq!(body["code"], "timeout", "{body}");
+    assert_audit_outcome(pool, sub, "run_query", "timeout", "recast timeout").await;
+
     // 3. Row cap: generate 1000 rows with caller limit=10 → grant cap 50 →
     //    effective 10 → truncated=true. Audit row: outcome=success (the
     //    query itself succeeded; truncation is a flag, not an error).

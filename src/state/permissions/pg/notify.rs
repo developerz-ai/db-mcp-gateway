@@ -8,9 +8,11 @@
 //!
 //! A drop is not always announced: a NAT or firewall can discard the
 //! connection without a FIN, and a receive on it then waits forever. So the
-//! listener pings itself — a `NOTIFY` on a second channel of the same
-//! connection every [`Liveness::ping_every`] — and treats
-//! [`Liveness::deadline`] of silence as a lost connection.
+//! listener pings itself — every [`Liveness::ping_every`] another pool
+//! connection sends a `NOTIFY` on a second channel the listener also
+//! listens on — and treats [`Liveness::deadline`] of silence as a lost
+//! connection: a ping that reaches the server but not the listener means
+//! the listener's own connection is gone.
 
 use std::convert::Infallible;
 use std::future::Future;

@@ -153,6 +153,24 @@ async fn select_star_from_pg_class_decodes() {
     );
 }
 
+/// The driver cannot look up an internal type (`pg_node_tree`), so the
+/// first attempt fails before anything runs; the text-cast attempt is the
+/// one that runs the statement, and a timeout there is the answer, not that
+/// first refusal.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_timeout_on_the_text_cast_attempt_is_a_timeout() {
+    let adapter = adapter().await;
+    let err = adapter
+        .execute(ExecQuery {
+            statement_timeout_ms: Some(200),
+            ..read("SELECT ev_action, pg_sleep(2) FROM pg_rewrite LIMIT 1", 1)
+        })
+        .await
+        .expect_err("pg_sleep(2) under a 200 ms budget");
+    assert!(matches!(err, ExecError::Timeout), "{err:?}");
+}
+
 /// The statement was sound; the target rolled it back for a reason a retry
 /// clears. That is the target's state, not the caller's SQL.
 #[tokio::test]

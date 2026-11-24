@@ -138,20 +138,19 @@ impl PgAdapter {
     }
 
     /// What the write role is running, asked of the target over the write
-    /// tier's *cancel* pool: the writes of every replica are there, whether
-    /// or not this process ever wrote, and the listing still answers while
-    /// slow writes hold every connection of the query pool.
+    /// tier: the writes of every replica are there, whether or not this
+    /// process ever wrote. It runs on the query pool, under the caller's
+    /// share, like any statement: the cancel pool stays reserved for
+    /// cancels, so a burst of listings can never hold back the cancel of a
+    /// write. While writes hold every query connection the listing waits,
+    /// and the read listing answers alone.
     async fn write_activity(
         &self,
         write: &Tier,
         query: &ActivityQuery,
     ) -> Result<ExecResult, ExecError> {
         let sql = introspect::activity_sql(write.kind);
-        let mut conn = self
-            .acquire(write, &write.cancel_pool, query.request_id)
-            .await?;
-        self.run_on(&mut conn, write, &Self::activity_query(&sql, query))
-            .await
+        self.run(write, &Self::activity_query(&sql, query)).await
     }
 
     /// Signal `request_id`'s backends of `tier`'s role.

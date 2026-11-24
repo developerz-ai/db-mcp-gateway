@@ -7,10 +7,13 @@
 //! - A write credential that does not resolve, or that the target refuses,
 //!   fails writes only: reads keep working and the adapter is not stale.
 //! - A truncated read whose rollback fails leaves no reused connection.
+//! - `db_activity` listings in flight never hold back the cancel of a write:
+//!   they run on the query pool, the cancel pool stays the cancels'.
 //!
 //! Target: `target-db` (`bin/dev up`).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use db_mcp_gateway::audit::drain::DetachedTasks;
@@ -22,7 +25,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::common::pg_target::{
-    ensure_read_role, server, single_connection_adapter, writable_adapter, writable_database,
+    ensure_read_role, owner_url, server, single_connection_adapter, writable_adapter,
+    writable_database,
 };
 
 fn query(sql: &str, access: Access, row_limit: u32) -> ExecQuery<'_> {
@@ -184,4 +188,108 @@ async fn a_failed_rollback_after_truncation_discards_the_connection() {
         before, after,
         "the terminated backend's connection was reused"
     );
+}
+
+/// Listings kept in flight by [`activity_listings_never_hold_back_a_write_cancel`]:
+/// well over the write tier's two cancel connections.
+const LISTINGS: usize = 16;
+
+/// How long a cancel may take with every listing in flight.
+const PROMPT: Duration = Duration::from_secs(2);
+
+/// A write of `adapter`, `SELECT pg_sleep(20)`, running as `request_id`.
+fn spawn_write(
+    adapter: &Arc<PgAdapter>,
+    request_id: Uuid,
+) -> tokio::task::JoinHandle<Result<db_mcp_gateway::exec::ExecResult, ExecError>> {
+    let adapter = Arc::clone(adapter);
+    tokio::spawn(async move {
+        adapter
+            .execute(ExecQuery {
+                request_id,
+                ..query("SELECT pg_sleep(20)", Access::ReadWrite, 1)
+            })
+            .await
+    })
+}
+
+/// Whether a backend still runs `request_id`'s statement, polled until
+/// [`PROMPT`] runs out. An aborted transaction left `idle in transaction`
+/// keeps its tag, so only `active` counts.
+async fn still_running_after_prompt(monitor: &sqlx::PgPool, request_id: Uuid) -> bool {
+    let deadline = Instant::now() + PROMPT;
+    loop {
+        let running: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE state = 'active' AND application_name LIKE $1",
+        )
+        .bind(format!("dbmcp-{}-%", request_id.simple()))
+        .fetch_one(monitor)
+        .await
+        .expect("pg_stat_activity lookup");
+        if running == 0 {
+            return false;
+        }
+        if Instant::now() >= deadline {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn activity_listings_never_hold_back_a_write_cancel() {
+    let adapter = Arc::new(writable_adapter().await);
+    let monitor = sqlx::PgPool::connect(&owner_url())
+        .await
+        .expect("target owner connection");
+    let stop = Arc::new(AtomicBool::new(false));
+    let listings: Vec<_> = (0..LISTINGS)
+        .map(|_| {
+            let (adapter, stop) = (Arc::clone(&adapter), Arc::clone(&stop));
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    adapter.db_activity(activity()).await?;
+                }
+                Ok::<(), ExecError>(())
+            })
+        })
+        .collect();
+
+    // `cancel_request`, as the `cancel_query` tool sends it.
+    let victim_id = Uuid::new_v4();
+    let victim = spawn_write(&adapter, victim_id);
+    assert!(lists_write(&adapter, victim_id).await, "write never listed");
+    let started = Instant::now();
+    let cancelled = adapter.cancel_request(victim_id).await;
+    assert!(matches!(cancelled, Ok(true)), "{cancelled:?}");
+    assert!(
+        started.elapsed() < PROMPT,
+        "cancel_request took {:?} behind the listings",
+        started.elapsed()
+    );
+    let outcome = victim.await.expect("victim task");
+    assert!(matches!(outcome, Err(ExecError::Cancelled)), "{outcome:?}");
+
+    // `CancelOnDrop`, as an agent disconnect fires it.
+    let dropped_id = Uuid::new_v4();
+    let dropped = spawn_write(&adapter, dropped_id);
+    assert!(
+        lists_write(&adapter, dropped_id).await,
+        "write never listed"
+    );
+    dropped.abort();
+    assert!(
+        !still_running_after_prompt(&monitor, dropped_id).await,
+        "the dropped write was not cancelled within {PROMPT:?} behind the listings"
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    for listing in listings {
+        listing
+            .await
+            .expect("listing task")
+            .expect("listings answer throughout");
+    }
 }

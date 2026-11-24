@@ -97,7 +97,7 @@ Rendering rules for the non-obvious types:
 | `interval` | ISO-8601 duration, e.g. `"P1Y2M3DT4H5M6.5S"` |
 | `inet` / `cidr` | Postgres text form, e.g. `"10.0.0.1"`, `"10.0.0.0/8"` |
 | enums | the label, as a string |
-| a type with no binary output (`aclitem`, so `pg_class.relacl`) or an internal one (`pg_node_tree`, `pg_ndistinct`, …) | its text form, as a string. Such a column makes the driver refuse the whole read, so the read is run once more — before anything was returned and in a new read-only transaction — with those columns, and only those, cast to `text`; `SELECT * FROM pg_class` works. Reads only; a write is never run twice |
+| a type with no binary output (an extension type that never wrote one) or an internal one (`pg_node_tree` — so `pg_class.relpartbound` —, `pg_ndistinct`, …) | its text form, as a string. Such a column makes the driver refuse the whole read, so the read is run once more — before anything was returned and in a new read-only transaction — with those columns, and only those, cast to `text`; `SELECT * FROM pg_class` works. Reads only; a write is never run twice. The column probe runs under the read's own `request_id` tag and at most its `statement_timeout_ms` (2 s cap), so `cancel_query` and a disconnect reach it. A timeout, cancel or lost connection on the second run is the answer; only a refusal there answers with the first refusal |
 | multi-dimensional arrays, arrays of `json`/`jsonb`, ranges, composites, other user-defined types | `{"unsupported_type": "…"}` |
 
 #### Redis payload
@@ -198,7 +198,7 @@ Args: `server`, `database`, optional `schema` (default `public`), optional `tabl
 
 ### `db_activity`
 
-Args: `server`, `database`, optional `reason`. Requires `schema_read`. Returns `{ "columns", "rows", "truncated", "elapsed_ms" }` with `pid, request_id, pool, state, wait_event_type, wait_event, running_ms` for each statement the gateway is running on that database **for the caller** — `request_id` is the gateway request the backend serves (the gateway tags its backends via `application_name`), `pool` is `read` / `write`. The adapter only sees the gateway's own roles; the tool then keeps only requests whose intent row ([07-logging-retention](07-logging-retention.md)) carries the caller's identity, so one identity never sees another's activity. No query text: the caller's statements are in `get_query_history`.
+Args: `server`, `database`, optional `reason`. Requires `schema_read`. Returns `{ "columns", "rows", "truncated", "elapsed_ms" }` with `pid, request_id, pool, state, wait_event_type, wait_event, running_ms` for each statement the gateway is running on that database **for the caller** — `request_id` is the gateway request the backend serves (the gateway tags its backends via `application_name`), `pool` is `read` / `write`. The adapter only sees the gateway's own roles; the tool then keeps only requests whose intent row ([07-logging-retention](07-logging-retention.md)) carries the caller's identity, so one identity never sees another's activity. No query text: the caller's statements are in `get_query_history`. Each tier is listed over its own query pool, under the caller's share of it — never over the cancel pool, which stays reserved so a cancel always gets a connection; while writes hold every write-tier connection, the write tier's listing waits up to the acquire timeout and the read tier's rows are the answer.
 
 ### `cancel_query`
 

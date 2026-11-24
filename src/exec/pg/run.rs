@@ -35,8 +35,10 @@ pub(super) struct RunCtx<'a> {
 
 /// Run `query` in its own transaction. A read the target refused because a
 /// column's type has no binary form is run once more with those columns
-/// cast to text (see [`recast`]); when that is not possible the first
-/// refusal is the answer.
+/// cast to text (see [`recast`]); when that is not possible, or the target
+/// refuses the second statement too, the first refusal is the answer. The
+/// second attempt is the one that ran, so its timeout, cancel or lost
+/// connection is the answer.
 pub(super) async fn run_query(
     conn: &mut PgConnection,
     ctx: &RunCtx<'_>,
@@ -46,14 +48,17 @@ pub(super) async fn run_query(
         Err(err) if recast::may_apply(&err, query) => err,
         done => return done,
     };
-    let Some(sql) = recast::text_cast_sql(conn, query.sql).await else {
+    let Some(sql) = recast::text_cast_sql(conn, ctx, query).await else {
         return Err(refused);
     };
     let recast = ExecQuery {
         sql: &sql,
         ..*query
     };
-    run_query_inner(conn, ctx, &recast).await.or(Err(refused))
+    match run_query_inner(conn, ctx, &recast).await {
+        Err(ExecError::Sql | ExecError::Rejected(_)) => Err(refused),
+        done => done,
+    }
 }
 
 async fn run_query_inner(

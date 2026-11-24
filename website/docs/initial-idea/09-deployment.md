@@ -100,7 +100,7 @@ Two paths must be open:
 | Gateway | State DB | Sessions, audit, permissions |
 | Gateway | Syslog receiver (optional) | `logging.stream` syslog sink |
 
-`POST /mcp` validates `Origin` (MCP Streamable HTTP, against DNS rebinding): a request without one passes (non-browser agents), one whose `Origin` is not in `MCP_ALLOWED_ORIGINS` — or, on a loopback bind, not a loopback origin — gets `403` before authentication, with no audit row and a `WARN` log line.
+`POST /mcp` validates `Origin` (MCP Streamable HTTP, against DNS rebinding): a request without one passes (non-browser agents), one whose `Origin` is not a bare `scheme://host[:port]` (a path, even `/`, is refused — the same rule as a listed entry) or not in `MCP_ALLOWED_ORIGINS` — or, on a loopback bind, not a loopback origin — gets `403` before authentication, with no audit row and a `WARN` log line.
 
 Behind a reverse proxy, set `TRUSTED_PROXIES` to the proxies' addresses: when the TCP peer is one of them, the audit row's `ip` is the right-most `X-Forwarded-For` hop that is not itself a trusted proxy. Unset, `ip` is the TCP peer and `X-Forwarded-For` is ignored.
 
