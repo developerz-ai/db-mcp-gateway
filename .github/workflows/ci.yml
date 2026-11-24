@@ -214,7 +214,7 @@ jobs:
           fi
       - id: week
         run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@f4371d1ec7179bfbd04a82a81e3b3af7f720750f # v2
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2
         with:
           key: ${{ steps.week.outputs.week }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -289,7 +289,7 @@ jobs:
             fi
           fi
           echo "week=$week" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@f4371d1ec7179bfbd04a82a81e3b3af7f720750f # v2
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2
         with:
           shared-key: ci-${{ steps.week.outputs.week }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -373,7 +373,7 @@ jobs:
           fi
           echo "week=$week" >> "$GITHUB_OUTPUT"
       # Restores `test`'s entry; never saves (see the cache note above clippy).
-      - uses: Swatinem/rust-cache@f4371d1ec7179bfbd04a82a81e3b3af7f720750f # v2
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2
         with:
           shared-key: ci-${{ steps.week.outputs.week }}
           save-if: false
@@ -577,7 +577,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - id: week
         run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
-      - uses: Swatinem/rust-cache@f4371d1ec7179bfbd04a82a81e3b3af7f720750f # v2
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2
         with:
           key: ${{ steps.week.outputs.week }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
