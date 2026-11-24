@@ -5,7 +5,9 @@
 //! reply. Serial: `CLIENT PAUSE ALL` stalls every client of the server.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::num::NonZeroU32;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use crate::common::redis_target::{
@@ -15,7 +17,7 @@ use db_mcp_gateway::exec::{Access, DbAdapter, ExecError, ExecQuery, PoolSizing};
 use redis::aio::MultiplexedConnection;
 use serde_json::json;
 
-const PAUSE_MS: u64 = 1_500;
+const PAUSE_MS: u64 = 800;
 
 fn query(argv: &str, statement_timeout_ms: Option<u32>) -> ExecQuery<'_> {
     ExecQuery {
@@ -76,7 +78,7 @@ async fn a_stalled_server_times_out_and_the_connection_is_discarded() {
         admin_cmd(&mut side, &["CLIENT", "PAUSE", &pause, "ALL"]).await;
         let started = Instant::now();
         let stalled = a
-            .execute(query(&format!(r#"["GET","{first}"]"#), Some(300)))
+            .execute(query(&format!(r#"["GET","{first}"]"#), Some(200)))
             .await;
         let waited = started.elapsed();
         assert!(
@@ -86,9 +88,9 @@ async fn a_stalled_server_times_out_and_the_connection_is_discarded() {
         );
         assert!(waited < Duration::from_millis(PAUSE_MS), "{waited:?}");
 
-        tokio::time::sleep(Duration::from_millis(PAUSE_MS)).await;
-        // Had the stalled connection gone back to the pool, its late reply
-        // ("first") could answer this read; a fresh connection answers it.
+        // Sent while the server is still paused: it waits out the rest of the
+        // pause on its own. Had the stalled connection gone back to the pool,
+        // its late reply ("first") could answer this read; a fresh one does.
         let next = a
             .execute(query(&format!(r#"["GET","{second}"]"#), None))
             .await
@@ -106,20 +108,23 @@ async fn a_stalled_server_times_out_and_the_connection_is_discarded() {
     }
 }
 
-/// A saturated pool is `unavailable` after the acquire bound (5 s), not a
+/// A saturated pool is `unavailable` after the acquire bound, not a
 /// `timeout` of the waiting caller's command — the Postgres adapter's
 /// contract. The only connection is pinned by a command the paused server
-/// cannot answer yet; it completes once the pause ends.
+/// cannot answer yet; it completes once the pause ends. The bound is cut
+/// from the production 5 s to [`ACQUIRE`]; the waiter's budget stays below
+/// it, so a budget that wrongly covered the wait would fire first.
 #[tokio::test]
 #[serial_test::serial(world)]
 async fn a_saturated_pool_is_unavailable_not_timeout() {
-    const HOLD_MS: u64 = 7_000;
+    const HOLD_MS: u64 = 1_500;
+    const ACQUIRE: Duration = Duration::from_millis(500);
     for flavor in Flavor::ALL {
         let one = PoolSizing {
             max_connections: NonZeroU32::MIN.get(),
             ..PoolSizing::default()
         };
-        let a = std::sync::Arc::new(adapter(flavor, one).await);
+        let a = adapter(flavor, one).await.with_acquire_timeout(ACQUIRE);
         let mut side = admin(flavor).await;
         let key = unique_key("held");
         admin_cmd(&mut side, &["SET", &key, "held"]).await;
@@ -128,25 +133,26 @@ async fn a_saturated_pool_is_unavailable_not_timeout() {
             .expect("warm the one connection");
 
         admin_cmd(&mut side, &["CLIENT", "PAUSE", &HOLD_MS.to_string(), "ALL"]).await;
-        let holder = {
-            let a = std::sync::Arc::clone(&a);
-            let argv = format!(r#"["GET","{key}"]"#);
-            tokio::spawn(async move { a.execute(query(&argv, None)).await.map(|r| r.rows) })
-        };
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let argv = format!(r#"["GET","{key}"]"#);
+        let mut holder = std::pin::pin!(a.execute(query(&argv, None)));
+        // One poll leases the only connection and sends the command, which the
+        // paused server leaves unanswered: the pool is saturated from here on.
+        let polled = std::future::poll_fn(|cx| Poll::Ready(holder.as_mut().poll(cx))).await;
+        assert!(
+            polled.is_pending(),
+            "{}: paused server answered",
+            flavor.name()
+        );
         let started = Instant::now();
-        let waiting = a.execute(query(r#"["DBSIZE"]"#, Some(1_000))).await;
+        let waiting = a.execute(query(r#"["DBSIZE"]"#, Some(200))).await;
         let waited = started.elapsed();
         assert!(
             matches!(waiting, Err(ExecError::Unavailable)),
             "{}: {waiting:?}",
             flavor.name()
         );
-        assert!(
-            waited >= Duration::from_secs(4),
-            "{waited:?}: the acquire bound, not the 1 s budget"
-        );
-        let held = holder.await.expect("holder task");
+        assert!(waited >= ACQUIRE, "{waited:?}: the acquire bound");
+        let held = holder.await.map(|r| r.rows);
         assert_eq!(
             held.expect("holder read"),
             vec![vec![json!("held")]],

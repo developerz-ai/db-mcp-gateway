@@ -1,76 +1,131 @@
-//! Column names and types for a zero-row read. Without them the caller
-//! cannot tell "your filter matched nothing" from "that table has no such
-//! columns" (#136). Nothing runs again: only Parse/Describe.
+//! What a read returns, asked before it runs (#382). The statement is
+//! prepared — Parse/Describe over the extended protocol, which never
+//! executes it — with the types its params will be bound with, so `SELECT
+//! $1 AS v` is described as the read will run. The driver keeps the
+//! prepared statement and the read binds and executes it. The driver
+//! prepares every statement before binding it anyway, so a warm read takes
+//! no more round trips than without this; it adds a `Close` at release and
+//! one catalog lookup per connection and newly seen table.
 //!
-//! Without params the statement itself is described. With params, a bare
-//! Describe would re-infer every placeholder's type from the text alone,
-//! and `SELECT $1 AS v` has none: the statement is `PREPARE`d with the
-//! types the read was bound with (refusing a second statement, like the
-//! read's own Parse), and `EXECUTE` of it is described — Postgres answers
-//! that with the prepared result's columns, without executing it. The
-//! driver can only describe through a named statement; `reset_on_release`
-//! closes it, and `DEALLOCATE ALL` anything prepared here, before the
-//! connection serves anyone else.
+//! The description decides whether a column the driver cannot take needs
+//! the text cast (see [`recast`]), so the statement that runs is the one
+//! that answers: a read never runs twice, and its side effects (a volatile
+//! function) never repeat. It also names a zero-row read's columns (#136).
 
-use std::time::Duration;
+use sqlx::postgres::{PgStatement, PgTypeInfo};
+use sqlx::{Column, Executor, Postgres, SqlSafeStr, Statement, Transaction, TypeInfo};
 
-use sqlx::{Column, Executor, Postgres, SqlSafeStr, Transaction, TypeInfo};
+use super::super::adapter::ExecError;
+use super::super::query::{ExecQuery, QueryParam};
+use super::decode::ColumnDecoder;
+use super::error::{Origin, classify};
+use super::recast;
+use super::stream::bound_types;
 
-use super::super::query::QueryParam;
-use super::super::sql_guard::statement_body;
-use super::recast::{execute_with_nulls, param_types};
-
-const PREPARED: &str = "dbmcp_describe";
-
-/// `(names, types)`, best-effort on purpose: the read already succeeded,
-/// so a failure here answers no columns, never an error. `None` means
-/// `budget` ran out with the lookup still in flight on the connection.
-pub(super) async fn describe_columns(
-    tx: &mut Transaction<'_, Postgres>,
-    sql: &str,
-    params: &[QueryParam],
-    budget: Duration,
-) -> Option<(Vec<String>, Vec<String>)> {
-    let described = tokio::time::timeout(budget, describe(tx, sql, params))
-        .await
-        .ok()?;
-    Some(described.unwrap_or_default())
+/// The statement a read runs and what it returns.
+pub(super) struct Described {
+    /// The text-cast wrapper to run instead of the caller's statement.
+    pub(super) recast: Option<String>,
+    pub(super) columns: Vec<String>,
+    /// The server's type name per column (`int4`, `text`, …).
+    pub(super) column_types: Vec<String>,
 }
 
-async fn describe(
+/// Describe `query`, a read, and decide the statement to run. A statement
+/// that does not prepare is the read's answer, as if it had run.
+pub(super) async fn describe_read(
     tx: &mut Transaction<'_, Postgres>,
-    sql: &str,
+    query: &ExecQuery<'_>,
     params: &[QueryParam],
-) -> Option<(Vec<String>, Vec<String>)> {
-    if params.is_empty() {
-        return columns_of(tx, sql.to_owned()).await;
+    origin: &Origin<'_>,
+) -> Result<Described, ExecError> {
+    let types = bound_types(query.binds, params);
+    let statement = match prepare(tx, query.sql, &types).await {
+        Ok(statement) => statement,
+        // A type the driver cannot look up fails here, after Parse and
+        // before anything ran; the server's own refusals stand.
+        Err(err) => {
+            let refused = classify(err, origin, query.sql);
+            if !matches!(refused, ExecError::Sql) {
+                return Err(refused);
+            }
+            let wrapper = match recast::row_description(tx, query, params).await {
+                Ok(columns) => recast::text_cast_sql(tx, query, params, &columns).await,
+                Err(err) => Err(err),
+            };
+            return match wrapper {
+                Ok(Some(wrapper)) => described_recast(tx, wrapper, &types, origin).await,
+                _ => Err(refused),
+            };
+        }
+    };
+    let columns: Vec<(String, u32)> = statement
+        .columns()
+        .iter()
+        .map(|c| {
+            (
+                c.name().to_string(),
+                c.type_info().oid().map_or(0, |oid| oid.0),
+            )
+        })
+        .collect();
+    // Only a type this gateway cannot render may lack a binary form; every
+    // other read skips the catalog lookup.
+    let renderable = statement.columns().iter().all(|c| {
+        !matches!(
+            ColumnDecoder::for_type(c.type_info(), 0),
+            ColumnDecoder::Unsupported(_)
+        )
+    });
+    if renderable {
+        return Ok(described(None, &statement));
     }
-    let body = statement_body(sql)?;
-    let prepare = format!("PREPARE {PREPARED}{} AS\n{body}", param_types(params));
-    sqlx::query(sqlx::AssertSqlSafe(prepare))
-        .persistent(false)
-        .execute(&mut **tx)
-        .await
-        .ok()?;
-    let columns = columns_of(tx, execute_with_nulls(PREPARED, params.len())).await;
-    let deallocate = format!("DEALLOCATE {PREPARED}");
-    tx.execute(sqlx::AssertSqlSafe(deallocate)).await.ok()?;
-    columns
+    match recast::text_cast_sql(tx, query, params, &columns).await {
+        Ok(None) => Ok(described(None, &statement)),
+        Ok(Some(wrapper)) => described_recast(tx, wrapper, &types, origin).await,
+        Err(err) => Err(unpositioned(classify(err, origin, ""))),
+    }
 }
 
-async fn columns_of(
+async fn described_recast(
     tx: &mut Transaction<'_, Postgres>,
-    sql: String,
-) -> Option<(Vec<String>, Vec<String>)> {
-    let described = (&mut **tx)
-        .describe(sqlx::AssertSqlSafe(sql).into_sql_str())
-        .await
-        .ok()?;
-    Some(
-        described
-            .columns()
-            .iter()
-            .map(|c| (c.name().to_string(), c.type_info().name().to_string()))
-            .unzip(),
-    )
+    wrapper: String,
+    types: &[PgTypeInfo],
+    origin: &Origin<'_>,
+) -> Result<Described, ExecError> {
+    match prepare(tx, &wrapper, types).await {
+        Ok(statement) => Ok(described(Some(wrapper), &statement)),
+        Err(err) => Err(unpositioned(classify(err, origin, &wrapper))),
+    }
+}
+
+async fn prepare(
+    tx: &mut Transaction<'_, Postgres>,
+    sql: &str,
+    types: &[PgTypeInfo],
+) -> Result<PgStatement, sqlx::Error> {
+    let sql = sqlx::AssertSqlSafe(sql.to_owned()).into_sql_str();
+    (&mut **tx).prepare_with(sql, types).await
+}
+
+fn described(recast: Option<String>, statement: &PgStatement) -> Described {
+    let (columns, column_types) = statement
+        .columns()
+        .iter()
+        .map(|c| (c.name().to_string(), c.type_info().name().to_string()))
+        .unzip();
+    Described {
+        recast,
+        columns,
+        column_types,
+    }
+}
+
+/// A position into a statement the gateway built points at nothing the
+/// caller wrote.
+fn unpositioned(err: ExecError) -> ExecError {
+    match err {
+        ExecError::Rejected(rejection) => ExecError::Rejected(rejection.with_position(None)),
+        other => other,
+    }
 }

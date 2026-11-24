@@ -72,7 +72,7 @@ async fn listener_serves_metrics_and_stops_on_shutdown() {
 
 /// `(name, label names)` of every sample line, `_bucket`/`_sum`/`_count`
 /// folded into the histogram's name and `le` dropped.
-fn rendered_series(body: &str) -> Vec<(String, Vec<String>)> {
+pub(super) fn rendered_series(body: &str) -> Vec<(String, Vec<String>)> {
     body.lines()
         .filter(|line| !line.starts_with('#') && !line.is_empty())
         .map(|line| {
@@ -94,7 +94,7 @@ fn rendered_series(body: &str) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-const ONE_DB: &str = "servers:
+pub(super) const ONE_DB: &str = "servers:
   - name: pg
     kind: postgres
     host: localhost
@@ -113,11 +113,8 @@ fn boot_exports_the_catalogue_with_its_label_sets_at_zero() {
     let recorder = builder().expect("builder").build_recorder();
     let config = db_mcp_gateway::config::ConfigFile::from_yaml_str(ONE_DB).expect("config parses");
     metrics::with_local_recorder(&recorder, || {
-        describe_catalogue();
-        preregister::register_static();
+        register_boot_series();
         preregister::register_targets(&config);
-        loaded::record_build_info();
-        loaded::record_process_start();
     });
     let body = recorder.handle().render();
     let series = rendered_series(&body);

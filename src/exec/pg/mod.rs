@@ -28,8 +28,9 @@
 //! `sqlx::Error` → `ExecError`, `config` owns password resolution and
 //! `PgConnectOptions` construction, `release` owns the session reset between
 //! callers, `run` owns the per-query transaction,
-//! `stream` owns row collection against the result budget, `recast` owns the
-//! second attempt at a read whose columns have no binary form, `near_miss`
+//! `stream` owns row collection against the result budget, `describe` owns
+//! what a read returns, asked before it runs, `recast` owns the text cast of
+//! columns the driver cannot take, `near_miss`
 //! owns the names offered for an undefined table or column.
 //! `catalog`, `sample`, `explain` and `introspect` build the Postgres SQL
 //! behind the matching `DbAdapter` methods.

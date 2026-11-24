@@ -16,6 +16,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use crate::adapter_registry_concurrency::spawn_blackhole;
+use crate::common::gateway::config_file;
 use crate::common::pg_target::{self, READ_ROLE, READ_ROLE_PASSWORD, TARGET_USER};
 use db_mcp_gateway::config::{ConfigFile, Database, Password, Server};
 use db_mcp_gateway::exec::{AdapterRegistry, DbAdapter, ExecError, ExecQuery};
@@ -125,7 +126,7 @@ async fn interleaved_old_and_new_snapshots_never_replace_each_others_adapter() {
 const SWEEP_EVERY: Duration = Duration::from_millis(50);
 
 fn config_with(server: &Server, databases: Vec<Database>) -> ConfigFile {
-    let mut config = ConfigFile::from_yaml_str("permissions: []\n").expect("empty config");
+    let mut config = config_file("permissions: []\n");
     config.servers = vec![Server {
         databases,
         ..server.clone()

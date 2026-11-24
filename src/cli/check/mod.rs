@@ -1,10 +1,12 @@
 //! `--check`: parse, validate and (unless `--no-secrets`) resolve a config
 //! without booting, then print every error, every warning and the connection
-//! budget. Exit 0 when there is no error, 1 otherwise.
+//! budget. Exit 0 when there is no error, 1 otherwise. The environment boot
+//! parses is checked too ([`boot_env`]).
 //!
 //! Every line is built from the schema's own field names and the config's
 //! names (servers, databases, groups, env var names) — never a secret value.
 
+mod boot_env;
 mod budget;
 pub(in crate::cli) mod env_names;
 mod warnings;
@@ -23,7 +25,8 @@ pub fn run(path: &Path, no_secrets: bool) -> u8 {
     let config = match ConfigFile::from_file(path) {
         Ok(config) => config,
         Err(err) => {
-            let errors: Vec<String> = err.into_list().iter().map(ToString::to_string).collect();
+            let mut errors: Vec<String> = err.into_list().iter().map(ToString::to_string).collect();
+            errors.extend(env_errors());
             print_lines("error", &errors);
             print_result(errors.len(), 0);
             return EXIT_FAILED;
@@ -43,9 +46,9 @@ pub fn run(path: &Path, no_secrets: bool) -> u8 {
         .filter_map(|(name, _)| name.into_string().ok())
         .collect();
     let warnings = warnings::collect(&config, &env);
-    let cancel = budget::cancel_pool_size()
-        .map_err(|err| errors.push(err))
-        .ok();
+    errors.extend(env_errors());
+    // An invalid PG_CANCEL_POOL_SIZE is already an env error above.
+    let cancel = budget::cancel_pool_size().ok();
     print_lines("error", &errors);
     print_lines("warning", &warnings);
     if let Some(cancel) = cancel {
@@ -57,6 +60,13 @@ pub fn run(path: &Path, no_secrets: bool) -> u8 {
     } else {
         EXIT_FAILED
     }
+}
+
+/// One line per invalid variable: its name, never its value.
+fn env_errors() -> impl Iterator<Item = String> {
+    boot_env::invalid_variables()
+        .into_iter()
+        .map(|name| format!("environment variable {name}: boot refuses its value"))
 }
 
 fn print_lines(label: &str, lines: &[String]) {

@@ -18,7 +18,7 @@ Every agent-facing error carries a `request_id`; it matches `audit_calls.request
 
 ### GatewayAuditUnavailable
 
-**Means.** Tool calls were answered `audit_unavailable`: the state DB refused the intent row or the completion row. Audit is synchronous (MUST #4), so agents are getting no answers. Severity critical. It also fires for 5m when a replica's first scrape already shows refusals (a failure before Prometheus first saw the pod), which `increase()` alone cannot see.
+**Means.** Tool calls were answered `audit_unavailable`: the state DB refused the intent row or the completion row. Audit is synchronous (MUST #4), so agents are getting no answers. Severity critical. It keeps firing for 15m after the last refusal: it reads `audit_last_failure_timestamp{kind="write"}`, which the gateway stamps on every refusal, so a refusal before Prometheus first saw the pod (which `increase()` cannot see) still fires, however late that first scrape. A resolve means no refusal for 15m.
 
 **First checks.**
 - `/readyz` on each replica (`503` = the state DB does not answer `SELECT 1` in 2 s).
@@ -38,7 +38,7 @@ Every agent-facing error carries a `request_id`; it matches `audit_calls.request
 
 ### GatewayAuditFallbackFailures
 
-**Means.** `audit_fallback_failures_total` rose: an agent disconnected mid-call and the drop-path audit write failed. The call is recorded only once the reaper marks its intent `abandoned`.
+**Means.** `audit_fallback_failures_total` rose, or `audit_last_failure_timestamp{kind="fallback"}` is under 30m old: an agent disconnected mid-call and the drop-path audit write failed. The call is recorded only once the reaper marks its intent `abandoned`. Like [GatewayAuditUnavailable](#gatewayauditunavailable), the stamp makes a failure before a pod's first scrape fire too; it resolves 30m after the last failure.
 
 **First checks.** Same as [GatewayAuditUnavailable](#gatewayauditunavailable) — the state DB was unreachable when the disconnect happened. Check that [GatewayAuditReaperStale](#gatewayauditreaperstale) is not also firing.
 

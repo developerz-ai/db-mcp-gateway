@@ -174,3 +174,68 @@ fn healthcheck_fails_when_nothing_listens() {
     assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
     assert!(stdout(&output).starts_with("unhealthy:"));
 }
+
+/// #397: `--check` runs boot's env parsers and names every variable set to a
+/// value boot refuses — never the value. `--no-secrets` does not skip it.
+#[test]
+fn invalid_environment_is_reported_by_name_only() {
+    let env = [
+        ("GROUPS_MAX_AGE", "30x"),
+        ("SESSION_CACHE_TTL_SECONDS", "soon-hunter2"),
+        ("METRICS_BIND", "nowhere-hunter2"),
+        ("TRUSTED_PROXIES", "10.0.0.0/99"),
+        ("PG_CANCEL_POOL_SIZE", "990099"),
+        ("SESSION_TTL_HOURS", "999999"),
+        ("ALLOW_INSECURE_SIGNING_KEY", "maybe"),
+        ("STATE_DB_CONNECT_TIMEOUT_SECONDS", "forever"),
+    ];
+    let (code, out) = check("good", &["--no-secrets"], &env);
+    assert_golden("env_invalid", &out);
+    assert_eq!(code, 1, "{out}");
+    for (_, value) in env {
+        assert!(!out.contains(value), "{value} leaked:\n{out}");
+    }
+}
+
+#[test]
+fn invalid_groups_max_age_fails_the_check() {
+    let (code, out) = check("good", &["--no-secrets"], &[("GROUPS_MAX_AGE", "30x")]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("error: environment variable GROUPS_MAX_AGE:"),
+        "{out}"
+    );
+    assert!(!out.contains("30x"), "{out}");
+}
+
+/// A valid deployment environment changes nothing: same output as none.
+#[test]
+fn valid_environment_leaves_the_output_unchanged() {
+    let env = [
+        ("GROUPS_MAX_AGE", "12h"),
+        ("OIDC_SCOPES", "openid email groups"),
+        ("OIDC_TOKEN_AUTH_METHOD", "client_secret_basic"),
+        ("SESSION_TTL_HOURS", "8"),
+        ("REFRESH_TTL_DAYS", "30"),
+        ("TRUSTED_PROXIES", "10.0.0.0/8"),
+        ("MCP_ALLOWED_ORIGINS", "https://app.example.com"),
+        ("METRICS_BIND", "0.0.0.0:9090"),
+        ("MAX_CONCURRENT_REQUESTS", "256"),
+        ("PG_CANCEL_POOL_SIZE", "2"),
+        ("STATE_DB_CONNECT_TIMEOUT_SECONDS", "30"),
+    ];
+    let (code, out) = check("good", &["--no-secrets"], &env);
+    assert_golden("good.no-secrets", &out);
+    assert_eq!(code, 0, "{out}");
+}
+
+/// Required-but-unset settings belong to the deployment, not to the value
+/// check: CI runs `--check` without the TLS paths or the IdP.
+#[test]
+fn unset_required_variables_are_not_errors() {
+    let path = format!("{FIXTURES}/good.yaml");
+    let output = gateway(&["--config", &path, "--check", "--no-secrets"], &[]);
+    let out = stdout(&output);
+    assert_eq!(output.status.code(), Some(0), "{out}");
+    assert!(!out.contains("error:"), "{out}");
+}

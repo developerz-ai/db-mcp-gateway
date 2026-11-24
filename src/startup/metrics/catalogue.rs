@@ -76,6 +76,12 @@ pub(crate) const CATALOGUE: &[Metric] = &[
         "Disconnect-path audit writes that failed.",
     ),
     metric(
+        "audit_last_failure_timestamp",
+        Gauge,
+        &["kind"],
+        "Unix seconds of the last failed audit write (write: answered audit_unavailable; fallback: the disconnect-path retry).",
+    ),
+    metric(
         "audit_abandoned_total",
         Counter,
         &[],

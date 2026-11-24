@@ -4,7 +4,9 @@
 //! Action: `QueryRead` on the database the statement runs on. Ownership is
 //! checked against the intent row every target call commits first: a
 //! `request_id` that is not the caller's on this `(server, database)` answers
-//! `forbidden`, the same as an unknown one, so ids cannot be probed. The
+//! `forbidden`, the same as an unknown one, so ids cannot be probed. A
+//! service-token call that names its run (`x-dbmcp-run-id`) owns only that
+//! run's requests: another run's id answers the same `forbidden`. The
 //! cancelled call fails with `cancelled` and writes its own audit row.
 
 use std::time::Instant;
@@ -24,7 +26,7 @@ use super::audit_dispatch::{
     error_outcome, invalid_arguments, outcome_from_exec_error, reject_arguments, run_audited,
     success_outcome,
 };
-use super::target::{Target, ensure_reason, forbidden, record_intent, resolve_target};
+use super::target::{Target, ensure_reason, forbidden, record_intent, resolve_target, run_scope};
 
 const TOOL_NAME: &str = super::CANCEL_QUERY;
 const ERROR_MESSAGES: ToolErrorMessages = ToolErrorMessages {
@@ -131,7 +133,8 @@ async fn compute_outcome(
 }
 
 /// `forbidden` unless `victim` is one of the caller's own requests on
-/// `target` — never another identity's, even one holding the same grants.
+/// `target` (within its run, when it names one) — never another identity's,
+/// even one holding the same grants.
 async fn ensure_owned(
     ctx: ToolCtx<'_>,
     target: &Target<'_>,
@@ -143,6 +146,7 @@ async fn ensure_owned(
         &target.server.name,
         &target.database.name,
         &[victim.to_string()],
+        run_scope(ctx),
     )
     .await
     .map_err(|err| {

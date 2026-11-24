@@ -45,7 +45,7 @@ impl MongoAdapter {
         let started = Instant::now();
         // Wrapped in a block so `?` inside it is captured into `result`
         // rather than skipping `kill_guard.disarm()` below — same posture as
-        // `pg::run_query_inner`'s `CancelOnDrop`.
+        // `pg::run_query`'s `CancelOnDrop`.
         let result = async {
             let (column, collected) = match command_name.as_str() {
                 "find" | "aggregate" | "listCollections" | "listIndexes" => {

@@ -156,9 +156,8 @@ async fn run_query_full_acceptance() {
     assert_eq!(body["code"], "timeout", "{body}");
     assert_audit_outcome(pool, sub, "run_query", "timeout", "pg_sleep timeout").await;
 
-    // 2b. The same timeout on the second attempt of a read whose
-    //     `pg_node_tree` column the driver could not take: the timeout is the
-    //     answer, not the first refusal.
+    // 2b. The same timeout on a read run through the text cast because the
+    //     driver cannot take its `pg_node_tree` column.
     let resp = call_run_query(
         url,
         bearer,

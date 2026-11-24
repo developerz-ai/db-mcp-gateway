@@ -59,3 +59,6 @@ benchmarks/results/latest.json
 
 # Python bytecode from the .claude/hooks and .github/scripts tests.
 __pycache__/
+
+# proptest writes failing seeds here on a red run; the repo commits none
+proptest-regressions/

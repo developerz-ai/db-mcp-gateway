@@ -82,3 +82,37 @@ pub enum ConfigError {
     #[error(transparent)]
     TlsDisabledFlag(#[from] super::BoolFlagError),
 }
+
+impl ConfigError {
+    /// The variable this refusal is about — never its value, so `--check`
+    /// can name it in CI logs.
+    pub fn variable(&self) -> &'static str {
+        match self {
+            Self::Bind { .. } => "GATEWAY_BIND",
+            Self::MetricsBind { .. } | Self::MetricsBindCollides(_) => "METRICS_BIND",
+            Self::McpPath(_) | Self::McpPathReserved(_) => "MCP_PATH",
+            Self::StateDbPoolSize { .. }
+            | Self::StateDbPoolSizeZero
+            | Self::StateDbPoolSizeAboveConcurrency { .. } => "STATE_DB_POOL_SIZE",
+            Self::ConcurrencyCap { name, .. } => name,
+            Self::AuditRetentionDays { .. } | Self::AuditRetentionZero(_) => "AUDIT_RETENTION_DAYS",
+            Self::PermissionsCacheTtl { .. } | Self::PermissionsCacheTtlTooLong(_) => {
+                "PERMISSIONS_CACHE_TTL_SECONDS"
+            }
+            Self::SessionCacheTtl { .. } => "SESSION_CACHE_TTL_SECONDS",
+            Self::TlsMissing | Self::TlsCertUnreadable { .. } => "TLS_CERT_PATH",
+            Self::TlsKeyUnreadable { .. } => "TLS_KEY_PATH",
+            Self::TlsDisabledFlag(flag) => flag.var,
+        }
+    }
+
+    /// A refusal about the deployment rather than a value: a required TLS
+    /// setting left unset, or a cert/key file not mounted where `--check`
+    /// runs (CI without the deployment's volumes).
+    pub fn is_deployment_only(&self) -> bool {
+        matches!(
+            self,
+            Self::TlsMissing | Self::TlsCertUnreadable { .. } | Self::TlsKeyUnreadable { .. }
+        )
+    }
+}

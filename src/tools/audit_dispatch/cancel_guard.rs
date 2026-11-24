@@ -10,7 +10,9 @@ use crate::audit::stream::StreamSinks;
 use crate::audit::{self, AuditRow, OutcomeCode};
 use crate::exec::Access;
 
-use super::metric_names::{ACCESS_UNKNOWN, AUDIT_FALLBACK_FAILURES, CallLabels};
+use super::metric_names::{
+    ACCESS_UNKNOWN, AUDIT_FALLBACK_FAILURES, CallLabels, FailedAuditWrite, record_audit_failure,
+};
 use super::{Outcome, WriteState};
 
 const DISCONNECTED: &str = "client disconnected before completion";
@@ -133,6 +135,7 @@ impl Drop for CancelledAuditGuard {
                 Ok(()) => sinks.send(&row, &tasks),
                 Err(err) => {
                     counter!(AUDIT_FALLBACK_FAILURES).increment(1);
+                    record_audit_failure(FailedAuditWrite::Fallback);
                     tracing::error!(
                         %err,
                         class = %err.class(),

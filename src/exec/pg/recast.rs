@@ -1,15 +1,16 @@
-//! The second attempt at a read whose result has a column the driver
-//! cannot take.
+//! The text cast for a read whose result has a column the driver cannot
+//! take.
 //!
 //! The driver asks for every result in binary and looks every unfamiliar
 //! column type up in the catalog first. Two kinds of type defeat that, and
-//! with it the whole statement, before anything ran: a type with no binary
-//! output function (an extension type that never wrote one), which the
-//! server refuses at `Bind` (`42883`); and an internal type (category `Z`:
-//! `pg_node_tree`, as in `pg_class.relpartbound`, or `pg_ndistinct` …),
-//! whose catalog row the driver cannot read. Those
-//! columns, and only those, are cast to `text` by wrapping the caller's
-//! statement:
+//! with it the whole statement: a type with no binary output function (an
+//! extension type that never wrote one, or `aclitem` inside `relacl`'s
+//! array), which the server refuses at `Bind` (`42883`) — or, as an array's
+//! element, only while it sends the first row, after the statement's
+//! functions ran; and an internal type (category `Z`: `pg_node_tree`, as in
+//! `pg_class.relpartbound`, or `pg_ndistinct` …), whose catalog row the
+//! driver cannot read. Those columns, and only those, are cast to `text` by
+//! wrapping the caller's statement:
 //!
 //! ```sql
 //! SELECT q.c1 AS "oid", q.c2::text AS "relacl" FROM (
@@ -18,158 +19,113 @@
 //! ```
 //!
 //! The wrapper reads its columns by position, so duplicate or odd output
-//! names survive, and it keeps them as the column names. It runs in the same
-//! read-only transaction a read always runs in; the caller's statement is
-//! not changed, only nested.
+//! names survive, and it keeps them as the column names. It runs in the
+//! read's own read-only transaction instead of the caller's statement, which
+//! is not changed, only nested.
 //!
-//! The column names and types come from a probe that returns one row of
-//! NULLs. It is `EXECUTE`d over the simple protocol, the one whose result
-//! description the driver does not look up — and which would run a second
-//! statement smuggled into the text. So the statement is first `PREPARE`d
-//! over the extended protocol, which refuses more than one: the text is
-//! proven a single statement before it is ever nested. Both are prepared
-//! with the caller's params' types, and the probe executes with every param
-//! NULL: it reads no row, so their values do not matter. Everything runs in
-//! a read-only transaction that is rolled back, tagged and guarded like the
-//! read itself: `cancel_query` finds the probe, and a dropped call cancels it.
+//! Whether a read needs the wrapper is decided before it runs (see
+//! `describe`), never by retrying a failure: the read runs once (#382).
+//! Before the caller's statement is nested it is `PREPARE`d alone over the
+//! extended protocol, which refuses more than one statement: the text is
+//! proven a single statement first. When the driver cannot describe the
+//! statement at all (a category-`Z` column), its columns are read from a
+//! cursor over a wrapper that reads no row of it: the cursor is declared
+//! over the extended protocol with the caller's own params, and its row
+//! description fetched over the simple protocol, whose types the driver
+//! does not look up. Nothing runs with a made-up param value (#383).
 
 use sqlx::postgres::types::Oid;
-use sqlx::{Column, Connection, Executor, PgConnection, Postgres, Transaction};
+use sqlx::{Column, Executor, Postgres, Transaction};
 
-use super::super::adapter::{ExecError, effective_timeout_ms};
 use super::super::query::{ExecQuery, QueryParam};
-use super::super::sql_guard::{Access, statement_body};
-use super::cancel::{Backend, BackendTag, CancelOnDrop};
-use super::run::RunCtx;
+use super::super::sql_guard::statement_body;
+use super::stream::bound_query;
 
-/// SQLSTATE `42883`: what `Bind` raises for a result column whose type has
-/// no binary output function. A misspelt function raises it too; that
-/// statement does not prepare, and the first refusal stands.
-const NO_BINARY_OUTPUT: &str = "42883";
-
-/// Bound on the probe's statements, which plan the caller's statement but
-/// read no row of it; the caller's own budget when that is shorter.
-const PROBE_TIMEOUT_MS: u32 = 2_000;
-
-/// Whether `err`, raised by `query`, may be a column the driver cannot
-/// take: the server's `42883`, or the driver's own opaque failure. Reads
-/// only: a write is never run twice.
-pub(super) fn may_apply(err: &ExecError, query: &ExecQuery<'_>) -> bool {
-    query.access == Access::ReadOnly
-        && match err {
-            ExecError::Rejected(rejection) => rejection.sqlstate() == NO_BINARY_OUTPUT,
-            ExecError::Sql => true,
-            _ => false,
-        }
-}
-
-/// `query`'s statement with every column the driver cannot take cast to
-/// text, or `None` when the statement does not prepare or has no such
-/// column. `params` are the ones the statement will run with.
+/// `query`'s statement with every one of `columns` (name and type OID, in
+/// order) the driver cannot take cast to text, or `None` when there is no
+/// such column.
 pub(super) async fn text_cast_sql(
-    conn: &mut PgConnection,
-    ctx: &RunCtx<'_>,
-    query: &ExecQuery<'_>,
-    params: &[QueryParam],
-) -> Option<String> {
-    let mut tx = conn.begin().await.ok()?;
-    let wrapped = guarded_probe(&mut tx, ctx, query, params).await;
-    // Read-only and nothing to keep; a failed rollback is the release
-    // hook's to clean up (`release`).
-    let _ = tx.rollback().await;
-    wrapped
-}
-
-/// The probe under the same tag, budget and drop guard as a read of
-/// `query`. The interpolated values are a number and a [`BackendTag`],
-/// which contains no quote.
-async fn guarded_probe(
     tx: &mut Transaction<'_, Postgres>,
-    ctx: &RunCtx<'_>,
     query: &ExecQuery<'_>,
     params: &[QueryParam],
-) -> Option<String> {
-    let tag = BackendTag::for_request(query.request_id);
-    let ms = effective_timeout_ms(query.statement_timeout_ms).min(PROBE_TIMEOUT_MS);
-    let setup = format!(
-        "SET TRANSACTION READ ONLY; SET LOCAL statement_timeout = {ms}; \
-         SET LOCAL application_name = '{}'; \
-         SET LOCAL standard_conforming_strings = on",
-        tag.as_str()
-    );
-    tx.execute(sqlx::AssertSqlSafe(setup)).await.ok()?;
-    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .persistent(false)
-        .fetch_one(&mut **tx)
-        .await
-        .ok()?;
-    let mut cancel = CancelOnDrop::armed(
-        ctx.cancel_pool.clone(),
-        Backend { pid, tag },
-        ctx.detached.clone(),
-    );
-    let wrapped = match statement_body(query.sql) {
-        Some(body) => probe(tx, body, params).await,
-        None => None,
+    columns: &[(String, u32)],
+) -> Result<Option<String>, sqlx::Error> {
+    let Some(body) = statement_body(query.sql) else {
+        return Ok(None);
     };
-    cancel.disarm();
-    wrapped
-}
-
-async fn probe(
-    tx: &mut Transaction<'_, Postgres>,
-    body: &str,
-    params: &[QueryParam],
-) -> Option<String> {
-    let types = param_types(params);
-    // Extended protocol: a second statement in `body` is refused here.
-    prepare(tx, &format!("PREPARE dbmcp_recast{types} AS\n{body}")).await?;
-    tx.execute("DEALLOCATE dbmcp_recast").await.ok()?;
-    prepare(
-        tx,
-        &format!(
-            "PREPARE dbmcp_probe{types} AS SELECT q.* FROM (SELECT 1) AS one LEFT JOIN \
-             (SELECT * FROM (\n{body}\n) AS s LIMIT 0) AS q ON true"
-        ),
-    )
-    .await?;
-    let row = (&mut **tx)
-        .fetch_optional(sqlx::AssertSqlSafe(execute_with_nulls(
-            "dbmcp_probe",
-            params.len(),
-        )))
-        .await
-        .ok()??;
-    tx.execute("DEALLOCATE dbmcp_probe").await.ok()?;
-    let columns: Vec<(String, u32)> = sqlx::Row::columns(&row)
-        .iter()
-        .map(|c| {
-            (
-                c.name().to_string(),
-                c.type_info().oid().map_or(0, |oid| oid.0),
-            )
-        })
-        .collect();
     let oids: Vec<u32> = columns.iter().map(|(_, oid)| *oid).collect();
+    if oids.is_empty() {
+        return Ok(None);
+    }
     let textless = untakeable(tx, &oids).await?;
     if textless.is_empty() {
-        return None;
+        return Ok(None);
     }
+    prove_single_statement(tx, body, params).await?;
     let columns: Vec<(&str, bool)> = columns
         .iter()
         .map(|(name, oid)| (name.as_str(), textless.contains(oid)))
         .collect();
-    Some(wrap(body, &columns))
+    Ok(Some(wrap(body, &columns)))
 }
 
-async fn prepare(tx: &mut Transaction<'_, Postgres>, sql: &str) -> Option<()> {
-    let statement = sqlx::query(sqlx::AssertSqlSafe(sql)).persistent(false);
-    statement.execute(&mut **tx).await.ok().map(drop)
+/// `query`'s result columns, name and type OID, read without the driver's
+/// type lookup and without running the statement.
+pub(super) async fn row_description(
+    tx: &mut Transaction<'_, Postgres>,
+    query: &ExecQuery<'_>,
+    params: &[QueryParam],
+) -> Result<Vec<(String, u32)>, sqlx::Error> {
+    let Some(body) = statement_body(query.sql) else {
+        return Ok(Vec::new());
+    };
+    prove_single_statement(tx, body, params).await?;
+    // `LIMIT 0` never asks its input for a row: the caller's statement is
+    // planned with its params, and none of it runs.
+    let declare = format!(
+        "DECLARE dbmcp_columns NO SCROLL CURSOR FOR SELECT q.* FROM (SELECT 1) AS one \
+         LEFT JOIN (SELECT * FROM (\n{body}\n) AS s LIMIT 0) AS q ON true"
+    );
+    bound_query(sqlx::AssertSqlSafe(declare), query.binds, params)
+        .execute(&mut **tx)
+        .await?;
+    let row = (&mut **tx)
+        .fetch_optional("FETCH 1 FROM dbmcp_columns")
+        .await?;
+    tx.execute("CLOSE dbmcp_columns").await?;
+    let columns = row.map(|row| {
+        sqlx::Row::columns(&row)
+            .iter()
+            .map(|c| {
+                (
+                    c.name().to_string(),
+                    c.type_info().oid().map_or(0, |oid| oid.0),
+                )
+            })
+            .collect()
+    });
+    Ok(columns.unwrap_or_default())
+}
+
+/// `body` prepared alone, with the types `params` run with: a second
+/// statement in it is refused here, before it is nested.
+async fn prove_single_statement(
+    tx: &mut Transaction<'_, Postgres>,
+    body: &str,
+    params: &[QueryParam],
+) -> Result<(), sqlx::Error> {
+    let prepare = format!("PREPARE dbmcp_recast{} AS\n{body}", param_types(params));
+    sqlx::query(sqlx::AssertSqlSafe(prepare))
+        .persistent(false)
+        .execute(&mut **tx)
+        .await?;
+    tx.execute("DEALLOCATE dbmcp_recast").await?;
+    Ok(())
 }
 
 /// The `PREPARE` type list for the types `params` run with (see
 /// [`QueryParam`]), empty without params. Every name is a constant.
-pub(super) fn param_types(params: &[QueryParam]) -> String {
+fn param_types(params: &[QueryParam]) -> String {
     if params.is_empty() {
         return String::new();
     }
@@ -187,17 +143,12 @@ pub(super) fn param_types(params: &[QueryParam]) -> String {
     format!(" ({})", types.join(", "))
 }
 
-/// `EXECUTE name` with `count` NULL arguments.
-pub(super) fn execute_with_nulls(name: &str, count: usize) -> String {
-    match count {
-        0 => format!("EXECUTE {name}"),
-        _ => format!("EXECUTE {name}({})", vec!["NULL"; count].join(", ")),
-    }
-}
-
 /// Which of `types` the driver cannot take, themselves or as an array's
 /// element. The OIDs are numbers, so they are interpolated, not bound.
-async fn untakeable(tx: &mut Transaction<'_, Postgres>, types: &[u32]) -> Option<Vec<u32>> {
+async fn untakeable(
+    tx: &mut Transaction<'_, Postgres>,
+    types: &[u32],
+) -> Result<Vec<u32>, sqlx::Error> {
     let listed = types
         .iter()
         .map(u32::to_string)
@@ -211,9 +162,8 @@ async fn untakeable(tx: &mut Transaction<'_, Postgres>, types: &[u32]) -> Option
     let found: Vec<Oid> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
         .persistent(false)
         .fetch_all(&mut **tx)
-        .await
-        .ok()?;
-    Some(found.into_iter().map(|oid| oid.0).collect())
+        .await?;
+    Ok(found.into_iter().map(|oid| oid.0).collect())
 }
 
 /// The wrapper statement: `columns` are each output column's name and

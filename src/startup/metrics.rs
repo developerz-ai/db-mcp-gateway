@@ -79,10 +79,7 @@ pub(crate) fn install_recorder(shutdown: CancellationToken) -> anyhow::Result<Pr
     let handle = builder()?
         .install_recorder()
         .map_err(|err| anyhow::anyhow!("failed to install Prometheus recorder: {err}"))?;
-    describe_catalogue();
-    preregister::register_static();
-    loaded::record_build_info();
-    loaded::record_process_start();
+    register_boot_series();
     let refresher_stop = shutdown.clone();
     tokio::spawn(async move {
         held::run_refresher(held::held(), held::REFRESH_EVERY, refresher_stop).await;
@@ -132,6 +129,15 @@ async fn spawn_listener_with(
     Ok(local)
 }
 
+/// What the recorder exports from the moment it is installed: the catalogue's
+/// descriptions, the pre-registered counters and the build and start gauges.
+fn register_boot_series() {
+    describe_catalogue();
+    preregister::register_static();
+    loaded::record_build_info();
+    loaded::record_process_start();
+}
+
 /// `# HELP` and `# TYPE` for every catalogued series.
 fn describe_catalogue() {
     use catalogue::{CATALOGUE, Kind};
@@ -163,5 +169,7 @@ async fn render(handle: PrometheusHandle) -> Response {
     response
 }
 
+#[cfg(test)]
+mod docs_tests;
 #[cfg(test)]
 mod tests;

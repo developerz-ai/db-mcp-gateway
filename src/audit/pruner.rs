@@ -154,14 +154,6 @@ async fn prune_table(
 mod tests {
     use super::*;
 
-    // Structural smoke: `run_once` is exposed and takes the expected shape.
-    // The real-DB behaviour is covered by `tests/it_db/audit_pruner_real_db.rs`.
-    #[allow(dead_code)]
-    fn _signature_check(pool: &PgPool) {
-        // Compiles iff the signature stays stable.
-        let _fut = run_once(pool, 90);
-    }
-
     #[test]
     fn ttl_zero_clamps_to_one_day() {
         // `0` would delete every audit row; the floor must hold.

@@ -5,7 +5,8 @@
 //! Action: `SchemaRead`. The adapter lists only the gateway's own roles'
 //! backends; this tool then keeps only the caller's OWN requests (those whose
 //! intent row carries the caller's identity), so one identity never sees
-//! another's activity. No query text: the caller's statements are in its
+//! another's activity. A service-token call that names its run
+//! (`x-dbmcp-run-id`) sees only that run's requests. No query text: the caller's statements are in its
 //! audit rows and `get_query_history`.
 
 use std::collections::HashSet;
@@ -25,7 +26,7 @@ use super::audit_dispatch::{
     reject_arguments, run_audited,
 };
 use super::tabular::tabular_outcome;
-use super::target::{Target, ensure_reason, forbidden, record_intent, resolve_target};
+use super::target::{Target, ensure_reason, forbidden, record_intent, resolve_target, run_scope};
 
 const TOOL_NAME: &str = super::DB_ACTIVITY;
 const ERROR_MESSAGES: ToolErrorMessages = ToolErrorMessages {
@@ -136,6 +137,7 @@ async fn own_rows(
         &target.server.name,
         &target.database.name,
         &tagged,
+        run_scope(ctx),
     )
     .await
     .map_err(|err| {

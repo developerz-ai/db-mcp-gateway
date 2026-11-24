@@ -53,23 +53,28 @@ pub async fn insert_intent(
 /// Of `request_ids`, the ones whose intent row belongs to `user_sub` on
 /// `(server, database)`. Every call that reaches a target commits an intent
 /// first, so this is the ownership check `db_activity` and `cancel_query`
-/// apply before showing or touching another request.
+/// apply before showing or touching another request. `run_id` narrows it to
+/// the intents recorded under that upstream run (spec 14); `None` applies no
+/// run filter.
 pub async fn select_owned_request_ids(
     pool: &PgPool,
     user_sub: &str,
     server: &str,
     database: &str,
     request_ids: &[String],
+    run_id: Option<&str>,
 ) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT request_id FROM audit_call_intents \
          WHERE user_sub = $1 AND server_name = $2 AND database_name = $3 \
-           AND request_id = ANY($4)",
+           AND request_id = ANY($4) \
+           AND ($5::text IS NULL OR upstream_run_id = $5)",
     )
     .bind(user_sub)
     .bind(server)
     .bind(database)
     .bind(request_ids)
+    .bind(run_id)
     .fetch_all(pool)
     .await
 }

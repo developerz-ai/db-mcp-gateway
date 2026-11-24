@@ -7,11 +7,16 @@ use std::path::PathBuf;
 pub use error::ConfigError;
 pub use flag::{BoolFlagError, bool_flag_from_env};
 use mcp_path::validate_mcp_path;
+use parse::{
+    parse_audit_retention, parse_bind, parse_cache_ttl, parse_cap, parse_metrics_bind,
+    parse_pool_size, tls_from_env,
+};
 use session_ttl::parse_session_cache_ttl;
 
 mod error;
 mod flag;
 mod mcp_path;
+mod parse;
 mod session_ttl;
 
 const DEFAULT_STATE_DB_URL: &str = "postgres://gateway:gateway-dev-only@localhost:5433/gateway";
@@ -30,7 +35,6 @@ const DEFAULT_AUDIT_RETENTION_DAYS: u32 = 90;
 /// `PermissionsCache::invalidate` directly so the practical staleness is the
 /// in-flight request, not the TTL.
 const DEFAULT_PERMISSIONS_CACHE_TTL_SECONDS: u64 = 60;
-const MAX_PERMISSIONS_CACHE_TTL_SECONDS: u64 = 300;
 /// A3: freshness TTL for the in-memory session cache. A cache hit older than
 /// this re-reads the state DB, so a session revoked on another replica stops
 /// being honored within this window. Short — revocation is security-critical.
@@ -141,146 +145,116 @@ impl Config {
     ///
     /// `GATEWAY_BIND`, `METRICS_BIND`, `MCP_PATH`, `STATE_DB_URL`, and
     /// `STATE_DB_POOL_SIZE` override the defaults. Malformed values are startup
-    /// errors — config mistakes should fail at boot, not silently.
+    /// errors — config mistakes should fail at boot, not silently. The first
+    /// refusal, in reading order, is the one returned.
     pub fn from_env() -> Result<Self, ConfigError> {
-        let mut config = Config::default();
+        let (config, errors) = Self::read_env();
+        match errors.into_iter().next() {
+            Some(first) => Err(first),
+            None => Ok(config),
+        }
+    }
 
-        if let Ok(value) = std::env::var("GATEWAY_BIND") {
-            config.bind = value
-                .parse()
-                .map_err(|source| ConfigError::Bind { value, source })?;
+    /// Every refusal [`Self::from_env`] would meet, not only the first —
+    /// what `--check` reports.
+    pub fn env_errors() -> Vec<ConfigError> {
+        Self::read_env().1
+    }
+
+    fn read_env() -> (Self, Vec<ConfigError>) {
+        let mut config = Config::default();
+        let mut errors = Vec::new();
+
+        let bind = std::env::var("GATEWAY_BIND")
+            .ok()
+            .map(parse_bind)
+            .transpose();
+        if let Some(bind) = keep(&mut errors, bind) {
+            config.bind = bind;
         }
-        if let Ok(value) = std::env::var("METRICS_BIND") {
-            config.metrics_bind = value
-                .parse()
-                .map_err(|source| ConfigError::MetricsBind { value, source })?;
+        let metrics = std::env::var("METRICS_BIND")
+            .ok()
+            .map(parse_metrics_bind)
+            .transpose();
+        if let Some(bind) = keep(&mut errors, metrics) {
+            config.metrics_bind = bind;
         }
-        if config.metrics_bind == config.bind {
-            return Err(ConfigError::MetricsBindCollides(config.bind));
+        // Only two binds that both parsed can collide.
+        if errors.is_empty() && config.metrics_bind == config.bind {
+            errors.push(ConfigError::MetricsBindCollides(config.bind));
         }
-        if let Ok(path) = std::env::var("MCP_PATH") {
-            config.mcp_path = validate_mcp_path(path)?;
+        let mcp_path = std::env::var("MCP_PATH")
+            .ok()
+            .map(validate_mcp_path)
+            .transpose();
+        if let Some(path) = keep(&mut errors, mcp_path) {
+            config.mcp_path = path;
         }
         if let Ok(url) = std::env::var("STATE_DB_URL") {
             config.state_db.url = url;
         }
         // Read before STATE_DB_POOL_SIZE, which is bounded by the global cap.
-        if let Ok(value) = std::env::var("MAX_CONCURRENT_REQUESTS") {
-            config.max_concurrent_requests = parse_cap("MAX_CONCURRENT_REQUESTS", value)?;
+        let global = std::env::var("MAX_CONCURRENT_REQUESTS")
+            .ok()
+            .map(|value| parse_cap("MAX_CONCURRENT_REQUESTS", value))
+            .transpose();
+        let global_failed = global.is_err();
+        if let Some(cap) = keep(&mut errors, global) {
+            config.max_concurrent_requests = cap;
         }
-        if let Ok(value) = std::env::var("MAX_CONCURRENT_PER_IDENTITY") {
-            config.max_concurrent_per_identity = parse_cap("MAX_CONCURRENT_PER_IDENTITY", value)?;
+        let per_identity = std::env::var("MAX_CONCURRENT_PER_IDENTITY")
+            .ok()
+            .map(|value| parse_cap("MAX_CONCURRENT_PER_IDENTITY", value))
+            .transpose();
+        if let Some(cap) = keep(&mut errors, per_identity) {
+            config.max_concurrent_per_identity = cap;
         }
-        if let Ok(value) = std::env::var("STATE_DB_POOL_SIZE") {
-            config.state_db.pool_size = parse_pool_size(value, config.max_concurrent_requests)?;
+        // An unreadable cap is its own error; the pool is not judged against it.
+        let ceiling = if global_failed {
+            usize::MAX
+        } else {
+            config.max_concurrent_requests
+        };
+        let pool = std::env::var("STATE_DB_POOL_SIZE")
+            .ok()
+            .map(|value| parse_pool_size(value, ceiling))
+            .transpose();
+        if let Some(size) = keep(&mut errors, pool) {
+            config.state_db.pool_size = size;
         }
-        if let Ok(value) = std::env::var("AUDIT_RETENTION_DAYS") {
-            let parsed: u32 = value
-                .parse()
-                .map_err(|source| ConfigError::AuditRetentionDays {
-                    value: value.clone(),
-                    source,
-                })?;
-            // Zero would make the pruner immediately delete every audit row
-            // — a silent durability violation. Reject at boot.
-            if parsed == 0 {
-                return Err(ConfigError::AuditRetentionZero(value));
-            }
-            config.audit_retention_days = parsed;
+        let retention = std::env::var("AUDIT_RETENTION_DAYS")
+            .ok()
+            .map(parse_audit_retention)
+            .transpose();
+        if let Some(days) = keep(&mut errors, retention) {
+            config.audit_retention_days = days;
         }
-        if let Ok(value) = std::env::var("PERMISSIONS_CACHE_TTL_SECONDS") {
-            config.permissions_cache_ttl_seconds = parse_cache_ttl(value)?;
+        let grant_ttl = std::env::var("PERMISSIONS_CACHE_TTL_SECONDS")
+            .ok()
+            .map(parse_cache_ttl)
+            .transpose();
+        if let Some(ttl) = keep(&mut errors, grant_ttl) {
+            config.permissions_cache_ttl_seconds = ttl;
         }
-        if let Ok(value) = std::env::var("SESSION_CACHE_TTL_SECONDS") {
-            config.session_cache_ttl_seconds = parse_session_cache_ttl(&value)?;
+        let session_ttl = std::env::var("SESSION_CACHE_TTL_SECONDS")
+            .ok()
+            .map(|value| parse_session_cache_ttl(&value))
+            .transpose();
+        if let Some(ttl) = keep(&mut errors, session_ttl) {
+            config.session_cache_ttl_seconds = ttl;
         }
-
-        config.tls = tls_from_env()?;
-
-        Ok(config)
+        if let Some(tls) = keep(&mut errors, tls_from_env().map(Some)) {
+            config.tls = tls;
+        }
+        (config, errors)
     }
 }
 
-/// The grant cache bounds how long a revoked grant can still be honoured on a
-/// replica that missed the invalidation; past five minutes that window is an
-/// outage of revocation, so a larger value fails boot rather than being
-/// silently clamped.
-fn parse_cache_ttl(value: String) -> Result<u64, ConfigError> {
-    let ttl: u64 = value
-        .parse()
-        .map_err(|source| ConfigError::PermissionsCacheTtl {
-            value: value.clone(),
-            source,
-        })?;
-    if ttl > MAX_PERMISSIONS_CACHE_TTL_SECONDS {
-        return Err(ConfigError::PermissionsCacheTtlTooLong(ttl));
-    }
-    Ok(ttl)
-}
-
-/// A concurrency ceiling: a positive integer. Zero would shed every request.
-fn parse_cap(name: &'static str, value: String) -> Result<usize, ConfigError> {
-    match value.trim().parse::<usize>() {
-        Ok(0) | Err(_) => Err(ConfigError::ConcurrencyCap { name, value }),
-        Ok(cap) => Ok(cap),
-    }
-}
-
-/// `STATE_DB_POOL_SIZE`: non-zero, and no larger than the request ceiling —
-/// connections past `max_concurrent_requests` can never be checked out at
-/// once, they only hold server slots.
-fn parse_pool_size(
-    value: String,
-    max_concurrent_requests: usize,
-) -> Result<NonZeroU32, ConfigError> {
-    let parsed: u32 = value
-        .parse()
-        .map_err(|source| ConfigError::StateDbPoolSize {
-            value: value.clone(),
-            source,
-        })?;
-    let Some(size) = NonZeroU32::new(parsed) else {
-        return Err(ConfigError::StateDbPoolSizeZero);
-    };
-    if usize::try_from(parsed).is_ok_and(|n| n > max_concurrent_requests) {
-        return Err(ConfigError::StateDbPoolSizeAboveConcurrency {
-            size: parsed,
-            max_concurrent_requests,
-        });
-    }
-    Ok(size)
-}
-
-/// Resolve `TlsConfig` from `TLS_DISABLED` / `TLS_CERT_PATH` / `TLS_KEY_PATH`.
-///
-/// Refuses to boot without TLS unless `TLS_DISABLED=true` is set explicitly —
-/// missing/empty cert paths are *not* an implicit opt-out (issue #12). The
-/// readability check here is cheap and catches the common "sealed-secret
-/// volume isn't mounted" failure before transport spins up.
-fn tls_from_env() -> Result<TlsConfig, ConfigError> {
-    if bool_flag_from_env("TLS_DISABLED")? == Some(true) {
-        return Ok(TlsConfig::Disabled);
-    }
-
-    let cert = std::env::var("TLS_CERT_PATH").ok().map(PathBuf::from);
-    let key = std::env::var("TLS_KEY_PATH").ok().map(PathBuf::from);
-    let (cert_path, key_path) = match (cert, key) {
-        (Some(c), Some(k)) => (c, k),
-        _ => return Err(ConfigError::TlsMissing),
-    };
-
-    std::fs::metadata(&cert_path).map_err(|source| ConfigError::TlsCertUnreadable {
-        path: cert_path.clone(),
-        source,
-    })?;
-    std::fs::metadata(&key_path).map_err(|source| ConfigError::TlsKeyUnreadable {
-        path: key_path.clone(),
-        source,
-    })?;
-
-    Ok(TlsConfig::Enabled {
-        cert_path,
-        key_path,
+/// The parsed value, or `None` with the refusal recorded.
+fn keep<T>(errors: &mut Vec<ConfigError>, result: Result<Option<T>, ConfigError>) -> Option<T> {
+    result.unwrap_or_else(|err| {
+        errors.push(err);
+        None
     })
 }
 

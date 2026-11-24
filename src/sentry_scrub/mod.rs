@@ -109,3 +109,6 @@ fn parse_dsn(raw: &str) -> Option<Dsn> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod proptests;

@@ -97,6 +97,15 @@ pub(super) async fn record_intent(
         })
 }
 
+/// The upstream run a service-token call claimed, which narrows what
+/// `db_activity` lists and `cancel_query` may touch to that run's own
+/// statements (spec 14). Attribution only: it filters the caller's own
+/// requests further, never widens them. `None` for SSO sessions (their
+/// headers are ignored) and for a service call without `x-dbmcp-run-id`.
+pub(super) fn run_scope<'a>(ctx: ToolCtx<'a>) -> Option<&'a str> {
+    ctx.request.upstream.run_id()
+}
+
 /// `Err` with the `reason_required` outcome when the grant demands a reason
 /// and the caller gave none (or a blank one). Applies to every tool that
 /// reaches the target DB, so no tool is a reason-free side door.

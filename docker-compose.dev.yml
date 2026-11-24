@@ -135,8 +135,8 @@ services:
     # Docker's default 10 s grace SIGKILLs tablets mid-flush; the WAL then
     # comes back without its footer and writes time out until the volume is
     # recreated. `stop`/`down` without `-t` use this value. It buys a clean
-    # stop only if the command traps SIGTERM and passes it to yugabyted: bash
-    # as PID 1 ignores an untrapped one, and docker SIGKILLs after the grace.
+    # stop only because the command traps SIGTERM and stops the servers itself
+    # (`stop_yb`), about 10 s: passing it to yugabyted would SIGKILL them.
     stop_grace_period: 120s
     environment:
       YB_APP_USER: ${TARGET_DB_USER:-app}
@@ -148,13 +148,26 @@ services:
       - |
         set -euo pipefail
         addr=$$(hostname -i | awk '{print $$1}')
-        bin/yugabyted start --background=false --ui=false \
+        # Its own session: yugabyted answers SIGTERM by SIGKILLing its process
+        # group, which must not be this shell's.
+        setsid bin/yugabyted start --background=false --ui=false \
           --advertise_address="$$addr" \
           --tserver_flags="ysql_enable_auth=true" &
         yb=$$!
-        # bash as PID 1 ignores SIGTERM: forward it so YugabyteDB flushes and
-        # exits inside stop_grace_period instead of being SIGKILLed mid-write.
-        trap 'kill -TERM "$$yb"; wait "$$yb"; exit 0' TERM
+        # Stop the servers first, so they flush and exit on their own, then
+        # yugabyted, which removes its pid file (a stale one fails the restart).
+        stop_yb() {
+          for name in yb-tserver yb-master; do
+            pid=$$(pgrep -x "$$name" || true)
+            [ -n "$$pid" ] || continue
+            kill -TERM "$$pid" || true
+            while kill -0 "$$pid" 2>/dev/null; do sleep 0.2; done
+          done
+          kill -TERM "$$yb" 2>/dev/null || true
+          wait "$$yb" || true
+          exit 0
+        }
+        trap stop_yb TERM
         export PGPASSWORD=yugabyte
         until bin/ysqlsh -h "$$addr" -U yugabyte -d yugabyte -tAc 'SELECT 1' >/dev/null 2>&1; do
           kill -0 "$$yb" 2>/dev/null || exit 1

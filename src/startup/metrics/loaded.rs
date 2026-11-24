@@ -27,9 +27,7 @@ pub(crate) fn record_build_info() {
     );
 }
 
-/// `process_start_time_seconds`: when this process booted. The audit alerts
-/// read it to tell a new pod's first scrape from scrapes resuming after an
-/// outage (`deploy/prometheus/rules.yaml`).
+/// `process_start_time_seconds`: when this process booted.
 pub(crate) fn record_process_start() {
     held().set("process_start_time_seconds", Vec::new(), unix_now_secs());
 }

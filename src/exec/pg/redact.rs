@@ -185,3 +185,7 @@ fn part_len(text: &str) -> Option<usize> {
 #[cfg(test)]
 #[path = "redact_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "redact_proptests.rs"]
+mod proptests;

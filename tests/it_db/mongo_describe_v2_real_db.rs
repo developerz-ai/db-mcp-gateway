@@ -245,3 +245,54 @@ async fn full_over_http_samples_only_under_query_read() {
     assert!(metadata["collections"][0]["indexes"].is_array());
     assert!(metadata["note"].is_string(), "{metadata}");
 }
+
+/// Field types are the stored BSON element types: a subdocument shaped
+/// exactly like an ObjectId's extended JSON is an `object` holding a
+/// `string`, a real ObjectId an `objectId`, an Int64 a `long`.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn sampled_types_are_bson_types_not_extended_json_shapes() {
+    let a = adapter(SERVER).await;
+    let coll = format!("{}-types", unique_collection("mdesc"));
+    let hex = "65f0c0ffee0000000000abcd";
+    side_client()
+        .database(TARGET_DB)
+        .collection(&coll)
+        .insert_one(doc! {
+            "mimic": { "$oid": hex },
+            "real": mongodb::bson::oid::ObjectId::parse_str(hex).expect("hex"),
+            "when": mongodb::bson::DateTime::from_millis(0),
+            "big": 5_i64,
+            "small": 5_i32,
+            "bytes": mongodb::bson::Binary {
+                subtype: mongodb::bson::spec::BinarySubtype::Generic,
+                bytes: vec![1],
+            },
+        })
+        .await
+        .expect("seed");
+
+    let full = a
+        .describe_schema(schema_query(&coll, SchemaDetail::Full, 5))
+        .await;
+    drop_collection(&side_client(), &coll).await;
+
+    let full = full.expect("full");
+    let sample = &full.rows[0][4];
+    let types = |name: &str| {
+        sample["fields"]
+            .as_array()
+            .and_then(|fields| fields.iter().find(|f| f["name"] == name))
+            .map(|f| f["types"].clone())
+            .unwrap_or(Value::Null)
+    };
+    assert_eq!(types("mimic"), json!(["object"]), "{sample}");
+    assert_eq!(types("mimic.$oid"), json!(["string"]), "{sample}");
+    assert_eq!(types("real"), json!(["objectId"]), "{sample}");
+    assert_eq!(types("_id"), json!(["objectId"]), "{sample}");
+    assert_eq!(types("when"), json!(["date"]), "{sample}");
+    assert_eq!(types("big"), json!(["long"]), "{sample}");
+    assert_eq!(types("small"), json!(["int"]), "{sample}");
+    assert_eq!(types("bytes"), json!(["binary"]), "{sample}");
+    assert!(!sample.to_string().contains(hex), "{sample}");
+}

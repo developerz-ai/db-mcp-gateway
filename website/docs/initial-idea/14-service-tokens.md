@@ -103,6 +103,18 @@ not *which run* or *for whom*. Two request headers carry that:
 - **History is per run.** `get_query_history` called with `x-dbmcp-run-id`
   returns only rows recorded with that run id, so agents sharing a token do
   not read each other's history by default ([03](03-mcp-tools.md)).
+- **Activity and cancel are per run.** `db_activity` and `cancel_query`
+  called with `x-dbmcp-run-id` see and touch only statements whose intent row
+  recorded that run id. Another run's `request_id` answers `cancel_query`
+  exactly like an unknown one (`forbidden`, same message), so a run cannot
+  learn that other runs' statements exist. Without the header the call keeps
+  the account-wide view (refused instead under `require_upstream`). The run
+  id only narrows the caller's own requests; it never reaches past the
+  `service:<name>` identity ([03](03-mcp-tools.md)).
+- **The request id to cancel.** Every response carries the gateway's
+  `x-request-id` header and every error body its `request_id`; while a
+  statement is still running, `db_activity` with the run's header lists its
+  `request_id` — the id `cancel_query` takes.
 
 ### Per-account concurrency
 

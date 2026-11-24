@@ -129,13 +129,11 @@ impl AuthConfig {
         if let Ok(value) = std::env::var("OIDC_GROUPS_CLAIM") {
             config.groups_claim = value;
         }
-        if let Ok(value) = std::env::var("SESSION_TTL_HOURS") {
-            config.session_ttl =
-                parse_ttl("SESSION_TTL_HOURS", &value, 3600, SESSION_TTL_HOURS_MAX)?;
+        if let Some(ttl) = Self::session_ttl_from_env()? {
+            config.session_ttl = ttl;
         }
-        if let Ok(value) = std::env::var("REFRESH_TTL_DAYS") {
-            config.refresh_ttl =
-                parse_ttl("REFRESH_TTL_DAYS", &value, 24 * 3600, REFRESH_TTL_DAYS_MAX)?;
+        if let Some(ttl) = Self::refresh_ttl_from_env()? {
+            config.refresh_ttl = ttl;
         }
         if let Ok(value) = std::env::var("SESSION_SIGNING_KEY") {
             config.session_signing_key = value.into_bytes().into();
@@ -154,6 +152,18 @@ impl AuthConfig {
         Ok(config)
     }
 
+    /// `SESSION_TTL_HOURS`, as boot reads it; `Ok(None)` when unset.
+    pub fn session_ttl_from_env() -> Result<Option<Duration>, AuthConfigError> {
+        let raw = std::env::var("SESSION_TTL_HOURS").ok();
+        parse_ttl_if_set("SESSION_TTL_HOURS", raw, 3600, SESSION_TTL_HOURS_MAX)
+    }
+
+    /// `REFRESH_TTL_DAYS`, as boot reads it; `Ok(None)` when unset.
+    pub fn refresh_ttl_from_env() -> Result<Option<Duration>, AuthConfigError> {
+        let raw = std::env::var("REFRESH_TTL_DAYS").ok();
+        parse_ttl_if_set("REFRESH_TTL_DAYS", raw, 24 * 3600, REFRESH_TTL_DAYS_MAX)
+    }
+
     /// Refuse the insecure-key waiver on a listener reachable beyond loopback.
     /// Separate from [`Self::from_env`] because the bind is `Config`'s, not ours.
     pub fn check_bind(&self, bind: SocketAddr) -> Result<(), AuthConfigError> {
@@ -169,6 +179,16 @@ fn required(var: &'static str) -> Result<String, AuthConfigError> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .ok_or(AuthConfigError::Missing { var })
+}
+
+fn parse_ttl_if_set(
+    var: &'static str,
+    raw: Option<String>,
+    unit_secs: u64,
+    max: u64,
+) -> Result<Option<Duration>, AuthConfigError> {
+    raw.map(|value| parse_ttl(var, &value, unit_secs, max))
+        .transpose()
 }
 
 /// Parse a whole number of `unit_secs` units in `1..=max`.

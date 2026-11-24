@@ -10,9 +10,12 @@
 //! - the tool lists name exactly the advertised tools;
 //! - the log contract lists every audit outcome code, and no doc uses a
 //!   retired one;
-//! - every metric in the catalogue is named by shipped code;
 //! - every documented or shipped MCP client URL ends in the MCP path;
 //! - every gateway config under `examples/` parses.
+//!
+//! The metric table is checked against the recorder's rendered output, not
+//! source text: `src/startup/metrics/docs_tests.rs` (a binary unit test, where
+//! the recorder setup lives).
 
 // CLAUDE.md §Conventions: tests may panic; `[lints.clippy]` denies it for shipped code.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -517,22 +520,6 @@ fn outcome_codes_match_the_code() {
         for retired in RETIRED_CODES {
             assert!(!text.contains(retired), "{rel} mentions {retired}");
         }
-    }
-}
-
-#[test]
-fn catalogued_metrics_are_emitted() {
-    let metrics = first_column_names(&read(QUICKSTART), "### Metric catalogue");
-    assert!(
-        metrics.len() >= 10,
-        "metric catalogue not found: {metrics:?}"
-    );
-    let code = src();
-    for name in &metrics {
-        assert!(
-            code.contains(&format!("\"{name}\"")),
-            "{name}: never emitted"
-        );
     }
 }
 

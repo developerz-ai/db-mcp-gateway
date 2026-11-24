@@ -14,15 +14,10 @@ use super::super::adapter::{ExecError, ExecResult, effective_timeout_ms};
 use super::super::query::{ExecQuery, QueryParam};
 use super::super::sql_guard::Access;
 use super::cancel::{Backend, BackendTag, CancelOnDrop};
-use super::describe::describe_columns;
+use super::describe::describe_read;
 use super::error::{Origin, classify, classify_commit};
-use super::recast;
 use super::stream::stream_rows;
 use super::truncate::cancel_and_rollback;
-
-/// Longest the zero-row column lookup may take. It is a parse, not an
-/// execution; this only bounds a target that stalls on it.
-const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// What one run needs besides the query: where cancels go and run, where its
 /// errors are logged from (and the role name to redact from server
@@ -34,36 +29,10 @@ pub(super) struct RunCtx<'a> {
     pub(super) large_rows: &'a Semaphore,
 }
 
-/// Run `query` in its own transaction. A read the target refused because a
-/// column's type has no binary form is run once more with those columns
-/// cast to text (see [`recast`]); when that is not possible, or the target
-/// refuses the second statement too, the first refusal is the answer. The
-/// second attempt is the one that ran, so its timeout, cancel or lost
-/// connection is the answer. `params` are bound to both attempts.
+/// Run `query` in its own transaction. A read is described first (see
+/// [`describe`](super::describe)): when a column's type has no binary form
+/// the driver can take, the text-cast statement runs instead of it — once.
 pub(super) async fn run_query(
-    conn: &mut PgConnection,
-    ctx: &RunCtx<'_>,
-    query: &ExecQuery<'_>,
-    params: &[QueryParam],
-) -> Result<ExecResult, ExecError> {
-    let refused = match run_query_inner(conn, ctx, query, params).await {
-        Err(err) if recast::may_apply(&err, query) => err,
-        done => return done,
-    };
-    let Some(sql) = recast::text_cast_sql(conn, ctx, query, params).await else {
-        return Err(refused);
-    };
-    let recast = ExecQuery {
-        sql: &sql,
-        ..*query
-    };
-    match run_query_inner(conn, ctx, &recast, params).await {
-        Err(ExecError::Sql | ExecError::Rejected(_)) => Err(refused),
-        done => done,
-    }
-}
-
-async fn run_query_inner(
     conn: &mut PgConnection,
     ctx: &RunCtx<'_>,
     query: &ExecQuery<'_>,
@@ -128,28 +97,31 @@ async fn run_query_inner(
     // / outer `tokio::time::timeout`): the one case where the backend is
     // still running and must be cancelled.
     let result = async {
-        let collected =
-            stream_rows(&mut tx, query, params, origin, ctx.large_rows, money_digits).await?;
-        let (mut columns, mut column_types) = (collected.columns, collected.column_types);
-        // Reads only. Inside a write's transaction a failed lookup would
-        // abort it, and the `COMMIT` that follows would then roll the write
-        // back while reporting success.
-        let mut in_step = true;
-        if columns.is_empty() && query.access == Access::ReadOnly {
-            let left = Duration::from_millis(u64::from(ms)).saturating_sub(started.elapsed());
-            let budget = left.min(DESCRIBE_TIMEOUT);
-            match describe_columns(&mut tx, query.sql, params, budget).await {
-                Some(described) => (columns, column_types) = described,
-                None => in_step = false,
-            }
-        }
-        if !in_step {
-            // The lookup is still in flight on this connection and the read
-            // is already answered: waiting for the connection again could
-            // only turn that answer into a timeout. Dropping the transaction
-            // rolls it back when the connection is released.
-            drop(tx);
-        } else if query.access == Access::ReadOnly && collected.truncated {
+        let described = match query.access {
+            Access::ReadOnly => Some(describe_read(&mut tx, query, params, origin).await?),
+            Access::ReadWrite => None,
+        };
+        let sql = described
+            .as_ref()
+            .and_then(|described| described.recast.as_deref())
+            .unwrap_or(query.sql);
+        let to_run = ExecQuery { sql, ..*query };
+        let collected = stream_rows(
+            &mut tx,
+            &to_run,
+            params,
+            origin,
+            ctx.large_rows,
+            money_digits,
+        )
+        .await?;
+        // A read's columns come from its description: a zero-row read has
+        // no row to name them (#136).
+        let (columns, column_types) = match described {
+            Some(described) => (described.columns, described.column_types),
+            None => (collected.columns, collected.column_types),
+        };
+        if query.access == Access::ReadOnly && collected.truncated {
             cancel_and_rollback(tx, ctx.cancel_pool, &backend).await;
         } else if query.dry_run {
             // The statement ran to completion; its effect is discarded. A

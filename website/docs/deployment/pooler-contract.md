@@ -15,7 +15,7 @@ SET LOCAL statement_timeout = <ms>;
 SET LOCAL application_name = 'dbmcp-<request-id>-<nonce>';
 SET LOCAL standard_conforming_strings = on;
 SELECT pg_backend_pid();
-<the statement>                       -- unnamed (unprepared) statement
+<the statement>                       -- a read: prepared by name, then bound once; a write: unnamed
 COMMIT;                               -- ROLLBACK for dry_run / errors
 ```
 
@@ -26,7 +26,7 @@ When the connection goes back to the gateway's pool it runs one simple-query bat
 | # | Requirement | What breaks otherwise |
 |---|---|---|
 | 1 | **Session pooling, or transaction pooling with a server reset (rule 8).** *Statement* pooling does not work | Statement mode cannot run a multi-statement transaction: every call fails |
-| 2 | **Named prepared statements across the transaction.** The driver (sqlx) prepares its own fixed statements by name and reuses them per connection. In transaction mode the pooler must track them: PgBouncer ≥ 1.21 with `max_prepared_statements` > 0, pgcat with prepared-statement support on | `prepared statement "sqlx_s_…" does not exist` errors, intermittently |
+| 2 | **Named prepared statements across the transaction.** Every read is prepared by name (`sqlx_s_…`) inside its transaction and bound there; the name is closed when the connection is released. In transaction mode the pooler must track them: PgBouncer ≥ 1.21 with `max_prepared_statements` > 0, pgcat with prepared-statement support on | `prepared statement "sqlx_s_…" does not exist` (or `already exists`) errors on reads, intermittently |
 | 3 | **The configured role reaches Postgres.** Pass the client's user through (auth passthrough / `auth_query`), not one shared pooler user | Every query runs with the pooler user's privileges: the read-only role, and the read/write split, stop meaning anything |
 | 4 | **One Postgres server per endpoint.** The cancel connection must reach the same server as the query connection | `pg_stat_activity` on another node does not see the backend: cancel-on-disconnect, `cancel_query` and `db_activity` silently find nothing. Statements still end at `statement_timeout` |
 | 5 | **`SET LOCAL` and `application_name` pass through.** Poolers that rewrite or drop `application_name` defeat the cancel identity check | Same as 4: cancels and `db_activity` miss |

@@ -202,9 +202,8 @@ impl ConfigFile {
         Ok(parsed)
     }
 
-    /// String-input twin of `load`. Same fail-fast contract; useful for
-    /// in-memory configs (tests with literal passwords, `SIGHUP` reload
-    /// once the watcher hands us the new YAML).
+    /// String-input twin of `load` for in-src tests. Same fail-fast contract.
+    #[cfg(test)]
     pub fn load_yaml_str(raw: &str) -> Result<Self, ConfigLoadError> {
         let parsed = Self::from_yaml_str(raw)?;
         parsed.resolve_secrets()?;
@@ -235,7 +234,7 @@ impl ConfigFile {
     }
 
     /// Parse + structural validation only. See `from_file` for the contract;
-    /// use `load_yaml_str` for the fail-fast variant.
+    /// use `load` for the fail-fast variant.
     ///
     /// The single place config YAML is parsed. Any new parse site must go
     /// through [`non_leaking_options`] too — `serde_saphyr::from_str` defaults
@@ -259,7 +258,7 @@ impl ConfigFile {
     /// the typed `SecretError` directly so callers (tests, the `SIGHUP`
     /// reload path) see exactly which env var or file went wrong.
     ///
-    /// `load` / `load_yaml_str` call this for you; reach for `resolve_secrets`
+    /// `load` calls this for you; reach for `resolve_secrets`
     /// directly only when re-resolving an already-parsed config (e.g. a
     /// hot-reload watcher that wants to check rotated `${FILE:…}` mounts
     /// without re-parsing the YAML).

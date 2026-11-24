@@ -15,7 +15,7 @@ use super::super::query::{ExecQuery, SampleQuery, SchemaDetail, SchemaQuery};
 use super::super::rejection::RejectionKind;
 use super::super::sql_guard::Access;
 use super::MongoAdapter;
-use super::infer::infer_fields;
+use super::infer::{field_types, infer_fields};
 use super::rejector::is_system_collection;
 
 /// Indexes listed per collection. Mongo allows 64; the cap only bounds a
@@ -27,7 +27,7 @@ impl MongoAdapter {
     /// `indexes` at `columns` and `full`, plus `sample` (see
     /// [`infer_fields`]) at `full`. The whole listing — one
     /// `listCollections`, then per collection one `listIndexes` and the
-    /// sample's `find` — shares a single time budget.
+    /// sample's `aggregate` — shares a single time budget.
     pub(super) async fn describe(&self, query: SchemaQuery<'_>) -> Result<ExecResult, ExecError> {
         let effective_ms = effective_timeout_ms(query.statement_timeout_ms);
         let budget = Duration::from_millis(u64::from(effective_ms) + TOKIO_TIMEOUT_SLACK_MS);
@@ -130,8 +130,8 @@ impl MongoAdapter {
     /// may list but not read is still listed, its sample withheld: one
     /// unreadable collection never sinks the whole listing.
     async fn sample(&self, collection: &str, query: &SchemaQuery<'_>) -> Result<Value, ExecError> {
-        match self.sample_documents(collection, query).await {
-            Ok(documents) => Ok(infer_fields(&documents)),
+        match self.sample_field_trees(collection, query).await {
+            Ok(trees) => Ok(infer_fields(&trees)),
             Err(ExecError::Rejected(rejection))
                 if rejection.kind() == RejectionKind::PermissionDenied =>
             {
@@ -141,20 +141,26 @@ impl MongoAdapter {
         }
     }
 
-    /// Up to `query.sample_limit` documents of `collection`, through
-    /// `execute` like any `find` the caller could run.
-    async fn sample_documents(
+    /// The field trees (see [`field_types`]) of up to `query.sample_limit`
+    /// documents of `collection`, through `execute` like any `aggregate` the
+    /// caller could run.
+    async fn sample_field_trees(
         &self,
         collection: &str,
         query: &SchemaQuery<'_>,
     ) -> Result<Vec<Value>, ExecError> {
-        let command = json!({ "find": collection, "filter": {} });
+        let command = json!({
+            "aggregate": collection,
+            "pipeline": [{ "$project": { "_id": 0, "fields": field_types() } }],
+            "cursor": {},
+        });
         let found = self.read(&command, query.sample_limit, query).await?;
-        Ok(found
+        found
             .rows
-            .into_iter()
-            .filter_map(|row| row.into_iter().next())
-            .collect())
+            .iter()
+            .filter_map(|row| row.first())
+            .map(|tree| tree.get("fields").cloned().ok_or(ExecError::Decode))
+            .collect()
     }
 
     /// `[{name, key, unique}]` for one collection.
