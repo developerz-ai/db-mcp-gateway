@@ -11,6 +11,7 @@
 //! query results must never be handed a null that was really a `uuid`, a
 //! `timestamptz`, or a money `numeric` (#136).
 
+mod datetime;
 mod render;
 
 use serde_json::Value;
@@ -37,7 +38,9 @@ pub(super) enum ColumnDecoder {
     /// columns are made of, and `f64` would silently round it.
     Numeric,
     Uuid,
-    /// RFC 3339, normalised to UTC.
+    /// RFC 3339, normalised to UTC. Like every date/time decoder below:
+    /// `infinity` / `-infinity` for Postgres' infinities, and a signed year
+    /// outside `0000..=9999` (see [`datetime`]).
     TimestampTz,
     /// ISO-8601 with the `T` separator and no zone — Postgres stores none.
     Timestamp,
@@ -141,15 +144,10 @@ impl ColumnDecoder {
             Self::Text => get::<String>(row, idx).map(Value::from),
             Self::Numeric => get::<BigDecimal>(row, idx).map(|v| Value::from(v.to_string())),
             Self::Uuid => get::<Uuid>(row, idx).map(|v| Value::from(v.to_string())),
-            Self::TimestampTz => {
-                get::<chrono::DateTime<chrono::Utc>>(row, idx).map(|v| Value::from(v.to_rfc3339()))
-            }
-            // `%.f` keeps fractional seconds when present and elides them
-            // when zero, matching Postgres round-tripping.
-            Self::Timestamp => get::<chrono::NaiveDateTime>(row, idx)
-                .map(|v| Value::from(v.format("%Y-%m-%dT%H:%M:%S%.f").to_string())),
-            Self::Date => get::<chrono::NaiveDate>(row, idx).map(|v| Value::from(v.to_string())),
-            Self::Time => get::<chrono::NaiveTime>(row, idx).map(|v| Value::from(v.to_string())),
+            Self::TimestampTz => datetime::timestamptz(&raw).map(Value::from).ok_or(()),
+            Self::Timestamp => datetime::timestamp(&raw).map(Value::from).ok_or(()),
+            Self::Date => datetime::date(&raw).map(Value::from).ok_or(()),
+            Self::Time => datetime::time(&raw).map(Value::from).ok_or(()),
             Self::Bytea => get::<Vec<u8>>(row, idx).map(|v| Value::from(hex(&v))),
             Self::Interval => get::<sqlx::postgres::types::PgInterval>(row, idx)
                 .map(|v| Value::from(interval(&v))),

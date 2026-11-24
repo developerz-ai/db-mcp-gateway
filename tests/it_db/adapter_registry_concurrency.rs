@@ -44,7 +44,7 @@ const FAILED_OPEN_TTL: Duration = Duration::from_secs(5);
 /// A listener that completes the TCP handshake and then goes silent, so a
 /// Postgres client blocks waiting for a startup response that never comes.
 /// The accept loop holds each connection open for the life of the test.
-async fn spawn_blackhole() -> u16 {
+pub(crate) async fn spawn_blackhole() -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {

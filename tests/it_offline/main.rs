@@ -10,6 +10,7 @@ mod auth_hardening_id_token;
 mod auth_reserved_subject;
 mod isolation_guard;
 mod oauth_discovery;
+mod oauth_slow_body;
 mod permissions_shipped_yml;
 mod redis_tls;
 mod tls_reload;

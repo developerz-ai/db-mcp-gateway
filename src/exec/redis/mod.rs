@@ -36,7 +36,7 @@ use crate::config::{Database, Server, Tls};
 
 use super::adapter::{AdapterKind, DbAdapter, ExecError, ExecResult, effective_timeout_ms};
 use super::pg::resolve_password;
-use super::pool_sizing::PoolSizing;
+use super::pool_sizing::{CallerSlots, PoolSizing};
 use super::query::{
     ActivityQuery, ExecQuery, ExplainQuery, SampleQuery, SchemaQuery, TableStatsQuery,
 };
@@ -55,6 +55,8 @@ const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 /// a slow command on one never blocks another.
 pub struct RedisAdapter {
     pool: Arc<ConnPool>,
+    /// Each caller's share of `pool`.
+    callers: CallerSlots,
     /// `server/db` for logs — from config, bounded cardinality.
     db_label: String,
     /// The ACL username, redacted out of every server message.
@@ -128,6 +130,7 @@ impl RedisAdapter {
         .map_err(|_| ExecError::Connection)?;
         Ok(Self {
             pool: ConnPool::new(client, sizing),
+            callers: CallerSlots::new(sizing),
             db_label,
             role: database.role.clone(),
             stale: AtomicBool::new(false),
@@ -212,6 +215,8 @@ impl DbAdapter for RedisAdapter {
     async fn execute(&self, query: ExecQuery<'_>) -> Result<ExecResult, ExecError> {
         let command = rejector::validate_command(query.sql)
             .map_err(|err| ExecError::Forbidden(err.to_string()))?;
+        // The caller's share of the pool first, as on Postgres.
+        let _slot = self.callers.take(POOL_ACQUIRE_TIMEOUT).await?;
         let lease = self.lease().await?;
         let budget =
             Duration::from_millis(u64::from(effective_timeout_ms(query.statement_timeout_ms)));

@@ -40,6 +40,53 @@ const FAMILIES: &[(&str, &str)] = &[
         "ts_rewrite('a'::tsquery, 'SELECT q, r FROM t')",
         "ts_rewrite",
     ),
+    ("crosstab('select 1, 2, 3')", "crosstab*"),
+    ("crosstab4('select 1, 2, 3')", "crosstab*"),
+    ("connectby('t', 'k', 'p', '1', 0)", "connectby"),
+    ("xpath_table('k', 'doc', 't', '/a', 'true')", "xpath_table"),
+    (
+        "aws_s3.query_export_to_s3('select 1', 's3uri')",
+        "query_export_to_s3",
+    ),
+    (
+        "aws_s3.table_import_from_s3('t', '', '', 's3uri')",
+        "table_import_from_s3",
+    ),
+    ("aws_lambda.invoke('fn', '{}'::json)", "invoke"),
+    ("http(('GET', 'http://x', NULL, NULL, NULL))", "http"),
+    ("http_get('http://169.254.169.254/')", "http_get"),
+    ("net.http_post('http://x', '{}'::jsonb)", "http_post"),
+    ("http_set_curlopt('CURLOPT_PROXY', 'x')", "http_set_curlopt"),
+    (
+        "pg_logical_slot_get_changes('s', NULL, NULL)",
+        "pg_logical_slot_*",
+    ),
+    (
+        "pg_logical_slot_peek_binary_changes('s', NULL, NULL)",
+        "pg_logical_slot_*",
+    ),
+    (
+        "pg_replication_slot_advance('s', '0/1')",
+        "pg_replication_slot_advance",
+    ),
+    ("pg_drop_replication_slot('s')", "pg_drop_replication_slot"),
+    (
+        "pg_create_logical_replication_slot('s', 'pgoutput')",
+        "pg_create_*",
+    ),
+    ("pg_create_physical_replication_slot('s')", "pg_create_*"),
+    ("pg_copy_logical_replication_slot('s', 'd')", "pg_copy_*"),
+    (
+        "pg_replication_origin_advance('o', '0/1')",
+        "pg_replication_origin_*",
+    ),
+    ("pg_stat_reset()", "pg_stat_reset*"),
+    ("pg_stat_reset_shared('bgwriter')", "pg_stat_reset*"),
+    ("pg_stat_statements_reset()", "pg_stat_statements_reset"),
+    ("setseed(0.5)", "setseed"),
+    ("pg_stat_get_activity(NULL)", "pg_stat_get_activity"),
+    ("pg_stat_get_backend_activity(1)", "pg_stat_get_backend_*"),
+    ("pg_prepared_statement()", "pg_prepared_statement"),
 ];
 
 fn denied_as(sql: &str, want: &str) {

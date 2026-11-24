@@ -149,7 +149,11 @@ async fn release_2_1_0_client_queries_run_on_the_0019_schema() {
     .expect("2.1.0-shaped insert");
     assert_eq!(inserted.rows_affected(), 1);
     let registry = ClientRegistry::with_db(pool.clone());
-    let record = registry.lookup(&old_id).await.expect("live");
+    let record = registry
+        .lookup(&old_id)
+        .await
+        .expect("state DB")
+        .expect("live");
     assert_eq!(record.redirect_uris, vec![HTTPS_REDIRECT.to_string()]);
     assert_eq!(record.client_name, None);
 

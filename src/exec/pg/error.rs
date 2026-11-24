@@ -5,6 +5,10 @@
 //! request path never leaks credentials. Logs carry the variant name and the
 //! SQLSTATE only; the agent gets SQLSTATE + server message for a
 //! statement-level error and an opaque code for everything else.
+//!
+//! The message is also what the audit row and its sinks keep, so it must not
+//! carry row data: outside the classes whose quoted text is a name the
+//! statement itself spelled, quoted text is cut (see [`redact_values`]).
 
 use super::super::adapter::ExecError;
 use super::super::rejection::DbRejection;
@@ -26,13 +30,54 @@ pub(super) fn classify(err: sqlx::Error, role: &str) -> ExecError {
             c if c.starts_with("08") || c.starts_with("57P") || c.starts_with("53") => {
                 ExecError::Unavailable
             }
-            c => ExecError::Rejected(DbRejection::new(c, db.message(), role)),
+            // Invalid authorization: a login refusal, whose text names the
+            // role and can name the client address. Never passed on, however
+            // it got here.
+            c if c.starts_with("28") => ExecError::Connection,
+            c => ExecError::Rejected(DbRejection::new(c, &redact_values(c, db.message()), role)),
         };
     }
     if matches!(err, sqlx::Error::PoolTimedOut | sqlx::Error::Io(_)) {
         return ExecError::Unavailable;
     }
     ExecError::Sql
+}
+
+/// Stand-in for the quoted text cut from a server message.
+const VALUE_PLACEHOLDER: &str = "\"<value>\"";
+
+/// SQLSTATE classes whose messages quote only names from the statement:
+/// `42` (syntax error or access rule violation — the token, column, table
+/// or function the caller wrote), `23` (the violated constraint, its table
+/// and column; the offending row is in `DETAIL`, which is never read) and
+/// `3D` / `3F` (an unknown database or schema).
+const NAME_QUOTING_CLASSES: [&str; 4] = ["42", "23", "3D", "3F"];
+
+/// `message` without the values it quotes. Everywhere but
+/// [`NAME_QUOTING_CLASSES`], what Postgres puts in double quotes is data —
+/// `invalid input syntax for type integer: "alice@example.com"` — and data
+/// read from a table must not outlive the call in an audit row. Postgres
+/// does not escape a quote inside the value, so everything from the first
+/// quote to the last goes, not each pair.
+fn redact_values(sqlstate: &str, message: &str) -> String {
+    if NAME_QUOTING_CLASSES
+        .iter()
+        .any(|class| sqlstate.starts_with(class))
+    {
+        return message.to_string();
+    }
+    match (message.find('"'), message.rfind('"')) {
+        (Some(first), Some(last)) => format!(
+            "{}{VALUE_PLACEHOLDER}{}",
+            &message[..first],
+            if first == last {
+                ""
+            } else {
+                &message[last + 1..]
+            }
+        ),
+        _ => message.to_string(),
+    }
 }
 
 /// Classify a failed `COMMIT`. A server refusal (deferred constraint,
@@ -147,6 +192,52 @@ mod tests {
             AcquireFailure::of(&sqlx::Error::PoolTimedOut),
             AcquireFailure::Other
         );
+    }
+
+    #[test]
+    fn quoted_values_are_cut_outside_the_name_quoting_classes() {
+        assert_eq!(
+            redact_values(
+                "22P02",
+                r#"invalid input syntax for type integer: "alice@example.com""#
+            ),
+            r#"invalid input syntax for type integer: "<value>""#
+        );
+        assert_eq!(
+            redact_values(
+                "22003",
+                r#"value "99999999999" is out of range for type integer"#
+            ),
+            r#"value "<value>" is out of range for type integer"#
+        );
+        // A quote inside the value does not end the cut early.
+        assert_eq!(
+            redact_values("22P02", r#"invalid input syntax for type uuid: "a" b "c""#),
+            r#"invalid input syntax for type uuid: "<value>""#
+        );
+        assert_eq!(
+            redact_values("22P02", r#"bad: "unterminated"#),
+            r#"bad: "<value>""#
+        );
+        assert_eq!(
+            redact_values("22012", "division by zero"),
+            "division by zero"
+        );
+    }
+
+    #[test]
+    fn names_the_statement_spelled_are_kept() {
+        for (sqlstate, message) in [
+            ("42703", r#"column "nope" does not exist"#),
+            ("42601", r#"syntax error at or near "FORM""#),
+            (
+                "23505",
+                r#"duplicate key value violates unique constraint "users_pkey""#,
+            ),
+            ("3F000", r#"schema "nope" does not exist"#),
+        ] {
+            assert_eq!(redact_values(sqlstate, message), message);
+        }
     }
 
     fn io_reset() -> sqlx::Error {

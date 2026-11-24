@@ -81,9 +81,11 @@ impl RefreshTokens {
 
         let mut tx = pool.begin().await?;
         let presented_hash = hash_secret(presented);
-        // Lock before consuming, so a concurrent reuse-revocation of this
-        // chain sees either none or all of this rotation.
-        if let Some(chain_id) = db::live_chain(&mut *tx, &presented_hash).await? {
+        // Lock before consuming, so a concurrent logout of this subject or
+        // reuse-revocation of this chain sees either none or all of this
+        // rotation.
+        if let Some((sub, chain_id)) = db::live_chain(&mut *tx, &presented_hash).await? {
+            db::lock_subject(&mut *tx, &sub).await?;
             db::lock_chain(&mut *tx, chain_id).await?;
         }
         let Some(row) = db::rotate_out_refresh_token(&mut *tx, &presented_hash).await? else {
@@ -149,7 +151,8 @@ impl RefreshTokens {
     }
 
     /// Logout: revoke every session of `sub` and drop every refresh chain, in
-    /// one transaction. Returns the number of sessions revoked.
+    /// one transaction, after waiting out any in-flight mint or rotation for
+    /// `sub`. Returns the number of sessions revoked.
     pub async fn end_all_for_sub(
         &self,
         sessions: &SessionStore,
@@ -161,6 +164,7 @@ impl RefreshTokens {
             return Ok(revoked);
         };
         let mut tx = pool.begin().await?;
+        db::lock_subject(&mut *tx, sub).await?;
         let revoked = SessionStore::revoke_all_for_sub_in(&mut tx, sub).await?;
         db::delete_refresh_tokens_for_sub(&mut *tx, sub).await?;
         tx.commit().await?;
@@ -202,6 +206,7 @@ impl RefreshTokens {
         };
         let session = new_session(&identity, session_ttl, chain_born);
         let mut tx = pool.begin().await?;
+        db::lock_subject(&mut *tx, &identity.sub).await?;
         SessionStore::insert_in(&mut tx, &session).await?;
         // A fresh chain is born with its session, so both clocks start together.
         self.store_paired(

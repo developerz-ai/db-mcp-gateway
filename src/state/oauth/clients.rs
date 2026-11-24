@@ -7,7 +7,7 @@
 use sqlx::types::Json;
 use sqlx::{PgExecutor, PgPool};
 
-/// A live registration as read back by [`touch_client`].
+/// A live registration as read back by [`find_client`].
 #[derive(Debug, sqlx::FromRow)]
 pub struct ClientRow {
     pub redirect_uris: Json<Vec<String>>,
@@ -17,8 +17,8 @@ pub struct ClientRow {
 }
 
 /// Rows a capped client insert may evict: expired, or never authorised
-/// (`expires_at` still within `unused_ttl` of `created_at` — a successful
-/// `/authorize` slides it far past that).
+/// (`expires_at` still within `unused_ttl` of `created_at` — a completed
+/// login slides it far past that).
 const EVICTABLE_CLIENT: &str = "expires_at <= now() OR expires_at <= created_at + $4";
 
 /// Returns the number of rows deleted.
@@ -29,12 +29,23 @@ pub async fn delete_expired_clients(pool: &PgPool) -> Result<u64, sqlx::Error> {
     Ok(result.rows_affected())
 }
 
+/// What a capped insert does to a still-live row with the same `client_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveClient {
+    /// `/register`: the caller owns the id it was just issued.
+    Replace,
+    /// `/authorize` adoption: the id is caller-chosen, so an existing live
+    /// registration's redirect URIs must survive it.
+    Keep,
+}
+
 /// Register a client with the never-authorised TTL, in one statement. At
 /// `cap` rows it first evicts the oldest evictable row; if none is evictable
-/// the insert is refused (`false`). Re-registering an existing `client_id`
-/// replaces its URIs and name and keeps a live row's expiry; a lapsed,
-/// not-yet-GC'd row is reset as if new, so `/authorize` adoption of a cached
-/// id can revive it. At the cap it needs the same room as a new client.
+/// the insert is refused (`false`). A lapsed, not-yet-GC'd row with the same
+/// `client_id` is reset as if new, so `/authorize` adoption of a cached id
+/// can revive it. A live one keeps its expiry and, per `live`, either takes
+/// the new URIs and name or is left untouched (`false`). At the cap a
+/// re-registration needs the same room as a new client.
 pub async fn insert_client_capped(
     conn: impl PgExecutor<'_>,
     client_id: &str,
@@ -42,7 +53,12 @@ pub async fn insert_client_capped(
     client_name: Option<&str>,
     cap: i64,
     unused_ttl: chrono::Duration,
+    live: LiveClient,
 ) -> Result<bool, sqlx::Error> {
+    let only_lapsed = match live {
+        LiveClient::Replace => "",
+        LiveClient::Keep => " WHERE oauth_clients.expires_at <= now()",
+    };
     let sql = format!(
         "WITH evicted AS ( \
            DELETE FROM oauth_clients WHERE client_id IN ( \
@@ -59,7 +75,8 @@ pub async fn insert_client_capped(
            created_at = CASE WHEN oauth_clients.expires_at <= now() \
              THEN EXCLUDED.created_at ELSE oauth_clients.created_at END, \
            expires_at = CASE WHEN oauth_clients.expires_at <= now() \
-             THEN EXCLUDED.expires_at ELSE oauth_clients.expires_at END"
+             THEN EXCLUDED.expires_at ELSE oauth_clients.expires_at END\
+         {only_lapsed}"
     );
     let result = sqlx::query(&sql)
         .bind(client_id)
@@ -72,21 +89,32 @@ pub async fn insert_client_capped(
     Ok(result.rows_affected() > 0)
 }
 
-/// The live client, sliding its `expires_at` to `now() + ttl` in the same
-/// statement so the read and the renewal can't disagree. `None` when absent or
-/// expired.
-pub async fn touch_client(
+/// The live client; `None` when absent or expired. Read-only: `/authorize`
+/// is unauthenticated, so resolving a client must not extend its lifetime.
+pub async fn find_client(pool: &PgPool, client_id: &str) -> Result<Option<ClientRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT redirect_uris, client_name FROM oauth_clients \
+         WHERE client_id = $1 AND expires_at > now()",
+    )
+    .bind(client_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Slide a live client's `expires_at` to `now() + ttl`. `false` when absent
+/// or expired.
+pub async fn promote_client(
     pool: &PgPool,
     client_id: &str,
     ttl: chrono::Duration,
-) -> Result<Option<ClientRow>, sqlx::Error> {
-    sqlx::query_as(
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
         "UPDATE oauth_clients SET expires_at = now() + $2 \
-         WHERE client_id = $1 AND expires_at > now() \
-         RETURNING redirect_uris, client_name",
+         WHERE client_id = $1 AND expires_at > now()",
     )
     .bind(client_id)
     .bind(ttl)
-    .fetch_optional(pool)
-    .await
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }

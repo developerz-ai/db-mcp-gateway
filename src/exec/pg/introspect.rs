@@ -4,14 +4,16 @@
 
 use std::time::Duration;
 
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 use super::super::adapter::{ExecError, ExecResult};
-use super::POOL_ACQUIRE_TIMEOUT;
 use super::cancel::BackendTag;
 use super::error::classify;
-use super::tier::{Tier, TierKind};
+use super::tier::TierKind;
+
+/// Bound on the cancel's one round trip, on a connection already acquired.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Statistics for every table in `schema` (or just `table`) the read role
 /// may `SELECT`: the statistics views list every table in the database, and
@@ -81,24 +83,24 @@ pub(super) fn merge_activity(read: ExecResult, write: ExecResult, row_limit: u32
 }
 
 /// Signal every backend of the tier's role that carries `request_id`'s tag.
-/// Runs on the cancel pool, so it is never queued behind the query it
-/// targets. `pg_cancel_backend` on an own-role backend needs no privilege.
+/// Runs on a cancel-pool connection, so it is never queued behind the query
+/// it targets. `pg_cancel_backend` on an own-role backend needs no privilege.
 const CANCEL_BY_TAG_SQL: &str = "SELECT count(*) FILTER (WHERE pg_cancel_backend(pid)) \
                                  FROM pg_stat_activity \
                                  WHERE usename = current_user AND application_name LIKE $1";
 
-pub(super) async fn cancel_request(tier: &Tier, request_id: Uuid) -> Result<bool, ExecError> {
+pub(super) async fn cancel_request(
+    conn: &mut PgConnection,
+    role: &str,
+    request_id: Uuid,
+) -> Result<bool, ExecError> {
     let pattern = format!("{}%", BackendTag::request_prefix(request_id));
-    let cancel = sqlx::query(CANCEL_BY_TAG_SQL)
-        .bind(pattern)
-        .fetch_one(&tier.cancel_pool);
-    // The acquire is bounded by the pool; the round trip itself by this.
-    let budget = POOL_ACQUIRE_TIMEOUT + Duration::from_secs(5);
-    let row = match tokio::time::timeout(budget, cancel).await {
-        Ok(row) => row.map_err(|err| classify(err, &tier.role))?,
+    let cancel = sqlx::query(CANCEL_BY_TAG_SQL).bind(pattern).fetch_one(conn);
+    let row = match tokio::time::timeout(CANCEL_TIMEOUT, cancel).await {
+        Ok(row) => row.map_err(|err| classify(err, role))?,
         Err(_elapsed) => return Err(ExecError::Timeout),
     };
-    let signalled: i64 = row.try_get(0).map_err(|err| classify(err, &tier.role))?;
+    let signalled: i64 = row.try_get(0).map_err(|err| classify(err, role))?;
     Ok(signalled > 0)
 }
 

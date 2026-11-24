@@ -19,6 +19,9 @@
 //! pg-side mapping is in `pg::error`; new adapters must preserve this
 //! discipline.
 
+use std::future::Future;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::Value;
@@ -48,8 +51,8 @@ pub const DEFAULT_STATEMENT_TIMEOUT_MS: u32 = 30_000;
 /// analogue of the row cap. A handful of wide `text`/`jsonb` rows can be
 /// hundreds of MiB while staying under any row limit; past this budget the
 /// adapter stops collecting and flags `truncated`, exactly as for the row
-/// cap. Measured over the decoded JSON values (see `result_size`), not wire
-/// bytes, because the decoded form is what the gateway holds in memory.
+/// cap. Measured over the decoded JSON values, node by node (see `budget`):
+/// that is what the gateway holds, and it can be several times the wire form.
 pub const MAX_RESULT_BYTES: usize = 32 * 1024 * 1024;
 
 /// Extra slack on top of the DB-side timeout so the Tokio guard doesn't
@@ -69,6 +72,35 @@ pub(super) fn effective_timeout_ms(grant: Option<u32>) -> u32 {
     grant
         .unwrap_or(DEFAULT_STATEMENT_TIMEOUT_MS)
         .clamp(1, DEFAULT_STATEMENT_TIMEOUT_MS)
+}
+
+/// Who a tool call runs for, as the exec layer sees it: the key under which
+/// each adapter counts that caller's share of a connection pool.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Caller(Arc<str>);
+
+impl Caller {
+    pub fn new(subject: &str) -> Self {
+        Self(Arc::from(subject))
+    }
+}
+
+tokio::task_local! {
+    static CALLER: Caller;
+}
+
+/// Run `call` on behalf of `caller`: every target connection an adapter
+/// takes inside it counts against that caller's share of the pool. Scoped
+/// once, where a tool call is dispatched, so a tool cannot forget to name
+/// its caller. Work outside any scope is the gateway's own and is not
+/// counted.
+pub async fn for_caller<F: Future>(caller: Caller, call: F) -> F::Output {
+    CALLER.scope(caller, call).await
+}
+
+/// The caller the current task runs for, if any.
+pub(super) fn current_caller() -> Option<Caller> {
+    CALLER.try_with(Clone::clone).ok()
 }
 
 /// Backend identifier — names the adapter in [`ExecError::NotImplemented`].
@@ -264,41 +296,4 @@ pub trait DbAdapter: Send + Sync + std::fmt::Debug {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn effective_timeout_clamps_and_defaults() {
-        // No grant constraint → gateway ceiling, never unbounded.
-        assert_eq!(effective_timeout_ms(None), DEFAULT_STATEMENT_TIMEOUT_MS);
-        assert_eq!(effective_timeout_ms(None), 30_000);
-        // A tighter grant wins (most-restrictive-wins).
-        assert_eq!(effective_timeout_ms(Some(5_000)), 5_000);
-        // A looser grant is clamped down to the ceiling — it can only tighten.
-        assert_eq!(effective_timeout_ms(Some(60_000)), 30_000);
-        assert_eq!(effective_timeout_ms(Some(3_600_000)), 30_000);
-    }
-
-    /// Postgres reads `statement_timeout = 0` as "no limit", so a zero grant
-    /// must never reach the DB as zero.
-    #[test]
-    fn effective_timeout_never_zero() {
-        assert_eq!(effective_timeout_ms(Some(0)), 1);
-    }
-
-    proptest::proptest! {
-        /// For any grant: never zero (Postgres' "no limit"), never above the
-        /// grant, never above the ceiling. The upper bound is floored at 1
-        /// because a zero grant still runs with the 1 ms floor.
-        #[test]
-        fn effective_timeout_stays_within_grant_and_ceiling(
-            grant in proptest::option::of(proptest::num::u32::ANY)
-        ) {
-            let effective = effective_timeout_ms(grant);
-            let bound = grant
-                .unwrap_or(u32::MAX)
-                .clamp(1, DEFAULT_STATEMENT_TIMEOUT_MS);
-            proptest::prop_assert!((1..=bound).contains(&effective));
-        }
-    }
-}
+mod tests;

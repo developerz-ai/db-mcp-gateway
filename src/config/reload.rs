@@ -59,9 +59,11 @@ async fn apply(targets: &ReloadTargets) -> Result<usize, ReloadError> {
     let sinks = StreamSinks::from_config(&new.logging.stream);
     let changed = current.changed_databases(&new);
 
-    // Point of no return: nothing below can fail.
-    targets.config.store(Arc::new(new));
+    // Point of no return: nothing below can fail. Tokens go first: a request
+    // that sees the new config must not still authenticate a service account
+    // the new config removed.
     targets.service_tokens.store(Arc::new(tokens));
+    targets.config.store(Arc::new(new));
     targets.audit_sinks.store(Arc::new(sinks));
     targets
         .permissions_cache

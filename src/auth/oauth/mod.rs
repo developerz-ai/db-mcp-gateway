@@ -18,6 +18,7 @@
 mod auth_codes;
 mod client_name;
 mod client_registry;
+mod client_registry_mem;
 mod facade;
 mod grants;
 mod pending_flows;

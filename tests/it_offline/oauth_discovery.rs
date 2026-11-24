@@ -4,13 +4,11 @@
 //! authorization-code + PKCE round-trip needs a live IdP and is covered by the
 //! auth e2e harness; here we lock down the discovery contract that was missing.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::common::gateway::{SERVICE_TOKEN, SERVICE_YAML, spawn_authless, spawn_offline};
+use crate::common::gateway::spawn_authless;
 use db_mcp_gateway::config::Config;
 use serde_json::{Value, json};
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 
 /// Boot the gateway on an ephemeral port; return its base URL (no path).
 async fn spawn_gateway() -> String {
@@ -356,68 +354,4 @@ async fn authorize_adopts_nothing_from_an_invalid_request() {
         .await
         .unwrap();
     assert_eq!(second["error_description"], "state is required");
-}
-
-/// Hold a `POST /token` open by announcing a body that never arrives: the
-/// request sits on an OAuth permit until the body deadline.
-async fn stall_token_request(base: &str) -> TcpStream {
-    let addr = base.trim_start_matches("http://");
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    let head = format!(
-        "POST /token HTTP/1.1\r\nHost: {addr}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\n\
-         Content-Length: 100\r\n\r\n"
-    );
-    stream.write_all(head.as_bytes()).await.unwrap();
-    stream
-}
-
-/// Unauthenticated traffic has its own budget (gated cap / 8). Stalled OAuth
-/// bodies exhaust it — further OAuth requests shed with the stable 503 — while
-/// `/mcp` keeps serving authenticated callers.
-#[tokio::test]
-async fn stalled_oauth_bodies_saturate_only_the_oauth_budget() {
-    // Gated cap 8 → OAuth budget 1: one stalled body fills it.
-    let base = spawn_offline(
-        Config {
-            max_concurrent_requests: 8,
-            ..Config::default()
-        },
-        SERVICE_YAML,
-    )
-    .await;
-    let _stalled = stall_token_request(&base).await;
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let shed = loop {
-        let resp = client()
-            .get(format!("{base}/authorize"))
-            .send()
-            .await
-            .unwrap();
-        if resp.status() == 503 {
-            break resp;
-        }
-        assert!(Instant::now() < deadline, "OAuth budget never saturated");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
-    assert_eq!(shed.headers()["retry-after"], "1");
-    let request_id = shed.headers()["x-request-id"].to_str().unwrap().to_owned();
-    let body: Value = shed.json().await.unwrap();
-    assert_eq!(
-        body,
-        json!({
-            "error": {"category": "overloaded", "code": "service_overloaded"},
-            "request_id": request_id,
-        })
-    );
-
-    let mcp = client()
-        .post(format!("{base}/mcp"))
-        .bearer_auth(SERVICE_TOKEN)
-        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(mcp.status(), 200, "/mcp must not share the OAuth budget");
 }

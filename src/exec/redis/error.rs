@@ -4,7 +4,7 @@
 
 use std::sync::atomic::Ordering;
 
-use redis::{ErrorKind, RedisError};
+use redis::{ErrorKind, RedisError, ServerErrorKind};
 
 use super::super::adapter::ExecError;
 use super::super::rejection::DbRejection;
@@ -25,7 +25,21 @@ impl RedisAdapter {
     /// A command's failure. A server error reply is passed to the agent as a
     /// [`DbRejection`] (code + message, ACL username redacted) — `NOPERM`
     /// maps to `permission_denied`, anything else to `syntax_error`.
+    ///
+    /// A cluster reply about the topology is the exception: `MOVED` / `ASK`
+    /// carry another node's address, and none of them is anything the agent
+    /// can fix in its command. They are `unavailable`, text dropped.
     pub(super) fn classify_command(&self, err: RedisError) -> ExecError {
+        if let ErrorKind::Server(kind) = err.kind()
+            && is_topology_reply(kind)
+        {
+            tracing::warn!(
+                error_kind = "topology",
+                code = err.code().unwrap_or("ERR"),
+                "target command failed"
+            );
+            return ExecError::Unavailable;
+        }
         if connection_survives(&err) {
             let code = err.code().unwrap_or("ERR");
             tracing::warn!(error_kind = "server", code, "target command failed");
@@ -81,6 +95,19 @@ impl RedisAdapter {
     }
 }
 
+/// The server answered about where the data lives or whether the cluster can
+/// serve at all, not about the command.
+fn is_topology_reply(kind: ServerErrorKind) -> bool {
+    matches!(
+        kind,
+        ServerErrorKind::Moved
+            | ServerErrorKind::Ask
+            | ServerErrorKind::TryAgain
+            | ServerErrorKind::ClusterDown
+            | ServerErrorKind::MasterDown
+    )
+}
+
 /// Replace every whole-word occurrence of `role` — bounded by characters an
 /// ACL username in the config cannot contain — with [`ROLE_PLACEHOLDER`].
 fn redact_role(message: &str, role: &str) -> String {
@@ -124,6 +151,62 @@ mod tests {
             "key gateway_ro_x and <role>."
         );
         assert_eq!(redact_role("no role here", "ro"), "no role here");
+    }
+
+    fn server_error(reply: &[u8]) -> RedisError {
+        redis::parse_redis_value(reply)
+            .and_then(|v| v.extract_error())
+            .expect_err("a server error")
+    }
+
+    async fn adapter() -> RedisAdapter {
+        use crate::config::{Database, Password, Server, ServerKind, Tls};
+        let database = Database {
+            name: "0".into(),
+            role: "gateway_ro".into(),
+            password: Password::Literal("pw".into()),
+            description: String::new(),
+            auth_database: None,
+            pool: None,
+            write_role: None,
+            write_password: None,
+        };
+        let server = Server {
+            name: "cache".into(),
+            kind: ServerKind::Redis,
+            description: String::new(),
+            host: "cache.internal".into(),
+            port: 6379,
+            tls: Tls::Insecure,
+            tls_ca_file: None,
+            pool: None,
+            databases: vec![],
+        };
+        // Lazy: nothing connects.
+        RedisAdapter::open(&server, &database, Default::default())
+            .await
+            .expect("client builds")
+    }
+
+    /// A redirect names another node's address; the agent gets neither the
+    /// address nor a "fix your command" code.
+    #[tokio::test]
+    async fn cluster_replies_are_unavailable_without_their_text() {
+        let adapter = adapter().await;
+        for reply in [
+            &b"-MOVED 3999 10.0.0.5:6381\r\n"[..],
+            b"-ASK 3999 10.0.0.5:6381\r\n",
+            b"-TRYAGAIN Multiple keys request during rehashing of slot\r\n",
+            b"-CLUSTERDOWN The cluster is down\r\n",
+        ] {
+            let mapped = adapter.classify_command(server_error(reply));
+            assert!(matches!(mapped, ExecError::Unavailable), "{mapped:?}");
+        }
+        let wrong_type = adapter.classify_command(server_error(b"-WRONGTYPE not a list\r\n"));
+        assert!(
+            matches!(wrong_type, ExecError::Rejected(_)),
+            "{wrong_type:?}"
+        );
     }
 
     #[test]

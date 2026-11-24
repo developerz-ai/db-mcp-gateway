@@ -31,6 +31,7 @@ use tracing::info_span;
 
 use crate::audit::prefix_at_char_boundary;
 use crate::config::{ConfigFile, ServerKind};
+use crate::exec::adapter::{Caller, for_caller};
 use crate::mcp::jsonrpc::Response;
 
 /// Map a `ServerKind` to its audit-row string. Single source of truth so
@@ -187,7 +188,10 @@ pub async fn dispatch_call(id: Value, ctx: ToolCtx<'_>, params: Option<Value>) -
     // this future resumes and the guard finally drops. `Instrument`
     // properly enters/exits the span around each individual poll, so
     // interleaved tasks never see it as "current."
-    async move {
+    // One scope for every tool: each adapter counts the connections taken
+    // inside it against this caller's share of the pool.
+    let caller = Caller::new(&ctx.identity.user_sub);
+    let dispatch = async move {
         match call.name.as_str() {
             LIST_SERVERS => list_servers::run(ctx, id).await,
             LIST_DATABASES => list_databases::run(ctx, id, args).await,
@@ -205,9 +209,8 @@ pub async fn dispatch_call(id: Value, ctx: ToolCtx<'_>, params: Option<Value>) -
                 audit_dispatch::reject_arguments(ctx, id, UNKNOWN_TOOL, &message).await
             }
         }
-    }
-    .instrument(span)
-    .await
+    };
+    for_caller(caller, dispatch.instrument(span)).await
 }
 
 /// The `&'static` audit/metric name for `name`: the tool's own when it is

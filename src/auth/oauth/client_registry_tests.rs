@@ -33,23 +33,38 @@ async fn fill(reg: &ClientRegistry, authorised: bool) {
 async fn insert_then_lookup_roundtrips() {
     let reg = ClientRegistry::default();
     reg.insert("c1".into(), vec![URI.into()]).await.unwrap();
-    assert_eq!(reg.redirect_uris("c1").await, Some(vec![URI.into()]));
-    assert_eq!(reg.redirect_uris("unknown").await, None);
+    assert_eq!(reg.redirect_uris("c1").await, Ok(Some(vec![URI.into()])));
+    assert_eq!(reg.redirect_uris("unknown").await, Ok(None));
 }
 
+/// `/authorize` resolves a client with `lookup`, before anyone has logged
+/// in: however often it runs, the client stays evictable.
 #[tokio::test]
-async fn first_authorize_promotes_the_client_to_the_long_ttl() {
+async fn lookup_leaves_the_client_on_the_unused_ttl() {
     let reg = ClientRegistry::default();
     reg.insert("c1".into(), vec![URI.into()]).await.unwrap();
     let Backend::Memory(map) = &reg.backend else {
         unreachable!();
     };
+    for _ in 0..3 {
+        reg.lookup("c1").await.unwrap().expect("live");
+    }
     assert!(
         map.lock().await["c1"].evictable(Utc::now()),
-        "unused: evictable"
+        "looked up, never used: still evictable"
     );
-    reg.redirect_uris("c1").await.expect("live");
+}
+
+#[tokio::test]
+async fn promote_moves_the_client_to_the_long_ttl() {
+    let reg = ClientRegistry::default();
+    reg.insert("c1".into(), vec![URI.into()]).await.unwrap();
+    let Backend::Memory(map) = &reg.backend else {
+        unreachable!();
+    };
+    assert_eq!(reg.promote("c1").await, Ok(true));
     assert!(!map.lock().await["c1"].evictable(Utc::now()), "used: kept");
+    assert_eq!(reg.promote("unknown").await, Ok(false));
 }
 
 #[tokio::test]
@@ -59,9 +74,13 @@ async fn at_cap_evicts_the_oldest_never_authorised_client() {
     reg.insert("newcomer".into(), vec![URI.into()])
         .await
         .expect("room made by eviction");
-    assert_eq!(reg.redirect_uris("c0").await, None, "oldest unused evicted");
-    assert!(reg.redirect_uris("c1").await.is_some());
-    assert!(reg.redirect_uris("newcomer").await.is_some());
+    assert_eq!(
+        reg.redirect_uris("c0").await,
+        Ok(None),
+        "oldest unused evicted"
+    );
+    assert!(reg.redirect_uris("c1").await.unwrap().is_some());
+    assert!(reg.redirect_uris("newcomer").await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -73,7 +92,7 @@ async fn full_of_authorised_clients_is_store_full() {
         Err(StoreError::StoreFull)
     );
     assert!(
-        reg.redirect_uris("c0").await.is_some(),
+        reg.redirect_uris("c0").await.unwrap().is_some(),
         "no live client evicted"
     );
 }
@@ -102,13 +121,13 @@ async fn gc_drops_only_expired_clients() {
 }
 
 #[tokio::test]
-async fn adopted_client_is_authorised_immediately() {
+async fn adopted_client_starts_on_the_unused_ttl() {
     let reg = ClientRegistry::default();
     reg.adopt("adopted".into(), URI.into()).await.unwrap();
     let Backend::Memory(map) = &reg.backend else {
         unreachable!();
     };
-    assert!(!map.lock().await["adopted"].evictable(Utc::now()));
+    assert!(map.lock().await["adopted"].evictable(Utc::now()));
 }
 
 /// A cached `client_id` whose registration lapsed but isn't GC'd yet is
@@ -130,11 +149,29 @@ async fn adopting_a_lapsed_unswept_client_revives_it() {
             expires_at: Utc::now() - ChronoDuration::days(1),
         },
     );
-    reg.adopt("lapsed".into(), URI.into())
+    let adopted = reg
+        .adopt("lapsed".into(), URI.into())
         .await
         .expect("adoption revives a lapsed registration");
-    assert_eq!(reg.redirect_uris("lapsed").await, Some(vec![URI.into()]));
-    assert!(!map.lock().await["lapsed"].evictable(Utc::now()));
+    assert_eq!(adopted.redirect_uris, vec![URI.to_string()]);
+    assert_eq!(
+        reg.redirect_uris("lapsed").await,
+        Ok(Some(vec![URI.into()]))
+    );
+}
+
+/// Adoption takes a caller-chosen id: on a live registration it must hand
+/// back that registration, never rewrite its redirect URIs.
+#[tokio::test]
+async fn adopting_a_live_client_keeps_its_redirect_uris() {
+    let reg = ClientRegistry::default();
+    reg.insert("c1".into(), vec![URI.into()]).await.unwrap();
+    let adopted = reg
+        .adopt("c1".into(), "http://127.0.0.1:1/cb".into())
+        .await
+        .unwrap();
+    assert_eq!(adopted.redirect_uris, vec![URI.to_string()]);
+    assert_eq!(reg.redirect_uris("c1").await, Ok(Some(vec![URI.into()])));
 }
 
 /// Re-registering a still-live client keeps its expiry: only a lapsed row
@@ -142,7 +179,8 @@ async fn adopting_a_lapsed_unswept_client_revives_it() {
 #[tokio::test]
 async fn re_registering_a_live_client_keeps_its_expiry() {
     let reg = ClientRegistry::default();
-    reg.adopt("c1".into(), URI.into()).await.unwrap();
+    reg.insert("c1".into(), vec![URI.into()]).await.unwrap();
+    assert_eq!(reg.promote("c1").await, Ok(true));
     let Backend::Memory(map) = &reg.backend else {
         unreachable!();
     };
@@ -160,10 +198,11 @@ async fn name_roundtrips_and_adoption_records_none() {
     reg.register("named".into(), vec![URI.into()], name.clone())
         .await
         .unwrap();
-    let record = reg.lookup("named").await.expect("live");
+    let record = reg.lookup("named").await.unwrap().expect("live");
     assert_eq!(record.client_name, name);
     reg.adopt("adopted".into(), URI.into()).await.unwrap();
-    assert_eq!(reg.lookup("adopted").await.unwrap().client_name, None);
+    let adopted = reg.lookup("adopted").await.unwrap().expect("live");
+    assert_eq!(adopted.client_name, None);
 }
 
 #[test]

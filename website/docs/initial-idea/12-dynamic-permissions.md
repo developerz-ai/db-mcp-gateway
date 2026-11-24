@@ -120,7 +120,7 @@ Pagination deliberately does *not* apply to the resolver's read: `authz::loader`
 | `GET` | `/admin/v1/users/:id` | Fetch one user |
 | `PATCH` | `/admin/v1/users/:id` | Update (e.g. refresh group cache) |
 | `DELETE` | `/admin/v1/users/:id` | Soft-delete; its live grants are revoked in the same transaction, one `delete` audit row per grant |
-| `POST` | `/admin/v1/users/:id/revoke-sessions` | Revoke every live session and delete every refresh chain of the user's `user_sub`; their bearers are `401` on the next call. One `permissions_audit` row (`update` on the user, payload `{user_sub, live_sessions, refresh_tokens}` before → zeros after) in the revoke's transaction; session-cache tombstones only after commit. Returns `{revoked_sessions, revoked_refresh_tokens}` |
+| `POST` | `/admin/v1/users/:id/revoke-sessions` | Revoke every live session and delete every refresh chain of the user's `user_sub`; their bearers are `401` on the next call. One `permissions_audit` row (`update` on the user, payload `{user_sub, live_sessions, refresh_tokens}` before → zeros after) in the revoke's transaction; session-cache tombstones only after commit. Takes the per-subject advisory lock shared with code redemption, refresh rotation and logout, so a rotation in flight is waited out and its new session and refresh token are revoked too. Returns `{revoked_sessions, revoked_refresh_tokens}` |
 | `POST` | `/admin/v1/databases` | Register a logical `(server, db_name, db_type)` |
 | `GET` | `/admin/v1/databases` | List |
 | `GET` | `/admin/v1/databases/:id` | Fetch one |

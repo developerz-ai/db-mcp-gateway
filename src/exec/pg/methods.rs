@@ -85,7 +85,10 @@ impl DbAdapter for PgAdapter {
     async fn cancel_request(&self, request_id: Uuid) -> Result<bool, ExecError> {
         let mut cancelled = false;
         for tier in self.connected_tiers() {
-            cancelled |= introspect::cancel_request(tier, request_id).await?;
+            // Acquired here, not by the statement: a login the target
+            // refuses must take the connect-phase path.
+            let mut conn = self.acquire(&tier.cancel_pool).await?;
+            cancelled |= introspect::cancel_request(&mut conn, &tier.role, request_id).await?;
         }
         Ok(cancelled)
     }

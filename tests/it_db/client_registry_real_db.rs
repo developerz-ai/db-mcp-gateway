@@ -46,12 +46,12 @@ async fn registration_survives_a_restart() {
     let after_restart = ClientRegistry::with_db(pool.clone());
     assert_eq!(
         after_restart.redirect_uris(&client_id).await,
-        Some(vec!["http://127.0.0.1:0/cb".into()]),
+        Ok(Some(vec!["http://127.0.0.1:0/cb".into()])),
         "a registration persisted across the restart must still resolve"
     );
     assert_eq!(
         after_restart.redirect_uris("mcp-never-registered").await,
-        None,
+        Ok(None),
         "an unknown client_id still resolves to None"
     );
 
@@ -76,7 +76,7 @@ async fn re_register_updates_redirect_uris() {
         .expect("registered");
     assert_eq!(
         reg.redirect_uris(&client_id).await,
-        Some(vec!["https://b/cb".into()])
+        Ok(Some(vec!["https://b/cb".into()]))
     );
 
     cleanup(&pool, &client_id).await;
@@ -112,7 +112,7 @@ async fn expired_registration_is_swept_and_not_returned() {
     // Lookup filters on `expires_at > now()`, so the stale row is invisible...
     assert_eq!(
         reg.redirect_uris(&stale).await,
-        None,
+        Ok(None),
         "an expired registration must not resolve"
     );
 
@@ -174,7 +174,7 @@ async fn at_cap_evicts_the_oldest_never_authorised_client_real_db() {
         .expect("a registration at the cap evicts junk instead of failing");
     assert_eq!(
         reg.redirect_uris(&newcomer).await,
-        Some(vec!["https://new/cb".into()])
+        Ok(Some(vec!["https://new/cb".into()]))
     );
 
     cleanup(&pool, &newcomer).await;
@@ -199,7 +199,7 @@ async fn at_cap_of_authorised_clients_is_store_full_real_db() {
             .await,
         Err(StoreError::StoreFull)
     );
-    assert_eq!(reg.redirect_uris(&newcomer).await, None);
+    assert_eq!(reg.redirect_uris(&newcomer).await, Ok(None));
 
     delete_prefixed(&pool, &prefix).await;
 }

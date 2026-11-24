@@ -50,15 +50,15 @@ pub async fn token(
             "supported grant types: authorization_code, refresh_token",
         );
     }
-    let auth = &state.auth;
     if grant == Some("refresh_token") {
-        token_refresh(auth, form).await
+        token_refresh(&state.auth, form).await
     } else {
-        token_authorization_code(auth, form).await
+        token_authorization_code(&state, form).await
     }
 }
 
-async fn token_authorization_code(auth: &AuthFacade, form: TokenForm) -> Response {
+async fn token_authorization_code(state: &OAuthState, form: TokenForm) -> Response {
+    let auth = &state.auth;
     let (Some(code), Some(verifier)) = (form.code.as_deref(), form.code_verifier.as_deref()) else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -112,6 +112,23 @@ async fn token_authorization_code(auth: &AuthFacade, form: TokenForm) -> Respons
             StatusCode::BAD_REQUEST,
             "invalid_grant",
             "PKCE verification failed",
+        );
+    }
+
+    // A redeemed code proves a verified IdP login used this client: only now
+    // does its registration earn the long TTL. Before minting, so a failure
+    // never leaves a session behind an error response. A registration that
+    // lapsed mid-login has nothing to promote; the login still stands.
+    if state
+        .client_registry
+        .promote(&entry.client_id)
+        .await
+        .is_err()
+    {
+        return oauth_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "could not issue tokens; try again",
         );
     }
 

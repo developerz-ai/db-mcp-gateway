@@ -1,93 +1,22 @@
 //! Substructure walk: denied functions, nested writes, locking clauses and
 //! `SELECT ... INTO`, driven by sqlparser's `Visit` derive.
 
-use sqlparser::ast::{Expr, ObjectName, Query, SetExpr, Statement, TableFactor, Visitor};
+use sqlparser::ast::{
+    AccessExpr, Expr, Ident, ObjectName, Query, SetExpr, Statement, TableFactor, Visitor,
+};
 use std::ops::ControlFlow;
 
 use super::GuardError;
-
-/// Functions the gateway always blocks, regardless of the Postgres role's
-/// privileges. Matched case-insensitively on the last name component, so a
-/// schema-qualified call (`pg_catalog.pg_read_file`) is caught too.
-///
-/// This is layer three. The DB role is layer one and the read-only
-/// transaction layer two; the list exists for the functions those two do
-/// not stop — ones a read-only transaction still runs, or that run SQL the
-/// guard never sees:
-///
-/// - filesystem: `pg_read_file`, `pg_read_binary_file`, `pg_stat_file`,
-///   `pg_ls_*` (every directory listing), `pg_current_logfile`, and the
-///   large-object family `lo_*` / `lowrite` (`lo_export` writes a server
-///   file; `lo_from_bytea` creates an object — no side effect is allowed
-///   from a read).
-/// - session state: `set_config` (a session-level change would outlive the
-///   query on a pooled connection) and every advisory lock function (a
-///   session lock blocks other users until the connection is reset).
-/// - other backends: `pg_cancel_backend`, `pg_terminate_backend`.
-/// - dynamic SQL: `query_to_xml*`, `cursor_to_xml*`, `table_to_xml*`,
-///   `schema_to_xml*`, `database_to_xml*`, `ts_stat` and `ts_rewrite` execute
-///   SQL text or whole-schema reads the guard cannot inspect — a denied call
-///   inside that text runs unseen; `dblink*` reaches other servers.
-/// - messages to other sessions: `pg_notify` and `pg_logical_emit_message`
-///   run in a read-only transaction and, on its commit, reach every
-///   `LISTEN`er or logical-decoding consumer (job queues, CDC pipelines).
-const DENIED_FUNCTIONS: &[Denied] = &[
-    Denied::Exact("pg_read_file"),
-    Denied::Exact("pg_read_binary_file"),
-    Denied::Exact("pg_stat_file"),
-    Denied::Exact("pg_current_logfile"),
-    Denied::Exact("pg_ls_dir"),
-    Denied::Prefix("pg_ls_", "pg_ls_*"),
-    Denied::Exact("lo_export"),
-    Denied::Exact("lo_import"),
-    Denied::Prefix("lo_", "lo_*"),
-    Denied::Exact("lowrite"),
-    Denied::Exact("set_config"),
-    Denied::Prefix("pg_advisory_", "pg_advisory_*"),
-    Denied::Prefix("pg_try_advisory_", "pg_try_advisory_*"),
-    Denied::Exact("pg_cancel_backend"),
-    Denied::Exact("pg_terminate_backend"),
-    Denied::Prefix("query_to_xml", "query_to_xml*"),
-    Denied::Prefix("cursor_to_xml", "cursor_to_xml*"),
-    Denied::Prefix("table_to_xml", "table_to_xml*"),
-    Denied::Prefix("schema_to_xml", "schema_to_xml*"),
-    Denied::Prefix("database_to_xml", "database_to_xml*"),
-    Denied::Prefix("dblink", "dblink*"),
-    Denied::Exact("pg_notify"),
-    Denied::Exact("pg_logical_emit_message"),
-    Denied::Exact("ts_stat"),
-    Denied::Exact("ts_rewrite"),
-];
-
-/// One denylist entry. Exact names come first in [`DENIED_FUNCTIONS`] so a
-/// well-known name is reported as itself rather than as its family.
-#[derive(Debug, Clone, Copy)]
-enum Denied {
-    Exact(&'static str),
-    /// `(prefix, label)` — the label is what the error reports.
-    Prefix(&'static str, &'static str),
-}
-
-impl Denied {
-    /// The name to report if `fn_name` matches this entry.
-    fn matches(self, fn_name: &str) -> Option<&'static str> {
-        match self {
-            Self::Exact(name) => name.eq_ignore_ascii_case(fn_name).then_some(name),
-            Self::Prefix(prefix, label) => fn_name
-                .get(..prefix.len())
-                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-                .then_some(label),
-        }
-    }
-}
+use super::denylist::denied_function;
 
 /// Substructure guard, run once the top-level [`check_statement_shape`] has
 /// admitted the statement. Enforces four things via sqlparser's `Visit`
 /// derive, which walks every child node automatically:
 ///
-/// 1. Denied-function calls (`Expr::Function`, and `TableFactor::{Table,
+/// 1. Denied-function calls: `Expr::Function`, `TableFactor::{Table,
 ///    Function}` when a set-returning denied function is used as a table
-///    source).
+///    source, and attribute notation — Postgres resolves `(x).f` and
+///    `row.f` to `f(x)` / `f(row)` when no such column exists.
 /// 2. `SELECT ... FOR UPDATE / FOR SHARE` — [`GuardError::Locking`].
 /// 3. `SELECT ... INTO new_table` — [`GuardError::SelectInto`].
 /// 4. Nested `Statement` — sqlparser encodes a writable CTE as a Query whose
@@ -144,12 +73,14 @@ impl Visitor for GuardVisitor {
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<GuardError> {
-        if let Expr::Function(f) = expr
-            && let Err(err) = check_denied_name(&f.name)
-        {
-            return ControlFlow::Break(err);
-        }
-        ControlFlow::Continue(())
+        break_on(match expr {
+            Expr::Function(f) => check_denied_name(&f.name),
+            Expr::CompoundIdentifier(parts) => parts.last().map_or(Ok(()), check_attribute),
+            Expr::CompoundFieldAccess { access_chain, .. } => {
+                access_chain.iter().try_for_each(check_access)
+            }
+            _ => Ok(()),
+        })
     }
 
     fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<GuardError> {
@@ -167,10 +98,7 @@ impl Visitor for GuardVisitor {
             | TableFactor::Function { name, .. } => name,
             _ => return ControlFlow::Continue(()),
         };
-        if let Err(err) = check_denied_name(name) {
-            return ControlFlow::Break(err);
-        }
-        ControlFlow::Continue(())
+        break_on(check_denied_name(name))
     }
 }
 
@@ -188,6 +116,31 @@ fn body_has_select_into(body: &SetExpr) -> bool {
     }
 }
 
+/// One step of an access chain: `.name` may be a call in attribute notation.
+/// A dot followed by anything but a name is nothing Postgres parses.
+fn check_access(access: &AccessExpr) -> Result<(), GuardError> {
+    match access {
+        AccessExpr::Dot(Expr::Identifier(ident)) => check_attribute(ident),
+        AccessExpr::Dot(Expr::Function(_)) | AccessExpr::Subscript(_) => Ok(()),
+        AccessExpr::Dot(_) => Err(GuardError::NotAllowed("computed field access")),
+    }
+}
+
+/// A name in attribute position (`x.name`): a column, or a call of `name`.
+fn check_attribute(ident: &Ident) -> Result<(), GuardError> {
+    match denied_function(&ident.value) {
+        Some(denied) => Err(GuardError::DeniedFunction(denied)),
+        None => Ok(()),
+    }
+}
+
+fn break_on(result: Result<(), GuardError>) -> ControlFlow<GuardError> {
+    match result {
+        Ok(()) => ControlFlow::Continue(()),
+        Err(e) => ControlFlow::Break(e),
+    }
+}
+
 /// Match a callable's name against the denylist. Matches on the last identifier
 /// component so schema-qualified calls (`pg_catalog.pg_read_file(...)`) are
 /// caught too. Case-insensitive to match SQL identifier semantics.
@@ -201,7 +154,7 @@ fn check_denied_name(name: &ObjectName) -> Result<(), GuardError> {
             None => return Err(GuardError::NotAllowed("computed function name")),
         },
     };
-    match DENIED_FUNCTIONS.iter().find_map(|d| d.matches(fn_name)) {
+    match denied_function(fn_name) {
         Some(denied) => Err(GuardError::DeniedFunction(denied)),
         None => Ok(()),
     }

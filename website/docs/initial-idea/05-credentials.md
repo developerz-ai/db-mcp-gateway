@@ -48,7 +48,7 @@ Contract:
 
 ### No session state survives a pooled connection
 
-Every connection returned to the pool runs `RESET ALL; SELECT pg_advisory_unlock_all()` before the next caller gets it; a connection whose reset fails is closed, not reused. Ad-hoc SQL runs as an unnamed statement, so it does not accumulate in the connection's prepared-statement cache. `DISCARD ALL` is not used: it would drop prepared statements the driver's cache still believes exist.
+Every connection returned to the pool clears the driver's statement cache, then runs `RESET ALL; RESET SESSION AUTHORIZATION; RESET ROLE; DEALLOCATE ALL; SET standard_conforming_strings = on; SELECT pg_advisory_unlock_all()` before the next caller gets it; a connection whose reset fails is closed, not reused. `RESET ALL` leaves `role` and `session_authorization` alone, so both are reset by name; `DEALLOCATE ALL` drops anything still prepared, so one caller's SQL never shows up in the next caller's `pg_prepared_statements`. `standard_conforming_strings` is pinned on (also at connect) because the SQL guard lexes string literals the way Postgres does only with it on. `DISCARD ALL` is not used: it cannot run inside the multi-statement batch.
 
 Cancellation safety (CLAUDE.md §Cancellation safety) still holds: if the request future is dropped mid-query (agent disconnect / outer `tokio::time::timeout`), the `CancelOnDrop` guard fires `pg_cancel_backend` from a detached task. Disarming happens only after the inline cleanup returns, so a hang during rollback still hands the cancel off to the guard on outer-timeout kick-in.
 
@@ -77,7 +77,7 @@ Per `(server, database)`:
 - A separate cancel pool (2 connections, lazy) carries `pg_cancel_backend`, so cancels never queue behind the queries they are cancelling
 - Mongo: the same sizing, plus a 5 s server-selection and connect timeout
 - Redis: `max_connections` and `idle_timeout_s` as above; `min_connections` is ignored (nothing is opened ahead of use). One connection per in-flight command (no shared multiplexed connection). A connection returns to the pool only after a complete reply or a server error reply; one hit by a timeout, a client disconnect or an I/O error is closed, never reused — its reply may still be in flight. A connection the server closed while idle fails that one call with `unavailable`; there is no retry
-- YugabyteDB (as `kind: postgres`): the Postgres pool unchanged. On release a connection is reset with `RESET ALL; SELECT pg_advisory_unlock_all()`; a server without advisory locks rejects the unlock as `feature_not_supported`, and the gateway then repeats `RESET ALL` alone and keeps the connection (since 2.0.1)
+- YugabyteDB (as `kind: postgres`): the Postgres pool unchanged. On release a connection gets the same reset as Postgres; a server without advisory locks rejects the unlock as `feature_not_supported`, and the gateway then repeats the resets without the unlock and keeps the connection (since 2.0.1)
 - TLS required by default; reject non-TLS unless explicitly opted out for local dev
 
 ## Rotation
