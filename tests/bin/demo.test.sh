@@ -11,6 +11,30 @@ set -euo pipefail
 cd "$(dirname "$0")/../../examples/demo"
 
 port=${DEMO_PORT:-18443}
+
+# A release PR bumps the pinned tag to the crate's next version before that
+# image exists (the tag is cut after merge). Only that case — the pin is the
+# crate's own version and no `v<version>` tag exists yet — tests the same
+# code through `:main`, which a release PR does not change. Any other
+# unpullable pin (a typo, a registry error) fails the test.
+if [[ -z "${GATEWAY_IMAGE:-}" ]]; then
+  pinned=$(sed -n 's/.*image: \${GATEWAY_IMAGE:-\([^}]*\)}.*/\1/p' docker-compose.yml | head -1)
+  version=$(sed -n 's/^version = "\(.*\)"/\1/p' ../../Cargo.toml | head -1)
+  # Cheap local checks first; origin is asked only when a fallback is
+  # possible. `ls-remote --exit-code` answers 2 only for "no such ref"; a
+  # lookup error (no network, no origin) is not proof the release is uncut.
+  if [[ -n "$pinned" && -n "$version" && "${pinned##*:}" == "$version" ]] &&
+    ! git -C ../.. rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+    remote=0
+    # git's own low-speed abort (portable; no coreutils `timeout` on macOS).
+    GIT_HTTP_LOW_SPEED_LIMIT=1 GIT_HTTP_LOW_SPEED_TIME=20 \
+      git -C ../.. ls-remote --exit-code --tags origin "v$version" >/dev/null 2>&1 || remote=$?
+    if [[ $remote -eq 2 ]]; then
+      export GATEWAY_IMAGE=${pinned%:*}:main
+      printf 'note: release v%s is not cut yet; testing %s\n' "$version" "$GATEWAY_IMAGE" >&2
+    fi
+  fi
+fi
 compose=(docker compose -p "db-mcp-gateway-demo-test-$$")
 export DEMO_PORT=$port
 trap '"${compose[@]}" --profile sso down -v >/dev/null 2>&1 || true' EXIT
