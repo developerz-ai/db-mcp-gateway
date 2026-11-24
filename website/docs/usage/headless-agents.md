@@ -36,6 +36,8 @@ In an MCP client config that takes static headers:
 }
 ```
 
+To check what the token resolves to, call `whoami`: it answers `"auth": "service"`, the `service_account` name, its one group and the grants that group holds — no session expiry, since a service token has none.
+
 Keep the token in your secret manager, never in a repo. It does not expire and cannot be revoked in-band — rotation is an operator config edit plus rollout ([spec 14](../initial-idea/14-service-tokens.md)).
 
 ## The two headers
@@ -51,7 +53,7 @@ Keep the token in your secret manager, never in a repo. It does not expire and c
 - `get_query_history` with `x-dbmcp-run-id` returns only that run's queries — runs sharing a token don't see each other's history. Leave the header off to see everything your token ran.
 - SSO sessions don't need them: the headers are ignored when a human is logged in.
 
-Each token has its own concurrency budget — 16 in-flight requests by default, or the account's `max_concurrent_requests`. Past it the gateway answers `429` with `Retry-After: 1`.
+Each token has its own concurrency budget — 16 in-flight requests by default, or the account's `max_concurrent_requests`. Every `/mcp` answer reports it in `x-dbmcp-concurrency-limit` and `x-dbmcp-concurrency-remaining`. Past it the gateway answers `429` with `Retry-After: 1` and a JSON-RPC error (`code` `-32000`, `data.code` `concurrency_limit_exceeded`, `data.retry_after_s`); a saturated gateway answers `503` the same way with `data.code` `service_overloaded`. Back off for `retry_after_s` and retry — nothing ran and nothing was audited.
 
 ## Tiers
 

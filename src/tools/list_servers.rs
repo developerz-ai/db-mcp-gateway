@@ -1,7 +1,9 @@
 //! `list_servers` — the caller's visible servers, sans connection info.
 //!
-//! Per spec 03: returns logical name, kind, and human description. No host,
-//! port, role, password, or database listing. The output goes through a
+//! Per spec 03: returns logical name, kind, human description, and the
+//! databases the caller sees there (the `list_databases` view, so one call
+//! answers "where can I go and what may I do"). No host, port, role or
+//! password. The output goes through a
 //! `Serialize`-able view type that doesn't even have a `password` field —
 //! leaking credentials is structurally impossible, not "remembered to strip".
 //!
@@ -16,7 +18,7 @@ use serde_json::Value;
 
 use crate::auth::Identity;
 use crate::authz;
-use crate::config::{ConfigFile, Grant, ServerKind};
+use crate::config::{ConfigFile, Grant};
 use crate::mcp::jsonrpc::Response;
 
 use super::ToolCtx;
@@ -24,6 +26,7 @@ use super::audit_dispatch::{
     AuditHeader, Outcome, OutcomeCode, elapsed_ms_since, error_outcome, run_audited,
     success_outcome,
 };
+use super::list_databases::{SafeDatabaseView, visible_databases};
 
 const TOOL_NAME: &str = "list_servers";
 
@@ -33,6 +36,7 @@ pub struct SafeServerView {
     pub name: String,
     pub kind: &'static str,
     pub description: String,
+    pub databases: Vec<SafeDatabaseView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,7 +71,12 @@ fn compute_outcome(
         .servers
         .iter()
         .filter(|s| authz::can_see_server_effective(identity, s, &config.permissions, db_grants))
-        .map(SafeServerView::from)
+        .map(|server| SafeServerView {
+            name: server.name.clone(),
+            kind: super::db_type_label(server.kind),
+            description: server.description.clone(),
+            databases: visible_databases(identity, config, db_grants, server),
+        })
         .collect();
     let row_count = i64::try_from(servers.len()).unwrap_or(i64::MAX);
 
@@ -88,144 +97,6 @@ fn compute_outcome(
     success_outcome(id, payload, elapsed, Some(row_count), Some(false))
 }
 
-impl From<&crate::config::Server> for SafeServerView {
-    fn from(server: &crate::config::Server) -> Self {
-        Self {
-            name: server.name.clone(),
-            kind: kind_label(server.kind),
-            description: server.description.clone(),
-        }
-    }
-}
-
-fn kind_label(kind: ServerKind) -> &'static str {
-    super::db_type_label(kind)
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::auth::SessionId;
-    use crate::config::ConfigFile;
-
-    fn identity(groups: &[&str]) -> Identity {
-        Identity {
-            session_id: SessionId::new(),
-            user_sub: "u".to_string(),
-            user_email: "u@example.com".to_string(),
-            groups: groups.iter().map(|g| g.to_string()).collect(),
-            issued_at: chrono::Utc::now(),
-            kind: crate::auth::IdentityKind::Sso,
-        }
-    }
-
-    const YAML: &str = r#"
-servers:
-  - name: prod
-    kind: postgres
-    description: Customer-facing prod
-    host: prod.db.internal
-    databases:
-      - { name: app, role: ro, password: hunter2 }
-  - name: staging
-    kind: postgres
-    description: Staging
-    host: staging.db.internal
-    databases:
-      - { name: app, role: ro, password: stagingpw }
-  - name: analytics
-    kind: mongo
-    description: Analytics
-    host: an.db.internal
-    databases:
-      - { name: warehouse, role: ro, password: dwpw }
-
-permissions:
-  - group: backend-engineers
-    grants:
-      - { server: staging, database: "*", action: query_read }
-      - { server: prod,    database: "*", action: schema_read }
-  - group: analytics-team
-    grants:
-      - { server: analytics, database: "*", action: query_read }
-"#;
-
-    fn load() -> ConfigFile {
-        ConfigFile::from_yaml_str(YAML).expect("yaml parses")
-    }
-
-    /// Drives the sync `compute_outcome` directly. Unit-testing the filter +
-    /// shape logic doesn't need the audit chokepoint (covered by integration
-    /// tests against a real state DB).
-    fn body_for(groups: &[&str]) -> String {
-        let outcome = compute_outcome(Value::from(1), &identity(groups), &load(), &[]);
-        let crate::tools::audit_dispatch::Reply::Response(response) = &outcome.reply else {
-            panic!("expected a rendered response, got {:?}", outcome.reply);
-        };
-        let json = serde_json::to_value(response).unwrap();
-        json["result"]["content"][0]["text"]
-            .as_str()
-            .expect("content[0].text is the JSON-stringified payload")
-            .to_string()
-    }
-
-    #[test]
-    fn engineer_sees_prod_and_staging_but_not_analytics() {
-        let body = body_for(&["backend-engineers"]);
-        assert!(body.contains("\"name\":\"prod\""), "{body}");
-        assert!(body.contains("\"name\":\"staging\""), "{body}");
-        assert!(!body.contains("\"name\":\"analytics\""), "{body}");
-    }
-
-    #[test]
-    fn analyst_only_sees_analytics() {
-        let body = body_for(&["analytics-team"]);
-        assert!(body.contains("\"name\":\"analytics\""), "{body}");
-        assert!(!body.contains("\"name\":\"prod\""), "{body}");
-        assert!(!body.contains("\"name\":\"staging\""), "{body}");
-    }
-
-    #[test]
-    fn user_in_no_group_sees_nothing() {
-        let body = body_for(&[]);
-        assert!(body.contains("\"servers\":[]"), "{body}");
-    }
-
-    /// row_count in Outcome equals the visible server count — operators
-    /// reading audit_calls.row_count get the same answer.
-    #[test]
-    fn row_count_matches_visible_servers() {
-        let outcome = compute_outcome(
-            Value::from(1),
-            &identity(&["backend-engineers"]),
-            &load(),
-            &[],
-        );
-        assert_eq!(outcome.code, OutcomeCode::Success);
-        assert_eq!(outcome.row_count, Some(2));
-        assert_eq!(outcome.truncated, Some(false));
-    }
-
-    /// The hard one: no inline password value (literal, env-ref, or vault-ref)
-    /// can ever appear in the tool output. Hunter2 is in the YAML; it must
-    /// never reach the wire.
-    #[test]
-    fn no_password_ever_appears_in_output() {
-        for groups in [
-            vec!["backend-engineers"],
-            vec!["analytics-team"],
-            vec!["backend-engineers", "analytics-team"],
-        ] {
-            let body = body_for(&groups);
-            assert!(!body.contains("hunter2"), "leaked literal password: {body}");
-            assert!(
-                !body.contains("stagingpw"),
-                "leaked literal password: {body}"
-            );
-            assert!(!body.contains("dwpw"), "leaked literal password: {body}");
-            assert!(!body.contains("password"), "field name leaked: {body}");
-            assert!(!body.contains("role"), "role name leaked: {body}");
-            assert!(!body.contains("host"), "host leaked: {body}");
-        }
-    }
-}
+#[path = "list_servers_tests.rs"]
+mod tests;

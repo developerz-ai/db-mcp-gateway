@@ -153,7 +153,7 @@ proptest! {
         let combined = format!("{safe}; {unsafe_}");
         let got = is_read_only(&combined);
         prop_assert!(
-            matches!(got, Err(GuardError::MultiStatement(_)) | Err(GuardError::NotAllowed(_)) | Err(GuardError::Parse)),
+            matches!(got, Err(GuardError::MultiStatement(_)) | Err(GuardError::NotAllowed(_)) | Err(GuardError::Parse(_))),
             "wrongly handled: `{combined}` → {got:?}"
         );
     }

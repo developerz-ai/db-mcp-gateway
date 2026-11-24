@@ -249,3 +249,26 @@ async fn explain_on_mongo_is_unsupported_backend() {
     assert_eq!(f.intents().await, 0);
     f.finish().await;
 }
+
+/// A Mongo `sql` that is not a JSON command, and a `sample_table` name no
+/// collection can have, are the caller's argument errors — audited, refused
+/// before any intent row (the Mongo host is never reached).
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn malformed_mongo_arguments_are_invalid_arguments() {
+    let f = Fixture::new().await;
+    let sql = r#"{"find": "events""#;
+    let args = json!({ "server": "analytics", "database": "dw", "sql": sql });
+    let message = assert_invalid_params(&f.call("run_query", args).await);
+    assert!(message.starts_with("`sql`: "), "{message}");
+    let row = f.latest("run_query", "malformed mongo").await;
+    assert_eq!(row.outcome, "invalid_arguments");
+
+    let args = json!({ "server": "analytics", "database": "dw", "table": "events." });
+    let message = assert_invalid_params(&f.call("sample_table", args).await);
+    assert!(message.contains("no trailing `.`"), "{message}");
+    let row = f.latest("sample_table", "bad collection").await;
+    assert_eq!(row.outcome, "invalid_arguments");
+    assert_eq!(f.intents().await, 0);
+    f.finish().await;
+}

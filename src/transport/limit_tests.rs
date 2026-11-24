@@ -140,7 +140,7 @@ async fn held_permits(
     limiter: &ConcurrencyLimiter,
     user_sub: &str,
     cap: Option<usize>,
-) -> Vec<OwnedSemaphorePermit> {
+) -> Vec<IdentityPermit> {
     let mut held = Vec::new();
     while let Some(permit) = limiter.try_identity(user_sub, cap).await {
         held.push(permit);

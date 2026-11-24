@@ -125,6 +125,7 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
   - `get_query_history` - Retrieve a user's own recent queries from the audit log
   - `table_stats` - Table and index sizes, row estimates, scan and vacuum statistics
   - `db_activity` - The caller's own statements the gateway is running right now
+  - `whoami` - Your identity, groups, session expiry and grants
   - `cancel_query` - Cancel one of the caller's own running statements by `request_id`
 
 ### Multi-Database Support

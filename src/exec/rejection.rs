@@ -36,9 +36,12 @@ pub enum RejectionKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbRejection {
-    /// A Postgres SQLSTATE, a Redis error code, or a Mongo code (`13`).
+    /// A Postgres SQLSTATE, a Redis error code, or a Mongo error code.
     sqlstate: String,
     message: String,
+    position: Option<usize>,
+    hint: Option<String>,
+    near_misses: Vec<String>,
 }
 
 impl DbRejection {
@@ -46,12 +49,41 @@ impl DbRejection {
     /// `message` is replaced, because Postgres names the role in privilege
     /// errors (`permission denied to set role "app"`).
     pub(crate) fn new(sqlstate: &str, message: &str, role: &str) -> Self {
-        let quoted_role = format!("\"{role}\"");
-        let redacted = message.replace(&quoted_role, ROLE_PLACEHOLDER);
         Self {
             sqlstate: sqlstate.to_string(),
-            message: redacted.chars().take(MAX_MESSAGE_CHARS).collect(),
+            message: redact_role(message, role),
+            position: None,
+            hint: None,
+            near_misses: Vec::new(),
         }
+    }
+
+    /// `position` is a 1-based character offset into the caller's statement.
+    pub(crate) fn with_position(mut self, position: Option<usize>) -> Self {
+        self.position = position;
+        self
+    }
+
+    /// `hint` is a server hint already judged free of row data (see
+    /// `pg::redact::safe_hint`); the role is redacted here as in the message.
+    pub(crate) fn with_hint(mut self, hint: Option<&str>, role: &str) -> Self {
+        self.hint = hint.map(|hint| redact_role(hint, role));
+        self
+    }
+
+    pub(crate) fn with_near_misses(mut self, near_misses: Vec<String>) -> Self {
+        self.near_misses = near_misses;
+        self
+    }
+
+    /// Move [`Self::position`] back by `chars`: the statement the target saw
+    /// was the caller's behind a `chars`-long prefix (`EXPLAIN (…) `).
+    pub(crate) fn behind_prefix(mut self, chars: usize) -> Self {
+        self.position = self
+            .position
+            .and_then(|at| at.checked_sub(chars))
+            .filter(|at| *at > 0);
+        self
     }
 
     pub fn sqlstate(&self) -> &str {
@@ -60,6 +92,28 @@ impl DbRejection {
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// Where in the caller's statement the target located the error: a
+    /// 1-based character offset, as Postgres reports it. `None` when the
+    /// error was raised at run time or by another engine.
+    pub fn position(&self) -> Option<usize> {
+        self.position
+    }
+
+    /// The server's hint, only when it is a parser or catalog hint (SQLSTATE
+    /// class `42`, raised at a position in the caller's statement), with the
+    /// role redacted. Never `DETAIL`.
+    pub fn hint(&self) -> Option<&str> {
+        self.hint.as_deref()
+    }
+
+    /// For an [`RejectionKind::UndefinedObject`]: up to five existing table
+    /// or column names close to the one the caller typed, from the catalog
+    /// the read role can see, closest first. Empty when none is close or the
+    /// lookup did not finish in time.
+    pub fn near_misses(&self) -> &[String] {
+        &self.near_misses
     }
 
     pub fn kind(&self) -> RejectionKind {
@@ -73,6 +127,16 @@ impl DbRejection {
             _ => RejectionKind::Other,
         }
     }
+}
+
+/// `text` with every quoted occurrence of `role` replaced, cut to
+/// [`MAX_MESSAGE_CHARS`].
+fn redact_role(text: &str, role: &str) -> String {
+    let quoted_role = format!("\"{role}\"");
+    text.replace(&quoted_role, ROLE_PLACEHOLDER)
+        .chars()
+        .take(MAX_MESSAGE_CHARS)
+        .collect()
 }
 
 impl fmt::Display for DbRejection {
@@ -109,6 +173,17 @@ mod tests {
             r#"permission denied to set role "<role>" for application"#
         );
         assert_eq!(r.to_string(), format!("42501 {}", r.message()));
+    }
+
+    #[test]
+    fn hint_is_role_redacted_and_position_shifts_behind_a_prefix() {
+        let r = DbRejection::new("42501", "m", "app")
+            .with_position(Some(30))
+            .with_hint(Some(r#"grant it to "app""#), "app")
+            .behind_prefix(22);
+        assert_eq!(r.hint(), Some(r#"grant it to "<role>""#));
+        assert_eq!(r.position(), Some(8));
+        assert_eq!(r.behind_prefix(9).position(), None);
     }
 
     #[test]

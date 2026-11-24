@@ -4,7 +4,7 @@
 use futures::StreamExt;
 use serde_json::Value;
 use sqlx::postgres::PgRow;
-use sqlx::{Column, Either, Executor, Postgres, Row, Transaction};
+use sqlx::{Column, Either, Executor, Postgres, Row, Transaction, TypeInfo};
 use tokio::sync::Semaphore;
 
 use super::super::adapter::ExecError;
@@ -25,6 +25,8 @@ pub(super) const LARGE_ROW_DECODES: usize = 2;
 /// Rows collected so far plus what the stream said about the statement.
 pub(super) struct Collected {
     pub(super) columns: Vec<String>,
+    /// The server's type name per column (`int4`, `text`, …).
+    pub(super) column_types: Vec<String>,
     pub(super) rows: Vec<Vec<Value>>,
     pub(super) truncated: bool,
     pub(super) rows_affected: u64,
@@ -44,6 +46,7 @@ pub(super) async fn stream_rows(
     let mut budget = ResultBudget::new(query.row_limit);
     let mut collected = Collected {
         columns: Vec::new(),
+        column_types: Vec::new(),
         rows: Vec::new(),
         truncated: false,
         rows_affected: 0,
@@ -74,6 +77,11 @@ pub(super) async fn stream_rows(
         }
         if collected.columns.is_empty() {
             collected.columns = row.columns().iter().map(|c| c.name().to_string()).collect();
+            collected.column_types = row
+                .columns()
+                .iter()
+                .map(|c| c.type_info().name().to_string())
+                .collect();
             decoders_for_rows = decoders(&row, money_digits);
         }
         // Cheapest check first, and nothing is decoded that cannot be kept:

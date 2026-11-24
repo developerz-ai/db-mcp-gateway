@@ -50,10 +50,10 @@ fn uescape_rejected() {
         is_read_only(r#"select U&"!0070g_notify" UESCAPE '!' ('a', 'b')"#),
         Err(GuardError::UnicodeEscapedIdentifier)
     );
-    assert_eq!(
+    assert!(matches!(
         is_read_only(r"select U&'!0070' UESCAPE '!'"),
-        Err(GuardError::Parse)
-    );
+        Err(GuardError::Parse(_))
+    ));
 }
 
 /// Other spellings of a denied name already reach the denylist: quoting,

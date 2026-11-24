@@ -7,6 +7,7 @@
 //! call and this row still leaves a trace the reaper turns into `abandoned`.
 
 mod cancel_guard;
+mod error_body;
 mod metric_names;
 mod outcome;
 mod types;
@@ -18,13 +19,14 @@ pub use outcome::{ToolErrorMessages, outcome_from_exec_error, success_outcome, t
 // payload and the audit row's `error_message`. Scope it to the tools that own
 // their per-tool wording; callers outside `src/tools/` must go through the
 // sanitized `outcome_from_exec_error` boundary instead.
-use outcome::tool_error;
+use error_body::{ErrorDetail, ToolErrorBody, tool_error};
 pub(in crate::tools) use outcome::{
-    elapsed_ms_since, error_outcome, invalid_arguments, write_state,
+    elapsed_ms_since, error_outcome, guard_rejected, invalid_arguments, note_timeout_limit,
+    write_state,
 };
 pub use types::{
-    AuditHeader, AuditStore, Outcome, Reply, RequestContext, Upstream, UpstreamClaim, WriteEffect,
-    WriteState,
+    AuditHeader, AuditStore, HitLimit, Outcome, Reply, RequestContext, Upstream, UpstreamClaim,
+    WriteEffect, WriteState,
 };
 
 use std::future::Future;
@@ -172,13 +174,15 @@ where
             &outcome,
             OutcomeCode::AuditUnavailable,
         );
-        return tool_error(
-            id,
-            request_ctx.request_id,
-            OutcomeCode::AuditUnavailable,
-            &audit_failure_message(write),
+        let message = audit_failure_message(write);
+        let body = ToolErrorBody {
+            code: OutcomeCode::AuditUnavailable,
+            message: &message,
             write,
-        );
+            elapsed_ms: outcome.elapsed_ms,
+            detail: ErrorDetail::None,
+        };
+        return tool_error(id, request_ctx.request_id, body);
     }
 
     record_dispatch(identity, request_ctx, &header, &outcome, outcome.code);
@@ -186,16 +190,18 @@ where
     // not be streamed as if it were.
     store.sinks.send(&row, store.tasks);
     guard.disarm();
-    match outcome.reply {
-        Reply::Response(response) => *response,
-        Reply::ToolError => tool_error(
-            id,
-            request_ctx.request_id,
-            outcome.code,
-            outcome.error_message.as_deref().unwrap_or_default(),
-            outcome.write.map(|w| w.state),
-        ),
-    }
+    let reply = match outcome.reply {
+        Reply::Response(response) => return *response,
+        reply => reply,
+    };
+    let body = ToolErrorBody {
+        code: outcome.code,
+        message: outcome.error_message.as_deref().unwrap_or_default(),
+        write: outcome.write.map(|w| w.state),
+        elapsed_ms: outcome.elapsed_ms,
+        detail: ErrorDetail::of(&reply),
+    };
+    tool_error(id, request_ctx.request_id, body)
 }
 
 /// What the client is told when the completion row failed. "Rejected" is

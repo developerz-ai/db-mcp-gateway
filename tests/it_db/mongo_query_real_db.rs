@@ -488,10 +488,13 @@ async fn describe_schema_lists_collections_and_indexes() {
 
     let result = a
         .describe_schema(db_mcp_gateway::exec::SchemaQuery {
-            schema: "ignored",
+            schema: None,
             table: Some(&coll),
+            search: None,
+            detail: db_mcp_gateway::exec::SchemaDetail::Columns,
             statement_timeout_ms: None,
             row_limit: 10,
+            sample_limit: 0,
             request_id: uuid::Uuid::new_v4(),
         })
         .await

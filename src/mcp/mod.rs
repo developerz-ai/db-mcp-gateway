@@ -2,6 +2,8 @@
 //! JSON-RPC 2.0 envelope and the MCP payload types + tool names. Pure data, no
 //! I/O — both layers import it, so neither depends on the other for framing.
 
+mod instructions;
 pub mod jsonrpc;
+mod limits;
 pub mod protocol;
 mod tool_list;

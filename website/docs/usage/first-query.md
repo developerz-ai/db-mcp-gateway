@@ -54,13 +54,14 @@ After SSO, the same prompt completes:
 ```text
 You:    What databases can I see through db-gateway?
 
-Claude: [calls list_servers]
-        [calls list_databases for each server]
+Claude: [calls list_servers — each server comes back with its databases]
 
         You have access to:
         • staging (postgres) — staging/app, staging/billing
         • prod (postgres)    — prod/billing (read-only, reason required)
 ```
+
+Each database in the answer carries what you may do there: `actions` (`schema_read`, `query_read`, …), `writes`, the `tools` that work on it, and per action the `row_limit`, `statement_timeout_ms` and `require_reason` your grant enforces. To see your own identity, groups, session expiry and every grant in one call, ask the agent to call `whoami`.
 
 If you see **nothing** here, the auth worked but you're not in any group that has grants. Skip to [Gotchas → I see no servers](#i-see-no-servers).
 
@@ -86,6 +87,10 @@ staging/app.users
 ```
 
 Each `describe_schema` call goes to the database and writes its own audit row — the gateway does not cache schemas.
+
+Three levels of detail: `detail: "names"` lists tables and their kind, the default `columns` adds column types, `full` adds real types (`varchar(64)`, `integer[]`, enum labels), primary and foreign keys, indexes, comments and a row estimate. `search: "email"` finds the tables whose name or a column name contains the term, across every schema when no `schema` is named. On MongoDB, `full` infers each collection's fields from a sample of up to 100 documents, under a `query_read` grant.
+
+When a query names a table or column that does not exist, the error carries up to five near-miss names the agent can see (`users` for `usres`), the position of the error in the statement and, for a parser error, Postgres' own hint — so the next call is usually the fix.
 
 ## 5. Run a query
 
@@ -158,11 +163,11 @@ Answer it (or put the reason in your request up front) and the agent retries wit
 
 ### `timeout` on `run_query`
 
-The query exceeded the grant's `statement_timeout_ms`. Don't try to bypass it — narrow the query (tighter `WHERE`, smaller table, smaller window) or ask the agent to `explain` first to see what's expensive.
+The query exceeded the grant's `statement_timeout_ms` — the error names the budget in its message and in `limit` (`{"name": "statement_timeout_ms", "value": …}`). Don't try to bypass it — narrow the query (tighter `WHERE`, smaller table, smaller window) or ask the agent to `explain` first to see what's expensive.
 
 ### `truncated: true` in the response
 
-The result was clipped at the row cap (the grant's `row_limit`, else 1000) or at the gateway's result-size cap. It is not an error: the rows that fit come back with `truncated: true`. Add a `LIMIT`, a tighter `WHERE`, or aggregate (`count`, `sum`, `group by`) before the gateway has to truncate.
+The result was clipped at the row cap (the grant's `row_limit`, else 1000) or at the gateway's result-size cap. It is not an error: the rows that fit come back with `truncated: true`. Add a `LIMIT`, a tighter `WHERE`, or aggregate (`count`, `sum`, `group by`) before the gateway has to truncate. The response says which cap cut — `truncated_by`: `limit` (raise `limit`), `grant_row_limit` (the grant's cap; page instead) or `byte_cap` — next to the effective `row_limit` and a `hint` on how to page by key. To keep a result small for the agent's context, pass `max_bytes` (cap on the returned rows' JSON) and `max_cell_bytes` (an oversized cell becomes a `{"$dbmcp_truncated": {"bytes", "preview"}}` marker); `sample_table` also takes `columns`.
 
 ### "I want to write, not just read"
 

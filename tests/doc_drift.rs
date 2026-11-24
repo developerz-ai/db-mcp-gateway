@@ -304,7 +304,7 @@ fn tool_lists_name_the_advertised_tools() {
         r#"pub const [A-Z_]+_TOOL: &str = "([a-z_]+)";"#,
         &read("src/mcp/protocol.rs"),
     );
-    assert_eq!(tools.len(), 10, "tool constants changed: {tools:?}");
+    assert_eq!(tools.len(), 11, "tool constants changed: {tools:?}");
     let readme = read("README.md");
     let line = readme
         .lines()

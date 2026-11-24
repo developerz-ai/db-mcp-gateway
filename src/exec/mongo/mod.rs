@@ -22,6 +22,8 @@ mod bson_json;
 mod cancel;
 mod catalog;
 mod dispatch;
+mod error;
+mod infer;
 pub mod rejector;
 
 pub use catalog::sample_command;

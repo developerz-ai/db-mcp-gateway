@@ -132,6 +132,7 @@ async fn sql_shaped_operations_are_not_implemented() {
         .await
         .map(|_| ExecResult {
             columns: Vec::new(),
+            column_types: Vec::new(),
             rows: Vec::new(),
             truncated: false,
             elapsed_ms: 0,

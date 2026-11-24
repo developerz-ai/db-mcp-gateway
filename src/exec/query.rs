@@ -30,17 +30,47 @@ pub struct ExecQuery<'a> {
     pub request_id: Uuid,
 }
 
-/// Catalog lookup for one schema, optionally narrowed to one table. Schema
-/// and table are *values* to the catalog query (bound, not interpolated).
-/// Mongo ignores `schema` (the database is the namespace) and reads `table`
-/// as a collection name.
+/// Catalog lookup for one schema (or every schema the read role may use,
+/// when `schema` is `None`), optionally narrowed to one table and to the
+/// tables whose name or column names contain `search`, case-insensitively.
+/// Every one of them is a *value* to the catalog query (bound, never
+/// interpolated). Mongo ignores `schema` (the database is the namespace)
+/// and reads `table` as a collection name.
 #[derive(Debug)]
 pub struct SchemaQuery<'a> {
-    pub schema: &'a str,
+    pub schema: Option<&'a str>,
     pub table: Option<&'a str>,
+    pub search: Option<&'a str>,
+    pub detail: SchemaDetail,
     pub statement_timeout_ms: Option<u32>,
     pub row_limit: u32,
+    /// Documents read per collection to infer its fields: Mongo at
+    /// [`SchemaDetail::Full`] only, which reads row data — the tool sets it
+    /// from the caller's `query_read` grant.
+    pub sample_limit: u32,
     pub request_id: Uuid,
+}
+
+/// How much of the catalog a [`SchemaQuery`] reads, and the row each answers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SchemaDetail {
+    /// Postgres only: `[schema]` per schema.
+    Schemas,
+    /// Postgres: `[schema, table, kind]`, `kind` one of `table`,
+    /// `partitioned_table`, `view`, `materialized_view`, `foreign_table`.
+    /// Mongo: `[database, collection, type]`.
+    Names,
+    /// The default and original shape. Postgres:
+    /// `[schema, table, column, data_type, is_nullable]` per column, all
+    /// strings from `information_schema` (`is_nullable` `"YES"` / `"NO"`).
+    /// Mongo: `[database, collection, type, indexes]`, `indexes` a JSON
+    /// array of `{name, key, unique}`, empty for a view.
+    #[default]
+    Columns,
+    /// Postgres: one row per table, see `pg::catalog_full`. Mongo: the
+    /// `Columns` row plus `sample`, `{sampled, fields: [{name, types,
+    /// count}], truncated}` over at most `sample_limit` documents.
+    Full,
 }
 
 /// First `row_limit` rows of one table, every column. The names are

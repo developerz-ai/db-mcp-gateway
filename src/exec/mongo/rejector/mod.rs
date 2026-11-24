@@ -126,8 +126,10 @@ const DENIED_OPERATORS: &[&str] = &["$out", "$merge", "$function", "$where", "$a
 /// audit signal; values stay in the original command for the audit row.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum RejectReason {
-    #[error("mongo command is not valid JSON")]
-    Malformed,
+    /// Where serde_json stopped reading: 1-based line and column. Its
+    /// message is not kept — it can quote the payload.
+    #[error("mongo command is not valid JSON at line {line}, column {column}")]
+    Malformed { line: usize, column: usize },
 
     #[error("mongo command must be a JSON object with at least one field")]
     EmptyCommand,
@@ -142,12 +144,23 @@ pub enum RejectReason {
     DisallowedField { command: String, field: String },
 }
 
+impl RejectReason {
+    /// The payload is not a JSON object with a command in it (as opposed to
+    /// a command refused by policy): the caller's argument error.
+    pub fn is_malformed(&self) -> bool {
+        matches!(self, Self::Malformed { .. } | Self::EmptyCommand)
+    }
+}
+
 /// Read-only enforcement for a mongo command. Returns `Ok(())` iff the
 /// command name is in [`ALLOWED_COMMANDS`], every other top-level key is in
 /// its [`allowed_fields`], AND no [`DENIED_OPERATORS`] appear anywhere in
 /// the parsed tree.
 pub fn validate_command(json: &str) -> Result<(), RejectReason> {
-    let value: Value = serde_json::from_str(json).map_err(|_| RejectReason::Malformed)?;
+    let value: Value = serde_json::from_str(json).map_err(|err| RejectReason::Malformed {
+        line: err.line(),
+        column: err.column(),
+    })?;
     let object = value.as_object().ok_or(RejectReason::EmptyCommand)?;
 
     // Mongo wire convention: the first field is the command name.

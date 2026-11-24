@@ -21,7 +21,7 @@ use super::ToolCtx;
 use super::args::parse_arguments;
 use super::audit_dispatch::{
     AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, WriteEffect, WriteState, error_outcome,
-    outcome_from_exec_error, reject_arguments, run_audited, success_outcome,
+    guard_rejected, outcome_from_exec_error, reject_arguments, run_audited, success_outcome,
 };
 use super::target::{ensure_reason, forbidden, record_intent, resolve_target};
 
@@ -126,12 +126,7 @@ async fn compute_outcome(
     };
     let sql = match GuardedSql::parse(&args.sql, grant_access) {
         Ok(sql) => sql,
-        Err(err) => {
-            return error_outcome(
-                OutcomeCode::ForbiddenSql,
-                &format!("SQL rejected by gateway: {err}"),
-            );
-        }
+        Err(err) => return guard_rejected(&err),
     };
     let access = sql.required_access();
     if args.analyze && access != Access::ReadOnly {
@@ -232,6 +227,7 @@ mod tests {
     fn extract_plan_decodes_string_cell() {
         let result = crate::exec::ExecResult {
             columns: vec!["QUERY PLAN".to_string()],
+            column_types: Vec::new(),
             rows: vec![vec![Value::from(r#"[{"Plan":{"Node Type":"Seq Scan"}}]"#)]],
             truncated: false,
             elapsed_ms: 0,
@@ -247,6 +243,7 @@ mod tests {
         // Value::Array (or Object) — pass through without re-parsing.
         let result = crate::exec::ExecResult {
             columns: vec!["QUERY PLAN".to_string()],
+            column_types: Vec::new(),
             rows: vec![vec![serde_json::json!([{"Plan": {"Node Type": "Result"}}])]],
             truncated: false,
             elapsed_ms: 0,
@@ -260,6 +257,7 @@ mod tests {
     fn extract_plan_errors_on_empty_or_unexpected_shape() {
         let empty = crate::exec::ExecResult {
             columns: vec![],
+            column_types: Vec::new(),
             rows: vec![],
             truncated: false,
             elapsed_ms: 0,
@@ -270,6 +268,7 @@ mod tests {
         // Wrong cell type (number)
         let wrong = crate::exec::ExecResult {
             columns: vec!["QUERY PLAN".to_string()],
+            column_types: Vec::new(),
             rows: vec![vec![Value::from(42)]],
             truncated: false,
             elapsed_ms: 0,

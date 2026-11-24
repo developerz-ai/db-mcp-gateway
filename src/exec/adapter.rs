@@ -68,7 +68,7 @@ pub(super) const TOKIO_TIMEOUT_SLACK_MS: u64 = 500;
 /// The floor of 1 is belt and braces: config and the admin API reject a zero
 /// timeout, but Postgres reads `statement_timeout = 0` as *no limit*, so a
 /// zero that slipped through would silently disable the DB-side cap.
-pub(super) fn effective_timeout_ms(grant: Option<u32>) -> u32 {
+pub(crate) fn effective_timeout_ms(grant: Option<u32>) -> u32 {
     grant
         .unwrap_or(DEFAULT_STATEMENT_TIMEOUT_MS)
         .clamp(1, DEFAULT_STATEMENT_TIMEOUT_MS)
@@ -121,9 +121,13 @@ pub enum AdapterKind {
 /// number of rows the statement changed (or, under `dry_run`, would have
 /// changed), which can exceed `rows.len()` when a `RETURNING` list was
 /// truncated (the write itself is never cut short).
-#[derive(Debug, Serialize)]
+///
+/// `column_types` names each column's type, in the same order as
+/// `columns`; empty when the backend has no type info (Mongo, Redis).
+#[derive(Debug, Default, Serialize)]
 pub struct ExecResult {
     pub columns: Vec<String>,
+    pub column_types: Vec<String>,
     pub rows: Vec<Vec<Value>>,
     pub truncated: bool,
     pub elapsed_ms: u64,
@@ -243,16 +247,10 @@ pub trait DbAdapter: Send + Sync + std::fmt::Debug {
     /// See `ExecQuery` for the per-call inputs.
     async fn execute(&self, query: ExecQuery<'_>) -> Result<ExecResult, ExecError>;
 
-    /// The schema, one row per column or per collection.
-    ///
-    /// - Postgres: every table in `query.schema` (or just `query.table`),
-    ///   ordered by table then column position. Each row is exactly
-    ///   `[schema, table, column, data_type, is_nullable]`, all strings;
-    ///   `is_nullable` is `"YES"` / `"NO"`.
-    /// - Mongo: every collection (or just `query.table`), ordered by name.
-    ///   Each row is exactly `[database, collection, type, indexes]`: three
-    ///   strings (`type` is `"collection"` / `"view"` / …) and a JSON array
-    ///   of `{name, key, unique}`, empty for a view.
+    /// The catalog at `query.detail` (row shapes on
+    /// [`SchemaDetail`](super::query::SchemaDetail)), over `query.schema`
+    /// (every schema the read role may use when `None`; Mongo has none),
+    /// narrowed by `query.table` and `query.search`; ordered by name.
     async fn describe_schema(&self, query: SchemaQuery<'_>) -> Result<ExecResult, ExecError>;
 
     /// Up to `query.row_limit` rows of the table, with `truncated` set when

@@ -59,10 +59,13 @@ pub fn router(config: &Config, state: AppState) -> Result<Router, TransportError
     // Bearer-gated budget, shared by `/mcp`, logout and the admin API. Layer
     // order: the last-applied route layer runs first, so `bearer_auth`
     // resolves the `Identity` before `limit::enforce` reads it.
-    let gated_limiter = Arc::new(ConcurrencyLimiter::with_caps(
-        config.max_concurrent_requests,
-        config.max_concurrent_per_identity,
-    ));
+    let gated_limiter = Arc::new(
+        ConcurrencyLimiter::with_caps(
+            config.max_concurrent_requests,
+            config.max_concurrent_per_identity,
+        )
+        .with_mcp_path(&path),
+    );
     let gated = Router::new()
         .route(&path, post(mcp_handler::post_handler))
         .route("/auth/logout", post(auth_routes::logout))

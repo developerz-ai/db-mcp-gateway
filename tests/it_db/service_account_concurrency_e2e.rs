@@ -118,7 +118,7 @@ async fn assert_shed(response: reqwest::Response, label: &str) {
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{label}");
     let body: Value = response.json().await.expect("429 body is JSON");
     assert_eq!(
-        body["error"]["code"], "concurrency_limit_exceeded",
+        body["error"]["data"]["code"], "concurrency_limit_exceeded",
         "{label}: {body}"
     );
 }

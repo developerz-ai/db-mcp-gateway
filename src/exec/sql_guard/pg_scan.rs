@@ -157,7 +157,7 @@ fn comment_end(b: &[u8], i: usize) -> Result<usize, GuardError> {
             _ => j += 1,
         }
     }
-    Err(GuardError::Parse)
+    Err(GuardError::Parse(None))
 }
 
 /// End of the quoted run whose opening quote is at `open`. A doubled quote
@@ -176,7 +176,7 @@ fn quoted_end(b: &[u8], open: usize, quote: u8, backslash: bool) -> Result<usize
             return Ok(j + 1);
         }
     }
-    Err(GuardError::Parse)
+    Err(GuardError::Parse(None))
 }
 
 /// End of the dollar-quoted string opening at `i` (`$$…$$`, `$tag$…$tag$`),
@@ -197,7 +197,7 @@ fn dollar_quoted_end(sql: &str, i: usize) -> Result<Option<usize>, GuardError> {
     let delimiter = &sql[i..body];
     match sql[body..].find(delimiter) {
         Some(at) => Ok(Some(body + at + delimiter.len())),
-        None => Err(GuardError::Parse),
+        None => Err(GuardError::Parse(None)),
     }
 }
 

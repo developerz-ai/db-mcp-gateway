@@ -76,7 +76,7 @@ In a Claude Code session, ask the agent to list databases:
 What databases can I see through db-gateway?
 ```
 
-The agent calls `list_servers` / `list_databases` and shows what your group has access to. Empty list = authenticated but no grants — see [first-query.md → I see no servers](first-query.md#i-see-no-servers).
+The agent calls `list_servers` (each server inlines its databases, with the actions, limits and tools your grants give you there) and shows what your group has access to. `whoami` answers "who am I logged in as, which groups, until when, with which grants". Empty list = authenticated but no grants — see [first-query.md → I see no servers](first-query.md#i-see-no-servers).
 
 For a full first-query walkthrough — including reading your own audit row — see [first-query.md](first-query.md).
 

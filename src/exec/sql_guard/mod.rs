@@ -57,6 +57,7 @@ mod tests;
 use sqlparser::ast::{Statement, UtilityOption, Visit};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
+use sqlparser::tokenizer::Location;
 use std::ops::ControlFlow;
 
 use lexical::check_lexical;
@@ -73,10 +74,39 @@ pub enum Access {
     ReadWrite,
 }
 
+/// Where in the statement the parser gave up: 1-based line and column, as
+/// sqlparser reports them. Coordinates only — the parser's message, which
+/// quotes the statement, is never kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct SqlLocation {
+    pub line: u64,
+    pub column: u64,
+}
+
+impl SqlLocation {
+    /// From sqlparser's location; line `0` marks an empty span, no place.
+    fn of(location: Location) -> Option<Self> {
+        (location.line > 0).then_some(Self {
+            line: location.line,
+            column: location.column,
+        })
+    }
+
+    /// The ` at Line: L, Column: C` suffix sqlparser ends a message with.
+    fn from_message(message: &str) -> Option<Self> {
+        let (_, at) = message.rsplit_once(" at Line: ")?;
+        let (line, column) = at.split_once(", Column: ")?;
+        Self::of(Location::new(line.parse().ok()?, column.parse().ok()?))
+    }
+}
+
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum GuardError {
-    #[error("could not parse SQL")]
-    Parse,
+    #[error(
+        "could not parse SQL{}",
+        .0.map(|at| format!(" at line {}, column {}", at.line, at.column)).unwrap_or_default()
+    )]
+    Parse(Option<SqlLocation>),
     #[error("multiple statements are not allowed (got {0})")]
     MultiStatement(usize),
     #[error(
@@ -102,6 +132,16 @@ pub enum GuardError {
     /// Stable error code: `GUARD_DENIED_FUNCTION`.
     #[error("function `{0}` is not allowed (high-privilege server-side function)")]
     DeniedFunction(&'static str),
+}
+
+impl GuardError {
+    /// Where an unparseable statement stopped parsing, when the parser said.
+    pub fn location(&self) -> Option<SqlLocation> {
+        match self {
+            Self::Parse(at) => *at,
+            _ => None,
+        }
+    }
 }
 
 /// Read-only guard — the `query_read` default. Equivalent to
@@ -153,13 +193,14 @@ fn guard(sql: &str, access: Access) -> Result<Access, GuardError> {
     check_lexical(sql)?;
     let dialect = PostgreSqlDialect {};
     let statements = Parser::parse_sql(&dialect, sql).map_err(|e| match e {
-        ParserError::ParserError(_)
-        | ParserError::TokenizerError(_)
-        | ParserError::RecursionLimitExceeded => GuardError::Parse,
+        ParserError::ParserError(message) | ParserError::TokenizerError(message) => {
+            GuardError::Parse(SqlLocation::from_message(&message))
+        }
+        ParserError::RecursionLimitExceeded => GuardError::Parse(None),
     })?;
 
     match statements.len() {
-        0 => return Err(GuardError::Parse),
+        0 => return Err(GuardError::Parse(None)),
         1 => {}
         n => return Err(GuardError::MultiStatement(n)),
     }

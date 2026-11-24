@@ -4,9 +4,9 @@
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
 
-use super::GuardError;
 use super::denylist::denied_relation;
 use super::pg_scan::{self, Kind, Lexeme};
+use super::{GuardError, SqlLocation};
 
 const DIFFERENT_TOKENS: &str = "Postgres would split this text into different tokens; \
      spell literals, numbers and identifiers plainly";
@@ -29,7 +29,7 @@ const DIFFERENT_TOKENS: &str = "Postgres would split this text into different to
 pub(super) fn check_lexical(sql: &str) -> Result<(), GuardError> {
     let tokens = Tokenizer::new(&PostgreSqlDialect {}, sql)
         .tokenize_with_location()
-        .map_err(|_| GuardError::Parse)?;
+        .map_err(|err| GuardError::Parse(SqlLocation::of(err.location)))?;
     let escaped = tokens
         .windows(3)
         .any(|w| is_unicode_escaped_identifier(&w[0], &w[1], &w[2]));

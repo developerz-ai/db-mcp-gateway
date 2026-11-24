@@ -5,7 +5,9 @@
 
 use std::time::{Duration, Instant};
 
-use sqlx::{Column, Connection, Executor, PgConnection, PgPool, Postgres, SqlSafeStr, Transaction};
+use sqlx::{
+    Column, Connection, Executor, PgConnection, PgPool, Postgres, SqlSafeStr, Transaction, TypeInfo,
+};
 use tokio::sync::Semaphore;
 
 use crate::audit::drain::DetachedTasks;
@@ -126,7 +128,7 @@ async fn run_query_inner(
     // still running and must be cancelled.
     let result = async {
         let collected = stream_rows(&mut tx, query, origin, ctx.large_rows, money_digits).await?;
-        let mut columns = collected.columns;
+        let (mut columns, mut column_types) = (collected.columns, collected.column_types);
         // Reads only. Inside a write's transaction a failed lookup would
         // abort it, and the `COMMIT` that follows would then roll the write
         // back while reporting success.
@@ -134,7 +136,7 @@ async fn run_query_inner(
         if columns.is_empty() && query.access == Access::ReadOnly {
             let left = Duration::from_millis(u64::from(ms)).saturating_sub(started.elapsed());
             match describe_columns(&mut tx, query.sql, left.min(DESCRIBE_TIMEOUT)).await {
-                Some(described) => columns = described,
+                Some(described) => (columns, column_types) = described,
                 None => in_step = false,
             }
         }
@@ -165,6 +167,7 @@ async fn run_query_inner(
         let rows_affected = (query.access == Access::ReadWrite).then_some(collected.rows_affected);
         Ok(ExecResult {
             columns,
+            column_types,
             rows: collected.rows,
             truncated: collected.truncated,
             elapsed_ms: started.elapsed().as_millis() as u64,
@@ -188,7 +191,7 @@ fn cancelled_before_budget(err: ExecError, elapsed: Duration, budget_ms: u32) ->
     }
 }
 
-/// Column names for a zero-row read. Without them the caller cannot tell
+/// Column names and types for a zero-row read. Without them the caller cannot tell
 /// "your filter matched nothing" from "that table has no such columns"
 /// (#136). Parse/Describe only — the statement does not run again. The
 /// driver can only describe through a named statement; `reset_on_release`
@@ -201,7 +204,7 @@ async fn describe_columns(
     tx: &mut Transaction<'_, Postgres>,
     sql: &str,
     budget: Duration,
-) -> Option<Vec<String>> {
+) -> Option<(Vec<String>, Vec<String>)> {
     let described = tokio::time::timeout(
         budget,
         (&mut **tx).describe(sqlx::AssertSqlSafe(sql).into_sql_str()),
@@ -212,9 +215,9 @@ async fn describe_columns(
         Ok(described) => described
             .columns()
             .iter()
-            .map(|c| c.name().to_string())
-            .collect(),
-        Err(_) => Vec::new(),
+            .map(|c| (c.name().to_string(), c.type_info().name().to_string()))
+            .unzip(),
+        Err(_) => (Vec::new(), Vec::new()),
     })
 }
 

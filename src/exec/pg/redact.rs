@@ -119,17 +119,43 @@ const COLUMN_REFERENCE: &[&str] = &["42702", "42703"];
 /// The identifier the caller typed at `position`, unless it is the operand
 /// of a cast: `email::regclass` looks its relation up from row data, so a
 /// position on that expression points at no name the caller chose.
-fn name_at<'s>(sqlstate: &str, sql: &'s str, position: usize) -> Option<&'s str> {
+pub(super) fn name_at<'s>(sqlstate: &str, sql: &'s str, position: usize) -> Option<&'s str> {
+    let (name, after) = identifier_at(sql, position)?;
+    let named = !is_cast(name, after) || COLUMN_REFERENCE.contains(&sqlstate);
+    (named && name.chars().count() <= MAX_NAME_CHARS).then_some(name)
+}
+
+/// The server's hint, when it can only be about the statement: a parse or
+/// analysis diagnostic (class `42`) located in the caller's statement, not
+/// on a cast operand. Those hints name catalog objects and fixed advice
+/// (`Perhaps you meant to reference the column "users.email".`); a hint
+/// raised at run time, over data, has no position and is dropped.
+pub(super) fn safe_hint<'h>(
+    sqlstate: &str,
+    position: Option<usize>,
+    sql: &str,
+    hint: Option<&'h str>,
+) -> Option<&'h str> {
+    let at = position.filter(|_| is_parser_diagnostic(sqlstate))?;
+    let on_cast = identifier_at(sql, at)
+        .is_some_and(|(name, after)| is_cast(name, after) && !COLUMN_REFERENCE.contains(&sqlstate));
+    if on_cast { None } else { hint }
+}
+
+/// The (possibly qualified) identifier starting at the 1-based character
+/// `position`, and the text after it.
+fn identifier_at(sql: &str, position: usize) -> Option<(&str, &str)> {
     let (start, _) = sql.char_indices().nth(position.checked_sub(1)?)?;
     let rest = &sql[start..];
     let mut len = part_len(rest)?;
     while let Some(next) = rest[len..].strip_prefix('.').and_then(part_len) {
         len += 1 + next;
     }
-    let (name, after) = rest.split_at(len);
-    let cast = name.eq_ignore_ascii_case("cast") || after.trim_start().starts_with("::");
-    let named = !cast || COLUMN_REFERENCE.contains(&sqlstate);
-    (named && name.chars().count() <= MAX_NAME_CHARS).then_some(name)
+    Some(rest.split_at(len))
+}
+
+fn is_cast(name: &str, after: &str) -> bool {
+    name.eq_ignore_ascii_case("cast") || after.trim_start().starts_with("::")
 }
 
 /// Byte length of the identifier `text` starts with — bare, or double-quoted
@@ -152,104 +178,5 @@ fn part_len(text: &str) -> Option<usize> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_name_at_the_error_position_is_kept_as_the_caller_spelled_it() {
-        for (sqlstate, position, sql, want) in [
-            (
-                "42P01",
-                15,
-                "SELECT * FROM Usres",
-                "relation does not exist: Usres",
-            ),
-            (
-                "42P01",
-                15,
-                r#"SELECT * FROM "My ""T""".x WHERE true"#,
-                r#"relation does not exist: "My ""T""".x"#,
-            ),
-            (
-                "42P01",
-                15,
-                "SELECT * FROM nope.t, u",
-                "relation does not exist: nope.t",
-            ),
-            ("42601", 10, "SELECT 1 FORM t", "syntax error: FORM"),
-            (
-                "42883",
-                8,
-                "SELECT nope(1)",
-                "function or operator does not exist: nope",
-            ),
-            (
-                "42703",
-                8,
-                "SELECT t.nöpe::int FROM t",
-                "column does not exist: t.nöpe",
-            ),
-        ] {
-            assert_eq!(rejection_message(sqlstate, Some(position), sql), want);
-        }
-    }
-
-    #[test]
-    fn an_error_raised_over_row_data_names_nothing() {
-        // The alias spells the very word a row could hold.
-        let sql = "SELECT email::regclass AS alice FROM users";
-        for sqlstate in [
-            "3F000", "22P02", "22021", "23505", "P0001", "XX000", "55000",
-        ] {
-            for position in [None, Some(8), Some(26)] {
-                let message = rejection_message(sqlstate, position, sql);
-                assert_eq!(message, wording(sqlstate), "{sqlstate} at {position:?}");
-            }
-        }
-        // A parser-class code without a position was raised at run time.
-        for sqlstate in ["42P01", "42704", "42883", "42601", "42501"] {
-            assert_eq!(rejection_message(sqlstate, None, sql), wording(sqlstate));
-        }
-    }
-
-    #[test]
-    fn a_position_on_a_cast_names_nothing() {
-        for (sql, position) in [
-            ("SELECT email::regclass FROM users", 8),
-            ("SELECT email :: regclass FROM users", 8),
-            ("SELECT email::regclass FROM users", 13),
-            ("SELECT CAST(email AS regclass) FROM users", 8),
-            ("SELECT 'users'::regclass", 8),
-        ] {
-            let message = rejection_message("42P01", Some(position), sql);
-            assert_eq!(message, "relation does not exist", "{sql} at {position}");
-        }
-    }
-
-    #[test]
-    fn a_position_on_no_identifier_names_nothing() {
-        for (sql, position) in [
-            ("SELECT 1", 99),
-            ("SELECT 1", 0),
-            ("SELECT 1 2", 10),
-            ("SELECT 1 + 'a'", 10),
-            (r#"SELECT "unterminated"#, 8),
-        ] {
-            let message = rejection_message("42601", Some(position), sql);
-            assert_eq!(message, "syntax error", "{sql} at {position}");
-        }
-        let long = format!("SELECT * FROM {}", "t".repeat(MAX_NAME_CHARS + 1));
-        assert_eq!(
-            rejection_message("42P01", Some(15), &long),
-            "relation does not exist"
-        );
-    }
-
-    #[test]
-    fn unlisted_codes_fall_back_to_class_then_generic_wording() {
-        assert_eq!(wording("22999"), "data exception");
-        assert_eq!(wording("P0999"), "error raised by a database function");
-        assert_eq!(wording("F0000"), UNKNOWN);
-        assert_eq!(wording(""), UNKNOWN);
-    }
-}
+#[path = "redact_tests.rs"]
+mod tests;

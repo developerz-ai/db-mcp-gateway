@@ -29,18 +29,21 @@
 //! `PgConnectOptions` construction, `release` owns the session reset between
 //! callers, `run` owns the per-query transaction,
 //! `stream` owns row collection against the result budget, `recast` owns the
-//! second attempt at a read whose columns have no binary form.
+//! second attempt at a read whose columns have no binary form, `near_miss`
+//! owns the names offered for an undefined table or column.
 //! `catalog`, `sample`, `explain` and `introspect` build the Postgres SQL
 //! behind the matching `DbAdapter` methods.
 
 mod cancel;
 mod catalog;
+mod catalog_full;
 mod config;
 mod decode;
 mod error;
 mod explain;
 mod introspect;
 mod methods;
+mod near_miss;
 mod recast;
 mod redact;
 mod release;

@@ -47,10 +47,13 @@ async fn seeded_collection() -> String {
 
 fn schema(table: &str) -> SchemaQuery<'_> {
     SchemaQuery {
-        schema: "ignored",
+        schema: None,
         table: Some(table),
+        search: None,
+        detail: db_mcp_gateway::exec::SchemaDetail::Columns,
         statement_timeout_ms: None,
         row_limit: 10,
+        sample_limit: 0,
         request_id: Uuid::new_v4(),
     }
 }

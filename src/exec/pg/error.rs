@@ -14,7 +14,7 @@ use uuid::Uuid;
 use super::super::adapter::ExecError;
 use super::super::rejection::DbRejection;
 use super::super::sql_guard::Access;
-use super::redact::rejection_message;
+use super::redact::{rejection_message, safe_hint};
 
 /// Where a target error came from. The names go on its log line as event
 /// fields — the operator's log shows no span, so a line without them cannot
@@ -52,16 +52,26 @@ pub(super) fn classify(err: sqlx::Error, origin: &Origin<'_>, sql: &str) -> Exec
             // role and can name the client address. Never passed on, however
             // it got here.
             c if c.starts_with("28") => ExecError::Connection,
-            c => {
-                let message = rejection_message(c, error_position(db.as_ref()), sql);
-                ExecError::Rejected(DbRejection::new(c, &message, origin.role))
-            }
+            c => ExecError::Rejected(rejection(c, db.as_ref(), origin.role, sql)),
         };
     }
     if matches!(err, sqlx::Error::PoolTimedOut | sqlx::Error::Io(_)) {
         return ExecError::Unavailable;
     }
     ExecError::Sql
+}
+
+/// A statement-level refusal: the gateway's wording, the error position, and
+/// the server's hint when [`safe_hint`] admits it. `DETAIL` is never read.
+fn rejection(sqlstate: &str, db: &dyn DatabaseError, role: &str, sql: &str) -> DbRejection {
+    let position = error_position(db);
+    let hint = db
+        .try_downcast_ref::<PgDatabaseError>()
+        .and_then(PgDatabaseError::hint);
+    let message = rejection_message(sqlstate, position, sql);
+    DbRejection::new(sqlstate, &message, role)
+        .with_position(position)
+        .with_hint(safe_hint(sqlstate, position, sql, hint), role)
 }
 
 /// SQLSTATEs with which the target itself rolled the transaction back, for

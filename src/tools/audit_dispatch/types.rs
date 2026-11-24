@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::audit::OutcomeCode;
 use crate::audit::drain::DetachedTasks;
 use crate::audit::stream::StreamSinks;
+use crate::exec::sql_guard::SqlLocation;
 use crate::mcp::jsonrpc::Response;
 
 /// What goes back to the client for one dispatch.
@@ -21,6 +22,32 @@ pub enum Reply {
     /// `code` and `error_message`, because only it knows the gateway
     /// `request_id` the error body carries.
     ToolError,
+    /// A spec 03 tool error raised by a gateway cap: rendered like
+    /// [`Self::ToolError`], with the body's `limit` naming the cap.
+    LimitHit(HitLimit),
+    /// A spec 03 tool error the target DB raised: rendered like
+    /// [`Self::ToolError`], with what the DB pointed at in the statement.
+    Rejected(Box<RejectionDetail>),
+    /// A `forbidden_sql` from the SQL guard's parser: rendered like
+    /// [`Self::ToolError`], with the body's `location` saying where it stopped.
+    Unparsed(SqlLocation),
+}
+
+/// What a target DB's refusal adds to the error body (spec 03 §Errors):
+/// `position`, `db_hint`, `near_misses`, each omitted when absent or empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RejectionDetail {
+    pub position: Option<usize>,
+    pub db_hint: Option<String>,
+    pub near_misses: Vec<String>,
+}
+
+/// The gateway cap a call ran into, as the error body's `limit` names it:
+/// `{"name": "statement_timeout_ms", "value": 200}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct HitLimit {
+    pub name: &'static str,
+    pub value: u64,
 }
 
 /// Result of a tool's compute step. Carries the reply to send back AND

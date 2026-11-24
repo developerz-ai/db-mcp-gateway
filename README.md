@@ -102,7 +102,7 @@ hardware.
 
 ## What it does
 
-- **MCP tool surface** — `list_servers`, `list_databases`, `describe_schema`, `sample_table`, `run_query`, `explain`, `get_query_history`, `table_stats`, `db_activity`, `cancel_query`. `run_query` takes SQL on PostgreSQL and YugabyteDB, a JSON command document on MongoDB, and a JSON argv array (`["HGETALL","user:1"]`) on Redis and Dragonfly.
+- **MCP tool surface** — `list_servers`, `list_databases`, `describe_schema`, `sample_table`, `run_query`, `explain`, `get_query_history`, `table_stats`, `db_activity`, `cancel_query`, `whoami`. `run_query` takes SQL on PostgreSQL and YugabyteDB, a JSON command document on MongoDB, and a JSON argv array (`["HGETALL","user:1"]`) on Redis and Dragonfly.
 - **OIDC SSO** — Any OIDC-compliant identity provider (e.g. Okta, Google Workspace, Entra, Authentik, Keycloak). Browser-flow login from the agent.
 - **Read-only by default, writes opt-in per grant** — per-database least-privilege roles; a `query_write` grant permits data writes (INSERT/UPDATE/DELETE), never schema changes. Statement timeouts and row caps enforced at the DB *and* gateway layer.
 - **Permissions in YAML** — group × server × database × action, with per-grant constraints (`require_reason`, `row_limit`, `statement_timeout_ms`). Table and schema scoping is the target-DB role's job, not a grant's. Reviewed by PR, with the full change history git already gives you.

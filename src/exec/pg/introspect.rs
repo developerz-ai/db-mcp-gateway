@@ -75,6 +75,7 @@ pub(super) fn merge_activity(read: ExecResult, write: ExecResult, row_limit: u32
     rows.truncate(cap);
     ExecResult {
         columns: read.columns,
+        column_types: read.column_types,
         rows,
         truncated: read.truncated || write.truncated || over,
         elapsed_ms: read.elapsed_ms + write.elapsed_ms,
@@ -133,6 +134,7 @@ mod tests {
     fn result(rows: usize, truncated: bool) -> ExecResult {
         ExecResult {
             columns: vec!["pid".into()],
+            column_types: Vec::new(),
             rows: (0..rows).map(|i| vec![serde_json::json!(i)]).collect(),
             truncated,
             elapsed_ms: 1,

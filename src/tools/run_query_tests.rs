@@ -1,7 +1,8 @@
-//! `run_query` unit tests: the indeterminate-write note and the Redis
-//! argv gate.
+//! `run_query` unit tests: the indeterminate-write note and the Redis,
+//! Mongo and SQL gates at the tool edge.
 
 use super::*;
+use crate::tools::audit_dispatch::{Reply, error_outcome};
 
 #[test]
 fn a_timed_out_write_says_it_may_have_committed() {
@@ -66,5 +67,42 @@ fn an_allowed_redis_command_reads() {
     assert_eq!(
         redis_access(Value::from(1), r#"["hgetall","user:1"]"#).ok(),
         Some(Access::ReadOnly)
+    );
+}
+
+#[test]
+fn a_malformed_mongo_command_is_invalid_arguments() {
+    for command in ["{\"find\": ", "[]", "{}", "\"find\""] {
+        let outcome = *mongo_access(Value::from(1), command).expect_err(command);
+        assert_eq!(outcome.code, OutcomeCode::InvalidArguments, "{command}");
+    }
+}
+
+/// A well-formed command the policy refuses is left to the adapter, which
+/// refuses it `forbidden_sql`; an allowed one reads.
+#[test]
+fn a_well_formed_mongo_command_passes_the_edge() {
+    for command in [r#"{"find": "users"}"#, r#"{"insert": "users"}"#] {
+        assert_eq!(
+            mongo_access(Value::from(1), command).ok(),
+            Some(Access::ReadOnly),
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn an_unparseable_statement_carries_its_location() {
+    let outcome = *statement_access("SELECT 1\nFROM t WHERE = = 1", false).expect_err("parse");
+    assert_eq!(outcome.code, OutcomeCode::ForbiddenSql);
+    let Reply::Unparsed(location) = outcome.reply else {
+        panic!("no location: {:?}", outcome.reply);
+    };
+    assert_eq!(location.line, 2);
+    let refused = *statement_access("DROP TABLE t", false).expect_err("DROP");
+    assert!(
+        matches!(refused.reply, Reply::ToolError),
+        "{:?}",
+        refused.reply
     );
 }

@@ -17,6 +17,7 @@ use super::super::rejection::DbRejection;
 use super::MongoAdapter;
 use super::bson_json::{bson_to_json, doc_to_json};
 use super::cancel;
+use super::error::command_rejection;
 
 impl MongoAdapter {
     /// Parse, stamp the DB-side budget, and run one already-accepted command.
@@ -48,10 +49,10 @@ impl MongoAdapter {
         let result = async {
             let (column, collected) = match command_name.as_str() {
                 "find" | "aggregate" | "listCollections" | "listIndexes" => {
-                    ("document", self.drain_cursor(cmd, query.row_limit).await?)
+                    ("document", self.drain_cursor(cmd, query).await?)
                 }
-                "count" => ("count", self.count(cmd, query.row_limit).await?),
-                "distinct" => ("value", self.distinct(cmd, query.row_limit).await?),
+                "count" => ("count", self.count(cmd, query).await?),
+                "distinct" => ("value", self.distinct(cmd, query).await?),
                 // Rejector already filters to the commands above.
                 // This arm exists for type-system completeness — if the
                 // rejector's allow-list and dispatch table drift, fail loudly.
@@ -63,6 +64,7 @@ impl MongoAdapter {
             };
             Ok(ExecResult {
                 columns: vec![column.to_string()],
+                column_types: Vec::new(),
                 rows: collected.rows,
                 truncated: collected.truncated,
                 elapsed_ms: started.elapsed().as_millis() as u64,
@@ -79,16 +81,16 @@ impl MongoAdapter {
 
     /// Cursor-returning commands: the initial response *and* follow-up
     /// `getMore` calls, until the budget runs out.
-    async fn drain_cursor(&self, cmd: Document, row_limit: u32) -> Result<Rows, ExecError> {
+    async fn drain_cursor(&self, cmd: Document, query: &ExecQuery<'_>) -> Result<Rows, ExecError> {
         let db = self.client.database(&self.database_name);
         let mut cursor = db
             .run_cursor_command(cmd)
             .await
-            .map_err(|e| self.classify(e))?;
-        let mut budget = ResultBudget::new(row_limit);
+            .map_err(|e| self.classify(e, query.sql))?;
+        let mut budget = ResultBudget::new(query.row_limit);
         let mut rows = Vec::new();
         while let Some(doc_result) = cursor.next().await {
-            let doc = doc_result.map_err(|e| self.classify(e))?;
+            let doc = doc_result.map_err(|e| self.classify(e, query.sql))?;
             let row = vec![doc_to_json(doc)?];
             if !budget.admit(&row) {
                 return Ok(Rows {
@@ -106,16 +108,19 @@ impl MongoAdapter {
 
     /// `count` answers in one field, `n`. A reply without it is a decode
     /// error, never a `null` count.
-    async fn count(&self, cmd: Document, row_limit: u32) -> Result<Rows, ExecError> {
+    async fn count(&self, cmd: Document, query: &ExecQuery<'_>) -> Result<Rows, ExecError> {
         let db = self.client.database(&self.database_name);
-        let response = db.run_command(cmd).await.map_err(|e| self.classify(e))?;
+        let response = db
+            .run_command(cmd)
+            .await
+            .map_err(|e| self.classify(e, query.sql))?;
         let n = response
             .get_i64("n")
             .or_else(|_| response.get_i32("n").map(i64::from))
             .map_err(|_| ExecError::Decode)?;
         // The result shape is fixed at one row, so the row cap (which may be
         // 0 for an internal caller) has to be applied explicitly.
-        let mut budget = ResultBudget::new(row_limit);
+        let mut budget = ResultBudget::new(query.row_limit);
         let row = vec![Value::from(n)];
         Ok(if budget.admit(&row) {
             Rows {
@@ -132,13 +137,16 @@ impl MongoAdapter {
 
     /// `distinct` answers with every value in one array; the budget applies
     /// to it value by value.
-    async fn distinct(&self, cmd: Document, row_limit: u32) -> Result<Rows, ExecError> {
+    async fn distinct(&self, cmd: Document, query: &ExecQuery<'_>) -> Result<Rows, ExecError> {
         let db = self.client.database(&self.database_name);
-        let mut response = db.run_command(cmd).await.map_err(|e| self.classify(e))?;
+        let mut response = db
+            .run_command(cmd)
+            .await
+            .map_err(|e| self.classify(e, query.sql))?;
         let Some(Bson::Array(values)) = response.remove("values") else {
             return Err(ExecError::Decode);
         };
-        let mut budget = ResultBudget::new(row_limit);
+        let mut budget = ResultBudget::new(query.row_limit);
         let mut rows = Vec::new();
         for value in values {
             let row = vec![bson_to_json(value)?];
@@ -166,10 +174,13 @@ impl MongoAdapter {
     /// - Rejected credentials → `Connection`, and the adapter goes stale so
     ///   the registry re-opens it with a freshly resolved password.
     /// - Connection / IO / selection failures → `Unavailable`.
-    /// - Anything else (a malformed command, a missing collection) → `Sql`.
+    /// - Any other server refusal → a rejection with its code and the
+    ///   gateway's wording (see [`command_rejection`]); `command` is the
+    ///   caller's JSON, the only place a name may come from.
+    /// - Anything else → `Sql`.
     ///
     /// Never renders the driver error: only its kind is logged.
-    fn classify(&self, err: MongoError) -> ExecError {
+    fn classify(&self, err: MongoError, command: &str) -> ExecError {
         let (kind, mapped) = match err.kind.as_ref() {
             ErrorKind::Command(cmd_err) if cmd_err.code == MAX_TIME_MS_EXPIRED => {
                 ("command", ExecError::Timeout)
@@ -186,7 +197,10 @@ impl MongoAdapter {
             ErrorKind::ConnectionPoolCleared { .. } => ("pool_cleared", ExecError::Unavailable),
             ErrorKind::DnsResolve { .. } => ("dns", ExecError::Unavailable),
             ErrorKind::ServerSelection { .. } => ("server_selection", ExecError::Unavailable),
-            ErrorKind::Command(_) => ("command", ExecError::Sql),
+            ErrorKind::Command(cmd_err) => (
+                "command",
+                ExecError::Rejected(command_rejection(cmd_err.code, &cmd_err.message, command)),
+            ),
             _ => ("other", ExecError::Sql),
         };
         let code = match err.kind.as_ref() {

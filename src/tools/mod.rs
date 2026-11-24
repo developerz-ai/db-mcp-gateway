@@ -23,6 +23,7 @@ pub mod sample_table;
 pub mod table_stats;
 mod tabular;
 mod target;
+pub mod whoami;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -91,6 +92,7 @@ pub use crate::mcp::protocol::LIST_SERVERS_TOOL as LIST_SERVERS;
 pub use crate::mcp::protocol::RUN_QUERY_TOOL as RUN_QUERY;
 pub use crate::mcp::protocol::SAMPLE_TABLE_TOOL as SAMPLE_TABLE;
 pub use crate::mcp::protocol::TABLE_STATS_TOOL as TABLE_STATS;
+pub use crate::mcp::protocol::WHOAMI_TOOL as WHOAMI;
 
 /// Audit-row and metric `tool` for a call that named no known tool. The
 /// caller's string is caller-controlled and unbounded, so it rides in
@@ -203,6 +205,7 @@ pub async fn dispatch_call(id: Value, ctx: ToolCtx<'_>, params: Option<Value>) -
             TABLE_STATS => table_stats::run(ctx, id, args).await,
             DB_ACTIVITY => db_activity::run(ctx, id, args).await,
             CANCEL_QUERY => cancel_query::run(ctx, id, args).await,
+            WHOAMI => whoami::run(ctx, id, args).await,
             other => {
                 let name = prefix_at_char_boundary(other, UNKNOWN_TOOL_NAME_MAX_BYTES);
                 let message = format!("unknown tool: {name}");
@@ -225,7 +228,7 @@ fn audited_tool_name(name: &str) -> &'static str {
 }
 
 /// Every tool `dispatch_call` routes.
-const ALL_TOOLS: [&str; 10] = [
+const ALL_TOOLS: [&str; 11] = [
     LIST_SERVERS,
     LIST_DATABASES,
     DESCRIBE_SCHEMA,
@@ -236,6 +239,7 @@ const ALL_TOOLS: [&str; 10] = [
     TABLE_STATS,
     DB_ACTIVITY,
     CANCEL_QUERY,
+    WHOAMI,
 ];
 
 /// Pull `server`/`database` out of `tools/call` arguments for the dispatch

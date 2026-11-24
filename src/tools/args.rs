@@ -12,7 +12,8 @@ use serde_json::{Map, Value};
 
 use crate::audit::{AUDIT_SQL_MAX_BYTES, prefix_at_char_boundary};
 
-/// Names: `server`, `database`, `schema`, `table`, a `request_id`. Twice
+/// Names: `server`, `database`, `schema`, `table`, each `columns` entry, a
+/// `request_id`. Twice
 /// Postgres' 63-byte `NAMEDATALEN` limit, so no real name is refused.
 const IDENTIFIER_MAX_BYTES: usize = 128;
 /// A human-written justification, not a document.
@@ -31,7 +32,14 @@ const PARSE_ERROR_MAX_BYTES: usize = 256;
 /// every tool taking one refuses it (spec 03 §Errors `invalid_arguments`).
 pub(super) const LIMIT_AT_LEAST_ONE: &str = "`limit` must be at least 1";
 
-const IDENTIFIER_KEYS: [&str; 5] = ["server", "database", "schema", "table", "request_id"];
+const IDENTIFIER_KEYS: [&str; 6] = [
+    "server",
+    "database",
+    "schema",
+    "table",
+    "columns",
+    "request_id",
+];
 
 /// What may appear in a string: identifiers take no control character at
 /// all; free text keeps tab, newline and carriage return (multi-line SQL).

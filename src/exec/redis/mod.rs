@@ -209,6 +209,7 @@ impl RedisAdapter {
         };
         Ok(ExecResult {
             columns: shaped.columns,
+            column_types: Vec::new(),
             rows: shaped.rows,
             truncated: shaped.truncated,
             elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
