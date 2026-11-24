@@ -28,7 +28,7 @@ $ARGUMENTS
 1-2 sentences: what + why.
 
 ## Context
-- Stack facts the executor needs (Rust toolchain from `rust-toolchain.toml`, tokio, axum, sqlx for Postgres/MySQL targets, mongodb + redis drivers, hand-rolled JSON-RPC over POST-only Streamable HTTP, serde-saphyr YAML config validated at boot, Postgres state store, `pg` or `mysql` permissions store — only what's relevant).
+- Stack facts the executor needs (Rust toolchain from `rust-toolchain.toml`, tokio, axum, sqlx — Postgres targets (YugabyteDB YSQL included) and the MySQL permissions store (MySQL is not a query target) — mongodb + redis drivers for those targets, hand-rolled JSON-RPC over POST-only Streamable HTTP, serde-saphyr YAML config validated at boot, Postgres state store, `pg` or `mysql` permissions store — only what's relevant).
 - Which of the CLAUDE.md Non-negotiables this touches (credentials never leave the gateway / SSO identity → audit row / read-only by default / synchronous audit / permissions in YAML-by-PR or SSO admin API).
 - Reference patterns: `src/<layer>/<thing>.rs:12` — follow this for Z.
 - `security review required` label needed? (touching `src/auth/`, `src/authz/`, credential loading, audit write path, any new MCP tool, or SQL execution).

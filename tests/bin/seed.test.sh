@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Isolated tests for bin/seed: a stub docker records calls. Pins: it never
 # runs `compose up` (that can recreate a container in use), refuses with 75
-# when target-db is down, creates `shop` only when missing, and loads the
-# committed seed into `shop`, never into the tests' database.
+# when target-db is down, creates `shop` only when missing, loads the
+# committed seed into `shop`, never into the tests' database, and provisions
+# the read-only gateway role on both with its password off argv.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 work=$(mktemp -d)
@@ -12,7 +13,7 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
 mkdir -p "$work/repo/bin/lib" "$work/repo/examples/demo" "$work/tools"
 cp bin/seed "$work/repo/bin/"
-cp bin/lib/dotenv.sh "$work/repo/bin/lib/"
+cp bin/lib/dotenv.sh bin/lib/target-ro-role.sql "$work/repo/bin/lib/"
 cp examples/demo/seed.sql "$work/repo/examples/demo/"
 for tool in bash dirname grep cat; do
   ln -s "$(command -v "$tool")" "$work/tools/$tool"
@@ -23,6 +24,8 @@ printf '%s\n' "$*" >> "$CALLS"
 case "$*" in
   *' ps --status running --services') printf '%s\n' ${RUNNING:-} ;;
   *"SELECT 1 FROM pg_database WHERE datname = 'shop'") printf '%s\n' "${SHOP_EXISTS:-}" ;;
+  *'-e RO_PASSWORD '*) [[ $(cat) == *'GRANT SELECT ON ALL TABLES IN SCHEMA public TO gateway_ro'* ]] || exit 9
+    printf 'ro-env %s\n' "$RO_PASSWORD" >> "$CALLS" ;;
   *' -d shop') [[ $(cat) == *'CREATE TABLE IF NOT EXISTS orders'* ]] || exit 9 ;;
 esac
 STUB
@@ -41,7 +44,15 @@ grep -qF -- '-d app -c CREATE DATABASE shop' "$work/calls" || fail 'missing shop
 grep -qxF -- 'compose -f docker-compose.dev.yml exec -T target-db psql -v ON_ERROR_STOP=1 -q -U app -d shop' "$work/calls" \
   || fail 'seed not loaded into shop'
 
-seed RUNNING=target-db SHOP_EXISTS=1 TARGET_DB_USER=owner || fail 'seed failed with shop present'
+for database in shop app; do
+  grep -qxF -- "compose -f docker-compose.dev.yml exec -T -e RO_PASSWORD target-db psql -v ON_ERROR_STOP=1 -q -U app -d $database" "$work/calls" \
+    || fail "read-only role not provisioned on $database"
+done
+grep -qxF 'ro-env gateway-ro-dev-only' "$work/calls" || fail 'default read-only password not passed by env'
+! grep -qE 'exec .*gateway-ro-dev-only' "$work/calls" || fail 'read-only password on the docker command line'
+
+seed RUNNING=target-db SHOP_EXISTS=1 TARGET_DB_USER=owner TARGET_DB_RO_PASSWORD=from-env || fail 'seed failed with shop present'
+grep -qxF 'ro-env from-env' "$work/calls" || fail 'TARGET_DB_RO_PASSWORD ignored'
 ! grep -qF 'CREATE DATABASE' "$work/calls" || fail 'existing shop database re-created'
 grep -qF -- '-U owner -d shop' "$work/calls" || fail 'TARGET_DB_USER ignored'
 

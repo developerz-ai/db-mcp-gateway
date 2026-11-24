@@ -11,12 +11,27 @@ echo '→ cargo fmt --check'
 cargo fmt --all -- --check
 
 # Same regex and exempt paths as CI's secret-scan job, over the staged diff only.
+# The diff goes to a file first: `git diff | grep -q` under pipefail lets grep's
+# early exit SIGPIPE git, which turns a match into a failed `if` — an accept.
 token_re='dbmcp_svc_[0-9a-f]{64}'
 exempt=(':!tests/**' ':!website/**' ':!config/example.yaml' ':!.github/**' ':!src/config/yaml/**')
-if git diff --cached -U0 --no-color -- . "${exempt[@]}" | grep -qE "^\+.*${token_re}"; then
-  # File names only: never echo the token itself.
+staged=$(mktemp)
+trap 'rm -f "$staged"' EXIT
+scan_error() { echo "pre-commit: secret scan could not run ($1) — refusing the commit." >&2; exit 2; }
+
+git diff --cached -U0 --no-color -- . "${exempt[@]}" > "$staged" || scan_error 'git diff failed'
+all_names=$(git diff --cached --name-only -- . "${exempt[@]}") || scan_error 'git diff --name-only failed'
+# A token in a file name counts too: an empty new file has no `+++` line.
+by_name=$(grep -E "$token_re" <<<"$all_names") || (( $? == 1 )) || scan_error 'grep failed'
+hit=0
+grep -qE "^\+.*${token_re}" "$staged" || hit=$?
+(( hit <= 1 )) || scan_error "grep exited $hit"
+if (( hit == 0 )) || [[ -n $by_name ]]; then
+  by_content=$(git diff --cached --name-only -G "$token_re" -- . "${exempt[@]}") || scan_error 'git diff --name-only failed'
+  # File names only — a token inside a file name is redacted too.
   echo 'pre-commit: the staged change adds a service-token value (dbmcp_svc_…) in:' >&2
-  git diff --cached --name-only -G "$token_re" -- . "${exempt[@]}" >&2
+  printf '%s\n%s\n' "$by_content" "$by_name" | sed '/^$/d' | sort -u \
+    | sed -E "s/${token_re}/dbmcp_svc_<redacted>/g" >&2
   echo "Reference it as \${ENV:…} or \${FILE:…} instead (spec 14)." >&2
   exit 1
 fi

@@ -60,13 +60,22 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # A PR checkout is the merge commit and a push to main is one squash
-          # commit; either way the first parent is the base tip, so HEAD^1..HEAD
-          # is exactly what changed.
+          # A PR checkout is the merge commit, whose first parent is the base
+          # tip, so HEAD^1..HEAD is exactly what the PR changes. A push diffs
+          # from `github.event.before`, fetched below: one push may carry
+          # several commits.
           fetch-depth: 2
       - id: diff
+        env:
+          BEFORE: ${{ github.event.before }}
         run: |
-          matches() { printf '%s\n' "$changed" | grep -qE "$1"; }
+          # Here-strings, not `printf | grep -q`: under pipefail grep's early
+          # exit can SIGPIPE the writer and turn a match into a miss.
+          matches() { grep -qE "$1" <<<"$changed"; }
+          everything() {
+            printf '%s\n' code=true deps=true image=true msrv=true website=true >> "$GITHUB_OUTPUT"
+            exit 0
+          }
           case "$GITHUB_EVENT_NAME" in
             pull_request|push) ;;
             *)
@@ -74,17 +83,23 @@ jobs:
               printf '%s\n' code=true deps=true image=false msrv=false website=false >> "$GITHUB_OUTPUT"
               exit 0 ;;
           esac
-          # --no-renames: a rename would list only its destination, so moving a
-          # source file to a docs path would read as docs-only. No HEAD^1 (a
-          # multi-parent or truncated push) reads as "everything changed".
-          if ! changed=$(git diff --name-only --no-renames HEAD^1 HEAD); then
-            printf '%s\n' code=true deps=true image=true msrv=true website=true >> "$GITHUB_OUTPUT"
-            exit 0
+          # The base: HEAD^1 on a PR; on a push, the ref's previous tip. A new
+          # branch (all-zero `before`) or a `before` that no longer resolves
+          # (force-push) reads as "everything changed".
+          base=HEAD^1
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            if [ -z "$BEFORE" ] || [ -z "${BEFORE//0/}" ] \
+                || ! git fetch --quiet --no-tags --depth=1 origin "$BEFORE"; then
+              everything
+            fi
+            base=$BEFORE
           fi
+          # --no-renames: a rename would list only its destination, so moving a
+          # source file to a docs path would read as docs-only.
+          changed=$(git diff --name-only --no-renames "$base" HEAD) || everything
           code=true deps=false image=false msrv=false website=false
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            if ! matches '^\.dz/' && ! printf '%s\n' "$changed" \
-                | grep -vE '^(website/|docs/|\.claude/)|\.md$' | grep -q .; then
+            if ! matches '^\.dz/' && ! grep -qvE '^(website/|docs/|\.claude/)|\.md$' <<<"$changed"; then
               code=false
             fi
             if matches '^(Dockerfile|\.dockerignore|Cargo\.(toml|lock)|rust-toolchain\.toml|src/|migrations/|migrations-mysql/|third_party/|config/example\.yaml$)'; then
@@ -209,6 +224,9 @@ jobs:
     needs: [changes]
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # the cache lookup in `week`
     # ~2x the measured p95 (cold, Cargo.lock-changing run: 471 s).
     timeout-minutes: 20
     # The dev stack (docker-compose.dev.yml) instead of `services:`. Service
@@ -236,8 +254,24 @@ jobs:
           if rustup toolchain list | grep -q '^stable'; then
             rustup toolchain uninstall stable
           fi
+      # ISO-week rollover: until this week's entry exists (`main`'s `test` or the
+      # Monday warm run writes it), restore last week's — an exact-key hit, so
+      # nothing is pruned — instead of compiling cold. `main` itself keys on
+      # the current week: its save is what creates the entry.
       - id: week
-        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FALLBACK: ${{ github.ref != 'refs/heads/main' }}
+        run: |
+          week=$(date -u +%G-W%V)
+          if [ "$FALLBACK" = true ]; then
+            if ! found=$(gh api "repos/$GITHUB_REPOSITORY/actions/caches?key=v0-rust-ci-$week-&per_page=1" --jq .total_count); then
+              echo "::warning::cache lookup failed; keeping ci-$week"
+            elif [ "$found" = 0 ]; then
+              week=$(date -u -d '7 days ago' +%G-W%V)
+            fi
+          fi
+          echo "week=$week" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@f4371d1ec7179bfbd04a82a81e3b3af7f720750f # v2
         with:
           shared-key: ci-${{ steps.week.outputs.week }}
@@ -284,6 +318,9 @@ jobs:
     needs: [changes]
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # the cache lookup in `week`
     # ~2x a cold run: `test`'s cold compile (471 s p95) bounds it; the
     # Yugabyte pull and boot (~25 s) overlap the compile.
     timeout-minutes: 20
@@ -304,8 +341,18 @@ jobs:
           if rustup toolchain list | grep -q '^stable'; then
             rustup toolchain uninstall stable
           fi
+      # Never saves, so it may always fall back to last week's entry (see `test`).
       - id: week
-        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          week=$(date -u +%G-W%V)
+          if ! found=$(gh api "repos/$GITHUB_REPOSITORY/actions/caches?key=v0-rust-ci-$week-&per_page=1" --jq .total_count); then
+            echo "::warning::cache lookup failed; keeping ci-$week"
+          elif [ "$found" = 0 ]; then
+            week=$(date -u -d '7 days ago' +%G-W%V)
+          fi
+          echo "week=$week" >> "$GITHUB_OUTPUT"
       # Restores `test`'s entry; never saves (see the cache note above clippy).
       - uses: Swatinem/rust-cache@f4371d1ec7179bfbd04a82a81e3b3af7f720750f # v2
         with:

@@ -16,7 +16,7 @@ fixture() {
   cp bin/run "$work/repo/bin/"
   cp bin/lib/dotenv.sh "$work/repo/bin/lib/"
   cp config/dev.yaml "$work/repo/config/"
-  for tool in bash dirname grep sed mkdir cat; do
+  for tool in bash dirname grep sed mkdir cat mktemp mv rm; do
     ln -s "$(command -v "$tool")" "$work/tools/$tool"
   done
   cat > "$work/tools/stub" <<'STUB'
@@ -26,10 +26,13 @@ name=${0##*/}
 printf '%s %s\n' "$name" "$*" >> "$CALLS"
 case "$name $*" in
   'docker compose '*' ps --status running --services') printf '%s\n' ${RUNNING:-} ;;
-  'openssl rand -hex 32') printf '%064d\n' 7 ;;
+  'openssl rand -hex 32')
+    # A failing openssl may still have written part of its output.
+    if [[ -n ${OPENSSL_FAIL:-} ]]; then printf 'abc'; exit 1; fi
+    printf '%064d\n' 7 ;;
   'cargo '*)
     # The environment the gateway would boot with.
-    for var in STATE_DB_URL TARGET_DB_PASSWORD TLS_DISABLED OIDC_ISSUER OIDC_CLIENT_ID \
+    for var in STATE_DB_URL TARGET_DB_PASSWORD TARGET_DB_RO_PASSWORD TLS_DISABLED OIDC_ISSUER OIDC_CLIENT_ID \
       OIDC_CLIENT_SECRET ALLOW_INSECURE_SIGNING_KEY DBMCP_DEV_SERVICE_TOKEN; do
       printf 'env %s=%s\n' "$var" "${!var-<unset>}" >> "$CALLS"
     done ;;
@@ -37,6 +40,11 @@ esac
 STUB
   chmod +x "$work/tools/stub"
   for tool in docker cargo openssl; do ln -s stub "$work/tools/$tool"; done
+  cat > "$work/repo/bin/seed" <<'STUB'
+#!/usr/bin/env bash
+echo bin/seed >> "$CALLS"
+STUB
+  chmod +x "$work/repo/bin/seed"
   : > "$work/calls"
 }
 
@@ -57,6 +65,12 @@ expect_call 'env STATE_DB_URL=postgres://gateway:gateway-dev-only@localhost:5433
 expect_call 'env TLS_DISABLED=true'
 expect_call 'env OIDC_ISSUER=http://localhost:5556'
 expect_call 'env OIDC_CLIENT_SECRET=dev-only-oidc-secret'
+# The gateway gets only the read-only login; the owner password stays with bin/seed.
+expect_call 'env TARGET_DB_RO_PASSWORD=gateway-ro-dev-only'
+expect_call 'env TARGET_DB_PASSWORD=<unset>'
+# bin/seed (the read-only role) runs after the stack is up and before the gateway boots.
+[[ $(grep -nE '^(docker compose .* up |bin/seed|cargo run)' "$work/calls" | cut -d: -f2 | cut -c1-8) == $'docker c\nbin/seed\ncargo ru' ]] \
+  || { cat "$work/calls" >&2; fail 'bin/seed not between compose up and cargo run'; }
 token=$(<"$work/repo/target/dev/service-token")
 [[ $token =~ ^dbmcp_svc_[0-9a-f]{64}$ ]] || fail 'minted token has the wrong shape'
 [[ $(stat -c %a "$work/repo/target/dev/service-token") == 600 ]] || fail 'token file is not 0600'
@@ -94,6 +108,14 @@ run || true
   > "$work/output" 2>&1 || fail 'bin/run --idp failed'
 expect_call 'docker compose -f docker-compose.dev.yml --profile idp up -d --wait state-db target-db dex'
 expect_call 'cargo run --bin db-mcp-gateway --release -- --config config/dev.yaml'
+
+# A failed mint leaves no token file (and no temp file) behind, and boots nothing.
+fixture
+if run OPENSSL_FAIL=1; then fail 'bin/run succeeded with openssl failing'; fi
+[[ -z $(ls -A "$work/repo/target/dev") ]] || fail "failed mint left files: $(ls -A "$work/repo/target/dev")"
+reject_call 'cargo'
+run || fail 'bin/run failed after a failed mint'
+[[ $(<"$work/repo/target/dev/service-token") =~ ^dbmcp_svc_[0-9a-f]{64}$ ]] || fail 'retry did not mint a full token'
 
 # A non-numeric port is refused before anything starts.
 fixture

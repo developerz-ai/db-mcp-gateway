@@ -17,13 +17,13 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; "${compose[@]}" logs gateway ready >&2 ||
 
 "${compose[@]}" up -d --wait >/dev/null 2>&1 || fail 'demo did not come up'
 
-line=''
-for _ in $(seq 60); do
-  line=$("${compose[@]}" logs --no-log-prefix ready 2>/dev/null | grep -F 'claude mcp add' || true)
-  [[ -n $line ]] && break
-  sleep 1
-done
-[[ -n $line ]] || fail 'no claude mcp add line printed'
+# The walkthrough's order: wait for `ready` to finish, then read its log.
+"${compose[@]}" wait ready >/dev/null 2>&1 || fail 'the ready service did not exit 0'
+line=$("${compose[@]}" logs --no-log-prefix ready 2>/dev/null | grep -F 'claude mcp add') \
+  || fail 'no claude mcp add line printed'
+# Without the sso profile nothing publishes Dex's port.
+[[ -z $("${compose[@]}" ps -q dex-port) ]] || fail 'dex-port runs without the sso profile'
+! "${compose[@]}" port gateway 5556 >/dev/null 2>&1 || fail 'the gateway publishes 5556 without the sso profile'
 [[ $line == *"--transport http demo-db http://localhost:${port}/mcp --header \"Authorization: Bearer dbmcp_svc_"* ]] \
   || fail 'unexpected claude mcp add line'
 token=$(grep -oE 'dbmcp_svc_[0-9a-f]{64}' <<<"$line")

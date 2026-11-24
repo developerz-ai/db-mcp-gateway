@@ -1,6 +1,8 @@
 # Dev gateway config for `bin/run` against docker-compose.dev.yml — never deploy it.
 # bin/run rewrites `port: 5434` when TARGET_DB_PORT differs, and exports the
-# two env refs below.
+# two env refs below. The gateway logs in as `gateway_ro`, a SELECT-only role
+# (default_transaction_read_only) that bin/seed provisions; the target's owner
+# credentials stay with bin/seed and never reach the gateway.
 servers:
   - name: local
     kind: postgres
@@ -8,15 +10,14 @@ servers:
     port: 5434
     tls: insecure                       # the dev Postgres has no TLS
     databases:
-      # The dev superuser `app` — fine on a throwaway stack, never in production.
       - name: app
-        role: app
-        password: ${ENV:TARGET_DB_PASSWORD}
+        role: gateway_ro
+        password: ${ENV:TARGET_DB_RO_PASSWORD}
         description: "Dev target (integration-test fixtures)"
       # Demo data, loaded by bin/seed (examples/demo/seed.sql).
       - name: shop
-        role: app
-        password: ${ENV:TARGET_DB_PASSWORD}
+        role: gateway_ro
+        password: ${ENV:TARGET_DB_RO_PASSWORD}
         description: "Demo shop: customers, products, orders"
 
 permissions:

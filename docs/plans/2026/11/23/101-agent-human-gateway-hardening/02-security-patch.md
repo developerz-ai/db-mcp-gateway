@@ -11,7 +11,7 @@
 | SEC-2 **V** | high | `src/exec/sql_guard/visitor.rs:146` | `pre_visit_expr`: run `check_denied_name` on every name-bearing node that Postgres can resolve to a call, not only `Expr::Function` |
 | SEC-3 **V** | high | `src/exec/pg/decode/mod.rs:144` | Decode date/time from raw integers with checked arithmetic; out-of-range and special values render as text. Add a catch-panic layer in `src/transport/mod.rs` → 500 + `internal` + completed audit row |
 | SEC-4 **V** | high | `src/exec/pg/run.rs:184`, `src/exec/budget.rs:54` | Charge raw wire length (`try_get_raw().as_bytes()`) before decode; charge `size_of::<Value>()` per node; document memory limit; bound concurrent in-flight decode per adapter |
-| SEC-5 **V** | med | `src/exec/pg/run.rs:208` | No persistent statement for the zero-row describe. Fold with 03-E1 |
+| SEC-5 **V** | med | `src/exec/pg/run.rs:208` | Planned: no persistent statement for the zero-row describe. Shipped: the describe still prepares a named statement (sqlx describes only through one); `reset_on_release` (`src/exec/pg/release.rs`, `DEALLOCATE ALL`) drops it before the connection serves anyone else. Fold with 03-E1 |
 | SEC-6 | med | `visitor.rs:155` | Deny relations/functions exposing other sessions (H9) |
 | SEC-7 | med | `visitor.rs:34` | Add missing families |
 | SEC-8 | med | `src/exec/pg/introspect.rs:88`, `pg/error.rs:16` | Acquire via `AcquireFailure`; SQLSTATE class 28 never becomes `Rejected`; mark adapter stale |
@@ -25,14 +25,14 @@
 
 ## Steps
 1. Owner drafts the advisory (H1). Coordinator keeps branch names and PR text neutral ("exec: guard hardening").
-2. Failing real-DB test per row, then fix. SEC-1: differential test — corpus run through the guard **and** Postgres, asserting the function set Postgres executes equals the set the guard saw.
+2. Failing real-DB test per row, then fix. SEC-1: differential test (`tests/it_db/sql_guard_differential.rs`), as shipped: Postgres stores each corpus statement in a temp view and deparses it (`pg_get_viewdef`) **without executing it**; the test asserts that every call name in the deparsed text appears among the original statement's words, and that the guard still accepts the deparsed SQL. It does not compare executed function sets.
 3. Extend `sql_guard` proptest: an accepted statement re-parses to one read-shaped statement; token-mutation fuzz over comments, strings, operators.
 4. Yugabyte suite: every new refusal and the reset statement (`bin/test-yugabyte`).
 5. `chore(release)` 2.3.1 alone; tag; release notes generic until the owner publishes the advisory.
 6. After release (H2): `pg_query` second parser in its own PR; agreement required on statement count, kinds, function names.
 
 ## Tests
-- `tests/it_db/sql_guard_*.rs`, `exec_run_query.rs`, `oauth_lifecycle_real_db.rs`, `admin_users_e2e.rs`, `adapter_registry_concurrency.rs`, `config_reload.rs`. Every refusal asserts an audit row (`forbidden_sql`).
+- `tests/it_db/sql_guard_*.rs`, `exec_run_query.rs`, `oauth_lifecycle_real_db.rs`, `admin_users_e2e.rs`, `adapter_registry_concurrency.rs`, `config_reload.rs`. The differential loop calls the guard (`sql_guard::is_read_only`) directly, so it writes no audit rows; `sql_guard_refusals_e2e.rs` goes through `run_query` and asserts the `forbidden_sql` audit row for each refusal.
 
 ## Done when
 - All rows closed, each with a test red on `ad833b7`; spec 03 §guard and 04 updated; 2.3.1 images on both registries.

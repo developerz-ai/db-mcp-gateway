@@ -1,7 +1,11 @@
 """Proves every public_tree.py rule can fail, and that the public ones pass."""
 
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
+import time
 import unittest
 
 sys.dont_write_bytecode = True
@@ -13,6 +17,7 @@ from public_tree import (  # noqa: E402
     private_words,
     private_words_for_run,
     scan,
+    tracked_entries,
     violations,
 )
 
@@ -38,6 +43,20 @@ class Rules(unittest.TestCase):
         self.assertEqual(
             violations("a.md", f"url: https://{host}/v1"), ["internal host on our own domain"]
         )
+
+    def test_host_rule_edges(self):
+        domain = ".".join(["developerz", "ai"])
+        for text in (f"www.{domain}.", f"https://www.{domain}/x", f"apex {domain} only", f"a.{domain}x"):
+            self.assertEqual(violations("a.md", text), [], text)
+        for text in (f"WWW.{domain}.{domain}", f"..svc.{domain}", f"svc.{domain}-x", f"a.b.{domain}"):
+            self.assertEqual(violations("a.md", text), ["internal host on our own domain"], text)
+
+    def test_host_rule_is_linear_on_long_dotted_names(self):
+        domain = ".".join(["developerz", "ai"])
+        for content in ("a." * 200_000, "a." * 200_000 + domain + "x", f"www.{domain}" * 50_000):
+            started = time.monotonic()
+            violations("a.md", content)
+            self.assertLess(time.monotonic() - started, 1.0)
 
     def test_fires_on_the_setup_mode_name(self):
         word = "-".join(["DZ", "RUNNER"])
@@ -84,32 +103,69 @@ class Rules(unittest.TestCase):
         self.assertEqual(violations(".claude/commands/x.md", "no marker needed"), [])
 
 
+def git(root, *args):
+    subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+
+def temp_dir(case):
+    path = tempfile.mkdtemp()
+    case.addCleanup(shutil.rmtree, path)
+    return path
+
+
+def repo_with(case, files):
+    """A real git repository whose index holds `files` (path -> body)."""
+    root = temp_dir(case)
+    git(root, "init", "-q")
+    for name, body in files.items():
+        full = os.path.join(root, name)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as handle:
+            handle.write(body)
+    git(root, "add", "-A")
+    return root
+
+
 class Scan(unittest.TestCase):
     def test_reports_path_and_rule_never_the_value(self):
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as root:
-            for name, body in (("ok.md", "public"), ("bad.md", "x QUIMTEL y"), (".dz/x.md", "QUIMTEL")):
-                os.makedirs(os.path.dirname(os.path.join(root, name)), exist_ok=True)
-                with open(os.path.join(root, name), "w") as handle:
-                    handle.write(body)
-            read, failures = scan(root, ["ok.md", "bad.md", ".dz/x.md"], private_words("quimtel"))
+        root = repo_with(self, {"ok.md": "public", "bad.md": "x QUIMTEL y", ".dz/x.md": "QUIMTEL"})
+        read, failures = scan(root, tracked_entries(root), private_words("quimtel"))
         self.assertEqual(read, 2)
         self.assertEqual(failures, ["bad.md: private word (from the secret)"])
         self.assertNotIn("quimtel", "".join(failures).lower())
 
-    def test_a_file_deleted_in_the_working_tree_is_skipped(self):
-        import tempfile
+    def test_an_unstaged_deletion_still_scans_the_indexed_blob(self):
+        root = repo_with(self, {"gone.md": "x QUIMTEL y"})
+        os.remove(os.path.join(root, "gone.md"))
+        self.assertEqual(
+            scan(root, tracked_entries(root), private_words("quimtel")),
+            (1, ["gone.md: private word (from the secret)"]),
+        )
 
-        with tempfile.TemporaryDirectory() as root:
-            self.assertEqual(scan(root, ["deleted.md"], []), (0, []))
+    def test_reads_the_index_not_the_working_tree(self):
+        root = repo_with(self, {"a.md": "x QUIMTEL y"})
+        with open(os.path.join(root, "a.md"), "w") as handle:
+            handle.write("clean now, but not staged")
+        _, failures = scan(root, tracked_entries(root), private_words("quimtel"))
+        self.assertEqual(failures, ["a.md: private word (from the secret)"])
 
-    def test_an_unreadable_tracked_file_fails_closed(self):
-        import tempfile
+    def test_a_symlink_is_scanned_as_its_target_text_never_followed(self):
+        root = repo_with(self, {})
+        outside = temp_dir(self)
+        with open(os.path.join(outside, "x"), "w") as handle:
+            handle.write("QUIMTEL in the followed file")
+        os.symlink(os.path.join(outside, "QUIMTEL-target"), os.path.join(root, "named"))
+        os.symlink(os.path.join(outside, "x"), os.path.join(root, "followed"))
+        os.symlink("loop", os.path.join(root, "loop"))
+        git(root, "add", "-A")
+        _, failures = scan(root, tracked_entries(root), private_words("quimtel"))
+        self.assertEqual(failures, ["named: private word (from the secret)"])
 
-        with tempfile.TemporaryDirectory() as root, self.assertRaises(GuardError):
-            os.symlink("loop", os.path.join(root, "loop"))
-            scan(root, ["loop"], [])
+    def test_an_unreadable_index_entry_fails_closed(self):
+        root = repo_with(self, {"a.md": "public"})
+        missing = "0123456789abcdef0123456789abcdef01234567"
+        with self.assertRaises(GuardError):
+            scan(root, [("a.md", missing)], [])
 
 
 if __name__ == "__main__":

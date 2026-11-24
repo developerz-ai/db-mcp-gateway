@@ -5,8 +5,9 @@
 # e.g. bin/mcp-call run_query '{"server":"local","database":"shop","sql":"select * from orders"}'
 # Defaults target `bin/run`: http://127.0.0.1:<GATEWAY_BIND port><MCP_PATH> and
 # the token bin/run minted (target/dev/service-token). Override with MCP_URL
-# and DBMCP_TOKEN (e.g. the examples/demo token). Exit 1 on a JSON-RPC error
-# or a tool result with isError.
+# and DBMCP_TOKEN (e.g. the examples/demo token). Exit 1 on a non-2xx HTTP
+# status, a body that is not a JSON-RPC envelope, a JSON-RPC error, or a tool
+# result with isError. Needs jq.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -34,15 +35,27 @@ if [[ -z ${DBMCP_TOKEN:-} ]]; then
   DBMCP_TOKEN=$(<"$token_file")
 fi
 
-# The token goes to curl on stdin, never on its command line (visible in ps).
-response=$(printf 'header = "Authorization: Bearer %s"\n' "$DBMCP_TOKEN" \
-  | curl -sS --config - -H 'Content-Type: application/json' --data-binary "$body" "$url")
+command -v jq >/dev/null 2>&1 || { echo "bin/mcp-call: jq is required" >&2; exit 2; }
+response=$(mktemp)
+trap 'rm -f "$response"' EXIT
 
-if command -v jq >/dev/null 2>&1; then
-  jq . <<<"$response"
-else
-  printf '%s\n' "$response"
+# The token goes to curl on stdin, never on its command line (visible in ps).
+status=$(printf 'header = "Authorization: Bearer %s"\n' "$DBMCP_TOKEN" \
+  | curl -sS --config - -H 'Content-Type: application/json' --data-binary "$body" \
+      -o "$response" -w '%{http_code}' "$url")
+
+if [[ ! $status =~ ^2[0-9][0-9]$ ]]; then
+  echo "bin/mcp-call: HTTP $status from $url" >&2
+  cat "$response" >&2
+  exit 1
 fi
-if [[ $response == *'"error":'* || $response == *'"isError":true'* ]]; then
+if ! jq -e 'type == "object" and .jsonrpc == "2.0" and (has("result") or has("error"))' \
+    "$response" >/dev/null 2>&1; then
+  echo "bin/mcp-call: the response is not a JSON-RPC envelope:" >&2
+  cat "$response" >&2
+  exit 1
+fi
+jq . "$response"
+if jq -e '.error != null or .result.isError == true' "$response" >/dev/null; then
   exit 1
 fi

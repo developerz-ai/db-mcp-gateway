@@ -2,13 +2,13 @@
 # service account, so no IdP is needed. Loopback only, plain HTTP — a demo,
 # never a deployment (that is examples/docker-compose.yml).
 #
-#   cd examples/demo && docker compose up -d
-#   docker compose logs ready        # prints the `claude mcp add …` line
+#   cd examples/demo && docker compose up -d --wait
+#   docker compose wait ready && docker compose logs ready   # the `claude mcp add …` line
 #
 # Then ask Claude: "list the servers you can see, then the 5 latest orders".
 #
 # SSO path (Dex, static user dev@example.com / dev-only-password, group
-# `devs`): `docker compose --profile sso up -d`, then add the gateway without
+# `devs`): `docker compose --profile sso up -d --wait`, then add the gateway without
 # the Authorization header and sign in from Claude Code's /mcp.
 #
 # Variables (all optional):
@@ -38,11 +38,12 @@ services:
       OIDC_CLIENT_ID: dev
       OIDC_CLIENT_SECRET: dev-only-oidc-secret
       OIDC_REDIRECT_URL: http://localhost:${DEMO_PORT:-8443}/auth/callback
-      # The committed dev signing key; accepted only with a loopback issuer.
-      ALLOW_INSECURE_SIGNING_KEY: "true"
+      # A fixed, public key: this container binds 0.0.0.0, where the gateway
+      # refuses ALLOW_INSECURE_SIGNING_KEY. Sessions signed with it are only
+      # as private as this file — a demo, never a deployment.
+      SESSION_SIGNING_KEY: demo-only-session-signing-key-not-for-production
     ports:
       - "127.0.0.1:${DEMO_PORT:-8443}:8443"
-      - "127.0.0.1:5556:5556"   # Dex (profile `sso`) listens in this namespace
     volumes:
       - ./gateway.yaml:/etc/gateway/config.yml:ro
       - demo-secrets:/run/demo-secrets:ro
@@ -65,7 +66,9 @@ services:
     volumes:
       - state-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      # Over TCP: during first-boot init the image runs a temporary server on
+      # the unix socket only, which a socket probe would call ready.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U gateway -d gateway"]
       interval: 2s
       timeout: 3s
       retries: 30
@@ -82,8 +85,9 @@ services:
       - ./init-target.sh:/docker-entrypoint-initdb.d/init-target.sh:ro
       - ./seed.sql:/demo/seed.sql:ro
     healthcheck:
-      # Ready once the init script has created the gateway's role.
-      test: ["CMD-SHELL", "psql -U shop_owner -d shop -tAc \"SELECT 1 FROM pg_roles WHERE rolname = 'mcp_demo_ro'\" | grep -qx 1"]
+      # Ready once the init script has created the gateway's role, asked over
+      # TCP: the temporary init server listens on the unix socket only.
+      test: ["CMD-SHELL", "psql -h 127.0.0.1 -U shop_owner -d shop -tAc \"SELECT 1 FROM pg_roles WHERE rolname = 'mcp_demo_ro'\" | grep -qx 1"]
       interval: 2s
       timeout: 3s
       retries: 30
@@ -139,6 +143,19 @@ services:
     command: ["dex", "serve", "/etc/dex/config.yaml"]
     volumes:
       - ../../config/dex.yaml:/etc/dex/config.yaml:ro
+
+  # Publishes Dex to the browser at the same http://localhost:5556. Dex lives
+  # in the gateway's namespace, whose ports exist in every profile; this relay
+  # keeps 5556 unreserved unless `sso` is on.
+  dex-port:
+    image: busybox:1.38.0-musl
+    profiles: ["sso"]
+    depends_on:
+      dex:
+        condition: service_started
+    ports:
+      - "127.0.0.1:5556:5556"
+    command: ["nc", "-lk", "-p", "5556", "-e", "nc", "gateway", "5556"]
 
 volumes:
   state-db-data:

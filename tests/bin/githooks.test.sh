@@ -44,6 +44,32 @@ grep -qxF 'config/leak.yaml' "$work/output" || fail 'refusal does not name the f
 ! grep -qF "$token" "$work/output" || fail 'refusal echoed the token'
 git -C "$repo" rm -q --cached config/leak.yaml
 
+# A token early in a large diff: grep matches and exits at once. Piped under
+# pipefail, git then dies of SIGPIPE and the match read as a clean scan.
+{ printf 'token: %s\n' "$token"; seq 1 400000 | sed 's/^/line: /'; } > "$repo/config/big.yaml"
+git -C "$repo" add config/big.yaml
+if hook pre-commit; then fail 'token at the head of a large diff accepted (SIGPIPE)'; fi
+grep -qxF 'config/big.yaml' "$work/output" || fail 'large-diff refusal does not name the file'
+git -C "$repo" rm -q --cached config/big.yaml
+
+# A token in a file *name* is refused and redacted in the report.
+: > "$repo/config/$token.yaml"
+git -C "$repo" add "config/$token.yaml"
+if hook pre-commit; then fail 'token in a staged file name accepted'; fi
+grep -qxF 'config/dbmcp_svc_<redacted>.yaml' "$work/output" || fail "file name not redacted: $(<"$work/output")"
+! grep -qF "$token" "$work/output" || fail 'refusal echoed the token from a file name'
+git -C "$repo" rm -q --cached "config/$token.yaml"
+rm "$repo/config/$token.yaml"
+
+# A scanner that errors is a refusal, never a clean pass.
+mkdir -p "$work/badgrep"
+printf '#!/usr/bin/env bash\nexit 2\n' > "$work/badgrep/grep"
+chmod +x "$work/badgrep/grep"
+if (cd "$repo" && PATH="$work/badgrep:$work/tools:$PATH" CALLS="$work/calls" bash .githooks/pre-commit) > "$work/output" 2>&1; then
+  fail 'a failing scanner was read as a clean scan'
+fi
+grep -qF 'secret scan could not run' "$work/output" || fail "scanner error not reported: $(<"$work/output")"
+
 printf 'const T: &str = "%s";\n' "$token" > "$repo/tests/fixture.rs"
 git -C "$repo" add tests/fixture.rs
 hook pre-commit || fail 'token under the exempt tests/ path refused'

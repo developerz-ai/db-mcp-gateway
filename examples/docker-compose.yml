@@ -92,7 +92,8 @@ services:
     volumes:
       - state-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U gateway"]
+      # TCP, not the unix socket: first-boot init runs a socket-only temporary server.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U gateway"]
       interval: 5s
       timeout: 5s
       retries: 10

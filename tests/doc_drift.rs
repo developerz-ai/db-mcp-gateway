@@ -1,10 +1,12 @@
 //! Doc drift: the names the docs tell an operator or an agent to type must
 //! exist in the code. Offline and fast — it reads files, never boots anything.
 //!
-//! - the pinned image version in the docs is `Cargo.toml`'s;
+//! - the pinned image version in the docs and in every example compose file
+//!   (including a `${VAR:-image:tag}` default) is `Cargo.toml`'s;
 //! - every env var in the quickstart table is read by the code, and every env
 //!   var the code reads is in that table;
-//! - every documented HTTP route is mounted;
+//! - every documented `METHOD /path` is mounted with that method, and every
+//!   other documented gateway path is mounted;
 //! - the tool lists name exactly the advertised tools;
 //! - the log contract lists every audit outcome code, and no doc uses a
 //!   retired one;
@@ -121,6 +123,63 @@ fn pinned_image_version_is_the_crate_version() {
     assert!(read("README.md").contains(&install), "README install line");
 }
 
+/// The gateway image an `image:` value names, unwrapping a `${VAR:-default}`.
+fn image_default(value: &str) -> &str {
+    let value = value.trim().trim_matches(['"', '\'']);
+    match value.strip_prefix("${") {
+        Some(rest) => rest
+            .split_once(":-")
+            .map_or("", |(_, default)| default.trim_end_matches('}')),
+        None => value,
+    }
+}
+
+#[test]
+fn example_compose_images_are_the_crate_version() {
+    let version = env!("CARGO_PKG_VERSION");
+    let image = Regex::new(r"(?m)^\s*image:\s*([^#\s]+)").unwrap();
+    let ours = Regex::new(
+        r"^(?:ghcr\.io|registry\.digitalocean\.com)/developerz-ai/db-mcp-gateway(?::(.+))?$",
+    )
+    .unwrap();
+    let composes: Vec<PathBuf> = files_under("examples", &["yml", "yaml"])
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("docker-compose"))
+        })
+        .collect();
+    let mut pinned = 0;
+    for path in &composes {
+        let text = fs::read_to_string(path).unwrap();
+        for c in image.captures_iter(&text) {
+            let Some(tag) = ours.captures(image_default(&c[1])) else {
+                continue;
+            };
+            pinned += 1;
+            let tag = tag.get(1).map_or("", |t| t.as_str());
+            assert_eq!(
+                tag,
+                version,
+                "{} pins the gateway image at {:?}",
+                path.display(),
+                &c[1]
+            );
+        }
+    }
+    assert!(pinned >= 2, "only {pinned} gateway images in {composes:?}");
+}
+
+#[test]
+fn image_default_unwraps_compose_defaults() {
+    assert_eq!(
+        image_default("${GATEWAY_IMAGE:-ghcr.io/x:1.0.0}"),
+        "ghcr.io/x:1.0.0"
+    );
+    assert_eq!(image_default("\"ghcr.io/x:1.0.0\""), "ghcr.io/x:1.0.0");
+    assert_eq!(image_default("${GATEWAY_IMAGE}"), "");
+}
+
 #[test]
 fn documented_env_vars_match_the_code() {
     let documented = first_column_names(
@@ -157,32 +216,84 @@ fn normalise(path: &str) -> String {
         .join("/")
 }
 
+/// Where a `.route(` call's path argument is an expression, what it names.
+fn route_path(arg: &str, code: &str) -> String {
+    if let Some(rest) = arg.strip_prefix('"') {
+        return rest[..rest.find('"').expect("closing quote")].to_string();
+    }
+    if arg.starts_with("&path") || arg.starts_with("&normalize_path(&config.mcp_path)") {
+        return MCP_PATH.to_string();
+    }
+    if arg.starts_with("&prm_suffixed") {
+        return format!("/.well-known/oauth-protected-resource{MCP_PATH}");
+    }
+    if arg.starts_with("oauth::CONSENT_PATH") {
+        let consent = captures(r#"CONSENT_PATH: &str = "([^"]+)""#, code);
+        return consent.into_iter().next().expect("CONSENT_PATH");
+    }
+    panic!("doc_drift does not know the route path expression {arg:?}");
+}
+
+/// The router contract: every `(METHOD, path)` a `.route(path, get(..).post(..))`
+/// mounts, read from the source.
+fn mounted_routes(code: &str) -> BTreeSet<(String, String)> {
+    let method = Regex::new(r"\b(get|post|patch|delete|put)\(").unwrap();
+    let ends = [".route_layer(", ".layer(", ".with_state(", ".merge(", ";"];
+    let mut routes = BTreeSet::new();
+    for call in code.split(".route(").skip(1) {
+        let call = &call[..ends
+            .iter()
+            .filter_map(|e| call.find(e))
+            .min()
+            .unwrap_or(call.len())];
+        let path = route_path(call.trim_start(), code);
+        for m in method.captures_iter(call) {
+            routes.insert((m[1].to_uppercase(), path.clone()));
+        }
+    }
+    routes
+}
+
 #[test]
 fn documented_routes_are_mounted() {
     let code = src();
-    let mut mounted = captures(r#"\.route\(\s*"([^"]+)""#, &code);
-    mounted.extend(captures(r#"CONSENT_PATH: &str = "([^"]+)""#, &code));
-    mounted.insert(MCP_PATH.to_string());
-    mounted.insert(format!("/.well-known/oauth-protected-resource{MCP_PATH}"));
+    let routes = mounted_routes(&code);
+    assert!(
+        routes.contains(&("DELETE".to_string(), "/admin/v1/grants/:id".to_string())),
+        "router contract not read: {routes:?}"
+    );
+    // A path mounted for one method is not mounted for another.
+    assert!(!routes.contains(&("GET".to_string(), "/token".to_string())));
+    let paths: BTreeSet<String> = routes.iter().map(|(_, p)| p.clone()).collect();
     assert!(
         code.contains(&format!("mcp_path: \"{MCP_PATH}\"")),
         "MCP_PATH default"
     );
 
-    let method = Regex::new(r"\b(?:GET|POST|PATCH|DELETE|PUT)\s+(/[^\s`|]*)").unwrap();
+    let method = Regex::new(r"\b(GET|POST|PATCH|DELETE|PUT)\s+(/[^\s`|]*)").unwrap();
     let gated = Regex::new(r"`(/(?:admin/v1|auth|\.well-known)/[^`\s]*)`").unwrap();
+    // `/auth/…`, `/x/*`, `/x/{a,b}` and `/x[/y]` name a family of routes, not one.
+    let family = |raw: &str| raw.ends_with('…') || raw.contains(['*', ',', '[']);
     for (rel, text) in docs() {
-        let found = method
-            .captures_iter(&text)
-            .chain(gated.captures_iter(&text));
-        for c in found {
-            let path = normalise(&c[1]);
-            // `/auth/…`, `/x/*`, `/x/{a,b}` and `/x[/y]` name a family of routes, not one.
-            let family = c[1].ends_with('…') || c[1].contains(['*', ',', '[']);
-            if path.is_empty() || path == "/" || family {
+        for c in method.captures_iter(&text) {
+            let path = normalise(&c[2]);
+            if path.is_empty() || path == "/" || family(&c[2]) {
                 continue;
             }
-            assert!(mounted.contains(&path), "{rel}: route {path} not mounted");
+            let route = (c[1].to_string(), path);
+            assert!(
+                routes.contains(&route),
+                "{rel}: {} {} is not mounted with that method",
+                route.0,
+                route.1
+            );
+        }
+        for c in gated.captures_iter(&text) {
+            let path = normalise(&c[1]);
+            if path.is_empty() || path == "/" || family(&c[1]) {
+                continue;
+            }
+            assert!(paths.contains(&path), "{rel}: route {path} not mounted");
         }
     }
 }

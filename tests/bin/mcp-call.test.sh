@@ -14,14 +14,21 @@ mkdir -p "$work/repo/bin/lib" "$work/repo/target/dev" "$work/tools"
 cp bin/mcp-call "$work/repo/bin/"
 cp bin/lib/dotenv.sh "$work/repo/bin/lib/"
 printf '%s' "$token" > "$work/repo/target/dev/service-token"
-for tool in bash dirname grep cat; do
+for tool in bash dirname grep cat jq mktemp rm; do
   ln -s "$(command -v "$tool")" "$work/tools/$tool"
 done
 cat > "$work/tools/curl" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" > "$WORK/argv"
 cat > "$WORK/stdin"
-printf '%s' "${RESPONSE:-{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[],\"isError\":false}}}"
+out=/dev/stdout
+while (( $# )); do
+  [[ $1 == -o ]] && { out=$2; shift; }
+  shift
+done
+ok='{"jsonrpc":"2.0","id":1,"result":{"content":[],"isError":false}}'
+printf '%s' "${RESPONSE:-$ok}" > "$out"
+printf '%s' "${STATUS:-200}"
 STUB
 chmod +x "$work/tools/curl"
 
@@ -60,6 +67,19 @@ env=('RESPONSE={"jsonrpc":"2.0","id":1,"result":{"content":[],"isError":true}}')
 if call run_query '{}'; then fail 'isError result exited 0'; fi
 env=('RESPONSE={"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"x"}}')
 if call run_query '{}'; then fail 'JSON-RPC error exited 0'; fi
+# A substring is not a verdict: an `"error":` inside a successful row is data.
+env=('RESPONSE={"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"error\":1,\"isError\":true}"}],"isError":false}}')
+call run_query '{}' || fail "a row containing \"error\": read as a failure: $(<"$work/output")"
+# Non-2xx fails even with a well-formed body; a non-envelope body fails.
+env=(STATUS=502)
+if call run_query '{}'; then fail 'HTTP 502 exited 0'; fi
+grep -qF 'HTTP 502' "$work/output" || fail 'HTTP status not reported'
+env=(STATUS=401 'RESPONSE={"jsonrpc":"2.0","id":1,"result":{}}')
+if call run_query '{}'; then fail 'HTTP 401 exited 0'; fi
+env=('RESPONSE=<html>proxy error</html>')
+if call run_query '{}'; then fail 'a non-JSON body exited 0'; fi
+env=('RESPONSE={"jsonrpc":"2.0","id":1}')
+if call run_query '{}'; then fail 'an envelope without result or error exited 0'; fi
 env=()
 for bad in '' 'Run-Query' '-x' 'a"b'; do
   rc=0; call "$bad" || rc=$?

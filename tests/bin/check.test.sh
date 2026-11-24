@@ -179,7 +179,7 @@ fixture
 run_gate 0
 for call in \
   'cargo fmt --all -- --check' \
-  'cargo clippy --all-targets --all-features -- -D warnings' \
+  'cargo clippy --profile ci --all-targets --all-features -- -D warnings' \
   'cargo clippy --profile ci --all-features -- -D warnings -C debug-assertions=off' \
   'cargo tree -e features -i regex-syntax -e no-dev' \
   'docker compose -f docker-compose.dev.yml up -d --wait' \
@@ -299,7 +299,7 @@ for probe in 'docker info:Docker daemon' \
 done
 
 for stage in 'cargo fmt --all -- --check' \
-  'cargo clippy --all-targets --all-features -- -D warnings' \
+  'cargo clippy --profile ci --all-targets --all-features -- -D warnings' \
   'cargo clippy --profile ci --all-features -- -D warnings -C debug-assertions=off' \
   'cargo tree -e features -i regex-syntax -e no-dev' \
   'cargo test --all-targets --all-features' \

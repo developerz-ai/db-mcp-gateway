@@ -22,8 +22,12 @@ assembled from parts so the guard does not trip over itself. A failure names
 the file and the rule, never the matched text: CI logs are public.
 
 Git is the oracle for "tracked", after checking that git answers for this
-checkout and not for an outer repository. `.dz/` is excluded: the platform's
-setup template rewrites it whole. `.mcp.json` is scanned on purpose.
+checkout and not for an outer repository. The scan reads each tracked blob from
+git's index, never the working tree: a symlink is scanned as its target text
+and never followed, a file deleted but not yet staged is still scanned (the
+index is what the next commit ships), and an entry git cannot hand back fails
+the scan closed. `.dz/` is excluded: the platform's setup template rewrites it
+whole. `.mcp.json` is scanned on purpose.
 
 Run as `python3 -I .github/scripts/public_tree.py`; test_public_tree.py proves
 each rule can fail. A guard that cannot fail is not a guard.
@@ -46,7 +50,11 @@ PUBLIC_REPOS = ("db-mcp-gateway", "wurk")
 PUBLIC_HOSTS = ("www.developerz.ai",)
 MARKER = "owned by this repository's maintainers"
 
-OWN_HOST = re.compile(r"(?i)\b(?:[a-z0-9-]+\.)+developerz\.ai\b")
+OWN_DOMAIN = ".developerz.ai"
+# A run of hostname characters. One flat class: linear on any input, where a
+# nested `(?:label\.)+domain` pattern backtracks quadratically on a long
+# dotted name that never reaches the domain.
+HOSTNAME_RUN = re.compile(r"[a-z0-9.-]+", re.IGNORECASE | re.ASCII)
 ORG_REPO = re.compile(r"(?i)\bdeveloperz-ai/([a-z0-9_.-]+)")
 HOME_PATH = re.compile(r"(?:^|[^\w.-])/(?:home|Users)/[\w.-]+", re.MULTILINE)
 FORBIDDEN_WORDS = (
@@ -93,6 +101,29 @@ def carries_preamble(path):
     return agent or skill
 
 
+def _names_internal_host(content):
+    """Whether any `<labels>.developerz.ai` other than a public host appears.
+    Finds the fixed domain suffix inside each hostname run first, then reads the
+    labels before it once: linear in the content."""
+    for run in HOSTNAME_RUN.finditer(content):
+        text = run.group(0).lower()
+        labels_start = len(text) - len(text.lstrip(".-"))
+        at = text.find(OWN_DOMAIN)
+        while at != -1:
+            end = at + len(OWN_DOMAIN)
+            ends_on_boundary = end == len(text) or not text[end].isalnum()
+            has_labels = at > labels_start
+            if ends_on_boundary and has_labels and not _is_public_host(text, labels_start, end):
+                return True
+            at = text.find(OWN_DOMAIN, at + 1)
+    return False
+
+
+def _is_public_host(text, start, end):
+    # Length first: never slice a long run once per suffix it contains.
+    return any(len(host) == end - start and text[start:end] == host for host in PUBLIC_HOSTS)
+
+
 def _names_private_repo(content):
     for match in ORG_REPO.finditer(content):
         # GitHub owner and repository names are case-insensitive.
@@ -106,7 +137,7 @@ def _names_private_repo(content):
 def violations(path, content):
     """The names of every rule `content` breaks. Never the matched text."""
     broken = []
-    if any(m.group(0).lower() not in PUBLIC_HOSTS for m in OWN_HOST.finditer(content)):
+    if _names_internal_host(content):
         broken.append("internal host on our own domain")
     broken.extend(rule for rule, word in FORBIDDEN_WORDS if word.search(content))
     if _names_private_repo(content):
@@ -139,48 +170,83 @@ def repo_root():
     return root
 
 
-def tracked_files(root):
-    return [p for p in _git(root, "ls-files", "-z").decode(errors="surrogateescape").split("\0") if p]
+# Index modes: a gitlink (submodule) has no blob in this repository.
+GITLINK_MODE = "160000"
 
 
-def scan(root, tracked, private):
-    """(files read, failures as `path: rule`)."""
-    read = 0
+def tracked_entries(root):
+    """(path, blob id) per index entry, gitlinks dropped. Every conflict stage
+    of a path is its own entry: each is content the tree may ship."""
+    entries = []
+    for record in _git(root, "ls-files", "-s", "-z").decode(errors="surrogateescape").split("\0"):
+        if not record:
+            continue
+        meta, _, path = record.partition("\t")
+        mode, blob, _stage = meta.split(" ")
+        if mode != GITLINK_MODE:
+            entries.append((path, blob))
+    return entries
+
+
+def read_blobs(root, blobs):
+    """Blob id -> bytes, read from git's object store in one batch. A missing or
+    non-blob object is a GuardError: the scan never passes what it did not read."""
+    unique = list(dict.fromkeys(blobs))
+    try:
+        out = subprocess.run(
+            ["git", "cat-file", "--batch"],
+            cwd=root,
+            input="".join(f"{blob}\n" for blob in unique).encode(),
+            capture_output=True,
+            check=False,
+        )
+    except OSError as err:
+        raise GuardError(f"git cat-file must run: {err}") from err
+    if out.returncode != 0:
+        raise GuardError(f"git cat-file exited {out.returncode}")
+    data, pos, contents = out.stdout, 0, {}
+    for blob in unique:
+        newline = data.find(b"\n", pos)
+        header = data[pos:newline].decode(errors="replace").split(" ") if newline != -1 else []
+        if len(header) != 3 or header[0] != blob or header[1] != "blob" or not header[2].isdigit():
+            raise GuardError(f"tracked blob {blob} must read from the index")
+        size = int(header[2])
+        contents[blob] = data[newline + 1 : newline + 1 + size]
+        if len(contents[blob]) != size:
+            raise GuardError(f"tracked blob {blob} came back truncated")
+        pos = newline + 1 + size + 1
+    return contents
+
+
+def scan(root, entries, private):
+    """(blobs read, failures as `path: rule`) over index entries (path, blob)."""
+    entries = [(path, blob) for path, blob in entries if not platform_owned(path)]
+    blobs = read_blobs(root, [blob for _, blob in entries])
     failures = []
-    for path in tracked:
-        full = os.path.join(root, path)
-        if platform_owned(path) or os.path.isdir(full):
-            continue  # a directory entry is a submodule, not a file
-        try:
-            with open(full, "rb") as handle:
-                content = handle.read().decode("utf-8", errors="replace")
-        except FileNotFoundError:
-            continue  # deleted in the working tree: the commit that ships removes it
-        except OSError as err:
-            raise GuardError(f"tracked {path} must read: {err.strerror}") from err
-        read += 1
+    for path, blob in entries:
+        content = blobs[blob].decode("utf-8", errors="replace")
         rules = violations(path, content)
         if names_private_word(content, private):
             rules.append("private word (from the secret)")
         failures.extend(f"{path}: {rule}" for rule in rules)
-    return read, failures
+    return len(entries), failures
 
 
 def main():
     try:
         root = repo_root()
-        tracked = tracked_files(root)
-        if SELF not in tracked:
+        entries = tracked_entries(root)
+        if SELF not in {path for path, _ in entries}:
             raise GuardError(f"git ls-files does not list {SELF}: the scan is not reading this tree")
         required = os.environ.get(PRIVATE_WORDS_REQUIRED_ENV) == "1"
         private = private_words_for_run(os.environ.get(PRIVATE_WORDS_ENV), required)
         if not private:
             print(f"public-tree guard: {PRIVATE_WORDS_ENV} is unset, private words not checked", file=sys.stderr)
-        read, failures = scan(root, tracked, private)
+        read, failures = scan(root, entries, private)
     except GuardError as err:
         print(f"public-tree guard: {err}", file=sys.stderr)
         return 2
-    print(f"public-tree guard read {read} of {len(tracked)} tracked files, {len(private)} private words")
+    print(f"public-tree guard read {read} of {len(entries)} tracked files, {len(private)} private words")
     if read < MIN_TRACKED:
         print(f"public-tree guard: read only {read} tracked files; expected at least {MIN_TRACKED}", file=sys.stderr)
         return 2
