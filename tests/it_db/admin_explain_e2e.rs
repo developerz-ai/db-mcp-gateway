@@ -68,7 +68,17 @@ async fn explain_merges_yaml_group_and_db_user_grants_most_restrictive() {
         )
         .await;
     assert_eq!(body["groups_source"], "assumed");
-    assert_eq!(h.admin_reads("admin.explain").await, 4);
+    // A subject with no `permissions_users` row has no snapshot to cite.
+    let (_, body) = h
+        .post(
+            "/admin/v1/explain",
+            &json!({ "user": "o10-explain-never-logged-in", "server": "prod",
+                     "database": "app", "action": "query_read" }),
+        )
+        .await;
+    assert_eq!(body["groups_source"], "none", "{body}");
+    assert_eq!(body["groups"], json!([]));
+    assert_eq!(h.admin_reads("admin.explain").await, 5);
     h.cleanup().await;
 }
 

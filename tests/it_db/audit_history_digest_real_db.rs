@@ -4,7 +4,8 @@
 //! `audit_calls_history_sha_idx` instead of hashing the caller's history.
 
 use db_mcp_gateway::audit::{self, AuditRow, HistoryQuery, OutcomeCode};
-use db_mcp_gateway::state::audit::select_user_history;
+use db_mcp_gateway::state::audit::{HISTORY_BY_DIGEST_SQL, select_user_history};
+use sqlx::Row as _;
 use uuid::Uuid;
 
 use crate::common::cleanup::delete_audit_calls;
@@ -100,27 +101,25 @@ async fn every_row_carries_its_digest_and_the_lookup_seeks_it() {
         .execute(&mut *tx)
         .await
         .expect("planner setting");
-    let plan: Vec<String> = sqlx::query_scalar(
-        "EXPLAIN SELECT id FROM audit_calls \
-         WHERE user_sub = $1 AND server_name = 'prod' AND database_name = 'app' \
-           AND sql_sha256 = decode($2, 'hex') \
-         ORDER BY occurred_at DESC, id DESC LIMIT 10",
-    )
-    .bind(&sub)
-    .bind(&hash)
+    // The production statement, planned as a generic prepared plan (what a
+    // cached sqlx statement runs after five executions): the digest must be
+    // an index condition, or a rare hash still walks the caller's history.
+    // Simple protocol: an extended-protocol prepare would demand the `$n`.
+    let plan = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN (GENERIC_PLAN) {HISTORY_BY_DIGEST_SQL}"
+    )))
     .fetch_all(&mut *tx)
     .await
-    .expect("explain");
-    let plan = plan.join("\n");
-    // Which index the planner picks depends on the shared state DB's
-    // statistics (with one matching row the history index plus a digest
-    // filter costs the same); what must hold is an index seek, never a scan
-    // of the caller's whole history, and that the digest index exists.
+    .expect("explain")
+    .iter()
+    .map(|row| row.try_get::<String, _>(0).expect("plan line"))
+    .collect::<Vec<_>>()
+    .join("\n");
     assert!(
-        ["Index Scan", "Index Only Scan", "Bitmap Index Scan"]
-            .iter()
-            .any(|scan| plan.contains(scan))
-            && !plan.contains("Seq Scan"),
+        plan.contains("audit_calls_history_sha_idx")
+            && plan
+                .lines()
+                .any(|line| line.contains("Index Cond") && line.contains("sql_sha256")),
         "{plan}"
     );
     let indexed: bool = sqlx::query_scalar(

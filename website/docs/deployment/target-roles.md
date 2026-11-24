@@ -103,7 +103,7 @@ An ACL user, never `default`. The full recipe and the meaning of each part is in
 ACL SETUSER gateway_ro on #<sha256-of-password> resetkeys %R~app:* resetchannels -@all +@read -keys
 ```
 
-`db-mcp-gateway roles` prints a stricter form: an explicit command allowlist without `SCAN`, `DBSIZE` or `KEYS`. Otherwise add `-scan -dbsize` when key names are sensitive, `+select` for a database index other than `0`. Persist it (`ACL SAVE` or your config file) so a restart does not drop the user.
+`db-mcp-gateway roles` prints a stricter form: `reset` first, then an explicit command allowlist without `SCAN`, `DBSIZE` or `KEYS`. Re-running `ACL SETUSER` on an existing user only adds to it: without `reset`, every ACL selector (`(…)`) the user had keeps allowing its commands. Dragonfly has no selectors and rejects `reset`: drop it there. Otherwise add `-scan -dbsize` when key names are sensitive, `+select` for a database index other than `0`. Persist it (`ACL SAVE` or your config file) so a restart does not drop the user.
 
 ## MySQL, MSSQL
 

@@ -62,3 +62,16 @@ fn a_value_naming_two_users_is_refused() {
     let err = only_user(&[a, b], "x").unwrap_err();
     assert!(err.to_string().contains("--by"), "{err}");
 }
+
+#[test]
+fn an_id_matches_in_any_case_and_a_subject_only_exactly() {
+    let id = "0b6c2e6e-1d1f-4a63-8a43-6c3b0c8f2d10";
+    let upper = id.to_uppercase();
+    let owner = json!({ "id": id, "user_sub": "alice" });
+    let other = json!({ "id": "6f1c0a52-4f0e-4c55-9d0b-3f3a4a3f9a11", "user_sub": upper });
+    assert!(user_matches(&owner, &upper, Some(UserField::Id)));
+    // Default lookup: both users match, so find_user refuses to guess.
+    assert!(user_matches(&owner, &upper, None));
+    assert!(user_matches(&other, &upper, None));
+    assert!(!user_matches(&other, id, Some(UserField::Sub)));
+}

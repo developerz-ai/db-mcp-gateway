@@ -157,7 +157,8 @@ was masked by the downstream filters (exit 1) and the scan read as clean. A
 scan that cannot read `.github/workflows` now fails closed — a read error is
 never an empty result.
 
-A secret-scan hit is reported by LOCATION only (`path:line`), never by its
+A secret-scan hit is reported by LOCATION only (`path:line`, or the masked
+path for a file-name or symlink-target hit), never by its
 matched line: the hit is the credential, and the gate's output is copied into
 PRs. A path that carries tokens itself has every one of them masked — a
 filename holding two different tokens prints two `<redacted>` markers, never

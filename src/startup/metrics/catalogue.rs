@@ -198,6 +198,12 @@ pub(crate) const CATALOGUE: &[Metric] = &[
         "1, labelled with the running build.",
     ),
     metric(
+        "process_start_time_seconds",
+        Gauge,
+        &[],
+        "Unix seconds this process booted.",
+    ),
+    metric(
         "log_lines_dropped_total",
         Counter,
         &[],

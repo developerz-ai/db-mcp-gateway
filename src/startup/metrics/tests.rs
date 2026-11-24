@@ -117,6 +117,7 @@ fn boot_exports_the_catalogue_with_its_label_sets_at_zero() {
         preregister::register_static();
         preregister::register_targets(&config);
         loaded::record_build_info();
+        loaded::record_process_start();
     });
     let body = recorder.handle().render();
     let series = rendered_series(&body);
@@ -161,6 +162,10 @@ fn boot_exports_the_catalogue_with_its_label_sets_at_zero() {
             env!("CARGO_PKG_VERSION")
         )),
         "build_info missing:\n{body}"
+    );
+    assert!(
+        body.contains("process_start_time_seconds "),
+        "process_start_time_seconds missing:\n{body}"
     );
     preregister::exhaustive(db_mcp_gateway::audit::OutcomeCode::Success);
 }

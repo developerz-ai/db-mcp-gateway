@@ -16,8 +16,11 @@ groups:
       - alert: GatewayAuditUnavailable
         # increase() needs two samples of a series, so a refusal before a new
         # pod's first scrape (its series born above 0) would never show: the
-        # second clause catches a series that is non-zero but absent 5m ago.
-        expr: sum(increase(tool_calls{outcome="audit_unavailable"}[5m])) > 0 or sum(tool_calls{outcome="audit_unavailable"} > 0 unless tool_calls{outcome="audit_unavailable"} offset 5m) > 0
+        # second clause catches a series that is non-zero but absent 5m ago,
+        # from a process that booted in the last 10m. Absent 5m ago alone is
+        # also every series after a scrape outage longer than the lookback:
+        # without the boot gate a long-lived pod's old count fired again.
+        expr: sum(increase(tool_calls{outcome="audit_unavailable"}[5m])) > 0 or sum((tool_calls{outcome="audit_unavailable"} > 0 unless tool_calls{outcome="audit_unavailable"} offset 5m) and on (job, instance) (time() - process_start_time_seconds < 600)) > 0
         labels:
           severity: critical
         annotations:
@@ -34,9 +37,9 @@ groups:
           description: 'Audit write p95 is {{ $value | humanizeDuration }}. Every response waits on this insert; at 15 s it becomes audit_unavailable.'
           runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditwriteslow
       - alert: GatewayAuditFallbackFailures
-        # Second clause: a failure before a new pod's first scrape, as in
-        # GatewayAuditUnavailable.
-        expr: sum(increase(audit_fallback_failures_total[15m])) > 0 or sum(audit_fallback_failures_total > 0 unless audit_fallback_failures_total offset 15m) > 0
+        # Second clause: a failure before a new pod's first scrape, gated on
+        # a boot in the last 20m, as in GatewayAuditUnavailable.
+        expr: sum(increase(audit_fallback_failures_total[15m])) > 0 or sum((audit_fallback_failures_total > 0 unless audit_fallback_failures_total offset 15m) and on (job, instance) (time() - process_start_time_seconds < 1200)) > 0
         labels:
           severity: warning
         annotations:
@@ -54,10 +57,12 @@ groups:
       - alert: GatewayAuditReaperStale
         # The reaper sweeps every 60 s; the gauge is absent until the first
         # sweep completes, so a reaper that never succeeds also fires. Per
-        # deployment (`job`, `namespace`): on a shared Prometheus one healthy
-        # gateway must not hide another's stale or missing sweeps. A
+        # deployment (`job`, `namespace`, `service`): on a shared Prometheus
+        # one healthy gateway must not hide another's stale or missing sweeps,
+        # and two releases in one namespace can share a `job` — their
+        # Services (the ServiceMonitor's `service` label) still differ. A
         # deployment is a scraped `build_info` (set at boot).
-        expr: (time() - max by (job, namespace) (audit_reaper_last_success_timestamp) > 600) or (group by (job, namespace) (build_info) unless on (job, namespace) group by (job, namespace) (audit_reaper_last_success_timestamp))
+        expr: (time() - max by (job, namespace, service) (audit_reaper_last_success_timestamp) > 600) or (group by (job, namespace, service) (build_info) unless on (job, namespace, service) group by (job, namespace, service) (audit_reaper_last_success_timestamp))
         for: 15m
         labels:
           severity: warning
@@ -68,7 +73,7 @@ groups:
       - alert: GatewayAuditPrunerStale
         # Hourly prune (first run within 5 min of boot): three missed runs.
         # Per deployment, like GatewayAuditReaperStale.
-        expr: (time() - max by (job, namespace) (audit_pruner_last_success_timestamp) > 10800) or (group by (job, namespace) (build_info) unless on (job, namespace) group by (job, namespace) (audit_pruner_last_success_timestamp))
+        expr: (time() - max by (job, namespace, service) (audit_pruner_last_success_timestamp) > 10800) or (group by (job, namespace, service) (build_info) unless on (job, namespace, service) group by (job, namespace, service) (audit_pruner_last_success_timestamp))
         for: 15m
         labels:
           severity: warning

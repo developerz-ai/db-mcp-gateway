@@ -282,7 +282,7 @@ quality jobs in [ci.yml](.github/workflows/ci.yml) and validation in
 | `ci.yml` / `clippy` | `bin/lint`: debug all-target/all-feature clippy and release all-feature clippy, both `-D warnings`; `bin/check-scrub-features` checks the non-dev regex feature graph |
 | `ci.yml` / `test` | `bin/test`: `cargo nextest run --all-targets --all-features` when cargo-nextest is installed, else `cargo test` with the same flags, including bench-harness tests, real-DB setup and argument forwarding |
 | `ci.yml` / `audit` | `cargo audit` — CI's exact command; no advisory is ignored, on the command line or in `.cargo/audit.toml` (the one config cargo-audit reads) |
-| `ci.yml` / `secret-scan` | The tracked-token scan — same `git grep` regex and pathspec exclusions as the workflow, fail-closed on any non-1 grep status, reporting a hit by location (`path:line`) and never by the matched credential — plus the regex regression run from the same script CI runs (`bash tests/bin/secret-scan-regex.test.sh`) |
+| `ci.yml` / `secret-scan` | `bin/secret-scan`, the script the workflow (and `.githooks/pre-commit`, with `--staged`) runs: every tracked file's contents, file names and symlink targets, fail-closed (exit 2) when the scan cannot run, reporting a hit by location (`path:line` or a masked path) and never by the matched credential — plus the regex regression run from the same script CI runs (`bash tests/bin/secret-scan-regex.test.sh`) |
 | `pages.yml` / `build` | In `website/`: `npm run typecheck` and `npm run build` |
 | `pages.yml` / pre-upload artifact guard | Post-build sensitive/config-asset denylist over `website/build/` |
 | Local orchestration regression | `bash tests/bin/check.test.sh`: temporary fixture checkouts and command stubs, no real DB mocks or recursive full-gate execution |
@@ -316,13 +316,13 @@ install website dependencies. Run `cd website && npm ci` to have every job run.
 
 The gate mirrors ci.yml's SHA-pin validation and secret-scan: a local gate
 that skipped them would let unpinned actions and committed service tokens pass
-before the push. The regex regression is a single copy shared with the
-workflow (both run `tests/bin/secret-scan-regex.test.sh`); the two greps are
-ports of the workflow's steps, and `tests/bin/check.test.sh` pins the
-tracked-token scan's exact command line (git is stubbed in its fixture) and
-exercises both scans' verdicts (a pinned ref passes, a mutable tag fails, an
-unreadable workflows directory fails closed; a token match is reported by
-location only and a grep failure fails closed), so drift between the
+before the push. The token scanner and the regex regression are single copies
+shared with the workflow (`bin/secret-scan`, `tests/bin/secret-scan-regex.test.sh`;
+`tests/bin/secret-scan.test.sh` pins the scanner against a real index); the
+SHA-pin grep is a port of the workflow's step, and `tests/bin/check.test.sh`
+exercises both stages' verdicts (a pinned ref passes, a mutable tag fails, an
+unreadable workflows directory fails closed; a token hit and a scanner that
+cannot run both fail the gate), so drift between the
 workflow and the gate turns red instead of passing silently.
 What the local gate adds beyond `bin/lint` (fmt, both clippy configurations and
 the scrub-feature guard) is the all-target/all-feature test invocation through

@@ -187,11 +187,12 @@ async fn forward(mut client: TcpStream, marker: Arc<Vec<u8>>, swallowed: Signal)
         return;
     };
     let (mut up, mut down) = ([0u8; 16 * 1024], [0u8; 16 * 1024]);
+    let mut scan = MarkerScan::new(&marker);
     loop {
         tokio::select! {
             read = client.read(&mut up) => {
                 let Ok(n @ 1..) = read else { return };
-                if up[..n].windows(marker.len()).any(|w| w == marker.as_slice()) {
+                if scan.feed(&up[..n]) {
                     if let Some(tx) = swallowed.lock().unwrap().take() {
                         let _ = tx.send(());
                     }
@@ -210,6 +211,41 @@ async fn forward(mut client: TcpStream, marker: Arc<Vec<u8>>, swallowed: Signal)
             }
         }
     }
+}
+
+/// Finds the marker in a byte stream even when TCP splits it across reads.
+struct MarkerScan<'a> {
+    marker: &'a [u8],
+    tail: Vec<u8>,
+}
+
+impl<'a> MarkerScan<'a> {
+    fn new(marker: &'a [u8]) -> Self {
+        Self {
+            marker,
+            tail: Vec::new(),
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        self.tail.extend_from_slice(bytes);
+        let found = self
+            .tail
+            .windows(self.marker.len())
+            .any(|w| w == self.marker);
+        let keep = self.tail.len().saturating_sub(self.marker.len() - 1);
+        self.tail.drain(..keep);
+        found
+    }
+}
+
+#[test]
+#[serial_test::parallel(world)]
+fn marker_scan_matches_across_read_boundaries() {
+    let mut scan = MarkerScan::new(b"mongosat_1");
+    assert!(!scan.feed(b"\x02count\0mongo"));
+    assert!(scan.feed(b"sat_1\0"));
+    assert!(!MarkerScan::new(b"mongosat_1").feed(b"count other"));
 }
 
 /// The pool's only connection is held by a command whose reply never comes
@@ -240,7 +276,12 @@ async fn a_saturated_pool_is_unavailable_not_timeout() {
     let held_call = run(&a, &held, Some(10_000));
     let waiting_call = async {
         // The command is written only once its call holds the connection.
-        swallowed.await.expect("the held command reaches the proxy");
+        // Bounded: the accept loop keeps the sender alive, so a missed
+        // marker would otherwise wait forever.
+        tokio::time::timeout(Duration::from_secs(10), swallowed)
+            .await
+            .expect("the held command reaches the proxy within 10 s")
+            .expect("the proxy signals");
         let started = Instant::now();
         (run(&a, &count, Some(1_000)).await, started.elapsed())
     };

@@ -53,6 +53,7 @@ Self-hosted MCP gateway. AI agents get audited, SSO-gated, read-only DB access. 
 | Validate `deploy/` (promtool, helm lint, kubeconform; Docker only) | `bin/check-deploy` |
 | Reproduce CI locally / one-command check (2 build jobs by default; `CARGO_BUILD_JOBS=$(nproc) bin/check` on a dedicated box) | `bin/ci` / `bin/check` |
 | Assert scrubber regex features in the shipping graph | `bin/check-scrub-features` |
+| Scan the git index for service tokens (contents, file names, symlink targets; CI and the pre-commit hook run it) | `bin/secret-scan` (`--staged` for the index only) |
 | Mint a static service bearer token | `bin/mint-service-token <name>` |
 | Run the gateway from source (dev stack + committed `config/dev.yaml`; `--idp` adds Dex) | `bin/run` |
 | Seed the demo `shop` DB on the dev target | `bin/seed` |

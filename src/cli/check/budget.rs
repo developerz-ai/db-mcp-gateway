@@ -76,11 +76,17 @@ fn print_state_db() {
     let raw = std::env::var("STATE_DB_POOL_SIZE").ok();
     let default = Config::default().state_db.pool_size.get();
     let (pool, source) = state_pool(full, raw.as_deref(), default);
-    let total = pool + STATE_BACKGROUND_POOL + STATE_LISTENER_POOL;
+    let total = state_total(pool);
     println!(
         "  state DB: request {pool} ({source}) + background {STATE_BACKGROUND_POOL} \
          + listener {STATE_LISTENER_POOL} = {total}"
     );
+}
+
+/// Every state-DB connection: in `u64`, so an operator's `u32::MAX` request
+/// pool cannot wrap to a tiny total.
+fn state_total(pool: u32) -> u64 {
+    u64::from(pool) + u64::from(STATE_BACKGROUND_POOL) + u64::from(STATE_LISTENER_POOL)
 }
 
 /// The request pool size and where it came from. `full` is `None` without the
@@ -116,5 +122,11 @@ mod tests {
         assert_eq!(state_pool(None, Some("0"), DEFAULT).0, DEFAULT);
         assert_eq!(state_pool(None, Some("ten"), DEFAULT).0, DEFAULT);
         assert_eq!(state_pool(Some(7), Some("4"), DEFAULT).0, 7);
+    }
+
+    #[test]
+    fn the_largest_pool_size_does_not_wrap_the_total() {
+        let (pool, _) = state_pool(None, Some("4294967295"), DEFAULT);
+        assert_eq!(state_total(pool), 4_294_967_299);
     }
 }

@@ -47,6 +47,16 @@ fn secondary_namespaces() {
             Ok(()),
         ),
         (
+            "a $lookup-shaped document inside $literal is data, allowed",
+            r#"{"aggregate":"users","pipeline":[{"$project":{"x":{"$literal":{"$lookup":{"from":"system.users","db":"admin"}}}}}],"cursor":{}}"#,
+            Ok(()),
+        ),
+        (
+            "a stage beside $literal data is still checked",
+            r#"{"aggregate":"users","pipeline":[{"$project":{"x":{"$literal":1}}},{"$lookup":{"from":"system.users","as":"u","pipeline":[]}}],"cursor":{}}"#,
+            Err(RejectReason::SystemCollection("aggregate".into())),
+        ),
+        (
             "$documents-only $unionWith (no coll) allowed",
             r#"{"aggregate":1,"pipeline":[{"$unionWith":{"pipeline":[{"$documents":[{"a":1}]}]}}],"cursor":{}}"#,
             Ok(()),

@@ -50,7 +50,11 @@ fn every_database_local_grant_follows_a_connect_to_that_database() {
             .iter()
             .position(|l| l.starts_with("GRANT CONNECT") && l.ends_with(&format!("{role};")))
             .unwrap();
-        assert_eq!(lines[connect + 1], "\\connect \"app\"", "{sql}");
+        assert_eq!(
+            lines[connect + 1],
+            r"\connect -reuse-previous=on 'dbname=''app'''",
+            "{sql}"
+        );
         let usage = lines
             .iter()
             .position(|l| l.starts_with(grant) && l.ends_with(&format!("{role};")))
@@ -93,10 +97,28 @@ permissions: []
     let acl = rendered(yaml).remove(0).unwrap();
     let setuser = acl.lines().find(|l| l.starts_with("ACL SETUSER")).unwrap();
     let rules: Vec<&str> = setuser.split(' ').collect();
+    // An existing user's rules and selectors are cleared before the allowlist.
+    assert_eq!(rules[3], "reset", "{acl}");
     assert!(rules.contains(&"-@all") && rules.contains(&"+get"), "{acl}");
     for denied in ["+scan", "+keys", "+dbsize", "+@read", "+@keyspace"] {
         assert!(!rules.contains(&denied), "{denied} in {acl}");
     }
+}
+
+/// These lines were run through psql 16 against a server without these
+/// databases: each failed as `database "<the literal name>" does not exist`,
+/// never as a connection-option parse (a bare `\connect "a=b"` fails with
+/// `invalid connection option "a"`).
+#[test]
+fn a_database_name_never_reaches_psql_as_a_connection_string() {
+    assert_eq!(
+        psql_connect(r"a=b x\y'q"),
+        "\\connect -reuse-previous=on 'dbname=''a=b x\\\\\\\\y\\\\''q'''\n"
+    );
+    assert_eq!(
+        psql_connect("postgresql://h/x"),
+        "\\connect -reuse-previous=on 'dbname=''postgresql://h/x'''\n"
+    );
 }
 
 #[test]

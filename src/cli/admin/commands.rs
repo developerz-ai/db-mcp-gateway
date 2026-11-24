@@ -113,7 +113,11 @@ async fn find_user(
 
 fn user_matches(row: &Value, user: &str, by: Option<UserField>) -> bool {
     let field = |name: &str| row[name].as_str();
-    let id = || field("id") == Some(user);
+    // As UUIDs: `6F1C…` and `6f1c…` are one id. Subjects stay exact strings.
+    let id = || {
+        let wanted = Uuid::parse_str(user).ok();
+        wanted.is_some() && field("id").and_then(|id| Uuid::parse_str(id).ok()) == wanted
+    };
     let sub = || field("user_sub") == Some(user);
     let email = || field("user_email").is_some_and(|email| email.eq_ignore_ascii_case(user));
     match by {
@@ -229,7 +233,7 @@ async fn copy_body(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|err| CliError::unreachable(client.base(), &err))?
+        .map_err(|err| CliError::unreachable(client.shown(), &err))?
     {
         sink.write_all(&chunk)
             .map_err(|err| CliError::io(what.to_string(), err))?;

@@ -467,6 +467,7 @@ Names are fixed — dashboards and alerts are written against them. No label car
 | `config_info` | gauge (`1`) | `hash` (first 12 hex of the SHA-256 of the parsed config with every credential field (`password`, `write_password`, `token`, `tokens`) removed; `${…}` references are never resolved) |
 | `tls_cert_not_after_timestamp` | gauge (unix seconds) | — (the served leaf certificate; absent with `TLS_DISABLED`) |
 | `build_info` | gauge (`1`) | `version`, `git_sha` (`unknown` when the build had no `GIT_SHA`) |
+| `process_start_time_seconds` | gauge (unix seconds) | — (set at boot; the audit alerts use it to tell a new pod's first scrape from scrapes resuming after an outage) |
 | `log_lines_dropped_total` | counter | — |
 
 `audit_stream_dropped_total` counts only syslog deliveries that failed. The `stdout` stream sink writes through the same non-blocking log queue as every other log line, so an audit row it drops when that queue is full is counted only in `log_lines_dropped_total` — the two are not separable by metric. Every stream sink is a best-effort copy; the state DB row is the record.

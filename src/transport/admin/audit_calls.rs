@@ -6,9 +6,10 @@
 //! The statement text and its bound `params` stay out unless the caller asks
 //! with `include_sql=true`. The read is audited (`admin.audit_calls`, the
 //! filters and `include_sql` in its `params`) before the first byte streams.
-//! Rows are read in bounded keyset batches and no state-DB connection is held
-//! while a line waits for the reader, so a stalled client pins nothing the
-//! audit write path needs. A failure after streaming started ends the body
+//! Rows are read in keyset batches bounded by rows and by bytes, and no
+//! state-DB connection is held while a batch waits for the reader, so a
+//! stalled client pins nothing the audit write path needs and holds at most a
+//! few [`BATCH_BYTES`] of encoded lines however large `include_sql` rows are. A failure after streaming started ends the body
 //! with one `{"error": …}` line instead of a row.
 
 use axum::body::Body;
@@ -17,6 +18,7 @@ use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
+use futures::TryStreamExt as _;
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
 use sqlx::Row;
@@ -76,11 +78,15 @@ const SELECT: &str = "SELECT id, request_id, occurred_at, user_sub, user_email, 
        AND ($10::timestamptz IS NULL OR (occurred_at, id) < ($10, $11)) \
      ORDER BY occurred_at DESC, id DESC LIMIT $8";
 
-/// Lines buffered between the query task and the response body.
-const LINE_BUFFER: usize = 64;
+/// Batches buffered between the query task and the response body.
+const BATCH_BUFFER: usize = 2;
 
 /// Rows one query reads before its connection goes back to the pool.
 const BATCH_ROWS: i64 = 200;
+
+/// Encoded bytes a batch stops at: with `include_sql`, 200 rows of 64 KiB
+/// statements and params would otherwise be ~25 MiB per export.
+const BATCH_BYTES: usize = 1 << 20;
 
 pub async fn stream(
     State(state): State<ReadState>,
@@ -108,7 +114,7 @@ pub async fn stream(
     };
     audit_read(&state.state_db, &actor, AdminRead::AuditCalls, scope).await?;
 
-    let (tx, rx) = mpsc::channel::<String>(LINE_BUFFER);
+    let (tx, rx) = mpsc::channel::<String>(BATCH_BUFFER);
     let pool = state.state_db.clone();
     let request_id = actor.request_id.clone();
     tokio::spawn(async move { produce(pool, query, tx, request_id).await });
@@ -140,9 +146,9 @@ fn requested(q: &AuditCallsQuery) -> JsonValue {
     })
 }
 
-/// Run the query batch by batch and push one line per row. A closed channel
-/// means the client went away: stop reading. `request_id` only labels the
-/// log line.
+/// Run the query batch by batch and push each batch's lines as one chunk. A
+/// closed channel means the client went away: stop reading. `request_id`
+/// only labels the log line.
 async fn produce(
     pool: sqlx::PgPool,
     q: AuditCallsQuery,
@@ -152,7 +158,8 @@ async fn produce(
     let mut remaining = i64::from(q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT));
     let mut after: Option<(DateTime<Utc>, uuid::Uuid)> = None;
     while remaining > 0 {
-        let batch = match fetch_batch(&pool, &q, after, remaining.min(BATCH_ROWS)).await {
+        let asked = remaining.min(BATCH_ROWS);
+        let batch = match fetch_batch(&pool, &q, after, asked).await {
             Ok(batch) => batch,
             Err(()) => {
                 // The cause can carry row text; only the stage is logged.
@@ -161,37 +168,51 @@ async fn produce(
                 return;
             }
         };
-        let full =
-            i64::try_from(batch.lines.len()).unwrap_or(i64::MAX) == remaining.min(BATCH_ROWS);
-        remaining -= i64::try_from(batch.lines.len()).unwrap_or(i64::MAX);
-        for line in batch.lines {
-            if tx.send(line).await.is_err() {
-                return;
-            }
+        let rows = i64::try_from(batch.rows).unwrap_or(i64::MAX);
+        let more = batch.full || rows == asked;
+        remaining -= rows;
+        if !batch.text.is_empty() && tx.send(batch.text).await.is_err() {
+            return;
         }
-        if !full {
+        if !more {
             return;
         }
         after = batch.last;
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Batch {
-    lines: Vec<String>,
+    /// One NDJSON line per row.
+    text: String,
+    rows: usize,
     /// Keyset position of the batch's last row.
     last: Option<(DateTime<Utc>, uuid::Uuid)>,
+    /// Stopped at [`BATCH_BYTES`], before the query ran out of rows.
+    full: bool,
 }
 
-/// One page, read whole: its connection is back in the pool before any line
-/// is sent.
+impl Batch {
+    /// Append one row's line; `true` once the batch holds [`BATCH_BYTES`].
+    fn push(&mut self, line: &JsonValue, at: (DateTime<Utc>, uuid::Uuid)) -> bool {
+        self.text.push_str(&line.to_string());
+        self.text.push('\n');
+        self.rows += 1;
+        self.last = Some(at);
+        self.full = self.text.len() >= BATCH_BYTES;
+        self.full
+    }
+}
+
+/// One page, read until `limit` rows or [`BATCH_BYTES`]: its connection is
+/// back in the pool before any line is sent.
 async fn fetch_batch(
     pool: &sqlx::PgPool,
     q: &AuditCallsQuery,
     after: Option<(DateTime<Utc>, uuid::Uuid)>,
     limit: i64,
 ) -> Result<Batch, ()> {
-    let rows = sqlx::query(SELECT)
+    let mut rows = sqlx::query(SELECT)
         .bind(q.user.as_deref())
         .bind(q.server.as_deref())
         .bind(q.db.as_deref())
@@ -203,19 +224,19 @@ async fn fetch_batch(
         .bind(q.include_sql)
         .bind(after.map(|(at, _)| at))
         .bind(after.map(|(_, id)| id))
-        .fetch_all(pool)
-        .await
-        .map_err(|_| ())?;
-    let mut last = None;
-    let mut lines = Vec::with_capacity(rows.len());
-    for row in &rows {
-        lines.push(format!("{}\n", row_json(row).map_err(|_| ())?));
-        last = Some((
+        .fetch(pool);
+    let mut batch = Batch::default();
+    // Rows past the byte bound are left to the next batch's keyset.
+    while let Some(row) = rows.try_next().await.map_err(|_| ())? {
+        let at = (
             row.try_get("occurred_at").map_err(|_| ())?,
             row.try_get("id").map_err(|_| ())?,
-        ));
+        );
+        if batch.push(&row_json(&row).map_err(|_| ())?, at) {
+            break;
+        }
     }
-    Ok(Batch { lines, last })
+    Ok(batch)
 }
 
 fn error_line() -> String {
@@ -266,3 +287,7 @@ fn row_json(row: &PgRow) -> Result<JsonValue, sqlx::Error> {
     }
     Ok(line)
 }
+
+#[cfg(test)]
+#[path = "audit_calls_tests.rs"]
+mod tests;

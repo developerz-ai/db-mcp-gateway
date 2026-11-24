@@ -13,7 +13,7 @@ use clap::{Args, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 use super::{CliError, EXIT_OK};
-use client::AdminClient;
+use client::{AdminClient, origin};
 
 pub use commands::{audit, grants, sessions};
 
@@ -126,7 +126,7 @@ pub async fn login(args: LoginArgs) -> Result<u8, CliError> {
     session_file::save(&path, &session)?;
     println!(
         "logged in to {}; session stored in {}",
-        session.url,
+        origin(&session.url),
         path.display()
     );
     Ok(EXIT_OK)
@@ -150,8 +150,10 @@ fn session_url<'a>(flag: Option<&str>, stored: &'a str) -> Result<&'a str, CliEr
     let stored = stored.trim_end_matches('/');
     match flag.map(|url| url.trim_end_matches('/')) {
         Some(url) if url != stored => Err(CliError::Usage(format!(
-            "--url {url} is not the gateway this session belongs to ({stored}); \
-             log in to it with its own --token-file"
+            "--url {} is not the gateway this session belongs to ({}); \
+             log in to it with its own --token-file",
+            origin(url),
+            origin(stored)
         ))),
         _ => Ok(stored),
     }
@@ -173,5 +175,19 @@ mod tests {
             session_url(Some("https://evil.example.com"), stored),
             Err(CliError::Usage(_))
         ));
+    }
+
+    #[test]
+    fn a_url_mismatch_names_origins_only() {
+        let Err(CliError::Usage(message)) = session_url(
+            Some("https://u:hunter2@evil.example.com/x?t=secret"),
+            "https://gw.example.com/stored-path",
+        ) else {
+            panic!("mismatch refused");
+        };
+        for leaked in ["hunter2", "secret", "stored-path", "/x"] {
+            assert!(!message.contains(leaked), "{message}");
+        }
+        assert!(message.contains("https://evil.example.com"), "{message}");
     }
 }

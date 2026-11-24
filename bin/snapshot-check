@@ -51,6 +51,28 @@ for i in "${!files[@]}"; do
   files[i]=$file
 done
 
+# A symlinked directory on the way to a listed file would carry the overlay's
+# copy or removal outside the tree it names: refused on both sides (the
+# working tree here, the exported HEAD below). The file itself may be a link.
+symlinked_parent() {
+  local dir=$2
+  while [[ $dir == */* ]]; do
+    dir=${dir%/*}
+    if [[ -L $1/$dir ]]; then return 0; fi
+  done
+  return 1
+}
+refuse_symlinked_parents() {
+  local file
+  for file in "${files[@]}"; do
+    if symlinked_parent "$1" "$file"; then
+      echo "snapshot-check: '$file' is under a symlinked directory in $1" >&2
+      exit 2
+    fi
+  done
+}
+refuse_symlinked_parents "$root"
+
 # shellcheck source=bin/lib/queue.sh
 . bin/lib/queue.sh
 # Re-run under `heavy` with the paths already resolved against the root.
@@ -72,12 +94,13 @@ tree=$base/tree
 rm -rf "$tree"
 mkdir -p "$tree"
 git archive --format=tar HEAD | tar -x -C "$tree"
+refuse_symlinked_parents "$tree"
 for file in "${files[@]}"; do
+  # Removed first: copying onto a link in the export would write through it.
+  rm -f "$tree/$file"
   if [[ -e $root/$file || -L $root/$file ]]; then
     mkdir -p "$tree/$(dirname "$file")"
     cp -a "$root/$file" "$tree/$file"
-  else
-    rm -f "$tree/$file"
   fi
 done
 echo "snapshot-check: HEAD $(git rev-parse --short HEAD) + ${#files[@]} file(s) in $tree"

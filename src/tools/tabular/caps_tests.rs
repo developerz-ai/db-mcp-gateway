@@ -123,6 +123,31 @@ fn an_oversized_cell_is_replaced_by_the_marker() {
     assert!(!sizing.truncated, "capping a cell drops no row");
 }
 
+/// Rows past the byte cut are dropped before their cells are shaped: only
+/// the returned rows' cells become markers, and only they are counted.
+#[test]
+fn rows_past_the_byte_cap_are_never_shaped() {
+    let wide = || (0..50).map(|_| json!("x".repeat(64))).collect::<Vec<_>>();
+    let caps = ByteCaps {
+        max_bytes: max_bytes(4096),
+        max_cell_bytes: cap(1),
+    };
+    let (kept, sizing) = shape(
+        (0..1000).map(|_| wide()).collect(),
+        false,
+        RowLimit {
+            effective: 1000,
+            asked: 1000,
+        },
+        caps,
+        ServerKind::Postgres,
+    );
+    assert!(!kept.is_empty() && kept.len() < 1000);
+    assert_eq!(sizing.truncated_by, Some(TruncatedBy::ByteCap));
+    assert_eq!(sizing.cells_truncated, kept.len() * 50);
+    assert!(json_len(&kept) <= 4096);
+}
+
 /// Three rows of 12 MiB each: 36 MiB of JSON, past the 32 MiB ceiling.
 fn oversized_rows() -> Vec<Vec<Value>> {
     let cell = "x".repeat(12 * 1024 * 1024);

@@ -82,6 +82,7 @@ pub(crate) fn install_recorder(shutdown: CancellationToken) -> anyhow::Result<Pr
     describe_catalogue();
     preregister::register_static();
     loaded::record_build_info();
+    loaded::record_process_start();
     let refresher_stop = shutdown.clone();
     tokio::spawn(async move {
         held::run_refresher(held::held(), held::REFRESH_EVERY, refresher_stop).await;

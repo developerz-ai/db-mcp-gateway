@@ -119,7 +119,7 @@ For organizations that need to survive a single gateway instance going down: run
 
 ## Statelessness
 
-The gateway process is stateless apart from in-memory caches (JWKS, sessions, decoded permissions). Login state (pending logins, consents, authorization codes), client registrations and refresh-token chains live in the state DB, so all of it persists across restarts. Restarting the binary loses nothing that isn't reloadable from config + state DB — not even a login that is mid-round-trip: its callback, consent or `/token` step completes on another replica or on the restarted one. Two replicas behind a load balancer is the path to HA, with no sticky sessions for any route (see [HA](#ha) above).
+The gateway process is stateless apart from in-memory caches (JWKS, sessions, decoded permissions). Login state (pending logins, consents, authorization codes), client registrations and refresh-token chains live in the state DB, so all of it persists across restarts. Restarting the binary loses nothing that isn't reloadable from config + state DB — not even a login that is mid-round-trip, as long as its next step's state is unconsumed and unexpired: its callback, consent or `/token` step completes on another replica or on the restarted one. A replica stopped in the middle of a step it had already taken (a code redemption after the take, before the answer) leaves nothing to retry; the client restarts authorization. Two replicas behind a load balancer is the path to HA, with no sticky sessions for any route (see [HA](#ha) above).
 
 ## What's deliberately not here
 

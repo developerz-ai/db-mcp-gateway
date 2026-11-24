@@ -103,10 +103,10 @@ fn plain_line_arg<'a>(what: &str, value: &'a str) -> Result<&'a str, CliError> {
 /// lands in the database psql is connected to, so the recipe `\connect`s to
 /// the configured one first.
 fn postgres(server: &Server, db: &Database, args: &RolesArgs) -> Result<String, CliError> {
-    let database = quote_ident(plain_line_arg("database", &db.name)?);
+    let connect = psql_connect(plain_line_arg("database", &db.name)?);
+    let database = quote_ident(&db.name);
     let read = quote_ident(&db.role);
     let owner = quote_ident(&args.owner);
-    let connect = format!("\\connect {database}\n");
     let mut sql = format!(
         "-- {}: read role\n\
          -- set the password out of band (psql: \\password {read}) and store it where\n\
@@ -244,10 +244,29 @@ fn redis(server: &Server, db: &Database) -> Result<String, CliError> {
         .collect();
     Ok(format!(
         "# {}: ACL user — narrow `%R~*` to the key patterns agents may read;\n\
-         # SCAN/DBSIZE/KEYS stay off: they would list keys outside those patterns\n\
-         ACL SETUSER {user} on #<sha256-of-password> resetkeys %R~* resetchannels -@all{commands}{select}\n",
+         # SCAN/DBSIZE/KEYS stay off: they would list keys outside those patterns.\n\
+         # `reset` first: on an existing user it clears every earlier rule, ACL\n\
+         # selectors included, which would otherwise still allow their commands\n\
+         # (Dragonfly has neither selectors nor `reset`: drop it there).\n\
+         ACL SETUSER {user} reset on #<sha256-of-password> resetkeys %R~* resetchannels -@all{commands}{select}\n",
         label(server, db)
     ))
+}
+
+/// psql's `\connect` to `name` as a literal database name. A bare
+/// `\connect "a=b"` hands psql a connection string (any `=`, or a
+/// `postgresql://` prefix), so the name travels as an explicit `dbname`
+/// value — escaped for libpq's quoting, then for psql's single-quoted
+/// argument — and `-reuse-previous=on` keeps the host, port and user.
+fn psql_connect(name: &str) -> String {
+    let conninfo = format!(
+        "dbname='{}'",
+        name.replace('\\', "\\\\").replace('\'', "\\'")
+    );
+    format!(
+        "\\connect -reuse-previous=on '{}'\n",
+        conninfo.replace('\\', "\\\\").replace('\'', "''")
+    )
 }
 
 /// Postgres identifier quoting: always quoted, so a mixed-case role keeps

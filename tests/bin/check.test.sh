@@ -14,6 +14,15 @@ fixture() {
   rm -rf "$work/repo" "$work/tools" "$work/calls.ready"
   mkdir -p "$work/repo"/{bin,tests/bin,website/node_modules/.bin,.github/workflows} "$work/tools"
   cp bin/{ci,check,lint,test,check-scrub-features} "$work/repo/bin/"
+  # The token scanner itself is pinned by secret-scan.test.sh against a real
+  # git index; here only the gate's handling of its exit code is under test.
+  cat > "$work/repo/bin/secret-scan" <<'STUB'
+#!/usr/bin/env bash
+printf 'bin/secret-scan %s\n' "$*" >> "$CALLS"
+(( ${SECRET_SCAN_RC:-0} != 1 )) || echo 'config/prod.yaml:9' >&2
+exit "${SECRET_SCAN_RC:-0}"
+STUB
+  chmod +x "$work/repo/bin/secret-scan"
   cp -r bin/lib "$work/repo/bin/"
   # Replace only the recursive test entry in the fixture, not the gate itself.
   printf 'echo orchestration >> "$CALLS"\n' > "$work/repo/tests/bin/check.test.sh"
@@ -59,20 +68,6 @@ name=${0##*/}
 printf '%s %s\n' "$name" "$*" >> "$CALLS"
 case "$name $*" in
   'node -e '*) exit "${NODE_RC:-0}" ;;
-  'git grep '*)
-    # rc=0 with a match line fails the gate; any rc other than 1 fails it
-    # closed; only the default rc=1 (no match) reads as clean. The simulated
-    # token deliberately cannot match the real guard regex; the multi-token
-    # fixture's filename tokens can — exercising their redaction is the point.
-    if [[ -n ${TOKEN_HIT_MULTI:-} ]]; then
-      echo "config/${TOKEN_A}_and_${TOKEN_B}.yaml:3: dbmcp_svc_SIMULATED_TOKEN_FIXTURE_ONLY_NOT_HEX"
-      exit 0
-    fi
-    if [[ -n ${TOKEN_HIT:-} ]]; then
-      echo 'config/prod.yaml:9: dbmcp_svc_SIMULATED_TOKEN_FIXTURE_ONLY_NOT_HEX'
-      exit 0
-    fi
-    exit "${GIT_GREP_RC:-1}" ;;
   'docker compose '*ps*)
     # Realistic service/state/health fields: 'running' alone is discarded by
     # the health check, so the fixture would prove nothing about it.
@@ -133,18 +128,6 @@ not_output() {
     exit 1
   fi
 }
-# A matched token must never reach the gate's output: the hit IS the
-# credential, and the gate's output is copied into PRs. The needles are not
-# echoed, so a failure never copies a token into the test log either.
-assert_no_token_in_output() {
-  local tok
-  for tok in "$@"; do
-    if grep -qF -- "$tok" "$work/output"; then
-      echo 'FAIL: the gate output contains the matched token'
-      exit 1
-    fi
-  done
-}
 # The final summary must repeat every skipped job's notice. Asserting over the
 # whole output would also pass on the initial notice alone, so the assertion is
 # scoped to the summary section.
@@ -170,11 +153,6 @@ assert_not_run() {
   fi
 }
 
-# Two DIFFERENT simulated 64-hex tokens for the multi-token filename fixture:
-# one repeated hex character each, so they cannot be mistaken for real ones.
-token_a="dbmcp_svc_$(printf 'a%.0s' {1..64})"
-token_b="dbmcp_svc_$(printf 'b%.0s' {1..64})"
-
 fixture
 run_gate 0
 for call in \
@@ -185,7 +163,7 @@ for call in \
   'docker compose -f docker-compose.dev.yml up -d --wait' \
   'cargo test --all-targets --all-features' \
   'cargo audit' \
-  'git grep -nE dbmcp_svc_[0-9a-f]{64} -- :!tests/** :!website/** :!config/example.yaml :!.github/** :!src/config/yaml/**' \
+  'bin/secret-scan ' \
   'npm run typecheck' 'npm run build' 'orchestration' \
   'python3 -I .github/scripts/public_tree.py'; do
   called "$call"
@@ -195,7 +173,7 @@ done
 # REAL grep and leave no call trace, so their verdicts are the pin: the happy
 # path passes with a pinned ref and a local action in the fixture workflow,
 # and the unpinned case below fails on a mutable tag.
-assert_output 'no literal service tokens in committed config (git grep rc=1)'
+assert_output 'no literal service tokens in tracked files, names or link targets'
 # The token-regex regression ran the real script copied into the fixture.
 assert_output 'passed, 0 failed'
 # The doc-anchor guard ran too: the gate invokes it, so the fixture must
@@ -218,9 +196,9 @@ ln -s stub "$work/tools/cargo-nextest"
   bash bin/test --test smoke -- --nocapture 'filter with spaces')
 called 'cargo nextest run --all-targets --all-features --test smoke -- --nocapture filter with spaces'
 rm "$work/tools/cargo-nextest"
-# The restored ci.yml parity stages, exercised against the real scan code: a
-# mutable action ref fails the SHA-pin scan, a committed token fails the
-# tracked-token scan, and a git grep that cannot run fails closed (#190).
+# The restored ci.yml parity stages: a mutable action ref fails the SHA-pin
+# scan (real code), and the token scanner's hit (exit 1) and tooling failure
+# (exit 2) both fail the gate (#190).
 fixture
 printf 'jobs:\n  fmt:\n    steps:\n      - uses: actions/checkout@v5\n' \
   > "$work/repo/.github/workflows/ci.yml"
@@ -239,25 +217,14 @@ assert_output 'grep tooling failure (rc=2) — SHA-pin scan cannot read as clean
 assert_not_run "NOT RUN: test - the gate stopped before this job"
 
 fixture
-run_gate 1 TOKEN_HIT=1
-assert_output 'literal dbmcp_svc_ service token(s) in committed config'
-# The hit IS the credential: the gate reports where it is, never what it is.
+run_gate 1 SECRET_SCAN_RC=1
+assert_output 'literal dbmcp_svc_ service token(s) tracked'
 assert_output 'config/prod.yaml:9'
-assert_no_token_in_output 'dbmcp_svc_SIMULATED_TOKEN_FIXTURE_ONLY_NOT_HEX'
-assert_not_run "NOT RUN: pages typecheck/build/artifact guard - the gate stopped before this job"
-
-# A filename can carry the token itself — here two DIFFERENT tokens, and both
-# must be masked: a single match+replace left the second one in the output.
-fixture
-run_gate 1 TOKEN_HIT_MULTI=1 TOKEN_A="$token_a" TOKEN_B="$token_b"
-assert_output 'literal dbmcp_svc_ service token(s) in committed config'
-assert_output 'config/<redacted>_and_<redacted>.yaml:3'
-assert_no_token_in_output "$token_a" "$token_b" 'dbmcp_svc_SIMULATED_TOKEN_FIXTURE_ONLY_NOT_HEX'
 assert_not_run "NOT RUN: pages typecheck/build/artifact guard - the gate stopped before this job"
 
 fixture
-run_gate 1 GIT_GREP_RC=128
-assert_output 'git grep tooling failure (rc=128) — secret-scan cannot read as clean (fail-closed, #190)'
+run_gate 1 SECRET_SCAN_RC=2
+assert_output 'secret scan tooling failure (rc=2) — cannot read as clean (fail-closed, #190)'
 fixture
 run_gate 75 FAIL_AT='docker compose -f docker-compose.dev.yml up -d --wait'
 not_called 'cargo test --all-targets --all-features'

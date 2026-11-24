@@ -55,6 +55,28 @@ for bad in '../outside.rs' '/etc/passwd' 'src/../../x.rs'; do
   rc=0; snap "$bad" || rc=$?
   [[ $rc == 2 && ! -s $work/calls ]] || fail "'$bad' exited $rc or ran cargo"
 done
+# A symlinked directory on either side would carry the overlay outside the
+# tree: a link committed in HEAD (the export) and one only in the working tree.
+mkdir -p "$work/outside"
+echo victim > "$work/outside/x.rs"
+ln -s "$work/outside" "$repo/escape"
+ln -s "$work/outside" "$repo/head-escape"
+git_ add escape head-escape && git_ commit -qm link
+# Only in HEAD: the working tree holds a real directory there.
+rm "$repo/head-escape" && mkdir "$repo/head-escape" && echo mine > "$repo/head-escape/x.rs"
+ln -s "$work/outside" "$repo/local-escape"
+for bad in escape/x.rs escape/new.rs head-escape/x.rs local-escape/x.rs; do
+  rc=0; snap "$bad" || rc=$?
+  [[ $rc == 2 && ! -s $work/calls ]] || fail "'$bad' under a symlinked directory exited $rc or ran cargo"
+  [[ $(<"$work/outside/x.rs") == victim && ! -e $work/outside/new.rs ]] || fail "'$bad' wrote outside the snapshot"
+done
+# The listed file itself a link in HEAD: replaced, never written through.
+ln -s "$work/outside/x.rs" "$repo/src/link.rs"
+git_ add src/link.rs && git_ commit -qm file-link
+rm "$repo/src/link.rs" && echo mine > "$repo/src/link.rs"
+snap --slot c src/link.rs -- true || fail "overlaying a committed link failed: $(<"$work/out")"
+[[ $(<"$work/outside/x.rs") == victim ]] || fail 'overlay wrote through a committed file link'
+
 for usage in '' '-- cargo check' '--slot' '--slot a/b x.rs' 'x.rs --'; do
   rc=0
   # shellcheck disable=SC2086

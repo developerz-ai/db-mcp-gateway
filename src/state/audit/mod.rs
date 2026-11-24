@@ -8,6 +8,8 @@ mod intents;
 mod permissions;
 mod retention;
 
+#[cfg(any(test, debug_assertions))]
+pub use history::HISTORY_BY_DIGEST_SQL;
 pub use history::select_user_history;
 pub use intents::{
     IntentKey, ReapBatch, insert_intent, reap_abandoned_batch, select_intent_access,

@@ -13,7 +13,7 @@ use url::Url;
 use uuid::Uuid;
 
 use super::super::CliError;
-use super::client::{ensure_success, gateway_url, http_client};
+use super::client::{ensure_success, gateway_url, http_client, origin};
 use super::session_file::StoredSession;
 
 /// How long the operator has to finish signing in.
@@ -35,7 +35,7 @@ pub async fn run(gateway: &str) -> Result<StoredSession, CliError> {
         .map_err(|err| CliError::io("read the loopback port", err))?
         .port();
     let redirect_uri = format!("http://127.0.0.1:{port}{CALLBACK_PATH}");
-    let http = http_client(None)?;
+    let http = http_client(None, gateway)?;
     let client_id = register(&http, gateway, &redirect_uri).await?;
     let (verifier, challenge) = pkce::generate();
     let state = Uuid::new_v4().simple().to_string();
@@ -59,12 +59,12 @@ async fn register(
         .json(&json!({ "redirect_uris": [redirect_uri], "client_name": "db-mcp-gateway CLI" }))
         .send()
         .await
-        .map_err(|err| CliError::unreachable(gateway, &err))?;
+        .map_err(|err| CliError::unreachable(&origin(gateway), &err))?;
     let body: Value = ensure_success("register the CLI client", response)
         .await?
         .json()
         .await
-        .map_err(|err| CliError::unreachable(gateway, &err))?;
+        .map_err(|err| CliError::unreachable(&origin(gateway), &err))?;
     body["client_id"]
         .as_str()
         .map(str::to_string)
@@ -89,7 +89,7 @@ fn authorize_url(
             ("state", state),
         ],
     )
-    .map_err(|_| CliError::Usage(format!("--url `{gateway}` is not a URL")))
+    .map_err(|_| CliError::Usage(format!("--url {} is not a URL", origin(gateway))))
 }
 
 /// Serve callbacks until one carries our `state`; anything else (a favicon
@@ -177,12 +177,12 @@ async fn redeem(
         ])
         .send()
         .await
-        .map_err(|err| CliError::unreachable(gateway, &err))?;
+        .map_err(|err| CliError::unreachable(&origin(gateway), &err))?;
     let body: Value = ensure_success("redeem the authorization code", response)
         .await?
         .json()
         .await
-        .map_err(|err| CliError::unreachable(gateway, &err))?;
+        .map_err(|err| CliError::unreachable(&origin(gateway), &err))?;
     let access_token = body["access_token"]
         .as_str()
         .ok_or_else(|| CliError::Invalid("/token returned no access_token".to_string()))?;

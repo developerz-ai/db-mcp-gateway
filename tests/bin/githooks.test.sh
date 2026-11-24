@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# .githooks: pre-commit refuses a staged service-token value (naming the file,
-# never echoing the token) outside the exempt paths, and stays fast — no
+# .githooks: pre-commit refuses a staged service-token value (naming the file
+# and line, never echoing the token) outside the exempt paths, and stays fast — no
 # compile, no containers. pre-push runs clippy then the unit loop.
 set -euo pipefail
 
@@ -30,6 +30,7 @@ repo=$work/repo
 git init -q "$repo"
 mkdir -p "$repo/.githooks" "$repo/bin" "$repo/tests" "$repo/config"
 cp "$root/.githooks/pre-commit" "$root/.githooks/pre-push" "$repo/.githooks/"
+cp "$root/bin/secret-scan" "$repo/bin/"
 
 hook() {
   : > "$work/calls"
@@ -44,7 +45,7 @@ grep -qxF 'cargo fmt --all -- --check' "$work/calls" || fail 'pre-commit did not
 printf 'token: %s\n' "$token" > "$repo/config/leak.yaml"
 git -C "$repo" add config/leak.yaml
 if hook pre-commit; then fail 'staged token value accepted'; fi
-grep -qxF 'config/leak.yaml' "$work/output" || fail 'refusal does not name the file'
+grep -qxF 'config/leak.yaml:1' "$work/output" || fail 'refusal does not name the file'
 ! grep -qF "$token" "$work/output" || fail 'refusal echoed the token'
 git -C "$repo" rm -q --cached config/leak.yaml
 
@@ -53,7 +54,7 @@ git -C "$repo" rm -q --cached config/leak.yaml
 { printf 'token: %s\n' "$token"; seq 1 400000 | sed 's/^/line: /'; } > "$repo/config/big.yaml"
 git -C "$repo" add config/big.yaml
 if hook pre-commit; then fail 'token at the head of a large diff accepted (SIGPIPE)'; fi
-grep -qxF 'config/big.yaml' "$work/output" || fail 'large-diff refusal does not name the file'
+grep -qxF 'config/big.yaml:1' "$work/output" || fail 'large-diff refusal does not name the file'
 git -C "$repo" rm -q --cached config/big.yaml
 
 # A token in a file *name* is refused and redacted in the report.
@@ -69,7 +70,7 @@ rm "$repo/config/$token.yaml"
 printf '\0\001bin\0%s\0' "$token" > "$repo/config/blob.bin"
 git -C "$repo" add config/blob.bin
 if hook pre-commit; then fail 'token inside a staged binary file accepted'; fi
-grep -qxF 'config/blob.bin' "$work/output" || fail "binary refusal does not name the file: $(<"$work/output")"
+grep -qxF 'config/blob.bin:1' "$work/output" || fail "binary refusal does not name the file: $(<"$work/output")"
 ! grep -qF "$token" "$work/output" || fail 'binary refusal echoed the token'
 git -C "$repo" rm -q --cached config/blob.bin
 
@@ -140,11 +141,11 @@ mkdir -p "$repo/bin/lib"
 printf -- '-- sql\n' > "$repo/bin/lib/role.sql"
 printf '#!/usr/bin/env bash\n' > "$repo/bin/lib/q.sh"
 printf '#!/usr/bin/env bash\n' > "$repo/bin/wrapper"
-git -C "$repo" add bin
+git -C "$repo" add bin/lib bin/wrapper
 hook pre-commit || fail "shell scripts refused: $(<"$work/output")"
 grep -qxF 'shellcheck -x -- bin/lib/q.sh bin/wrapper' "$work/calls" \
   || fail "shellcheck got the wrong files: $(<"$work/calls")"
-git -C "$repo" rm -q --cached -r bin
+git -C "$repo" rm -q --cached -r bin/lib bin/wrapper
 rm -rf "$repo/bin/lib" "$repo/bin/wrapper"
 rm "$work/tools/shellcheck"
 

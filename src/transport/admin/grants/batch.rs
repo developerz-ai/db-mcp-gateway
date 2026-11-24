@@ -37,7 +37,8 @@ const GRANT: PermissionsAuditTargetType = PermissionsAuditTargetType::Grant;
 /// Changes one batch may carry; larger sets hold their row locks too long.
 pub const MAX_BATCH_CHANGES: usize = 500;
 
-/// Body bound of this route, where every other admin body gets 64 KiB:
+/// Body bound of this route, where every other admin body gets 64 KiB save
+/// `permissions/diff` (16 MiB):
 /// [`MAX_BATCH_CHANGES`] maximal upserts (255-byte server name),
 /// pretty-printed, take about 310 KiB (the unit test below computes it).
 pub const BATCH_BODY_LIMIT: usize = 1024 * 1024;

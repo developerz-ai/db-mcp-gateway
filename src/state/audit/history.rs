@@ -6,6 +6,33 @@ use uuid::Uuid;
 
 use crate::audit::{HistoryCursor, HistoryEntry, HistoryPage, HistoryQuery, cap_history_sql};
 
+/// One history page's SQL; `$digest` is either nothing or the digest
+/// predicate, so each variant is a static string.
+macro_rules! history_sql {
+    ($digest:literal) => {
+        concat!(
+            "SELECT id, request_id, sql, sql_truncated, reason, outcome, elapsed_ms, row_count, \
+                    rows_affected, occurred_at, \
+                    encode(sql_sha256, 'hex') AS sql_sha256 \
+             FROM audit_calls \
+             WHERE user_sub = $1 AND server_name = $2 AND database_name = $3 \
+               AND ($4::timestamptz IS NULL OR occurred_at >= $4::timestamptz) \
+               AND ($5::timestamptz IS NULL OR (occurred_at, id) < ($5::timestamptz, $6::uuid)) \
+               AND ($8::text IS NULL OR upstream_run_id = $8::text) ",
+            $digest,
+            "ORDER BY occurred_at DESC, id DESC \
+             LIMIT $7"
+        )
+    };
+}
+
+const HISTORY_SQL: &str = history_sql!("");
+/// The digest lookup. Its own statement, not an optional `($9 IS NULL OR …)`
+/// predicate: a generic prepared plan cannot use an optional predicate as an
+/// index condition, so the digest would only filter the caller's whole
+/// history.
+pub const HISTORY_BY_DIGEST_SQL: &str = history_sql!("AND sql_sha256 = decode($9::text, 'hex') ");
+
 /// SECURITY-CRITICAL — used by `tools::get_query_history`. One page of the
 /// caller's `audit_calls` rows for `(server, database)`, newest first, scoped
 /// by the authenticated `user_sub` (never a client-supplied field) and, for a
@@ -23,31 +50,24 @@ pub async fn select_user_history(
         Some(cursor) => (Some(cursor.occurred_at), Some(cursor.id)),
         None => (None, None),
     };
+    let sql = match query.sql_sha256 {
+        Some(_) => HISTORY_BY_DIGEST_SQL,
+        None => HISTORY_SQL,
+    };
     // Explicit casts so the bind types are unambiguous when a value is NULL.
-    let rows = sqlx::query(
-        "SELECT id, request_id, sql, sql_truncated, reason, outcome, elapsed_ms, row_count, \
-                rows_affected, occurred_at, \
-                encode(sql_sha256, 'hex') AS sql_sha256 \
-         FROM audit_calls \
-         WHERE user_sub = $1 AND server_name = $2 AND database_name = $3 \
-           AND ($4::timestamptz IS NULL OR occurred_at >= $4::timestamptz) \
-           AND ($5::timestamptz IS NULL OR (occurred_at, id) < ($5::timestamptz, $6::uuid)) \
-           AND ($8::text IS NULL OR upstream_run_id = $8::text) \
-           AND ($9::text IS NULL OR sql_sha256 = decode($9::text, 'hex')) \
-         ORDER BY occurred_at DESC, id DESC \
-         LIMIT $7",
-    )
-    .bind(query.user_sub)
-    .bind(query.server)
-    .bind(query.database)
-    .bind(query.since)
-    .bind(before_at)
-    .bind(before_id)
-    .bind(i64::from(query.limit) + 1)
-    .bind(query.upstream_run_id)
-    .bind(query.sql_sha256)
-    .fetch_all(pool)
-    .await?;
+    let mut statement = sqlx::query(sql)
+        .bind(query.user_sub)
+        .bind(query.server)
+        .bind(query.database)
+        .bind(query.since)
+        .bind(before_at)
+        .bind(before_id)
+        .bind(i64::from(query.limit) + 1)
+        .bind(query.upstream_run_id);
+    if let Some(digest) = query.sql_sha256 {
+        statement = statement.bind(digest);
+    }
+    let rows = statement.fetch_all(pool).await?;
 
     let limit = usize::try_from(query.limit).unwrap_or(usize::MAX);
     let has_more = rows.len() > limit;

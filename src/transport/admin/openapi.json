@@ -1797,10 +1797,11 @@
             "type": "string",
             "enum": [
               "stored",
+              "none",
               "assumed",
               "group"
             ],
-            "description": "Where `groups` came from: `stored` (the user's last-login snapshot) or `assumed` (the request body) make the answer a simulation, which a live session holding other claims can contradict; `group` for a group question."
+            "description": "Where `groups` came from: `stored` (the user's last-login snapshot), `none` (no snapshot: the user has no `permissions_users` row, so no groups) or `assumed` (the request body) make the answer a simulation, which a live session holding other claims can contradict; `group` for a group question."
           },
           "server": {
             "type": "string"

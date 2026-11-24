@@ -141,9 +141,11 @@ about tokens is callable over HTTP — the lifecycle is GitOps:
   Under `gateway.env: production` an inline literal token is rejected at
   boot (the error names the field, never the value); the default
   `development` accepts one for dev/test parity with `Database.password`.
-  Committed config is also guarded at the CI layer: the `secret-scan` job in `.github/workflows/ci.yml` scans
-  every tracked file (not just YAML) and FAILS on any literal
-  `dbmcp_svc_<64hex>` token (test fixtures under `tests/**` are excluded).
+  Committed config is also guarded at the CI layer: the `secret-scan` job in `.github/workflows/ci.yml` runs
+  `bin/secret-scan` over the git index — every tracked file's contents (not
+  just YAML), every tracked file name and every symlink target — and FAILS on
+  any literal `dbmcp_svc_<64hex>` token (test fixtures under `tests/**` are
+  excluded); `.githooks/pre-commit` runs the same script over the staged change.
   It is ADVISORY — it fails the job on every PR, but does not by itself
   block a merge until made a required branch-protection check (#190
   follow-up).

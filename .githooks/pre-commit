@@ -10,66 +10,18 @@ cd "$(dirname "$0")/.."
 echo '→ cargo fmt --check'
 cargo fmt --all -- --check
 
-# Same regex and exempt paths as CI's secret-scan job, over the staged side of
-# the change only: names and index blobs of added, copied, modified, renamed
-# and retyped paths. A deletion stages nothing, so removing a leaked file (or
-# a leaked file name) always commits. The blobs are scanned as bytes
-# (`--text`): a binary file's patch carries no added lines.
-token_re='dbmcp_svc_[0-9a-f]{64}'
-exempt=(':!tests/**' ':!website/**' ':!config/example.yaml' ':!.github/**' ':!src/config/yaml/**')
-scan_error() { echo "pre-commit: secret scan could not run ($1) — refusing the commit." >&2; exit 2; }
-
-# Paths stay NUL-delimited end to end: a newline inside a staged file name
-# would otherwise split it into pathspecs that match nothing, and its blob would
-# never be scanned.
-staged_paths() {
-  local list
-  list=$(mktemp) || scan_error 'mktemp failed'
-  if ! git diff --cached --name-only -z --diff-filter="$1" -- "${@:2}" > "$list"; then
-    rm -f "$list"
-    scan_error 'git diff --name-only failed'
-  fi
-  mapfile -d '' -t paths < "$list"
-  rm -f "$list"
-}
-staged_paths ACMRT . "${exempt[@]}"
-staged=("${paths[@]}")
-by_name=()
-for path in "${staged[@]}"; do
-  if [[ $path =~ $token_re ]]; then by_name+=("$path"); fi
-done
-by_content=''
-if (( ${#staged[@]} )); then
-  # Captured, not piped: an early exit downstream cannot SIGPIPE git into a pass.
-  by_content=$(git --literal-pathspecs grep --cached --text -l -E "$token_re" -- "${staged[@]}") \
-    || (( $? == 1 )) || scan_error 'git grep failed'
-  # git grep skips symlinks, so a staged link's target (its blob) is scanned here.
-  entries=$(mktemp) || scan_error 'mktemp failed'
-  if ! git --literal-pathspecs ls-files --stage -z -- "${staged[@]}" > "$entries"; then
-    rm -f "$entries"
-    scan_error 'git ls-files failed'
-  fi
-  mapfile -d '' -t stage_entries < "$entries"
-  rm -f "$entries"
-  for entry in "${stage_entries[@]}"; do
-    [[ $entry == 120000\ * ]] || continue
-    read -r _ blob _ <<< "${entry%%$'\t'*}"
-    target=$(git cat-file blob "$blob") || scan_error 'git cat-file failed'
-    if [[ $target =~ $token_re ]]; then by_content+=$'\n'"${entry#*$'\t'}"; fi
-  done
-fi
-if [[ -n $by_content || ${#by_name[@]} -gt 0 ]]; then
-  # File names only — a token inside a file name is redacted too.
-  echo 'pre-commit: the staged change adds a service-token value (dbmcp_svc_…) in:' >&2
-  printf '%s\n' "$by_content" "${by_name[@]}" | sed '/^$/d' | sort -u \
-    | sed -E "s/${token_re}/dbmcp_svc_<redacted>/g" >&2
-  echo "Reference it as \${ENV:…} or \${FILE:…} instead (spec 14)." >&2
-  exit 1
-fi
+# No service-token value in the staged side of the change: contents, file
+# names and symlink targets, by the same scanner CI's secret-scan job runs.
+bin/secret-scan --staged
 
 if command -v shellcheck >/dev/null 2>&1; then
   # Shell only: `*.sh` plus the extensionless wrappers (bin/lib/*.sql is not).
-  staged_paths ACMR 'bin/*' '.githooks/*' 'tests/bin/*.sh'
+  # NUL-delimited, so a newline in a name cannot split it.
+  list=$(mktemp)
+  git diff --cached --name-only -z --diff-filter=ACMR -- 'bin/*' '.githooks/*' 'tests/bin/*.sh' > "$list" \
+    || { rm -f "$list"; echo 'pre-commit: git diff --name-only failed' >&2; exit 2; }
+  mapfile -d '' -t paths < "$list"
+  rm -f "$list"
   scripts=()
   for path in "${paths[@]}"; do
     if [[ $path == *.sh || ${path##*/} != *.* ]]; then scripts+=("$path"); fi

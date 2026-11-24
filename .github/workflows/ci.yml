@@ -46,7 +46,7 @@ jobs:
   #            daily for advisories published without a commit here.
   #   image    what the Dockerfile builds changed (PRs only; main builds the
   #            image itself).
-  #   msrv     a manifest, the lock or shipped Rust source changed.
+  #   msrv     a manifest, the lock, build.rs or shipped Rust source changed.
   #   website  the docs site's sources changed (PRs only; pages.yml builds and
   #            deploys on main).
   #   deploy   the manifests under `deploy/`, the metric catalogue their rules
@@ -129,7 +129,7 @@ jobs:
           fi
           # Shipped Rust source too: a new std API compiles on the pinned
           # toolchain and only the MSRV build catches it.
-          if matches '^(Cargo\.(toml|lock)$|src/|third_party/)'; then
+          if matches '^(Cargo\.(toml|lock)$|build\.rs$|src/|third_party/)'; then
             msrv=true
           fi
           printf '%s\n' "code=$code" "deps=$deps" "image=$image" "msrv=$msrv" "website=$website" "deploy=$deploy" \
@@ -458,43 +458,21 @@ jobs:
         with:
           persist-credentials: false
       - name: reject literal service tokens in committed config
-        # git grep scans every TRACKED file (not just YAML) — the credential
-        # surface is broader than .yaml/.yml (.env.example, JSON, shell
-        # scripts, Dockerfile all commit). Exit codes: 0 = match (FAIL),
-        # 1 = no match (the ONLY pass), anything else incl. 128 fatal (FAIL —
-        # a broken grep must NEVER read as clean; fail-closed rule, #190;
-        # verified empirically — git grep returns 128, not 2, on a fatal
-        # regex error, so the lens-suggested `rc -eq 2` check was still
-        # fail-open). Pathspec exclusions are the
-        # only places a literal token legitimately lives: test fixtures,
-        # spec/docs examples, the example config, this workflow, the loader
-        # unit-test fixtures.
-        #
-        # This log is public: a hit is reported as `path:line` only, never the
-        # matched line (it IS the credential), and a token inside a path is
-        # masked. `-z` NUL-separates path, line and content so a `:` in a path
-        # cannot shift the cut; the content field is dropped before printing.
+        # bin/secret-scan reads the index: every tracked file's contents (as
+        # bytes), every tracked file NAME and every symlink TARGET (git grep
+        # alone scans neither). The pre-commit hook runs the same script over
+        # the staged change. Exit 1 = a token, 2 = the scan could not run —
+        # both fail (fail-closed, #190); only 0 reads as clean. This log is
+        # public: a hit is reported as `path:line` or a masked path, never
+        # the value.
         run: |
-          hits="$RUNNER_TEMP/secret-scan-hits"
-          set +e
-          git grep -n -z -E "dbmcp_svc_[0-9a-f]{64}" \
-              -- ":!tests/**" ":!website/**" ":!config/example.yaml" \
-              ":!.github/**" ":!src/config/yaml/**" > "$hits"
-          rc=$?
-          set -e
-          if [ "$rc" -eq 0 ] && [ -s "$hits" ]; then
-            echo "::error::literal dbmcp_svc_ service token(s) in committed config — reference the secret via ENV: or FILE: (spec 14). Locations (content withheld):"
-            tr '\0' '\037' < "$hits" | cut -d "$(printf '\037')" -f1,2 --output-delimiter=: \
-              | sed -E 's/dbmcp_svc_[0-9a-f]{64}/<redacted>/g; s/^/  /'
-            rm -f "$hits"
-            exit 1
-          fi
-          rm -f "$hits"
-          if [ "$rc" -ne 1 ]; then
-            echo "::error::git grep tooling failure (rc=$rc) — secret-scan cannot read as clean (fail-closed, #190)"
-            exit 1
-          fi
-          echo "no literal service tokens in committed config (git grep rc=1)"
+          rc=0
+          bin/secret-scan || rc=$?
+          case $rc in
+            0) echo 'no literal service tokens in tracked files, names or link targets' ;;
+            1) echo '::error::literal dbmcp_svc_ service token(s) tracked — reference the secret via ENV: or FILE: (spec 14). Locations above (value withheld).'; exit 1 ;;
+            *) echo "::error::secret scan tooling failure (rc=$rc) — cannot read as clean (fail-closed, #190)"; exit 1 ;;
+          esac
 
   # The gate's own regression scripts: every tests/bin/*.test.sh (a glob, so a
   # new script is never left out — a red pages guard once merged because
@@ -806,9 +784,12 @@ jobs:
           DOCR_IMAGE: registry.digitalocean.com/developerz-ai/db-mcp-gateway
         run: |
           set -euo pipefail
+          # Called inside `$(…)`, where bash clears errexit: without the
+          # explicit return, a failed create on a rerun would fall through to
+          # inspecting the previous run's index tag and sign that digest.
           stage() {
             docker buildx imagetools create -t "$1:index-$SHORT" \
-              "$1:linux-amd64-$SHORT" "$1:linux-arm64-$SHORT" >&2
+              "$1:linux-amd64-$SHORT" "$1:linux-arm64-$SHORT" >&2 || return 1
             docker buildx imagetools inspect "$1:index-$SHORT" --format '{{json .Manifest}}' | jq -er .digest
           }
           # Assigned first: a failure inside `echo "…$(…)"` would not stop the step.

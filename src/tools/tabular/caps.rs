@@ -102,9 +102,6 @@ pub(in crate::tools) fn shape(
     kind: ServerKind,
 ) -> (Vec<Vec<Value>>, Sizing) {
     let at_row_limit = rows.len() >= usize::try_from(limit.effective).unwrap_or(usize::MAX);
-    let cells_truncated = caps
-        .max_cell_bytes
-        .map_or(0, |cap| cap_cells(&mut rows, cap));
     // The ceiling holds even with no caller cap: shaping can grow a result.
     let byte_cap = caps
         .max_bytes
@@ -112,7 +109,7 @@ pub(in crate::tools) fn shape(
             usize::try_from(cap.0).unwrap_or(usize::MAX)
         })
         .min(MAX_RESULT_BYTES);
-    let byte_capped = keep_within(&mut rows, byte_cap);
+    let (cells_truncated, byte_capped) = shape_rows(&mut rows, caps.max_cell_bytes, byte_cap);
     // Rows run out at the row limit only when every row was kept; otherwise
     // a byte budget cut first (the gateway's when the adapter stopped short).
     let truncated_by = match (byte_capped, exec_truncated) {
@@ -153,12 +150,41 @@ fn hint(by: TruncatedBy, kind: ServerKind) -> String {
     format!("{cause} {paging}")
 }
 
-/// Replace every cell whose JSON is longer than `cap` bytes with the marker
-/// object; the count replaced.
-fn cap_cells(rows: &mut [Vec<Value>], cap: NonZeroU32) -> usize {
+/// Row by row: cap the row's cells at `cell_cap`, then keep it while the
+/// JSON array still fits in `cap` bytes. Stops at the first row that does
+/// not fit, so no row past the cut is ever shaped — a wide result with a
+/// tiny `max_cell_bytes` builds markers for the rows it returns, not for all
+/// of them. The cells replaced in the kept rows, and `true` when a row was
+/// dropped.
+fn shape_rows(
+    rows: &mut Vec<Vec<Value>>,
+    cell_cap: Option<NonZeroU32>,
+    cap: usize,
+) -> (usize, bool) {
+    // `[` and `]`, then each row plus its separating comma.
+    let mut used: usize = 2;
+    let mut replaced = 0;
+    let mut keep = rows.len();
+    for (index, row) in rows.iter_mut().enumerate() {
+        let row_replaced = cell_cap.map_or(0, |cell_cap| cap_cells(row, cell_cap));
+        used = used.saturating_add(json_len(row)).saturating_add(1);
+        if used > cap + 1 {
+            keep = index;
+            break;
+        }
+        replaced += row_replaced;
+    }
+    let dropped = keep < rows.len();
+    rows.truncate(keep);
+    (replaced, dropped)
+}
+
+/// Replace every cell of `row` whose JSON is longer than `cap` bytes with
+/// the marker object; the count replaced.
+fn cap_cells(row: &mut [Value], cap: NonZeroU32) -> usize {
     let cap = usize::try_from(cap.get()).unwrap_or(usize::MAX);
     let mut replaced = 0;
-    for cell in rows.iter_mut().flatten() {
+    for cell in row {
         let bytes = json_len(cell);
         if bytes > cap {
             *cell = marker(cell, bytes, cap);
@@ -181,23 +207,6 @@ fn marker(cell: &Value, bytes: usize, cap: usize) -> Value {
     serde_json::json!({
         CELL_MARKER: { "bytes": bytes, "preview": prefix_at_char_boundary(text, cap) }
     })
-}
-
-/// Keep the leading rows whose JSON array fits in `cap` bytes; `true` when
-/// a row was dropped.
-fn keep_within(rows: &mut Vec<Vec<Value>>, cap: usize) -> bool {
-    // `[ and `]`, then each row plus its separating comma.
-    let mut used: usize = 2;
-    let keep = rows
-        .iter()
-        .take_while(|row| {
-            used = used.saturating_add(json_len(row)).saturating_add(1);
-            used <= cap + 1
-        })
-        .count();
-    let dropped = keep < rows.len();
-    rows.truncate(keep);
-    dropped
 }
 
 /// The length of `value`'s compact JSON, counted without building it. A

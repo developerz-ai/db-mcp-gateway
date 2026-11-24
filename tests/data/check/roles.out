@@ -3,7 +3,7 @@
 -- the config's `password:` reference points
 CREATE ROLE "mcp_app_ro" LOGIN;
 GRANT CONNECT ON DATABASE "app" TO "mcp_app_ro";
-\connect "app"
+\connect -reuse-previous=on 'dbname=''app'''
 GRANT USAGE ON SCHEMA "public" TO "mcp_app_ro";
 GRANT SELECT ON ALL TABLES IN SCHEMA "public" TO "mcp_app_ro";
 ALTER DEFAULT PRIVILEGES FOR ROLE "app_owner" IN SCHEMA "public" GRANT SELECT ON TABLES TO "mcp_app_ro";
@@ -16,7 +16,7 @@ ALTER ROLE "mcp_app_ro" SET idle_in_transaction_session_timeout = '60s';
 -- write role (`write_role`): narrow the table list to what writes need
 CREATE ROLE "mcp_app_rw" LOGIN;
 GRANT CONNECT ON DATABASE "app" TO "mcp_app_rw";
-\connect "app"
+\connect -reuse-previous=on 'dbname=''app'''
 GRANT USAGE ON SCHEMA "public" TO "mcp_app_rw";
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "public" TO "mcp_app_rw";
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA "public" TO "mcp_app_rw";
@@ -26,5 +26,8 @@ GRANT USAGE ON ALL SEQUENCES IN SCHEMA "sales" TO "mcp_app_rw";
 ALTER ROLE "mcp_app_rw" SET statement_timeout = '30000ms';
 
 # server `cache`, database `0`: ACL user — narrow `%R~*` to the key patterns agents may read;
-# SCAN/DBSIZE/KEYS stay off: they would list keys outside those patterns
-ACL SETUSER gateway_ro on #<sha256-of-password> resetkeys %R~* resetchannels -@all +get +mget +strlen +getrange +substr +getbit +bitcount +bitpos +exists +type +ttl +pttl +expiretime +pexpiretime +hget +hmget +hgetall +hkeys +hvals +hlen +hexists +hstrlen +hrandfield +hscan +lrange +llen +lindex +lpos +smembers +sismember +smismember +scard +srandmember +sscan +sinter +sunion +sdiff +sintercard +zrange +zrangebyscore +zrangebylex +zrevrange +zrevrangebyscore +zrevrangebylex +zscore +zmscore +zcard +zcount +zlexcount +zrank +zrevrank +zrandmember +zscan +xrange +xrevrange +xlen
+# SCAN/DBSIZE/KEYS stay off: they would list keys outside those patterns.
+# `reset` first: on an existing user it clears every earlier rule, ACL
+# selectors included, which would otherwise still allow their commands
+# (Dragonfly has neither selectors nor `reset`: drop it there).
+ACL SETUSER gateway_ro reset on #<sha256-of-password> resetkeys %R~* resetchannels -@all +get +mget +strlen +getrange +substr +getbit +bitcount +bitpos +exists +type +ttl +pttl +expiretime +pexpiretime +hget +hmget +hgetall +hkeys +hvals +hlen +hexists +hstrlen +hrandfield +hscan +lrange +llen +lindex +lpos +smembers +sismember +smismember +scard +srandmember +sscan +sinter +sunion +sdiff +sintercard +zrange +zrangebyscore +zrangebylex +zrevrange +zrevrangebyscore +zrevrangebylex +zscore +zmscore +zcard +zcount +zlexcount +zrank +zrevrank +zrandmember +zscan +xrange +xrevrange +xlen

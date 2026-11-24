@@ -24,8 +24,9 @@ chmod +x "$work/tools/cargo"
 
 repo=$work/repo
 git init -q "$repo"
-mkdir -p "$repo/.githooks" "$repo/config" "$repo/tests"
+mkdir -p "$repo/.githooks" "$repo/bin" "$repo/config" "$repo/tests"
 cp "$root/.githooks/pre-commit" "$repo/.githooks/"
+cp "$root/bin/secret-scan" "$repo/bin/"
 
 hook() {
   (cd "$repo" && PATH="${1:-}$work/tools:$PATH" bash .githooks/pre-commit) > "$work/output" 2>&1
@@ -41,7 +42,7 @@ grep -qxF 'config/leak-link' "$work/output" || fail "symlink refusal does not na
 printf 'token: %s\n' "$token" > "$repo/config/leak.yaml"
 git -C "$repo" add config/leak.yaml
 if hook; then fail 'symlink plus leaked file accepted'; fi
-[[ $(grep -cxE 'config/leak(-link|\.yaml)' "$work/output") == 2 ]] \
+[[ $(grep -cxE 'config/leak(-link|\.yaml:1)' "$work/output") == 2 ]] \
   || fail "both leaks not named: $(<"$work/output")"
 git -C "$repo" rm -q --cached config/leak.yaml config/leak-link
 

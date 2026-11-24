@@ -12,6 +12,7 @@ mod audit_assertion_guard;
 mod auth_hardening_id_token;
 mod auth_login_options;
 mod auth_reserved_subject;
+mod cli_admin_proxy;
 mod cli_check;
 mod cli_config_schema;
 mod cli_mint;

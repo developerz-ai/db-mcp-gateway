@@ -40,6 +40,25 @@ async fn live_count(pool: &PgPool, table: &str) -> i64 {
         .expect("count")
 }
 
+/// The live count once no live row can lapse during the test: a code another
+/// test left behind (60 s TTL) that expired mid-race would free a slot, and
+/// two racers would legitimately fit. Waits out rows due within two minutes
+/// (at most one code TTL), so every row counted here outlives the race.
+async fn settled_live_count(pool: &PgPool, table: &str) -> i64 {
+    let sql = format!(
+        "SELECT EXTRACT(EPOCH FROM max(expires_at) - now())::float8 FROM {table} \
+         WHERE expires_at > now() AND expires_at < now() + interval '2 minutes'"
+    );
+    let due: Option<f64> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .fetch_one(pool)
+        .await
+        .expect("soonest expiry");
+    if let Some(secs) = due {
+        tokio::time::sleep(Duration::from_secs_f64(secs.clamp(0.0, 120.0) + 0.5)).await;
+    }
+    live_count(pool, table).await
+}
+
 fn code<'a>(hash: &'a [u8], sub: &'a str, groups: &'a [String]) -> NewAuthCode<'a> {
     NewAuthCode {
         code_hash: hash,
@@ -66,7 +85,7 @@ async fn racing_code_inserts_fill_the_last_slot_once() {
     let pool = wide_pool().await;
     let sub = format!("caps-code-{}", Uuid::new_v4().simple());
     let groups: Vec<String> = Vec::new();
-    let cap = live_count(&pool, "oauth_auth_codes").await + 1;
+    let cap = settled_live_count(&pool, "oauth_auth_codes").await + 1;
     let hashes: Vec<Vec<u8>> = (0..RACERS).map(|i| digest(&format!("{sub}-{i}"))).collect();
 
     let admitted = join_all(hashes.iter().map(|hash| {

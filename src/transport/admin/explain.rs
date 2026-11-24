@@ -4,8 +4,10 @@
 //! ([`authz::matching_grants`] + [`authz::decide`]), so the answer is the
 //! decision a real call would get — for the groups it assumed. It never
 //! reads a live session, so `groups_source` says where the groups came from:
-//! `stored` (the user's last-login snapshot) and `assumed` (from the body)
-//! are simulations, which a session holding other claims can contradict.
+//! `stored` (the user's last-login snapshot), `none` (no snapshot: the user
+//! has no `permissions_users` row, so no groups) and `assumed` (from the
+//! body) are simulations, which a session holding other claims can
+//! contradict.
 //! Read-only; audited as `admin.explain`.
 
 use axum::Json;
@@ -60,14 +62,14 @@ pub async fn explain(
         Subject::User(sub) => {
             let (groups, source) = match body.groups.clone() {
                 Some(groups) => (groups, "assumed"),
-                None => {
-                    let stored = live_user_by_sub(&state.state_db, sub)
-                        .await
-                        .map_err(|err| internal("explain user", err, rid))?
-                        .map(|u| u.groups)
-                        .unwrap_or_default();
-                    (stored, "stored")
-                }
+                // No `permissions_users` row is no snapshot, not an empty one.
+                None => match live_user_by_sub(&state.state_db, sub)
+                    .await
+                    .map_err(|err| internal("explain user", err, rid))?
+                {
+                    Some(user) => (user.groups, "stored"),
+                    None => (Vec::new(), "none"),
+                },
             };
             let rows = state
                 .repo

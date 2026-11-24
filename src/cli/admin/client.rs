@@ -15,21 +15,26 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 pub struct AdminClient {
     base: String,
+    /// What diagnostics name: [`origin`] of `base`.
+    shown: String,
     token: String,
     http: reqwest::Client,
 }
 
 impl AdminClient {
     pub fn new(base: &str, token: String) -> Result<Self, CliError> {
+        let base = gateway_url(base)?;
         Ok(Self {
-            base: gateway_url(base)?.to_string(),
+            base: base.to_string(),
+            shown: origin(base),
             token,
-            http: http_client(None)?,
+            http: http_client(None, base)?,
         })
     }
 
-    pub fn base(&self) -> &str {
-        &self.base
+    /// The gateway as diagnostics may name it.
+    pub fn shown(&self) -> &str {
+        &self.shown
     }
 
     pub fn request(&self, method: Method, path: &str) -> RequestBuilder {
@@ -43,7 +48,7 @@ impl AdminClient {
         let response = request
             .send()
             .await
-            .map_err(|err| CliError::unreachable(&self.base, &err))?;
+            .map_err(|err| CliError::unreachable(&self.shown, &err))?;
         ensure_success(what, response).await
     }
 
@@ -52,21 +57,31 @@ impl AdminClient {
             .await?
             .json()
             .await
-            .map_err(|err| CliError::unreachable(&self.base, &err))
+            .map_err(|err| CliError::unreachable(&self.shown, &err))
     }
 }
 
 /// `raw` without a trailing `/`, refused unless it is `https://` or
-/// `http://` to a loopback host: the CLI sends a bearer, which plain HTTP
-/// would hand to anyone on the path.
+/// `http://` to a loopback host (the CLI sends a bearer, which plain HTTP
+/// would hand to anyone on the path), and refused if it carries userinfo, a
+/// query or a fragment: a base URL has none, and a `user:password@` would
+/// otherwise be stored and echoed. A refusal names [`origin`] at most.
 pub fn gateway_url(raw: &str) -> Result<&str, CliError> {
     let trimmed = raw.trim_end_matches('/');
-    let refused = || {
+    let url = Url::parse(trimmed)
+        .map_err(|_| CliError::Usage("--url is not an absolute URL".to_string()))?;
+    let refused = |why: &str| {
         CliError::Usage(format!(
-            "--url `{trimmed}` must be https://, or http:// to 127.0.0.1, [::1] or localhost"
+            "--url {} {why}",
+            url.origin().ascii_serialization()
         ))
     };
-    let url = Url::parse(trimmed).map_err(|_| refused())?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(refused("must not carry user:password@"));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(refused("must not carry a ?query or #fragment"));
+    }
     let loopback = match url.host() {
         Some(Host::Ipv4(ip)) => ip.is_loopback(),
         Some(Host::Ipv6(ip)) => ip.is_loopback(),
@@ -76,15 +91,35 @@ pub fn gateway_url(raw: &str) -> Result<&str, CliError> {
     match url.scheme() {
         "https" => Ok(trimmed),
         "http" if loopback => Ok(trimmed),
-        _ => Err(refused()),
+        _ => Err(refused(
+            "must be https://, or http:// to 127.0.0.1, [::1] or localhost",
+        )),
     }
 }
 
+/// `scheme://host[:port]` of `url` — never its userinfo, path, query or
+/// fragment: all a diagnostic may say about a gateway URL.
+pub fn origin(url: &str) -> String {
+    Url::parse(url).map_or_else(
+        |_| "(unparsable URL)".to_string(),
+        |url| url.origin().ascii_serialization(),
+    )
+}
+
 /// `None` → the default request timeout; streaming reads pass their own.
-pub fn http_client(timeout: Option<Duration>) -> Result<reqwest::Client, CliError> {
-    reqwest::Client::builder()
+/// A plain-`http` gateway (loopback only, see [`gateway_url`]) is reached
+/// directly: an `HTTP_PROXY` in the environment would otherwise carry the
+/// bearer off the host in plaintext.
+pub fn http_client(timeout: Option<Duration>, gateway: &str) -> Result<reqwest::Client, CliError> {
+    let builder = reqwest::Client::builder()
         .timeout(timeout.unwrap_or(REQUEST_TIMEOUT))
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::none());
+    let builder = if gateway.starts_with("http://") {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    builder
         .build()
         .map_err(|err| CliError::unreachable("the HTTP client", &err))
 }
@@ -148,5 +183,35 @@ mod tests {
                 "{refused} is refused"
             );
         }
+    }
+
+    #[test]
+    fn userinfo_query_and_fragment_are_refused_without_echoing_the_url() {
+        for refused in [
+            "https://admin:hunter2@gw.example.com",
+            "https://hunter2@gw.example.com",
+            "http://admin:hunter2@localhost:8080",
+            "https://gw.example.com/?token=hunter2",
+            "https://gw.example.com/#hunter2",
+            "https://gw.example.com/hunter2?",
+            "ftp://admin:hunter2@gw.example.com",
+            "not a url hunter2",
+        ] {
+            let Err(CliError::Usage(message)) = gateway_url(refused) else {
+                panic!("{refused} is refused");
+            };
+            assert!(!message.contains("hunter2"), "{message}");
+            assert!(!message.contains("admin"), "{message}");
+        }
+    }
+
+    #[test]
+    fn origin_drops_everything_but_scheme_host_and_port() {
+        assert_eq!(
+            origin("https://u:p@gw.example.com:8443/prefix?q=1#f"),
+            "https://gw.example.com:8443"
+        );
+        assert_eq!(origin("http://localhost/x"), "http://localhost");
+        assert_eq!(origin("::"), "(unparsable URL)");
     }
 }

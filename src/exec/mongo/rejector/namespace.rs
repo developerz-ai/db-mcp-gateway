@@ -12,10 +12,18 @@ use super::{RejectReason, is_system_collection};
 /// Stages whose argument names a collection to read.
 const NAMESPACE_STAGES: &[&str] = &["$lookup", "$graphLookup", "$unionWith"];
 
-/// Every namespace-naming stage under `value`, at any depth.
+/// The expression operator whose argument is data, never evaluated: a
+/// `$lookup` key inside it is a value, not a stage.
+const LITERAL: &str = "$literal";
+
+/// Every namespace-naming stage under `value`, at any depth, outside
+/// `$literal` data.
 pub(super) fn check_namespaces(command: &str, value: &Value) -> Result<(), RejectReason> {
     match value {
         Value::Object(map) => map.iter().try_for_each(|(key, child)| {
+            if key == LITERAL {
+                return Ok(());
+            }
             if let Some(stage) = NAMESPACE_STAGES.iter().copied().find(|s| s == key) {
                 check_stage(command, stage, child)?;
             }
