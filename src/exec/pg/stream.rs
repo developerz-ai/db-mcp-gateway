@@ -61,9 +61,8 @@ pub(super) async fn stream_rows(
     };
     let mut decoders_for_rows = Vec::new();
 
-    // A read was prepared by `describe`, and the driver's cache hands that
-    // statement back: no second Parse. A write runs unnamed, so ad-hoc SQL
-    // does not accumulate in the connection's prepared-statement cache.
+    // Parsed and bound here, unnamed, in one driver call: the driver parses
+    // again if it had to look a type up in between.
     // Running the caller's SQL is this path's job: the guard, the grant and
     // the role's privileges bound it, not sqlx.
     let sqlx_query = bound_query(sqlx::AssertSqlSafe(query.sql), query.binds, params);

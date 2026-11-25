@@ -112,6 +112,7 @@ mod pg_error_hints_real_db;
 mod pg_error_redaction_real_db;
 mod pg_result_budget_real_db;
 mod pg_type_rendering_real_db;
+mod pg_unnamed_statements_real_db;
 mod pg_write_tier_real_db;
 mod pool_sizing_real_db;
 mod reaper_stream_real_db;

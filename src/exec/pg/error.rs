@@ -33,6 +33,9 @@ pub(super) struct Origin<'a> {
 /// `""` for one of the gateway's own.
 pub(super) fn classify(err: sqlx::Error, origin: &Origin<'_>, sql: &str) -> ExecError {
     log_discarded(&err, Some(origin), "target statement failed");
+    if is_stale_plan(&err) {
+        return ExecError::Unavailable;
+    }
     if let sqlx::Error::Database(db) = &err
         && let Some(code) = db.code()
     {
@@ -111,6 +114,26 @@ pub(super) fn classify_commit(
         }
         other => other,
     }
+}
+
+/// "cached plan must not change result type" of the statement itself: a
+/// definition changed between its `Parse` and its `Bind`. Revalidation comes
+/// before execution, so nothing ran and the same call, planned afresh, may
+/// succeed. Told from any other `0A000` by the raising C function: the
+/// message is localised, the function name is not.
+///
+/// Raised by a plan the statement's own functions keep, it has a context: by
+/// then the statement was running, its side effects outside the transaction
+/// (a session lock, a sequence) stand, and the function may fail the same
+/// way every time. That one is the statement's error, not a retry.
+fn is_stale_plan(err: &sqlx::Error) -> bool {
+    is_feature_not_supported(err)
+        && err
+            .as_database_error()
+            .and_then(|db| db.try_downcast_ref::<PgDatabaseError>())
+            .is_some_and(|db| {
+                db.routine() == Some("RevalidateCachedQuery") && db.r#where().is_none()
+            })
 }
 
 fn sqlstate(err: &sqlx::Error) -> Option<String> {

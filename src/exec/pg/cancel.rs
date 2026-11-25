@@ -23,23 +23,41 @@
 //! request the transaction runs for, which is what `db_activity` reports and
 //! `cancel_request` matches on.
 
-use sqlx::PgPool;
+use std::fmt;
+
+use sqlx::{Executor, PgPool};
 use uuid::Uuid;
 
 use crate::audit::drain::DetachedTasks;
 
-/// The cancel statement. `pg_stat_activity` shows the caller's own backends
-/// in full, and the cancel pool connects as the same role.
-const CANCEL_SQL: &str = "SELECT pg_cancel_backend(pid) FROM pg_stat_activity \
-                          WHERE pid = $1 AND application_name = $2";
+/// Every tag of one request starts with this. It is a UUID, so it renders as
+/// `dbmcp-<32 lowercase hex digits>-` and nothing else: no quote, no `LIKE`
+/// wildcard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RequestPrefix(Uuid);
 
-/// Per-transaction `application_name`: `dbmcp-<request id>-<nonce>`, the
-/// request id and nonce in lowercase hex. Built only from UUIDs, so it is
-/// safe to interpolate into `SET LOCAL` (no quote can appear in it) and fits
+impl RequestPrefix {
+    pub(super) fn of(request_id: Uuid) -> Self {
+        Self(request_id)
+    }
+}
+
+impl fmt::Display for RequestPrefix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "dbmcp-{}-", self.0.simple())
+    }
+}
+
+/// Per-transaction `application_name`: `dbmcp-<request id>-<nonce>`, both in
+/// lowercase hex. It holds numbers, never text, so it is safe to interpolate
+/// between quotes — there is no tag whose rendering contains one — and fits
 /// in Postgres' 63-byte `application_name` (47 bytes). The nonce keeps two
 /// transactions of one request apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct BackendTag(String);
+pub(super) struct BackendTag {
+    request: RequestPrefix,
+    nonce: u32,
+}
 
 impl BackendTag {
     /// Captures the request id of a tag in `pg_stat_activity` (a POSIX regex,
@@ -47,22 +65,16 @@ impl BackendTag {
     pub(super) const REQUEST_ID_PATTERN: &'static str = "^dbmcp-([0-9a-f]{32})-[0-9a-f]{8}$";
 
     pub(super) fn for_request(request_id: Uuid) -> Self {
-        let nonce = Uuid::new_v4().simple().to_string();
-        Self(format!(
-            "{}{}",
-            Self::request_prefix(request_id),
-            &nonce[..8]
-        ))
+        Self {
+            request: RequestPrefix::of(request_id),
+            nonce: Uuid::new_v4().as_fields().0,
+        }
     }
+}
 
-    /// Every tag of `request_id` starts with this; it contains no `LIKE`
-    /// wildcard.
-    pub(super) fn request_prefix(request_id: Uuid) -> String {
-        format!("dbmcp-{}-", request_id.simple())
-    }
-
-    pub(super) fn as_str(&self) -> &str {
-        &self.0
+impl fmt::Display for BackendTag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}{:08x}", self.request, self.nonce)
     }
 }
 
@@ -76,14 +88,23 @@ pub(super) struct Backend {
 /// Cancel `backend` if it is still running the tagged transaction. Not
 /// matching (the backend moved on, or is gone) is success: there is nothing
 /// left to cancel. Errors are the caller's to log — never with `Display`.
+///
+/// A simple query, because it runs outside a transaction: a transaction-mode
+/// pooler may send a `Parse` and the `Bind` after it to two backends, and
+/// the `Bind` would then run whatever another caller last parsed there.
+/// `pg_stat_activity` shows the caller's own backends in full, and the
+/// cancel pool connects as the same role.
 pub(super) async fn cancel_backend(
     cancel_pool: &PgPool,
     backend: &Backend,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(CANCEL_SQL)
-        .bind(backend.pid)
-        .bind(backend.tag.as_str())
-        .execute(cancel_pool)
+    let sql = format!(
+        "SELECT pg_cancel_backend(pid) FROM pg_stat_activity \
+         WHERE pid = {} AND application_name = '{}'",
+        backend.pid, backend.tag
+    );
+    cancel_pool
+        .execute(sqlx::AssertSqlSafe(sql))
         .await
         .map(|_| ())
 }
@@ -132,31 +153,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tag_is_unique_quote_free_and_fits_application_name() {
+    fn two_transactions_of_one_request_have_different_tags() {
         let request = Uuid::new_v4();
         let (a, b) = (
             BackendTag::for_request(request),
             BackendTag::for_request(request),
         );
         assert_ne!(a, b);
-        assert!(a.as_str().starts_with(&BackendTag::request_prefix(request)));
-        assert!(a.as_str().len() <= 63, "{}", a.as_str());
-        assert!(
-            a.as_str()
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-'),
-            "{}",
-            a.as_str()
-        );
+        let prefix = RequestPrefix::of(request).to_string();
+        assert!(a.to_string().starts_with(&prefix) && b.to_string().starts_with(&prefix));
     }
 
     #[test]
     fn request_id_pattern_matches_the_tag_shape() {
         let request = Uuid::new_v4();
-        let tag = BackendTag::for_request(request);
+        let tag = BackendTag::for_request(request).to_string();
         let hex = request.simple().to_string();
-        assert_eq!(tag.as_str().len(), "dbmcp-".len() + 32 + 1 + 8);
-        assert_eq!(&tag.as_str()["dbmcp-".len().."dbmcp-".len() + 32], hex);
+        assert_eq!(&tag["dbmcp-".len().."dbmcp-".len() + 32], hex);
         assert!(!BackendTag::REQUEST_ID_PATTERN.contains('\''));
+    }
+
+    proptest::proptest! {
+        /// Whatever it holds, a tag renders as one plain word that fits in
+        /// `application_name`, and its prefix as one `LIKE` cannot expand.
+        #[test]
+        fn no_tag_renders_anything_but_hex_and_hyphens(id: u128, nonce: u32) {
+            let request = RequestPrefix::of(Uuid::from_u128(id));
+            let tag = BackendTag { request, nonce }.to_string();
+            proptest::prop_assert_eq!(tag.len(), "dbmcp-".len() + 32 + 1 + 8);
+            let words: Vec<&str> = tag.split('-').collect();
+            proptest::prop_assert!(words.len() == 3 && words[0] == "dbmcp", "{}", tag);
+            let hex = |word: &str| word.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+            proptest::prop_assert!(hex(words[1]) && hex(words[2]), "{}", tag);
+            proptest::prop_assert_eq!(request.to_string(), format!("dbmcp-{}-", words[1]));
+        }
     }
 }
