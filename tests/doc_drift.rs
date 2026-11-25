@@ -352,14 +352,14 @@ fn env_reads() -> BTreeSet<String> {
 }
 
 /// A documented path with its parameter segments (`:id`, `<id>`, `{id}`, `…`)
-/// normalised to `:id`.
+/// normalised to `{id}`, as the router mounts it.
 fn normalise(path: &str) -> String {
     let path = path.split('?').next().unwrap_or(path);
     let path = path.trim_end_matches(['.', ',', ')', ':', '`']);
     path.split('/')
         .map(|seg| {
             let param = seg.starts_with([':', '<', '{']) || seg == "…" || seg == "...";
-            if param { ":id" } else { seg }
+            if param { "{id}" } else { seg }
         })
         .collect::<Vec<_>>()
         .join("/")
