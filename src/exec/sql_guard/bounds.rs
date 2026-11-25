@@ -11,6 +11,9 @@
 //! Counts only, never grammar: a count cannot be smaller than the structure
 //! the parser builds from the words.
 
+use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::task::block_in_place;
+
 use super::GuardError;
 use super::pg_scan::{Kind, Lexeme};
 
@@ -33,6 +36,22 @@ const PARSER_STACK: usize = 32 << 20;
 /// within the bounds, whatever is left of the caller's.
 pub(super) fn with_parser_stack<T>(f: impl FnOnce() -> T) -> T {
     stacker::grow(PARSER_STACK, f)
+}
+
+/// A longer statement is guarded off the async worker: one at the length cap
+/// takes 40 ms as a matter of course and 150 ms at the end of its work budget,
+/// one this long at most 15 ms.
+const MAX_BYTES_ON_WORKER: usize = 4 * 1024;
+
+/// Run `f` for a statement of `bytes` bytes with the thread's other tasks
+/// moved elsewhere, where there is elsewhere. Not `spawn_blocking`: there is
+/// no point to cancel at, and the statement is borrowed.
+pub(super) fn off_the_worker<T>(bytes: usize, f: impl FnOnce() -> T) -> T {
+    let flavor = Handle::try_current().map(|runtime| runtime.runtime_flavor());
+    match flavor {
+        Ok(RuntimeFlavor::MultiThread) if bytes > MAX_BYTES_ON_WORKER => block_in_place(f),
+        _ => f(),
+    }
 }
 
 pub(super) fn check_length(sql: &str) -> Result<(), GuardError> {

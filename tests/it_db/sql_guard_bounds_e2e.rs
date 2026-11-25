@@ -1,15 +1,17 @@
 //! The guard's bounds over HTTP: a statement past one, or not read to its
 //! end, is `forbidden_sql` with its audit row; at the length cap, the target's
 //! own answer and its audit row. Either way the same gateway serves the next
-//! call.
+//! call, and other callers meanwhile.
 
 use std::time::Duration;
 
+use db_mcp_gateway::auth::jwt;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::common::audit::calls_for_request;
-use crate::common::gateway::{LoggedInGateway, spawn_logged_in};
+use crate::common::env::state_pool;
+use crate::common::gateway::{GatewayBuilder, LoggedInGateway, TestGateway, spawn_logged_in};
 use crate::common::idp::MockUser;
 use crate::common::pg_target::config_yaml;
 
@@ -129,6 +131,68 @@ async fn a_statement_past_a_bound_is_refused_and_audited_and_the_next_call_runs(
             assert_still_serving(&gateway).await;
         }
     }
+}
+
+async fn signed_in(gateway: &TestGateway) -> LoggedInGateway {
+    let sub = format!("guardbudget-{}", Uuid::new_v4().simple());
+    let ttl = Duration::from_secs(600);
+    let session = gateway
+        .sessions
+        .create(
+            &sub,
+            "guard-budget@example.com",
+            &["engineers".to_owned()],
+            ttl,
+            None,
+        )
+        .await
+        .expect("session");
+    let key = &gateway.auth_config.session_signing_key;
+    LoggedInGateway {
+        url: gateway.url.clone(),
+        bearer: jwt::issue(key, session.id, &sub, ttl).expect("bearer"),
+        state_db: gateway.state_db.clone(),
+        user_sub: sub,
+    }
+}
+
+/// Nesting the parser retries is refused at its work budget, on a runtime of
+/// two workers with as many of the statements on it, short and at the length
+/// cap, while another caller's statements are answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::parallel(world)]
+async fn a_statement_past_the_parser_work_budget_is_refused_and_audited_and_others_are_answered() {
+    let gateway = GatewayBuilder::new(&config_yaml(YAML))
+        .spawn(state_pool().await)
+        .await;
+    let (caller, other) = (signed_in(&gateway).await, signed_in(&gateway).await);
+    let nested = [
+        format!("SELECT {}x", "NOT (a).".repeat(40)),
+        format!("SELECT {}x{}", "CAST(a.".repeat(40), " AS int)".repeat(40)),
+    ];
+    let statements = nested.iter().flat_map(|sql| {
+        let padded = format!("{sql}{}", ",a".repeat((CAP - sql.len()) / 2));
+        [sql.clone(), padded]
+    });
+    let refused = futures::future::join_all(statements.flat_map(|sql| {
+        ["run_query", "explain"].map(|tool| {
+            let (caller, sql) = (&caller, sql.clone());
+            async move {
+                let called = call(caller, tool, &sql).await;
+                assert_refused(caller, &called, "forbidden_sql", "parser work budget").await;
+            }
+        })
+    }));
+    let answered = async {
+        for _ in 0..10 {
+            assert_still_serving(&other).await;
+        }
+    };
+    let both = async { tokio::join!(refused, answered) };
+    tokio::time::timeout(Duration::from_secs(60), both)
+        .await
+        .expect("every call is answered");
+    assert_still_serving(&caller).await;
 }
 
 /// What the target makes of a chain the guard admitted.

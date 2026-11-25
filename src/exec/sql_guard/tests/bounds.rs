@@ -4,6 +4,7 @@ use crate::exec::sql_guard::bounds::{MAX_JOINS, MAX_PARENS, MAX_SELECTS, MAX_SQL
 mod combined;
 mod properties;
 mod timing;
+mod worker;
 
 /// A worker thread's stack, as Tokio sizes it.
 const WORKER_STACK: usize = 2 << 20;

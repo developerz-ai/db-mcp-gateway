@@ -26,7 +26,8 @@
 //! differently from sqlparser: a Unicode-escaped identifier (`U&"…"`), or
 //! any text the two split into different tokens (`lexical`, `pg_scan`).
 //! A relation showing other sessions' statements is refused by name.
-//! The statement's length and structure are bounded first (`bounds`), and its
+//! The statement's length and structure are bounded first (`bounds`), the work
+//! its parse may take with them (`budget`), and its
 //! lexemes are held against the denylist whatever the tree holds (`tokens`).
 //! Conservative on purpose: better to reject a legitimate exotic statement
 //! than quietly send an unintended one.
@@ -46,8 +47,12 @@
 //! close, and the reason the walk is now visitor-driven, not hand-recursion.
 
 mod bounds;
+mod budget;
 mod denylist;
+mod error;
 mod lexical;
+mod metered;
+mod parse;
 mod pg_scan;
 mod shape;
 mod tokens;
@@ -59,13 +64,13 @@ mod proptests;
 mod tests;
 
 use sqlparser::ast::{Statement, Visit};
-use sqlparser::dialect::PostgreSqlDialect;
-use sqlparser::parser::{Parser, ParserError};
-use sqlparser::tokenizer::{Location, Token};
 use std::ops::ControlFlow;
 
-use bounds::{check_bounds, check_length, with_parser_stack};
+pub use error::{GuardError, SqlLocation};
+
+use bounds::{check_bounds, check_length, off_the_worker, with_parser_stack};
 use lexical::check_lexical;
+use parse::parse;
 use shape::{check_statement_shape, explain_analyzes, required_access};
 use tokens::check_tokens;
 use visitor::GuardVisitor;
@@ -78,78 +83,6 @@ use visitor::GuardVisitor;
 pub enum Access {
     ReadOnly,
     ReadWrite,
-}
-
-/// Where in the statement the parser gave up: 1-based line and column, as
-/// sqlparser reports them. Coordinates only — the parser's message, which
-/// quotes the statement, is never kept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub struct SqlLocation {
-    pub line: u64,
-    pub column: u64,
-}
-
-impl SqlLocation {
-    /// From sqlparser's location; line `0` marks an empty span, no place.
-    fn of(location: Location) -> Option<Self> {
-        (location.line > 0).then_some(Self {
-            line: location.line,
-            column: location.column,
-        })
-    }
-
-    /// The ` at Line: L, Column: C` suffix sqlparser ends a message with.
-    fn from_message(message: &str) -> Option<Self> {
-        let (_, at) = message.rsplit_once(" at Line: ")?;
-        let (line, column) = at.split_once(", Column: ")?;
-        Self::of(Location::new(line.parse().ok()?, column.parse().ok()?))
-    }
-}
-
-#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
-pub enum GuardError {
-    #[error(
-        "could not parse SQL{}",
-        .0.map(|at| format!(" at line {}, column {}", at.line, at.column)).unwrap_or_default()
-    )]
-    Parse(Option<SqlLocation>),
-    #[error("multiple statements are not allowed (got {0})")]
-    MultiStatement(usize),
-    #[error(
-        "statement type `{0}` is not allowed; only SELECT, EXPLAIN and, with a write grant, INSERT/UPDATE/DELETE"
-    )]
-    NotAllowed(&'static str),
-    #[error("SELECT ... FOR UPDATE/SHARE is not allowed (acquires write locks)")]
-    Locking,
-    #[error("write statement `{0}` is not allowed inside a read-only query")]
-    WriteInReadPath(&'static str),
-    #[error("SELECT ... INTO is not allowed (it materializes a table)")]
-    SelectInto,
-    #[error("EXPLAIN ANALYZE is not allowed (it executes the query)")]
-    ExplainAnalyze,
-    #[error("Unicode-escaped identifiers (U&\"…\") are not allowed; spell the identifier plainly")]
-    UnicodeEscapedIdentifier,
-    #[error("the SQL text is ambiguous: {0}")]
-    AmbiguousTokens(&'static str),
-    #[error("the statement has more than {limit} {what}; split it into smaller statements")]
-    TooComplex { limit: usize, what: &'static str },
-    #[error(
-        "relation `{0}` is not allowed (it shows other sessions' statements); use the db_activity tool"
-    )]
-    DeniedRelation(&'static str),
-    /// Stable error code: `GUARD_DENIED_FUNCTION`.
-    #[error("function `{0}` is not allowed (high-privilege server-side function)")]
-    DeniedFunction(&'static str),
-}
-
-impl GuardError {
-    /// Where an unparseable statement stopped parsing, when the parser said.
-    pub fn location(&self) -> Option<SqlLocation> {
-        match self {
-            Self::Parse(at) => *at,
-            _ => None,
-        }
-    }
 }
 
 /// Read-only guard — the `query_read` default. Equivalent to
@@ -199,6 +132,10 @@ pub fn check_sql(sql: &str, access: Access) -> Result<(), GuardError> {
 /// [`check_sql`], returning the access the admitted statement needs.
 fn guard(sql: &str, access: Access) -> Result<Access, GuardError> {
     check_length(sql)?;
+    off_the_worker(sql.len(), || guard_here(sql, access))
+}
+
+fn guard_here(sql: &str, access: Access) -> Result<Access, GuardError> {
     let lexemes = check_lexical(sql)?;
     check_bounds(sql, &lexemes)?;
     let required = with_parser_stack(|| inspect(sql, access))?;
@@ -209,23 +146,7 @@ fn guard(sql: &str, access: Access) -> Result<Access, GuardError> {
 /// Parse, walk and drop the tree: sqlparser work only, and all of it, so no
 /// part of a tree — partial or refused — outlives the stack sized for it.
 fn inspect(sql: &str, access: Access) -> Result<Access, GuardError> {
-    let dialect = PostgreSqlDialect {};
-    let parse_error = |e| match e {
-        ParserError::ParserError(message) | ParserError::TokenizerError(message) => {
-            GuardError::Parse(SqlLocation::from_message(&message))
-        }
-        ParserError::RecursionLimitExceeded => GuardError::Parse(None),
-    };
-    let mut parser = Parser::new(&dialect)
-        .try_with_sql(sql)
-        .map_err(parse_error)?;
-    let statements = parser.parse_statements().map_err(parse_error)?;
-    // The statement must be read to its end.
-    let next = parser.peek_token();
-    if next.token != Token::EOF {
-        return Err(GuardError::Parse(SqlLocation::of(next.span.start)));
-    }
-
+    let statements = parse(sql)?;
     match statements.len() {
         0 => return Err(GuardError::Parse(None)),
         1 => {}
