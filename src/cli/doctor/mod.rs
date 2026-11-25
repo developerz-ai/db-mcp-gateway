@@ -161,8 +161,11 @@ fn connect_options(server: &Server, db: &Database, role: &str) -> PgConnectOptio
         .host(&server.host)
         .port(server.port)
         .username(role)
-        .database(&db.name)
+        .database(db.connect_name())
         .ssl_mode(ssl_mode)
+        // Unnamed statements only, as there: a named one fails behind a
+        // transaction-mode pooler.
+        .statement_cache_capacity(0)
         .disable_statement_logging();
     match &server.tls_ca_file {
         Some(ca) => options.ssl_root_cert(ca),

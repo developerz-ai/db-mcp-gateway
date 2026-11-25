@@ -13,6 +13,10 @@
 
 /// Wording for one SQLSTATE; anything not listed falls back to its class.
 const BY_SQLSTATE: &[(&str, &str)] = &[
+    (
+        "08P01",
+        "protocol violation; a $n without a param is refused so",
+    ),
     ("0A000", "feature not supported"),
     ("21000", "subquery returned more than one row"),
     ("22001", "value too long for the target type"),

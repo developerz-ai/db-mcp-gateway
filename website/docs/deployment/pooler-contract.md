@@ -43,9 +43,22 @@ The gateway keeps two things apart, and a pooler's mode decides which of them st
 | **Transaction-local pins** | `READ ONLY`, `statement_timeout`, `application_name`, `standard_conforming_strings` — set with `SET TRANSACTION` / `SET LOCAL` inside each call's transaction | Hold | Hold: they travel with the transaction to whichever backend runs it |
 | **Session cleanup** | The reset batch above, run when a connection returns to the gateway's pool | Holds: one gateway connection is one backend | **Does not hold** on its own: the backend went back to the pooler at `COMMIT`, so the batch may run on another backend and the one the caller used is handed out uncleaned |
 
-The gateway itself relies on no session state across calls — no session `SET`, temp tables, `LISTEN` or advisory locks — so its own correctness is the same in both modes. What changes is what a *caller* can leave behind for the next one. In session mode the gateway guarantees nothing survives. In transaction mode that guarantee exists only if the pooler provides it (rule 8); without it, run the endpoint in session mode.
+On a target the gateway itself relies on no session state across calls — no session `SET`, temp tables, `LISTEN` or advisory locks — so its own correctness is the same in both modes. What changes is what a *caller* can leave behind for the next one. In session mode the gateway guarantees nothing survives. In transaction mode that guarantee exists only if the pooler provides it (rule 8); without it, run the endpoint in session mode.
 
 **Prepared statements in transaction mode.** A pooler that tracks them keeps its own map, by statement text, of what is prepared on each server connection, and that map outlives a client's `Close`, DDL and an SQL-level `DEALLOCATE`. Gateway 2.5.0 named its reads and met it: after an `ALTER TABLE` a repeated `SELECT *` could fail with `0A000 cached plan must not change result type`. Later versions name nothing, so the map holds nothing of theirs. Other clients' entries are still at risk from the gateway's `DEALLOCATE ALL` on a server connection they share, so give the gateway roles no other client uses.
+
+## The state DB behind a pooler
+
+Everything above is about target databases. `STATE_DB_URL` may point at a pooler too, in **session mode only**: the gateway sets its timeouts per session and holds one connection for `LISTEN`.
+
+| Pooler, session mode | Permission changes from another replica | Checked with |
+|---|---|---|
+| None, or PgBouncer | Arrive at once | PgBouncer 1.26.1 |
+| pgcat | Arrive within 5 s: pgcat relays a notification only while it answers a request, so the listener sends one (`SELECT 1`) every 5 s. Up to 2.6.0 it did not: every 15 s it logged `permissions listener heard no ping within the liveness deadline; reconnecting`, then flushed its cache and resubscribed, so a change took up to 15 s plus a 5 s beat (14 s measured) — not the cache TTL | pgcat, image of 2024-08-30 |
+
+That warning, repeating, means notifications do not reach this replica: the pooler is in transaction or statement mode, or drops them. The replica then works as it does on a lost connection — the whole grant cache is flushed when the 15 s deadline passes and every 5 s until it resubscribes, so a revoke can take 20 s but never the cache TTL (14 s measured through PgBouncer in transaction mode). Fix the pooler mode, or point `STATE_DB_URL` at Postgres directly.
+
+Size the pooler for `STATE_DB_POOL_SIZE` + 5 server connections per replica: session mode pins one per open client connection.
 
 ## Sequences declared with `CACHE`
 

@@ -79,7 +79,7 @@ pub(crate) const CATALOGUE: &[Metric] = &[
         "audit_failure_recent",
         Gauge,
         &["kind"],
-        "1 while an MCP tool call's audit write failed recently, else 0 (write: answered audit_unavailable, 15 min; fallback: the detached write after a disconnect or a failed completion write, 30 min).",
+        "1 while an audit write failed recently, else 0 (write: a tool call answered audit_unavailable, or an admin API request whose audit row failed, 15 min; fallback: the detached write after a disconnect or a failed completion write, 30 min).",
     ),
     metric(
         "audit_abandoned_total",

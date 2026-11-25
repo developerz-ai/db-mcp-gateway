@@ -1,6 +1,6 @@
 //! BSON → JSON rendering for tool responses.
 
-use mongodb::bson::{Bson, Document, RawDocument};
+use mongodb::bson::{Bson, Document, JavaScriptCodeWithScope, RawDocument};
 use serde_json::{Map, Value};
 
 use super::super::adapter::ExecError;
@@ -17,9 +17,10 @@ pub(super) fn raw_to_json(raw: &RawDocument) -> Result<Value, ExecError> {
 }
 
 /// A value that fails to serialize is an error, never a fabricated `null`
-/// (which would read as a real BSON null). Documents and arrays are walked
-/// here rather than by serde because a JSON number cannot hold a NaN or an
-/// infinity: serde would render one as `null`.
+/// (which would read as a real BSON null). Every value that nests others —
+/// documents, arrays, a code's scope — is walked here rather than by serde
+/// because a JSON number cannot hold a NaN or an infinity: serde would render
+/// one as `null`.
 pub(super) fn bson_to_json(b: Bson) -> Result<Value, ExecError> {
     match b {
         Bson::Double(value) if !value.is_finite() => Ok(non_finite_double(value)),
@@ -33,6 +34,10 @@ pub(super) fn bson_to_json(b: Bson) -> Result<Value, ExecError> {
             .map(bson_to_json)
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array),
+        Bson::JavaScriptCodeWithScope(JavaScriptCodeWithScope { code, scope }) => {
+            let scope = bson_to_json(Bson::Document(scope))?;
+            Ok(serde_json::json!({ "$code": code, "$scope": scope }))
+        }
         other => serde_json::to_value(&other).map_err(|_| ExecError::Decode),
     }
 }
@@ -75,6 +80,34 @@ mod tests {
                 "nested": { "list": [1.5, { "$numberDouble": "NaN" }, { "deep": { "$numberDouble": "Infinity" } }] },
                 "null": null,
             })
+        );
+    }
+
+    /// The scope is the one value besides a document or an array that nests
+    /// doubles; it must not fall back to serde's `null`.
+    #[test]
+    fn non_finite_doubles_in_a_code_scope_render_as_extended_json() {
+        let code = Bson::JavaScriptCodeWithScope(JavaScriptCodeWithScope {
+            code: "x".into(),
+            scope: doc! {
+                "nan": f64::NAN,
+                "nested": [f64::NEG_INFINITY, { "deep": f64::INFINITY }],
+                "inner": Bson::JavaScriptCodeWithScope(JavaScriptCodeWithScope {
+                    code: "y".into(),
+                    scope: doc! { "nan": f64::NAN, "n": 1 },
+                }),
+            },
+        });
+        assert_eq!(
+            bson_to_json(Bson::Array(vec![code])).expect("renders"),
+            json!([{
+                "$code": "x",
+                "$scope": {
+                    "nan": { "$numberDouble": "NaN" },
+                    "nested": [{ "$numberDouble": "-Infinity" }, { "deep": { "$numberDouble": "Infinity" } }],
+                    "inner": { "$code": "y", "$scope": { "nan": { "$numberDouble": "NaN" }, "n": 1 } },
+                },
+            }])
         );
     }
 

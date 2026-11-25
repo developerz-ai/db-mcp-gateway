@@ -4,8 +4,11 @@
 //! test's own fixture setup, run as the owner.
 
 use std::process::Output;
+use std::sync::{Arc, Mutex};
 
 use sqlx::{Connection, Executor, PgConnection};
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
 
 use crate::common::pg_target::{
@@ -16,11 +19,22 @@ const ROLE: &str = "dbmcp_doctor_ro";
 const ROLE_PASSWORD: &str = "doctor-dev-only";
 
 fn config(role: &str, password: &str) -> tempfile::NamedTempFile {
+    let name = format!("name: {TARGET_DB}");
+    config_at(TARGET_HOST, target_port(), &name, role, password)
+}
+
+/// `names`: the database's `name:`, and its `connect_name:` if it has one.
+fn config_at(
+    host: &str,
+    port: u16,
+    names: &str,
+    role: &str,
+    password: &str,
+) -> tempfile::NamedTempFile {
     let yaml = format!(
-        "servers:\n  - name: target\n    kind: postgres\n    host: {TARGET_HOST}\n    \
-         port: {}\n    tls: insecure\n    databases:\n      - {{ name: {TARGET_DB}, role: {role}, \
-         password: \"{password}\" }}\npermissions: []\n",
-        target_port()
+        "servers:\n  - name: target\n    kind: postgres\n    host: {host}\n    \
+         port: {port}\n    tls: insecure\n    databases:\n      - {{ {names}, role: {role}, \
+         password: \"{password}\" }}\npermissions: []\n"
     );
     let file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(file.path(), yaml).unwrap();
@@ -163,4 +177,99 @@ async fn doctor_names_the_site_of_an_unresolved_secret() {
         out.contains("error: servers[target].databases[app].password (read tier)"),
         "{out}"
     );
+}
+
+/// A TCP forwarder to the target, keeping what its one client sent.
+async fn recorder() -> (u16, Arc<Mutex<Vec<u8>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let sent: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let record = sent.clone();
+    tokio::spawn(async move {
+        let (client, _) = listener.accept().await.unwrap();
+        let target = TcpStream::connect((TARGET_HOST, target_port()))
+            .await
+            .unwrap();
+        let (from_client, mut to_client) = client.into_split();
+        let (mut from_target, mut to_target) = target.into_split();
+        tokio::spawn(async move { tokio::io::copy(&mut from_target, &mut to_client).await });
+        let mut chunk = [0u8; 8192];
+        loop {
+            from_client.readable().await.unwrap();
+            match from_client.try_read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => {
+                    record.lock().unwrap().extend_from_slice(&chunk[..n]);
+                    to_target.write_all(&chunk[..n]).await.unwrap();
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return,
+            }
+        }
+    });
+    (port, sent)
+}
+
+/// The `(kind, body)` of each client message after the untyped startup one.
+fn messages(mut wire: &[u8]) -> Vec<(u8, String)> {
+    let len = |at: &[u8]| u32::from_be_bytes(at[..4].try_into().unwrap()) as usize;
+    wire = &wire[len(wire)..];
+    let mut messages = Vec::new();
+    while let Some((kind, rest)) = wire.split_first() {
+        let (message, next) = rest.split_at(len(rest));
+        messages.push((*kind, String::from_utf8_lossy(&message[4..]).into_owned()));
+        wire = next;
+    }
+    messages
+}
+
+/// A transaction-mode pooler serves only unnamed statements, and those only
+/// inside a transaction (as `pg_unnamed_statements_real_db` pins for targets).
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn doctor_sends_unnamed_statements_inside_one_transaction() {
+    let (port, sent) = recorder().await;
+    let name = format!("name: {TARGET_DB}");
+    let config = config_at("127.0.0.1", port, &name, TARGET_USER, TARGET_PASSWORD);
+
+    let (code, out) = doctor(&config, "public").await;
+    assert_eq!(code, Some(1), "the dev owner is a superuser: {out}");
+
+    let messages = messages(&sent.lock().unwrap());
+    let at = |sql: &str| {
+        messages
+            .iter()
+            .position(|(kind, text)| *kind == b'Q' && text.starts_with(sql))
+            .unwrap_or_else(|| panic!("no {sql}"))
+    };
+    let (begin, rollback) = (at("BEGIN"), at("ROLLBACK"));
+    let mut parsed = 0;
+    for (i, (kind, text)) in messages.iter().enumerate() {
+        // Parse starts with the statement's name; Bind with the portal's,
+        // then the statement's.
+        let name = match kind {
+            b'P' => text.split('\0').next(),
+            b'B' => text.split('\0').nth(1),
+            _ => continue,
+        };
+        parsed += usize::from(*kind == b'P');
+        assert_eq!(name, Some(""), "named statement: {text:?}");
+        assert!(
+            begin < i && i < rollback,
+            "outside the transaction: {text:?}"
+        );
+    }
+    assert!(parsed > 0, "the probe was recorded");
+}
+
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn doctor_connects_to_connect_name_and_reports_the_logical_name() {
+    let names = format!("name: logical, connect_name: {TARGET_DB}");
+    let port = target_port();
+    let config = config_at(TARGET_HOST, port, &names, TARGET_USER, TARGET_PASSWORD);
+    let (code, out) = doctor(&config, "public").await;
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("target/logical read role"), "{out}");
+    assert!(out.contains("finding: role has rolsuper"), "{out}");
 }

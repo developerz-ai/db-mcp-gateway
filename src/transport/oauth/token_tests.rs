@@ -57,7 +57,7 @@ async fn a_failed_promotion_leaves_the_code_redeemable() {
 
     let (status, body) = redeem(&state).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body["error"], "server_error");
+    assert_eq!(body["error"], "temporarily_unavailable");
     assert!(
         state
             .auth
@@ -78,7 +78,7 @@ async fn a_failed_mint_leaves_the_code_redeemable() {
 
     let (status, body) = redeem(&state).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body["error"], "server_error");
+    assert_eq!(body["error"], "temporarily_unavailable");
     assert!(
         state
             .auth
@@ -130,5 +130,55 @@ async fn an_unreachable_code_store_is_a_retryable_503() {
 
     let (status, body) = redeem(&state).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body["error"], "server_error");
+    assert_eq!(body["error"], "temporarily_unavailable");
+}
+
+/// A full store and a refused statement keep their own answer: only a dead
+/// state DB is `temporarily_unavailable`.
+#[tokio::test]
+async fn a_full_store_and_a_refused_statement_stay_server_error() {
+    let cases = [
+        (
+            AuthError::StoreFull,
+            "gateway temporarily overloaded; try again",
+        ),
+        (
+            AuthError::State(sqlx::Error::RowNotFound),
+            "could not issue tokens; try again",
+        ),
+    ];
+    for (err, description) in cases {
+        let response = token_response(Err(err));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(body["error"], "server_error");
+        assert_eq!(body["error_description"], description);
+    }
+}
+
+/// A refresh during the outage asks for a retry, not for a new login.
+#[tokio::test]
+async fn a_refresh_the_state_db_cannot_serve_is_temporarily_unavailable() {
+    let mut state = offline_for_tests().oauth;
+    let down = PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(200))
+        .connect_lazy_with(PgConnectOptions::new().host("offline.invalid"));
+    state.auth.refresh =
+        crate::auth::oauth::RefreshTokens::with_db(down, std::time::Duration::from_secs(60));
+    let form = TokenForm {
+        grant_type: Some("refresh_token".into()),
+        code: None,
+        redirect_uri: None,
+        code_verifier: None,
+        refresh_token: Some("any".into()),
+        client_id: None,
+        resource: None,
+    };
+    let response = token(State(state), Ok(Form(form))).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), 4096).await.expect("body");
+    let body: Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(body["error"], "temporarily_unavailable");
+    assert!(!body.to_string().contains("offline.invalid"), "{body}");
 }

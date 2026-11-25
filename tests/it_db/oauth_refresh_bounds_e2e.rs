@@ -3,14 +3,8 @@
 //! signs in again, so the IdP's current groups apply), and an RFC 8707
 //! `resource` that is not this gateway (refused before the code is spent).
 
-use std::sync::Arc;
-
-use arc_swap::ArcSwap;
-use db_mcp_gateway::auth::jwt::SessionJwt;
-use db_mcp_gateway::auth::oauth::{AuthCodes, AuthFacade, PendingFlows, RefreshTokens};
-use db_mcp_gateway::auth::{AuthConfig, LoginOptions, OidcClient, ServiceTokenStore, SessionStore};
-use db_mcp_gateway::config::Config;
-use db_mcp_gateway::transport::{self, AppState};
+use db_mcp_gateway::auth::LoginOptions;
+use db_mcp_gateway::auth::oauth::{DEFAULT_REFRESH_TTL, RefreshTokens};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -19,7 +13,7 @@ use uuid::Uuid;
 use crate::common::audit::assert_audit_outcome;
 use crate::common::cleanup::delete_audit_calls;
 use crate::common::env::state_pool;
-use crate::common::gateway::{bind, config_file, no_redirect_client, serve};
+use crate::common::gateway::{GatewayBuilder, no_redirect_client};
 use crate::common::idp::{MockUser, spawn_mock_idp};
 
 // RFC 7636 Appendix B test vector.
@@ -54,43 +48,18 @@ async fn spawn(pool: &PgPool, groups_max_age: &str) -> Gateway {
         groups: vec!["engineers".into()],
     };
     let idp = spawn_mock_idp("test-client", "test-secret", user).await;
-    let (listener, addr) = bind().await;
-    let url = format!("http://{addr}");
-    let auth_config = AuthConfig {
-        issuer: idp.issuer.clone(),
-        client_id: idp.client_id.clone(),
-        client_secret: idp.client_secret.clone().into(),
-        audience: idp.client_id.clone(),
-        redirect_url: format!("{url}/auth/callback"),
-        ..AuthConfig::default()
-    };
     let options = LoginOptions::from_lookup(|var| {
         (var == "GROUPS_MAX_AGE").then(|| groups_max_age.to_owned())
     })
     .expect("valid GROUPS_MAX_AGE");
-    let config = config_file(YAML);
-    let tokens = ServiceTokenStore::from_config(&config.service_accounts).expect("tokens");
-    let auth = AuthFacade {
-        jwt: SessionJwt::new(&auth_config.session_signing_key),
-        config: Arc::new(auth_config.clone()),
-        sessions: SessionStore::new(pool.clone()),
-        refresh: RefreshTokens::with_db(pool.clone(), auth_config.refresh_ttl),
-        oidc: OidcClient::with_options(auth_config, options).expect("oidc client"),
-        flows: PendingFlows::default(),
-        codes: AuthCodes::default(),
-        service_tokens: Arc::new(ArcSwap::from_pointee(tokens)),
-    };
-    let state = AppState::for_tests(config, pool.clone(), auth);
-    let config = Config {
-        bind: addr,
-        ..Config::default()
-    };
-    serve(
-        listener,
-        transport::router(&config, state).expect("router builds"),
-    );
+    let gateway = GatewayBuilder::new(YAML)
+        .idp(&idp)
+        .refresh(RefreshTokens::with_db(pool.clone(), DEFAULT_REFRESH_TTL))
+        .login_options(options)
+        .spawn(pool.clone())
+        .await;
     Gateway {
-        url,
+        url: gateway.url,
         sub,
         http: no_redirect_client(),
     }

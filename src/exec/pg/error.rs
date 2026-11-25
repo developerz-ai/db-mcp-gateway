@@ -8,7 +8,7 @@
 //! everything else.
 
 use sqlx::error::DatabaseError;
-use sqlx::postgres::{PgDatabaseError, PgErrorPosition};
+use sqlx::postgres::{PgDatabaseError, PgErrorPosition, PgSeverity};
 use uuid::Uuid;
 
 use super::super::adapter::ExecError;
@@ -41,11 +41,13 @@ pub(super) fn classify(err: sqlx::Error, origin: &Origin<'_>, sql: &str) -> Exec
     {
         return match code.as_ref() {
             // `statement_timeout` raises `57014` (`query_canceled`).
-            "57014" => ExecError::Timeout,
+            QUERY_CANCELED => ExecError::Timeout,
             // Connection exception, operator intervention (backend
             // terminated, server shutting down), insufficient resources:
-            // the target, not the statement, is the problem.
-            c if c.starts_with("08") || c.starts_with("57P") || c.starts_with("53") => {
+            // the target, not the statement, is the problem. `08P01` is the
+            // code a placeholder without a param is refused with, too.
+            c if c.starts_with("57P") || c.starts_with("53") => ExecError::Unavailable,
+            c if c.starts_with("08") && !(c == "08P01" && judges_a_statement(db.as_ref())) => {
                 ExecError::Unavailable
             }
             // The statement was sound and the target could not finish it
@@ -55,6 +57,7 @@ pub(super) fn classify(err: sqlx::Error, origin: &Origin<'_>, sql: &str) -> Exec
             // role and can name the client address. Never passed on, however
             // it got here.
             c if c.starts_with("28") => ExecError::Connection,
+            c if not_the_statements(c, db.as_ref()) => ExecError::Unavailable,
             c => ExecError::Rejected(rejection(c, db.as_ref(), origin.role, sql)),
         };
     }
@@ -75,6 +78,31 @@ fn rejection(sqlstate: &str, db: &dyn DatabaseError, role: &str, sql: &str) -> D
     DbRejection::new(sqlstate, &message, role)
         .with_position(position)
         .with_hint(safe_hint(sqlstate, position, sql, hint), role)
+}
+
+/// Whether an error the SQLSTATE alone would blame on the statement is a
+/// pooler's, or the end of the session: any `FATAL` (pgcat's answer for every
+/// failure of its own is a `FATAL` `58000`; PgBouncer passes on the server's
+/// refusal of *its* login as one), and class `58`, system error, unless the
+/// server raised it for the statement.
+fn not_the_statements(sqlstate: &str, db: &dyn DatabaseError) -> bool {
+    is_fatal(db) || (sqlstate.starts_with("58") && !judges_a_statement(db))
+}
+
+/// Whether the server raised this error for a statement and the session goes
+/// on. Postgres names the source location in every error; a pooler answering
+/// for a server it cannot reach has none.
+fn judges_a_statement(db: &dyn DatabaseError) -> bool {
+    !is_fatal(db)
+        && db
+            .try_downcast_ref::<PgDatabaseError>()
+            .is_some_and(|db| db.file().is_some() || db.routine().is_some())
+}
+
+/// `FATAL` and `PANIC` end the session. No statement's own error does.
+fn is_fatal(db: &dyn DatabaseError) -> bool {
+    db.try_downcast_ref::<PgDatabaseError>()
+        .is_some_and(|db| matches!(db.severity(), PgSeverity::Fatal | PgSeverity::Panic))
 }
 
 /// SQLSTATEs with which the target itself rolled the transaction back, for
@@ -134,6 +162,13 @@ fn is_stale_plan(err: &sqlx::Error) -> bool {
             .is_some_and(|db| {
                 db.routine() == Some("RevalidateCachedQuery") && db.r#where().is_none()
             })
+}
+
+/// SQLSTATE `57014`: a cancel, or `statement_timeout`.
+const QUERY_CANCELED: &str = "57014";
+
+pub(super) fn is_query_canceled(err: &sqlx::Error) -> bool {
+    sqlstate(err).as_deref() == Some(QUERY_CANCELED)
 }
 
 fn sqlstate(err: &sqlx::Error) -> Option<String> {

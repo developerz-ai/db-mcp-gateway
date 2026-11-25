@@ -2,7 +2,7 @@ apiVersion: v2
 name: db-mcp-gateway
 description: Self-hosted MCP gateway — audited, SSO-gated, read-only database access for AI agents.
 type: application
-# The chart's own version; bumped with any template change.
+# A checkout's version only; release.yml publishes the chart as the release's.
 version: 0.1.0
 # The image tag deployed when image.tag is empty.
 appVersion: "2.6.0"

@@ -7,6 +7,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::audit::{self, AuditRow, OutcomeCode};
+use crate::tools::audit_dispatch::failure_hold::{FailedAuditWrite, audit_failures};
 
 use super::error::AdminError;
 use super::middleware::AdminActor;
@@ -74,6 +75,7 @@ pub(super) async fn audit_read(
         sql_truncated: false,
     };
     audit::log(pool, &row).await.map_err(|err| {
+        audit_failures().mark(FailedAuditWrite::Write);
         tracing::error!(
             tool = read.tool(),
             cause = %err.class(),

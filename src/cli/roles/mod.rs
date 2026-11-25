@@ -76,13 +76,21 @@ fn render(server: &Server, db: &Database, args: &RolesArgs) -> Result<String, Cl
     }
 }
 
-/// `server `a`, database `b``, safe inside a one-line comment: a name with a
+/// `server `a`, database `b``, plus the database's name on the server when it
+/// has another one there. Safe inside a one-line comment: a name with a
 /// line break cannot end the comment and start a statement.
 fn label(server: &Server, db: &Database) -> String {
-    format!(
+    let label = format!(
         "server `{}`, database `{}`",
         server.name.escape_debug(),
         db.name.escape_debug()
+    );
+    if db.connect_name() == db.name {
+        return label;
+    }
+    format!(
+        "{label} (`{}` on the server)",
+        db.connect_name().escape_debug()
     )
 }
 
@@ -103,8 +111,8 @@ fn plain_line_arg<'a>(what: &str, value: &'a str) -> Result<&'a str, CliError> {
 /// lands in the database psql is connected to, so the recipe `\connect`s to
 /// the configured one first.
 fn postgres(server: &Server, db: &Database, args: &RolesArgs) -> Result<String, CliError> {
-    let connect = psql_connect(plain_line_arg("database", &db.name)?);
-    let database = quote_ident(&db.name);
+    let connect = psql_connect(plain_line_arg("database", db.connect_name())?);
+    let database = quote_ident(db.connect_name());
     let read = quote_ident(&db.role);
     let owner = quote_ident(&args.owner);
     let mut sql = format!(
@@ -156,7 +164,10 @@ fn postgres(server: &Server, db: &Database, args: &RolesArgs) -> Result<String, 
 }
 
 fn mongo(server: &Server, db: &Database) -> String {
-    let auth_db = db.auth_database.as_deref().unwrap_or(&db.name);
+    let auth_db = db
+        .auth_database
+        .as_deref()
+        .unwrap_or_else(|| db.connect_name());
     format!(
         "// {}: read user — mongosh, as an admin\n\
          db = db.getSiblingDB({})\n\
@@ -164,7 +175,7 @@ fn mongo(server: &Server, db: &Database) -> String {
         label(server, db),
         json_string(auth_db),
         json_string(&db.role),
-        json_string(&db.name),
+        json_string(db.connect_name()),
     )
 }
 

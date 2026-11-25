@@ -26,19 +26,16 @@ use db_mcp_gateway::transport::{AppState, McpState, OAuthState};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
-use super::metrics;
+use super::{Shutdown, metrics};
 
 /// Wire every `AppState` dependency. Moves `config_file` and `auth_config` in.
-/// `stop` is the process shutdown token; probes go 503 once it is cancelled.
-/// `drained` fires once in-flight requests have drained: work those requests
-/// still depend on, like cross-replica revocations, runs until then.
+/// Probes go 503 at `shutdown.stop`.
 pub(crate) async fn build_app_state(
     config_file: ConfigFile,
     config: &Config,
     auth_config: AuthConfig,
     service_tokens: ServiceTokenStore,
-    stop: CancellationToken,
-    drained: CancellationToken,
+    shutdown: &Shutdown,
     state_db: &PgPool,
 ) -> anyhow::Result<AppState> {
     let sessions = SessionStore::with_cache_config(
@@ -55,10 +52,14 @@ pub(crate) async fn build_app_state(
     // finish (bounded) before shutdown closes the pools.
     let detached = DetachedTasks::new();
     let (permissions_repo, permissions_cache) =
-        build_permissions(&config_file, config, state_db, &detached, drained).await?;
+        build_permissions(&config_file, config, state_db, &detached, shutdown).await?;
     pg::init_cancel_pool_size_from_env()?;
     metrics::preregister::register_targets(&config_file);
-    metrics::state_pools::spawn_state_pool_sampler("request", state_db.clone(), stop.clone());
+    metrics::state_pools::spawn_state_pool_sampler(
+        "request",
+        state_db.clone(),
+        shutdown.finished.clone(),
+    );
     let mcp = McpState {
         audit_sinks: Arc::new(ArcSwap::from_pointee(
             StreamSinks::from_config(&config_file.logging.stream)
@@ -94,7 +95,7 @@ pub(crate) async fn build_app_state(
         client_registry: ClientRegistry::with_db(state_db.clone()),
         mcp_path: Arc::from(config.mcp_path.as_str()),
     };
-    let app_state = AppState::new(mcp, oauth, stop);
+    let app_state = AppState::new(mcp, oauth, shutdown.stop.clone());
     metrics::probes::probe_state().attach(app_state.clone());
     Ok(app_state)
 }
@@ -109,7 +110,7 @@ async fn build_permissions(
     config: &Config,
     state_db: &PgPool,
     detached: &DetachedTasks,
-    drained: CancellationToken,
+    shutdown: &Shutdown,
 ) -> anyhow::Result<(Arc<dyn PermissionsRepo>, PermissionsCache)> {
     let ttl = Duration::from_secs(config.permissions_cache_ttl_seconds);
     match config_file.permissions_store_driver() {
@@ -119,11 +120,11 @@ async fn build_permissions(
             let listener_db = state::connect_listener(&config.state_db.url)
                 .await
                 .map_err(|err| boot_db_error("permissions listener", err))?;
-            spawn_permissions_listener(listener_db, cache.clone(), drained);
+            spawn_permissions_listener(listener_db, cache.clone(), shutdown.drained.clone());
             Ok((repo, cache))
         }
         PermissionsStoreDriver::Mysql => {
-            let repo = connect_mysql_repo(config, drained.clone()).await?;
+            let repo = connect_mysql_repo(config, shutdown.finished.clone()).await?;
             let cache = PermissionsCache::new(repo.clone(), ttl).with_detached(detached.clone());
             Ok((repo, cache))
         }
@@ -164,7 +165,7 @@ fn spawn_permissions_listener(pool: PgPool, cache: PermissionsCache, stop: Cance
 
 async fn connect_mysql_repo(
     config: &Config,
-    stop: CancellationToken,
+    finished: CancellationToken,
 ) -> anyhow::Result<Arc<dyn PermissionsRepo>> {
     let dsn = std::env::var("PERMISSIONS_DB_DSN").map_err(|_| {
         anyhow::anyhow!("permissions_store.driver = mysql requires PERMISSIONS_DB_DSN env")
@@ -176,7 +177,7 @@ async fn connect_mysql_repo(
         pool_size = config.state_db.pool_size,
         "mysql permissions store connected, migrations applied"
     );
-    metrics::state_pools::spawn_state_pool_sampler("permissions_mysql", pool.clone(), stop);
+    metrics::state_pools::spawn_state_pool_sampler("permissions_mysql", pool.clone(), finished);
     Ok(Arc::new(MysqlPermissionsRepo::new(pool)))
 }
 

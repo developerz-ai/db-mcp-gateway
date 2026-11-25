@@ -348,6 +348,47 @@ async fn a_zero_row_text_cast_read_keeps_its_columns() {
     assert_eq!(result.column_types, vec!["OID", "TEXT"]);
 }
 
+/// The caller's text is nested only once it stands as one statement of its
+/// own: every shape a read can have is taken, by both routes to the text
+/// cast, and a second statement, or a parenthesis that would close the
+/// wrapper's, is refused.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn only_a_statement_of_its_own_is_nested() {
+    let a = adapter().await;
+    for sql in [
+        "TABLE pg_rewrite",
+        "(SELECT ev_action FROM pg_rewrite)",
+        "WITH r AS (SELECT ev_action FROM pg_rewrite) SELECT * FROM r -- c",
+        "SELECT ev_action FROM pg_rewrite WHERE ev_type <> ';' ORDER BY oid DESC;",
+        "SELECT relacl FROM pg_class UNION ALL (SELECT relacl FROM pg_class LIMIT 1)",
+        "VALUES ((SELECT relacl FROM pg_class ORDER BY oid LIMIT 1))",
+    ] {
+        let result = a
+            .execute(read(sql, 1))
+            .await
+            .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+        assert_eq!(result.rows.len(), 1, "{sql}");
+    }
+    let params = [QueryParam::Null, QueryParam::Int(1)];
+    let untyped = "SELECT ev_action FROM pg_rewrite WHERE $1::text IS NULL LIMIT $2";
+    let result = a.execute_with_params(read(untyped, 10), &params).await;
+    assert_eq!(result.expect("a NULL's type is inferred").rows.len(), 1);
+
+    for sql in [
+        "SELECT relacl FROM pg_class; SELECT 1",
+        "SELECT ev_action FROM pg_rewrite; SELECT 1",
+        "SELECT relacl FROM pg_class) AS q(c1), (SELECT 1",
+        "SELECT ev_action FROM pg_rewrite) AS s, (SELECT 1",
+    ] {
+        let outcome = a.execute(read(sql, 1)).await;
+        let Err(ExecError::Rejected(rejection)) = outcome else {
+            panic!("{sql}: {outcome:?}")
+        };
+        assert_eq!(rejection.sqlstate(), "42601", "{sql}");
+    }
+}
+
 /// The read every fallback test runs: `ev_action` sends it through the
 /// cursor description, whose planning folds the immutable call — the
 /// fallback is what is slow, not the read. Returns `(function, sql)`.

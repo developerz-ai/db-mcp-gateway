@@ -25,9 +25,13 @@
 //!
 //! Whether a read needs the wrapper is decided before it runs (see
 //! `describe`), never by retrying a failure: the read runs once (#382).
-//! Before the caller's statement is nested it is `PREPARE`d alone over the
-//! extended protocol, which refuses more than one statement: the text is
-//! proven a single statement first. When the driver cannot describe the
+//! Before the caller's statement is nested it is parsed alone, as a cursor's
+//! query, over the extended protocol, which refuses more than one statement:
+//! the text is proven a single statement first. That `Parse` is the unnamed
+//! statement's and executes nothing: an SQL `PREPARE` would outlive a call
+//! abandoned before its `DEALLOCATE` on a backend a transaction-mode pooler
+//! hands to the next caller (#411). The one name used, the cursor below, ends
+//! with its transaction. When the driver cannot describe the
 //! statement at all (a category-`Z` column), its columns are read from a
 //! cursor over a wrapper that reads no row of it: the cursor is declared
 //! over the extended protocol with the caller's own params, and its row
@@ -35,11 +39,11 @@
 //! does not look up. Nothing runs with a made-up param value (#383).
 
 use sqlx::postgres::types::Oid;
-use sqlx::{Column, Executor, Postgres, Transaction};
+use sqlx::{Column, Executor, Postgres, SqlSafeStr, Transaction};
 
 use super::super::query::{ExecQuery, QueryParam};
 use super::super::sql_guard::statement_body;
-use super::stream::bound_query;
+use super::stream::{bound_query, bound_types};
 
 /// `query`'s statement with every one of `columns` (name and type OID, in
 /// order) the driver cannot take cast to text, or `None` when there is no
@@ -61,7 +65,7 @@ pub(super) async fn text_cast_sql(
     if textless.is_empty() {
         return Ok(None);
     }
-    prove_single_statement(tx, body, params).await?;
+    prove_single_statement(tx, body, query.binds, params).await?;
     let columns: Vec<(&str, bool)> = columns
         .iter()
         .map(|(name, oid)| (name.as_str(), textless.contains(oid)))
@@ -79,7 +83,7 @@ pub(super) async fn row_description(
     let Some(body) = statement_body(query.sql) else {
         return Ok(Vec::new());
     };
-    prove_single_statement(tx, body, params).await?;
+    prove_single_statement(tx, body, query.binds, params).await?;
     // `LIMIT 0` never asks its input for a row: the caller's statement is
     // planned with its params, and none of it runs.
     let declare = format!(
@@ -107,40 +111,22 @@ pub(super) async fn row_description(
     Ok(columns.unwrap_or_default())
 }
 
-/// `body` prepared alone, with the types `params` run with: a second
-/// statement in it is refused here, before it is nested.
+/// `body` parsed alone, with the types it runs with: a second statement in it
+/// is refused here, before it is nested. Nothing runs: the cursor is never
+/// declared. A cursor's declaration has no result columns, so the driver looks
+/// no type up — it cannot for the statements [`row_description`] is asked of.
 async fn prove_single_statement(
     tx: &mut Transaction<'_, Postgres>,
     body: &str,
+    binds: &[&str],
     params: &[QueryParam],
 ) -> Result<(), sqlx::Error> {
-    let prepare = format!("PREPARE dbmcp_recast{} AS\n{body}", param_types(params));
-    sqlx::query(sqlx::AssertSqlSafe(prepare))
-        .persistent(false)
-        .execute(&mut **tx)
+    let cursor = format!("DECLARE dbmcp_recast NO SCROLL CURSOR FOR\n{body}");
+    let types = bound_types(binds, params);
+    (&mut **tx)
+        .prepare_with(sqlx::AssertSqlSafe(cursor).into_sql_str(), &types)
         .await?;
-    tx.execute("DEALLOCATE dbmcp_recast").await?;
     Ok(())
-}
-
-/// The `PREPARE` type list for the types `params` run with (see
-/// [`QueryParam`]), empty without params. Every name is a constant.
-fn param_types(params: &[QueryParam]) -> String {
-    if params.is_empty() {
-        return String::new();
-    }
-    let types: Vec<&str> = params
-        .iter()
-        .map(|param| match param {
-            QueryParam::Null => "unknown",
-            QueryParam::Bool(_) => "bool",
-            QueryParam::Int(_) => "int8",
-            QueryParam::Float(_) => "float8",
-            QueryParam::Text(_) => "text",
-            QueryParam::Json(_) => "jsonb",
-        })
-        .collect();
-    format!(" ({})", types.join(", "))
 }
 
 /// Which of `types` the driver cannot take, themselves or as an array's

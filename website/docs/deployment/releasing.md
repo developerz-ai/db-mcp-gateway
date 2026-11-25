@@ -6,11 +6,12 @@ Releases are triggered by a `v*` git tag. The `.github/workflows/release.yml` wo
 2. **Reuses the tested `main` image.** The tag sits on a commit `main` CI is already building, so the release waits for that `ci.yml` run (up to 40 minutes):
    - **Green** — its `sha-<7>` multi-arch manifest, the image the quality jobs gated and the Image Updater deployed, is re-tagged: the release index points at the very per-arch images CI tested (same per-arch digests). The index digest itself differs from `sha-<7>`'s, because the release adds its own annotations (below).
    - **Red** (failed or cancelled) — the release is **blocked** and fails with an error. Nothing ships from a commit CI rejected; fix it and tag the next patch.
-   - **No `ci.yml` run for the commit** (a tag on a commit that never reached `main`, such as a backport) — a loud warning, then the image is built natively per architecture (amd64 + arm64) from the tag and stitched into one multi-arch manifest. The same fallback covers a green run whose `sha-<7>` image is missing.
+   - **No `ci.yml` push run for the commit** (after a 2-minute grace), or a green run whose `sha-<7>` image is missing from either registry — the release is **blocked** too. Nothing is built from the tag: an image no test ran against never ships. (Preflight has already refused a tag whose commit is not on `main`.)
    - An Actions API error, or a run still going after 40 minutes, fails the job; re-run it.
 3. Tags it `X.Y.Z` and, where preflight allows, `X.Y`, `X` and `latest`.
 4. Pushes the same tag set to two registries: `ghcr.io/developerz-ai/db-mcp-gateway` (the public artifact) and a DigitalOcean Container Registry mirror (the in-cluster source the ArgoCD Image Updater tracks).
-5. Creates a GitHub Release with auto-generated notes.
+5. Once the image is published and signed, packages `deploy/helm/db-mcp-gateway` at the release version (chart version and `appVersion`), pushes it to `oci://ghcr.io/developerz-ai/charts/db-mcp-gateway`, signs it (cosign keyless) and attests its provenance. If this job fails the image stays published and the GitHub Release is not created; re-run the job. A re-run reuses the chart the same commit already pushed, and a version already published with other content fails instead of moving.
+6. Creates a GitHub Release with auto-generated notes.
 
 GHCR is the public distribution channel because this is an open-source project — public images are free, unmetered for pulls, and don't have Docker Hub's rate limits.
 
@@ -24,7 +25,7 @@ GHCR is the public distribution channel because this is an open-source project �
 | `X` | in major `X` |
 | `X.Y` | in minor `X.Y` |
 
-So a backport `v1.6.1` pushed after `v2.0.3` gets `1.6.1`, `1.6` and `1`, but `latest` stays on `2.0.3`. The GitHub Release's "Latest" badge (`make_latest`) follows the same rule. Prereleases move none of them.
+The tagged commit must be on `main` (preflight refuses any other). So a `v1.6.1` tagged there after `v2.0.3` gets `1.6.1`, `1.6` and `1`, but `latest` stays on `2.0.3`. The GitHub Release's "Latest" badge (`make_latest`) follows the same rule. Prereleases move none of them.
 
 ## Cutting a release
 
@@ -49,6 +50,7 @@ Watch the workflow at `https://github.com/developerz-ai/db-mcp-gateway/actions`.
 
 - `ghcr.io/developerz-ai/db-mcp-gateway:X.Y.Z` is pullable.
 - `ghcr.io/developerz-ai/db-mcp-gateway:latest` points at it, if it is the highest release.
+- `helm show chart oci://ghcr.io/developerz-ai/charts/db-mcp-gateway --version X.Y.Z` answers. GHCR creates a new package private: after the first chart publish, an owner makes it public once in the package settings.
 - A GitHub Release exists with the changelog.
 
 ## Versioning
@@ -67,7 +69,13 @@ Post-1.0:
 
 ## Image provenance
 
-The image is built from a clean checkout of the tagged commit by GitHub Actions — by `ci.yml` on the `main` push, or by `release.yml` itself on the fallback path. No SLSA provenance or signature is attached yet: the workflow holds no `id-token: write` permission, and adding provenance is on the roadmap.
+The image is built once, from a clean checkout, by `ci.yml` on the `main` push; `release.yml` only re-tags it. Each per-arch image carries a BuildKit SBOM and max-mode SLSA provenance. `release.yml` then signs the release index (cosign keyless, the workflow's own OIDC identity) and attests its build provenance, in both registries, before `latest` moves; the Helm chart is signed and attested the same way. Verify the image (the chart: [Kubernetes](kubernetes.md#install-with-helm)):
+
+```bash
+cosign verify ghcr.io/developerz-ai/db-mcp-gateway:X.Y.Z \
+  --certificate-identity-regexp '^https://github\.com/developerz-ai/db-mcp-gateway/\.github/workflows/release\.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
 
 ### Image labels on a reused image
 

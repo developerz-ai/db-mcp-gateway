@@ -46,8 +46,10 @@ const BACKGROUND_SESSION_SQL: &str =
 /// connections keep it off the request pool without competing with it.
 const BACKGROUND_POOL_SIZE: u32 = 2;
 /// The permissions listener pins one connection for `LISTEN` and briefly
-/// takes a second for its liveness ping.
-const LISTENER_POOL_SIZE: u32 = 2;
+/// takes a second for its liveness ping. The third stands in for a `LISTEN`
+/// connection that died silently: it keeps its slot until TCP gives up on it
+/// (minutes), and without a spare the ping would find no connection.
+const LISTENER_POOL_SIZE: u32 = 3;
 /// How long a state-DB caller waits for a pooled connection.
 pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 

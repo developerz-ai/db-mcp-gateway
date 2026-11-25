@@ -13,7 +13,7 @@ use super::super::app_state::OAuthState;
 use super::helpers::{form_rejected, oauth_error, random_token};
 use super::resource;
 use super::urls::MCP_SCOPE;
-use crate::auth::oauth::{AuthCode, AuthFacade, IssuedTokens, MintError, Refreshed};
+use crate::auth::oauth::{AuthCode, AuthFacade, IssuedTokens, MintError, Refreshed, StoreError};
 
 #[derive(Deserialize)]
 pub struct TokenForm {
@@ -97,7 +97,7 @@ async fn token_authorization_code(state: &OAuthState, form: TokenForm) -> Respon
                 "authorization code is invalid or expired",
             );
         }
-        Err(_) => return issue_failed(),
+        Err(_) => return state_unavailable(),
     };
 
     // client_id, when sent, must match the registrant (RFC 6749 §3.2.1).
@@ -143,13 +143,12 @@ async fn token_authorization_code(state: &OAuthState, form: TokenForm) -> Respon
     // does its registration earn the long TTL. Before minting, so a failure
     // never leaves a session behind an error response. A registration that
     // lapsed mid-login has nothing to promote; the login still stands.
-    if state
-        .client_registry
-        .promote(&entry.client_id)
-        .await
-        .is_err()
-    {
-        return restore_code(auth, code, entry, issue_failed()).await;
+    if let Err(err) = state.client_registry.promote(&entry.client_id).await {
+        let retry = match err {
+            StoreError::StoreFull => issue_failed(),
+            StoreError::Backend => state_unavailable(),
+        };
+        return restore_code(auth, code, entry, retry).await;
     }
 
     // Fresh authorization → fresh session + refresh-token chain. The identity
@@ -183,6 +182,17 @@ fn issue_failed() -> Response {
         StatusCode::SERVICE_UNAVAILABLE,
         "server_error",
         "could not issue tokens; try again",
+    )
+}
+
+/// [`issue_failed`], because the state DB is down. `server_error` sends some
+/// MCP clients to a fresh browser login on a refresh; this code asks for a
+/// retry, as `/authorize` and `/register` do.
+fn state_unavailable() -> Response {
+    oauth_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "temporarily_unavailable",
+        "could not reach the gateway's state database; try again",
     )
 }
 
@@ -247,14 +257,14 @@ fn token_response(issued: Result<IssuedTokens, AuthError>) -> Response {
                 "gateway temporarily overloaded; try again",
             );
         }
+        Err(AuthError::StateUnavailable) => {
+            tracing::warn!("token issuance failed (state DB unavailable)");
+            return state_unavailable();
+        }
         Err(_) => {
             // No error source: `AuthError::State` can carry the DSN.
             tracing::warn!("token issuance failed (state DB)");
-            return oauth_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "server_error",
-                "could not issue tokens; try again",
-            );
+            return issue_failed();
         }
     };
     let body = json!({

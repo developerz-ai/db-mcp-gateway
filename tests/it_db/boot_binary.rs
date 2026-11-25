@@ -127,6 +127,15 @@ impl BinaryGateway {
         }
     }
 
+    /// Send the process `SIGTERM`, as `docker stop` and the kubelet do.
+    pub fn terminate(&self) {
+        let status = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill -TERM: {status}");
+    }
+
     /// Wait for the process to exit on its own within `within`.
     pub async fn wait_exit(&mut self, within: Duration) -> ExitStatus {
         let deadline = Instant::now() + within;

@@ -29,6 +29,9 @@ metadata:
     app.kubernetes.io/component: metrics
 spec:
   type: ClusterIP
+  # A draining pod is not ready but still serves /metrics: keep it a target.
+  # No client traffic comes this way; `metrics` is this Service's only port.
+  publishNotReadyAddresses: true
   selector:
     {{- include "gateway.selectorLabels" . | nindent 4 }}
   ports:

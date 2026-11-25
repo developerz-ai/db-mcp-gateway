@@ -19,14 +19,23 @@
 //! listens on — and treats [`Liveness::deadline`] of silence as a lost
 //! connection: a ping that reaches the server but not the listener means
 //! the listener's own connection is gone.
+//!
+//! A pooler may hold a notification back: pgcat in session mode relays a
+//! server's bytes only while it answers a client's request. So the listener
+//! also pokes its own connection every [`Liveness::ping_every`], which makes
+//! such a pooler hand over what it holds — a change arrives within one beat
+//! there instead of at once. The ping stays on another connection: only a
+//! notification from elsewhere proves that a change from elsewhere arrives,
+//! so behind a pooler that drops them (transaction mode) the deadline still
+//! passes, warns and flushes.
 
 use std::convert::Infallible;
 use std::future::Future;
 use std::time::Duration;
 
-use sqlx::postgres::PgListener;
-use sqlx::{PgPool, Postgres, Transaction};
-use tokio::time::{Instant, MissedTickBehavior, timeout};
+use sqlx::postgres::{PgListener, PgNotification};
+use sqlx::{Executor as _, PgPool, Postgres, Transaction};
+use tokio::time::{Instant, Interval, MissedTickBehavior, timeout};
 
 use super::super::{PermissionsChange, RepoError};
 
@@ -37,10 +46,13 @@ const PING_CHANNEL: &str = "dbmcp_permissions_ping";
 const RECONNECT_MIN: Duration = Duration::from_millis(500);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
+/// Any request makes a pooler relay; this is the cheapest that has an answer.
+const POKE_SQL: &str = "SELECT 1";
+
 /// How the listener proves its connection still delivers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Liveness {
-    /// Interval between self-pings.
+    /// Interval between self-pings, and between pokes.
     pub ping_every: Duration,
     /// Silence longer than this — no ping, no change — is a lost connection.
     /// Several `ping_every` long, so one slow ping is not a miss.
@@ -100,7 +112,7 @@ where
             tracing::info!("permissions listener recovered; grant cache flushed");
         }
         tokio::select! {
-            () = drain(&mut listener, liveness.deadline, &on_change) => {}
+            () = drain(&mut listener, liveness, &on_change) => {}
             never = ping(&pool, liveness.ping_every) => match never {},
         }
         lost = true;
@@ -151,6 +163,9 @@ where
 async fn subscribe(pool: &PgPool, deadline: Duration) -> Result<PgListener, &'static str> {
     let connect = async {
         let mut listener = PgListener::connect_with(pool).await?;
+        // The caller resubscribes on a fresh listener; one that reconnects by
+        // itself would lose notifications before the caller could flush.
+        listener.eager_reconnect(false);
         listener.listen_all([CHANNEL, PING_CHANNEL]).await?;
         Ok::<_, sqlx::Error>(listener)
     };
@@ -161,16 +176,24 @@ async fn subscribe(pool: &PgPool, deadline: Duration) -> Result<PgListener, &'st
     }
 }
 
-/// Deliver notifications until the connection drops or goes silent.
-async fn drain<F, Fut>(listener: &mut PgListener, deadline: Duration, on_change: &F)
+/// Deliver notifications until the connection drops or goes silent. Only a
+/// notification moves the deadline: an answered poke proves the connection,
+/// not that a change announced on another one arrives.
+async fn drain<F, Fut>(listener: &mut PgListener, liveness: Liveness, on_change: &F)
 where
     F: Fn(PermissionsChange) -> Fut,
     Fut: Future<Output = ()>,
 {
+    let Liveness {
+        ping_every,
+        deadline,
+    } = liveness;
+    let mut poke = tokio::time::interval(ping_every);
+    poke.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        // Only the receive is under the deadline; on a miss the listener is
-        // dropped, so the cancelled receive is never resumed.
-        match timeout(deadline, listener.try_recv()).await {
+        // On a miss the listener is dropped, so a poke cut off here is never
+        // followed by another request on its connection.
+        match timeout(deadline, next_notification(listener, &mut poke)).await {
             Ok(Ok(Some(n))) if n.channel() == PING_CHANNEL => {}
             Ok(Ok(Some(n))) => on_change(PermissionsChange::decode(n.payload())).await,
             Ok(Ok(None)) => {
@@ -187,6 +210,24 @@ where
                     "permissions listener heard no ping within the liveness deadline; reconnecting"
                 );
                 return;
+            }
+        }
+    }
+}
+
+/// The next notification, poking the connection while there is none; `None`
+/// when the connection is lost.
+async fn next_notification(
+    listener: &mut PgListener,
+    poke: &mut Interval,
+) -> Result<Option<PgNotification>, sqlx::Error> {
+    loop {
+        tokio::select! {
+            // Cancel-safe: a receive only consumes whole messages, and
+            // `subscribe` turned its reconnect off.
+            received = listener.try_recv() => return received,
+            _ = poke.tick() => {
+                listener.execute(POKE_SQL).await?;
             }
         }
     }

@@ -42,88 +42,150 @@ fn envelope(body: &str) -> String {
     format!("<{SYSLOG_PRI}>1 {timestamp} - {SYSLOG_APP_NAME} {pid} audit - {body}")
 }
 
-/// [`format_rfc5424`], cut to [`MAX_MESSAGE_BYTES`]. The `sql` field is cut
-/// first when it alone can absorb the excess, then `params`, then the other
-/// free text; the body stays valid JSON
-/// throughout, and a row that still does not fit is sent as its identity.
+/// Bytes of JSON a cut field keeps while another field can still absorb the
+/// excess, so one long field never costs the row the rest of its text.
+const CUT_FLOOR: usize = 512;
+
+/// Bytes of `error_message` the identity-only message keeps.
+const IDENTITY_ERROR_BYTES: usize = 512;
+
+/// [`format_rfc5424`], cut to [`MAX_MESSAGE_BYTES`]. Free text is cut field by
+/// field in [`CUT_ORDER`] until the message fits: first down to [`CUT_FLOOR`]
+/// each, then, when the row's other fields leave no room for that, to the
+/// marker alone. Every cut ends in [`TRUNCATION_MARKER`] and the body stays
+/// valid JSON throughout; a row that still does not fit is sent as its
+/// identity.
 pub(in crate::audit::stream) fn message(row: &AuditRow) -> String {
-    let message = format_rfc5424(row);
-    let Some(excess) = message.len().checked_sub(MAX_MESSAGE_BYTES) else {
-        return message;
-    };
-    // Budgeted by encoded size: escaping makes a quote two bytes and a
-    // control character six, so a raw-length cut can leave the body too big.
     let mut shrunk = row.clone();
-    if let Some(sql) = row.sql.as_deref()
-        && let Some(keep) = json_len(sql).checked_sub(excess + TRUNCATION_MARKER.len())
-    {
-        shrunk.sql = Some(format!(
-            "{}{TRUNCATION_MARKER}",
-            prefix_within_json_len(sql, keep)
-        ));
-        let message = format_rfc5424(&shrunk);
-        if message.len() <= MAX_MESSAGE_BYTES {
-            return message;
+    let mut message = format_rfc5424(&shrunk);
+    for floor in [CUT_FLOOR, 0] {
+        for field in CUT_ORDER {
+            let Some(excess) = over_cap(&message) else {
+                return message;
+            };
+            if field.cut(row, &mut shrunk, excess, floor) {
+                message = format_rfc5424(&shrunk);
+            }
         }
     }
-    if let Some(message) = cut_params(&mut shrunk) {
-        return message;
+    match over_cap(&message) {
+        None => message,
+        Some(_) => identity_only(row),
     }
-    for text in [
-        &mut shrunk.reason,
-        &mut shrunk.error_message,
-        &mut shrunk.agent_client,
-        &mut shrunk.upstream_actor,
-        &mut shrunk.upstream_run_id,
-    ] {
-        if text.is_some() {
-            *text = Some(TRUNCATION_MARKER.to_owned());
-        }
-    }
-    let message = format_rfc5424(&shrunk);
-    if message.len() <= MAX_MESSAGE_BYTES {
-        return message;
-    }
-    identity_only(row)
 }
 
-/// Cut `params` until the message fits; `None` if even an empty cut does not.
-fn cut_params(shrunk: &mut AuditRow) -> Option<String> {
-    let params = shrunk.params.as_ref().map(ToString::to_string)?;
-    // A cut array becomes a JSON string, as in `audit_calls.params`. Its
-    // escapes make the string's encoding longer than the raw prefix, so the
-    // cut shrinks by each overshoot until the body fits.
-    let excess = format_rfc5424(shrunk)
+/// How far `message` is past the cap; `None` when it fits.
+fn over_cap(message: &str) -> Option<usize> {
+    message
         .len()
-        .saturating_sub(MAX_MESSAGE_BYTES);
-    let mut keep = params
-        .len()
-        .saturating_sub(excess + TRUNCATION_MARKER.len());
-    loop {
-        shrunk.params = Some(serde_json::Value::String(format!(
-            "{}{TRUNCATION_MARKER}",
-            prefix_at_char_boundary(&params, keep)
-        )));
-        let message = format_rfc5424(shrunk);
-        match message.len().checked_sub(MAX_MESSAGE_BYTES) {
-            None | Some(0) => return Some(message),
-            Some(_) if keep == 0 => return None,
-            Some(over) => keep = keep.saturating_sub(over),
-        }
+        .checked_sub(MAX_MESSAGE_BYTES)
+        .filter(|excess| *excess > 0)
+}
+
+/// A field [`message`] may cut.
+#[derive(Debug, Clone, Copy)]
+enum CutField {
+    Sql,
+    Params,
+    AgentClient,
+    UpstreamRunId,
+    UpstreamActor,
+    Reason,
+    ErrorMessage,
+}
+
+/// The error message last: it is what the receiver cannot rebuild from the
+/// rest of the row.
+const CUT_ORDER: [CutField; 7] = [
+    CutField::Sql,
+    CutField::Params,
+    CutField::AgentClient,
+    CutField::UpstreamRunId,
+    CutField::UpstreamActor,
+    CutField::Reason,
+    CutField::ErrorMessage,
+];
+
+impl CutField {
+    /// Shorten this field of `shrunk` by `excess` bytes of JSON or down to
+    /// `floor`, whichever leaves more. `row` holds the uncut text. `false`
+    /// when there is nothing a cut would save.
+    fn cut(self, row: &AuditRow, shrunk: &mut AuditRow, excess: usize, floor: usize) -> bool {
+        let (whole, sent) = match self {
+            Self::Params => return cut_params(row, shrunk, excess, floor),
+            Self::Sql => (&row.sql, &mut shrunk.sql),
+            Self::AgentClient => (&row.agent_client, &mut shrunk.agent_client),
+            Self::UpstreamRunId => (&row.upstream_run_id, &mut shrunk.upstream_run_id),
+            Self::UpstreamActor => (&row.upstream_actor, &mut shrunk.upstream_actor),
+            Self::Reason => (&row.reason, &mut shrunk.reason),
+            Self::ErrorMessage => (&row.error_message, &mut shrunk.error_message),
+        };
+        let (Some(whole), Some(now)) = (whole.as_deref(), sent.as_deref()) else {
+            return false;
+        };
+        let Some(cut) = cut_text(whole, quoted_len(now), excess, floor) else {
+            return false;
+        };
+        *sent = Some(cut);
+        true
     }
+}
+
+/// A cut array becomes a JSON string, as in `audit_calls.params`.
+fn cut_params(row: &AuditRow, shrunk: &mut AuditRow, excess: usize, floor: usize) -> bool {
+    let (Some(whole), Some(now)) = (&row.params, &shrunk.params) else {
+        return false;
+    };
+    let whole = match whole {
+        // Already cut for `audit_calls`: the string is the text itself.
+        serde_json::Value::String(text) => text.clone(),
+        array => array.to_string(),
+    };
+    let Some(cut) = cut_text(&whole, now.to_string().len(), excess, floor) else {
+        return false;
+    };
+    shrunk.params = Some(serde_json::Value::String(cut));
+    true
+}
+
+/// A marked prefix of `whole` whose JSON string is `excess` bytes shorter
+/// than the `now` bytes the field takes, or keeps `floor` bytes if that is
+/// longer. `None` when it would not be shorter than `now`.
+fn cut_text(whole: &str, now: usize, excess: usize, floor: usize) -> Option<String> {
+    let marker = quoted_len(TRUNCATION_MARKER);
+    let keep = now.saturating_sub(excess + marker).max(floor);
+    let prefix = prefix_within_json_len(whole, keep);
+    (prefix.len() < whole.len() && json_len(prefix) + marker < now)
+        .then(|| format!("{prefix}{TRUNCATION_MARKER}"))
 }
 
 /// The last resort for a row whose fixed fields (groups, email) alone pass
-/// the cap: enough to find the durable `audit_calls` row, still one object.
+/// the cap: enough to find the durable `audit_calls` row, and the start of
+/// what went wrong, still one object.
 fn identity_only(row: &AuditRow) -> String {
+    let error_message = row.error_message.as_deref().map(|text| {
+        let kept = prefix_within_json_len(text, IDENTITY_ERROR_BYTES);
+        let marker = if kept.len() < text.len() {
+            TRUNCATION_MARKER
+        } else {
+            ""
+        };
+        format!("{kept}{marker}")
+    });
     let body = serde_json::json!({
         "id": row.id,
         "request_id": prefix_at_char_boundary(&row.request_id, 128),
         "tool": prefix_at_char_boundary(&row.tool, 128),
         "outcome": row.outcome,
+        "error_message": error_message,
         "message_truncated": true,
     });
     envelope(&body.to_string())
+}
+
+/// The bytes `text` takes as a JSON string.
+fn quoted_len(text: &str) -> usize {
+    json_len(text) + 2
 }
 
 /// The bytes `text` takes inside a JSON string, quotes excluded.
@@ -159,3 +221,7 @@ fn json_char_len(ch: char) -> usize {
 pub(in crate::audit::stream) fn octet_frame(message: &str) -> String {
     format!("{} {message}", message.len())
 }
+
+#[cfg(test)]
+#[path = "format_tests.rs"]
+mod tests;

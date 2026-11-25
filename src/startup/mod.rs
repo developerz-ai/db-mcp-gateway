@@ -11,6 +11,7 @@ mod boot;
 mod logging;
 mod metrics;
 mod serve;
+mod shutdown;
 mod state_db;
 
 pub(crate) use background::{
@@ -21,6 +22,7 @@ pub(crate) use logging::{init_logging, spawn_dropped_lines_exporter};
 pub(crate) use metrics::state_pools::spawn_state_pool_sampler;
 pub(crate) use metrics::{install_recorder, spawn_listener as spawn_metrics_listener};
 pub(crate) use serve::serve;
+pub(crate) use shutdown::Shutdown;
 pub(crate) use state_db::{connect_budget_from_env, connect_state_db};
 
 /// Install the shutdown signal handlers and return a future that resolves on
@@ -28,7 +30,7 @@ pub(crate) use state_db::{connect_budget_from_env, connect_state_db};
 /// `docker stop`. The awaited future cancels `stop` — the token `AppState`
 /// carries as `shutdown` — *before* axum starts draining, so `/healthz` and
 /// `/readyz` go 503 in time for k8s to pull the pod out of the Service
-/// endpoint set, and background loops and the metrics listener wind down.
+/// endpoint set, and background loops wind down.
 ///
 /// The SIGTERM handler is registered **synchronously** here so a registration
 /// failure surfaces as an `Err` the caller bubbles to `main`, failing boot —

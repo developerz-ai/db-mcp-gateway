@@ -38,7 +38,7 @@ use async_trait::async_trait;
 use mongodb::Client;
 use mongodb::options::{ClientOptions, Credential, ServerAddress, Tls as MongoTls, TlsOptions};
 use secrecy::ExposeSecret;
-use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::audit::drain::DetachedTasks;
 use crate::config::{Database, Server, Tls};
@@ -182,9 +182,10 @@ impl MongoAdapter {
 
     /// A connection of the pool reserved for one command, waited for at most
     /// [`CONNECT_TIMEOUT`] outside the statement budget, as on Postgres.
-    async fn reserve_connection(&self) -> Result<SemaphorePermit<'_>, ExecError> {
+    async fn reserve_connection(&self) -> Result<OwnedSemaphorePermit, ExecError> {
         let started = std::time::Instant::now();
-        let reserved = tokio::time::timeout(CONNECT_TIMEOUT, self.connections.acquire()).await;
+        let acquire = Arc::clone(&self.connections).acquire_owned();
+        let reserved = tokio::time::timeout(CONNECT_TIMEOUT, acquire).await;
         pool_metrics::record_acquire_wait(&self.db_label, "query", started.elapsed());
         match reserved {
             Ok(Ok(permit)) => Ok(permit),
@@ -234,7 +235,10 @@ impl DbAdapter for MongoAdapter {
     /// covered by the driver's own `killCursors` on `Cursor::drop`, not by
     /// this guard — the marker rides on the initial `find` / `aggregate`
     /// but each `getMore` round-trip is a fresh operation with no marker
-    /// to find. Three things keep even the initial-phase kill short of a
+    /// to find. That `killCursors` runs on a task of the driver's, where no
+    /// permit can follow it: it stays inside the driver's `max_pool_size`,
+    /// and only a byte-cap cut, a catalog cut or a mid-drain stop leaves a
+    /// cursor to close. Three things keep even the initial-phase kill short of a
     /// guarantee (see `cancel` module docs for the full rationale):
     /// `killOp` and `currentOp` (with `$ownOps: false`) both require
     /// cluster-admin privileges the least-privilege mongo role doesn't
