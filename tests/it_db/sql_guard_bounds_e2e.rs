@@ -44,12 +44,13 @@ async fn boot() -> LoggedInGateway {
 /// header, the key of this call's own audit row) and the tool result.
 #[derive(Debug)]
 struct Called {
+    tool: &'static str,
     request_id: String,
     is_error: bool,
     body: Value,
 }
 
-async fn call(gateway: &LoggedInGateway, tool: &str, sql: &str) -> Called {
+async fn call(gateway: &LoggedInGateway, tool: &'static str, sql: &str) -> Called {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
@@ -73,6 +74,7 @@ async fn call(gateway: &LoggedInGateway, tool: &str, sql: &str) -> Called {
         .as_str()
         .unwrap_or_else(|| panic!("tool result text: {response}"));
     Called {
+        tool,
         request_id,
         is_error: response["result"]["isError"] == true,
         body: serde_json::from_str(text).expect("JSON body"),
@@ -80,11 +82,20 @@ async fn call(gateway: &LoggedInGateway, tool: &str, sql: &str) -> Called {
 }
 
 /// The one audit row of `called`, found by its own `request_id` so an earlier
-/// call's row can never stand in for it, carries `outcome`.
+/// call's row can never stand in for it, carries `outcome` and names the
+/// signed-in user and the tool.
 async fn assert_audited(gateway: &LoggedInGateway, called: &Called, outcome: &str) {
     let rows = calls_for_request(&gateway.state_db, &called.request_id).await;
     let outcomes: Vec<_> = rows.iter().map(|(outcome, _)| outcome.as_str()).collect();
     assert_eq!(outcomes, [outcome], "{}", called.body);
+    let caller: (String, String) =
+        sqlx::query_as("SELECT user_sub, tool FROM audit_calls WHERE request_id = $1")
+            .bind(&called.request_id)
+            .fetch_one(&gateway.state_db)
+            .await
+            .expect("audit row");
+    let expected = (gateway.user_sub.clone(), called.tool.to_string());
+    assert_eq!(caller, expected, "{}", called.body);
 }
 
 async fn assert_refused(gateway: &LoggedInGateway, called: &Called, code: &str, names: &str) {

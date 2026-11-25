@@ -68,8 +68,13 @@ spec:
               value: "0.0.0.0:8443"
             - name: METRICS_BIND
               value: "0.0.0.0:{{ .Values.metrics.port }}"
+            {{- /* An extraEnv entry of the same name replaces the default. */}}
+            {{- $ownThreads := false }}
+            {{- range .Values.extraEnv }}{{ if eq .name "TOKIO_WORKER_THREADS" }}{{ $ownThreads = true }}{{ end }}{{ end }}
+            {{- if not $ownThreads }}
             - name: TOKIO_WORKER_THREADS
               value: {{ include "db-mcp-gateway.workerThreads" . | quote }}
+            {{- end }}
             - name: STATE_DB_CONNECT_TIMEOUT_SECONDS
               value: {{ .Values.stateDb.connectTimeoutSeconds | quote }}
             - name: OIDC_ISSUER
