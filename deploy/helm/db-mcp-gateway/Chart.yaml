@@ -5,7 +5,7 @@ type: application
 # The chart's own version; bumped with any template change.
 version: 0.1.0
 # The image tag deployed when image.tag is empty.
-appVersion: "2.4.1"
+appVersion: "2.5.0"
 # lifecycle.preStop.sleep (PodLifecycleSleepAction) is on by default from 1.30.
 kubeVersion: ">=1.30.0-0"
 home: https://github.com/developerz-ai/db-mcp-gateway
