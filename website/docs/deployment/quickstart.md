@@ -545,4 +545,4 @@ Point them at [../usage/first-query.md](../usage/first-query.md) — 5-minute ha
 
 ## Helm / Kubernetes
 
-The Helm chart (`deploy/helm/db-mcp-gateway`, published as `oci://ghcr.io/developerz-ai/charts/db-mcp-gateway`) and a kustomize base ship in this repository, with Prometheus alerts, a Grafana dashboard and a runbook: see [Kubernetes](kubernetes.md).
+The Helm chart (`deploy/helm/db-mcp-gateway`, published as `oci://ghcr.io/developerz-ai/db-mcp-gateway/charts/db-mcp-gateway`) and a kustomize base ship in this repository, with Prometheus alerts, a Grafana dashboard and a runbook: see [Kubernetes](kubernetes.md).

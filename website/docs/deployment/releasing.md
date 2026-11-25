@@ -10,7 +10,7 @@ Releases are triggered by a `v*` git tag. The `.github/workflows/release.yml` wo
    - An Actions API error, or a run still going after 40 minutes, fails the job; re-run it.
 3. Tags it `X.Y.Z` and, where preflight allows, `X.Y`, `X` and `latest`.
 4. Pushes the same tag set to two registries: `ghcr.io/developerz-ai/db-mcp-gateway` (the public artifact) and a DigitalOcean Container Registry mirror (the in-cluster source the ArgoCD Image Updater tracks).
-5. Once the image is published and signed, packages `deploy/helm/db-mcp-gateway` at the release version (chart version and `appVersion`), pushes it to `oci://ghcr.io/developerz-ai/charts/db-mcp-gateway`, signs it (cosign keyless) and attests its provenance. If this job fails the image stays published and the GitHub Release is not created; re-run the job. A re-run reuses the chart the same commit already pushed, and a version already published with other content fails instead of moving.
+5. Once the image is published and signed, packages `deploy/helm/db-mcp-gateway` at the release version (chart version and `appVersion`), pushes it to `oci://ghcr.io/developerz-ai/db-mcp-gateway/charts/db-mcp-gateway`, signs it (cosign keyless) and attests its provenance. If this job fails the image stays published and the GitHub Release is not created; re-run the job. A re-run reuses the chart the same commit already pushed, and a version already published with other content fails instead of moving.
 6. Creates a GitHub Release with auto-generated notes.
 
 GHCR is the public distribution channel because this is an open-source project — public images are free, unmetered for pulls, and don't have Docker Hub's rate limits.
@@ -50,7 +50,7 @@ Watch the workflow at `https://github.com/developerz-ai/db-mcp-gateway/actions`.
 
 - `ghcr.io/developerz-ai/db-mcp-gateway:X.Y.Z` is pullable.
 - `ghcr.io/developerz-ai/db-mcp-gateway:latest` points at it, if it is the highest release.
-- `helm show chart oci://ghcr.io/developerz-ai/charts/db-mcp-gateway --version X.Y.Z` answers. GHCR creates a new package private: after the first chart publish, an owner makes it public once in the package settings.
+- `helm show chart oci://ghcr.io/developerz-ai/db-mcp-gateway/charts/db-mcp-gateway --version X.Y.Z` answers. GHCR creates a new package private: after the first chart publish, an owner makes it public once in the package settings.
 - A GitHub Release exists with the changelog.
 
 ## Versioning

@@ -20,9 +20,9 @@ env:
   # registries; `DOCR_TOKEN` authenticates the DOCR probe and re-tag.
   DOCR_REGISTRY: registry.digitalocean.com
   DOCR_IMAGE_NAME: developerz-ai/db-mcp-gateway
-  # The Helm chart's own OCI path, beside the image's: one repository holding
+  # The Helm chart's own OCI path, below the image's: one repository holding
   # both would put a chart and an image on the same version tag. GHCR only.
-  CHART_PARENT: ghcr.io/${{ github.repository_owner }}/charts
+  CHART_PARENT: ghcr.io/${{ github.repository }}/charts
 
 jobs:
   # Gate every publish on three checks: the tag must be on `main` (only `main`

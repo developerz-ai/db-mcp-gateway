@@ -2,7 +2,7 @@
 # Package deploy/helm/db-mcp-gateway as chart <version> (appVersion too), push
 # it to the OCI repository <parent>/db-mcp-gateway and print the pushed digest.
 #
-#   publish_chart.sh <version> <parent>   # e.g. 2.7.0 ghcr.io/developerz-ai/charts
+#   publish_chart.sh <version> <parent>   # e.g. 2.7.0 ghcr.io/developerz-ai/db-mcp-gateway/charts
 #
 # The archive is byte-reproducible for one commit (sorted, commit-time mtimes),
 # so a re-run of a failed release recognises its own chart: the version already

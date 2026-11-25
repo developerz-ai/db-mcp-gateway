@@ -138,7 +138,7 @@ class ReleaseWorkflow(unittest.TestCase):
         self.assertIn("needs: [preflight, merge, chart]\n", job(self.workflow, "github_release"))
 
     def test_the_chart_never_shares_the_image_repository(self):
-        self.assertIn("CHART_PARENT: ghcr.io/${{ github.repository_owner }}/charts\n", self.workflow)
+        self.assertIn("CHART_PARENT: ghcr.io/${{ github.repository }}/charts\n", self.workflow)
 
     def test_the_chart_is_pushed_signed_then_attested(self):
         chart = job(self.workflow, "chart")

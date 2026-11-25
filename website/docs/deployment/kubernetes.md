@@ -1,6 +1,6 @@
 # Kubernetes
 
-The repository ships a Helm chart ([`deploy/helm/db-mcp-gateway`](https://github.com/developerz-ai/db-mcp-gateway/tree/main/deploy/helm/db-mcp-gateway)), a minimal kustomize base mirroring it ([`deploy/kustomize/base`](https://github.com/developerz-ai/db-mcp-gateway/tree/main/deploy/kustomize/base)), Prometheus alerts, a Grafana dashboard and a runbook ([`deploy/`](https://github.com/developerz-ai/db-mcp-gateway/tree/main/deploy)). Each release publishes the chart at its own version as a signed OCI artifact, `oci://ghcr.io/developerz-ai/charts/db-mcp-gateway` (from the first release after 2.6.0).
+The repository ships a Helm chart ([`deploy/helm/db-mcp-gateway`](https://github.com/developerz-ai/db-mcp-gateway/tree/main/deploy/helm/db-mcp-gateway)), a minimal kustomize base mirroring it ([`deploy/kustomize/base`](https://github.com/developerz-ai/db-mcp-gateway/tree/main/deploy/kustomize/base)), Prometheus alerts, a Grafana dashboard and a runbook ([`deploy/`](https://github.com/developerz-ai/db-mcp-gateway/tree/main/deploy)). Each release publishes the chart at its own version as a signed OCI artifact, `oci://ghcr.io/developerz-ai/db-mcp-gateway/charts/db-mcp-gateway` (from the first release after 2.6.0).
 
 **Requires Kubernetes ≥ 1.30**: the pod's `preStop` hook is the native `sleep` action (`PodLifecycleSleepAction`, on by default from 1.30). The image is distroless — there is no shell for an `exec` hook. The chart's `kubeVersion` refuses older clusters.
 
@@ -66,14 +66,14 @@ networkPolicy:
 
 ```bash
 # X.Y.Z = the gateway release to run: chart version, appVersion and image tag are the same
-helm install gateway oci://ghcr.io/developerz-ai/charts/db-mcp-gateway --version X.Y.Z \
+helm install gateway oci://ghcr.io/developerz-ai/db-mcp-gateway/charts/db-mcp-gateway --version X.Y.Z \
   -n gateway -f my-values.yaml
 ```
 
 Or from a checkout: `helm install gateway ./deploy/helm/db-mcp-gateway …`. To verify the published chart before installing it:
 
 ```bash
-cosign verify ghcr.io/developerz-ai/charts/db-mcp-gateway:X.Y.Z \
+cosign verify ghcr.io/developerz-ai/db-mcp-gateway/charts/db-mcp-gateway:X.Y.Z \
   --certificate-identity-regexp '^https://github\.com/developerz-ai/db-mcp-gateway/\.github/workflows/release\.yml@refs/tags/v' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
