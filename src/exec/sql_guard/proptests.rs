@@ -91,7 +91,80 @@ fn arbitrary_denied_function() -> impl Strategy<Value = String> {
     .prop_map(|s| s.to_string())
 }
 
+/// What an admitted statement may be followed by: denied, however it is joined.
+fn denied_continuation() -> impl Strategy<Value = String> {
+    let join = proptest::sample::select(vec![
+        " END, ",
+        " end , ",
+        "\nEND\n, ",
+        " /* c */ END/**/,",
+        " END + ",
+        " END FROM ",
+        " END; SELECT ",
+        " ; END, ",
+        ", ",
+        " + ",
+        " FROM ",
+        " UNION SELECT ",
+        " AND, ",
+        " x, ",
+        " AS end, ",
+        " \"end\", ",
+        " END WHERE ",
+        " END ORDER BY ",
+        " ORDER BY ",
+        " LIMIT ",
+        " OR ",
+        " ",
+    ]);
+    let call = proptest::sample::select(vec![
+        "pg_notify('c', 'p')",
+        "pg_catalog.lo_creat(1)",
+        "\"set_config\"('a.b', 'c', true)",
+        "PG_LS_DIR('.')",
+        "TREAT(1 AS pg_advisory_lock)",
+        "cron.schedule('a', 'b')",
+        "pg_stat_activity",
+    ]);
+    (join, call).prop_map(|(join, call)| format!("{join}{call}"))
+}
+
+fn arbitrary_write() -> impl Strategy<Value = String> {
+    proptest::sample::select(vec![
+        "INSERT INTO t VALUES (1)",
+        "INSERT INTO t SELECT a FROM u RETURNING a",
+        "UPDATE t SET x = 1 WHERE a",
+        "DELETE FROM t WHERE a RETURNING x",
+    ])
+    .prop_map(str::to_string)
+}
+
 proptest! {
+    /// No denied name that follows an admitted statement is ever admitted.
+    #[test]
+    fn a_denied_continuation_is_never_admitted(
+        sql in prop_oneof![arbitrary_safe_select(), arbitrary_write()],
+        soup in token_soup(),
+        tail in denied_continuation(),
+        more in prop_oneof![Just(""), Just(" END"), Just(" FROM t"), Just("; SELECT 1")],
+    ) {
+        for text in [format!("{sql}{tail}{more}"), format!("{sql}{soup}{tail}{more}")] {
+            // The soup may put the call in a string or comment: judge the text
+            // as Postgres tokenizes it.
+            let plain = as_postgres_tokens(&text).unwrap_or_default().to_lowercase();
+            let written = [
+                "pg_notify (", "lo_creat (", "\"set_config\" (", "pg_ls_dir (", "treat (",
+                "schedule (", "pg_stat_activity",
+            ];
+            if !written.iter().any(|call| plain.contains(call)) {
+                continue;
+            }
+            for access in [Access::ReadOnly, Access::ReadWrite] {
+                prop_assert!(check_sql(&text, access).is_err(), "{access:?}: {text:?}");
+            }
+        }
+    }
+
     #[test]
     fn never_panics_on_arbitrary_strings(s in ".{0,200}") {
         // We don't care about the result — just that the parser path

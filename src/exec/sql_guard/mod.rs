@@ -26,7 +26,8 @@
 //! differently from sqlparser: a Unicode-escaped identifier (`U&"…"`), or
 //! any text the two split into different tokens (`lexical`, `pg_scan`).
 //! A relation showing other sessions' statements is refused by name.
-//! The statement's length and structure are bounded first (`bounds`).
+//! The statement's length and structure are bounded first (`bounds`), and its
+//! lexemes are held against the denylist whatever the tree holds (`tokens`).
 //! Conservative on purpose: better to reject a legitimate exotic statement
 //! than quietly send an unintended one.
 //!
@@ -49,6 +50,7 @@ mod denylist;
 mod lexical;
 mod pg_scan;
 mod shape;
+mod tokens;
 mod visitor;
 
 #[cfg(test)]
@@ -59,12 +61,13 @@ mod tests;
 use sqlparser::ast::{Statement, Visit};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
-use sqlparser::tokenizer::Location;
+use sqlparser::tokenizer::{Location, Token};
 use std::ops::ControlFlow;
 
 use bounds::{check_bounds, check_length, with_parser_stack};
 use lexical::check_lexical;
-use shape::{check_statement_shape, explain_analyzes};
+use shape::{check_statement_shape, explain_analyzes, required_access};
+use tokens::check_tokens;
 use visitor::GuardVisitor;
 
 /// How much a query is allowed to do, decided upstream by the caller's grant
@@ -198,19 +201,30 @@ fn guard(sql: &str, access: Access) -> Result<Access, GuardError> {
     check_length(sql)?;
     let lexemes = check_lexical(sql)?;
     check_bounds(sql, &lexemes)?;
-    with_parser_stack(|| inspect(sql, access))
+    let required = with_parser_stack(|| inspect(sql, access))?;
+    check_tokens(sql, &lexemes)?;
+    Ok(required)
 }
 
 /// Parse, walk and drop the tree: sqlparser work only, and all of it, so no
 /// part of a tree — partial or refused — outlives the stack sized for it.
 fn inspect(sql: &str, access: Access) -> Result<Access, GuardError> {
     let dialect = PostgreSqlDialect {};
-    let statements = Parser::parse_sql(&dialect, sql).map_err(|e| match e {
+    let parse_error = |e| match e {
         ParserError::ParserError(message) | ParserError::TokenizerError(message) => {
             GuardError::Parse(SqlLocation::from_message(&message))
         }
         ParserError::RecursionLimitExceeded => GuardError::Parse(None),
-    })?;
+    };
+    let mut parser = Parser::new(&dialect)
+        .try_with_sql(sql)
+        .map_err(parse_error)?;
+    let statements = parser.parse_statements().map_err(parse_error)?;
+    // The statement must be read to its end.
+    let next = parser.peek_token();
+    if next.token != Token::EOF {
+        return Err(GuardError::Parse(SqlLocation::of(next.span.start)));
+    }
 
     match statements.len() {
         0 => return Err(GuardError::Parse(None)),
@@ -276,12 +290,4 @@ pub(crate) fn statement_body(sql: &str) -> Option<&str> {
         last.end
     };
     sql.get(start..end)
-}
-
-/// Only a `Query` reads; every other admitted shape is a data write.
-fn required_access(stmt: &Statement) -> Access {
-    match stmt {
-        Statement::Query(_) => Access::ReadOnly,
-        _ => Access::ReadWrite,
-    }
 }

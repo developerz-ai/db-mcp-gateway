@@ -90,3 +90,11 @@ pub(super) fn explain_analyzes(analyze: bool, options: Option<&[UtilityOption]>)
             })
         })
 }
+
+/// Only a `Query` reads; every other admitted shape is a data write.
+pub(super) fn required_access(stmt: &Statement) -> Access {
+    match stmt {
+        Statement::Query(_) => Access::ReadOnly,
+        _ => Access::ReadWrite,
+    }
+}
