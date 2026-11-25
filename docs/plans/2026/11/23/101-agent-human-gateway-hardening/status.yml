@@ -5,7 +5,7 @@ created_by: sebi
 worked_by: claude
 owner: sebi
 percent: 98
-current_focus: "Shipped: #400-#402, #404, #405, #408-#410, v2.4.1, v2.5.0, v2.5.1, v2.5.2 (smoke-tested), both deployments bumped. Open: H2 as draft #412 for the owner; leftovers in #413; follow-ups #378, #379, #375, #403, #406, #407, #411."
+current_focus: "Shipped: everything through v2.6.0 (#416, #417; run_scoped), both deployments bumped. Open: H2 as draft #412 for the owner; leftovers in #413; follow-ups #375, #378, #379, #403, #406, #407, #411."
 slices:
   - {file: 01-unblock-main.md, status: done, percent: 100, note: "`gate` is the single required CI check (ruleset + classic protection), 2026-11-24, owner approved"}
   - {file: 02-security-patch.md, status: done, percent: 100, note: "#377 + #380, v2.3.1, GHSA-j6xv-c57r-59rw published; guard hardening #401 and #405 (2.4.1, 2.5.1); H2 (second parser) built and open as draft #412 for the owner"}
@@ -27,6 +27,6 @@ decisions:
   - {date: 2026-11-23, by: sebi, rows: [H1, H9], decision: "full work: advisory drafted, published with 2.3.1; deny other-session statement views"}
   - {date: 2026-11-24, by: sebi, rows: [required-checks], decision: "make `gate` the single required check — applied after #381 merged"}
   - {date: 2026-11-24, by: sebi, rows: [H2], decision: "ship the second parser, in its own PR (asked after it was built, before any commit)"}
-evidence: ["#376", "#377", "#380", "v2.3.1", "GHSA-j6xv-c57r-59rw", "#381", "#394", "#393", "v2.4.0", "#396", "release-smoke 2.4.0 green (4/4)", "#400", "#401", "v2.4.1", "#404", "v2.5.0", "#405", "#409", "v2.5.1", "#408", "#410", "v2.5.2", "release-smoke green on 2.4.1, 2.5.0, 2.5.1, 2.5.2 (4/4 each)"]
+evidence: ["#376", "#377", "#380", "v2.3.1", "GHSA-j6xv-c57r-59rw", "#381", "#394", "#393", "v2.4.0", "#396", "release-smoke 2.4.0 green (4/4)", "#400", "#401", "v2.4.1", "#404", "v2.5.0", "#405", "#409", "v2.5.1", "#408", "#410", "v2.5.2", "#416", "#417", "v2.6.0", "release-smoke green on 2.4.1, 2.5.0, 2.5.1, 2.5.2, 2.6.0 (4/4 each)"]
 notes: "Human rows H1-H12 in overview.md. Repo-settings detail: owner's private notes. Deployment and consumer slices tracked in their own repositories."
 last_updated: 2026-11-25
