@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use db_mcp_gateway::auth::jwt;
+use db_mcp_gateway::exec::sql_guard::hold::hold;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -158,7 +159,8 @@ async fn signed_in(gateway: &TestGateway) -> LoggedInGateway {
 
 /// Nesting the parser retries is refused at its work budget, on a runtime of
 /// two workers with as many of the statements on it, short and at the length
-/// cap, while another caller's statements are answered.
+/// cap, while another caller's statements are answered, one of them while a
+/// guarded parse is held in progress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::parallel(world)]
 async fn a_statement_past_the_parser_work_budget_is_refused_and_audited_and_others_are_answered() {
@@ -193,6 +195,43 @@ async fn a_statement_past_the_parser_work_budget_is_refused_and_audited_and_othe
         .await
         .expect("every call is answered");
     assert_still_serving(&caller).await;
+
+    // As many held in their guarded parse as there are workers: the other
+    // caller is answered meanwhile.
+    let holds: Vec<_> = (0..2)
+        .map(|_| {
+            let marker = format!("m{}", Uuid::new_v4().simple());
+            let held = format!("SELECT {marker}, {}x", "NOT (a).".repeat(40));
+            let held = format!("{held}{}", ",a".repeat((CAP - held.len()) / 2));
+            (hold(&marker), held)
+        })
+        .collect();
+    let (holds, held): (Vec<_>, Vec<_>) = holds.into_iter().unzip();
+    let in_guard =
+        futures::future::join_all(held.iter().map(|sql| call(&caller, "run_query", sql)));
+    let meanwhile = async {
+        let entered = tokio::task::spawn_blocking(move || {
+            let wait = Duration::from_secs(20);
+            let entered = holds
+                .iter()
+                .all(|hold| hold.entered.recv_timeout(wait).is_ok());
+            (entered, holds)
+        });
+        let (entered, holds) = entered.await.expect("waits");
+        assert!(entered, "the statements are held in the guard");
+        tokio::time::timeout(Duration::from_secs(20), assert_still_serving(&other))
+            .await
+            .expect("answered while the other statements are held");
+        drop(holds);
+    };
+    let (called, ()) = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(in_guard, meanwhile)
+    })
+    .await
+    .expect("all answered");
+    for called in called {
+        assert_refused(&caller, &called, "forbidden_sql", "parser work budget").await;
+    }
 }
 
 /// What the target makes of a chain the guard admitted.

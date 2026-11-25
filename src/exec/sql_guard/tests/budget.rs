@@ -4,6 +4,7 @@
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
+use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use super::*;
@@ -122,11 +123,21 @@ fn another_panic_stays_a_panic() {
 /// The parser copies a token each time it looks at it.
 #[test]
 fn a_long_token_costs_by_its_length() {
+    let tag = format!("$t{}$", "z".repeat(32_000));
+    let dollar = format!("{tag}x{tag}");
     for quoted in ["'", "\""] {
         let long = format!("SELECT {quoted}{}{quoted}", "z".repeat(32_000));
         let (short, long) = (work("SELECT 'z'").steps, work(&long).steps);
         assert!(long > short + 32_000 / 16, "{quoted}: {short} {long}");
     }
+    let (short, long) = (
+        work("SELECT $t$x$t$").steps,
+        work(&format!("SELECT {dollar}")).steps,
+    );
+    assert!(
+        long > short + 32_000 / 16,
+        "a long dollar tag: {short} {long}"
+    );
 }
 
 #[test]
@@ -198,13 +209,15 @@ fn ordinary_nesting_stays_well_within() {
         ("(a::int + ", ")"),
         ("sum(", ") OVER (PARTITION BY a)"),
     ] {
-        // As deep as it is read at all.
+        // As deep as the parser reads it without a budget.
+        let unmetered = |sql: &String| Parser::parse_sql(&PostgreSqlDialect {}, sql).is_ok();
         let deepest = (1..60)
             .map(|levels| nested(opening, "a", closing, levels))
-            .take_while(|sql| matches!(measured(sql), Ok((Ok(_), _))))
+            .take_while(unmetered)
             .last()
             .unwrap_or_else(|| panic!("{opening} is never read"));
-        let work = work(&deepest);
+        let (parsed, work) = measured(&deepest).expect("tokens");
+        assert!(parsed.is_ok(), "{opening}: {parsed:?}");
         assert!(work.steps * 2 < work.allowance, "{opening}: {work:?}");
     }
 }

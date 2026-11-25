@@ -64,25 +64,48 @@ fn metered_dialect_reads_as_postgres_dialect() {
     }
 }
 
-/// Runs of whitespace and comments are passed over once.
+/// Runs of whitespace and comments are passed over once, which changes no
+/// tree but an optimizer hint's: a run keeps its first, and the guard reads
+/// no hint.
 #[test]
 fn whitespace_does_not_change_the_tree() {
-    let tree = |sql: &str| parse::parse(sql).expect("parses");
-    for (spaced, plain) in [
-        ("SELECT  a ,\n\n\tb", "SELECT a , b"),
-        ("SELECT/**/ /**/a--x\n--y\n+ 1", "SELECT a\n+ 1"),
-        (" /* a */ SELECT 'a /**/  b' ; -- c", "SELECT 'a /**/  b' ;"),
-        ("SELECT a . b,  c . *  FROM t", "SELECT a . b, c . * FROM t"),
+    for sql in [
+        "SELECT  a ,\n\n\tb",
+        "SELECT/**/ /**/a--x\n--y\n+ 1",
+        " /* a */ SELECT 'a /**/  b' ; -- c",
+        "SELECT a . b,  c . *  FROM t",
+        "SELECT a/**/./**/b, c\n.\n*, $1 /**/::int, x/* */[1] FROM t /* a */ AS /* b */ u",
+        "SELECT 1 /**/ /**/ /**/ -- x\n UNION /* y */ ALL\n\n SELECT 2",
+        "SELECT f(/**/ a /**/ => /**/ 1), 'a' -- c\n || 'b', E'x' /**/ FROM t",
+        "/*+ SeqScan(t) */ SELECT 1",
+        "WITH a AS ( /* x */ SELECT 1 ) SELECT * FROM a --",
     ] {
-        let normal = |sql| {
-            format!(
-                "{:?}",
-                tree(sql)
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-            )
-        };
-        assert_eq!(normal(spaced), normal(plain), "{spaced:?}");
+        let unmetered = Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("parses");
+        assert_eq!(parse::parse(sql), Ok(unmetered), "{sql:?}");
+    }
+    let hinted = "SELECT /* first */ /*+ SeqScan(t) */ 1";
+    let unmetered = Parser::parse_sql(&PostgreSqlDialect {}, hinted).expect("parses");
+    assert_ne!(parse::parse(hinted), Ok(unmetered.clone()));
+    assert_eq!(
+        parse::parse(hinted),
+        Parser::parse_sql(&PostgreSqlDialect {}, "SELECT /* first */ 1")
+            .map_err(|_| unreachable!())
+    );
+}
+
+/// Where whitespace decides the reading, it stays.
+#[test]
+fn whitespace_that_matters_is_kept() {
+    for sql in [
+        "SELECT :a",
+        "SELECT : a",
+        "SELECT a FROM t WHERE b = :c",
+        "SELECT x : y",
+    ] {
+        let unmetered = Parser::parse_sql(&PostgreSqlDialect {}, sql);
+        assert_eq!(parse::parse(sql).is_ok(), unmetered.is_ok(), "{sql:?}");
+        if let Ok(unmetered) = unmetered {
+            assert_eq!(parse::parse(sql), Ok(unmetered), "{sql:?}");
+        }
     }
 }

@@ -108,7 +108,9 @@ fn text_len(token: &Token) -> usize {
         | Token::SingleQuotedByteStringLiteral(text)
         | Token::CustomBinaryOperator(text)
         | Token::Placeholder(text) => text.len(),
-        Token::DollarQuotedString(quoted) => quoted.value.len(),
+        Token::DollarQuotedString(quoted) => {
+            quoted.value.len() + quoted.tag.as_ref().map_or(0, String::len)
+        }
         _ => 0,
     }
 }

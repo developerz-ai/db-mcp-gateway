@@ -11,7 +11,11 @@
 //! Counts only, never grammar: a count cannot be smaller than the structure
 //! the parser builds from the words.
 
+use std::num::NonZeroUsize;
+use std::sync::OnceLock;
+
 use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::sync::Semaphore;
 use tokio::task::block_in_place;
 
 use super::GuardError;
@@ -46,12 +50,35 @@ const MAX_BYTES_ON_WORKER: usize = 4 * 1024;
 /// Run `f` for a statement of `bytes` bytes with the thread's other tasks
 /// moved elsewhere, where there is elsewhere. Not `spawn_blocking`: there is
 /// no point to cancel at, and the statement is borrowed.
+///
+/// Off the worker, as many run at once as there are cores; the rest wait
+/// their turn. The wait is bounded without a deadline of its own: at most
+/// the gateway's concurrent requests are waiting, each for its turn of under
+/// a second.
 pub(super) fn off_the_worker<T>(bytes: usize, f: impl FnOnce() -> T) -> T {
-    let flavor = Handle::try_current().map(|runtime| runtime.runtime_flavor());
-    match flavor {
-        Ok(RuntimeFlavor::MultiThread) if bytes > MAX_BYTES_ON_WORKER => block_in_place(f),
+    let runtime = Handle::try_current().ok();
+    match runtime {
+        Some(runtime)
+            if runtime.runtime_flavor() == RuntimeFlavor::MultiThread
+                && bytes > MAX_BYTES_ON_WORKER =>
+        {
+            block_in_place(|| {
+                // Never closed, so a permit always comes.
+                let _turn = runtime.block_on(turns().acquire()).ok();
+                f()
+            })
+        }
         _ => f(),
     }
+}
+
+/// Statements guarded off the worker at once.
+pub(super) fn turns() -> &'static Semaphore {
+    static TURNS: OnceLock<Semaphore> = OnceLock::new();
+    TURNS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        Semaphore::new(cores)
+    })
 }
 
 pub(super) fn check_length(sql: &str) -> Result<(), GuardError> {

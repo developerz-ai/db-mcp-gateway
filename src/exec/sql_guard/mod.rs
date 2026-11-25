@@ -50,6 +50,8 @@ mod bounds;
 mod budget;
 mod denylist;
 mod error;
+#[cfg(any(test, feature = "test-support"))]
+pub mod hold;
 mod lexical;
 mod metered;
 mod parse;
@@ -132,7 +134,11 @@ pub fn check_sql(sql: &str, access: Access) -> Result<(), GuardError> {
 /// [`check_sql`], returning the access the admitted statement needs.
 fn guard(sql: &str, access: Access) -> Result<Access, GuardError> {
     check_length(sql)?;
-    off_the_worker(sql.len(), || guard_here(sql, access))
+    off_the_worker(sql.len(), || {
+        #[cfg(any(test, feature = "test-support"))]
+        hold::wait_if_held(sql);
+        guard_here(sql, access)
+    })
 }
 
 fn guard_here(sql: &str, access: Access) -> Result<Access, GuardError> {
