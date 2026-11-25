@@ -97,7 +97,9 @@ pub(super) fn infer_fields(lists: &[Value], cut: bool) -> Value {
             };
             let seen = fields.entry(path).or_default();
             // One document can spell a path twice (`a: {b: …}` and a literal
-            // `a.b`, or a name stored twice): it holds the field once.
+            // `a.b`, or a name stored twice): it holds the field once. A
+            // truncated sample's counts are lower bounds: a cut document may
+            // hold a field it did not get to.
             if seen.last_document != Some(document) {
                 seen.last_document = Some(document);
                 seen.count += 1;
