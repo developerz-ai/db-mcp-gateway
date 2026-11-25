@@ -119,11 +119,8 @@ mod tests {
         )
         .unwrap();
         let options = connect_options(&server, &server.databases[0], "r");
-        let rendered = format!("{options:?}");
-        assert!(
-            rendered.contains("statement_cache_capacity: 0,"),
-            "{rendered}"
-        );
+        // The options are not printed: they can hold a password.
+        assert!(format!("{options:?}").contains("statement_cache_capacity: 0,"));
     }
 
     #[test]
