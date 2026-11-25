@@ -124,9 +124,9 @@ Comprehensive feature breakdown of db-mcp-gateway with technical benefits and im
   - `explain` - Get query execution plans
   - `get_query_history` - Retrieve a user's own recent queries from the audit log
   - `table_stats` - Table and index sizes, row estimates, scan and vacuum statistics
-  - `db_activity` - The caller's own statements the gateway is running right now
+  - `db_activity` - The caller's own statements the gateway is running right now (`run_scoped: true`: refuse unless narrowed to the caller's run)
   - `whoami` - Your identity, groups, session expiry and grants
-  - `cancel_query` - Cancel one of the caller's own running statements by `request_id`
+  - `cancel_query` - Cancel one of the caller's own running statements by `request_id` (same `run_scoped`)
 
 ### Multi-Database Support
 - **What it does:** Single gateway instance fronts PostgreSQL, YugabyteDB (YSQL, as a Postgres target), MongoDB and Redis-protocol targets (Redis, Dragonfly, Valkey, KeyDB). MongoDB and Redis are read-only; MySQL/MSSQL are rejected at boot — see [multi-db](usage/multi-db.md)

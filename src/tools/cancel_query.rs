@@ -6,7 +6,8 @@
 //! `request_id` that is not the caller's on this `(server, database)` answers
 //! `forbidden`, the same as an unknown one, so ids cannot be probed. A
 //! service-token call that names its run (`x-dbmcp-run-id`) owns only that
-//! run's requests: another run's id answers the same `forbidden`. The
+//! run's requests: another run's id answers the same `forbidden`;
+//! `run_scoped: true` refuses a call that is not narrowed that way. The
 //! cancelled call fails with `cancelled` and writes its own audit row.
 
 use std::time::Instant;
@@ -26,7 +27,9 @@ use super::audit_dispatch::{
     error_outcome, invalid_arguments, outcome_from_exec_error, reject_arguments, run_audited,
     success_outcome,
 };
-use super::target::{Target, ensure_reason, forbidden, record_intent, resolve_target, run_scope};
+use super::target::{
+    Target, ensure_reason, ensure_run_scoped, forbidden, record_intent, resolve_target, run_scope,
+};
 
 const TOOL_NAME: &str = super::CANCEL_QUERY;
 const ERROR_MESSAGES: ToolErrorMessages = ToolErrorMessages {
@@ -43,6 +46,10 @@ pub struct Arguments {
     pub request_id: String,
     #[serde(default)]
     pub reason: Option<String>,
+    /// Answer only when the call is narrowed to the caller's run
+    /// ([`run_scope`]); refuse it otherwise.
+    #[serde(default)]
+    pub run_scoped: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -63,7 +70,15 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
         database: Some(&args.database),
         sql: Some(&args.request_id),
         reason: args.reason.as_deref(),
+        db_type: None,
+    };
+    if let Err(message) = ensure_run_scoped(args.run_scoped, run_scope(ctx)) {
+        let outcome = invalid_arguments(id.clone(), message);
+        return audit_outcome(ctx, id, header, outcome).await;
+    }
+    let header = AuditHeader {
         db_type: super::db_type_for_server(ctx.config, &args.server),
+        ..header
     };
     let Ok(victim) = Uuid::parse_str(&args.request_id) else {
         let outcome = invalid_arguments(id.clone(), "`request_id` must be a UUID");
