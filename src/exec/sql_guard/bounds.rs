@@ -21,8 +21,11 @@ pub(super) const MAX_SQL_BYTES: usize = 64 * 1024;
 pub(super) const MAX_JOINS: usize = 512;
 /// Across the whole statement. Each takes about 14 KiB of heap.
 pub(super) const MAX_SELECTS: usize = 1024;
-/// Open at once. The parser's own expression limit is 50.
+/// Open at once.
 pub(super) const MAX_PARENS: usize = 128;
+/// The parser's own recursion limit: calls, subqueries, `CASE`, `NOT`, a
+/// level or more each. Its default of 50 refuses ordinary generated `CASE`s.
+pub(super) const MAX_NESTING: usize = 128;
 
 /// Within the bounds the parser needs up to 6 MiB as measured, and under
 /// 10 MiB were every limit reached at once. Mapped on demand: a call touches

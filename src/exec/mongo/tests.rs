@@ -103,6 +103,7 @@ async fn sql_shaped_operations_are_not_implemented() {
     let request_id = uuid::Uuid::new_v4();
 
     let sql = crate::exec::GuardedSql::parse("SELECT 1", crate::exec::Access::ReadOnly)
+        .await
         .expect("read-only");
     let explain = adapter
         .explain(ExplainQuery {

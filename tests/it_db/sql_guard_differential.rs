@@ -19,7 +19,7 @@ use sqlparser::tokenizer::{Token, Tokenizer};
 use sqlx::{Column, Connection, Executor, PgConnection, SqlSafeStr, Statement as _};
 
 use crate::common::pg_target::{is_yugabyte, owner_url};
-use db_mcp_gateway::exec::sql_guard::is_read_only;
+use db_mcp_gateway::exec::sql_guard::{GuardError, is_read_only};
 
 /// The wrapper's own aggregate, the one call the corpus did not write.
 const WRAPPER_CALL: &str = "count";
@@ -188,6 +188,11 @@ const ADMITTED: &[&str] = &[
     "SELECT \"relname\", c.\"oid\" FROM pg_catalog.\"pg_class\" c WHERE relname = 'pg_stat_activity'",
     "SELECT * FROM generate_series(1, 3)",
     "SELECT g FROM generate_series(1, 3) AS g, LATERAL unnest(ARRAY[g]) u",
+    // Calls sqlparser models as their own expressions or table factors and
+    // Postgres's grammar writes as plain calls: the second parser agrees.
+    "SELECT ceil(1.5), ceiling(1.5), floor(1.5), substring('abc', 1, 2)",
+    "SELECT * FROM unnest(ARRAY[1, 2]) WITH ORDINALITY",
+    "SELECT extract(year FROM now()), now() AT TIME ZONE 'UTC', trim(BOTH 'x' FROM 'xax')",
 ];
 
 #[tokio::test]
@@ -200,6 +205,31 @@ async fn admitted_statements_read_the_same_to_postgres() {
             .await
             .unwrap_or_else(|| panic!("the target accepts {sql:?}"));
         assert_same_reading(sql, &reading);
+    }
+}
+
+/// Syntax sqlparser takes from other dialects: the second parser refuses
+/// it at the guard, and the target would have rejected it too — the guard
+/// no longer forwards text whose reading it cannot confirm.
+const SQLPARSER_ONLY: &[&str] = &[
+    "SELECT relname FROM pg_class QUALIFY relname = 'x'",
+    "SELECT TOP 1 relname FROM pg_class",
+    "SELECT relname FROM pg_class GROUP BY ALL",
+    "SELECT [1, 2]",
+    "SELECT relname FROM pg_class CONNECT BY PRIOR oid = relnamespace",
+];
+
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn syntax_only_the_guard_parser_reads_is_refused() {
+    let mut conn = connect().await;
+    for sql in SQLPARSER_ONLY {
+        assert_eq!(
+            is_read_only(sql),
+            Err(GuardError::ParserDisagreement("syntax")),
+            "{sql:?}"
+        );
+        assert_eq!(as_postgres_reads(&mut conn, sql).await, None, "{sql:?}");
     }
 }
 

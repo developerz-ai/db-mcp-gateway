@@ -10,6 +10,7 @@ The everyday commands and the concurrency rules are in the root [`CLAUDE.md`](..
 |---|---|
 | Postgres query-path suite against YugabyteDB (starts `state-db` + `target-yugabyte`, nextest profile `yugabyte`) | `bin/test-yugabyte` |
 | Regenerate nextest's run-alone list after adding/removing `#[serial_test::serial(world)]` | `bin/regen-serial` |
+| Regenerate the SQL guard's parse-tree schema after bumping `pg_query` (`--check` reports drift) | `bin/regen-pg-tree` |
 | Validate `deploy/` (promtool, helm lint, kubeconform; Docker only) | `bin/check-deploy` |
 | Assert scrubber regex features in the shipping graph | `bin/check-scrub-features` |
 | Scan the git index for service tokens (contents, file names, symlink targets; CI and the pre-commit hook run it); `--staged` for the index only | `bin/secret-scan` |

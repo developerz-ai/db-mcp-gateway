@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""bin/regen-pg-tree — rewrite src/exec/sql_guard/pg_tree/schema.rs.
+
+The wire shapes of the parse-tree messages a guarded statement may hold,
+read off the `pg_query.proto` of the locked `pg_query` crate. Run after
+bumping that crate; every node a new grammar adds to a SELECT or a data write
+has to be added to NODES, or a statement holding it is refused.
+
+  bin/regen-pg-tree          rewrite the file in place
+  bin/regen-pg-tree --check  exit 1 when the file is stale, change nothing
+"""
+
+import json
+import re
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SCHEMA = ROOT / "src/exec/sql_guard/pg_tree/schema.rs"
+
+# What Postgres's grammar builds for a SELECT, an INSERT / UPDATE / DELETE /
+# MERGE and an EXPLAIN of one (`raw_expression_tree_walker`'s raw nodes).
+NODES = """
+    Alias RangeVar IntoClause GroupingFunc NamedArgExpr BoolExpr SubLink CaseExpr CaseWhen RowExpr
+    CoalesceExpr MinMaxExpr XmlExpr XmlSerialize NullTest BooleanTest JoinExpr SQLValueFunction
+    CurrentOfExpr SetToDefault JsonFormat JsonReturning JsonValueExpr JsonBehavior JsonIsPredicate
+    JsonOutput JsonArgument JsonFuncExpr JsonTable JsonTableColumn JsonTablePathSpec JsonKeyValue
+    JsonParseExpr JsonScalarExpr JsonSerializeExpr JsonObjectConstructor JsonArrayConstructor
+    JsonArrayQueryConstructor JsonAggConstructor JsonObjectAgg JsonArrayAgg TypeName ColumnRef
+    ParamRef A_Expr TypeCast CollateClause FuncCall A_Star A_Indices A_Indirection A_ArrayExpr
+    ResTarget MultiAssignRef SortBy WindowDef RangeSubselect RangeFunction RangeTableFunc
+    RangeTableFuncCol RangeTableSample ColumnDef DefElem LockingClause GroupingSet WithClause
+    InferClause OnConflictClause CTESearchClause CTECycleClause CommonTableExpr IndexElem
+    ReturningClause ReturningOption InsertStmt DeleteStmt UpdateStmt MergeStmt MergeWhenClause
+    SelectStmt ExplainStmt Integer Float Boolean String BitString List A_Const
+""".split()
+ROOTS = ["ParseResult", "RawStmt"]
+# Typed fields only parse analysis fills: a raw tree never holds one.
+ANALYZED = {"Query", "FromExpr", "OnConflictExpr"}
+# The fields the check reads by name.
+READ = [
+    ("ParseResult", "version"),
+    ("ParseResult", "stmts"),
+    ("RawStmt", "stmt"),
+    ("ExplainStmt", "query"),
+    ("ExplainStmt", "options"),
+    ("DefElem", "defname"),
+    ("FuncCall", "funcname"),
+    ("FuncCall", "funcformat"),
+    ("RangeVar", "catalogname"),
+    ("RangeVar", "schemaname"),
+    ("RangeVar", "relname"),
+    ("UpdateStmt", "relation"),
+    ("ColumnRef", "fields"),
+    ("A_Indirection", "indirection"),
+    ("String", "sval"),
+]
+
+
+def crate():
+    metadata = json.loads(
+        subprocess.check_output(
+            ["cargo", "metadata", "--format-version", "1", "--locked", "--filter-platform", "x86_64-unknown-linux-gnu"],
+            cwd=ROOT,
+        )
+    )
+    package = next(p for p in metadata["packages"] if p["name"] == "pg_query")
+    return package["version"], Path(package["manifest_path"]).parent
+
+
+def parse(proto):
+    """{message: {number: (repeated, type, name)}} and the enum names."""
+    text = re.sub(r"//.*", "", proto)
+    messages = {}
+    for name, body in re.findall(r"^message (\w+)\s*\{(.*?)^\}", text, re.M | re.S):
+        fields = re.findall(r"^\s*(repeated\s+)?([\w.]+)\s+(\w+)\s*=\s*(\d+)", body, re.M)
+        messages[name] = {int(n): (bool(r), t, f) for r, t, f, n in fields}
+    return messages, set(re.findall(r"^enum (\w+)", text, re.M))
+
+
+def variant(name):
+    return name.replace("_", "")
+
+
+def field(messages, enums, declared):
+    if declared is None or declared[1] in ANALYZED:
+        return "U"
+    repeated, kind, _ = declared
+    if kind == "Node":
+        return "N"
+    if kind in messages:
+        return f"M({variant(kind)})"
+    if kind == "string":
+        return "T"
+    if repeated or kind not in enums | {"bool", "int32", "int64", "uint32", "uint64"}:
+        sys.exit(f"bin/regen-pg-tree: no wire shape for {declared}")
+    return "V"
+
+
+def render(version, messages, enums):
+    kept, todo = [], ROOTS + NODES
+    while todo:
+        name = todo.pop(0)
+        if name in kept or name == "Node":
+            continue
+        kept.append(name)
+        types = [t for _, (_, t, _) in sorted(messages[name].items())]
+        todo += [t for t in types if t in messages and t not in ANALYZED]
+    wrap = lambda text: textwrap.wrap(text, 96, initial_indent="    ", subsequent_indent="    ")
+    out = [
+        "//! Wire shapes of the parse-tree messages a guarded statement may hold.",
+        f"//! Generated from pg_query {version} by `bin/regen-pg-tree`; do not edit.",
+        "",
+        "use super::wire::Field::{self, Message as M, Node as N, Text as T, Unused as U, Varint as V};",
+        "",
+        "/// Message types. A node type not named here refuses the statement.",
+        "#[rustfmt::skip]",
+        "#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]",
+        "pub(in crate::exec::sql_guard) enum NodeType {",
+        *wrap(", ".join(variant(n) for n in kept)),
+        "}",
+        "",
+        "use NodeType::*;",
+        "",
+        "/// The fields of a type, by field number from 1.",
+        "#[rustfmt::skip]",
+        "pub(in crate::exec::sql_guard) fn fields(of: NodeType) -> &'static [Field] {",
+        "    match of {",
+    ]
+    for name in kept:
+        declared = messages[name]
+        row = [field(messages, enums, declared.get(i)) for i in range(1, max(declared, default=0) + 1)]
+        out.append(f"        {variant(name)} => &[{', '.join(row)}],")
+    out += ["    }", "}", "", "/// The type a `Node` holds, by its field number.",
+            "pub(in crate::exec::sql_guard) fn node(number: u32) -> Option<NodeType> {", "    Some(match number {"]
+    for number, (_, name, _) in sorted(messages["Node"].items()):
+        if name in NODES:
+            out.append(f"        {number} => {variant(name)},")
+    out += ["        _ => return None,", "    })", "}", "", "/// The numbers of the fields the check reads.",
+            "pub(in crate::exec::sql_guard) mod number {"]
+    for name, wanted in READ:
+        number = next(n for n, (_, _, f) in messages[name].items() if f == wanted)
+        out.append(f"    pub(in crate::exec::sql_guard) const {variant(name).upper()}_{wanted.upper()}: u32 = {number};")
+    return "\n".join(out + ["}", ""])
+
+
+def main():
+    version, source = crate()
+    text = render(version, *parse((source / "libpg_query/protobuf/pg_query.proto").read_text()))
+    if SCHEMA.exists() and SCHEMA.read_text() == text:
+        return
+    if sys.argv[1:] == ["--check"]:
+        sys.exit("src/exec/sql_guard/pg_tree/schema.rs is stale: run bin/regen-pg-tree")
+    SCHEMA.write_text(text)
+
+
+main()

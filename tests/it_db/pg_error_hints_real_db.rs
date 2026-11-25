@@ -149,7 +149,9 @@ async fn an_explain_position_counts_from_the_callers_statement() {
     let table = Table::create().await;
     let a = adapter().await;
     let sql = format!("SELECT emial FROM {}", table.name);
-    let guarded = GuardedSql::parse(&sql, Access::ReadOnly).expect("guarded");
+    let guarded = GuardedSql::parse(&sql, Access::ReadOnly)
+        .await
+        .expect("guarded");
     let result = a
         .explain(ExplainQuery {
             sql: guarded,

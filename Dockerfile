@@ -56,6 +56,12 @@ RUN cargo chef prepare --recipe-path recipe.json
 # already downloaded (CARGO_NET_RETRY widens cargo's own budget, default 3);
 # the final attempt still exits 1, so a persistent error keeps failing.
 FROM chef AS builder
+# `pg_query` (the SQL guard's second parser) compiles libpg_query from C and
+# runs bindgen, which loads libclang. Builder only: the C library links
+# statically, so the runtime stage gains nothing.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /src/recipe.json recipe.json
 ENV CARGO_NET_RETRY=10
 RUN for attempt in 1 2 3 4 5; do \

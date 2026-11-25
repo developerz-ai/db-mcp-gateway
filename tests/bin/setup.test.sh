@@ -33,7 +33,7 @@ if [[ "$name $*" == "${FAIL_AT:-}" ]]; then
 fi
 STUB
   chmod +x "$work/tools/stub"
-  for tool in cargo docker git cc make openssl curl tar uname cat; do
+  for tool in cargo docker git cc clang make openssl curl tar uname cat; do
     ln -s stub "$work/tools/$tool"
   done
   : > "$work/calls"

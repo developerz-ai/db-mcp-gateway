@@ -1261,7 +1261,7 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
         (update.clone(), Access::ReadWrite, false),
     ] {
         a.explain(ExplainQuery {
-            sql: GuardedSql::parse(&sql, access).expect("guarded"),
+            sql: GuardedSql::parse(&sql, access).await.expect("guarded"),
             analyze,
             statement_timeout_ms: None,
             request_id: id(),

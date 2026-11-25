@@ -942,7 +942,7 @@ async fn dry_run_reports_rows_affected_and_rolls_back() {
 
 fn explain(sql: &str, access: Access, analyze: bool) -> db_mcp_gateway::exec::ExplainQuery<'_> {
     db_mcp_gateway::exec::ExplainQuery {
-        sql: db_mcp_gateway::exec::GuardedSql::parse(sql, access).expect("guarded"),
+        sql: db_mcp_gateway::exec::GuardedSql::parse_blocking(sql, access).expect("guarded"),
         analyze,
         statement_timeout_ms: None,
         request_id: Uuid::new_v4(),

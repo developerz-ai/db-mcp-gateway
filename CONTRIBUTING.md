@@ -16,7 +16,7 @@ This project adheres to a [Code of Conduct](CODE_OF_CONDUCT.md). By participatin
 
 Host prerequisites — `bin/setup` checks these before it installs anything:
 
-- **Bash** and Git. On a Debian/Ubuntu host `bin/setup` installs `build-essential`, `openssl` and `curl` when missing (needs root or non-interactive `sudo`, or have an administrator install them first). On any other host it only checks that `cc`, `make`, `openssl` and `curl` are on `PATH` — install them with your package manager.
+- **Bash** and Git. On a Debian/Ubuntu host `bin/setup` installs `build-essential`, `libclang-dev`, `openssl` and `curl` when missing (needs root or non-interactive `sudo`, or have an administrator install them first). On any other host it only checks that `cc`, `clang`, `make`, `openssl` and `curl` are on `PATH` — install them with your package manager.
 - **Rust**, including Cargo and rustc, with the pinned toolchain and the `rustfmt` and `clippy` components from `rust-toolchain.toml`. Install through your trusted toolchain manager before setup; setup does not bootstrap Rust.
 - **Docker Engine or Docker Desktop** with **Docker Compose v2** (`docker compose`), including support for `up --wait`. Start the daemon and ensure your user can access it without sudo before setup; setup does not install Docker.
 - **Network access** to host package repositories, Rust dependency registries and container image registries; available local ports listed below.

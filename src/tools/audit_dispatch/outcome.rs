@@ -178,12 +178,15 @@ fn rejection_detail(rejection: &DbRejection) -> RejectionDetail {
 }
 
 /// A statement the SQL guard refused: `forbidden_sql`, with the body's
-/// `location` when the parser said where it stopped.
+/// `location` when the parser said where it stopped. One it reached no verdict
+/// on is refused too, but is no fault of the SQL.
 pub(in crate::tools) fn guard_rejected(err: &GuardError) -> Outcome {
-    let mut outcome = error_outcome(
-        OutcomeCode::ForbiddenSql,
-        &format!("SQL rejected by gateway: {err}"),
-    );
+    let code = match err {
+        GuardError::Busy => OutcomeCode::Unavailable,
+        GuardError::Failed => OutcomeCode::Internal,
+        _ => OutcomeCode::ForbiddenSql,
+    };
+    let mut outcome = error_outcome(code, &format!("SQL rejected by gateway: {err}"));
     if let Some(location) = err.location() {
         outcome.reply = Reply::Unparsed(location);
     }

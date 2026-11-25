@@ -5,6 +5,20 @@ mod combined;
 mod properties;
 mod timing;
 
+/// The first parser alone, which the bounds and the stack are sized for. The
+/// second refuses long operator chains the first must still survive.
+fn check_sql(sql: &str, access: Access) -> Result<(), GuardError> {
+    read(sql, access).map(drop)
+}
+
+fn is_read_only(sql: &str) -> Result<(), GuardError> {
+    check_sql(sql, Access::ReadOnly)
+}
+
+fn ok(sql: &str) {
+    assert_eq!(is_read_only(sql), Ok(()), "{sql}");
+}
+
 /// A worker thread's stack, as Tokio sizes it.
 const WORKER_STACK: usize = 2 << 20;
 
@@ -145,7 +159,7 @@ fn every_outcome_at_the_length_cap_gets_an_answer_on_a_worker_stack() {
 #[test]
 fn nesting_past_the_parser_limit_is_a_parse_error_on_a_worker_stack() {
     for part in ["NOT ", "CASE WHEN a THEN ", "- "] {
-        for n in [60, 1000, 3000] {
+        for n in [140, 1000, 3000] {
             let sql = format!("SELECT {}a", part.repeat(n));
             let got = on_worker_stack(move || is_read_only(&sql));
             assert!(

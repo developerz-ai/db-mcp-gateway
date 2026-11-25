@@ -27,7 +27,9 @@
 //! any text the two split into different tokens (`lexical`, `pg_scan`).
 //! A relation showing other sessions' statements is refused by name.
 //! The statement's length and structure are bounded first (`bounds`), and its
-//! lexemes are held against the denylist whatever the tree holds (`tokens`).
+//! lexemes are held against the denylist whatever the tree holds (`tokens`). Last,
+//! Postgres's own grammar (libpg_query, `agreement`) parses the text again
+//! and must agree on the statement count, kind and calls.
 //! Conservative on purpose: better to reject a legitimate exotic statement
 //! than quietly send an unintended one.
 //!
@@ -45,10 +47,15 @@
 //! were manually enumerated — that's the class of gap this module exists to
 //! close, and the reason the walk is now visitor-driven, not hand-recursion.
 
+mod agreement;
 mod bounds;
+mod calls;
 mod denylist;
+mod error;
 mod lexical;
+mod parser_pool;
 mod pg_scan;
+mod pg_tree;
 mod shape;
 mod tokens;
 mod visitor;
@@ -61,10 +68,12 @@ mod tests;
 use sqlparser::ast::{Statement, Visit};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
-use sqlparser::tokenizer::{Location, Token};
+use sqlparser::tokenizer::Token;
 use std::ops::ControlFlow;
 
-use bounds::{check_bounds, check_length, with_parser_stack};
+use agreement::{Kind, Reading};
+use bounds::{MAX_NESTING, check_bounds, check_length, with_parser_stack};
+pub use error::{GuardError, SqlLocation};
 use lexical::check_lexical;
 use shape::{check_statement_shape, explain_analyzes, required_access};
 use tokens::check_tokens;
@@ -80,80 +89,9 @@ pub enum Access {
     ReadWrite,
 }
 
-/// Where in the statement the parser gave up: 1-based line and column, as
-/// sqlparser reports them. Coordinates only — the parser's message, which
-/// quotes the statement, is never kept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub struct SqlLocation {
-    pub line: u64,
-    pub column: u64,
-}
-
-impl SqlLocation {
-    /// From sqlparser's location; line `0` marks an empty span, no place.
-    fn of(location: Location) -> Option<Self> {
-        (location.line > 0).then_some(Self {
-            line: location.line,
-            column: location.column,
-        })
-    }
-
-    /// The ` at Line: L, Column: C` suffix sqlparser ends a message with.
-    fn from_message(message: &str) -> Option<Self> {
-        let (_, at) = message.rsplit_once(" at Line: ")?;
-        let (line, column) = at.split_once(", Column: ")?;
-        Self::of(Location::new(line.parse().ok()?, column.parse().ok()?))
-    }
-}
-
-#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
-pub enum GuardError {
-    #[error(
-        "could not parse SQL{}",
-        .0.map(|at| format!(" at line {}, column {}", at.line, at.column)).unwrap_or_default()
-    )]
-    Parse(Option<SqlLocation>),
-    #[error("multiple statements are not allowed (got {0})")]
-    MultiStatement(usize),
-    #[error(
-        "statement type `{0}` is not allowed; only SELECT, EXPLAIN and, with a write grant, INSERT/UPDATE/DELETE"
-    )]
-    NotAllowed(&'static str),
-    #[error("SELECT ... FOR UPDATE/SHARE is not allowed (acquires write locks)")]
-    Locking,
-    #[error("write statement `{0}` is not allowed inside a read-only query")]
-    WriteInReadPath(&'static str),
-    #[error("SELECT ... INTO is not allowed (it materializes a table)")]
-    SelectInto,
-    #[error("EXPLAIN ANALYZE is not allowed (it executes the query)")]
-    ExplainAnalyze,
-    #[error("Unicode-escaped identifiers (U&\"…\") are not allowed; spell the identifier plainly")]
-    UnicodeEscapedIdentifier,
-    #[error("the SQL text is ambiguous: {0}")]
-    AmbiguousTokens(&'static str),
-    #[error("the statement has more than {limit} {what}; split it into smaller statements")]
-    TooComplex { limit: usize, what: &'static str },
-    #[error(
-        "relation `{0}` is not allowed (it shows other sessions' statements); use the db_activity tool"
-    )]
-    DeniedRelation(&'static str),
-    /// Stable error code: `GUARD_DENIED_FUNCTION`.
-    #[error("function `{0}` is not allowed (high-privilege server-side function)")]
-    DeniedFunction(&'static str),
-}
-
-impl GuardError {
-    /// Where an unparseable statement stopped parsing, when the parser said.
-    pub fn location(&self) -> Option<SqlLocation> {
-        match self {
-            Self::Parse(at) => *at,
-            _ => None,
-        }
-    }
-}
-
 /// Read-only guard — the `query_read` default. Equivalent to
-/// `check_sql(sql, Access::ReadOnly)`.
+/// `check_sql(sql, Access::ReadOnly)`. Tests only, as it blocks.
+#[cfg(any(test, feature = "test-support"))]
 pub fn is_read_only(sql: &str) -> Result<(), GuardError> {
     check_sql(sql, Access::ReadOnly)
 }
@@ -173,8 +111,17 @@ pub struct GuardedSql<'a> {
 impl<'a> GuardedSql<'a> {
     /// Guard `sql` at the caller's `access` (its grant). A `query_read`
     /// caller can only ever obtain a read statement.
-    pub fn parse(sql: &'a str, access: Access) -> Result<Self, GuardError> {
-        let required = guard(sql, access)?;
+    pub async fn parse(sql: &'a str, access: Access) -> Result<Self, GuardError> {
+        let (reading, required) = read(sql, access)?;
+        parser_pool::agree(sql, reading).await?;
+        Ok(Self { sql, required })
+    }
+
+    /// [`GuardedSql::parse`] for tests that are not async.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn parse_blocking(sql: &'a str, access: Access) -> Result<Self, GuardError> {
+        let (reading, required) = read(sql, access)?;
+        parser_pool::agree_blocking(sql, reading)?;
         Ok(Self { sql, required })
     }
 
@@ -191,24 +138,25 @@ impl<'a> GuardedSql<'a> {
 
 /// Parse `sql` and enforce the guard at the given [`Access`] level. A single
 /// statement only — multiple statements are rejected in both modes so a write
-/// can never ride in behind a leading `SELECT`.
+/// can never ride in behind a leading `SELECT`. Tests only, as it blocks.
+#[cfg(any(test, feature = "test-support"))]
 pub fn check_sql(sql: &str, access: Access) -> Result<(), GuardError> {
-    guard(sql, access).map(|_| ())
+    GuardedSql::parse_blocking(sql, access).map(drop)
 }
 
-/// [`check_sql`], returning the access the admitted statement needs.
-fn guard(sql: &str, access: Access) -> Result<Access, GuardError> {
+/// The first parser's reading of `sql`, refused or with the access it needs.
+fn read(sql: &str, access: Access) -> Result<(Reading, Access), GuardError> {
     check_length(sql)?;
     let lexemes = check_lexical(sql)?;
     check_bounds(sql, &lexemes)?;
-    let required = with_parser_stack(|| inspect(sql, access))?;
+    let read = with_parser_stack(|| inspect(sql, access))?;
     check_tokens(sql, &lexemes)?;
-    Ok(required)
+    Ok(read)
 }
 
 /// Parse, walk and drop the tree: sqlparser work only, and all of it, so no
 /// part of a tree — partial or refused — outlives the stack sized for it.
-fn inspect(sql: &str, access: Access) -> Result<Access, GuardError> {
+fn inspect(sql: &str, access: Access) -> Result<(Reading, Access), GuardError> {
     let dialect = PostgreSqlDialect {};
     let parse_error = |e| match e {
         ParserError::ParserError(message) | ParserError::TokenizerError(message) => {
@@ -217,6 +165,7 @@ fn inspect(sql: &str, access: Access) -> Result<Access, GuardError> {
         ParserError::RecursionLimitExceeded => GuardError::Parse(None),
     };
     let mut parser = Parser::new(&dialect)
+        .with_recursion_limit(MAX_NESTING)
         .try_with_sql(sql)
         .map_err(parse_error)?;
     let statements = parser.parse_statements().map_err(parse_error)?;
@@ -236,6 +185,7 @@ fn inspect(sql: &str, access: Access) -> Result<Access, GuardError> {
     // target statement. ANALYZE — in either spelling — executes the wrapped
     // statement, so it fails fast here before any further inspection.
     let mut stmt: &Statement = &statements[0];
+    let mut explained = false;
     while let Statement::Explain {
         analyze,
         options,
@@ -247,14 +197,21 @@ fn inspect(sql: &str, access: Access) -> Result<Access, GuardError> {
             return Err(GuardError::ExplainAnalyze);
         }
         stmt = statement;
+        explained = true;
     }
 
     check_statement_shape(stmt, access)?;
 
-    match stmt.visit(&mut GuardVisitor::new()) {
-        ControlFlow::Continue(()) => Ok(required_access(stmt)),
-        ControlFlow::Break(e) => Err(e),
+    let mut visitor = GuardVisitor::new();
+    if let ControlFlow::Break(e) = stmt.visit(&mut visitor) {
+        return Err(e);
     }
+    let reading = Reading {
+        explained,
+        kind: Kind::of(stmt).ok_or(GuardError::NotAllowed("unsupported"))?,
+        calls: visitor.into_calls(),
+    };
+    Ok((reading, required_access(stmt)))
 }
 
 /// `sql` from its first token to the end of its last, leading and

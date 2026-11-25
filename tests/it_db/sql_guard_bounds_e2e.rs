@@ -131,25 +131,28 @@ async fn a_statement_past_a_bound_is_refused_and_audited_and_the_next_call_runs(
     }
 }
 
-/// What the target makes of a chain the guard admitted.
+/// What becomes of a chain at the length cap.
 #[derive(Debug, Clone, Copy)]
-enum Target {
+enum Decision {
+    /// The target's answer.
     Answers(bool),
-    /// With this SQLSTATE, never one of the guard's codes.
+    /// The target's SQLSTATE, never one of the guard's codes.
     Rejects(&'static str),
+    /// The guard's: deeper than Postgres's own parse tree goes.
+    TooDeep,
 }
 
-/// `(opening, repeated part, the target's decision)`.
-const CHAINS: &[(&str, &str, Target)] = &[
-    ("SELECT true", " AND true", Target::Answers(true)),
-    ("SELECT false", " OR false", Target::Answers(false)),
-    ("SELECT 1", "+1", Target::Rejects("54001")),
-    ("SELECT 'x'", "||'x'", Target::Rejects("54001")),
-    ("SELECT 1", "::int", Target::Rejects("54001")),
-    ("SELECT (ARRAY[1])", "[1]", Target::Rejects("54000")),
+/// `(opening, repeated part, the decision)`.
+const CHAINS: &[(&str, &str, Decision)] = &[
+    ("SELECT true", " AND true", Decision::Answers(true)),
+    ("SELECT false", " OR false", Decision::Answers(false)),
+    ("SELECT 1", "+1", Decision::TooDeep),
+    ("SELECT 'x'", "||'x'", Decision::TooDeep),
+    ("SELECT 1", "::int", Decision::TooDeep),
+    ("SELECT (ARRAY[1])", "[1]", Decision::Rejects("54000")),
 ];
 
-/// Long operator chains pass the guard; the target decides.
+/// Flat chains pass the guard and the target decides; nested ones never reach it.
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn a_chain_at_the_length_cap_is_answered_and_audited_and_the_next_call_runs() {
@@ -161,20 +164,72 @@ async fn a_chain_at_the_length_cap_is_answered_and_audited_and_the_next_call_run
         for tool in ["run_query", "explain"] {
             let called = call(&gateway, tool, &sql).await;
             match target {
-                Target::Answers(value) => {
+                Decision::Answers(value) => {
                     assert!(!called.is_error, "{part:?} {tool}: {}", called.body);
                     if tool == "run_query" {
                         assert_eq!(called.body["rows"], json!([[value]]), "{part:?}");
                     }
                     assert_audited(&gateway, &called, "success").await;
                 }
-                Target::Rejects(sqlstate) => {
+                Decision::Rejects(sqlstate) => {
                     let names = format!("the target DB rejected the SQL: {sqlstate} ");
                     assert_refused(&gateway, &called, "syntax_error", &names).await;
+                }
+                Decision::TooDeep => {
+                    let names = "nests too deeply";
+                    assert_refused(&gateway, &called, "forbidden_sql", names).await;
                 }
             }
             assert_still_serving(&gateway).await;
         }
+    }
+}
+
+/// `(sql, its one value)`: sizes generated queries reach.
+fn long_queries() -> Vec<(String, Value)> {
+    let case = "CASE WHEN false THEN 0 ELSE ";
+    let joins: String = (0..200)
+        .map(|i| format!(" CROSS JOIN LATERAL (SELECT 1 AS x) u{i}"))
+        .collect();
+    vec![
+        (format!("SELECT 1{}", "+1".repeat(1000)), json!(1001)),
+        (
+            format!("SELECT length(''{})", "||'x'".repeat(1000)),
+            json!(1000),
+        ),
+        (
+            format!("SELECT {}7{}", case.repeat(100), " END".repeat(100)),
+            json!(7),
+        ),
+        (format!("SELECT u199.x FROM (SELECT 1) t{joins}"), json!(1)),
+        (
+            format!(
+                "SELECT count(*) FROM (SELECT 1{}) u",
+                " UNION ALL SELECT 2".repeat(500)
+            ),
+            json!(501),
+        ),
+        (
+            "SELECT substring('abc', 2, 1) || substr('xyz', 1, 1) || trim(BOTH '-' FROM '-q-')"
+                .to_string(),
+            json!("bxq"),
+        ),
+    ]
+}
+
+/// Both parsers read these alike, and the target answers them.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn long_generated_queries_are_answered_and_audited() {
+    let gateway = boot().await;
+    for (sql, value) in long_queries() {
+        let called = call(&gateway, "run_query", &sql).await;
+        assert!(!called.is_error, "{:.60}…: {}", sql, called.body);
+        assert_eq!(called.body["rows"], json!([[value]]), "{sql:.60}…");
+        assert_audited(&gateway, &called, "success").await;
+        let called = call(&gateway, "explain", &sql).await;
+        assert!(!called.is_error, "{:.60}…: {}", sql, called.body);
+        assert_audited(&gateway, &called, "success").await;
     }
 }
 

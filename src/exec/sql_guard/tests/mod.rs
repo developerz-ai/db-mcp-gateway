@@ -5,10 +5,15 @@ mod bounds;
 mod denied_families;
 mod denied_functions;
 mod denied_relations;
+mod depth;
 mod lexer_agreement;
 mod lexical;
+mod oracle;
+mod parser_agreement;
+mod pg_tree;
 mod read_only;
 mod whole_text;
+mod wire;
 mod write_access;
 
 fn ok(sql: &str) {

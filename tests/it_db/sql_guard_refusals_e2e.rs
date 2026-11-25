@@ -1,7 +1,8 @@
 //! `run_query` and `explain` over HTTP for the guard's refusals: text
 //! Postgres tokenizes differently, calls in attribute notation, relations
 //! showing other sessions' statements, and the SQL-running, network and
-//! replication function families. Each answers `forbidden_sql` before the
+//! replication function families, and text Postgres's own grammar parses
+//! differently from the guard's parser. Each answers `forbidden_sql` before the
 //! target is touched, and each leaves its audit row.
 
 use std::time::Duration;
@@ -95,6 +96,11 @@ const REFUSED: &[(&str, &str)] = &[
         "pg_create_*",
     ),
     ("SELECT pg_stat_reset()", "pg_stat_reset*"),
+    // Postgres's own grammar rejects what sqlparser read.
+    (
+        "SELECT relname FROM pg_class QUALIFY relname = 'x'",
+        "two SQL parsers disagree on its syntax",
+    ),
 ];
 
 async fn boot() -> LoggedInGateway {
@@ -168,4 +174,13 @@ async fn explain_refuses_each_shape_and_audits_it() {
     for (sql, names) in REFUSED {
         assert_refused_and_audited(&gateway, "explain", sql, names).await;
     }
+}
+
+/// Too deep for the two trees to be compared: refused, naming the rewrite.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn run_query_refuses_a_chain_too_deep_to_compare_and_audits_it() {
+    let gateway = boot().await;
+    let sql = format!("SELECT {}", vec!["'x'"; 5000].join(" || "));
+    assert_refused_and_audited(&gateway, "run_query", &sql, "concat(").await;
 }

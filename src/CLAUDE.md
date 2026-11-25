@@ -26,7 +26,7 @@ The bar: idiomatic, boring, readable Rust. No spaghetti, no premature abstractio
 | Rule | Meaning |
 |---|---|
 | Typed errors | `thiserror` for domain; `anyhow` only at the boot boundary (`src/main.rs`, `src/startup/`, `src/cli/`): those errors print on exit and never reach a client. Every client error has a stable code (see [03-mcp-tools](../website/docs/initial-idea/03-mcp-tools.md)). |
-| No panics | No `unwrap`/`expect` outside `src/main.rs` and tests — a panic in a hot path crashes every user. Propagate with `?`; branch with `match`/`if let`/`let ... else`. |
+| No panics | No `unwrap`/`expect` outside `src/main.rs` and tests; `unsafe` only in `exec::sql_guard::pg_tree::ffi` — a panic in a hot path crashes every user. Propagate with `?`; branch with `match`/`if let`/`let ... else`. |
 | Newtypes | Newtype over bare primitives when a value has meaning (`RequestId(String)`, not `String`). Make illegal states unrepresentable — `enum` over contradictory `bool`+`Option`. Validate input into a type once at the edge; don't re-validate downstream. |
 | Derive | Derive, don't hand-roll (`Debug`, `Clone`, serde). Every public type derives `Debug` at minimum. Keep the `pub` surface minimal. |
 | Borrow by default | `&str` over `String`, `&[T]` over `Vec<T>`. `.clone()` only when ownership must move — a non-obvious clone gets a one-line `// why`. `Arc<T>` for shared read-only; add a lock only when you mutate shared state, keep the critical section tiny. |

@@ -83,7 +83,7 @@ fn run_cases() {
         .iter()
         .flat_map(|a| OPENERS.iter().map(move |b| format!("{a}{b}")));
     for unit in pairs {
-        for n in [12, 24, 48] {
+        for n in [12, 24, 48, 124] {
             eprintln!("{CASE}{unit:?} x {n}");
             let sql = format!("SELECT {}1", unit.repeat(n));
             let _ = on_worker_stack(move || is_read_only(&sql));

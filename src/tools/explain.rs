@@ -142,7 +142,7 @@ async fn compute_outcome(
     } else {
         Access::ReadOnly
     };
-    let sql = match GuardedSql::parse(&args.sql, grant_access) {
+    let sql = match GuardedSql::parse(&args.sql, grant_access).await {
         Ok(sql) => sql,
         Err(err) => return guard_rejected(&err),
     };

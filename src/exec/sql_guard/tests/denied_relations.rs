@@ -82,8 +82,18 @@ fn cron_schema_relations_rejected() {
         "SELECT command FROM cron.job",
         "SELECT jobid FROM CRON.JOB",
         r#"SELECT * FROM "cron"."job""#,
+        "SELECT * FROM ONLY cron.job",
+        "SELECT * FROM (TABLE cron.job) j",
+        "SELECT 1 UNION ALL (SELECT 2 UNION TABLE \"cron\".job)",
     ] {
         denied_as(sql, "cron.*");
+        // By the first parser's reading alone, and by the second's (`parser_agreement`).
+        let first = read(sql, Access::ReadOnly).map(drop);
+        assert_eq!(
+            first,
+            Err(GuardError::DeniedRelation("cron.*")),
+            "for `{sql}`"
+        );
     }
 }
 

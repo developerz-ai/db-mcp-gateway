@@ -21,7 +21,7 @@ Scoped rules load with their directory and bind like this file: [`src/CLAUDE.md`
 
 ## Stack
 
-Rust 2024: toolchain `1.96.0` (`rust-toolchain.toml`), MSRV `1.94.1` (`Cargo.toml`); deps pinned to latest stable at implementation time. tokio + axum (axum-server, rustls). sqlx `=0.9.1` for Postgres + MySQL (YugabyteDB YSQL rides the Postgres path), mongodb 3.10, redis 1.8 (Redis/Dragonfly). MCP: hand-rolled JSON-RPC over Streamable HTTP (POST; `GET /mcp` → 405) until an SDK stabilizes. Config: serde + serde-saphyr (not serde_yaml), validated at boot. State store: co-deployed Postgres (sessions, audit log, denylist); permissions store `pg` or `mysql`. GlitchTip errors, credential-scrubbed by `src/sentry_scrub/`. Prometheus `/metrics`. Images: GHCR **and** DOCR (`ghcr.io/developerz-ai/db-mcp-gateway`, `registry.digitalocean.com/developerz-ai/db-mcp-gateway`).
+Rust 2024: toolchain `1.96.0` (`rust-toolchain.toml`), MSRV `1.94.1` (`Cargo.toml`); deps pinned to latest stable at implementation time. tokio + axum (axum-server, rustls). sqlx `=0.9.1` for Postgres + MySQL (YugabyteDB YSQL rides the Postgres path), mongodb 3.10, redis 1.8 (Redis/Dragonfly). SQL guard: sqlparser, then Postgres 18's grammar (`pg_query =18.1.0`, libpg_query, statically linked C) must agree; building needs libclang. MCP: hand-rolled JSON-RPC over Streamable HTTP (POST; `GET /mcp` → 405) until an SDK stabilizes. Config: serde + serde-saphyr (not serde_yaml), validated at boot. State store: co-deployed Postgres (sessions, audit log, denylist); permissions store `pg` or `mysql`. GlitchTip errors, credential-scrubbed by `src/sentry_scrub/`. Prometheus `/metrics`. Images: GHCR **and** DOCR (`ghcr.io/developerz-ai/db-mcp-gateway`, `registry.digitalocean.com/developerz-ai/db-mcp-gateway`).
 
 ## Commands
 
@@ -56,7 +56,7 @@ GitHub Actions, GitHub-hosted runners only (public repo); `bin/ci` reproduces it
 
 ## Security review required
 
-Touching any of these requires the `security review required` label on the PR: `src/auth/`, `src/authz/`, credential loading or storage, the audit write path, any new MCP tool, SQL execution (timeouts, row caps, cancellation). Reviewers look for: credentials in errors/logs, missing audit rows, authz bypass via constraint-merge edges, SQL injection / timeout bypass.
+Touching any of these requires the `security review required` label on the PR: `src/auth/`, `src/authz/`, credential loading or storage, the audit write path, any new MCP tool, SQL execution (timeouts, row caps, cancellation), `src/exec/sql_guard/pg_tree/ffi.rs` (the only `unsafe`). Reviewers look for: credentials in errors/logs, missing audit rows, authz bypass via constraint-merge edges, SQL injection / timeout bypass.
 
 ## Layout
 

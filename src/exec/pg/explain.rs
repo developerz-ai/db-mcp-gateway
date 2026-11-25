@@ -32,7 +32,7 @@ mod tests {
     use super::*;
 
     fn guarded(sql: &str, access: Access) -> GuardedSql<'_> {
-        GuardedSql::parse(sql, access).expect("guarded")
+        GuardedSql::parse_blocking(sql, access).expect("guarded")
     }
 
     #[test]

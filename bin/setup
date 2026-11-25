@@ -54,21 +54,21 @@ step 'Cargo cannot run the pinned toolchain. Install the toolchain from rust-too
 
 echo '→ checking host packages'
 if command -v dpkg >/dev/null 2>&1; then
-  if ! dpkg -s build-essential openssl curl >/dev/null 2>&1; then
-    command -v apt-get >/dev/null 2>&1 || fail 'Install build-essential, openssl and curl with apt-get, then retry.'
+  if ! dpkg -s build-essential libclang-dev openssl curl >/dev/null 2>&1; then
+    command -v apt-get >/dev/null 2>&1 || fail 'Install build-essential, libclang-dev, openssl and curl with apt-get, then retry.'
     APT=(apt-get)
     if (( EUID != 0 )); then
-      command -v sudo >/dev/null 2>&1 || fail 'Install build-essential, openssl and curl as administrator, then retry.'
+      command -v sudo >/dev/null 2>&1 || fail 'Install build-essential, libclang-dev, openssl and curl as administrator, then retry.'
       APT=(sudo -n apt-get)
     fi
     step 'Package index update failed. Check apt repositories and network access, then retry.' "${APT[@]}" update
-    step 'Host package installation failed. Ask an administrator to install build-essential, openssl and curl, then retry.' \
-      "${APT[@]}" install -y --no-install-recommends build-essential openssl curl
+    step 'Host package installation failed. Ask an administrator to install build-essential, libclang-dev, openssl and curl, then retry.' \
+      "${APT[@]}" install -y --no-install-recommends build-essential libclang-dev openssl curl
   fi
 else
   echo '  non-Debian host: not installing packages, only checking for them'
-  for tool in cc make openssl curl; do
-    command -v "$tool" >/dev/null 2>&1 || fail "'$tool' is missing. Install a C toolchain, make, openssl and curl with your package manager, then retry."
+  for tool in cc clang make openssl curl; do
+    command -v "$tool" >/dev/null 2>&1 || fail "'$tool' is missing. Install a C toolchain, clang (libclang), make, openssl and curl with your package manager, then retry."
   done
 fi
 

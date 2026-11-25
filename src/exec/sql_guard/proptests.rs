@@ -206,6 +206,20 @@ proptest! {
         }
     }
 
+    /// Whatever the guard admits, mutated or not, is exactly one statement
+    /// to both parsers: sqlparser and Postgres's own grammar.
+    #[test]
+    fn admitted_text_is_one_statement_to_both_parsers(
+        sql in prop_oneof![mutated_statement(), token_soup().prop_map(|s| format!("SELECT 1 {s}"))]
+    ) {
+        if check_sql(&sql, Access::ReadWrite).is_ok() {
+            let sqlparser = Parser::parse_sql(&PostgreSqlDialect {}, &sql).map(|s| s.len());
+            prop_assert_eq!(sqlparser, Ok(1), "{:?}", sql);
+            let postgres = pg_query::parse(&sql, 0).map(|p| p.protobuf.stmts.len());
+            prop_assert_eq!(postgres, Ok(1), "{:?}", sql);
+        }
+    }
+
     #[test]
     fn safe_selects_always_allowed(sql in arbitrary_safe_select()) {
         prop_assert!(is_read_only(&sql).is_ok(), "rejected: {sql}");

@@ -113,6 +113,13 @@ sqlparser = { version = "0.64", features = ["visitor"] }
 # The SQL guard's parser stack (`src/exec/sql_guard/bounds.rs`). Already in the
 # graph through sqlparser.
 stacker = "0.1"
+# Postgres's own grammar (libpg_query, C, statically linked) as the SQL
+# guard's second parser (`src/exec/sql_guard/agreement.rs`). Exact: the tree is
+# read off its wire bytes through two C symbols declared in
+# `src/exec/sql_guard/pg_tree/ffi.rs`, by shapes generated from this release —
+# bump it with `bin/regen-pg-tree`. Its build script compiles C and runs
+# bindgen, so the builder needs libclang; the runtime image gains no library.
+pg_query = "=18.1.0"
 async-trait = "0.1"
 # Mongo target adapter (#57 scaffold + #58 exec). Disable default features so
 # we never pull native-tls's openssl link; rustls matches the rest of the

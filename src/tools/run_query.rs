@@ -160,7 +160,7 @@ async fn compute_outcome(
     // the command is checked here too, so a malformed one is
     // `invalid_arguments`.
     let access = match server.kind {
-        ServerKind::Postgres => match statement_access(&args.sql, writes_allowed) {
+        ServerKind::Postgres => match statement_access(&args.sql, writes_allowed).await {
             Ok(access) => access,
             Err(rejected) => return *rejected,
         },

@@ -8,6 +8,7 @@ use sqlparser::ast::{
 use std::ops::ControlFlow;
 
 use super::GuardError;
+use super::calls::Calls;
 use super::denylist::{denied_function, denied_schema, denied_whole_row_call};
 
 /// Substructure guard, run once the top-level [`check_statement_shape`] has
@@ -32,11 +33,20 @@ use super::denylist::{denied_function, denied_schema, denied_whole_row_call};
 /// a node type a future sqlparser bump adds.
 pub(super) struct GuardVisitor {
     top_seen: bool,
+    calls: Calls,
 }
 
 impl GuardVisitor {
     pub(super) fn new() -> Self {
-        Self { top_seen: false }
+        Self {
+            top_seen: false,
+            calls: Calls::default(),
+        }
+    }
+
+    /// The functions the statement calls, for the second parser to agree with.
+    pub(super) fn into_calls(self) -> Calls {
+        self.calls
     }
 }
 
@@ -77,6 +87,7 @@ impl Visitor for GuardVisitor {
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<GuardError> {
+        self.calls.record_expr(expr);
         break_on(match expr {
             Expr::Function(f) => check_denied_name(&f.name),
             Expr::CompoundIdentifier(parts) => check_compound_identifier(parts),
@@ -95,6 +106,7 @@ impl Visitor for GuardVisitor {
     }
 
     fn pre_visit_table_factor(&mut self, tf: &TableFactor) -> ControlFlow<GuardError> {
+        self.calls.record_table_factor(tf);
         // `FROM pg_ls_dir(...)` and `FROM LATERAL pg_ls_dir(...)` place the
         // denied name on a TableFactor, not an Expr::Function — check both
         // shapes here so it is caught symmetrically with the expression pass.
