@@ -39,7 +39,6 @@ pub(super) struct Caller {
     policy: Option<ServicePolicy>,
 }
 
-#[axum::async_trait]
 impl<S: Send + Sync> FromRequestParts<S> for Caller {
     type Rejection = Infallible;
 

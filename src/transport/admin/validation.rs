@@ -22,7 +22,7 @@ pub(super) fn invalid_body(rejection: &JsonRejection, request_id: &str) -> Admin
     error.with_request_id(request_id)
 }
 
-/// A malformed UUID in `:id`.
+/// A malformed UUID in `{id}`.
 pub(super) fn invalid_id(entity: &str, request_id: &str) -> AdminError {
     AdminError::invalid(format!("invalid {entity} id")).with_request_id(request_id)
 }

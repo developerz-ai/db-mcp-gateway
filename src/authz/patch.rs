@@ -1,4 +1,4 @@
-//! Per-key constraint patch for `PATCH /admin/v1/grants/:id`.
+//! Per-key constraint patch for `PATCH /admin/v1/grants/{id}`.
 //!
 //! Each key is tri-state: absent keeps the stored value, `null` clears it,
 //! a value sets it. Replacing the whole object instead would let a PATCH

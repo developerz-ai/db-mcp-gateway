@@ -78,7 +78,6 @@ impl TrustedProxies {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ClientIp(pub(super) Option<IpAddr>);
 
-#[axum::async_trait]
 impl<S: Send + Sync> FromRequestParts<S> for ClientIp {
     type Rejection = Infallible;
 

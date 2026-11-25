@@ -43,7 +43,7 @@ required-features = ["bench-harness"]
 # the one async file read (`config::secret`), and `io-util` for the
 # syslog sink's TCP/TLS writes. Add a feature when code needs it.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs", "io-util"] }
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.8", features = ["macros"] }
 axum-server = { version = "0.9", features = ["tls-rustls"] }
 # rustls 0.23 requires explicit CryptoProvider selection — we pick aws-lc-rs
 # at boot in `transport::tls::install_crypto_provider`.

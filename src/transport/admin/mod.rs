@@ -67,7 +67,7 @@ pub struct AdminDeps {
     /// replica (other replicas hear it over `NOTIFY`) — spec 12 §"Cache
     /// invalidation".
     pub cache: PermissionsCache,
-    /// For `POST /admin/v1/users/:id/revoke-sessions`.
+    /// For `POST /admin/v1/users/{id}/revoke-sessions`.
     pub sessions: SessionStore,
     /// `admin.session_max_age_secs`: older sessions get `session_too_old`
     /// (403) to bound admin-group staleness. `None` = no cap.
@@ -110,13 +110,13 @@ pub fn router(deps: AdminDeps) -> Router {
     let users_routes = Router::new()
         .route("/admin/v1/users", post(users::create).get(users::list))
         .route(
-            "/admin/v1/users/:id",
+            "/admin/v1/users/{id}",
             get(users::get_one)
                 .patch(users::patch)
                 .delete(users::delete),
         )
         .route(
-            "/admin/v1/users/:id/revoke-sessions",
+            "/admin/v1/users/{id}/revoke-sessions",
             post(users::revoke_sessions),
         )
         .with_state(UsersState {
@@ -131,7 +131,7 @@ pub fn router(deps: AdminDeps) -> Router {
             post(databases::create).get(databases::list),
         )
         .route(
-            "/admin/v1/databases/:id",
+            "/admin/v1/databases/{id}",
             get(databases::get_one)
                 .patch(databases::patch)
                 .delete(databases::delete),
@@ -164,7 +164,7 @@ pub fn router(deps: AdminDeps) -> Router {
             post(grants::batch).layer(DefaultBodyLimit::max(grants::BATCH_BODY_LIMIT)),
         )
         .route(
-            "/admin/v1/grants/:id",
+            "/admin/v1/grants/{id}",
             get(grants::get_one)
                 .patch(grants::patch)
                 .delete(grants::delete),
