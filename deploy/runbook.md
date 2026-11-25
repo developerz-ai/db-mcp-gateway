@@ -71,7 +71,7 @@ The gauge holds for 30m after a replica's last such failure and goes with the pr
 
 **First checks.** The `version` label of the alert against the image you meant to run; a stalled or paused rollout; a rollback.
 
-**Fixes.** Roll the image. If it has to stay, use the rules shipped with it: `deploy/prometheus/rules.yaml` at that image's tag. Order for every upgrade: the image first, then the rules. The chart applies both in one upgrade, so this fires there only when the rollout takes longer than 15m.
+**Fixes.** Roll the image. If it has to stay, use the rules shipped with it: `deploy/prometheus/rules.yaml` at that image's tag. Order for every upgrade: the image first, then the rules. The 15m start at the first evaluation of this rule that matches the target (not at its first scrape), so a finished rollout does not rule this out: if the image pin was not bumped (a chart upgrade that keeps the old image), it fires. Check the pin and the running version before the rollout.
 
 ### GatewayAuditAbandoned
 
