@@ -33,6 +33,9 @@ pub(super) struct Origin<'a> {
 /// `""` for one of the gateway's own.
 pub(super) fn classify(err: sqlx::Error, origin: &Origin<'_>, sql: &str) -> ExecError {
     log_discarded(&err, Some(origin), "target statement failed");
+    if is_stale_plan(&err) {
+        return ExecError::Unavailable;
+    }
     if let sqlx::Error::Database(db) = &err
         && let Some(code) = db.code()
     {
@@ -111,6 +114,20 @@ pub(super) fn classify_commit(
         }
         other => other,
     }
+}
+
+/// "cached plan must not change result type": a definition changed between
+/// the statement's `Parse` and its `Bind`. Revalidation comes before
+/// execution, so the statement did not run, and the same one planned afresh
+/// may. Told from any other `0A000` by the raising C function: the message
+/// is localised, the function name is not.
+fn is_stale_plan(err: &sqlx::Error) -> bool {
+    is_feature_not_supported(err)
+        && err
+            .as_database_error()
+            .and_then(|db| db.try_downcast_ref::<PgDatabaseError>())
+            .and_then(PgDatabaseError::routine)
+            == Some("RevalidateCachedQuery")
 }
 
 fn sqlstate(err: &sqlx::Error) -> Option<String> {

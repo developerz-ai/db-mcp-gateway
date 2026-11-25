@@ -269,6 +269,46 @@ async fn a_read_needing_the_text_cast_runs_once() {
         .expect("drop call counter");
 }
 
+/// A plain read's functions run once too, though its text is parsed twice.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_plain_read_runs_once() {
+    // No advisory locks to count with (see above).
+    if is_yugabyte() {
+        return;
+    }
+    let owner = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&owner_url())
+        .await
+        .expect("target-db reachable; run `bin/dev up`");
+    let calls = create_call_counter(&owner).await;
+    let adapter = adapter().await;
+    for (sql, params) in [
+        (format!("SELECT {calls}()"), vec![]),
+        (
+            format!("SELECT {calls}() WHERE $1 = 1"),
+            vec![QueryParam::Int(1)],
+        ),
+        // The first call is discarded; the count is the second's.
+        (
+            format!("SELECT {calls}() FROM generate_series(1, 2) OFFSET 1"),
+            vec![],
+        ),
+    ] {
+        let want = if sql.contains("OFFSET") { 2 } else { 1 };
+        let result = adapter
+            .execute_with_params(read(&sql, 1), &params)
+            .await
+            .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+        assert_eq!(result.rows, vec![vec![json!(want)]], "{sql}");
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP FUNCTION {calls}()")))
+        .execute(&owner)
+        .await
+        .expect("drop call counter");
+}
+
 /// The cast is decided from the statement's description with the caller's
 /// params, never from a run with every param NULL: `array_fill` refuses a
 /// NULL dimension while the statement is planned. A plain `LIMIT $1` takes

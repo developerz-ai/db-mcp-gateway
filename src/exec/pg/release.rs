@@ -41,11 +41,9 @@ const UNLOCK_ALL: &str = "SELECT pg_advisory_unlock_all()";
 /// `after_release` hook: wipe session state before a connection serves the
 /// next caller. A failed reset discards the connection.
 ///
-/// The driver's statement cache is emptied first — every read is prepared
-/// as a named statement (`describe`), and its text is the previous caller's
-/// SQL — so the cache and the server agree before
-/// `DEALLOCATE ALL`. The read buffer is given back too: one huge row must
-/// not stay allocated on an idle connection.
+/// The driver names no statement on these connections (see `config`), so it
+/// has nothing of its own to close first. The read buffer is given back: one
+/// huge row must not stay allocated on an idle connection.
 ///
 /// A server without advisory locks (YugabyteDB with the preview flag off)
 /// rejects the unlock as `feature_not_supported`; it can hold no advisory
@@ -58,15 +56,10 @@ pub(super) fn reset_on_release(
 ) -> BoxFuture<'_, Result<bool, sqlx::Error>> {
     Box::pin(async move {
         conn.shrink_buffers();
-        let reset = match conn.clear_cached_statements().await {
-            Ok(()) => {
-                let with_unlock = format!("{RESET_SESSION}; {UNLOCK_ALL}");
-                match conn.execute(sqlx::AssertSqlSafe(with_unlock)).await {
-                    Err(err) if is_feature_not_supported(&err) => conn.execute(RESET_SESSION).await,
-                    other => other,
-                }
-            }
-            Err(err) => Err(err),
+        let with_unlock = format!("{RESET_SESSION}; {UNLOCK_ALL}");
+        let reset = match conn.execute(sqlx::AssertSqlSafe(with_unlock)).await {
+            Err(err) if is_feature_not_supported(&err) => conn.execute(RESET_SESSION).await,
+            other => other,
         };
         match reset {
             Ok(_) => Ok(true),

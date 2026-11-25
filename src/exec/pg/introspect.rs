@@ -4,11 +4,11 @@
 
 use std::time::Duration;
 
-use sqlx::{PgConnection, Row};
+use sqlx::{Executor, PgConnection, Row};
 use uuid::Uuid;
 
 use super::super::adapter::{ExecError, ExecResult};
-use super::cancel::BackendTag;
+use super::cancel::{BackendTag, RequestPrefix};
 use super::error::{Origin, classify};
 use super::tier::TierKind;
 
@@ -86,17 +86,18 @@ pub(super) fn merge_activity(read: ExecResult, write: ExecResult, row_limit: u32
 /// Signal every backend of the tier's role that carries `request_id`'s tag.
 /// Runs on a cancel-pool connection, so it is never queued behind the query
 /// it targets. `pg_cancel_backend` on an own-role backend needs no privilege.
-const CANCEL_BY_TAG_SQL: &str = "SELECT count(*) FILTER (WHERE pg_cancel_backend(pid)) \
-                                 FROM pg_stat_activity \
-                                 WHERE usename = current_user AND application_name LIKE $1";
-
+/// A simple query, for the reason `cancel::cancel_backend` is one.
 pub(super) async fn cancel_request(
     conn: &mut PgConnection,
     origin: &Origin<'_>,
     request_id: Uuid,
 ) -> Result<bool, ExecError> {
-    let pattern = format!("{}%", BackendTag::request_prefix(request_id));
-    let cancel = sqlx::query(CANCEL_BY_TAG_SQL).bind(pattern).fetch_one(conn);
+    let sql = format!(
+        "SELECT count(*) FILTER (WHERE pg_cancel_backend(pid)) FROM pg_stat_activity \
+         WHERE usename = current_user AND application_name LIKE '{}%'",
+        RequestPrefix::of(request_id)
+    );
+    let cancel = conn.fetch_one(sqlx::AssertSqlSafe(sql));
     let row = match tokio::time::timeout(CANCEL_TIMEOUT, cancel).await {
         Ok(row) => row.map_err(|err| classify(err, origin, ""))?,
         Err(_elapsed) => return Err(ExecError::Timeout),

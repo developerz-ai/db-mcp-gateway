@@ -46,7 +46,7 @@ pub(super) async fn run_query(
     // precede the transaction's first query. The read-only transaction is the
     // database's own enforcement of a read grant — the SQL guard is the
     // second layer, not the only one. Every interpolated value is a number
-    // or a `BackendTag`, which contains no quote. The lexing pin is repeated
+    // or a `BackendTag`, which renders no quote. The lexing pin is repeated
     // here because behind a transaction-mode pooler the session-level pin
     // may have landed on a different server connection than this one.
     let tag = BackendTag::for_request(query.request_id);
@@ -57,9 +57,8 @@ pub(super) async fn run_query(
     };
     let setup = format!(
         "SET TRANSACTION {mode}; SET LOCAL statement_timeout = {ms}; \
-         SET LOCAL application_name = '{}'; \
-         SET LOCAL standard_conforming_strings = on",
-        tag.as_str()
+         SET LOCAL application_name = '{tag}'; \
+         SET LOCAL standard_conforming_strings = on"
     );
     tx.execute(sqlx::AssertSqlSafe(setup))
         .await
@@ -69,10 +68,9 @@ pub(super) async fn run_query(
     // cancel the exact backend running our query — dropping `tx` alone won't
     // stop it. The guard holds the *cancel* pool so the cancel can always
     // acquire, even when every connection in the query pool is pinned.
-    // Unnamed, like every statement on a query connection: nothing is left
-    // prepared on it for `reset_on_release` to close. The same round trip
-    // asks how many of a `money` value's digits are its fraction: the wire
-    // form is a bare count of minor units, and `lc_monetary` says the rest.
+    // The same round trip asks how many of a `money` value's digits are its
+    // fraction: the wire form is a bare count of minor units, and
+    // `lc_monetary` says the rest.
     let (pid, money_digits): (i32, i32) =
         sqlx::query_as("SELECT pg_backend_pid(), scale(1::money::numeric)")
             .persistent(false)
@@ -115,11 +113,13 @@ pub(super) async fn run_query(
             money_digits,
         )
         .await?;
-        // A read's columns come from its description: a zero-row read has
-        // no row to name them (#136).
+        // A zero-row read has no row to name its columns (#136): its
+        // description does.
         let (columns, column_types) = match described {
-            Some(described) => (described.columns, described.column_types),
-            None => (collected.columns, collected.column_types),
+            Some(described) if collected.columns.is_empty() => {
+                (described.columns, described.column_types)
+            }
+            _ => (collected.columns, collected.column_types),
         };
         if query.access == Access::ReadOnly && collected.truncated {
             cancel_and_rollback(tx, ctx.cancel_pool, &backend).await;

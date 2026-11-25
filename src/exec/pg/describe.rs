@@ -1,11 +1,12 @@
 //! What a read returns, asked before it runs (#382). The statement is
 //! prepared — Parse/Describe over the extended protocol, which never
 //! executes it — with the types its params will be bound with, so `SELECT
-//! $1 AS v` is described as the read will run. The driver keeps the
-//! prepared statement and the read binds and executes it. The driver
-//! prepares every statement before binding it anyway, so a warm read takes
-//! no more round trips than without this; it adds a `Close` at release and
-//! one catalog lookup per connection and newly seen table.
+//! $1 AS v` is described as the read will run. It is the unnamed statement
+//! (see `config`): nothing outlives the call for a pooler to hand to another
+//! caller. Running it parses it again: one round trip and one Parse more
+//! than without this, and one catalog lookup per connection and newly seen
+//! table. The run takes nothing from the described statement but the choice
+//! of text, so whatever the driver sends in between cannot disturb it.
 //!
 //! The description decides whether a column the driver cannot take needs
 //! the text cast (see [`recast`]), so the statement that runs is the one

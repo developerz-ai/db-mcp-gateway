@@ -29,6 +29,13 @@ pub(super) fn connect_options(
         .username(role)
         .database(database.connect_name())
         .ssl_mode(ssl_mode(server.tls))
+        // No statement cache: the driver then prepares everything as the
+        // unnamed statement, `prepare_with` included, which has no other
+        // switch for it. A name would outlive its transaction in a
+        // transaction-mode pooler that tracks statements by their text: the
+        // next caller of that text is handed the old one, and after DDL the
+        // server refuses it (`0A000`, see `error::is_stale_plan`).
+        .statement_cache_capacity(0)
         // sqlx logs every statement it runs at `info` by default; on the
         // target path that is the caller's SQL — audit-row material, never a
         // log line.
@@ -102,6 +109,22 @@ pub(crate) async fn resolve_password(password: &Password) -> Result<SecretString
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every target pool — read, write and both cancel pools — opens with
+    /// these options. The driver has no getter for the capacity.
+    #[test]
+    fn a_target_connection_never_names_a_statement() {
+        let server: Server = serde_saphyr::from_str(
+            "{name: s, kind: postgres, host: h, databases: [{name: d, role: r, password: p}]}",
+        )
+        .unwrap();
+        let options = connect_options(&server, &server.databases[0], "r");
+        let rendered = format!("{options:?}");
+        assert!(
+            rendered.contains("statement_cache_capacity: 0,"),
+            "{rendered}"
+        );
+    }
 
     #[test]
     fn tls_maps_to_ssl_mode() {

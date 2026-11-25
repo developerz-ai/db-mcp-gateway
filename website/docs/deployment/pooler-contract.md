@@ -15,18 +15,18 @@ SET LOCAL statement_timeout = <ms>;
 SET LOCAL application_name = 'dbmcp-<request-id>-<nonce>';
 SET LOCAL standard_conforming_strings = on;
 SELECT pg_backend_pid();
-<the statement>                       -- a read: prepared by name, then bound once; a write: unnamed
+<the statement>                       -- the protocol's unnamed statement; a read is described first, then parsed again and run once
 COMMIT;                               -- ROLLBACK for dry_run / errors
 ```
 
-When the connection goes back to the gateway's pool it runs one simple-query batch outside an explicit transaction: `RESET ALL; RESET SESSION AUTHORIZATION; RESET ROLE; DEALLOCATE ALL; DISCARD SEQUENCES; DISCARD TEMP; SET standard_conforming_strings = on; SELECT pg_advisory_unlock_all()`. On an agent disconnect, a result cut off at the row cap, or a `cancel_query`, a **separate** connection (same role) runs `SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE pid = $1 AND application_name = $2`.
+When the connection goes back to the gateway's pool it runs one simple-query batch outside an explicit transaction: `RESET ALL; RESET SESSION AUTHORIZATION; RESET ROLE; DEALLOCATE ALL; DISCARD SEQUENCES; DISCARD TEMP; SET standard_conforming_strings = on; SELECT pg_advisory_unlock_all()`. On an agent disconnect, a result cut off at the row cap, or a `cancel_query`, a **separate** connection (same role) runs `SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE pid = … AND application_name = '…'` as a simple query (`cancel_query` matches the request's tag prefix instead of a pid). Nothing is parsed or bound outside a transaction, so a pooler never splits a `Parse` from its `Bind`.
 
 ## The contract
 
 | # | Requirement | What breaks otherwise |
 |---|---|---|
 | 1 | **Session pooling, or transaction pooling with a server reset (rule 8).** *Statement* pooling does not work | Statement mode cannot run a multi-statement transaction: every call fails |
-| 2 | **Named prepared statements across the transaction.** Every read is prepared by name (`sqlx_s_…`) inside its transaction and bound there; the name is closed when the connection is released. In transaction mode the pooler must track them: PgBouncer ≥ 1.21 with `max_prepared_statements` > 0, pgcat with prepared-statement support on | `prepared statement "sqlx_s_…" does not exist` (or `already exists`) errors on reads, intermittently |
+| 2 | **The extended protocol passes through.** Prepared-statement tracking is *not* needed: every statement the gateway sends a target is the unnamed one, inside one transaction, so `max_prepared_statements = 0` and any other value both work (2.5.0 alone named its reads and needed tracking) | Reads fail to parse or bind |
 | 3 | **The configured role reaches Postgres.** Pass the client's user through (auth passthrough / `auth_query`), not one shared pooler user | Every query runs with the pooler user's privileges: the read-only role, and the read/write split, stop meaning anything |
 | 4 | **One Postgres server per endpoint.** The cancel connection must reach the same server as the query connection | `pg_stat_activity` on another node does not see the backend: cancel-on-disconnect, `cancel_query` and `db_activity` silently find nothing. Statements still end at `statement_timeout` |
 | 5 | **`SET LOCAL` and `application_name` pass through.** Poolers that rewrite or drop `application_name` defeat the cancel identity check | Same as 4: cancels and `db_activity` miss |
@@ -45,8 +45,7 @@ The gateway keeps two things apart, and a pooler's mode decides which of them st
 
 The gateway itself relies on no session state across calls — no session `SET`, temp tables, `LISTEN` or advisory locks — so its own correctness is the same in both modes. What changes is what a *caller* can leave behind for the next one. In session mode the gateway guarantees nothing survives. In transaction mode that guarantee exists only if the pooler provides it (rule 8); without it, run the endpoint in session mode.
 
-Two more things to know in transaction mode:
-- **`DEALLOCATE ALL` and `DISCARD` arrive as a simple query.** A pooler that tracks protocol-level prepared statements (rule 2) keeps its own map of what is prepared on each server connection and does not necessarily notice SQL-level deallocation — older PgBouncer transaction mode in particular; newer releases recognise `DEALLOCATE ALL` / `DISCARD ALL`, but not reliably inside a multi-statement batch. Such a pooler can then believe a statement is still prepared on a server that dropped it, and a later call fails with `prepared statement "…" does not exist`. The gateway narrows the window — it closes its own named statements at the protocol level before the batch, so `DEALLOCATE ALL` normally finds nothing — but if you see that error behind a transaction-mode pooler, check the pooler's release notes for SQL-level `DEALLOCATE` support or switch that endpoint to session pooling.
+**Prepared statements in transaction mode.** A pooler that tracks them keeps its own map, by statement text, of what is prepared on each server connection, and that map outlives a client's `Close`, DDL and an SQL-level `DEALLOCATE`. Gateway 2.5.0 named its reads and met it: after an `ALTER TABLE` a repeated `SELECT *` could fail with `0A000 cached plan must not change result type`. Later versions name nothing, so the map holds nothing of theirs. Other clients' entries are still at risk from the gateway's `DEALLOCATE ALL` on a server connection they share, so give the gateway roles no other client uses.
 
 ## Sequences declared with `CACHE`
 
