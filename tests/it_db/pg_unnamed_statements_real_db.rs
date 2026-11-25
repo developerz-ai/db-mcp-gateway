@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use sqlx::postgres::{PgConnectOptions, PgDatabaseError, PgPoolOptions, PgSslMode};
-use sqlx::{ConnectOptions, Connection};
+use sqlx::{ConnectOptions, Connection, PgConnection};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
@@ -86,26 +86,41 @@ async fn run(owner: &sqlx::PgPool, sql: String) {
 async fn no_statement_is_prepared_by_name() {
     let one = single_connection_adapter().await;
     let named = "(SELECT count(*) FROM pg_prepared_statements)::int AS named";
-    for (sql, params) in [
-        (format!("SELECT {named}"), vec![]),
-        (format!("SELECT {named}, $1 AS p"), vec![QueryParam::Int(1)]),
+    // The view shows the driver's own named statements.
+    let control: i32 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT {named}")))
+        .fetch_one(&owner().await)
+        .await
+        .expect("control");
+    assert_eq!(control, 1, "the view does not show a named statement");
+
+    for (sql, params, types) in [
+        (format!("SELECT {named}"), vec![], &["INT4"][..]),
+        (
+            format!("SELECT {named}, $1 AS p"),
+            vec![QueryParam::Int(1)],
+            &["INT4", "INT8"],
+        ),
         // The text cast, described by the driver …
         (
             format!("SELECT {named}, relacl FROM pg_class WHERE relname = 'pg_class'"),
             vec![],
+            &["INT4", "TEXT"],
         ),
         // … and by the cursor, its lookup having failed after the Parse.
         (
             format!("SELECT {named}, ev_action FROM pg_rewrite LIMIT $1"),
             vec![QueryParam::Int(1)],
+            &["INT4", "TEXT"],
         ),
-        (format!("SELECT {named}"), vec![]),
+        (format!("SELECT {named}"), vec![], &["INT4"]),
     ] {
         let result = one
             .execute_with_params(read(&sql), &params)
             .await
             .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+        assert_eq!(result.rows.len(), 1, "{sql}");
         assert_eq!(result.rows[0][0], json!(0), "{sql}");
+        assert_eq!(result.column_types, types, "{sql}");
     }
 
     let sql = format!("SELECT {named}");
@@ -118,11 +133,13 @@ async fn no_statement_is_prepared_by_name() {
 }
 
 /// On a connection that has seen neither the table nor its types, the driver
-/// looks them up while the statement it serves is unnamed. Callers with
-/// tables of their own do so side by side.
+/// looks them up, by simple query, between the `Parse` of the statement it
+/// serves and its `Bind`, which must then find the statement parsed again.
+/// Callers with tables of their own do so side by side.
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn a_first_seen_type_does_not_lose_the_statement() {
+    ensure_read_role().await;
     let owner = owner().await;
     let mut names = Vec::new();
     for _ in 0..8 {
@@ -144,10 +161,11 @@ async fn a_first_seen_type_does_not_lose_the_statement() {
         .cloned()
         .map(|name| {
             tokio::spawn(async move {
-                let reader = single_connection_adapter().await;
+                let wire = WireRecorder::start().await;
+                let a = wire.adapter(1, DetachedTasks::new()).await;
                 for round in 0..3 {
                     let sql = format!("SELECT * FROM {name} WHERE id = $1");
-                    let found = reader
+                    let found = a
                         .execute_with_params(read(&sql), &[QueryParam::Int(1)])
                         .await
                         .unwrap_or_else(|err| panic!("read {round}: {err:?}"));
@@ -156,7 +174,10 @@ async fn a_first_seen_type_does_not_lose_the_statement() {
                     assert_eq!(found.rows[0][..2], [json!(1), json!("a")], "{found:?}");
                     assert_eq!(found.rows[0][2], json!(["a", "b"]), "{found:?}");
                     assert_eq!(found.rows[0][4], json!(1), "{found:?}");
-                    let none = reader
+                    if round == 0 {
+                        assert_parsed_again(&wire.take(), &sql);
+                    }
+                    let none = a
                         .execute(read(&format!("SELECT * FROM {name} WHERE false")))
                         .await
                         .unwrap_or_else(|err| panic!("zero rows {round}: {err:?}"));
@@ -164,11 +185,12 @@ async fn a_first_seen_type_does_not_lose_the_statement() {
                     assert_eq!(none.columns, found.columns);
                 }
                 let sql = format!("UPDATE {name} SET e = 'b' RETURNING e, es, c, d");
-                let written = writable_adapter()
-                    .await
+                wire.take();
+                let written = a
                     .execute(statement(&sql, Access::ReadWrite))
                     .await
                     .unwrap_or_else(|err| panic!("write: {err:?}"));
+                assert_parsed_again(&wire.take(), &sql);
                 assert_eq!(written.rows_affected, Some(1));
                 assert_eq!(written.rows[0][0], json!("b"), "{written:?}");
                 assert_eq!(written.rows[0][1], json!(["a", "b"]), "{written:?}");
@@ -188,6 +210,24 @@ async fn a_first_seen_type_does_not_lose_the_statement() {
     for outcome in outcomes {
         outcome.expect("reads and writes of a first-seen type");
     }
+}
+
+/// `seen`, one call's traffic, has `sql` parsed, then a lookup, then `sql`
+/// parsed again as the last thing parsed before it is bound.
+fn assert_parsed_again(seen: &Seen, sql: &str) {
+    let parses_sql = |(kind, text): &(u8, String)| *kind == b'P' && text.contains(sql);
+    let first = seen.messages.iter().position(parses_sql);
+    let first = first.unwrap_or_else(|| panic!("{sql}: never parsed"));
+    let rest = &seen.messages[first..];
+    // The last Bind: a question of the gateway's own may come before it.
+    let bind = rest.iter().rposition(|(kind, _)| *kind == b'B');
+    let until_bind = &rest[..bind.unwrap_or_else(|| panic!("{sql}: never bound"))];
+    let lookup = until_bind.iter().rposition(|(kind, _)| *kind == b'Q');
+    let lookup = lookup.unwrap_or_else(|| panic!("{sql}: no lookup in {until_bind:?}"));
+    let last_parse = until_bind.iter().rposition(|(kind, _)| *kind == b'P');
+    let last_parse = last_parse.expect("the first parse at least");
+    assert!(last_parse > lookup, "{sql}: {until_bind:?}");
+    assert!(parses_sql(&until_bind[last_parse]), "{sql}: {until_bind:?}");
 }
 
 /// The same `SELECT *` from several callers at once, again after each change
@@ -227,56 +267,206 @@ async fn reads_after_a_schema_change_see_the_new_table() {
     run(&owner, format!("DROP TABLE {table}")).await;
 }
 
-/// The same reads while the table changes under them, however the two fall
-/// together: none fails, and no header goes back to an older table.
+/// A read of `table`, whose column `c<n>` is `n` in both rows but for `c0`,
+/// the row's number.
+struct Shape {
+    condition: &'static str,
+    params: Vec<QueryParam>,
+    /// The `c0` of the rows that satisfy `condition`.
+    rows: &'static [i64],
+    /// A further column, which needs the text cast.
+    extra: Option<&'static str>,
+}
+
+/// Plain, without rows, with params, and by both routes to the text cast.
+fn shapes() -> [Shape; 5] {
+    let plain = || Shape {
+        condition: "true",
+        params: vec![],
+        rows: &[1, 2],
+        extra: None,
+    };
+    [
+        plain(),
+        Shape {
+            condition: "c0 < 0",
+            rows: &[],
+            ..plain()
+        },
+        Shape {
+            condition: "c0 = $1",
+            params: vec![QueryParam::Int(2)],
+            rows: &[2],
+            ..plain()
+        },
+        Shape {
+            extra: Some("SELECT relacl FROM pg_class WHERE oid = 'pg_class'::regclass"),
+            ..plain()
+        },
+        Shape {
+            extra: Some("SELECT ev_action FROM pg_rewrite LIMIT 1"),
+            ..plain()
+        },
+    ]
+}
+
+impl Shape {
+    /// `gate` is evaluated before any row of `table`.
+    fn sql(&self, table: &str, gate: &str) -> String {
+        let extra = self.extra.map(|sql| format!(", ({sql}) AS extra"));
+        format!(
+            "SELECT t.*{} FROM {table} t WHERE {gate} AND {} ORDER BY c0",
+            extra.unwrap_or_default(),
+            self.condition
+        )
+    }
+
+    /// `found` is this read's answer on a table with `c0` to `c<last>`.
+    fn assert_answer(&self, found: Result<ExecResult, ExecError>, last: usize, sql: &str) {
+        let found = found.unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+        let mut columns: Vec<String> = (0..=last).map(|at| format!("c{at}")).collect();
+        columns.extend(self.extra.map(|_| "extra".to_string()));
+        assert_eq!(found.columns, columns, "{sql}");
+        assert_eq!(found.rows.len(), self.rows.len(), "{sql}: {found:?}");
+        for (row, c0) in found.rows.iter().zip(self.rows) {
+            let mut own = vec![json!(c0)];
+            own.extend((1..=last).map(|at| json!(at)));
+            assert_eq!(row[..=last], own, "{sql}");
+            assert_eq!(row.len(), columns.len(), "{sql}");
+            if self.extra.is_some() {
+                assert!(row[last + 1].is_string(), "{sql}: {row:?}");
+            }
+        }
+    }
+}
+
+async fn create_evolving(owner: &sqlx::PgPool) -> String {
+    let table = format!("dbmcp_evolving_{}", Uuid::new_v4().simple());
+    run(
+        owner,
+        format!("CREATE TABLE {table} (c0 int); INSERT INTO {table} VALUES (1), (2)"),
+    )
+    .await;
+    table
+}
+
+fn add_column(table: &str, at: usize) -> String {
+    format!("ALTER TABLE {table} ADD COLUMN c{at} int DEFAULT {at}")
+}
+
+async fn connect() -> (PgConnection, i32) {
+    let mut conn = PgConnection::connect(&owner_url())
+        .await
+        .expect("target-db reachable; run `bin/dev up`");
+    let pid = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut conn)
+        .await
+        .expect("pid");
+    (conn, pid)
+}
+
+async fn execute(conn: &mut PgConnection, sql: String) {
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql.clone()))
+        .execute(conn)
+        .await
+        .unwrap_or_else(|err| panic!("{sql}: {err}"));
+}
+
+/// Wait for `condition` over `pg_stat_activity r`, the backend of
+/// `request_id`, with `$2` = `pid`.
+async fn observe(owner: &sqlx::PgPool, condition: &str, request_id: Uuid, pid: i32) {
+    let deadline = Instant::now() + PATIENCE;
+    let sql = format!(
+        "SELECT EXISTS (SELECT FROM pg_stat_activity r \
+         WHERE r.application_name LIKE $1 AND {condition})"
+    );
+    loop {
+        let seen: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.clone()))
+            .bind(format!("dbmcp-{}-%", request_id.simple()))
+            .bind(pid)
+            .fetch_one(owner)
+            .await
+            .expect("pg_stat_activity");
+        if seen {
+            return;
+        }
+        assert!(Instant::now() < deadline, "never observed: {condition}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+const READ_WAITS_FOR_PID: &str = "$2 = ANY(pg_blocking_pids(r.pid))";
+const PID_WAITS_FOR_READ: &str = "r.pid = ANY(pg_blocking_pids($2))";
+
+/// A read that meets an `ALTER TABLE` in progress waits for it and answers
+/// with the table it leaves.
 #[tokio::test]
 #[serial_test::parallel(world)]
-async fn reads_racing_schema_changes_neither_fail_nor_go_back() {
-    // Concurrent DDL aborts a YugabyteDB read with a retryable `40001`.
+async fn a_read_blocked_by_a_schema_change_answers_with_the_new_table() {
+    // YugabyteDB has neither the lock nor `pg_blocking_pids` for it.
     if is_yugabyte() {
         return;
     }
     let owner = owner().await;
-    let table = format!("dbmcp_evolving_{}", Uuid::new_v4().simple());
-    run(
-        &owner,
-        format!("CREATE TABLE {table} (c0 int); INSERT INTO {table} VALUES (1), (2)"),
-    )
-    .await;
-    let adapter = Arc::new(adapter().await);
-    let done = Arc::new(AtomicBool::new(false));
-    let readers: Vec<_> = ["", "", "WHERE c0 < 0"]
-        .map(|filter| {
-            let (adapter, done) = (adapter.clone(), done.clone());
-            let sql = format!("SELECT * FROM {table} {filter}");
-            tokio::spawn(async move {
-                let (mut failures, mut width) = (Vec::new(), 0);
-                while !done.load(Ordering::Relaxed) {
-                    match adapter.execute(read(&sql)).await {
-                        Ok(result) => {
-                            let columns = result.columns.len();
-                            if columns < width || result.rows.iter().any(|r| r.len() != columns) {
-                                failures.push(format!("{columns} columns after {width}"));
-                            }
-                            width = columns;
-                        }
-                        Err(err) => failures.push(format!("{err:?}")),
-                    }
-                }
-                failures
-            })
-        })
-        .into();
-    for at in 1..=20 {
-        run(&owner, format!("ALTER TABLE {table} ADD COLUMN c{at} int")).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    let table = create_evolving(&owner).await;
+    let adapter = adapter().await;
+    let (mut alter, alter_pid) = connect().await;
+    for (shape, at) in shapes().iter().zip(1..) {
+        execute(&mut alter, format!("BEGIN; {}", add_column(&table, at))).await;
+        let sql = shape.sql(&table, "true");
+        let victim = ExecQuery {
+            statement_timeout_ms: Some(30_000),
+            ..read(&sql)
+        };
+        let request_id = victim.request_id;
+        let (found, ()) = tokio::join!(adapter.execute_with_params(victim, &shape.params), async {
+            observe(&owner, READ_WAITS_FOR_PID, request_id, alter_pid).await;
+            execute(&mut alter, "COMMIT".to_string()).await;
+        });
+        shape.assert_answer(found, at, &sql);
     }
-    done.store(true, Ordering::Relaxed);
-    let outcomes = futures::future::join_all(readers).await;
     run(&owner, format!("DROP TABLE {table}")).await;
-    for outcome in outcomes {
-        assert_eq!(outcome.expect("reader"), Vec::<String>::new());
+}
+
+/// The reverse: an `ALTER TABLE` waits for a running read, which answers
+/// with the table it was described on; the next read has the new one.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_schema_change_waits_for_a_running_read() {
+    // No advisory locks to hold the read with, nor `pg_blocking_pids`.
+    if is_yugabyte() {
+        return;
     }
+    let owner = owner().await;
+    let table = create_evolving(&owner).await;
+    let adapter = adapter().await;
+    let (mut keeper, keeper_pid) = connect().await;
+    let (mut alter, alter_pid) = connect().await;
+    for (shape, at) in shapes().iter().zip(1..) {
+        // The read runs into a lock the test holds, and stays there.
+        let key = i64::from(Uuid::new_v4().as_fields().0);
+        execute(&mut keeper, format!("SELECT pg_advisory_lock({key})")).await;
+        let gate = format!("(SELECT pg_advisory_xact_lock({key}) IS NOT NULL)");
+        let sql = shape.sql(&table, &gate);
+        let victim = ExecQuery {
+            statement_timeout_ms: Some(30_000),
+            ..read(&sql)
+        };
+        let request_id = victim.request_id;
+        let (found, ()) = tokio::join!(adapter.execute_with_params(victim, &shape.params), async {
+            observe(&owner, READ_WAITS_FOR_PID, request_id, keeper_pid).await;
+            let ((), ()) = tokio::join!(execute(&mut alter, add_column(&table, at)), async {
+                observe(&owner, PID_WAITS_FOR_READ, request_id, alter_pid).await;
+                let unlock = format!("SELECT pg_advisory_unlock({key})");
+                execute(&mut keeper, unlock).await;
+            });
+        });
+        shape.assert_answer(found, at - 1, &sql);
+        let sql = shape.sql(&table, "true");
+        let next = adapter.execute_with_params(read(&sql), &shape.params);
+        shape.assert_answer(next.await, at, &sql);
+    }
+    run(&owner, format!("DROP TABLE {table}")).await;
 }
 
 /// "cached plan must not change result type" from a plan a function keeps —
@@ -459,21 +649,24 @@ impl Frames {
     /// The messages `bytes` completes.
     fn feed(&mut self, bytes: &[u8]) -> Vec<Frame> {
         self.pending.extend_from_slice(bytes);
-        let mut frames = Vec::new();
-        loop {
-            let head = usize::from(!self.startup_pending);
-            let Some(len) = self.pending.get(head..head + 4) else {
-                return frames;
-            };
-            let end = head + u32::from_be_bytes(len.try_into().unwrap()) as usize;
-            if self.pending.len() < end {
-                return frames;
-            }
-            let raw: Vec<u8> = self.pending.drain(..end).collect();
+        let (mut frames, mut at) = (Vec::new(), 0);
+        while let Some(end) = self.end_of_message(at) {
+            let raw = self.pending[at..end].to_vec();
             let kind = (!self.startup_pending).then(|| raw[0]);
             self.startup_pending = false;
             frames.push(Frame { kind, raw });
+            at = end;
         }
+        self.pending.drain(..at);
+        frames
+    }
+
+    /// Where the message at `at` ends, once all of it is here.
+    fn end_of_message(&self, at: usize) -> Option<usize> {
+        let len_at = at + usize::from(!self.startup_pending);
+        let len = self.pending.get(len_at..len_at + 4)?;
+        let end = len_at + u32::from_be_bytes(len.try_into().unwrap()) as usize;
+        (end <= self.pending.len()).then_some(end)
     }
 }
 
@@ -615,10 +808,8 @@ struct WireRecorder {
 
 #[derive(Default)]
 struct Seen {
-    /// The text of every Parse.
-    parses: Vec<String>,
-    /// Every simple query.
-    queries: Vec<String>,
+    /// Every Parse, Bind and simple query, in the order they came.
+    messages: Vec<(u8, String)>,
     violations: Vec<String>,
 }
 
@@ -664,9 +855,22 @@ impl WireRecorder {
         Self { port, seen }
     }
 
+    /// An adapter of both tiers whose every connection is recorded.
+    async fn adapter(&self, max_connections: u32, detached: DetachedTasks) -> PgAdapter {
+        let mut target = server();
+        target.port = self.port;
+        target.databases = vec![writable_database()];
+        let sizing = PoolSizing {
+            max_connections,
+            ..PoolSizing::default()
+        };
+        PgAdapter::open(&target, &target.databases[0], sizing, detached)
+            .await
+            .expect("adapter over the recorder")
+    }
+
     fn parsed(&self, needle: &str) -> bool {
-        let seen = self.seen.lock().unwrap();
-        seen.parses.iter().any(|text| text.contains(needle))
+        self.seen.lock().unwrap().sent(b'P', needle)
     }
 
     /// What was recorded since the last call.
@@ -685,12 +889,22 @@ impl Session {
 }
 
 impl Seen {
+    /// Whether a message of `kind` holding `needle` was seen.
+    fn sent(&self, kind: u8, needle: &str) -> bool {
+        self.messages
+            .iter()
+            .any(|(seen, text)| *seen == kind && text.contains(needle))
+    }
+
     fn client(&mut self, session: &mut Session, frame: &Frame) {
         let body = frame.body();
         let text = String::from_utf8_lossy(body);
         let Some(kind) = frame.kind else {
             return;
         };
+        if matches!(kind, b'P' | b'B' | b'Q') {
+            self.messages.push((kind, text.to_string()));
+        }
         // Parse starts with the statement's name; Bind with the portal's,
         // then the statement's; Describe and Close with which of the two
         // they are for, then its name.
@@ -698,15 +912,9 @@ impl Seen {
             // A simple query and a Sync are each answered with the state.
             b'Q' | b'S' => {
                 session.unanswered += 1;
-                if kind == b'Q' {
-                    self.queries.push(text.trim_end_matches('\0').to_string());
-                }
                 return;
             }
-            b'P' => {
-                self.parses.push(text.to_string());
-                body.split(|b| *b == 0).next()
-            }
+            b'P' => body.split(|b| *b == 0).next(),
             b'B' => body.split(|b| *b == 0).nth(1),
             b'D' | b'C' => body[1..].split(|b| *b == 0).next(),
             // Execute and Flush name no statement.
@@ -817,8 +1025,10 @@ fn the_recorder_judges_by_the_state_the_server_reported() {
         }
     }
     assert_eq!(seen.violations, Vec::<String>::new());
-    assert_eq!(seen.queries, ["BEGIN"]);
-    assert_eq!(seen.parses.len(), 1);
+    let kinds: Vec<u8> = seen.messages.iter().map(|(kind, _)| *kind).collect();
+    assert_eq!(kinds, b"QPB");
+    assert!(seen.sent(b'Q', "BEGIN") && seen.sent(b'P', "SELECT * FROM t"));
+    assert!(!seen.sent(b'P', "BEGIN"));
 
     // BEGIN refused, or not answered yet: P, D, B and E are all flagged.
     for answered in [true, false] {
@@ -892,7 +1102,7 @@ async fn the_wire_recorder_flags_what_a_pooler_cannot_serve() {
     select().execute(&mut *tx).await.expect("unnamed");
     let seen = wire.take();
     assert_eq!(seen.violations, Vec::<String>::new());
-    assert!(!seen.parses.is_empty());
+    assert!(seen.sent(b'P', "SELECT $1::int"));
     sqlx::query("SELECT 1")
         .execute(&mut *tx)
         .await
@@ -928,21 +1138,8 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
     )
     .await;
     let wire = WireRecorder::start().await;
-    let mut target = server();
-    target.port = wire.port;
-    target.databases = vec![writable_database()];
     let detached = DetachedTasks::new();
-    let a = PgAdapter::open(
-        &target,
-        &target.databases[0],
-        PoolSizing {
-            max_connections: 2,
-            ..PoolSizing::default()
-        },
-        detached.clone(),
-    )
-    .await
-    .expect("adapter over the recorder");
+    let a = wire.adapter(2, detached.clone()).await;
     let id = Uuid::new_v4;
 
     // Reads: a failed statement first, so the first-seen types after it are
@@ -964,9 +1161,9 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
             "quote_ident(c.relname)",
         ),
     ] {
-        let started = Instant::now();
+        let deadline = Instant::now() + PATIENCE;
         while !wire.parsed(lookup) {
-            assert!(started.elapsed() < PATIENCE, "{sql}: no near-miss lookup");
+            assert!(Instant::now() < deadline, "{sql}: no near-miss lookup");
             assert_refused(a.execute(read(sql)).await, sqlstate, sql);
         }
     }
@@ -996,11 +1193,18 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
         .await
         .expect("params");
     assert_eq!(found.rows[0][1], json!("a"));
-    let slow = ExecQuery {
-        statement_timeout_ms: Some(50),
-        ..read("SELECT pg_sleep(1)")
-    };
-    assert!(matches!(a.execute(slow).await, Err(ExecError::Timeout)));
+    // A timeout, until one came in the statement itself, not before it.
+    let timed_out = "SELECT pg_sleep(60), 'timed out'";
+    let deadline = Instant::now() + PATIENCE;
+    while !wire.parsed(timed_out) {
+        assert!(Instant::now() < deadline, "never timed out in the sleep");
+        let slow = ExecQuery {
+            statement_timeout_ms: Some(500),
+            ..read(timed_out)
+        };
+        let outcome = a.execute(slow).await;
+        assert!(matches!(outcome, Err(ExecError::Timeout)), "{outcome:?}");
+    }
 
     // Every other read operation.
     for detail in [
@@ -1081,8 +1285,9 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
     for access in [Access::ReadOnly, Access::ReadWrite] {
         let victim = asleep(access);
         let request_id = victim.request_id;
+        let deadline = Instant::now() + PATIENCE;
         let (cancelled, ()) = tokio::join!(a.execute(victim), async {
-            sleeping(&owner, request_id).await;
+            sleeping(&owner, request_id, deadline).await;
             let activity = a
                 .db_activity(ActivityQuery {
                     statement_timeout_ms: None,
@@ -1095,6 +1300,7 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
             assert!(listed.contains(&request_id.to_string()), "{listed}");
             assert!(a.cancel_request(request_id).await.expect("cancel"));
         });
+        assert!(Instant::now() < deadline, "too late to tell from a timeout");
         assert!(
             matches!(cancelled, Err(ExecError::Cancelled)),
             "{cancelled:?}"
@@ -1119,23 +1325,32 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
                 outcome.unwrap_or_else(|err| panic!("after a drop: {sql}: {err:?}"));
             }
         }
+        // Whatever the drops left behind, the next call finds nothing of it.
+        a.execute(read(sql)).await.expect("after the drops");
     }
 
-    // Dropped while its backend sleeps in it, on each tier: cancelled.
+    // Dropped while its backend sleeps in it, on each tier: cancelled. One
+    // deadline, set before the statement starts, for all of it: the
+    // statement's own timeout, longer and running from later, cannot have
+    // ended what is seen to have ended by then.
     let mut dropped_tags = Vec::new();
     for access in [Access::ReadOnly, Access::ReadWrite] {
+        let deadline = Instant::now() + PATIENCE;
         let victim = asleep(access);
         let request_id = victim.request_id;
         let tag = tokio::select! {
             outcome = a.execute(victim) => panic!("the sleep ended: {outcome:?}"),
-            tag = sleeping(&owner, request_id) => tag,
+            tag = sleeping(&owner, request_id, deadline) => tag,
         };
-        let started = Instant::now();
-        while sleeping_tag(&owner, request_id).await.is_some() {
+        loop {
+            let busy = busy(&owner, &tag).await;
             assert!(
-                started.elapsed() < PATIENCE,
-                "the dropped call's backend kept running"
+                Instant::now() < deadline,
+                "the dropped call's backend was not cancelled in time"
             );
+            if !busy {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         dropped_tags.push(tag);
@@ -1144,8 +1359,9 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
     // The backend killed under the statement.
     let victim = asleep(Access::ReadOnly);
     let request_id = victim.request_id;
+    let deadline = Instant::now() + PATIENCE;
     let (killed, ()) = tokio::join!(a.execute(victim), async {
-        let tag = sleeping(&owner, request_id).await;
+        let tag = sleeping(&owner, request_id, deadline).await;
         let killed: Vec<bool> = sqlx::query_scalar(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1",
         )
@@ -1155,6 +1371,7 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
         .expect("terminate");
         assert_eq!(killed, [true]);
     });
+    assert!(Instant::now() < deadline, "too late to tell from a timeout");
     assert!(matches!(killed, Err(ExecError::Unavailable)), "{killed:?}");
     let recovered = a.execute(read("SELECT 1")).await.expect("recovered");
     assert_eq!(recovered.rows, vec![vec![json!(1)]]);
@@ -1176,18 +1393,14 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
         "UPDATE",
         "FROM pg_stat_activity",
     ] {
-        assert!(
-            seen.parses.iter().any(|text| text.contains(route)),
-            "nothing parsed holds {route}"
-        );
+        assert!(seen.sent(b'P', route), "nothing parsed holds {route}");
     }
     // Every kind of cancel reached the target, as a simple query.
-    let cancels: Vec<&String> = seen
-        .queries
-        .iter()
-        .filter(|query| query.contains("pg_cancel_backend"))
-        .collect();
-    let cancelled = |needle: &str| cancels.iter().any(|query| query.contains(needle));
+    let cancelled = |whom: &str| {
+        seen.messages.iter().any(|(kind, text)| {
+            *kind == b'Q' && text.contains("pg_cancel_backend") && text.contains(whom)
+        })
+    };
     for tag in &dropped_tags {
         assert!(cancelled(&format!("application_name = '{tag}'")), "{tag}");
     }
@@ -1207,28 +1420,35 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
     );
 }
 
-/// The tag of the backend sleeping for `request_id`, waited for.
-async fn sleeping(owner: &sqlx::PgPool, request_id: Uuid) -> String {
-    let started = Instant::now();
+/// The tag of the backend sleeping for `request_id`, once it is: inside
+/// `pg_sleep`, for the statement's text alone is there from its Parse on.
+async fn sleeping(owner: &sqlx::PgPool, request_id: Uuid, deadline: Instant) -> String {
     loop {
-        if let Some(tag) = sleeping_tag(owner, request_id).await {
+        let tag: Option<String> = sqlx::query_scalar(
+            "SELECT application_name FROM pg_stat_activity WHERE state = 'active' \
+             AND wait_event_type = 'Timeout' AND wait_event = 'PgSleep' \
+             AND application_name LIKE $1",
+        )
+        .bind(format!("dbmcp-{}-%", request_id.simple()))
+        .fetch_optional(owner)
+        .await
+        .expect("pg_stat_activity");
+        if let Some(tag) = tag {
             return tag;
         }
-        assert!(started.elapsed() < PATIENCE, "{request_id} never slept");
+        assert!(Instant::now() < deadline, "{request_id} never slept");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
-/// The tag of the backend that is inside `pg_sleep` for `request_id`: its
-/// statement's text alone is there from the Parse on.
-async fn sleeping_tag(owner: &sqlx::PgPool, request_id: Uuid) -> Option<String> {
+/// Whether a backend still runs the transaction tagged `tag`.
+async fn busy(owner: &sqlx::PgPool, tag: &str) -> bool {
     sqlx::query_scalar(
-        "SELECT application_name FROM pg_stat_activity WHERE state = 'active' \
-         AND wait_event_type = 'Timeout' AND wait_event = 'PgSleep' \
-         AND application_name LIKE $1",
+        "SELECT EXISTS (SELECT FROM pg_stat_activity \
+         WHERE state = 'active' AND application_name = $1)",
     )
-    .bind(format!("dbmcp-{}-%", request_id.simple()))
-    .fetch_optional(owner)
+    .bind(tag)
+    .fetch_one(owner)
     .await
     .expect("pg_stat_activity")
 }
