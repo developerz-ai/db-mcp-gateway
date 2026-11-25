@@ -10,11 +10,13 @@ use std::ops::ControlFlow;
 
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
-use sqlparser::ast::{Expr, ObjectName, TableFactor, Visit, Visitor};
+use sqlparser::ast::{
+    Expr, ObjectName, SelectItem, SetExpr, Statement, TableFactor, Visit, Visitor,
+};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
-use sqlx::{Connection, PgConnection};
+use sqlx::{Column, Connection, Executor, PgConnection, SqlSafeStr, Statement as _};
 
 use crate::common::pg_target::{is_yugabyte, owner_url};
 use db_mcp_gateway::exec::sql_guard::is_read_only;
@@ -238,6 +240,128 @@ async fn whole_row_notation_reaches_only_row_arguments() {
         .await
         .expect("the target accepts the control");
     assert!(calls(&reading).contains("row_to_json"), "{reading}");
+}
+
+/// The columns the guard's parser gives a `SELECT`: a name, or `None` where
+/// only Postgres knows it. `None` altogether for a wildcard or another shape.
+fn columns_the_guard_reads(sql: &str) -> Option<Vec<Option<String>>> {
+    let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql).ok()?;
+    let Some(Statement::Query(query)) = statements.first() else {
+        return None;
+    };
+    let mut body = query.body.as_ref();
+    while let SetExpr::SetOperation { left, .. } = body {
+        body = left.as_ref();
+    }
+    let SetExpr::Select(select) = body else {
+        return None;
+    };
+    let folded = |ident: &sqlparser::ast::Ident| match ident.quote_style {
+        None => ident.value.to_ascii_lowercase(),
+        Some(_) => ident.value.clone(),
+    };
+    let column = |item: &SelectItem| match item {
+        SelectItem::ExprWithAlias { alias, .. } => Some(Some(folded(alias))),
+        SelectItem::UnnamedExpr(Expr::Identifier(ident)) => Some(Some(folded(ident))),
+        SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => Some(parts.last().map(folded)),
+        SelectItem::UnnamedExpr(_) => Some(None),
+        _ => None,
+    };
+    select.projection.iter().map(column).collect()
+}
+
+/// The columns the target describes, without executing; `None` when it
+/// rejects the text. Any other failure is the test's.
+async fn columns_postgres_describes(conn: &mut PgConnection, sql: &str) -> Option<Vec<String>> {
+    let text = sqlx::AssertSqlSafe(sql.to_owned()).into_sql_str();
+    let statement = match conn.prepare(text).await {
+        Ok(statement) => statement,
+        Err(sqlx::Error::Database(err))
+            if err
+                .code()
+                .is_some_and(|c| ["42", "22", "0A"].contains(&&c[..2])) =>
+        {
+            return None;
+        }
+        Err(err) => panic!("describing {sql:?}: {err}"),
+    };
+    let names = statement.columns().iter().map(|c| c.name().to_owned());
+    Some(names.collect())
+}
+
+/// Reads to compare column by column.
+const PROJECTIONS: &[&str] = &[
+    "SELECT 1",
+    "SELECT 1 AS a, 2 b, 3 AS \"C\"",
+    "SELECT relname, oid AS id FROM pg_class",
+    "SELECT c.relname AS end, c.oid FROM pg_class c",
+    "SELECT count(*) FROM pg_class GROUP BY relkind",
+    "SELECT CASE WHEN true THEN 1 END",
+    "SELECT CASE WHEN true THEN 1 END AS x, 2",
+    "SELECT 1 UNION SELECT 2",
+    "WITH w AS (SELECT 1 AS a) SELECT a FROM w",
+    "SELECT relname FROM pg_class ORDER BY oid LIMIT 1",
+    "SELECT interval '1 day' AS i",
+    "SELECT 'a' LIKE 'b', NOT true",
+];
+
+/// What may follow a statement's text, or not.
+const FOLLOWED_BY: &[&str] = &[
+    "",
+    ";",
+    " -- END, 2",
+    " END",
+    " end, 2",
+    " END, 2 AS b",
+    " END FROM pg_class",
+    "\nEND\n, 2",
+    " END END, 3",
+    " AS end",
+    " AS end, 2",
+    " AS x, 2 END, 3",
+    " x",
+    " x, 2",
+    ", 2",
+    ", 2 y",
+    " AND, 2",
+    " AND true, 2",
+    " FROM pg_class",
+    " BEGIN, 2",
+    " COMMIT, 2",
+    " GO, 2",
+];
+
+/// Every column Postgres describes, in order and by name, is one the guard
+/// read: no admitted statement holds text only the target reads.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn the_guard_reads_every_column_postgres_describes() {
+    let mut conn = connect().await;
+    let mut compared = 0;
+    for projection in PROJECTIONS {
+        for tail in FOLLOWED_BY {
+            let sql = format!("{projection}{tail}");
+            if is_read_only(&sql).is_err() {
+                continue;
+            }
+            let Some(described) = columns_postgres_describes(&mut conn, &sql).await else {
+                continue;
+            };
+            let read = columns_the_guard_reads(&sql).expect("a projection");
+            assert_eq!(
+                read.len(),
+                described.len(),
+                "{sql:?}: {read:?} {described:?}"
+            );
+            for (read, described) in read.iter().zip(&described) {
+                if let Some(read) = read {
+                    assert_eq!(read, described, "{sql:?}");
+                }
+            }
+            compared += 1;
+        }
+    }
+    assert!(compared >= 80, "only {compared} statements were compared");
 }
 
 /// The pieces `sql_guard::proptests` mutates with: where two lexers are

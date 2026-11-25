@@ -1,6 +1,7 @@
-//! The statement bounds over HTTP: past one, `forbidden_sql` and its audit
-//! row; at the length cap, the target's own answer and its audit row. Either
-//! way the same gateway serves the next call.
+//! The guard's bounds over HTTP: a statement past one, or not read to its
+//! end, is `forbidden_sql` with its audit row; at the length cap, the target's
+//! own answer and its audit row. Either way the same gateway serves the next
+//! call.
 
 use std::time::Duration;
 
@@ -174,5 +175,52 @@ async fn a_chain_at_the_length_cap_is_answered_and_audited_and_the_next_call_run
             }
             assert_still_serving(&gateway).await;
         }
+    }
+}
+
+/// `(sql, what the message names)`.
+const REFUSED: &[(&str, &str)] = &[
+    ("SELECT 1 END", "could not parse SQL at line 1, column 10"),
+    ("SELECT 1 END, pg_notify('c', 'p')", "column 10"),
+    ("SELECT 1 END FROM pg_class FOR UPDATE", "column 10"),
+    ("SELECT 1 end; SELECT 2", "column 10"),
+    ("SELECT TREAT(1 AS pg_advisory_lock)", "`treat`"),
+    ("SELECT a AND FOR UPDATE", "FOR UPDATE/SHARE"),
+    ("SELECT * FROM (TABLE cron.job) j", "`cron.*`"),
+];
+
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_statement_not_read_to_its_end_is_refused_and_audited_and_the_next_call_runs() {
+    let gateway = boot().await;
+    for (sql, names) in REFUSED {
+        for tool in ["run_query", "explain"] {
+            let called = call(&gateway, tool, sql).await;
+            assert_refused(&gateway, &called, "forbidden_sql", names).await;
+            assert_still_serving(&gateway).await;
+        }
+    }
+}
+
+/// The same words as labels and columns reach the target and its answer.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn labels_named_like_keywords_are_answered_and_audited() {
+    let gateway = boot().await;
+    for (sql, rows) in [
+        ("SELECT 1 AS end, 2 AS \"END\"", json!([[1, 2]])),
+        (
+            "SELECT CASE WHEN true THEN 1 END AS end, s.schedule FROM (VALUES (2)) AS s(schedule)",
+            json!([[1, 2]]),
+        ),
+        (
+            "SELECT s.\"end\" AS into FROM (SELECT 3 AS end) s;",
+            json!([[3]]),
+        ),
+    ] {
+        let called = call(&gateway, "run_query", sql).await;
+        assert!(!called.is_error, "{sql}: {}", called.body);
+        assert_eq!(called.body["rows"], rows, "{sql}");
+        assert_audited(&gateway, &called, "success").await;
     }
 }

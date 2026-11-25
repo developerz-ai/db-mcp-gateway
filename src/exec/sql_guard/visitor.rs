@@ -73,7 +73,7 @@ impl Visitor for GuardVisitor {
         if body_has_select_into(q.body.as_ref()) {
             return ControlFlow::Break(GuardError::SelectInto);
         }
-        ControlFlow::Continue(())
+        break_on(check_table_commands(q.body.as_ref()))
     }
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<GuardError> {
@@ -124,6 +124,24 @@ fn body_has_select_into(body: &SetExpr) -> bool {
             body_has_select_into(left) || body_has_select_into(right)
         }
         _ => false,
+    }
+}
+
+/// `TABLE s.t`, a query body that is a relation's name. Recurses as above.
+fn check_table_commands(body: &SetExpr) -> Result<(), GuardError> {
+    match body {
+        SetExpr::Table(table) => {
+            let schema = table.schema_name.as_ref();
+            match schema.and_then(|schema| denied_schema(&schema.value)) {
+                Some(label) => Err(GuardError::DeniedRelation(label)),
+                None => Ok(()),
+            }
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            check_table_commands(left)?;
+            check_table_commands(right)
+        }
+        _ => Ok(()),
     }
 }
 

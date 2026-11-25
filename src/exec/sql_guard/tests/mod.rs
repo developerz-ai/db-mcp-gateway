@@ -8,6 +8,7 @@ mod denied_relations;
 mod lexer_agreement;
 mod lexical;
 mod read_only;
+mod whole_text;
 mod write_access;
 
 fn ok(sql: &str) {

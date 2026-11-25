@@ -111,6 +111,8 @@ const DENIED_FUNCTIONS: &[Denied] = &[
     Denied::Prefix("pg_stat_get_backend_", "pg_stat_get_backend_*"),
     Denied::Exact("pg_prepared_statement"),
     Denied::Exact("yb_pg_stat_get_queries"),
+    // `TREAT(x AS f)` calls `f`.
+    Denied::Exact("treat"),
 ];
 
 /// Relations the gateway never reads for a caller: each row is another
