@@ -13,37 +13,31 @@ cd "$(dirname "$0")/../../examples/demo"
 port=${DEMO_PORT:-18443}
 
 # A release PR bumps the pinned tag to the crate's next version before that
-# image exists (the tag is cut after merge). Only that case — the pin is the
-# crate's own version and no `v<version>` tag exists yet — tests the same
-# code through `:main`, which a release PR does not change. Any other
-# unpullable pin (a typo, a registry error) fails the test.
+# image exists: it is published minutes after the `v<version>` tag, which is
+# cut after merge. Only that case — the pin is the crate's own version and the
+# registry says it has no such manifest — tests the same code through `:main`,
+# which a release PR does not change. The tag is not asked: `main`'s own run
+# can meet it before the image. Any other unpullable pin (a typo, a registry
+# error) fails the test.
+#
+# The HTTP status of the pinned manifest, anonymous; empty when the registry
+# could not be asked. `curl -q`: no user config.
+manifest_status() {
+  local repo=${1#ghcr.io/} token
+  token=$(curl -qsS --proto =https --max-time 20 "https://ghcr.io/token?service=ghcr.io&scope=repository:$repo:pull" \
+    | sed -n 's/.*"token":"\([^"]*\)".*/\1/p') || return 0
+  [[ -n $token ]] || return 0
+  printf 'header = "Authorization: Bearer %s"\n' "$token" \
+    | curl -qsS --config - --proto =https --max-time 20 --head -o /dev/null -w '%{http_code}' \
+      -H 'Accept: application/vnd.oci.image.index.v1+json' "https://ghcr.io/v2/$repo/manifests/$2" || true
+}
 if [[ -z "${GATEWAY_IMAGE:-}" ]]; then
   pinned=$(sed -n 's/.*image: \${GATEWAY_IMAGE:-\([^}]*\)}.*/\1/p' docker-compose.yml | head -1)
   version=$(sed -n 's/^version = "\(.*\)"/\1/p' ../../Cargo.toml | head -1)
-  # Cheap local checks first; the release repo is asked only when a fallback
-  # is possible. `ls-remote --exit-code` answers 2 only for "no such ref"; a
-  # lookup error (no network) is not proof the release is uncut.
-  if [[ -n "$pinned" && -n "$version" && "${pinned##*:}" == "$version" ]] &&
-    ! git -C ../.. rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
-    remote=0
-    # The public HTTPS URL, never `origin`: an SSH origin ignores git's
-    # low-speed abort (the portable deadline; no coreutils `timeout` on
-    # macOS). Outside the checkout with git's repository variables cleared
-    # (GIT_DIR, GIT_CONFIG_COUNT, GIT_CONFIG_PARAMETERS, ...) and no user or
-    # system config, so no `insteadOf` redirects it; https only, no prompt.
-    (
-      # shellcheck disable=SC2046 # a list of variable names
-      unset $(git rev-parse --local-env-vars)
-      cd /
-      GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
-        GIT_ALLOW_PROTOCOL=https GIT_HTTP_LOW_SPEED_LIMIT=1 GIT_HTTP_LOW_SPEED_TIME=20 \
-        git ls-remote --exit-code --tags https://github.com/developerz-ai/db-mcp-gateway.git \
-        "v$version"
-    ) >/dev/null 2>&1 || remote=$?
-    if [[ $remote -eq 2 ]]; then
-      export GATEWAY_IMAGE=${pinned%:*}:main
-      printf 'note: release v%s is not cut yet; testing %s\n' "$version" "$GATEWAY_IMAGE" >&2
-    fi
+  if [[ -n "$version" && "$pinned" == ghcr.io/*":$version" ]] &&
+    [[ $(manifest_status "${pinned%:*}" "$version") == 404 ]]; then
+    export GATEWAY_IMAGE=${pinned%:*}:main
+    printf 'note: %s is not published yet; testing %s\n' "$pinned" "$GATEWAY_IMAGE" >&2
   fi
 fi
 compose=(docker compose -p "db-mcp-gateway-demo-test-$$")
