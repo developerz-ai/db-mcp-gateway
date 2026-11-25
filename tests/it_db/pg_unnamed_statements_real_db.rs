@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
+use sqlx::postgres::{PgConnectOptions, PgDatabaseError, PgPoolOptions, PgSslMode};
 use sqlx::{ConnectOptions, Connection};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -139,11 +139,16 @@ async fn a_first_seen_type_does_not_lose_the_statement() {
                         .execute_with_params(read(&sql), &[QueryParam::Int(1)])
                         .await
                         .unwrap_or_else(|err| panic!("read {round}: {err:?}"));
+                    assert_eq!(found.rows.len(), 1, "{found:?}");
+                    assert_eq!(found.columns, ["id", "e", "es", "c", "d"]);
                     assert_eq!(found.rows[0][..2], [json!(1), json!("a")], "{found:?}");
+                    assert_eq!(found.rows[0][2], json!(["a", "b"]), "{found:?}");
+                    assert_eq!(found.rows[0][4], json!(1), "{found:?}");
                     let none = reader
                         .execute(read(&format!("SELECT * FROM {name} WHERE false")))
                         .await
                         .unwrap_or_else(|err| panic!("zero rows {round}: {err:?}"));
+                    assert!(none.rows.is_empty());
                     assert_eq!(none.columns, found.columns);
                 }
                 let sql = format!("UPDATE {name} SET e = 'b' RETURNING e, es, c, d");
@@ -152,7 +157,9 @@ async fn a_first_seen_type_does_not_lose_the_statement() {
                     .execute(statement(&sql, Access::ReadWrite))
                     .await
                     .unwrap_or_else(|err| panic!("write: {err:?}"));
+                assert_eq!(written.rows_affected, Some(1));
                 assert_eq!(written.rows[0][0], json!("b"), "{written:?}");
+                assert_eq!(written.rows[0][1], json!(["a", "b"]), "{written:?}");
             })
         })
         .collect();
@@ -203,13 +210,16 @@ async fn reads_survive_schema_changes_between_them() {
             };
             tokio::spawn(async move {
                 let mut failures = Vec::new();
-                let mut width = 0;
+                let mut widths = Vec::new();
                 while !done.load(Ordering::Relaxed) {
                     match adapter.execute(read(&sql)).await {
                         Ok(result) => {
                             let columns = result.columns.len();
-                            assert!(columns >= width, "{columns} columns after {width}");
-                            width = columns;
+                            let last = widths.last().copied().unwrap_or(0);
+                            assert!(columns >= last, "{columns} columns after {last}");
+                            if columns > last {
+                                widths.push(columns);
+                            }
                             let rows = if at == 0 { 0 } else { 2 };
                             assert_eq!(result.rows.len(), rows, "{result:?}");
                             assert!(result.rows.iter().all(|row| row.len() == columns));
@@ -217,7 +227,7 @@ async fn reads_survive_schema_changes_between_them() {
                         Err(err) => failures.push(format!("{err:?}")),
                     }
                 }
-                failures
+                (failures, widths)
             })
         })
         .collect();
@@ -233,7 +243,10 @@ async fn reads_survive_schema_changes_between_them() {
     let outcomes = futures::future::join_all(readers).await;
     run(&owner, format!("DROP TABLE {table}")).await;
     for outcome in outcomes {
-        assert_eq!(outcome.expect("reader"), Vec::<String>::new());
+        let (failures, widths) = outcome.expect("reader");
+        assert_eq!(failures, Vec::<String>::new());
+        // Reading before, between and after the changes, not around them.
+        assert!(widths.len() > 2, "saw only {widths:?} columns");
     }
     let last = last.expect("last read");
     assert_eq!(last.columns.len(), 21);
@@ -274,6 +287,11 @@ async fn a_stale_plan_inside_a_running_statement_is_not_retryable() {
     let insert = format!("INSERT INTO {name}_a.t SELECT {name}()");
     let raised = format!("SELECT {name}_raise()");
     let unsupported = "SELECT 1 UNION SELECT 2 FOR UPDATE";
+    // The fixture raises that very error, from inside the function.
+    let raw = sqlx::raw_sql(sqlx::AssertSqlSafe(stale.clone()))
+        .execute(&owner)
+        .await
+        .map(|_| ());
     let outcomes = [
         (adapter.execute(read(&stale)).await, stale.as_str()),
         (
@@ -291,6 +309,12 @@ async fn a_stale_plan_inside_a_running_statement_is_not_retryable() {
         ),
     )
     .await;
+    let raw = raw.expect_err("the fixture's plan goes stale");
+    let raw = raw.as_database_error().expect("server error");
+    let raw = raw.downcast_ref::<PgDatabaseError>();
+    assert_eq!(raw.code(), "0A000");
+    assert_eq!(raw.routine(), Some("RevalidateCachedQuery"));
+    assert!(raw.r#where().is_some());
     for (outcome, sql) in outcomes {
         assert_refused(outcome, "0A000", sql);
     }
@@ -340,10 +364,10 @@ async fn a_plan_stale_before_the_statement_runs_is_retryable() {
     ] {
         switch.armed.store(true, Ordering::SeqCst);
         let stale = a.execute(statement(&sql, access)).await;
-        let switched = !switch.armed.load(Ordering::SeqCst);
+        let answer = std::mem::take(&mut *switch.answer.lock().unwrap());
         // Again, its plan sound: now it runs, as far as its own error.
-        outcomes.push((sql.clone(), stale, switched));
-        assert_refused(a.execute(statement(&sql, access)).await, "P0001", &sql);
+        let again = a.execute(statement(&sql, access)).await;
+        outcomes.push((sql, stale, answer, again));
     }
     let plain = a.execute(read(&format!("SELECT * FROM {name}"))).await;
     run(
@@ -351,15 +375,88 @@ async fn a_plan_stale_before_the_statement_runs_is_retryable() {
         format!("DROP FUNCTION {name}_ran(); DROP SCHEMA {name}_b CASCADE; DROP TABLE {name}"),
     )
     .await;
-    for (sql, stale, switched) in outcomes {
-        assert!(switched, "{sql}: no Bind was intercepted");
+    for (sql, stale, answer, again) in outcomes {
+        // What the target answered to the Bind: that error, before a
+        // BindComplete, and with no context.
+        let error = answer.first().expect("a Bind was intercepted");
+        assert_eq!(error.kind, Some(b'E'), "{sql}: {answer:?}");
+        let field = |code: u8| {
+            let mut fields = error.body().split(|b| *b == 0);
+            fields.find(|f| f.first() == Some(&code)).map(|f| &f[1..])
+        };
+        assert_eq!(field(b'C'), Some(&b"0A000"[..]), "{sql}");
+        assert_eq!(field(b'R'), Some(&b"RevalidateCachedQuery"[..]), "{sql}");
+        assert_eq!(field(b'W'), None, "{sql}");
         assert!(
             matches!(stale, Err(ExecError::Unavailable)),
             "{sql}: {stale:?}"
         );
+        assert_refused(again, "P0001", &sql);
     }
     let plain = plain.expect("untouched table");
     assert_eq!(plain.rows, vec![vec![json!(1)]], "the write left no trace");
+}
+
+/// One protocol message. Only a connection's first, the startup, has no
+/// type byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Frame {
+    kind: Option<u8>,
+    raw: Vec<u8>,
+}
+
+impl Frame {
+    fn body(&self) -> &[u8] {
+        &self.raw[usize::from(self.kind.is_some()) + 4..]
+    }
+}
+
+/// Cuts a byte stream, however TCP splits it, into whole messages.
+struct Frames {
+    startup_pending: bool,
+    pending: Vec<u8>,
+}
+
+impl Frames {
+    fn from_client() -> Self {
+        Self {
+            startup_pending: true,
+            pending: Vec::new(),
+        }
+    }
+
+    fn from_server() -> Self {
+        Self {
+            startup_pending: false,
+            pending: Vec::new(),
+        }
+    }
+
+    /// The messages `bytes` completes.
+    fn feed(&mut self, bytes: &[u8]) -> Vec<Frame> {
+        self.pending.extend_from_slice(bytes);
+        let mut frames = Vec::new();
+        loop {
+            let head = usize::from(!self.startup_pending);
+            let Some(len) = self.pending.get(head..head + 4) else {
+                return frames;
+            };
+            let end = head + u32::from_be_bytes(len.try_into().unwrap()) as usize;
+            if self.pending.len() < end {
+                return frames;
+            }
+            let raw: Vec<u8> = self.pending.drain(..end).collect();
+            let kind = (!self.startup_pending).then(|| raw[0]);
+            self.startup_pending = false;
+            frames.push(Frame { kind, raw });
+        }
+    }
+}
+
+/// A message as it stands on the wire.
+fn message(kind: u8, body: &[u8]) -> Vec<u8> {
+    let len = (body.len() as u32 + 4).to_be_bytes();
+    [&[kind], &len[..], body].concat()
 }
 
 /// A TCP forwarder to the target that, once each time it is `armed`, changes
@@ -368,58 +465,103 @@ async fn a_plan_stale_before_the_statement_runs_is_retryable() {
 struct SearchPathSwitch {
     port: u16,
     armed: Arc<AtomicBool>,
+    /// The target's answer to the `Bind` after the switch, up to its
+    /// ReadyForQuery.
+    answer: Arc<Mutex<Vec<Frame>>>,
 }
 
 impl SearchPathSwitch {
     async fn start(table: &str) -> Self {
         let listener = TcpListener::bind((TARGET_HOST, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let armed: Arc<AtomicBool> = Arc::default();
-        let (arm, table) = (armed.clone(), table.to_owned());
+        let (armed, answer): (Arc<AtomicBool>, Arc<Mutex<Vec<Frame>>>) = Default::default();
+        let (arm, record, table) = (armed.clone(), answer.clone(), table.to_owned());
         tokio::spawn(async move {
             while let Ok((client, _)) = listener.accept().await {
-                tokio::spawn(Self::serve(client, arm.clone(), table.clone()));
+                let (arm, record, table) = (arm.clone(), record.clone(), table.clone());
+                tokio::spawn(Self::serve(client, arm, record, table));
             }
         });
-        Self { port, armed }
+        Self {
+            port,
+            armed,
+            answer,
+        }
     }
 
-    /// The driver sends one batch and reads its whole answer before the
-    /// next, so a batch is one read here and the two never interleave.
-    async fn serve(mut client: TcpStream, armed: Arc<AtomicBool>, table: String) {
-        let mut server = TcpStream::connect((TARGET_HOST, target_port()))
-            .await
-            .expect("target-db reachable; run `bin/dev up`");
-        let (mut from_client, mut from_server) = (vec![0u8; 65536], vec![0u8; 65536]);
-        let mut parsed = false;
+    /// The driver reads a batch's whole answer before it sends the next, so
+    /// the target has nothing in flight when a `Bind` arrives.
+    async fn serve(
+        mut client: TcpStream,
+        armed: Arc<AtomicBool>,
+        answer: Arc<Mutex<Vec<Frame>>>,
+        table: String,
+    ) {
+        let mut server = connect_target(&client).await;
+        let (mut client_chunk, mut server_chunk) = (vec![0u8; 65536], vec![0u8; 65536]);
+        let (mut client_frames, mut server_frames) = (Frames::from_client(), Frames::from_server());
+        let (mut parsed, mut answering) = (false, false);
         loop {
             tokio::select! {
-                read = client.read(&mut from_client) => {
+                read = client.read(&mut client_chunk) => {
                     let Ok(n @ 1..) = read else { return };
-                    let batch = &from_client[..n];
-                    if batch[0] == b'P' {
-                        parsed = batch.windows(table.len()).any(|w| w == table.as_bytes());
-                    }
-                    if batch[0] == b'B' && parsed && armed.swap(false, Ordering::SeqCst) {
-                        server.write_all(&switch_path(&table)).await.unwrap();
-                        let mut answer = Vec::new();
-                        // ReadyForQuery, in a transaction: the answer's end.
-                        while !answer.ends_with(b"Z\0\0\0\x05T") {
-                            let n = server.read(&mut from_server).await.unwrap();
-                            assert!(n > 0, "target closed the connection");
-                            answer.extend_from_slice(&from_server[..n]);
+                    for frame in client_frames.feed(&client_chunk[..n]) {
+                        if frame.kind == Some(b'P') {
+                            let table = table.as_bytes();
+                            parsed = frame.body().windows(table.len()).any(|w| w == table);
+                        }
+                        if frame.kind == Some(b'B') && parsed && armed.swap(false, Ordering::SeqCst)
+                        {
+                            server.write_all(&switch_path(&table)).await.unwrap();
+                            swallow_answer(&mut server, &mut server_frames).await;
+                            answering = true;
+                        }
+                        if server.write_all(&frame.raw).await.is_err() {
+                            return;
                         }
                     }
-                    if server.write_all(&from_client[..n]).await.is_err() {
-                        return;
-                    }
                 }
-                read = server.read(&mut from_server) => {
+                read = server.read(&mut server_chunk) => {
                     let Ok(n @ 1..) = read else { return };
-                    if client.write_all(&from_server[..n]).await.is_err() {
-                        return;
+                    for frame in server_frames.feed(&server_chunk[..n]) {
+                        if answering {
+                            answering = frame.kind != Some(b'Z');
+                            answer.lock().unwrap().push(frame.clone());
+                        }
+                        if client.write_all(&frame.raw).await.is_err() {
+                            return;
+                        }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// The target's end of a forwarded connection. Neither end waits to fill a
+/// packet: the small writes of a relay would each cost a delayed ACK, and
+/// the gateway's own short budgets with it.
+async fn connect_target(client: &TcpStream) -> TcpStream {
+    let server = TcpStream::connect((TARGET_HOST, target_port()))
+        .await
+        .expect("target-db reachable; run `bin/dev up`");
+    client.set_nodelay(true).expect("nodelay");
+    server.set_nodelay(true).expect("nodelay");
+    server
+}
+
+/// Read `server` up to its ReadyForQuery, which must leave the transaction
+/// usable.
+async fn swallow_answer(server: &mut TcpStream, frames: &mut Frames) {
+    assert!(frames.pending.is_empty(), "an answer was still in flight");
+    let mut chunk = vec![0u8; 65536];
+    loop {
+        let n = server.read(&mut chunk).await.unwrap();
+        assert!(n > 0, "target closed the connection");
+        for frame in frames.feed(&chunk[..n]) {
+            if frame.kind == Some(b'Z') {
+                assert_eq!(frame.body(), b"T", "the switch failed");
+                return;
             }
         }
     }
@@ -429,19 +571,14 @@ impl SearchPathSwitch {
 /// query would destroy the unnamed statement waiting for its `Bind`.
 fn switch_path(table: &str) -> Vec<u8> {
     let sql = format!("SELECT set_config('search_path', '{table}_b', true)");
-    let mut batch = Vec::new();
-    for (kind, body) in [
-        (b'P', [b"switch\0", sql.as_bytes(), b"\0\0\0"].concat()),
-        (b'B', b"\0switch\0\0\0\0\0\0\0".to_vec()),
-        (b'E', b"\0\0\0\0\0".to_vec()),
-        (b'C', b"Sswitch\0".to_vec()),
-        (b'S', Vec::new()),
-    ] {
-        batch.push(kind);
-        batch.extend_from_slice(&(body.len() as u32 + 4).to_be_bytes());
-        batch.extend_from_slice(&body);
-    }
-    batch
+    [
+        message(b'P', &[b"switch\0", sql.as_bytes(), b"\0\0\0"].concat()),
+        message(b'B', b"\0switch\0\0\0\0\0\0\0"),
+        message(b'E', b"\0\0\0\0\0"),
+        message(b'C', b"Sswitch\0"),
+        message(b'S', b""),
+    ]
+    .concat()
 }
 
 /// A TCP forwarder to the target that reads both directions of every
@@ -455,6 +592,8 @@ struct WireRecorder {
 struct Seen {
     /// The text of every Parse.
     parses: Vec<String>,
+    /// Every simple query.
+    queries: Vec<String>,
     violations: Vec<String>,
 }
 
@@ -475,28 +614,34 @@ impl WireRecorder {
         let record = seen.clone();
         tokio::spawn(async move {
             while let Ok((client, _)) = listener.accept().await {
-                let server = TcpStream::connect((TARGET_HOST, target_port()))
-                    .await
-                    .expect("target-db reachable; run `bin/dev up`");
+                let server = connect_target(&client).await;
                 let (from_client, to_client) = client.into_split();
                 let (from_server, to_server) = server.into_split();
                 let session: Arc<Mutex<Session>> = Arc::default();
                 let (state, record) = (session.clone(), record.clone());
-                // The client's first message, the startup, has no type byte.
-                tokio::spawn(forward(from_client, to_server, 1, move |kind, body| {
-                    let mut session = state.lock().unwrap();
-                    record.lock().unwrap().client(&mut session, kind, body);
-                }));
-                tokio::spawn(forward(from_server, to_client, 0, move |kind, body| {
-                    if kind == b'Z' {
-                        let mut session = session.lock().unwrap();
-                        session.unanswered = session.unanswered.saturating_sub(1);
-                        session.in_transaction = body.first() != Some(&b'I');
-                    }
-                }));
+                tokio::spawn(forward(
+                    from_client,
+                    to_server,
+                    Frames::from_client(),
+                    move |frame| {
+                        let mut session = state.lock().unwrap();
+                        record.lock().unwrap().client(&mut session, frame);
+                    },
+                ));
+                tokio::spawn(forward(
+                    from_server,
+                    to_client,
+                    Frames::from_server(),
+                    move |frame| session.lock().unwrap().server(frame),
+                ));
             }
         });
         Self { port, seen }
+    }
+
+    fn parsed(&self, needle: &str) -> bool {
+        let seen = self.seen.lock().unwrap();
+        seen.parses.iter().any(|text| text.contains(needle))
     }
 
     /// What was recorded since the last call.
@@ -505,70 +650,183 @@ impl WireRecorder {
     }
 }
 
-impl Seen {
-    fn client(&mut self, session: &mut Session, kind: u8, body: &[u8]) {
-        // Parse starts with the statement's name; Bind with the portal's,
-        // then the statement's; Describe with what it describes, then a name.
-        let name_at = match kind {
-            // A simple query and a Sync are each answered with the state.
-            b'Q' | b'S' => {
-                session.unanswered += 1;
-                return;
-            }
-            b'P' => 0,
-            b'B' => body.iter().position(|b| *b == 0).map_or(0, |end| end + 1),
-            b'D' | b'C' => 1,
-            b'E' => body.len().saturating_sub(5),
-            _ => return,
-        };
-        let name = body[name_at..].split(|b| *b == 0).next().unwrap_or(&[]);
-        let text = String::from_utf8_lossy(body);
-        if kind == b'P' {
-            self.parses.push(text.to_string());
-        }
-        if kind != b'E' && !name.is_empty() {
-            self.violations
-                .push(format!("{} names a statement: {text:?}", kind as char));
-        }
-        if !session.in_transaction || session.unanswered > 0 {
-            self.violations
-                .push(format!("{} outside a transaction: {text:?}", kind as char));
+impl Session {
+    fn server(&mut self, frame: &Frame) {
+        if frame.kind == Some(b'Z') {
+            self.unanswered = self.unanswered.saturating_sub(1);
+            self.in_transaction = frame.body() != b"I";
         }
     }
 }
 
-/// Copy `from` to `to`, calling `message` with every whole message before its
-/// last byte is passed on. The first `untyped` messages have no type byte.
+impl Seen {
+    fn client(&mut self, session: &mut Session, frame: &Frame) {
+        let body = frame.body();
+        let text = String::from_utf8_lossy(body);
+        let Some(kind) = frame.kind else {
+            return;
+        };
+        // Parse starts with the statement's name; Bind with the portal's,
+        // then the statement's; Describe and Close with which of the two
+        // they are for, then its name.
+        let name = match kind {
+            // A simple query and a Sync are each answered with the state.
+            b'Q' | b'S' => {
+                session.unanswered += 1;
+                if kind == b'Q' {
+                    self.queries.push(text.trim_end_matches('\0').to_string());
+                }
+                return;
+            }
+            b'P' => {
+                self.parses.push(text.to_string());
+                body.split(|b| *b == 0).next()
+            }
+            b'B' => body.split(|b| *b == 0).nth(1),
+            b'D' | b'C' => body[1..].split(|b| *b == 0).next(),
+            // Execute and Flush name no statement.
+            b'E' | b'H' => None,
+            _ => return,
+        };
+        let what = kind as char;
+        if name.is_some_and(|name| !name.is_empty()) {
+            self.violations
+                .push(format!("{what} names a statement: {text:?}"));
+        }
+        if !session.in_transaction || session.unanswered > 0 {
+            self.violations
+                .push(format!("{what} outside a transaction: {text:?}"));
+        }
+    }
+}
+
+/// Copy `from` to `to` in whole messages, showing each to `observe` before it
+/// is passed on.
 async fn forward(
     mut from: impl AsyncRead + Unpin,
     mut to: impl AsyncWrite + Unpin,
-    mut untyped: usize,
-    message: impl Fn(u8, &[u8]),
+    mut frames: Frames,
+    observe: impl Fn(&Frame),
 ) {
-    let (mut chunk, mut pending) = (vec![0u8; 65536], Vec::new());
+    let mut chunk = vec![0u8; 65536];
     while let Ok(n @ 1..) = from.read(&mut chunk).await {
-        pending.extend_from_slice(&chunk[..n]);
-        loop {
-            let head = usize::from(untyped == 0);
-            let Some(len) = pending.get(head..head + 4) else {
-                break;
-            };
-            let end = head + u32::from_be_bytes(len.try_into().unwrap()) as usize;
-            if pending.len() < end {
-                break;
-            }
-            if untyped > 0 {
-                untyped -= 1;
-            } else {
-                message(pending[0], &pending[5..end]);
-            }
-            pending.drain(..end);
+        let mut whole = Vec::new();
+        for frame in frames.feed(&chunk[..n]) {
+            observe(&frame);
+            whole.extend_from_slice(&frame.raw);
         }
-        if to.write_all(&chunk[..n]).await.is_err() {
+        if to.write_all(&whole).await.is_err() {
             return;
         }
     }
     let _ = to.shutdown().await;
+}
+
+/// One connection's start and one query of each protocol.
+fn sample_stream() -> Vec<u8> {
+    let startup = b"\0\x03\0\0user\0u\0\0";
+    let len = (startup.len() as u32 + 4).to_be_bytes();
+    [
+        [&len[..], startup].concat(),
+        message(b'Q', b"BEGIN\0"),
+        message(b'P', b"\0SELECT * FROM t\0\0\0"),
+        message(b'D', b"S\0"),
+        message(b'S', b""),
+        message(b'B', b"\0\0\0\0\0\0\0\0"),
+        message(b'E', b"\0\0\0\0\0"),
+        message(b'S', b""),
+    ]
+    .concat()
+}
+
+/// However the bytes arrive, the same messages come out, none early.
+#[test]
+#[serial_test::parallel(world)]
+fn the_decoder_does_not_depend_on_how_tcp_splits_the_stream() {
+    let stream = sample_stream();
+    let whole = Frames::from_client().feed(&stream);
+    let kinds: Vec<Option<u8>> = whole.iter().map(|frame| frame.kind).collect();
+    let expected = [None]
+        .into_iter()
+        .chain(b"QPDSBES".iter().copied().map(Some));
+    assert_eq!(kinds, expected.collect::<Vec<_>>());
+    let parse = &whole[2];
+    assert_eq!(parse.body(), b"\0SELECT * FROM t\0\0\0");
+
+    let (mut one, mut fed, mut out) = (Frames::from_client(), 0, Vec::new());
+    for byte in &stream {
+        fed += 1;
+        for frame in one.feed(std::slice::from_ref(byte)) {
+            out.push(frame);
+            let complete: usize = out.iter().map(|frame| frame.raw.len()).sum();
+            assert_eq!(complete, fed, "a message came out before its last byte");
+        }
+    }
+    assert_eq!(out, whole);
+    assert!(one.pending.is_empty());
+    for cut in 0..stream.len() {
+        let mut frames = Frames::from_client();
+        let mut out = frames.feed(&stream[..cut]);
+        out.extend(frames.feed(&stream[cut..]));
+        assert_eq!(out, whole, "cut at {cut}");
+    }
+    let raw: Vec<u8> = whole.into_iter().flat_map(|frame| frame.raw).collect();
+    assert_eq!(raw, stream, "nothing is lost in forwarding");
+}
+
+/// The recorder's rules on their own: every extended message is judged by
+/// the state the server last reported, and one sent behind an unanswered
+/// query is judged outside any transaction.
+#[test]
+#[serial_test::parallel(world)]
+fn the_recorder_judges_by_the_state_the_server_reported() {
+    let client = Frames::from_client().feed(&sample_stream());
+    let ready = |state: &[u8]| Frames::from_server().feed(&message(b'Z', state)).remove(0);
+
+    // BEGIN answered, then each Sync: nothing to flag.
+    let (mut seen, mut session) = (Seen::default(), Session::default());
+    for frame in &client {
+        seen.client(&mut session, frame);
+        if matches!(frame.kind, Some(b'Q' | b'S')) {
+            session.server(&ready(b"T"));
+        }
+    }
+    assert_eq!(seen.violations, Vec::<String>::new());
+    assert_eq!(seen.queries, ["BEGIN"]);
+    assert_eq!(seen.parses.len(), 1);
+
+    // BEGIN refused, or not answered yet: P, D, B and E are all flagged.
+    for answered in [true, false] {
+        let (mut seen, mut session) = (Seen::default(), Session::default());
+        session.in_transaction = !answered;
+        for frame in &client {
+            seen.client(&mut session, frame);
+            if answered && matches!(frame.kind, Some(b'Q' | b'S')) {
+                session.server(&ready(b"I"));
+            }
+        }
+        let kinds: String = seen.violations.iter().map(|v| &v[..1]).collect();
+        assert_eq!(kinds, "PDBE", "{:?}", seen.violations);
+        assert!(seen.violations.iter().all(|v| v.contains(" outside a ")));
+    }
+
+    // A name, wherever one can stand.
+    for (kind, body) in [
+        (b'P', &b"s\0SELECT 1\0\0\0"[..]),
+        (b'B', b"\0s\0\0\0\0\0\0\0"),
+        (b'D', b"Ss\0"),
+        (b'C', b"Ss\0"),
+    ] {
+        let mut session = Session {
+            in_transaction: true,
+            unanswered: 0,
+        };
+        let mut seen = Seen::default();
+        let frame = Frames::from_server().feed(&message(kind, body)).remove(0);
+        seen.client(&mut session, &frame);
+        assert_eq!(seen.violations.len(), 1, "{:?}", seen.violations);
+        assert!(seen.violations[0].contains(" names a statement"));
+    }
 }
 
 /// `outcome` is the target's refusal of `sql`, with `sqlstate`.
@@ -596,17 +854,14 @@ async fn the_wire_recorder_flags_what_a_pooler_cannot_serve() {
     let mut conn = options.connect().await.expect("connect");
     select().execute(&mut conn).await.expect("no transaction");
     let seen = wire.take();
-    assert!(
-        seen.violations
-            .iter()
-            .any(|v| v.starts_with("P outside a transaction"))
-            && seen
-                .violations
-                .iter()
-                .any(|v| v.starts_with("B outside a transaction")),
-        "{:?}",
-        seen.violations
-    );
+    for what in ["P", "D", "B", "E"] {
+        let flag = format!("{what} outside a transaction");
+        assert!(
+            seen.violations.iter().any(|v| v.starts_with(&flag)),
+            "{flag}: {:?}",
+            seen.violations
+        );
+    }
 
     let mut tx = conn.begin().await.expect("begin");
     select().execute(&mut *tx).await.expect("unnamed");
@@ -670,11 +925,27 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
     let nope = format!("SELECT nope FROM {name}");
     for (sql, sqlstate) in [
         ("SELECT 1 / 0", "22012"),
-        (nope.as_str(), "42703"),
-        ("SELECT * FROM dbmcp_no_such_table", "42P01"),
         ("SELECT 1 / 0, ev_action FROM pg_rewrite LIMIT 1", "22012"),
     ] {
         assert_refused(a.execute(read(sql)).await, sqlstate, sql);
+    }
+    // The near-miss lookup behind an undefined name gives up, silently, after
+    // 200 ms: a busy target gets another chance to be asked.
+    for (sql, sqlstate, lookup) in [
+        (nope.as_str(), "42703", "quote_ident(a.attname)"),
+        (
+            "SELECT * FROM dbmcp_no_such_table",
+            "42P01",
+            "quote_ident(c.relname)",
+        ),
+    ] {
+        for _ in 0..20 {
+            assert_refused(a.execute(read(sql)).await, sqlstate, sql);
+            if wire.parsed(lookup) {
+                break;
+            }
+        }
+        assert!(wire.parsed(lookup), "{sql}: no near-miss lookup");
     }
     let star = format!("SELECT * FROM {name}");
     let none = format!("SELECT e FROM {name} WHERE false");
@@ -691,10 +962,9 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
         assert_eq!(result.rows.len(), rows, "{sql}");
         assert!(!result.truncated && !result.columns.is_empty(), "{sql}");
     }
-    let capped = a
-        .execute(read("SELECT generate_series(1, 100000)"))
-        .await
-        .expect("capped read");
+    let capped = read("SELECT generate_series(1, 100000)");
+    let capped_id = capped.request_id;
+    let capped = a.execute(capped).await.expect("capped read");
     assert!(capped.truncated);
     assert_eq!(capped.rows.len(), 100);
     let all = format!("SELECT * FROM {name} WHERE id = $1");
@@ -727,26 +997,31 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
             request_id: id(),
         })
         .await
+        .map(|found| assert!(!found.rows.is_empty(), "{detail:?}"))
         .unwrap_or_else(|err| panic!("{detail:?}: {err:?}"));
     }
-    a.sample(SampleQuery {
-        schema: Identifier::parse("public").unwrap(),
-        table: Identifier::parse(&name).unwrap(),
-        statement_timeout_ms: None,
-        row_limit: 1,
-        request_id: id(),
-    })
-    .await
-    .expect("sample");
-    a.table_stats(TableStatsQuery {
-        schema: "public",
-        table: Some(&name),
-        statement_timeout_ms: None,
-        row_limit: 1,
-        request_id: id(),
-    })
-    .await
-    .expect("table_stats");
+    let sampled = a
+        .sample(SampleQuery {
+            schema: Identifier::parse("public").unwrap(),
+            table: Identifier::parse(&name).unwrap(),
+            statement_timeout_ms: None,
+            row_limit: 1,
+            request_id: id(),
+        })
+        .await
+        .expect("sample");
+    assert_eq!(sampled.rows.len(), 1);
+    let stats = a
+        .table_stats(TableStatsQuery {
+            schema: "public",
+            table: Some(&name),
+            statement_timeout_ms: None,
+            row_limit: 1,
+            request_id: id(),
+        })
+        .await
+        .expect("table_stats");
+    assert_eq!(stats.rows.len(), 1);
     let update = format!("UPDATE {name} SET d = d + 1 RETURNING *");
     for (sql, access, analyze) in [
         (all.replace("$1", "1"), Access::ReadOnly, true),
@@ -759,6 +1034,7 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
             request_id: id(),
         })
         .await
+        .map(|plan| assert!(!plan.rows.is_empty(), "explain {sql}"))
         .unwrap_or_else(|err| panic!("explain {sql}: {err:?}"));
     }
 
@@ -778,47 +1054,68 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
     assert_refused(outcome, "23505", &refused);
 
     // A cancel by request id, on each tier, while `db_activity` is asked.
+    let mut by_request = Vec::new();
     for access in [Access::ReadOnly, Access::ReadWrite] {
         let victim = statement("SELECT pg_sleep(5)", access);
         let request_id = victim.request_id;
         let (cancelled, ()) = tokio::join!(a.execute(victim), async {
-            for _ in 0..40 {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                a.db_activity(ActivityQuery {
+            running(&owner, request_id).await;
+            let activity = a
+                .db_activity(ActivityQuery {
                     statement_timeout_ms: None,
                     row_limit: 10,
                     request_id: id(),
                 })
                 .await
                 .expect("db_activity");
-                if a.cancel_request(request_id).await.expect("cancel") {
-                    return;
-                }
-            }
-            panic!("never cancelled");
+            let listed = json!(activity.rows).to_string();
+            assert!(listed.contains(&request_id.to_string()), "{listed}");
+            assert!(a.cancel_request(request_id).await.expect("cancel"));
         });
         assert!(
             matches!(cancelled, Err(ExecError::Cancelled)),
             "{cancelled:?}"
         );
+        by_request.push(request_id);
     }
 
-    // Dropped wherever it stands, a later point each time.
-    for at in 0..60u64 {
-        let sql = if at % 2 == 0 {
-            "SELECT e.*, pg_sleep(0.02) FROM pg_class e LIMIT 3"
-        } else {
-            "SELECT ev_action FROM pg_rewrite LIMIT 2"
-        };
-        let cut = Duration::from_micros(150 * at);
-        // Cut short or done first: a drop before it must never fail it.
-        if let Ok(outcome) = tokio::time::timeout(cut, a.execute(read(sql))).await {
-            outcome.unwrap_or_else(|err| panic!("after a drop: {sql}: {err:?}"));
+    // Dropped wherever it stands, a later point each time, up to its end.
+    let drop_read = "SELECT e.relname, pg_sleep(0.02) FROM pg_class e LIMIT 1";
+    let drop_cast = "SELECT ev_action FROM pg_rewrite LIMIT 2";
+    let mut dropped_ids = Vec::new();
+    for sql in [drop_read, drop_cast] {
+        let started = std::time::Instant::now();
+        a.execute(read(sql)).await.expect("undisturbed");
+        let whole = started.elapsed();
+        for at in 0..30 {
+            let victim = read(sql);
+            let request_id = victim.request_id;
+            // Cut short or done first: a drop before it must never fail it.
+            match tokio::time::timeout(whole * at / 28, a.execute(victim)).await {
+                Ok(outcome) => {
+                    outcome.unwrap_or_else(|err| panic!("after a drop: {sql}: {err:?}"));
+                }
+                Err(_elapsed) => dropped_ids.push(request_id),
+            }
         }
     }
-    let dropped = a.execute(read("SELECT pg_sleep(5)"));
-    let dropped = tokio::time::timeout(Duration::from_millis(300), dropped).await;
-    assert!(dropped.is_err(), "{dropped:?}");
+
+    // Dropped while its backend runs it: the backend is cancelled.
+    let victim = read("SELECT pg_sleep(8)");
+    let request_id = victim.request_id;
+    let dropped_tag = tokio::select! {
+        outcome = a.execute(victim) => panic!("pg_sleep(8) ended: {outcome:?}"),
+        tag = running(&owner, request_id) => tag,
+    };
+    let mut still = true;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        still = backend_tag(&owner, request_id).await.is_some();
+        if !still {
+            break;
+        }
+    }
+    assert!(!still, "the dropped call's backend kept running");
 
     // The backend killed under the statement.
     let victim = read("SELECT pg_sleep(5)");
@@ -854,17 +1151,43 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
     )
     .await;
     let seen = wire.take();
-    // Both routes to the text cast were on the wire, up to the cast itself.
+    // Both routes to the text cast, up to the cast itself, and the calls
+    // around them.
     for route in [
         "DECLARE dbmcp_columns",
         "q.c1::text AS \"relacl\"",
         "q.c1::text AS \"ev_action\"",
-        "SELECT * FROM",
+        "EXPLAIN",
         "UPDATE",
+        "FROM pg_stat_activity",
     ] {
         assert!(
             seen.parses.iter().any(|text| text.contains(route)),
             "nothing parsed holds {route}"
+        );
+    }
+    // Every kind of cancel reached the target, as a simple query.
+    let cancels: Vec<&String> = seen
+        .queries
+        .iter()
+        .filter(|query| query.contains("pg_cancel_backend"))
+        .collect();
+    let cancelled = |needle: &str| cancels.iter().any(|query| query.contains(needle));
+    let tagged = |id: &Uuid| format!("application_name = 'dbmcp-{}-", id.simple());
+    assert!(
+        cancelled(&format!("application_name = '{dropped_tag}'")),
+        "{dropped_tag}"
+    );
+    assert!(cancelled(&tagged(&capped_id)), "the row cap");
+    assert!(
+        dropped_ids.iter().any(|id| cancelled(&tagged(id))),
+        "none of {} drops",
+        dropped_ids.len()
+    );
+    for id in &by_request {
+        assert!(
+            cancelled(&format!("LIKE 'dbmcp-{}-%'", id.simple())),
+            "{id}"
         );
     }
     assert!(
@@ -873,4 +1196,26 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
         seen.violations.len(),
         &seen.violations[..seen.violations.len().min(5)]
     );
+}
+
+/// The tag of the backend sleeping for `request_id`, waited for.
+async fn running(owner: &sqlx::PgPool, request_id: Uuid) -> String {
+    for _ in 0..80 {
+        if let Some(tag) = backend_tag(owner, request_id).await {
+            return tag;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{request_id} never ran on the target");
+}
+
+async fn backend_tag(owner: &sqlx::PgPool, request_id: Uuid) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT application_name FROM pg_stat_activity WHERE state = 'active' \
+         AND application_name LIKE $1 AND query LIKE 'SELECT pg_sleep%'",
+    )
+    .bind(format!("dbmcp-{}-%", request_id.simple()))
+    .fetch_optional(owner)
+    .await
+    .expect("pg_stat_activity")
 }
