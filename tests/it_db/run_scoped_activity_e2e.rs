@@ -530,6 +530,7 @@ async fn run_scoped_true_without_a_run_is_refused_before_any_lookup() {
                 assert_eq!(row.error_message.as_deref(), Some(message.as_str()));
                 assert_eq!(row.server.as_deref(), Some(server), "{label}");
                 assert_eq!(row.database.as_deref(), Some("app"), "{label}");
+                assert_eq!(row.db_type, None, "{label}: the server is not looked up");
                 assert_eq!(row.upstream_run_id, None, "{label}");
             }
         }
@@ -576,12 +577,15 @@ async fn run_scoped_false_is_the_same_as_absent() {
     let id_b = fx.running_request_id(&service, Some(RUN_B)).await;
     let id_sso = fx.running_request_id(&sso, None).await;
 
-    let cases: [(&str, &str, Headers<'_>, &[&String]); 3] = [
-        (TOKEN, &service, &[], &[&id_a, &id_b]),
-        (TOKEN, &service, &[(RUN_HEADER, RUN_A)], &[&id_a]),
-        (&fx.gw.bearer, &sso, &[(RUN_HEADER, RUN_A)], &[&id_sso]),
+    // Each caller, the statements it owns, and a live one it does not:
+    // another identity's, or — for run A — run B's of the same identity.
+    let run_a: Headers<'_> = &[(RUN_HEADER, RUN_A)];
+    let cases: [(&str, &str, Headers<'_>, &[&String], &String); 3] = [
+        (TOKEN, &service, &[], &[&id_a, &id_b], &id_sso),
+        (TOKEN, &service, run_a, &[&id_a], &id_b),
+        (&fx.gw.bearer, &sso, run_a, &[&id_sso], &id_a),
     ];
-    for (bearer, sub, headers, running) in cases {
+    for (bearer, sub, headers, running, foreign) in cases {
         let caller = Caller {
             bearer,
             sub,
@@ -596,14 +600,22 @@ async fn run_scoped_false_is_the_same_as_absent() {
                 .filter(|id| [&id_a, &id_b, &id_sso].contains(&id))
                 .collect();
             assert_eq!(seen, running, "{sub} {headers:?} {args}");
+            let row = latest_audit(&fx.gw.state_db, sub, "db_activity", "false activity").await;
+            assert_eq!(row.outcome, "success");
         }
-        let row = latest_audit(&fx.gw.state_db, sub, "db_activity", "false activity").await;
-        assert_eq!(row.outcome, "success");
 
         let mut bodies = Vec::new();
         for mut args in [json!({}), json!({ "run_scoped": false })] {
-            args["request_id"] = json!(uuid::Uuid::new_v4().to_string());
-            let mut body = payload(&fx.call_with(bearer, headers, "cancel_query", args).await);
+            args["request_id"] = json!(foreign);
+            let resp = fx.call_with(bearer, headers, "cancel_query", args).await;
+            let row = latest_audit(&fx.gw.state_db, sub, "cancel_query", "foreign").await;
+            assert_eq!(row.outcome, "forbidden", "{sub} {headers:?}: {resp}");
+            assert_eq!(row.sql.as_deref(), Some(foreign.as_str()));
+            assert!(
+                fx.active_on_target(foreign).await,
+                "{sub} {headers:?}: a statement it does not own must keep running"
+            );
+            let mut body = payload(&resp);
             body["request_id"] = Value::Null;
             bodies.push(body);
         }

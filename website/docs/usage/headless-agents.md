@@ -87,7 +87,7 @@ A read-tier token cannot write even if the SQL guard had a bug: its statements n
 
 `db_activity` lists what the gateway is running for *you* on a database (`pid`, `request_id`, `state`, `wait_event`, `running_ms`). `cancel_query` with one of those `request_id`s stops it; the stopped call answers `cancelled`. You can only see and cancel your own token's requests.
 
-With `x-dbmcp-run-id` both cover only that run; without it, every run that shares the token. Pass `run_scoped: true` when the call must stay within your run:
+With `x-dbmcp-run-id` both cover only that run. Without it they cover every run that shares the token — but only if your account does not set `require_upstream` and `run_scoped` is `false` or absent; otherwise the call is refused. Pass `run_scoped: true` when the call must stay within your run:
 
 ```json
 {"name": "cancel_query", "arguments": {

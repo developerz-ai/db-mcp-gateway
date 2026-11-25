@@ -193,6 +193,7 @@ async fn cancel_query_rejects_a_malformed_request_id() {
     assert_eq!(resp["error"]["code"], -32602, "{resp}");
     let row = latest_audit(&fx.gw.state_db, &fx.gw.user_sub, "cancel_query", "bad id").await;
     assert_eq!(row.outcome, "invalid_arguments");
+    assert_eq!(row.db_type.as_deref(), Some("postgres"));
 }
 
 /// The owner sees its running query in `db_activity`; a peer with the same

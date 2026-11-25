@@ -107,13 +107,15 @@ not *which run* or *for whom*. Two request headers carry that:
   called with `x-dbmcp-run-id` see and touch only statements whose intent row
   recorded that run id; another run's `request_id` answers `cancel_query`
   exactly like an unknown one (`forbidden`, same message). Without the header
-  the call keeps the account-wide view (refused instead under
-  `require_upstream`). The run id only narrows the caller's own requests; it
-  never reaches past the `service:<name>` identity ([03](03-mcp-tools.md)).
-- **`run_scoped: true` fails closed.** Without the header the two tools
-  answer for the whole account, so a client whose header was lost (a proxy
-  strips it, a bug drops it) would list or cancel other runs' statements
-  without noticing. `run_scoped: true` on `db_activity` / `cancel_query`
+  the call keeps the account-wide view only where `require_upstream` is off
+  and `run_scoped` is `false` or absent; otherwise it is refused. The
+  run id only narrows the caller's own requests; it never reaches past the
+  `service:<name>` identity ([03](03-mcp-tools.md)).
+- **`run_scoped: true` fails closed.** Without the header, where
+  `require_upstream` is off, the two tools answer for the whole account unless
+  the call says otherwise, so a client whose header was lost (a proxy strips
+  it, a bug drops it) would list or cancel other runs' statements without
+  noticing. `run_scoped: true` on `db_activity` / `cancel_query`
   refuses that call (`invalid_arguments`, audited, nothing listed or
   cancelled); SSO sessions, which have no run, are always refused. It is a
   precondition on the unverified run id, checks only that one was claimed, and

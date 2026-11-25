@@ -65,12 +65,16 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
         database: Some(&args.database),
         sql: None,
         reason: args.reason.as_deref(),
-        db_type: super::db_type_for_server(ctx.config, &args.server),
+        db_type: None,
     };
     if let Err(message) = ensure_run_scoped(args.run_scoped, run_scope(ctx)) {
         let outcome = invalid_arguments(id.clone(), message);
         return audit_outcome(ctx, id, header, outcome).await;
     }
+    let header = AuditHeader {
+        db_type: super::db_type_for_server(ctx.config, &args.server),
+        ..header
+    };
     let args = &args;
     run_audited(ctx, id, header, |id, grants| async move {
         compute_outcome(ctx, id, &grants, &header, args).await
