@@ -45,15 +45,15 @@ use crate::config::{Database, Server, Tls};
 
 use uuid::Uuid;
 
-use super::adapter::{
-    AdapterKind, DbAdapter, ExecError, ExecResult, TOKIO_TIMEOUT_SLACK_MS, effective_timeout_ms,
-};
+use super::adapter::{AdapterKind, DbAdapter, ExecError, ExecResult};
 use super::pg::pool_metrics::{self, permits_sample};
 use super::pg::resolve_password;
 use super::pool_sizing::{CallerSlots, PoolSizing};
 use super::query::{
     ActivityQuery, ExecQuery, ExplainQuery, SampleQuery, SchemaQuery, TableStatsQuery,
 };
+
+use bson_json::raw_to_json;
 
 /// Bound on server selection and on opening one connection — the Mongo
 /// analogue of the pg pool's acquire timeout. Without it the driver waits
@@ -244,19 +244,7 @@ impl DbAdapter for MongoAdapter {
     /// `outcome: cancelled` audit row is unaffected: it is written by the
     /// backend-agnostic drop guard in `tools::audit_dispatch`.)
     async fn execute(&self, query: ExecQuery<'_>) -> Result<ExecResult, ExecError> {
-        rejector::validate_command(query.sql)
-            .map_err(|err| ExecError::Forbidden(err.to_string()))?;
-
-        // The caller's share of the pool, then a connection of it, both
-        // taken outside the time budget as the pg adapter's acquire is.
-        let _slot = self.callers.take(CONNECT_TIMEOUT).await?;
-        let _connection = self.reserve_connection().await?;
-        let effective_ms = effective_timeout_ms(query.statement_timeout_ms);
-        let budget = Duration::from_millis(u64::from(effective_ms) + TOKIO_TIMEOUT_SLACK_MS);
-        match tokio::time::timeout(budget, self.dispatch(&query, effective_ms)).await {
-            Ok(result) => result,
-            Err(_elapsed) => Err(ExecError::Timeout),
-        }
+        self.run(&query, raw_to_json).await
     }
 
     /// No caller slot here: each catalog command goes through `execute`,

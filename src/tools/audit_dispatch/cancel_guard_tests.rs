@@ -158,3 +158,26 @@ async fn armed_row_reads_cancelled_until_an_outcome_is_recorded() {
     assert!(!guard.completed);
     guard.disarm();
 }
+
+/// A failed fallback write holds `audit_failure_recent{kind="fallback"}`. The
+/// state DB here refuses connections; nothing else in this binary marks it.
+#[tokio::test]
+async fn a_failed_fallback_write_starts_the_fallback_hold() {
+    let recent = || audit_failures().is_recent(FailedAuditWrite::Fallback);
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(100))
+        .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+        .expect("lazy pool");
+    let tasks = DetachedTasks::new();
+    let mut guard = unarmed_guard();
+    guard.completed = true;
+    guard.state_db = Some(pool);
+    guard.tasks = tasks.clone();
+    assert!(!recent());
+    drop(guard);
+    tasks
+        .drain(std::time::Duration::from_secs(10))
+        .await
+        .expect("fallback settles");
+    assert!(recent());
+}

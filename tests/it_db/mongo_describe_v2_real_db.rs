@@ -387,3 +387,115 @@ async fn an_oversized_field_name_is_left_out_and_reported() {
     assert_eq!(field_names(&sample), ["_id", "kept"]);
     assert_eq!(sample["truncated"], true);
 }
+
+/// The bytes of a BSON document of `body`'s elements.
+fn framed(body: &[u8]) -> Vec<u8> {
+    let len = i32::try_from(body.len() + 5).expect("fits");
+    [&len.to_le_bytes()[..], body, &[0]].concat()
+}
+
+/// A document close to 16 MiB of nothing but short distinct field names
+/// (each a `null`), held under `parents`.
+fn widest_document(parents: &[&str]) -> mongodb::bson::RawDocumentBuf {
+    const NAME: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut body = Vec::new();
+    for i in 0..2_600_000_usize {
+        let mut rest = i;
+        body.push(0x0A);
+        for _ in 0..4 {
+            body.push(NAME[rest % NAME.len()]);
+            rest /= NAME.len();
+        }
+        body.push(0);
+    }
+    for parent in parents.iter().rev() {
+        let child = framed(&body);
+        body = [&[0x03][..], parent.as_bytes(), &[0], &child].concat();
+    }
+    mongodb::bson::RawDocumentBuf::from_bytes(framed(&body)).expect("valid BSON")
+}
+
+/// The widest legal object at each reported level: the sample is cut and
+/// says so, and the other collections of the same call are still listed.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn the_widest_object_at_any_level_is_a_truncated_sample() {
+    let a = adapter(SERVER).await;
+    let db = side_client().database(TARGET_DB);
+    let mut wrong = Vec::new();
+    for parents in [&[][..], &["w"], &["w", "x"]] {
+        let prefix = unique_collection("mwide");
+        let (wide, plain) = (format!("{prefix}-a"), format!("{prefix}-b"));
+        db.collection::<mongodb::bson::RawDocumentBuf>(&wide)
+            .insert_one(widest_document(parents))
+            .await
+            .expect("seed wide");
+        db.collection::<mongodb::bson::Document>(&plain)
+            .insert_one(doc! { "field": 1 })
+            .await
+            .expect("seed plain");
+        let full = a
+            .describe_schema(SchemaQuery {
+                table: None,
+                search: Some(&prefix),
+                ..schema_query(&plain, SchemaDetail::Full, 5)
+            })
+            .await;
+        drop_collection(&side_client(), &wide).await;
+        drop_collection(&side_client(), &plain).await;
+
+        let depth = parents.len() + 1;
+        let full = match full {
+            Ok(full) => full,
+            Err(err) => {
+                wrong.push(format!("level {depth}: {err:?}"));
+                continue;
+            }
+        };
+        let sample_of = |name: &str| {
+            full.rows
+                .iter()
+                .find(|row| row[1] == name)
+                .map(|row| row[4].clone())
+                .unwrap_or_default()
+        };
+        let (wide, plain) = (sample_of(&wide), sample_of(&plain));
+        let first = [parents, &["0000"]].concat().join(".");
+        if wide["sampled"] != 1
+            || wide["truncated"] != true
+            || !field_names(&wide).contains(&first.as_str())
+        {
+            wrong.push(format!("level {depth}: {wide}"));
+        }
+        if plain["truncated"] != false || field_names(&plain) != ["_id", "field"] {
+            wrong.push(format!("level {depth}, the other collection: {plain}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The documents read for a sample are held to the 32 MiB result budget in
+/// their stored form, however little is reported of them.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_sample_past_the_byte_budget_is_cut_and_says_so() {
+    let a = adapter(SERVER).await;
+    let coll = format!("{}-big", unique_collection("mdesc"));
+    let collection = side_client()
+        .database(TARGET_DB)
+        .collection::<mongodb::bson::Document>(&coll);
+    for _ in 0..3 {
+        collection
+            .insert_one(doc! { "blob": "x".repeat(12 * 1024 * 1024) })
+            .await
+            .expect("seed");
+    }
+    let full = a
+        .describe_schema(schema_query(&coll, SchemaDetail::Full, 5))
+        .await;
+    drop_collection(&side_client(), &coll).await;
+    let sample = full.expect("full").rows.remove(0).remove(4);
+    assert_eq!(sample["sampled"], 2, "{sample}");
+    assert_eq!(sample["truncated"], true);
+    assert_eq!(field_names(&sample), ["_id", "blob"]);
+}

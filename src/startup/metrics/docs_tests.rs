@@ -130,6 +130,10 @@ fn documented_metrics_match_the_recorder_output() {
             );
         }
     }
+    assert!(
+        rendered.contains_key("audit_failure_recent"),
+        "the alerts' failure gauge is not exported at boot"
+    );
     for name in docs.keys() {
         assert!(
             catalogue::CATALOGUE.iter().any(|m| m.name == name),

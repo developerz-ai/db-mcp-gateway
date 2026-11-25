@@ -1,4 +1,5 @@
-//! The text kept for a command the Mongo server refused.
+//! What a driver error becomes, and the text kept for a command the Mongo
+//! server refused.
 //!
 //! The server's `errmsg` echoes the command — filter values included — and,
 //! for an error raised while documents were read, values from those
@@ -8,9 +9,68 @@
 //! only for codes the server raises while parsing the command, before any
 //! document is read.
 
+use std::sync::atomic::Ordering;
+
+use mongodb::error::{Error as MongoError, ErrorKind};
 use serde_json::Value;
 
+use super::super::adapter::ExecError;
 use super::super::rejection::DbRejection;
+use super::MongoAdapter;
+
+/// Server error codes ([`mongodb::error::CommandError::code`]) with a
+/// mapping of their own.
+const MAX_TIME_MS_EXPIRED: i32 = 50;
+const UNAUTHORIZED: i32 = 13;
+
+impl MongoAdapter {
+    /// Map a driver error to [`ExecError`], same semantics as the pg side:
+    ///
+    /// - `maxTimeMS` exhaustion (code 50, `MaxTimeMSExpired`) → `Timeout`.
+    /// - The role lacks a privilege the command needs (code 13,
+    ///   `Unauthorized`) → a `13` rejection, `permission_denied` to the
+    ///   agent. Gateway wording only: the server's message echoes the
+    ///   command, filter values included.
+    /// - Rejected credentials → `Connection`, and the adapter goes stale so
+    ///   the registry re-opens it with a freshly resolved password.
+    /// - Connection / IO / selection failures → `Unavailable`.
+    /// - Any other server refusal → a rejection with its code and the
+    ///   gateway's wording (see [`command_rejection`]); `command` is the
+    ///   caller's JSON, the only place a name may come from.
+    /// - Anything else → `Sql`.
+    ///
+    /// Never renders the driver error: only its kind is logged.
+    pub(super) fn classify(&self, err: MongoError, command: &str) -> ExecError {
+        let (kind, mapped) = match err.kind.as_ref() {
+            ErrorKind::Command(cmd_err) if cmd_err.code == MAX_TIME_MS_EXPIRED => {
+                ("command", ExecError::Timeout)
+            }
+            ErrorKind::Command(cmd_err) if cmd_err.code == UNAUTHORIZED => (
+                "unauthorized",
+                ExecError::Rejected(DbRejection::new("13", "not authorized", "")),
+            ),
+            ErrorKind::Authentication { .. } => {
+                self.stale.store(true, Ordering::Relaxed);
+                ("authentication", ExecError::Connection)
+            }
+            ErrorKind::Io(_) => ("io", ExecError::Unavailable),
+            ErrorKind::ConnectionPoolCleared { .. } => ("pool_cleared", ExecError::Unavailable),
+            ErrorKind::DnsResolve { .. } => ("dns", ExecError::Unavailable),
+            ErrorKind::ServerSelection { .. } => ("server_selection", ExecError::Unavailable),
+            ErrorKind::Command(cmd_err) => (
+                "command",
+                ExecError::Rejected(command_rejection(cmd_err.code, &cmd_err.message, command)),
+            ),
+            _ => ("other", ExecError::Sql),
+        };
+        let code = match err.kind.as_ref() {
+            ErrorKind::Command(cmd_err) => cmd_err.code,
+            _ => 0,
+        };
+        tracing::warn!(error_kind = kind, code, "target command failed");
+        mapped
+    }
+}
 
 /// Wording for one server error code; anything else gets [`UNKNOWN`].
 const BY_CODE: &[(i32, &str)] = &[

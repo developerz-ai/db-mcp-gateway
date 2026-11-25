@@ -8,6 +8,7 @@
 
 mod cancel_guard;
 mod error_body;
+pub mod failure_hold;
 mod metric_names;
 mod outcome;
 mod report;

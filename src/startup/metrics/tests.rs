@@ -1,6 +1,8 @@
 //! Recorder configuration and the dedicated listener. The recorder is built,
 //! never installed, so these tests share no process-global state.
 
+use db_mcp_gateway::tools::audit_dispatch::failure_hold::FailedAuditWrite;
+
 use super::*;
 
 fn record_both(recorder: &metrics_exporter_prometheus::PrometheusRecorder) {
@@ -142,6 +144,7 @@ fn boot_exports_the_catalogue_with_its_label_sets_at_zero() {
         r#"tool_calls_by_db{db="pg/app",outcome="success",access="write"} 0"#,
         r#"handler_panics_total{layer="tool_work"} 0"#,
         r#"requests_shed_total{scope="oauth"} 0"#,
+        r#"audit_failure_recent{kind="fallback"} 0"#,
     ] {
         assert!(body.contains(sample), "missing `{sample}`:\n{body}");
     }
@@ -238,5 +241,47 @@ async fn metrics_listener_answers_probes_before_boot_completes() {
         .expect("readyz");
     assert_eq!(readyz.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(readyz.text().await.expect("body"), "starting");
+    shutdown.cancel();
+}
+
+/// The gauge is evaluated by the scrape itself: a failure shows on the next
+/// one, and neither value idles out between scrapes. The only test here that
+/// marks the process-wide `write` hold; nothing marks `fallback`.
+#[tokio::test]
+async fn a_scrape_shows_a_recent_audit_failure_and_never_drops_the_gauge() {
+    let idle = Duration::from_millis(100);
+    let recorder = builder_with_idle_timeout(idle)
+        .expect("builder")
+        .build_recorder();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let shutdown = CancellationToken::new();
+    let addr = spawn_listener(
+        "127.0.0.1:0".parse().expect("addr"),
+        recorder.handle(),
+        shutdown.clone(),
+    )
+    .await
+    .expect("bind");
+    let scrape = async || {
+        let url = format!("http://{addr}/metrics");
+        let response = reqwest::get(url).await.expect("scrape");
+        response.text().await.expect("body")
+    };
+    let expect = |body: &str, write: u8| {
+        for sample in [
+            format!(r#"audit_failure_recent{{kind="write"}} {write}"#),
+            r#"audit_failure_recent{kind="fallback"} 0"#.to_owned(),
+        ] {
+            assert!(body.contains(&sample), "missing `{sample}`:\n{body}");
+        }
+    };
+
+    expect(&scrape().await, 0);
+    tokio::time::sleep(idle * 3).await;
+    expect(&scrape().await, 0);
+    audit_failures().mark(FailedAuditWrite::Write);
+    expect(&scrape().await, 1);
+    tokio::time::sleep(idle * 3).await;
+    expect(&scrape().await, 1);
     shutdown.cancel();
 }

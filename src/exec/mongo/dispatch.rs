@@ -2,31 +2,53 @@
 //! `maxTimeMS` budget and the kill-on-drop guard, collecting results up to
 //! the row and byte budget.
 
-use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use futures::StreamExt;
-use mongodb::bson::{Bson, Document, doc};
-use mongodb::error::{Error as MongoError, ErrorKind};
+use mongodb::bson::{Bson, Document, RawDocument, doc};
 use serde_json::Value;
 
-use super::super::adapter::{ExecError, ExecResult};
+use super::super::adapter::{
+    ExecError, ExecResult, MAX_RESULT_BYTES, TOKIO_TIMEOUT_SLACK_MS, effective_timeout_ms,
+};
 use super::super::budget::ResultBudget;
 use super::super::query::ExecQuery;
-use super::super::rejection::DbRejection;
-use super::MongoAdapter;
-use super::bson_json::{bson_to_json, doc_to_json};
+use super::bson_json::bson_to_json;
 use super::cancel;
-use super::error::command_rejection;
+use super::{CONNECT_TIMEOUT, MongoAdapter, rejector};
+
+/// What one document of a cursor becomes in the result.
+pub(super) type Render = fn(&RawDocument) -> Result<Value, ExecError>;
 
 impl MongoAdapter {
+    /// `DbAdapter::execute` (see its doc for the guards), each cursor
+    /// document turned into its cell by `render`.
+    pub(super) async fn run(
+        &self,
+        query: &ExecQuery<'_>,
+        render: Render,
+    ) -> Result<ExecResult, ExecError> {
+        rejector::validate_command(query.sql)
+            .map_err(|err| ExecError::Forbidden(err.to_string()))?;
+
+        // The caller's share of the pool, then a connection of it, both
+        // taken outside the time budget as the pg adapter's acquire is.
+        let _slot = self.callers.take(CONNECT_TIMEOUT).await?;
+        let _connection = self.reserve_connection().await?;
+        let effective_ms = effective_timeout_ms(query.statement_timeout_ms);
+        let budget = Duration::from_millis(u64::from(effective_ms) + TOKIO_TIMEOUT_SLACK_MS);
+        match tokio::time::timeout(budget, self.dispatch(query, effective_ms, render)).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(ExecError::Timeout),
+        }
+    }
+
     /// Parse, stamp the DB-side budget, and run one already-accepted command.
-    /// Split out of `DbAdapter::execute` so the `tokio::time::timeout`
-    /// there covers the cursor drain as well as the initial dispatch.
-    pub(super) async fn dispatch(
+    /// Split out of [`Self::run`] so the `tokio::time::timeout` there covers the cursor drain as well as the initial dispatch.
+    async fn dispatch(
         &self,
         query: &ExecQuery<'_>,
         effective_ms: u32,
+        render: Render,
     ) -> Result<ExecResult, ExecError> {
         let mut cmd: Document = serde_json::from_str(query.sql).map_err(|_| ExecError::Sql)?;
         let command_name = first_command_name(&cmd).ok_or(ExecError::Sql)?;
@@ -49,7 +71,7 @@ impl MongoAdapter {
         let result = async {
             let (column, collected) = match command_name.as_str() {
                 "find" | "aggregate" | "listCollections" | "listIndexes" => {
-                    ("document", self.drain_cursor(cmd, query).await?)
+                    ("document", self.drain_cursor(cmd, query, render).await?)
                 }
                 "count" => ("count", self.count(cmd, query).await?),
                 "distinct" => ("value", self.distinct(cmd, query).await?),
@@ -81,24 +103,46 @@ impl MongoAdapter {
 
     /// Cursor-returning commands: the initial response *and* follow-up
     /// `getMore` calls, until the budget runs out.
-    async fn drain_cursor(&self, cmd: Document, query: &ExecQuery<'_>) -> Result<Rows, ExecError> {
+    async fn drain_cursor(
+        &self,
+        cmd: Document,
+        query: &ExecQuery<'_>,
+        render: Render,
+    ) -> Result<Rows, ExecError> {
         let db = self.client.database(&self.database_name);
         let mut cursor = db
             .run_cursor_command(cmd)
             .await
             .map_err(|e| self.classify(e, query.sql))?;
         let mut budget = ResultBudget::new(query.row_limit);
+        // The documents are held to the byte cap too: a rendered row may
+        // weigh far less than the document it was read from.
+        let mut wire_left = MAX_RESULT_BYTES;
         let mut rows = Vec::new();
-        while let Some(doc_result) = cursor.next().await {
-            let doc = doc_result.map_err(|e| self.classify(e, query.sql))?;
-            let row = vec![doc_to_json(doc)?];
-            if !budget.admit(&row) {
+        while cursor
+            .advance()
+            .await
+            .map_err(|e| self.classify(e, query.sql))?
+        {
+            let document = cursor.current();
+            let cut = match wire_left.checked_sub(document.as_bytes().len()) {
+                Some(left) if budget.has_row_left() => {
+                    wire_left = left;
+                    let row = vec![render(document)?];
+                    let admitted = budget.admit(&row);
+                    if admitted {
+                        rows.push(row);
+                    }
+                    !admitted
+                }
+                _ => true,
+            };
+            if cut {
                 return Ok(Rows {
                     rows,
                     truncated: true,
                 });
             }
-            rows.push(row);
         }
         Ok(Rows {
             rows,
@@ -163,59 +207,7 @@ impl MongoAdapter {
             truncated: false,
         })
     }
-
-    /// Map a driver error to [`ExecError`], same semantics as the pg side:
-    ///
-    /// - `maxTimeMS` exhaustion (code 50, `MaxTimeMSExpired`) → `Timeout`.
-    /// - The role lacks a privilege the command needs (code 13,
-    ///   `Unauthorized`) → a `13` rejection, `permission_denied` to the
-    ///   agent. Gateway wording only: the server's message echoes the
-    ///   command, filter values included.
-    /// - Rejected credentials → `Connection`, and the adapter goes stale so
-    ///   the registry re-opens it with a freshly resolved password.
-    /// - Connection / IO / selection failures → `Unavailable`.
-    /// - Any other server refusal → a rejection with its code and the
-    ///   gateway's wording (see [`command_rejection`]); `command` is the
-    ///   caller's JSON, the only place a name may come from.
-    /// - Anything else → `Sql`.
-    ///
-    /// Never renders the driver error: only its kind is logged.
-    fn classify(&self, err: MongoError, command: &str) -> ExecError {
-        let (kind, mapped) = match err.kind.as_ref() {
-            ErrorKind::Command(cmd_err) if cmd_err.code == MAX_TIME_MS_EXPIRED => {
-                ("command", ExecError::Timeout)
-            }
-            ErrorKind::Command(cmd_err) if cmd_err.code == UNAUTHORIZED => (
-                "unauthorized",
-                ExecError::Rejected(DbRejection::new("13", "not authorized", "")),
-            ),
-            ErrorKind::Authentication { .. } => {
-                self.stale.store(true, Ordering::Relaxed);
-                ("authentication", ExecError::Connection)
-            }
-            ErrorKind::Io(_) => ("io", ExecError::Unavailable),
-            ErrorKind::ConnectionPoolCleared { .. } => ("pool_cleared", ExecError::Unavailable),
-            ErrorKind::DnsResolve { .. } => ("dns", ExecError::Unavailable),
-            ErrorKind::ServerSelection { .. } => ("server_selection", ExecError::Unavailable),
-            ErrorKind::Command(cmd_err) => (
-                "command",
-                ExecError::Rejected(command_rejection(cmd_err.code, &cmd_err.message, command)),
-            ),
-            _ => ("other", ExecError::Sql),
-        };
-        let code = match err.kind.as_ref() {
-            ErrorKind::Command(cmd_err) => cmd_err.code,
-            _ => 0,
-        };
-        tracing::warn!(error_kind = kind, code, "target command failed");
-        mapped
-    }
 }
-
-/// Server error codes ([`mongodb::error::CommandError::code`]) with a
-/// mapping of their own.
-const MAX_TIME_MS_EXPIRED: i32 = 50;
-const UNAUTHORIZED: i32 = 13;
 
 /// Collected rows and whether the budget cut them short.
 struct Rows {
@@ -258,41 +250,5 @@ fn first_command_name(doc: &Document) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn find_limit_is_capped_but_a_smaller_one_kept() {
-        let mut cmd = doc! { "find": "c", "limit": 1000 };
-        cap_server_side(&mut cmd, "find", 10);
-        assert_eq!(cmd.get_i64("limit").ok(), Some(11));
-        assert_eq!(cmd.get_i64("batchSize").ok(), Some(11));
-
-        let mut cmd = doc! { "find": "c", "limit": 3 };
-        cap_server_side(&mut cmd, "find", 10);
-        assert_eq!(cmd.get_i64("limit").ok(), Some(3));
-
-        // `limit: 0` means "no limit" to mongo — never pass it through.
-        let mut cmd = doc! { "find": "c", "limit": 0 };
-        cap_server_side(&mut cmd, "find", 0);
-        assert_eq!(cmd.get_i64("limit").ok(), Some(1));
-    }
-
-    #[test]
-    fn aggregate_gets_a_trailing_limit_stage() {
-        let mut cmd = doc! { "aggregate": "c", "pipeline": [ { "$match": {} } ], "cursor": {} };
-        cap_server_side(&mut cmd, "aggregate", 4);
-        let pipeline = cmd.get_array("pipeline").expect("pipeline");
-        assert_eq!(
-            pipeline.last(),
-            Some(&Bson::Document(doc! { "$limit": 5_i64 }))
-        );
-        assert_eq!(
-            cmd.get_document("cursor")
-                .expect("cursor")
-                .get_i64("batchSize")
-                .ok(),
-            Some(5)
-        );
-    }
-}
+#[path = "dispatch_tests.rs"]
+mod tests;

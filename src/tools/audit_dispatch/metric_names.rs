@@ -1,14 +1,13 @@
 //! Metric names emitted by the audit chokepoint, and the bounded labels a
 //! dispatch's call metrics carry.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use metrics::{counter, gauge, histogram};
+use metrics::{counter, histogram};
 
 use crate::audit::OutcomeCode;
 use crate::config::ConfigFile;
 
 use super::AuditHeader;
+use super::failure_hold::{FailedAuditWrite, audit_failures};
 
 /// Per-call counter — `tool` is the tool name, `outcome` is the spec 03 code
 /// the client saw (`success`/`forbidden`/`audit_unavailable`/…), `access` is
@@ -26,35 +25,10 @@ pub(super) const AUDIT_WRITE_DURATION: &str = "audit_write_duration_seconds";
 /// Drop-guard fallback writes that failed: a call whose row may be missing
 /// unless its intent row is reaped.
 pub(super) const AUDIT_FALLBACK_FAILURES: &str = "audit_fallback_failures_total";
-/// Unix seconds of the last audit write that failed, by `kind`: alerts read
-/// how recent it is, which a pod first scraped after the failure still shows
-/// (a counter born above 0 has no `increase()`).
-const AUDIT_LAST_FAILURE: &str = "audit_last_failure_timestamp";
 /// Panics caught and answered `internal`; `layer` is `tool_work` here.
 pub(super) const HANDLER_PANICS: &str = "handler_panics_total";
 /// `access` label of a call dropped before its tool decided read vs write.
 pub(super) const ACCESS_UNKNOWN: &str = "unknown";
-
-/// Which audit write failed: [`FailedAuditWrite::Write`] answered the client
-/// `audit_unavailable`; [`FailedAuditWrite::Fallback`] is the drop-path retry.
-#[derive(Debug, Clone, Copy)]
-pub(super) enum FailedAuditWrite {
-    Write,
-    Fallback,
-}
-
-/// Stamp `audit_last_failure_timestamp{kind}` with now.
-pub(super) fn record_audit_failure(kind: FailedAuditWrite) {
-    let kind = match kind {
-        FailedAuditWrite::Write => "write",
-        FailedAuditWrite::Fallback => "fallback",
-    };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or_default();
-    gauge!(AUDIT_LAST_FAILURE, "kind" => kind).set(now);
-}
 
 /// The labels of one dispatch's call metrics.
 #[derive(Debug, Clone)]
@@ -92,7 +66,7 @@ impl CallLabels {
     /// Count one call: per tool always, per database when it named one.
     pub(super) fn count(&self, code: OutcomeCode, access: &'static str) {
         if code == OutcomeCode::AuditUnavailable {
-            record_audit_failure(FailedAuditWrite::Write);
+            audit_failures().mark(FailedAuditWrite::Write);
         }
         counter!(
             TOOL_CALLS,
@@ -120,46 +94,5 @@ impl CallLabels {
             "db" => self.db.clone().unwrap_or_default(),
         )
         .record(seconds);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use metrics_exporter_prometheus::PrometheusBuilder;
-
-    use super::*;
-
-    #[test]
-    fn audit_unavailable_stamps_the_last_write_failure() {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let labels = CallLabels::untargeted("run_query");
-        metrics::with_local_recorder(&recorder, || {
-            labels.count(OutcomeCode::Success, "read");
-            labels.count(OutcomeCode::Forbidden, "read");
-        });
-        let body = recorder.handle().render();
-        assert!(!body.contains(AUDIT_LAST_FAILURE), "{body}");
-
-        metrics::with_local_recorder(&recorder, || {
-            labels.count(OutcomeCode::AuditUnavailable, "read");
-            record_audit_failure(FailedAuditWrite::Fallback);
-        });
-        let body = recorder.handle().render();
-        for kind in ["write", "fallback"] {
-            let line = body
-                .lines()
-                .find(|l| {
-                    l.starts_with(&format!(
-                        r#"audit_last_failure_timestamp{{kind="{kind}"}} "#
-                    ))
-                })
-                .unwrap_or_else(|| panic!("no {kind} stamp:\n{body}"));
-            let stamp: f64 = line
-                .rsplit(' ')
-                .next()
-                .and_then(|v| v.parse().ok())
-                .expect("value");
-            assert!(stamp > 1.7e9, "{line}");
-        }
     }
 }

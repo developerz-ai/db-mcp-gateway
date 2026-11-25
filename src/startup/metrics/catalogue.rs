@@ -76,10 +76,10 @@ pub(crate) const CATALOGUE: &[Metric] = &[
         "Disconnect-path audit writes that failed.",
     ),
     metric(
-        "audit_last_failure_timestamp",
+        "audit_failure_recent",
         Gauge,
         &["kind"],
-        "Unix seconds of the last failed audit write of an MCP tool call (write: answered audit_unavailable; fallback: the disconnect-path retry).",
+        "1 while an MCP tool call's audit write failed recently, else 0 (write: answered audit_unavailable, 15 min; fallback: the disconnect-path write, 30 min).",
     ),
     metric(
         "audit_abandoned_total",

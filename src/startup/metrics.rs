@@ -18,6 +18,7 @@ use axum::Router;
 use axum::http::{HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use db_mcp_gateway::tools::audit_dispatch::failure_hold::audit_failures;
 use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder, PrometheusHandle};
 use metrics_util::MetricKindMask;
 use tokio_util::sync::CancellationToken;
@@ -136,6 +137,7 @@ fn register_boot_series() {
     preregister::register_static();
     loaded::record_build_info();
     loaded::record_process_start();
+    audit_failures().publish();
 }
 
 /// `# HELP` and `# TYPE` for every catalogued series.
@@ -160,7 +162,13 @@ fn router(handle: PrometheusHandle, probe: &'static probes::ProbeState) -> Route
         .merge(probe_routes)
 }
 
+/// One render at a time: two overlapping scrapes could otherwise publish out
+/// of order, the older one clearing a failure the newer one had just set.
+static RENDERING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn render(handle: PrometheusHandle) -> Response {
+    let _rendering = RENDERING.lock().await;
+    audit_failures().publish();
     let mut response = handle.render().into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,

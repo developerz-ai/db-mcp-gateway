@@ -15,7 +15,9 @@ use super::super::query::{ExecQuery, SampleQuery, SchemaDetail, SchemaQuery};
 use super::super::rejection::RejectionKind;
 use super::super::sql_guard::Access;
 use super::MongoAdapter;
-use super::infer::{field_types, infer_fields};
+use super::bson_json::raw_to_json;
+use super::dispatch::Render;
+use super::infer::{field_list, infer_fields};
 use super::rejector::is_system_collection;
 
 /// Indexes listed per collection. Mongo allows 64; the cap only bounds a
@@ -27,7 +29,7 @@ impl MongoAdapter {
     /// `indexes` at `columns` and `full`, plus `sample` (see
     /// [`infer_fields`]) at `full`. The whole listing — one
     /// `listCollections`, then per collection one `listIndexes` and the
-    /// sample's `aggregate` — shares a single time budget.
+    /// sample's `find` — shares a single time budget.
     pub(super) async fn describe(&self, query: SchemaQuery<'_>) -> Result<ExecResult, ExecError> {
         let effective_ms = effective_timeout_ms(query.statement_timeout_ms);
         let budget = Duration::from_millis(u64::from(effective_ms) + TOKIO_TIMEOUT_SLACK_MS);
@@ -141,32 +143,24 @@ impl MongoAdapter {
         }
     }
 
-    /// The field lists (see [`field_types`]) of up to `query.sample_limit`
-    /// documents of `collection`, through `execute` like any `aggregate` the
-    /// caller could run, and whether the result budget cut them short.
+    /// The field lists (see [`field_list`]) of up to `query.sample_limit`
+    /// documents of `collection`, read by the `find` any caller could run,
+    /// and whether the result budget cut them short.
     async fn sample_field_lists(
         &self,
         collection: &str,
         query: &SchemaQuery<'_>,
     ) -> Result<(Vec<Value>, bool), ExecError> {
-        let command = json!({
-            "aggregate": collection,
-            "pipeline": [{ "$project": { "_id": 0, "levels": field_types() } }],
-            "cursor": {},
-        });
-        let found = self.read(&command, query.sample_limit, query).await?;
+        let command = json!({ "find": collection, "filter": {} });
+        let found = self
+            .read_as(&command, query.sample_limit, query, field_list)
+            .await?;
         let cut = found.truncated && found.rows.len() < query.sample_limit as usize;
         let lists = found
             .rows
             .into_iter()
             .filter_map(|row| row.into_iter().next())
-            .map(|mut document| {
-                document
-                    .get_mut("levels")
-                    .map(Value::take)
-                    .ok_or(ExecError::Decode)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect();
         Ok((lists, cut))
     }
 
@@ -214,8 +208,19 @@ impl MongoAdapter {
         row_limit: u32,
         query: &SchemaQuery<'_>,
     ) -> Result<ExecResult, ExecError> {
+        self.read_as(command, row_limit, query, raw_to_json).await
+    }
+
+    /// [`Self::read`], each document turned into its cell by `render`.
+    async fn read_as(
+        &self,
+        command: &Value,
+        row_limit: u32,
+        query: &SchemaQuery<'_>,
+        render: Render,
+    ) -> Result<ExecResult, ExecError> {
         let command = command.to_string();
-        self.execute(ExecQuery {
+        let query = ExecQuery {
             sql: &command,
             binds: &[],
             statement_timeout_ms: query.statement_timeout_ms,
@@ -223,8 +228,8 @@ impl MongoAdapter {
             access: Access::ReadOnly,
             dry_run: false,
             request_id: query.request_id,
-        })
-        .await
+        };
+        self.run(&query, render).await
     }
 }
 

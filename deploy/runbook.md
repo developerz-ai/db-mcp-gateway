@@ -18,7 +18,9 @@ Every agent-facing error carries a `request_id`; it matches `audit_calls.request
 
 ### GatewayAuditUnavailable
 
-**Means.** Tool calls were answered `audit_unavailable`: the state DB refused the intent row or the completion row. Audit is synchronous (MUST #4), so agents are getting no answers. Severity critical. It keeps firing for 15m after the last refusal: it reads `audit_last_failure_timestamp{kind="write"}`, which the gateway stamps on every refusal, so a refusal before Prometheus first saw the pod (which `increase()` cannot see) still fires, as long as that scrape comes within the 15m. A stamp from a fast gateway clock never extends that: over 60 s in the future it is ignored, and one already visible 15m ago is dropped; a clock more than 15m off leaves only the 5m `increase()` clause. Covers MCP tool calls only: an admin API request refused because its `permissions_audit` write failed (also `audit_unavailable`, HTTP 503) neither counts nor stamps here.
+**Means.** Tool calls were answered `audit_unavailable`: the state DB refused the intent row or the completion row. Audit is synchronous (MUST #4), so agents are getting no answers. Severity critical. It keeps firing for 15m after a replica's last refusal: that replica holds `audit_failure_recent{kind="write"}` at 1 for that long, timed on its monotonic clock, so a refusal before Prometheus first saw the pod (which `increase()` cannot see) still fires when the first scrape comes within the 15m. No wall clock matters.
+
+**Does not cover.** A failure on a pod that is replaced or restarted before Prometheus scrapes it (the hold lives in the process), or one first scraped after the hold has ended. Admin API requests refused because their `permissions_audit` write failed (also `audit_unavailable`, HTTP 503): they neither count nor set the gauge.
 
 **First checks.**
 - `/readyz` on each replica (`503` = the state DB does not answer `SELECT 1` in 2 s).
@@ -38,7 +40,7 @@ Every agent-facing error carries a `request_id`; it matches `audit_calls.request
 
 ### GatewayAuditFallbackFailures
 
-**Means.** `audit_fallback_failures_total` rose, or `audit_last_failure_timestamp{kind="fallback"}` is under 30m old: an agent disconnected mid-call and the drop-path audit write failed. The call is recorded only once the reaper marks its intent `abandoned`. Like [GatewayAuditUnavailable](#gatewayauditunavailable), the stamp makes a failure before a pod's first scrape fire too; it resolves 30m after the last failure.
+**Means.** `audit_fallback_failures_total` rose, or `audit_failure_recent{kind="fallback"}` is 1: an agent disconnected mid-call and the drop-path audit write failed. The call is recorded only once the reaper marks its intent `abandoned`. The gauge holds for 30m after a replica's last such failure; what it does not cover is under [GatewayAuditUnavailable](#gatewayauditunavailable).
 
 **First checks.** Same as [GatewayAuditUnavailable](#gatewayauditunavailable) — the state DB was unreachable when the disconnect happened. Check that [GatewayAuditReaperStale](#gatewayauditreaperstale) is not also firing.
 
