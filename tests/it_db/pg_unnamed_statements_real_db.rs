@@ -462,7 +462,7 @@ async fn a_schema_change_waits_for_a_running_read() {
             });
         });
         shape.assert_answer(found, at - 1, &sql);
-        let sql = shape.sql(&table, "true");
+        // The same text: a plan kept by it would be stale now.
         let next = adapter.execute_with_params(read(&sql), &shape.params);
         shape.assert_answer(next.await, at, &sql);
     }
@@ -1196,15 +1196,21 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
     // A timeout, until one came in the statement itself, not before it.
     let timed_out = "SELECT pg_sleep(60), 'timed out'";
     let deadline = Instant::now() + PATIENCE;
-    while !wire.parsed(timed_out) {
+    loop {
         assert!(Instant::now() < deadline, "never timed out in the sleep");
         let slow = ExecQuery {
-            statement_timeout_ms: Some(500),
+            statement_timeout_ms: Some(2_000),
             ..read(timed_out)
         };
-        let outcome = a.execute(slow).await;
+        let asleep_by = Instant::now() + Duration::from_secs(2);
+        let seen = sleeping_until(&owner, slow.request_id, asleep_by);
+        let (outcome, seen) = tokio::join!(a.execute(slow), seen);
         assert!(matches!(outcome, Err(ExecError::Timeout)), "{outcome:?}");
+        if seen.is_some() {
+            break;
+        }
     }
+    assert!(wire.parsed(timed_out));
 
     // Every other read operation.
     for detail in [
@@ -1423,6 +1429,17 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
 /// The tag of the backend sleeping for `request_id`, once it is: inside
 /// `pg_sleep`, for the statement's text alone is there from its Parse on.
 async fn sleeping(owner: &sqlx::PgPool, request_id: Uuid, deadline: Instant) -> String {
+    sleeping_until(owner, request_id, deadline)
+        .await
+        .unwrap_or_else(|| panic!("{request_id} never slept"))
+}
+
+/// [`sleeping`], or `None` once `deadline` passed without it.
+async fn sleeping_until(
+    owner: &sqlx::PgPool,
+    request_id: Uuid,
+    deadline: Instant,
+) -> Option<String> {
     loop {
         let tag: Option<String> = sqlx::query_scalar(
             "SELECT application_name FROM pg_stat_activity WHERE state = 'active' \
@@ -1433,10 +1450,9 @@ async fn sleeping(owner: &sqlx::PgPool, request_id: Uuid, deadline: Instant) -> 
         .fetch_optional(owner)
         .await
         .expect("pg_stat_activity");
-        if let Some(tag) = tag {
+        if tag.is_some() || Instant::now() >= deadline {
             return tag;
         }
-        assert!(Instant::now() < deadline, "{request_id} never slept");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
