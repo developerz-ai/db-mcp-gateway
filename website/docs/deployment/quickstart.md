@@ -344,7 +344,7 @@ Every variable below is one the gateway refuses to boot without (or, for `OIDC_R
 # docker-compose.yml
 services:
   gateway:
-    image: ghcr.io/developerz-ai/db-mcp-gateway:2.4.0   # pin a release
+    image: ghcr.io/developerz-ai/db-mcp-gateway:2.4.1   # pin a release
     ports: ["8443:8443"]
     environment:
       DB_MCP_GATEWAY_CONFIG: /etc/gateway/config.yml
