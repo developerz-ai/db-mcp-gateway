@@ -53,10 +53,6 @@ spec:
               value: "0.0.0.0:8443"
             - name: METRICS_BIND
               value: "0.0.0.0:9090"
-            # Unset, the runtime starts one per node core: memory under the
-            # limit below must hold that many statement checks at once.
-            - name: TOKIO_WORKER_THREADS
-              value: "4"
             - name: STATE_DB_CONNECT_TIMEOUT_SECONDS
               value: "60"
             - name: STATE_DB_URL

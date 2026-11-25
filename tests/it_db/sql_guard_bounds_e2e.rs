@@ -1,13 +1,13 @@
 //! The statement bounds over HTTP: past one, `forbidden_sql` and its audit
-//! row; at the length cap, an answer and an audit row. Either way the same
-//! gateway serves the next call.
+//! row; at the length cap, the target's own answer and its audit row. Either
+//! way the same gateway serves the next call.
 
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::common::audit::latest_audit;
+use crate::common::audit::calls_for_request;
 use crate::common::gateway::{LoggedInGateway, spawn_logged_in};
 use crate::common::idp::MockUser;
 use crate::common::pg_target::config_yaml;
@@ -40,9 +40,17 @@ async fn boot() -> LoggedInGateway {
     spawn_logged_in(&config_yaml(YAML), user).await
 }
 
-/// The tool result: whether it is an error, and its JSON body.
-async fn call(gateway: &LoggedInGateway, tool: &str, sql: &str) -> (bool, Value) {
-    let response: Value = reqwest::Client::builder()
+/// One tool call's answer: the gateway `request_id` (the `x-request-id`
+/// header, the key of this call's own audit row) and the tool result.
+#[derive(Debug)]
+struct Called {
+    request_id: String,
+    is_error: bool,
+    body: Value,
+}
+
+async fn call(gateway: &LoggedInGateway, tool: &str, sql: &str) -> Called {
+    let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
         .expect("client")
@@ -55,30 +63,45 @@ async fn call(gateway: &LoggedInGateway, tool: &str, sql: &str) -> (bool, Value)
         }))
         .send()
         .await
-        .expect("gateway answers")
-        .json()
-        .await
-        .expect("JSON-RPC body");
+        .expect("gateway answers");
+    let request_id = http.headers()["x-request-id"]
+        .to_str()
+        .expect("x-request-id is text")
+        .to_owned();
+    let response: Value = http.json().await.expect("JSON-RPC body");
     let text = response["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or_else(|| panic!("tool result text: {response}"));
-    (
-        response["result"]["isError"] == true,
-        serde_json::from_str(text).expect("JSON body"),
-    )
+    Called {
+        request_id,
+        is_error: response["result"]["isError"] == true,
+        body: serde_json::from_str(text).expect("JSON body"),
+    }
+}
+
+/// The one audit row of `called`, found by its own `request_id` so an earlier
+/// call's row can never stand in for it, carries `outcome`.
+async fn assert_audited(gateway: &LoggedInGateway, called: &Called, outcome: &str) {
+    let rows = calls_for_request(&gateway.state_db, &called.request_id).await;
+    let outcomes: Vec<_> = rows.iter().map(|(outcome, _)| outcome.as_str()).collect();
+    assert_eq!(outcomes, [outcome], "{}", called.body);
+}
+
+async fn assert_refused(gateway: &LoggedInGateway, called: &Called, code: &str, names: &str) {
+    let body = &called.body;
+    assert!(called.is_error, "{body}");
+    assert_eq!(body["code"], code, "{body}");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(message.contains(names), "{names:?} in {body}");
+    assert_eq!(body["request_id"], called.request_id.as_str(), "{body}");
+    assert_audited(gateway, called, code).await;
 }
 
 async fn assert_still_serving(gateway: &LoggedInGateway) {
-    let (is_error, body) = call(gateway, "run_query", "SELECT 41 + 1 AS n").await;
-    assert!(!is_error, "{body}");
-    let row = latest_audit(
-        &gateway.state_db,
-        &gateway.user_sub,
-        "run_query",
-        "next call",
-    )
-    .await;
-    assert_eq!(row.outcome, "success");
+    let called = call(gateway, "run_query", "SELECT 41 + 1 AS n").await;
+    assert!(!called.is_error, "{}", called.body);
+    assert_eq!(called.body["rows"], json!([[42]]), "{}", called.body);
+    assert_audited(gateway, &called, "success").await;
 }
 
 #[tokio::test]
@@ -89,31 +112,54 @@ async fn a_statement_past_a_bound_is_refused_and_audited_and_the_next_call_runs(
     let selects = vec!["SELECT 1"; 2000].join(" UNION ALL ");
     for (sql, names) in [(joins, "512 joins"), (selects, "1024 SELECTs")] {
         for tool in ["run_query", "explain"] {
-            let (is_error, body) = call(&gateway, tool, &sql).await;
-            assert!(is_error, "{body}");
-            assert_eq!(body["code"], "forbidden_sql", "{body}");
-            let message = body["message"].as_str().unwrap_or_default();
-            assert!(message.contains(names), "{message}");
-            let row = latest_audit(&gateway.state_db, &gateway.user_sub, tool, names).await;
-            assert_eq!(row.outcome, "forbidden_sql");
-            assert_eq!(body["request_id"].as_str(), Some(row.request_id.as_str()));
+            let called = call(&gateway, tool, &sql).await;
+            assert_refused(&gateway, &called, "forbidden_sql", names).await;
             assert_still_serving(&gateway).await;
         }
     }
 }
+
+/// What the target makes of a chain the guard admitted.
+#[derive(Debug, Clone, Copy)]
+enum Target {
+    Answers(bool),
+    /// With this SQLSTATE, never one of the guard's codes.
+    Rejects(&'static str),
+}
+
+/// `(opening, repeated part, the target's decision)`.
+const CHAINS: &[(&str, &str, Target)] = &[
+    ("SELECT true", " AND true", Target::Answers(true)),
+    ("SELECT false", " OR false", Target::Answers(false)),
+    ("SELECT 1", "+1", Target::Rejects("54001")),
+    ("SELECT 'x'", "||'x'", Target::Rejects("54001")),
+    ("SELECT 1", "::int", Target::Rejects("54001")),
+    ("SELECT (ARRAY[1])", "[1]", Target::Rejects("54000")),
+];
 
 /// Long operator chains pass the guard; the target decides.
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn a_chain_at_the_length_cap_is_answered_and_audited_and_the_next_call_runs() {
     let gateway = boot().await;
-    for part in ["+1", "||1", " AND true", "::int", "[1]"] {
-        let sql = format!("SELECT 1{}", part.repeat((CAP - 8) / part.len()));
+    for (opening, part, target) in CHAINS {
+        let links = part.repeat((CAP - opening.len()) / part.len());
+        let mut sql = format!("{opening}{links}");
+        sql.push_str(&" ".repeat(CAP - sql.len()));
         for tool in ["run_query", "explain"] {
-            let (_, body) = call(&gateway, tool, &sql).await;
-            let row = latest_audit(&gateway.state_db, &gateway.user_sub, tool, part).await;
-            if let Some(code) = body["code"].as_str() {
-                assert_eq!(row.outcome, code, "{part:?}: {}", body["message"]);
+            let called = call(&gateway, tool, &sql).await;
+            match target {
+                Target::Answers(value) => {
+                    assert!(!called.is_error, "{part:?} {tool}: {}", called.body);
+                    if tool == "run_query" {
+                        assert_eq!(called.body["rows"], json!([[value]]), "{part:?}");
+                    }
+                    assert_audited(&gateway, &called, "success").await;
+                }
+                Target::Rejects(sqlstate) => {
+                    let names = format!("the target DB rejected the SQL: {sqlstate} ");
+                    assert_refused(&gateway, &called, "syntax_error", &names).await;
+                }
             }
             assert_still_serving(&gateway).await;
         }

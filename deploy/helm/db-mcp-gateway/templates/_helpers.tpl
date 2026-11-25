@@ -55,3 +55,12 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
     {{- toYaml . | nindent 4 }}
   {{- end }}
 {{- end -}}
+
+{{- /* The runtime refuses to start on 0 or a non-number. */ -}}
+{{- define "db-mcp-gateway.workerThreads" -}}
+{{- $n := .Values.workerThreads -}}
+{{- if not (regexMatch "^[1-9][0-9]{0,2}$" (toString $n)) -}}
+{{- fail "workerThreads must be a whole number from 1 to 999" -}}
+{{- end -}}
+{{- $n -}}
+{{- end }}

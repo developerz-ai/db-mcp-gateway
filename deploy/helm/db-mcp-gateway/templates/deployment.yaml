@@ -69,7 +69,7 @@ spec:
             - name: METRICS_BIND
               value: "0.0.0.0:{{ .Values.metrics.port }}"
             - name: TOKIO_WORKER_THREADS
-              value: "{{ .Values.workerThreads }}"
+              value: {{ include "db-mcp-gateway.workerThreads" . | quote }}
             - name: STATE_DB_CONNECT_TIMEOUT_SECONDS
               value: {{ .Values.stateDb.connectTimeoutSeconds | quote }}
             - name: OIDC_ISSUER

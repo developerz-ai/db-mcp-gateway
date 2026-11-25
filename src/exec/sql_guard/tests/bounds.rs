@@ -1,7 +1,9 @@
-use proptest::prelude::*;
-
 use super::*;
 use crate::exec::sql_guard::bounds::{MAX_JOINS, MAX_PARENS, MAX_SELECTS, MAX_SQL_BYTES};
+
+mod combined;
+mod properties;
+mod timing;
 
 /// A worker thread's stack, as Tokio sizes it.
 const WORKER_STACK: usize = 2 << 20;
@@ -98,35 +100,6 @@ fn every_repetition_at_the_length_cap_gets_an_answer_on_a_worker_stack() {
     }
 }
 
-/// The parser's limits reached together: nested joins up to the bound, then
-/// nested expressions, then a chain over the rest of the length — complete,
-/// and ending in text that does not parse, so the tree is dropped under them.
-#[test]
-fn structures_at_their_bounds_together_get_an_answer() {
-    let calls = [
-        "",
-        "f(",
-        "CASE WHEN ",
-        "EXISTS(SELECT ",
-        "(SELECT * FROM t JOIN f(",
-    ];
-    for (call, link) in calls
-        .into_iter()
-        .flat_map(|c| ["+a", "||a", "::a", "=a"].map(|l| (c, l)))
-    {
-        for depth in [1, 10, 20, 40] {
-            for ending in ["", ") ON a", " nonsense nonsense", " ("] {
-                let opening = format!("{} JOIN f({}a", joins(MAX_JOINS - 64), call.repeat(depth));
-                let room = MAX_SQL_BYTES - opening.len() - ending.len();
-                let sql = format!("{opening}{}{ending}", link.repeat(room / link.len()));
-                on_worker_stack(move || {
-                    let _ = is_read_only(&sql);
-                });
-            }
-        }
-    }
-}
-
 /// A join without a constraint, from a few to the length cap, on a worker
 /// stack: answered up to the bound and refused past it.
 #[test]
@@ -183,48 +156,6 @@ fn nesting_past_the_parser_limit_is_a_parse_error_on_a_worker_stack() {
     }
 }
 
-/// Generous for a loaded machine: the slowest takes about 60 ms optimised.
-/// What it guards against is time that grows faster than the text.
-#[test]
-fn openers_repeated_or_alternating_answer_in_bounded_time() {
-    const OPENERS: &[&str] = &[
-        "(",
-        "f(",
-        "ARRAY[",
-        "CASE ",
-        "CASE WHEN ",
-        "NOT ",
-        "EXISTS(SELECT ",
-        "(SELECT ",
-        "CAST(",
-        "CAST(CASE ",
-        "IF(",
-        "current_time(",
-        "INTERVAL ",
-        "ROW(",
-        "VALUES(",
-        "a IN (",
-        "a[",
-        "a.",
-        "f(a=>",
-        "TRIM(",
-        "LATERAL (",
-        "SELECT * FROM (",
-    ];
-    let pairs = OPENERS
-        .iter()
-        .flat_map(|a| OPENERS.iter().map(move |b| format!("{a}{b}")));
-    for unit in pairs {
-        for n in [12, 24, 48] {
-            let sql = format!("SELECT {}1", unit.repeat(n));
-            let started = std::time::Instant::now();
-            let _ = on_worker_stack(move || is_read_only(&sql));
-            let took = started.elapsed();
-            assert!(took.as_secs() < 5, "{unit:?} x {n}: {took:?}");
-        }
-    }
-}
-
 #[test]
 fn concurrent_statements_at_the_bounds_get_answers() {
     let threads: Vec<_> = (0..16)
@@ -251,7 +182,8 @@ fn selects(n: usize) -> String {
     vec!["SELECT 1"; n].join(" UNION ALL ")
 }
 
-/// Nested options, the one place sqlparser takes more than 50 levels.
+/// Nested options: like nested column definitions, not under the parser's own
+/// limit of 50 levels.
 fn parens(n: usize) -> String {
     format!("CREATE USER a k={}1{}", "(k=".repeat(n), ")".repeat(n))
 }
@@ -341,34 +273,4 @@ fn large_ordinary_statements_stay_admitted() {
         repeat(", (1, 'a')", 5000)
     );
     assert_eq!(check_sql(&insert, Access::ReadWrite), Ok(()));
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
-
-    /// Any mix of the repeated parts, up to the cap, gets an answer.
-    #[test]
-    fn any_mix_of_repetitions_gets_an_answer_on_a_worker_stack(
-        runs in proptest::collection::vec((0..REPEATED.len(), 1usize..6000), 1..6)
-    ) {
-        let mut sql = String::from(REPEATED[runs[0].0].0);
-        for (family, n) in runs {
-            sql.push_str(&REPEATED[family].1.repeat(n));
-        }
-        sql.truncate(MAX_SQL_BYTES);
-        on_worker_stack(move || {
-            let _ = is_read_only(&sql);
-        });
-    }
-
-    /// No arrangement hides a join from the count.
-    #[test]
-    fn joins_over_the_bound_are_refused_however_arranged(
-        extra in 1usize..40,
-        constraint in proptest::sample::select(vec!["", " ON a", " USING (a)", " AS on", ", u", " UNION SELECT 1 FROM t"]),
-    ) {
-        let sql = format!("SELECT 1 FROM t{}", format!(" JOIN t{constraint}").repeat(MAX_JOINS + extra));
-        let refused = matches!(is_read_only(&sql), Err(GuardError::TooComplex { .. }));
-        prop_assert!(refused, "admitted: {constraint:?}");
-    }
 }
