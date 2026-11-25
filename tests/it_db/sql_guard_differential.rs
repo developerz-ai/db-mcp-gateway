@@ -263,6 +263,7 @@ fn columns_the_guard_reads(sql: &str) -> Option<Vec<Option<String>>> {
     let column = |item: &SelectItem| match item {
         SelectItem::ExprWithAlias { alias, .. } => Some(Some(folded(alias))),
         SelectItem::UnnamedExpr(Expr::Identifier(ident)) => Some(Some(folded(ident))),
+        SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => Some(parts.last().map(folded)),
         SelectItem::UnnamedExpr(_) => Some(None),
         _ => None,
     };
@@ -270,10 +271,20 @@ fn columns_the_guard_reads(sql: &str) -> Option<Vec<Option<String>>> {
 }
 
 /// The columns the target describes, without executing; `None` when it
-/// rejects the text.
+/// rejects the text. Any other failure is the test's.
 async fn columns_postgres_describes(conn: &mut PgConnection, sql: &str) -> Option<Vec<String>> {
     let text = sqlx::AssertSqlSafe(sql.to_owned()).into_sql_str();
-    let statement = conn.prepare(text).await.ok()?;
+    let statement = match conn.prepare(text).await {
+        Ok(statement) => statement,
+        Err(sqlx::Error::Database(err))
+            if err
+                .code()
+                .is_some_and(|c| ["42", "22", "0A"].contains(&&c[..2])) =>
+        {
+            return None;
+        }
+        Err(err) => panic!("describing {sql:?}: {err}"),
+    };
     let names = statement.columns().iter().map(|c| c.name().to_owned());
     Some(names.collect())
 }

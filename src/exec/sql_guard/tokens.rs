@@ -86,13 +86,37 @@ fn before_qualified(tokens: &[Token<'_>], mut at: usize) -> Option<usize> {
     at.checked_sub(1)
 }
 
+/// The `FOR` at `at` stands directly in the parentheses of `substring(…)` or
+/// `overlay(…)`, where it takes a length. A subquery there has its own.
+fn in_length_syntax(tokens: &[Token<'_>], at: usize) -> bool {
+    let mut closed = 0usize;
+    for i in (0..at).rev() {
+        let Token::Symbols(run) = &tokens[i] else {
+            continue;
+        };
+        for (position, symbol) in run.bytes().enumerate().rev() {
+            match symbol {
+                b')' => closed += 1,
+                b'(' if closed > 0 => closed -= 1,
+                // Only a run's first symbol follows a word.
+                b'(' => {
+                    let word = i.checked_sub(1).filter(|_| position == 0);
+                    return is_any(tokens, word, &["SUBSTRING", "OVERLAY"]);
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 /// A locking clause, or an `INTO` that is neither `INSERT INTO` nor a label.
 fn check_clause(tokens: &[Token<'_>], at: usize) -> Result<(), GuardError> {
     let next = |n: usize, keywords: &[&str]| is_any(tokens, Some(at + n), keywords);
     let locks = next(1, &["UPDATE", "SHARE"])
         || (next(1, &["NO"]) && next(2, &["KEY"]))
         || (next(1, &["KEY"]) && next(2, &["SHARE"]));
-    if tokens[at].is("FOR") && locks {
+    if tokens[at].is("FOR") && locks && !in_length_syntax(tokens, at) {
         return Err(GuardError::Locking);
     }
     let before = at.checked_sub(1);

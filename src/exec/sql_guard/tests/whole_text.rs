@@ -66,6 +66,18 @@ fn clauses_keep_their_meaning_after_a_label() {
         ("SELECT a AND FOR UPDATE", GuardError::Locking),
         ("SELECT interval FOR SHARE", GuardError::Locking),
         ("SELECT a AND FOR SHARE", GuardError::Locking),
+        (
+            "SELECT substring(a FOR update) FROM t FOR UPDATE",
+            GuardError::Locking,
+        ),
+        (
+            "SELECT substring((SELECT a FROM t FOR UPDATE) FROM 1)",
+            GuardError::Locking,
+        ),
+        (
+            "SELECT substring(a FOR 1), (SELECT a FROM t FOR SHARE)",
+            GuardError::Locking,
+        ),
         ("SELECT interval INTO t2 FROM t", GuardError::SelectInto),
         ("SELECT a OR INTO t2", GuardError::SelectInto),
     ] {
@@ -160,6 +172,9 @@ fn labels_aliases_and_columns_stay_admitted() {
         "SELECT treat, t.treat FROM t",
         "SELECT substring(a FROM 1 FOR 2), overlay(a PLACING b FROM 1 FOR 2) FROM t",
         "SELECT substring(a FOR 2) FROM t",
+        "SELECT substring(a FOR update) FROM t",
+        "SELECT SUBSTRING((a) FROM f(1, (2)) FOR share + 1) FROM t",
+        "SELECT overlay(a PLACING b FROM 1 FOR update) FROM t",
         "SELECT a AS into, t.into FROM t",
         "SELECT a AS for, key, share, update FROM t",
         "SELECT 'x END, pg_notify(1)', $$ FOR UPDATE INTO $$ -- END, pg_notify(1)",
