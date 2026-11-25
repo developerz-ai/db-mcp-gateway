@@ -3,7 +3,7 @@
 
 use serde_json::json;
 
-use super::REASON_DESCRIPTION;
+use super::{REASON_DESCRIPTION, RUN_SCOPED_DESCRIPTION};
 use crate::mcp::protocol::{
     DB_ACTIVITY_TOOL, DESCRIBE_SCHEMA_TOOL, GET_QUERY_HISTORY_TOOL, LIST_DATABASES_TOOL,
     LIST_SERVERS_TOOL, TABLE_STATS_TOOL, Tool, ToolAnnotations, WHOAMI_TOOL,
@@ -164,7 +164,9 @@ pub(super) fn db_activity() -> Tool {
             "properties": {
                 "server":   { "type": "string" },
                 "database": { "type": "string" },
-                "reason":   { "type": "string", "description": REASON_DESCRIPTION }
+                "reason":   { "type": "string", "description": REASON_DESCRIPTION },
+                "run_scoped": { "type": "boolean", "default": false,
+                                "description": RUN_SCOPED_DESCRIPTION }
             },
             "required": ["server", "database"],
             "additionalProperties": false

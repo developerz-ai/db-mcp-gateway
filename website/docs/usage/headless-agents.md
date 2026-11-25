@@ -87,6 +87,18 @@ A read-tier token cannot write even if the SQL guard had a bug: its statements n
 
 `db_activity` lists what the gateway is running for *you* on a database (`pid`, `request_id`, `state`, `wait_event`, `running_ms`). `cancel_query` with one of those `request_id`s stops it; the stopped call answers `cancelled`. You can only see and cancel your own token's requests.
 
+With `x-dbmcp-run-id` both cover only that run; without it, every run that shares the token. Pass `run_scoped: true` when the call must stay within your run:
+
+```json
+{"name": "cancel_query", "arguments": {
+  "server": "prod", "database": "app",
+  "request_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7", "run_scoped": true}}
+```
+
+- The gateway answers only if the call carries the run header; otherwise it refuses with `invalid_arguments` (`-32602`) and lists or cancels nothing. An SSO session is always refused.
+- A gateway too old to know the argument refuses it the same way, so send it without checking versions. Treat the refusal as final: do not retry without `run_scoped`.
+- The run id is a claim, so this is a filter, not isolation. Runs that must not reach each other's statements need separate service accounts.
+
 ## See also
 
 - [Other MCP-aware agents](other-agents.md) — client config shapes

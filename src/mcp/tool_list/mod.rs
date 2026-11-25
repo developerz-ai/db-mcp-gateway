@@ -10,6 +10,11 @@ use super::protocol::ToolsListResult;
 
 const REASON_DESCRIPTION: &str =
     "Why you are making this call; required when the grant sets require_reason.";
+/// `db_activity` and `cancel_query`.
+const RUN_SCOPED_DESCRIPTION: &str = "Service accounts only: true refuses the call \
+                                      (invalid_arguments) unless it carries x-dbmcp-run-id, so \
+                                      it covers that run's statements only. The run id is \
+                                      unverified: a filter, not isolation.";
 
 impl ToolsListResult {
     pub(super) fn build() -> Self {

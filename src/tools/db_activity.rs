@@ -6,8 +6,9 @@
 //! backends; this tool then keeps only the caller's OWN requests (those whose
 //! intent row carries the caller's identity), so one identity never sees
 //! another's activity. A service-token call that names its run
-//! (`x-dbmcp-run-id`) sees only that run's requests. No query text: the caller's statements are in its
-//! audit rows and `get_query_history`.
+//! (`x-dbmcp-run-id`) sees only that run's requests; `run_scoped: true` refuses
+//! a call that is not narrowed that way. No query text: the caller's statements
+//! are in its audit rows and `get_query_history`.
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -22,11 +23,13 @@ use crate::mcp::jsonrpc::Response;
 use super::ToolCtx;
 use super::args::parse_arguments;
 use super::audit_dispatch::{
-    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, error_outcome, outcome_from_exec_error,
-    reject_arguments, run_audited,
+    AuditHeader, Outcome, OutcomeCode, ToolErrorMessages, audit_outcome, error_outcome,
+    invalid_arguments, outcome_from_exec_error, reject_arguments, run_audited,
 };
 use super::tabular::tabular_outcome;
-use super::target::{Target, ensure_reason, forbidden, record_intent, resolve_target, run_scope};
+use super::target::{
+    Target, ensure_reason, ensure_run_scoped, forbidden, record_intent, resolve_target, run_scope,
+};
 
 const TOOL_NAME: &str = super::DB_ACTIVITY;
 const ERROR_MESSAGES: ToolErrorMessages = ToolErrorMessages {
@@ -45,6 +48,10 @@ pub struct Arguments {
     pub database: String,
     #[serde(default)]
     pub reason: Option<String>,
+    /// Answer only when the call is narrowed to the caller's run
+    /// ([`run_scope`]); refuse it otherwise.
+    #[serde(default)]
+    pub run_scoped: bool,
 }
 
 pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Response {
@@ -60,6 +67,10 @@ pub async fn run(ctx: ToolCtx<'_>, id: Value, arguments: Option<Value>) -> Respo
         reason: args.reason.as_deref(),
         db_type: super::db_type_for_server(ctx.config, &args.server),
     };
+    if let Err(message) = ensure_run_scoped(args.run_scoped, run_scope(ctx)) {
+        let outcome = invalid_arguments(id.clone(), message);
+        return audit_outcome(ctx, id, header, outcome).await;
+    }
     let args = &args;
     run_audited(ctx, id, header, |id, grants| async move {
         compute_outcome(ctx, id, &grants, &header, args).await

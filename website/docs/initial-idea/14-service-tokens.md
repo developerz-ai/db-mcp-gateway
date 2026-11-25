@@ -110,6 +110,25 @@ not *which run* or *for whom*. Two request headers carry that:
   the call keeps the account-wide view (refused instead under
   `require_upstream`). The run id only narrows the caller's own requests; it
   never reaches past the `service:<name>` identity ([03](03-mcp-tools.md)).
+- **`run_scoped: true` fails closed.** Without the header the two tools
+  answer for the whole account, so a client whose header was lost (a proxy
+  strips it, a bug drops it) would list or cancel other runs' statements
+  without noticing. `run_scoped: true` on `db_activity` / `cancel_query`
+  refuses that call (`invalid_arguments`, audited, nothing listed or
+  cancelled); SSO sessions, which have no run, are always refused. It is a
+  precondition on the unverified run id, checks only that one was claimed, and
+  never widens an answer ([03](03-mcp-tools.md#run_scoped)). `require_upstream`
+  is the operator's version for every tool and is checked first; the argument
+  is the client's own, per call, and needs only the run id.
+- **`run_scoped` across versions.** Send `run_scoped: true` together with the
+  run header on every call that must stay within the run. A gateway that
+  predates the argument rejects it as an unknown field — the same
+  `invalid_arguments` (`-32602`), also before any target call — so one request
+  gives one answer: scoped, or nothing happened. No version check is needed,
+  and none would be safe during a rolling upgrade, when the replica that
+  answered `tools/list` need not be the one that serves the call. On the
+  refusal do not retry without the argument: run scoping itself only exists
+  from 2.5.0, and an older gateway ignores the run header on these two tools.
 - **This is a filter, not isolation.** The gateway does not verify the run
   id: whoever holds the bearer can claim another run's id, or omit the header
   where it is optional. It keeps well-behaved runs out of each other's way.
