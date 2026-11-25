@@ -12,13 +12,21 @@ type Held = (String, SyncSender<()>, Receiver<()>);
 
 static HELD: Mutex<Vec<Held>> = Mutex::new(Vec::new());
 
-/// A hold on the next guarded statement off the worker that contains
-/// `marker`. Dropping it lets the statement go.
+/// A hold on the next guarded statement that contains `marker`. Dropping it
+/// lets the statement go, or forgets the marker if none came.
 #[derive(Debug)]
 pub struct Hold {
-    /// Receives once the statement is held.
+    /// Receives once the statement is held: its parse has started.
     pub entered: Receiver<()>,
+    marker: String,
     _release: SyncSender<()>,
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let mut list = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+        list.retain(|(marker, ..)| *marker != self.marker);
+    }
 }
 
 pub fn hold(marker: &str) -> Hold {
@@ -28,6 +36,7 @@ pub fn hold(marker: &str) -> Hold {
     list.push((marker.to_owned(), entered, released));
     Hold {
         entered: held,
+        marker: marker.to_owned(),
         _release: release,
     }
 }

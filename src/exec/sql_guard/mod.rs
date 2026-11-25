@@ -95,7 +95,8 @@ pub fn is_read_only(sql: &str) -> Result<(), GuardError> {
 
 /// SQL text that passed the guard, plus the access the statement itself
 /// needs: [`Access::ReadOnly`] for a `SELECT`, [`Access::ReadWrite`] for a
-/// data write. [`GuardedSql::parse`] is the only constructor, so holding one
+/// data write. [`GuardedSql::parse_async`] and [`GuardedSql::parse`] are the
+/// only constructors, so holding one
 /// proves the guard already ran — the exec layer's `explain` takes this
 /// instead of a bare `&str`, and picks the role and the `ANALYZE` rule from
 /// [`GuardedSql::required_access`].
@@ -107,7 +108,16 @@ pub struct GuardedSql<'a> {
 
 impl<'a> GuardedSql<'a> {
     /// Guard `sql` at the caller's `access` (its grant). A `query_read`
-    /// caller can only ever obtain a read statement.
+    /// caller can only ever obtain a read statement. On the async runtime, a
+    /// long statement is guarded off its worker, in turn with the others.
+    pub async fn parse_async(sql: &'a str, access: Access) -> Result<Self, GuardError> {
+        check_length(sql)?;
+        let required = off_the_worker(sql.len(), || guard_here(sql, access)).await?;
+        Ok(Self { sql, required })
+    }
+
+    /// [`GuardedSql::parse_async`] on the calling thread, for a caller that
+    /// is not an async task.
     pub fn parse(sql: &'a str, access: Access) -> Result<Self, GuardError> {
         let required = guard(sql, access)?;
         Ok(Self { sql, required })
@@ -134,14 +144,12 @@ pub fn check_sql(sql: &str, access: Access) -> Result<(), GuardError> {
 /// [`check_sql`], returning the access the admitted statement needs.
 fn guard(sql: &str, access: Access) -> Result<Access, GuardError> {
     check_length(sql)?;
-    off_the_worker(sql.len(), || {
-        #[cfg(any(test, feature = "test-support"))]
-        hold::wait_if_held(sql);
-        guard_here(sql, access)
-    })
+    guard_here(sql, access)
 }
 
 fn guard_here(sql: &str, access: Access) -> Result<Access, GuardError> {
+    #[cfg(any(test, feature = "test-support"))]
+    hold::wait_if_held(sql);
     let lexemes = check_lexical(sql)?;
     check_bounds(sql, &lexemes)?;
     let required = with_parser_stack(|| inspect(sql, access))?;

@@ -48,28 +48,23 @@ pub(super) fn with_parser_stack<T>(f: impl FnOnce() -> T) -> T {
 const MAX_BYTES_ON_WORKER: usize = 4 * 1024;
 
 /// Run `f` for a statement of `bytes` bytes with the thread's other tasks
-/// moved elsewhere, where there is elsewhere. Not `spawn_blocking`: there is
-/// no point to cancel at, and the statement is borrowed.
+/// moved elsewhere, where there is elsewhere. Not `spawn_blocking`: the
+/// statement is borrowed, and once `f` starts there is nothing to cancel.
 ///
-/// Off the worker, as many run at once as there are cores; the rest wait
-/// their turn. The wait is bounded without a deadline of its own: at most
-/// the gateway's concurrent requests are waiting, each for its turn of under
-/// a second.
-pub(super) fn off_the_worker<T>(bytes: usize, f: impl FnOnce() -> T) -> T {
-    let runtime = Handle::try_current().ok();
-    match runtime {
-        Some(runtime)
-            if runtime.runtime_flavor() == RuntimeFlavor::MultiThread
-                && bytes > MAX_BYTES_ON_WORKER =>
-        {
-            block_in_place(|| {
-                // Never closed, so a permit always comes.
-                let _turn = runtime.block_on(turns().acquire()).ok();
-                f()
-            })
-        }
-        _ => f(),
+/// Off the worker, as many run at once as there are cores. The rest wait
+/// their turn asynchronously, so a caller that goes away while waiting leaves
+/// the queue and its statement is never parsed. The wait needs no deadline of
+/// its own: at most the gateway's concurrent requests wait, each for turns of
+/// under a second.
+pub(super) async fn off_the_worker<T>(bytes: usize, f: impl FnOnce() -> T) -> T {
+    let multi_thread = Handle::try_current()
+        .is_ok_and(|runtime| runtime.runtime_flavor() == RuntimeFlavor::MultiThread);
+    if !multi_thread || bytes <= MAX_BYTES_ON_WORKER {
+        return f();
     }
+    // Never closed, so a permit always comes.
+    let _turn = turns().acquire().await.ok();
+    block_in_place(f)
 }
 
 /// Statements guarded off the worker at once.

@@ -91,15 +91,19 @@ fn a_well_formed_mongo_command_passes_the_edge() {
     }
 }
 
-#[test]
-fn an_unparseable_statement_carries_its_location() {
-    let outcome = *statement_access("SELECT 1\nFROM t WHERE = = 1", false).expect_err("parse");
+#[tokio::test]
+async fn an_unparseable_statement_carries_its_location() {
+    let outcome = *statement_access("SELECT 1\nFROM t WHERE = = 1", false)
+        .await
+        .expect_err("parse");
     assert_eq!(outcome.code, OutcomeCode::ForbiddenSql);
     let Reply::Unparsed(location) = outcome.reply else {
         panic!("no location: {:?}", outcome.reply);
     };
     assert_eq!(location.line, 2);
-    let refused = *statement_access("DROP TABLE t", false).expect_err("DROP");
+    let refused = *statement_access("DROP TABLE t", false)
+        .await
+        .expect_err("DROP");
     assert!(
         matches!(refused.reply, Reply::ToolError),
         "{:?}",
