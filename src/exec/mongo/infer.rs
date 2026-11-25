@@ -41,7 +41,7 @@ pub(super) fn field_list(document: &RawDocument) -> Result<Value, ExecError> {
         left: [LEVEL_FIELDS; MAX_DEPTH],
         truncated: false,
     };
-    list.walk(document, "", 0);
+    list.walk(document, None, 0);
     Ok(json!({ "fields": list.fields, "truncated": list.truncated }))
 }
 
@@ -55,7 +55,7 @@ struct FieldList {
 }
 
 impl FieldList {
-    fn walk(&mut self, document: &RawDocument, prefix: &str, depth: usize) {
+    fn walk(&mut self, document: &RawDocument, parent: Option<&str>, depth: usize) {
         for element in document.iter_elements() {
             let (Ok(element), Some(left)) = (element, self.left[depth].checked_sub(1)) else {
                 self.truncated = true;
@@ -67,16 +67,15 @@ impl FieldList {
                 self.truncated = true;
                 continue;
             }
-            let path = if prefix.is_empty() {
-                key.to_string()
-            } else {
-                format!("{prefix}.{key}")
+            let path = match parent {
+                Some(parent) => format!("{parent}.{key}"),
+                None => key.to_string(),
             };
             let kind = element.element_type();
             self.fields.push((path.clone(), type_name(kind)));
             if kind == ElementType::EmbeddedDocument && depth + 1 < MAX_DEPTH {
                 match element.value() {
-                    Ok(RawBsonRef::Document(child)) => self.walk(child, &path, depth + 1),
+                    Ok(RawBsonRef::Document(child)) => self.walk(child, Some(&path), depth + 1),
                     _ => self.truncated = true,
                 }
             }
@@ -89,7 +88,7 @@ impl FieldList {
 pub(super) fn infer_fields(lists: &[Value], cut: bool) -> Value {
     let mut fields: BTreeMap<&str, Seen<'_>> = BTreeMap::new();
     let mut truncated = cut;
-    for list in lists {
+    for (document, list) in lists.iter().enumerate() {
         truncated |= list["truncated"] != false;
         for field in list["fields"].as_array().into_iter().flatten() {
             let (Some(path), Some(kind)) = (field[0].as_str(), field[1].as_str()) else {
@@ -97,7 +96,12 @@ pub(super) fn infer_fields(lists: &[Value], cut: bool) -> Value {
                 continue;
             };
             let seen = fields.entry(path).or_default();
-            seen.count += 1;
+            // One document can spell a path twice (`a: {b: …}` and a literal
+            // `a.b`, or a name stored twice): it holds the field once.
+            if seen.last_document != Some(document) {
+                seen.last_document = Some(document);
+                seen.count += 1;
+            }
             if !seen.types.contains(&kind) {
                 seen.types.push(kind);
             }
@@ -116,7 +120,9 @@ pub(super) fn infer_fields(lists: &[Value], cut: bool) -> Value {
 struct Seen<'a> {
     /// Distinct type names, in first-seen order.
     types: Vec<&'a str>,
+    /// Documents holding the field.
     count: usize,
+    last_document: Option<usize>,
 }
 
 fn type_name(kind: ElementType) -> &'static str {
@@ -195,6 +201,26 @@ mod tests {
         for value in ["alice@example.com", "Oslo", "65f0c0ffee"] {
             assert!(!inferred.to_string().contains(value), "{value} leaked");
         }
+    }
+
+    #[test]
+    fn a_path_spelled_twice_counts_its_document_once() {
+        let inferred = inferred(&[
+            doc! { "a": { "b": 1 }, "a.b": "x", "": { "x": 1 }, "x": true },
+            doc! { "a.b": 1.5 },
+        ]);
+        let field = |name: &str, types: Value, count: usize| {
+            assert_eq!(
+                inferred["fields"]
+                    .as_array()
+                    .and_then(|fields| fields.iter().find(|f| f["name"] == name)),
+                Some(&json!({ "name": name, "types": types, "count": count })),
+                "{inferred}"
+            );
+        };
+        field("a.b", json!(["int", "string", "double"]), 2);
+        field(".x", json!(["int"]), 1);
+        field("x", json!(["bool"]), 1);
     }
 
     #[test]

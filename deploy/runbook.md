@@ -18,7 +18,12 @@ Every agent-facing error carries a `request_id`; it matches `audit_calls.request
 
 ### GatewayAuditUnavailable
 
-**Means.** Tool calls were answered `audit_unavailable`: the state DB refused the intent row or the completion row. Audit is synchronous (MUST #4), so agents are getting no answers. Severity critical. It keeps firing for 15m after a replica's last refusal: that replica holds `audit_failure_recent{kind="write"}` at 1 for that long, timed on its monotonic clock, so a refusal before Prometheus first saw the pod (which `increase()` cannot see) still fires when the first scrape comes within the 15m. No wall clock matters.
+**Means.** Tool calls were answered `audit_unavailable`: the state DB refused the intent row or the completion row. Audit is synchronous (MUST #4), so agents are getting no answers. Severity critical.
+
+**How long it fires.**
+- *Process still running.* The replica holds `audit_failure_recent{kind="write"}` at 1 for 15m after its last refusal, timed on its monotonic clock (no wall clock matters). A refusal before Prometheus first saw the pod, which `increase()` cannot see, still fires when the first scrape comes within the 15m.
+- *Pod replaced or restarted.* The hold is in memory and goes with the process. What is left is `increase()` over 5m, and only if Prometheus scraped the counter both before and after the refusal: the alert can clear within 5m of the refusal. A resolve right after a rollout or a crash is not proof the state DB recovered; check `/readyz` and the logs.
+- *Image 2.4.1 and older* has no gauge: `increase()`, plus a 5m clause for a pod up under 10m whose first scrape already counts a refusal.
 
 **Does not cover.** A failure on a pod that is replaced or restarted before Prometheus scrapes it (the hold lives in the process), or one first scraped after the hold has ended. Admin API requests refused because their `permissions_audit` write failed (also `audit_unavailable`, HTTP 503): they neither count nor set the gauge.
 
@@ -40,11 +45,19 @@ Every agent-facing error carries a `request_id`; it matches `audit_calls.request
 
 ### GatewayAuditFallbackFailures
 
-**Means.** `audit_fallback_failures_total` rose, or `audit_failure_recent{kind="fallback"}` is 1: an agent disconnected mid-call and the drop-path audit write failed. The call is recorded only once the reaper marks its intent `abandoned`. The gauge holds for 30m after a replica's last such failure; what it does not cover is under [GatewayAuditUnavailable](#gatewayauditunavailable).
+**Means.** `audit_fallback_failures_total` rose, or `audit_failure_recent{kind="fallback"}` is 1: a call's fallback audit write failed. Two ways to get there:
+- the agent disconnected before the completion row landed, and the detached write of the call's row failed;
+- the agent stayed connected, the completion write failed (the call was answered `audit_unavailable`, so [GatewayAuditUnavailable](#gatewayauditunavailable) fires too), and its one detached retry failed as well.
 
-**First checks.** Same as [GatewayAuditUnavailable](#gatewayauditunavailable) — the state DB was unreachable when the disconnect happened. Check that [GatewayAuditReaperStale](#gatewayauditreaperstale) is not also firing.
+**What is recorded.**
+- *Recoverable:* calls that committed an intent row before reaching a target (`run_query`, `explain`, `describe_schema`, `sample_table`, `table_stats`, `db_activity`, `cancel_query`). Once the state DB is back, the reaper writes an `abandoned` row for each, about 2m20s after the intent at the earliest, with the caller, target, SQL, reason and access. The real outcome, row count and timing are lost; the `audit write failed` log line has the outcome when the completion write was the one that failed.
+- *Not recoverable:* calls with no intent. `list_servers`, `list_databases`, `get_query_history` and `whoami` never commit one; nor does any call that ended before its intent (bad arguments, `forbidden`, `forbidden_sql`, `reason_required`), or whose intent write itself failed. None of these reached a target. No audit row will appear; the gateway's `ERROR` lines for the `request_id` are the only trace.
 
-**Fixes.** Fix the state DB; the reaper closes the rows on its next sweep.
+The gauge holds for 30m after a replica's last such failure and goes with the process; `increase()` looks back 15m. Limits are under [GatewayAuditUnavailable](#gatewayauditunavailable).
+
+**First checks.** Same as [GatewayAuditUnavailable](#gatewayauditunavailable) — the state DB was refusing writes at that moment. Check that [GatewayAuditReaperStale](#gatewayauditreaperstale) is not also firing.
+
+**Fixes.** Fix the state DB; the reaper then closes the calls that have an intent. For the rest, keep the log lines.
 
 ### GatewayAuditAbandoned
 

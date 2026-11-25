@@ -17,9 +17,12 @@ groups:
         # The gauge is 1 until 15m after the last refusal, timed by the gateway
         # on its monotonic clock, so a pod first scraped within those 15m still
         # shows a refusal increase() cannot (a counter born above 0 has none),
-        # and no wall clock matters. increase() keeps firing when a pod that
-        # was scraped is replaced, which drops its gauge.
-        expr: sum(increase(tool_calls{outcome="audit_unavailable"}[5m])) > 0 or max(audit_failure_recent{kind="write"}) > 0
+        # and no wall clock matters. Replacing the pod drops its gauge; then
+        # only increase() is left, for at most 5m after the refusal.
+        # Last clause: replicas without the gauge (image 2.4.1 and older), by
+        # a series non-zero but absent 5m ago from a process up under 10m. Drop
+        # it once no such replica is deployed.
+        expr: sum(increase(tool_calls{outcome="audit_unavailable"}[5m])) > 0 or max(audit_failure_recent{kind="write"}) > 0 or sum((tool_calls{outcome="audit_unavailable"} > 0 unless tool_calls{outcome="audit_unavailable"} offset 5m) and on (job, instance) (time() - process_start_time_seconds < 600) unless on (job, instance) audit_failure_recent{kind="write"}) > 0
         labels:
           severity: critical
         annotations:
@@ -36,13 +39,14 @@ groups:
           description: 'Audit write p95 is {{ $value | humanizeDuration }}. Every response waits on this insert; at 15 s it becomes audit_unavailable.'
           runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditwriteslow
       - alert: GatewayAuditFallbackFailures
-        # As in GatewayAuditUnavailable; this gauge holds for 30m.
-        expr: sum(increase(audit_fallback_failures_total[15m])) > 0 or max(audit_failure_recent{kind="fallback"}) > 0
+        # As in GatewayAuditUnavailable; this gauge holds for 30m, increase()
+        # and the clause for replicas without the gauge look back 15m.
+        expr: sum(increase(audit_fallback_failures_total[15m])) > 0 or max(audit_failure_recent{kind="fallback"}) > 0 or sum((audit_fallback_failures_total > 0 unless audit_fallback_failures_total offset 15m) and on (job, instance) (time() - process_start_time_seconds < 1200) unless on (job, instance) audit_failure_recent{kind="fallback"}) > 0
         labels:
           severity: warning
         annotations:
-          summary: Disconnect-path audit writes failed.
-          description: 'Disconnect-path audit writes failed in the last 30m; those calls are recorded only once the reaper marks them abandoned.'
+          summary: Fallback audit writes failed.
+          description: 'Fallback audit writes (after a disconnect, or a failed completion write) failed in the last 30m. The reaper records those calls that committed an intent as abandoned; the others have no audit row.'
           runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditfallbackfailures
       - alert: GatewayAuditAbandoned
         expr: sum(increase(audit_abandoned_total[15m])) > 0

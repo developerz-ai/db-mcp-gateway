@@ -3,7 +3,8 @@
 # after a failure (`audit_failure_recent`), so a failure before a pod's first
 # scrape shows while the hold lasts; they clear with the gauge, stay quiet on a
 # flat 0, on a long-lived pod's old count after a scrape outage, and after a
-# restart drops the hold. The reaper and pruner staleness alerts are per
+# restart drops the hold. A replica without the gauge keeps the older
+# first-scrape clause. The reaper and pruner staleness alerts are per
 # deployment, even for two releases in one job.
 rule_files:
   - rules.yaml
@@ -71,16 +72,16 @@ tests:
         exp_alerts:
           - exp_labels: { severity: warning }
             exp_annotations:
-              summary: Disconnect-path audit writes failed.
-              description: 'Disconnect-path audit writes failed in the last 30m; those calls are recorded only once the reaper marks them abandoned.'
+              summary: Fallback audit writes failed.
+              description: 'Fallback audit writes (after a disconnect, or a failed completion write) failed in the last 30m. The reaper records those calls that committed an intent as abandoned; the others have no audit row.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditfallbackfailures
       - eval_time: 39m
         alertname: GatewayAuditFallbackFailures
         exp_alerts:
           - exp_labels: { severity: warning }
             exp_annotations:
-              summary: Disconnect-path audit writes failed.
-              description: 'Disconnect-path audit writes failed in the last 30m; those calls are recorded only once the reaper marks them abandoned.'
+              summary: Fallback audit writes failed.
+              description: 'Fallback audit writes (after a disconnect, or a failed completion write) failed in the last 30m. The reaper records those calls that committed an intent as abandoned; the others have no audit row.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditfallbackfailures
       - eval_time: 40m
         alertname: GatewayAuditFallbackFailures
@@ -124,8 +125,8 @@ tests:
         exp_alerts:
           - exp_labels: { severity: warning }
             exp_annotations:
-              summary: Disconnect-path audit writes failed.
-              description: 'Disconnect-path audit writes failed in the last 30m; those calls are recorded only once the reaper marks them abandoned.'
+              summary: Fallback audit writes failed.
+              description: 'Fallback audit writes (after a disconnect, or a failed completion write) failed in the last 30m. The reaper records those calls that committed an intent as abandoned; the others have no audit row.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditfallbackfailures
       - eval_time: 40m
         alertname: GatewayAuditFallbackFailures
@@ -198,16 +199,16 @@ tests:
         exp_alerts:
           - exp_labels: { severity: warning }
             exp_annotations:
-              summary: Disconnect-path audit writes failed.
-              description: 'Disconnect-path audit writes failed in the last 30m; those calls are recorded only once the reaper marks them abandoned.'
+              summary: Fallback audit writes failed.
+              description: 'Fallback audit writes (after a disconnect, or a failed completion write) failed in the last 30m. The reaper records those calls that committed an intent as abandoned; the others have no audit row.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditfallbackfailures
       - eval_time: 39m
         alertname: GatewayAuditFallbackFailures
         exp_alerts:
           - exp_labels: { severity: warning }
             exp_annotations:
-              summary: Disconnect-path audit writes failed.
-              description: 'Disconnect-path audit writes failed in the last 30m; those calls are recorded only once the reaper marks them abandoned.'
+              summary: Fallback audit writes failed.
+              description: 'Fallback audit writes (after a disconnect, or a failed completion write) failed in the last 30m. The reaper records those calls that committed an intent as abandoned; the others have no audit row.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditfallbackfailures
       - eval_time: 40m
         alertname: GatewayAuditFallbackFailures
@@ -241,8 +242,8 @@ tests:
         exp_alerts:
           - exp_labels: { severity: warning }
             exp_annotations:
-              summary: Disconnect-path audit writes failed.
-              description: 'Disconnect-path audit writes failed in the last 30m; those calls are recorded only once the reaper marks them abandoned.'
+              summary: Fallback audit writes failed.
+              description: 'Fallback audit writes (after a disconnect, or a failed completion write) failed in the last 30m. The reaper records those calls that committed an intent as abandoned; the others have no audit row.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditfallbackfailures
       - eval_time: 26m
         alertname: GatewayAuditFallbackFailures
@@ -309,8 +310,8 @@ tests:
         exp_alerts:
           - exp_labels: { severity: warning }
             exp_annotations:
-              summary: Disconnect-path audit writes failed.
-              description: 'Disconnect-path audit writes failed in the last 30m; those calls are recorded only once the reaper marks them abandoned.'
+              summary: Fallback audit writes failed.
+              description: 'Fallback audit writes (after a disconnect, or a failed completion write) failed in the last 30m. The reaper records those calls that committed an intent as abandoned; the others have no audit row.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditfallbackfailures
       - eval_time: 28m
         alertname: GatewayAuditFallbackFailures
@@ -334,6 +335,231 @@ tests:
         alertname: GatewayAuditUnavailable
         exp_alerts: []
       - eval_time: 32m
+        alertname: GatewayAuditFallbackFailures
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      # A replica without the gauge (image 2.4.1 and older), booted at 2m, first
+      # scraped at 3m already counting a failure: fires for the counter lookback.
+      - series: 'tool_calls{tool="run_query",outcome="audit_unavailable",access="read",job="gw",instance="old"}'
+        values: '_x3 1x40'
+      - series: 'audit_fallback_failures_total{job="gw",instance="old"}'
+        values: '_x3 1x40'
+      - series: 'process_start_time_seconds{job="gw",instance="old"}'
+        values: '_x3 120x40'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: GatewayAuditUnavailable
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: GatewayAuditUnavailable
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations:
+              summary: Tool calls refused because the audit store refused a write.
+              description: 'Tool calls were answered audit_unavailable in the last 15m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
+      - eval_time: 7m
+        alertname: GatewayAuditUnavailable
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations:
+              summary: Tool calls refused because the audit store refused a write.
+              description: 'Tool calls were answered audit_unavailable in the last 15m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
+      - eval_time: 8m
+        alertname: GatewayAuditUnavailable
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: GatewayAuditFallbackFailures
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: GatewayAuditFallbackFailures
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: Fallback audit writes failed.
+              description: 'Fallback audit writes (after a disconnect, or a failed completion write) failed in the last 30m. The reaper records those calls that committed an intent as abandoned; the others have no audit row.'
+              runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditfallbackfailures
+      - eval_time: 17m
+        alertname: GatewayAuditFallbackFailures
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: Fallback audit writes failed.
+              description: 'Fallback audit writes (after a disconnect, or a failed completion write) failed in the last 30m. The reaper records those calls that committed an intent as abandoned; the others have no audit row.'
+              runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditfallbackfailures
+      - eval_time: 18m
+        alertname: GatewayAuditFallbackFailures
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      # The same replica up long before its first scrape: history, as ever.
+      - series: 'tool_calls{tool="run_query",outcome="audit_unavailable",access="read",job="gw",instance="old"}'
+        values: '_x30 1x20'
+      - series: 'audit_fallback_failures_total{job="gw",instance="old"}'
+        values: '_x30 1x20'
+      - series: 'process_start_time_seconds{job="gw",instance="old"}'
+        values: '_x30 0x20'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: GatewayAuditUnavailable
+        exp_alerts: []
+      - eval_time: 31m
+        alertname: GatewayAuditFallbackFailures
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      # The same counters from a replica with the gauge, at 0: the gauge alone
+      # decides, the old-image clause does not apply to it.
+      - series: 'tool_calls{tool="run_query",outcome="audit_unavailable",access="read",job="gw",instance="new"}'
+        values: '_x3 1x40'
+      - series: 'audit_fallback_failures_total{job="gw",instance="new"}'
+        values: '_x3 1x40'
+      - series: 'process_start_time_seconds{job="gw",instance="new"}'
+        values: '_x3 120x40'
+      - series: 'audit_failure_recent{kind="write",job="gw",instance="new"}'
+        values: '_x3 0x40'
+      - series: 'audit_failure_recent{kind="fallback",job="gw",instance="new"}'
+        values: '_x3 0x40'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: GatewayAuditUnavailable
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: GatewayAuditUnavailable
+        exp_alerts: []
+      - eval_time: 17m
+        alertname: GatewayAuditUnavailable
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: GatewayAuditFallbackFailures
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: GatewayAuditFallbackFailures
+        exp_alerts: []
+      - eval_time: 17m
+        alertname: GatewayAuditFallbackFailures
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      # Mixed fleet, rules before image: an old replica born failing fires beside
+      # a new one at 0 that does not hide it.
+      - series: 'tool_calls{tool="run_query",outcome="audit_unavailable",access="read",job="gw",instance="old"}'
+        values: '_x3 1x40'
+      - series: 'audit_fallback_failures_total{job="gw",instance="old"}'
+        values: '_x3 1x40'
+      - series: 'process_start_time_seconds{job="gw",instance="old"}'
+        values: '_x3 120x40'
+      - series: 'tool_calls{tool="run_query",outcome="audit_unavailable",access="read",job="gw",instance="new"}'
+        values: '_x3 1x40'
+      - series: 'audit_fallback_failures_total{job="gw",instance="new"}'
+        values: '_x3 1x40'
+      - series: 'process_start_time_seconds{job="gw",instance="new"}'
+        values: '_x3 120x40'
+      - series: 'audit_failure_recent{kind="write",job="gw",instance="new"}'
+        values: '_x3 0x40'
+      - series: 'audit_failure_recent{kind="fallback",job="gw",instance="new"}'
+        values: '_x3 0x40'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: GatewayAuditUnavailable
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations:
+              summary: Tool calls refused because the audit store refused a write.
+              description: 'Tool calls were answered audit_unavailable in the last 15m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
+      - eval_time: 7m
+        alertname: GatewayAuditUnavailable
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations:
+              summary: Tool calls refused because the audit store refused a write.
+              description: 'Tool calls were answered audit_unavailable in the last 15m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
+      - eval_time: 8m
+        alertname: GatewayAuditUnavailable
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: GatewayAuditFallbackFailures
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: Fallback audit writes failed.
+              description: 'Fallback audit writes (after a disconnect, or a failed completion write) failed in the last 30m. The reaper records those calls that committed an intent as abandoned; the others have no audit row.'
+              runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditfallbackfailures
+      - eval_time: 17m
+        alertname: GatewayAuditFallbackFailures
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: Fallback audit writes failed.
+              description: 'Fallback audit writes (after a disconnect, or a failed completion write) failed in the last 30m. The reaper records those calls that committed an intent as abandoned; the others have no audit row.'
+              runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditfallbackfailures
+      - eval_time: 18m
+        alertname: GatewayAuditFallbackFailures
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      # Mixed fleet, the other way: the new replica holds its gauge, the old one
+      # is quiet at 0.
+      - series: 'tool_calls{tool="run_query",outcome="audit_unavailable",access="read",job="gw",instance="old"}'
+        values: '0x40'
+      - series: 'audit_fallback_failures_total{job="gw",instance="old"}'
+        values: '0x40'
+      - series: 'process_start_time_seconds{job="gw",instance="old"}'
+        values: '0x40'
+      - series: 'tool_calls{tool="run_query",outcome="audit_unavailable",access="read",job="gw",instance="new"}'
+        values: '_x3 1x40'
+      - series: 'audit_fallback_failures_total{job="gw",instance="new"}'
+        values: '_x3 1x40'
+      - series: 'process_start_time_seconds{job="gw",instance="new"}'
+        values: '_x3 120x40'
+      - series: 'audit_failure_recent{kind="write",job="gw",instance="new"}'
+        values: '_x3 1x11 0x40'
+      - series: 'audit_failure_recent{kind="fallback",job="gw",instance="new"}'
+        values: '_x3 1x26 0x40'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: GatewayAuditUnavailable
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: GatewayAuditUnavailable
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations:
+              summary: Tool calls refused because the audit store refused a write.
+              description: 'Tool calls were answered audit_unavailable in the last 15m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
+      - eval_time: 14m
+        alertname: GatewayAuditUnavailable
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations:
+              summary: Tool calls refused because the audit store refused a write.
+              description: 'Tool calls were answered audit_unavailable in the last 15m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
+      - eval_time: 15m
+        alertname: GatewayAuditUnavailable
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: GatewayAuditFallbackFailures
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: Fallback audit writes failed.
+              description: 'Fallback audit writes (after a disconnect, or a failed completion write) failed in the last 30m. The reaper records those calls that committed an intent as abandoned; the others have no audit row.'
+              runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditfallbackfailures
+      - eval_time: 29m
+        alertname: GatewayAuditFallbackFailures
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: Fallback audit writes failed.
+              description: 'Fallback audit writes (after a disconnect, or a failed completion write) failed in the last 30m. The reaper records those calls that committed an intent as abandoned; the others have no audit row.'
+              runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditfallbackfailures
+      - eval_time: 30m
         alertname: GatewayAuditFallbackFailures
         exp_alerts: []
   - interval: 1m

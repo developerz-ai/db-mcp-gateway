@@ -5,10 +5,12 @@
 
 use std::time::Duration;
 
+use db_mcp_gateway::audit::drain::DetachedTasks;
+use db_mcp_gateway::config::{Database, Server};
 use db_mcp_gateway::exec::{
-    Access, DbAdapter, ExecError, ExecQuery, MongoAdapter, SchemaDetail, SchemaQuery,
+    Access, DbAdapter, ExecError, ExecQuery, MongoAdapter, PoolSizing, SchemaDetail, SchemaQuery,
 };
-use mongodb::bson::doc;
+use mongodb::bson::{Document, RawDocumentBuf, doc};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -16,25 +18,112 @@ use crate::common::audit::latest_audit;
 use crate::common::gateway::{LoggedInGateway, spawn_logged_in};
 use crate::common::idp::MockUser;
 use crate::common::mongo_target::{
-    TARGET_DB, adapter, drop_collection, side_client, unique_collection,
+    TARGET_DB, adapter, database, server, side_client, unique_collection,
 };
 
 const SERVER: &str = "mongo";
 
+/// A collection or a database of a test's own, dropped when the test ends,
+/// by a panic too. Made before anything is seeded into it.
+struct Scratch {
+    name: String,
+    database: String,
+    drop_command: Document,
+}
+
+impl Scratch {
+    /// A uniquely named collection of the shared target database.
+    fn collection(suffix: &str) -> Self {
+        let name = format!("{}{suffix}", unique_collection("mdesc"));
+        Self {
+            database: TARGET_DB.to_string(),
+            drop_command: doc! { "drop": &name },
+            name,
+        }
+    }
+
+    /// A uniquely named database.
+    fn database() -> Self {
+        let id = Uuid::new_v4().simple().to_string();
+        let name = format!("mdesc_{}", &id[..12]);
+        Self {
+            database: name.clone(),
+            drop_command: doc! { "dropDatabase": 1 },
+            name,
+        }
+    }
+
+    async fn insert(&self, documents: Vec<RawDocumentBuf>) {
+        for document in documents {
+            side_client()
+                .database(&self.database)
+                .collection::<RawDocumentBuf>(&self.name)
+                .insert_one(document)
+                .await
+                .expect("seed");
+        }
+    }
+}
+
+impl Drop for Scratch {
+    /// On a runtime of its own thread: the test's may be unwinding.
+    fn drop(&mut self) {
+        let (database, command) = (self.database.clone(), self.drop_command.clone());
+        let dropped = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map(|runtime| {
+                    runtime.block_on(async {
+                        side_client().database(&database).run_command(command).await
+                    })
+                })
+        })
+        .join();
+        if !matches!(dropped, Ok(Ok(Ok(_)))) {
+            eprintln!("left behind: {} in {}", self.name, self.database);
+        }
+    }
+}
+
+fn raw(document: &Document) -> RawDocumentBuf {
+    RawDocumentBuf::try_from(document).expect("encodes")
+}
+
+/// A test that panics after seeding leaves nothing on the shared target.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_panicking_test_drops_its_scratch() {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let panicked = tokio::spawn(async move {
+        let scratch = Scratch::collection("-panic");
+        scratch.insert(vec![raw(&doc! { "a": 1 })]).await;
+        tx.send(scratch.name.clone()).expect("receiver waits");
+        panic!("on purpose");
+    })
+    .await;
+    assert!(panicked.is_err_and(|err| err.is_panic()));
+    let name = rx.await.expect("seeded");
+    let left = side_client()
+        .database(TARGET_DB)
+        .list_collection_names()
+        .filter(doc! { "name": &name })
+        .await
+        .expect("lists");
+    assert!(left.is_empty(), "{left:?}");
+}
+
 /// A collection named with `-` and `.`, holding two documents of different
 /// shapes; one carries a value that must never surface.
-async fn seeded(secret: &str) -> String {
-    let coll = format!("{}-v2.items", unique_collection("mdesc"));
-    side_client()
-        .database(TARGET_DB)
-        .collection(&coll)
-        .insert_many([
-            doc! { "email": secret, "address": { "city": "Oslo" }, "age": 41 },
-            doc! { "email": mongodb::bson::Bson::Null, "tags": ["a"] },
+async fn seeded(secret: &str) -> Scratch {
+    let scratch = Scratch::collection("-v2.items");
+    scratch
+        .insert(vec![
+            raw(&doc! { "email": secret, "address": { "city": "Oslo" }, "age": 41 }),
+            raw(&doc! { "email": mongodb::bson::Bson::Null, "tags": ["a"] }),
         ])
-        .await
-        .expect("seed");
-    coll
+        .await;
+    scratch
 }
 
 fn schema_query(table: &str, detail: SchemaDetail, sample_limit: u32) -> SchemaQuery<'_> {
@@ -55,22 +144,22 @@ fn schema_query(table: &str, detail: SchemaDetail, sample_limit: u32) -> SchemaQ
 async fn full_infers_fields_from_a_bounded_sample_without_values() {
     let a = adapter(SERVER).await;
     let secret = format!("leak-{}@example.com", Uuid::new_v4().simple());
-    let coll = seeded(&secret).await;
+    let scratch = seeded(&secret).await;
+    let coll = scratch.name.as_str();
 
     let full = a
-        .describe_schema(schema_query(&coll, SchemaDetail::Full, 1))
+        .describe_schema(schema_query(coll, SchemaDetail::Full, 1))
         .await;
     let names = a
-        .describe_schema(schema_query(&coll, SchemaDetail::Names, 0))
+        .describe_schema(schema_query(coll, SchemaDetail::Names, 0))
         .await;
     let search = |term: &'static str| SchemaQuery {
         table: None,
         search: Some(term),
-        ..schema_query(&coll, SchemaDetail::Names, 0)
+        ..schema_query(coll, SchemaDetail::Names, 0)
     };
     let found = a.describe_schema(search("V2.ITEMS")).await;
     let missed = a.describe_schema(search("nope-no-such")).await;
-    drop_collection(&side_client(), &coll).await;
 
     let full = full.expect("full");
     assert_eq!(
@@ -92,10 +181,7 @@ async fn full_infers_fields_from_a_bounded_sample_without_values() {
     let names = names.expect("names");
     assert_eq!(names.rows[0].len(), 3, "{:?}", names.rows);
     let found = found.expect("search");
-    assert!(
-        found.rows.iter().any(|r| r[1] == coll.as_str()),
-        "{found:?}"
-    );
+    assert!(found.rows.iter().any(|r| r[1] == coll), "{found:?}");
     assert!(missed.expect("search").rows.is_empty());
 }
 
@@ -104,12 +190,12 @@ async fn full_infers_fields_from_a_bounded_sample_without_values() {
 async fn a_refused_command_names_the_callers_key_never_a_value() {
     let a = adapter(SERVER).await;
     let secret = format!("leak-{}", Uuid::new_v4().simple());
-    let coll = seeded(&secret).await;
+    let scratch = seeded(&secret).await;
+    let coll = scratch.name.as_str();
     let sql = format!(
         r#"{{"aggregate":"{coll}","pipeline":[{{"$match":{{"email":"{secret}"}}}},{{"$project":{{"x":{{"$fooo":"$email"}}}}}}],"cursor":{{}}}}"#
     );
     let result = run(&a, &sql).await;
-    drop_collection(&side_client(), &coll).await;
     let Err(ExecError::Rejected(rejection)) = result else {
         panic!("expected a rejection, got {result:?}");
     };
@@ -228,10 +314,10 @@ async fn describe_full(gateway: &LoggedInGateway, coll: &str) -> Value {
 #[serial_test::parallel(world)]
 async fn full_over_http_samples_only_under_query_read() {
     let secret = format!("leak-{}", Uuid::new_v4().simple());
-    let coll = seeded(&secret).await;
-    let reader = describe_full(&boot("readers").await, &coll).await;
-    let metadata = describe_full(&boot("metadata-only").await, &coll).await;
-    drop_collection(&side_client(), &coll).await;
+    let scratch = seeded(&secret).await;
+    let coll = scratch.name.as_str();
+    let reader = describe_full(&boot("readers").await, coll).await;
+    let metadata = describe_full(&boot("metadata-only").await, coll).await;
 
     let sample = &reader["collections"][0]["sample"];
     assert_eq!(sample["sampled"], 2, "{reader}");
@@ -253,12 +339,11 @@ async fn full_over_http_samples_only_under_query_read() {
 #[serial_test::parallel(world)]
 async fn sampled_types_are_bson_types_not_extended_json_shapes() {
     let a = adapter(SERVER).await;
-    let coll = format!("{}-types", unique_collection("mdesc"));
+    let scratch = Scratch::collection("-types");
+    let coll = scratch.name.as_str();
     let hex = "65f0c0ffee0000000000abcd";
-    side_client()
-        .database(TARGET_DB)
-        .collection(&coll)
-        .insert_one(doc! {
+    scratch
+        .insert(vec![raw(&doc! {
             "mimic": { "$oid": hex },
             "real": mongodb::bson::oid::ObjectId::parse_str(hex).expect("hex"),
             "when": mongodb::bson::DateTime::from_millis(0),
@@ -268,14 +353,12 @@ async fn sampled_types_are_bson_types_not_extended_json_shapes() {
                 subtype: mongodb::bson::spec::BinarySubtype::Generic,
                 bytes: vec![1],
             },
-        })
-        .await
-        .expect("seed");
+        })])
+        .await;
 
     let full = a
-        .describe_schema(schema_query(&coll, SchemaDetail::Full, 5))
+        .describe_schema(schema_query(coll, SchemaDetail::Full, 5))
         .await;
-    drop_collection(&side_client(), &coll).await;
 
     let full = full.expect("full");
     let sample = &full.rows[0][4];
@@ -297,21 +380,87 @@ async fn sampled_types_are_bson_types_not_extended_json_shapes() {
     assert!(!sample.to_string().contains(hex), "{sample}");
 }
 
-/// The `sample` of a collection holding exactly `document`.
-async fn sample_of(document: mongodb::bson::Document) -> Value {
+/// The `sample` of a collection holding exactly `documents`.
+async fn sample_of_all(documents: Vec<RawDocumentBuf>) -> Value {
     let a = adapter(SERVER).await;
-    let coll = format!("{}-wide", unique_collection("mdesc"));
-    side_client()
-        .database(TARGET_DB)
-        .collection(&coll)
-        .insert_one(document)
-        .await
-        .expect("seed");
+    let scratch = Scratch::collection("-sample");
+    scratch.insert(documents).await;
     let full = a
-        .describe_schema(schema_query(&coll, SchemaDetail::Full, 5))
+        .describe_schema(schema_query(&scratch.name, SchemaDetail::Full, 5))
         .await;
-    drop_collection(&side_client(), &coll).await;
     full.expect("full").rows.remove(0).remove(4)
+}
+
+async fn sample_of(document: Document) -> Value {
+    sample_of_all(vec![raw(&document)]).await
+}
+
+fn field<'a>(sample: &'a Value, name: &str) -> &'a Value {
+    sample["fields"]
+        .as_array()
+        .and_then(|fields| fields.iter().find(|f| f["name"] == name))
+        .unwrap_or(&Value::Null)
+}
+
+/// One document spells a path in several ways — a subdocument's field and a
+/// literal dotted name, at any level: it counts once, and every type it
+/// held there is kept. `count` is documents, so it never passes `sampled`.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_document_counts_once_for_a_path_it_spells_twice() {
+    let sample = sample_of_all(vec![
+        raw(&doc! {
+            "mimic": { "$oid": "65f0c0ffee0000000000abcd" },
+            "mimic.$oid": 7,
+            "a": { "b.c": 1, "b": { "c": "x" } },
+            "a.b": { "c": 1.5 },
+            "list": [{ "x": 1 }, { "x": "y" }],
+            "": { "x": 1 },
+            "x": true,
+        }),
+        raw(&doc! { "mimic.$oid": "s" }),
+    ])
+    .await;
+    let is = |name: &str, types: Value, count: u32| {
+        assert_eq!(
+            field(&sample, name),
+            &json!({ "name": name, "types": types, "count": count }),
+            "{sample}"
+        );
+    };
+    is("mimic.$oid", json!(["string", "int"]), 2);
+    is("a.b.c", json!(["int", "string", "double"]), 1);
+    is("a.b", json!(["object"]), 1);
+    // An array's items are not walked.
+    is("list", json!(["array"]), 1);
+    assert_eq!(field(&sample, "list.x"), &Value::Null, "{sample}");
+    // An empty name is a name: its child is not a top-level field.
+    is("", json!(["object"]), 1);
+    is(".x", json!(["int"]), 1);
+    is("x", json!(["bool"]), 1);
+    assert_eq!(sample["truncated"], false);
+}
+
+/// BSON allows a name twice in one document; it is one document's field.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_name_stored_twice_counts_once() {
+    let dup = |element: &[u8]| [element, b"dup\0"].concat();
+    let body = [
+        dup(&[0x10]),
+        vec![1, 0, 0, 0],
+        dup(&[0x0A]),
+        dup(&[0x08]),
+        vec![1],
+    ]
+    .concat();
+    let document = RawDocumentBuf::from_bytes(framed(&body)).expect("valid BSON");
+    let sample = sample_of_all(vec![document]).await;
+    assert_eq!(
+        field(&sample, "dup"),
+        &json!({ "name": "dup", "types": ["int", "null", "bool"], "count": 1 }),
+        "{sample}"
+    );
 }
 
 fn field_names(sample: &Value) -> Vec<&str> {
@@ -329,7 +478,7 @@ fn field_names(sample: &Value) -> Vec<&str> {
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn a_wide_and_deep_document_is_a_truncated_sample_not_an_error() {
-    let level = |child: mongodb::bson::Bson| -> mongodb::bson::Document {
+    let level = |child: mongodb::bson::Bson| -> Document {
         (0..100)
             .map(|i| (format!("{i:02}"), child.clone()))
             .collect()
@@ -349,7 +498,7 @@ async fn a_wide_and_deep_document_is_a_truncated_sample_not_an_error() {
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn a_document_past_the_field_bound_below_the_top_level_is_truncated() {
-    let mut many: mongodb::bson::Document = (0..250)
+    let mut many: Document = (0..250)
         .map(|i| (format!("f{i:03}"), mongodb::bson::Bson::Int32(1)))
         .collect();
     many.insert("a_late", 1);
@@ -360,13 +509,13 @@ async fn a_document_past_the_field_bound_below_the_top_level_is_truncated() {
     assert!(!names.contains(&"a.b.a_late"), "{names:?}");
 }
 
-/// The server reads 201 fields of an object and no more: a later field is
+/// The gateway reads 201 fields of an object and no more: a later field is
 /// not reported even when it sorts first by name, and the sample says it
 /// was cut.
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn a_field_past_the_per_document_bound_is_not_read() {
-    let mut document: mongodb::bson::Document = (0..210)
+    let mut document: Document = (0..210)
         .map(|i| (format!("f{i:03}"), mongodb::bson::Bson::Int32(1)))
         .collect();
     document.insert("a_late", 1);
@@ -396,7 +545,7 @@ fn framed(body: &[u8]) -> Vec<u8> {
 
 /// A document close to 16 MiB of nothing but short distinct field names
 /// (each a `null`), held under `parents`.
-fn widest_document(parents: &[&str]) -> mongodb::bson::RawDocumentBuf {
+fn widest_document(parents: &[&str]) -> RawDocumentBuf {
     const NAME: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     let mut body = Vec::new();
     for i in 0..2_600_000_usize {
@@ -412,7 +561,27 @@ fn widest_document(parents: &[&str]) -> mongodb::bson::RawDocumentBuf {
         let child = framed(&body);
         body = [&[0x03][..], parent.as_bytes(), &[0], &child].concat();
     }
-    mongodb::bson::RawDocumentBuf::from_bytes(framed(&body)).expect("valid BSON")
+    RawDocumentBuf::from_bytes(framed(&body)).expect("valid BSON")
+}
+
+/// An adapter on `name`, a database of the target.
+async fn adapter_of(name: &str) -> MongoAdapter {
+    let database = Database {
+        name: name.to_string(),
+        ..database()
+    };
+    let server = Server {
+        databases: vec![database.clone()],
+        ..server(SERVER)
+    };
+    MongoAdapter::open(
+        &server,
+        &database,
+        PoolSizing::default(),
+        DetachedTasks::new(),
+    )
+    .await
+    .expect("target-mongo reachable; run `bin/dev up`")
 }
 
 /// The widest legal object at each reported level: the sample is cut and
@@ -420,29 +589,30 @@ fn widest_document(parents: &[&str]) -> mongodb::bson::RawDocumentBuf {
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn the_widest_object_at_any_level_is_a_truncated_sample() {
-    let a = adapter(SERVER).await;
-    let db = side_client().database(TARGET_DB);
     let mut wrong = Vec::new();
     for parents in [&[][..], &["w"], &["w", "x"]] {
-        let prefix = unique_collection("mwide");
-        let (wide, plain) = (format!("{prefix}-a"), format!("{prefix}-b"));
-        db.collection::<mongodb::bson::RawDocumentBuf>(&wide)
+        // A database of its own: the listing is capped, so another test's
+        // collections could push these two out of it.
+        let scratch = Scratch::database();
+        let (a, db) = (
+            adapter_of(&scratch.name).await,
+            side_client().database(&scratch.name),
+        );
+        let (wide, plain) = ("wide", "plain");
+        db.collection::<RawDocumentBuf>(wide)
             .insert_one(widest_document(parents))
             .await
             .expect("seed wide");
-        db.collection::<mongodb::bson::Document>(&plain)
+        db.collection::<Document>(plain)
             .insert_one(doc! { "field": 1 })
             .await
             .expect("seed plain");
         let full = a
             .describe_schema(SchemaQuery {
                 table: None,
-                search: Some(&prefix),
-                ..schema_query(&plain, SchemaDetail::Full, 5)
+                ..schema_query(plain, SchemaDetail::Full, 5)
             })
             .await;
-        drop_collection(&side_client(), &wide).await;
-        drop_collection(&side_client(), &plain).await;
 
         let depth = parents.len() + 1;
         let full = match full {
@@ -459,7 +629,7 @@ async fn the_widest_object_at_any_level_is_a_truncated_sample() {
                 .map(|row| row[4].clone())
                 .unwrap_or_default()
         };
-        let (wide, plain) = (sample_of(&wide), sample_of(&plain));
+        let (wide, plain) = (sample_of(wide), sample_of(plain));
         let first = [parents, &["0000"]].concat().join(".");
         if wide["sampled"] != 1
             || wide["truncated"] != true
@@ -479,22 +649,8 @@ async fn the_widest_object_at_any_level_is_a_truncated_sample() {
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn a_sample_past_the_byte_budget_is_cut_and_says_so() {
-    let a = adapter(SERVER).await;
-    let coll = format!("{}-big", unique_collection("mdesc"));
-    let collection = side_client()
-        .database(TARGET_DB)
-        .collection::<mongodb::bson::Document>(&coll);
-    for _ in 0..3 {
-        collection
-            .insert_one(doc! { "blob": "x".repeat(12 * 1024 * 1024) })
-            .await
-            .expect("seed");
-    }
-    let full = a
-        .describe_schema(schema_query(&coll, SchemaDetail::Full, 5))
-        .await;
-    drop_collection(&side_client(), &coll).await;
-    let sample = full.expect("full").rows.remove(0).remove(4);
+    let blob = raw(&doc! { "blob": "x".repeat(12 * 1024 * 1024) });
+    let sample = sample_of_all(vec![blob; 3]).await;
     assert_eq!(sample["sampled"], 2, "{sample}");
     assert_eq!(sample["truncated"], true);
     assert_eq!(field_names(&sample), ["_id", "blob"]);

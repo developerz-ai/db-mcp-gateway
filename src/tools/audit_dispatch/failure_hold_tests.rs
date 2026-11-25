@@ -60,6 +60,41 @@ fn a_new_failure_restarts_the_window_during_and_after_a_hold() {
     assert_eq!(scraped(&failures, third + WRITE_HOLD), (0, 0));
 }
 
+/// A thread paused between reading its clock and marking arrives late with an
+/// older time; the newest failure still sets the window.
+#[test]
+fn a_late_older_mark_never_shortens_the_window() {
+    let failures = AuditFailures::new();
+    let older = Instant::now();
+    let newer = older + Duration::from_secs(60);
+    failures.mark_at(FailedAuditWrite::Write, newer);
+    failures.mark_at(FailedAuditWrite::Write, older);
+    let tick = Duration::from_nanos(1);
+    assert_eq!(scraped(&failures, newer + WRITE_HOLD - tick), (1, 0));
+    assert_eq!(scraped(&failures, newer + WRITE_HOLD), (0, 0));
+}
+
+#[test]
+fn racing_marks_keep_the_newest() {
+    let failures = AuditFailures::new();
+    let start = Instant::now();
+    let newest = start + Duration::from_secs(7_999);
+    std::thread::scope(|scope| {
+        for thread in 0..8 {
+            let failures = &failures;
+            scope.spawn(move || {
+                for step in (0..1_000).rev() {
+                    let at = start + Duration::from_secs(step * 8 + thread);
+                    failures.mark_at(FailedAuditWrite::Write, at);
+                }
+            });
+        }
+    });
+    let tick = Duration::from_nanos(1);
+    assert_eq!(scraped(&failures, newest + WRITE_HOLD - tick), (1, 0));
+    assert_eq!(scraped(&failures, newest + WRITE_HOLD), (0, 0));
+}
+
 /// The only test in this binary that marks the process-wide `write` hold.
 #[test]
 fn only_a_call_answered_audit_unavailable_starts_the_write_hold() {

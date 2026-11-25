@@ -35,6 +35,15 @@ impl Hold {
         }
     }
 
+    /// Keep the newest failure: a thread preempted after reading its clock
+    /// must not put an older one back.
+    fn failed_at(&self, now: Instant) {
+        self.last_failure.rcu(|last| match last {
+            Some(last) if **last >= now => Arc::clone(last),
+            _ => Arc::new(now),
+        });
+    }
+
     fn active_at(&self, now: Instant) -> bool {
         self.last_failure
             .load()
@@ -43,7 +52,7 @@ impl Hold {
     }
 }
 
-/// The last failure of each kind. Marking is one atomic store, safe on the
+/// The last failure of each kind. Marking is lock-free, safe on the
 /// request path; nothing expires it, [`AuditFailures::publish`] reads its age.
 #[derive(Debug)]
 pub struct AuditFailures {
@@ -65,7 +74,7 @@ impl AuditFailures {
     }
 
     fn mark_at(&self, kind: FailedAuditWrite, now: Instant) {
-        self.hold(kind).last_failure.store(Some(Arc::new(now)));
+        self.hold(kind).failed_at(now);
     }
 
     /// Set both gauges to their state now. Run before every scrape renders,
