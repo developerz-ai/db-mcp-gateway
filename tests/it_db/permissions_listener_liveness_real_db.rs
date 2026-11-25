@@ -26,7 +26,7 @@ use db_mcp_gateway::state::permissions::{
     DbType, GrantAction, GrantTarget, PermissionsChange, PermissionsSeed,
 };
 use sqlx::PgPool;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use tracing_subscriber::fmt::MakeWriter;
 use uuid::Uuid;
 
@@ -146,20 +146,20 @@ fn identity(sub: &str) -> Identity {
     }
 }
 
-/// A second replica: its own cache, fed by its own listener on `pool`.
+/// A second replica: its own cache, fed by its own listener.
 pub(crate) struct Replica {
     cache: PermissionsCache,
     pub(crate) flushes: Arc<AtomicUsize>,
     pub(crate) listener: tokio::task::JoinHandle<()>,
 }
 
-pub(crate) fn replica(state: &PgPool, listener_pool: PgPool, liveness: Liveness) -> Replica {
+pub(crate) fn replica(state: &PgPool, listener: PgConnectOptions, liveness: Liveness) -> Replica {
     let repo = Arc::new(PgPermissionsRepo::new(state.clone()));
     let cache = PermissionsCache::new(repo, CACHE_TTL);
     let flushes = Arc::new(AtomicUsize::new(0));
     let listener = tokio::spawn({
         let (cache, flushes) = (cache.clone(), flushes.clone());
-        notify::listen_with(listener_pool, liveness, move |change| {
+        notify::listen_with(listener, liveness, move |change| {
             let (cache, flushes) = (cache.clone(), flushes.clone());
             async move {
                 if change == PermissionsChange::All {
@@ -221,14 +221,6 @@ pub(crate) fn state_options() -> PgConnectOptions {
     PgConnectOptions::from_str(&state_db_url()).expect("STATE_DB_URL parses")
 }
 
-pub(crate) async fn pool_with(options: PgConnectOptions) -> PgPool {
-    PgPoolOptions::new()
-        .max_connections(3)
-        .connect_with(options)
-        .await
-        .expect("state DB up (run `bin/dev up`)")
-}
-
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn revoke_lands_after_the_listener_backend_is_terminated() {
@@ -237,8 +229,11 @@ async fn revoke_lands_after_the_listener_backend_is_terminated() {
     let seeded = seed(&p, "liveness-kill").await;
     // Lets `pg_stat_activity` single out this test's listener backend.
     let app = format!("liveness-{}", Uuid::new_v4().simple());
-    let listener_pool = pool_with(state_options().application_name(&app)).await;
-    let b = replica(&p, listener_pool, Liveness::default());
+    let b = replica(
+        &p,
+        state_options().application_name(&app),
+        Liveness::default(),
+    );
     b.await_flushes(1).await;
     assert_eq!(b.grant_count(&seeded.sub).await, 1);
 
@@ -281,7 +276,7 @@ async fn revoke_lands_after_the_listener_connection_goes_silent() {
         ping_every: Duration::from_millis(250),
         deadline: Duration::from_secs(2),
     };
-    let b = replica(&p, pool_with(via_proxy).await, liveness);
+    let b = replica(&p, via_proxy, liveness);
     b.await_flushes(1).await;
     assert_eq!(b.grant_count(&seeded.sub).await, 1);
 

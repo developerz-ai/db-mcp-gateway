@@ -47,8 +47,12 @@ if report=$(registry pull "oci://$parent/$CHART" --version "$version" -d /work/p
     || { echo "$parent/$CHART:$version is already published with other content" >&2; exit 1; }
   echo "$parent/$CHART:$version is already published with this content" >&2
 else
-  # Absent, or unreadable: then the push below fails as well.
   printf '%s\n' "$report" >&2
+  # Only this line, whole, is the registry's 404 for the manifest itself. Any
+  # other failure (refused, down, a blob it could not read) may hide a chart
+  # already published, which a push would replace.
+  grep -qxF "Error: $parent/$CHART:$version: not found" <<< "$report" \
+    || { echo "cannot tell whether $parent/$CHART:$version is published; not pushing" >&2; exit 1; }
   report=$(registry push "/work/$archive" "oci://$parent") || { printf '%s\n' "$report" >&2; exit 1; }
 fi
 printf '%s\n' "$report" >&2

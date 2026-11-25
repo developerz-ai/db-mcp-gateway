@@ -84,6 +84,13 @@ async fn post_json(url: String, body: Value) -> StatusCode {
         .status()
 }
 
+/// The hold is process-wide, so each test here runs alone (`serial(world)`)
+/// and starts from none: the failure it then sees is its own.
+fn start_without_failures() {
+    audit_failures().reset();
+    assert!(!scrape_shows_a_failed_write());
+}
+
 /// Whether a scrape now would show a recent failed audit write.
 fn scrape_shows_a_failed_write() -> bool {
     let recorder = PrometheusBuilder::new().build_recorder();
@@ -107,8 +114,9 @@ fn repo_and_cache(pool: &PgPool) -> (Arc<dyn PermissionsRepo>, PermissionsCache)
 }
 
 #[tokio::test]
-#[serial_test::parallel(world)]
+#[serial_test::serial(world)]
 async fn audit_write_failure_rolls_back_a_database_create() {
+    start_without_failures();
     let pool = state_pool().await;
     let (repo, cache) = repo_and_cache(&pool);
     // A name no other test registers, so the count below is this test's.
@@ -147,8 +155,9 @@ async fn audit_write_failure_rolls_back_a_database_create() {
 }
 
 #[tokio::test]
-#[serial_test::parallel(world)]
+#[serial_test::serial(world)]
 async fn audit_write_failure_rolls_back_a_grant_create() {
+    start_without_failures();
     let pool = state_pool().await;
     let (repo, cache) = repo_and_cache(&pool);
     let user_sub = format!("grant-rollback-{}", Uuid::new_v4().simple());
@@ -199,8 +208,9 @@ async fn audit_write_failure_rolls_back_a_grant_create() {
 
 /// An audited read whose row cannot be written: no row, no response.
 #[tokio::test]
-#[serial_test::parallel(world)]
+#[serial_test::serial(world)]
 async fn audit_write_failure_refuses_an_audited_read() {
+    start_without_failures();
     let pool = state_pool().await;
     let (repo, _) = repo_and_cache(&pool);
     // Only this pool is closed: the state DB itself stays up for other tests.

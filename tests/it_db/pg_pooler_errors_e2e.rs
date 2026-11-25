@@ -237,20 +237,99 @@ async fn a_commit_the_pooler_answered_is_unknown() {
     let owner = owner().await;
     run(&owner, format!("CREATE TABLE {table} (x int)")).await;
     let sql = format!("UPDATE {table} SET x = 1");
-    for (severity, v, sqlstate) in [("FATAL", true, "58000"), ("FATAL", false, "08P01")] {
+    let mut answers = Vec::new();
+    for (severity, v, sqlstate) in [
+        ("FATAL", true, "58000"),
+        ("FATAL", false, "08P01"),
+        // The server's refusal of the pooler's own login, passed on.
+        ("FATAL", false, "28P01"),
+        ("FATAL", false, "28000"),
+        ("ERROR", true, "28000"),
+        ("FATAL", false, "53300"),
+        ("FATAL", false, "57P01"),
+        // The session ended: not the rollback these codes mean as an `ERROR`.
+        ("FATAL", false, "40001"),
+        ("FATAL", false, "25P03"),
+        ("ERROR", true, "57014"),
+    ] {
         pooler.arm(Refusal {
             to: "COMMIT",
             error: pooler_error(severity, v, sqlstate),
             state: b"T",
         });
-        let (body, outcome, _) = run_query(&gw, &sql, json!({})).await;
+        let answer = run_query(&gw, &sql, json!({})).await;
         assert!(pooler.fired(), "{sqlstate}: never sent");
-        assert_eq!(body["code"], "unavailable", "{sqlstate}: {body}");
-        assert_eq!(body["write"], "unknown", "{sqlstate}: {body}");
-        assert_eq!(body["retryable"], false, "{sqlstate}: {body}");
-        assert_eq!(outcome, "unavailable", "{sqlstate}");
+        answers.push((format!("{severity} {sqlstate}"), answer));
     }
     run(&owner, format!("DROP TABLE {table}")).await;
+    for (label, (body, outcome, audited)) in answers {
+        assert_eq!(body["write"], "unknown", "{label}: {body}");
+        assert_eq!(body["retryable"], false, "{label}: {body}");
+        // A `57014` before the budget ran out is a cancel.
+        let code = if label.ends_with("57014") {
+            "cancelled"
+        } else {
+            "unavailable"
+        };
+        assert_eq!(body["code"], code, "{label}: {body}");
+        assert_eq!(outcome, code, "{label}");
+        for text in [body.to_string(), audited] {
+            assert!(!text.contains("pooler_user_x"), "{label}: {text}");
+        }
+    }
+}
+
+/// The server's own refusal of a `COMMIT`, here a deferred trigger's, rolled
+/// the write back: that much is known, whatever the code. Only `53`, also
+/// raised where the server ran out in the middle, stays unknown.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_commit_the_server_refused_is_not_applied() {
+    let owner = owner().await;
+    let name = format!("dbmcp_refused_{}", Uuid::new_v4().simple());
+    run(
+        &owner,
+        format!(
+            "CREATE TABLE {name} (code text); \
+             CREATE FUNCTION {name}_raise() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+             RAISE EXCEPTION '{POOLER_TEXT}' USING ERRCODE = NEW.code; END $$; \
+             CREATE CONSTRAINT TRIGGER t AFTER INSERT ON {name} \
+             DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION {name}_raise()"
+        ),
+    )
+    .await;
+    let gw = boot(target_port()).await;
+    let mut answers = Vec::new();
+    for (sqlstate, code, write) in [
+        ("23514", "syntax_error", "not_applied"),
+        ("58000", "syntax_error", "not_applied"),
+        ("08P01", "syntax_error", "not_applied"),
+        ("28000", "unavailable", "not_applied"),
+        ("40001", "unavailable", "not_applied"),
+        ("53100", "unavailable", "unknown"),
+    ] {
+        let sql = format!("INSERT INTO {name} VALUES ('{sqlstate}')");
+        let answer = run_query(&gw, &sql, json!({})).await;
+        answers.push((sqlstate, code, write, answer));
+    }
+    let left: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {name}")))
+        .fetch_one(&owner)
+        .await
+        .expect("count");
+    run(
+        &owner,
+        format!("DROP TABLE {name}; DROP FUNCTION {name}_raise()"),
+    )
+    .await;
+    assert_eq!(left, 0, "every one was rolled back");
+    for (sqlstate, code, write, (body, outcome, audited)) in answers {
+        assert_eq!(body["code"], code, "{sqlstate}: {body}");
+        assert_eq!(body["write"], write, "{sqlstate}: {body}");
+        assert_eq!(outcome, code, "{sqlstate}");
+        for text in [body.to_string(), audited] {
+            assert!(!text.contains("pooler_user_x"), "{sqlstate}: {text}");
+        }
+    }
 }
 
 /// The statement's own error keeps its SQLSTATE, whatever the code: a

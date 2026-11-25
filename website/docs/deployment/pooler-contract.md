@@ -58,7 +58,7 @@ Everything above is about target databases. `STATE_DB_URL` may point at a pooler
 
 That warning, repeating, means notifications do not reach this replica: the pooler is in transaction or statement mode, or drops them. The replica then works as it does on a lost connection — the whole grant cache is flushed when the 15 s deadline passes and every 5 s until it resubscribes, so a revoke can take 20 s but never the cache TTL (14 s measured through PgBouncer in transaction mode). Fix the pooler mode, or point `STATE_DB_URL` at Postgres directly.
 
-Size the pooler for `STATE_DB_POOL_SIZE` + 5 server connections per replica: session mode pins one per open client connection.
+Size the pooler for `STATE_DB_POOL_SIZE` + 4 server connections per replica: session mode pins one per open client connection.
 
 ## Sequences declared with `CACHE`
 

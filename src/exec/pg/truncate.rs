@@ -26,17 +26,17 @@ use sqlx::{Connection, PgPool, Postgres, Transaction};
 use super::cancel::{Backend, cancel_backend};
 use super::error::is_query_canceled;
 
-/// Cancel the backend then roll back the (aborted) read transaction, which
-/// the server has answered by the time this returns. Cleanup
-/// outcome is deliberately NOT propagated to the caller: the truncated rows
-/// already collected are the result, and a valid truncated read must not be
-/// turned into a client-visible failure by cleanup noise.
+/// Cancel the backend then roll back the (aborted) read transaction, waiting
+/// for the server's answer. Cleanup outcome is deliberately NOT propagated to
+/// the caller: the truncated rows already collected are the result, and a
+/// valid truncated read must not be turned into a client-visible failure by
+/// cleanup noise.
 ///
 /// A cancel that matches no backend is accepted without a warning —
 /// equivalent to success, and so is the cancelled statement's own error.
 /// Cancellation execution errors, any other error of the statement and
-/// `rollback` errors are logged at `warn` for operator observability but never surfaced
-/// to the client. Contract documented in
+/// `rollback` errors are logged at `warn` for operator observability but never
+/// surfaced to the client. Contract documented in
 /// `website/docs/initial-idea/05-credentials.md`.
 pub(super) async fn cancel_and_rollback(
     mut tx: Transaction<'_, Postgres>,

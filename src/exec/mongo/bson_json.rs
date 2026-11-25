@@ -24,22 +24,36 @@ pub(super) fn raw_to_json(raw: &RawDocument) -> Result<Value, ExecError> {
 pub(super) fn bson_to_json(b: Bson) -> Result<Value, ExecError> {
     match b {
         Bson::Double(value) if !value.is_finite() => Ok(non_finite_double(value)),
-        Bson::Document(doc) => doc
-            .into_iter()
-            .map(|(key, value)| Ok((key, bson_to_json(value)?)))
-            .collect::<Result<Map<_, _>, _>>()
-            .map(Value::Object),
+        Bson::Document(document) => document_to_json(document),
         Bson::Array(items) => items
             .into_iter()
             .map(bson_to_json)
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array),
-        Bson::JavaScriptCodeWithScope(JavaScriptCodeWithScope { code, scope }) => {
-            let scope = bson_to_json(Bson::Document(scope))?;
-            Ok(serde_json::json!({ "$code": code, "$scope": scope }))
-        }
+        Bson::JavaScriptCodeWithScope(code) => code_to_json(code),
         other => serde_json::to_value(&other).map_err(|_| ExecError::Decode),
     }
+}
+
+// The two below are split out of `bson_to_json` so that a nesting level costs
+// the stack only its own kind's frame.
+
+fn document_to_json(document: Document) -> Result<Value, ExecError> {
+    document
+        .into_iter()
+        .map(|(key, value)| Ok((key, bson_to_json(value)?)))
+        .collect::<Result<Map<_, _>, _>>()
+        .map(Value::Object)
+}
+
+/// Both parts are moved in: `json!` would serialize the rendered scope again,
+/// once per nesting level.
+fn code_to_json(code: JavaScriptCodeWithScope) -> Result<Value, ExecError> {
+    let scope = document_to_json(code.scope)?;
+    Ok(Value::Object(Map::from_iter([
+        ("$code".to_owned(), Value::String(code.code)),
+        ("$scope".to_owned(), scope),
+    ])))
 }
 
 /// Extended JSON's spelling of a double JSON has no number for — the same in
@@ -108,6 +122,33 @@ mod tests {
                     "inner": { "$code": "y", "$scope": { "nan": { "$numberDouble": "NaN" }, "n": 1 } },
                 },
             }])
+        );
+    }
+
+    /// 200 levels is the server's default nesting limit, on a worker thread's
+    /// stack and in an unoptimised build.
+    #[test]
+    fn scopes_nested_to_the_servers_limit_render_in_order() {
+        const LEVELS: usize = 200;
+        let rendered = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let nested = (0..LEVELS).fold(doc! { "nan": f64::NAN }, |scope, _| {
+                    doc! { "z": 1, "c": Bson::JavaScriptCodeWithScope(JavaScriptCodeWithScope { code: "x".into(), scope }) }
+                });
+                let mut value = &bson_to_json(Bson::Document(nested)).expect("renders");
+                for _ in 0..LEVELS {
+                    let code = value["c"].as_object().expect("a code object");
+                    assert!(code.keys().eq(["$code", "$scope"]));
+                    value = &code["$scope"];
+                }
+                value.clone()
+            })
+            .expect("spawns")
+            .join();
+        assert_eq!(
+            rendered.expect("the stack holds"),
+            json!({ "nan": { "$numberDouble": "NaN" } })
         );
     }
 

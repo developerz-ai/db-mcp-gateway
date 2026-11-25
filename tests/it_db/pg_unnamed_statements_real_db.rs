@@ -25,6 +25,7 @@ use sqlx::postgres::{PgConnectOptions, PgDatabaseError, PgPoolOptions, PgSslMode
 use sqlx::{ConnectOptions, Connection, PgConnection};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::common::log_capture::BufWriter;
@@ -1482,8 +1483,100 @@ async fn warnings<T>(work: impl Future<Output = T>) -> (T, Vec<String>) {
     (done, own.map(str::to_owned).collect())
 }
 
-/// A read cut off at the row cap ends its transaction itself: the server has
-/// answered the `ROLLBACK` by the time the rows are handed over, whether the
+/// A TCP forwarder to the target that keeps the ReadyForQuery answering a
+/// `ROLLBACK` back until it is let go.
+struct HeldRollback {
+    port: u16,
+    /// The target answered, and its answer is kept back.
+    held: Arc<Notify>,
+    let_go: Arc<Notify>,
+}
+
+impl HeldRollback {
+    async fn start() -> Self {
+        let listener = TcpListener::bind((TARGET_HOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (held, let_go): (Arc<Notify>, Arc<Notify>) = Default::default();
+        let (holds, release) = (held.clone(), let_go.clone());
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                tokio::spawn(Self::serve(client, holds.clone(), release.clone()));
+            }
+        });
+        Self { port, held, let_go }
+    }
+
+    /// The driver sends nothing while it waits for the answer to a
+    /// `ROLLBACK`, so waiting here holds up nothing else.
+    async fn serve(mut client: TcpStream, held: Arc<Notify>, let_go: Arc<Notify>) {
+        let mut server = connect_target(&client).await;
+        let (mut client_chunk, mut server_chunk) = (vec![0u8; 65536], vec![0u8; 65536]);
+        let (mut client_frames, mut server_frames) = (Frames::from_client(), Frames::from_server());
+        let mut rolling_back = false;
+        loop {
+            tokio::select! {
+                read = client.read(&mut client_chunk) => {
+                    let Ok(n @ 1..) = read else { return };
+                    for frame in client_frames.feed(&client_chunk[..n]) {
+                        rolling_back |= frame.kind == Some(b'Q') && frame.body() == b"ROLLBACK\0";
+                        if server.write_all(&frame.raw).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                read = server.read(&mut server_chunk) => {
+                    let Ok(n @ 1..) = read else { return };
+                    for frame in server_frames.feed(&server_chunk[..n]) {
+                        // Only the rollback's own leaves the session idle.
+                        if rolling_back && frame.kind == Some(b'Z') && frame.body() == b"I" {
+                            rolling_back = false;
+                            held.notify_one();
+                            let_go.notified().await;
+                        }
+                        if client.write_all(&frame.raw).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The rows of a truncated read wait for the server's answer to the
+/// `ROLLBACK`, not only for its being sent.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_truncated_read_waits_for_its_rollback_to_be_answered() {
+    let relay = HeldRollback::start().await;
+    let mut target = server();
+    target.port = relay.port;
+    let a = PgAdapter::open(
+        &target,
+        &target.databases[0],
+        PoolSizing::default(),
+        DetachedTasks::new(),
+    )
+    .await
+    .expect("adapter over the relay");
+    for sql in [
+        "SELECT generate_series(1, 5000000)",
+        "SELECT generate_series(1, 101)",
+    ] {
+        let mut capped = std::pin::pin!(a.execute(read(sql)));
+        tokio::select! {
+            early = &mut capped => panic!("{sql}: answered before its rollback: {early:?}"),
+            () = relay.held.notified() => {}
+        }
+        let early = tokio::time::timeout(Duration::from_millis(300), &mut capped).await;
+        assert!(early.is_err(), "{sql}: did not wait: {early:?}");
+        relay.let_go.notify_one();
+        assert!(capped.await.expect("capped read").truncated, "{sql}");
+    }
+}
+
+/// A read cut off at the row cap ends its transaction itself: `ROLLBACK` went
+/// out by the time the rows are handed over, whether the
 /// cancel caught the statement or came after it, and neither is a warning.
 /// None is left queued for the connection's release.
 #[tokio::test]

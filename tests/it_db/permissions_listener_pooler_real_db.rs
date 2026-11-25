@@ -9,7 +9,6 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use sqlx::ConnectOptions;
 use sqlx::postgres::PgSslMode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -17,10 +16,9 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::blackhole_proxy::Proxy;
 use crate::common::env::state_pool;
 use crate::permissions_listener_liveness_real_db::{
-    HEARD_NO_PING, RECOVERED, capture_logs, cleanup, eventually, pool_with, replica,
-    revoke_and_notify, seed, state_options,
+    HEARD_NO_PING, RECOVERED, capture_logs, cleanup, eventually, replica, revoke_and_notify, seed,
+    state_options,
 };
-use db_mcp_gateway::state;
 use db_mcp_gateway::state::permissions::pg::notify::Liveness;
 
 const LIVENESS: Liveness = Liveness {
@@ -115,7 +113,7 @@ async fn revoke_is_heard_through_a_pooler_that_relays_only_answers() {
         .host("127.0.0.1")
         .port(port)
         .ssl_mode(PgSslMode::Disable);
-    let b = replica(&p, pool_with(via_pooler).await, LIVENESS);
+    let b = replica(&p, via_pooler, LIVENESS);
     b.await_flushes(1).await;
     assert_eq!(b.grant_count(&seeded.sub).await, 1);
 
@@ -138,12 +136,10 @@ async fn revoke_is_heard_through_a_pooler_that_relays_only_answers() {
     cleanup(&p, &seeded).await;
 }
 
-/// A silently dead connection keeps its pool slot until TCP gives up on it.
-/// The listener's pool must still hold the replacement and its ping, or the
-/// listener reconnects every deadline for as long as that takes.
-#[tokio::test]
-#[serial_test::parallel(world)]
-async fn the_listener_pool_outlasts_a_silent_drop() {
+/// A silently dead connection stays open until TCP gives up on it, minutes
+/// later. However many pile up meanwhile, the replacement and its ping must
+/// find a connection: one drop, one reconnect.
+async fn each_silent_drop_costs_one_reconnect(drops: usize, freeze: impl Fn(&Proxy)) {
     let (logs, _guard) = capture_logs();
     let p = state_pool().await;
     let direct = state_options();
@@ -151,19 +147,34 @@ async fn the_listener_pool_outlasts_a_silent_drop() {
     let via_proxy = direct
         .host("127.0.0.1")
         .port(proxy.addr.port())
-        .ssl_mode(PgSslMode::Disable)
-        .to_url_lossy();
-    let pool = state::connect_listener(via_proxy.as_str()).await.unwrap();
-    let b = replica(&p, pool, LIVENESS);
+        .ssl_mode(PgSslMode::Disable);
+    let b = replica(&p, via_proxy, LIVENESS);
     b.await_flushes(1).await;
 
-    assert_eq!(proxy.freeze_listeners(), 1);
-    eventually("the listener recovers", || async {
-        logs.contains(RECOVERED)
-    })
-    .await;
-    tokio::time::sleep(LIVENESS.deadline * 3).await;
-    assert_eq!(logs.count(HEARD_NO_PING), 1, "one drop, one reconnect");
+    for drop in 1..=drops {
+        freeze(&proxy);
+        eventually("the listener recovers", || async {
+            logs.count(RECOVERED) == drop
+        })
+        .await;
+        tokio::time::sleep(LIVENESS.deadline * 2).await;
+        assert_eq!(logs.count(HEARD_NO_PING), drop, "after drop {drop}");
+    }
 
     b.listener.abort();
+}
+
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn silent_drops_of_the_listen_connection_do_not_add_up() {
+    each_silent_drop_costs_one_reconnect(3, |proxy| {
+        proxy.freeze_listeners();
+    })
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn silent_drops_of_every_connection_do_not_add_up() {
+    each_silent_drop_costs_one_reconnect(3, Proxy::freeze_all).await;
 }

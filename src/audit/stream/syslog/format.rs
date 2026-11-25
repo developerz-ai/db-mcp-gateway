@@ -56,8 +56,11 @@ const IDENTITY_ERROR_BYTES: usize = 512;
 /// valid JSON throughout; a row that still does not fit is sent as its
 /// identity.
 pub(in crate::audit::stream) fn message(row: &AuditRow) -> String {
+    let mut message = format_rfc5424(row);
+    if over_cap(&message).is_none() {
+        return message;
+    }
     let mut shrunk = row.clone();
-    let mut message = format_rfc5424(&shrunk);
     for floor in [CUT_FLOOR, 0] {
         for field in CUT_ORDER {
             let Some(excess) = over_cap(&message) else {

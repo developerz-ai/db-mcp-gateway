@@ -94,6 +94,14 @@ impl AuditFailures {
         }
     }
 
+    /// Forget every failure. The set is process-wide: a test that asserts a
+    /// mark must first drop the ones other tests in its binary left.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reset(&self) {
+        self.write.last_failure.store(None);
+        self.fallback.last_failure.store(None);
+    }
+
     #[cfg(test)]
     pub(super) fn is_recent(&self, kind: FailedAuditWrite) -> bool {
         self.hold(kind).active_at(Instant::now())

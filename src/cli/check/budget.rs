@@ -6,8 +6,9 @@ use db_mcp_gateway::config::{Config, ConfigFile, Database, Server, ServerKind};
 use db_mcp_gateway::exec::PoolSizing;
 use db_mcp_gateway::exec::pg::init_cancel_pool_size_from_env;
 
-/// The state DB's background (pruner/GC) and LISTEN pools
-/// (`state::{BACKGROUND,LISTENER}_POOL_SIZE`, crate-private there).
+/// The state DB's background (pruner/GC) pool
+/// (`state::BACKGROUND_POOL_SIZE`, crate-private there), and the listener's
+/// `LISTEN` and ping connections (`state::permissions::pg::notify`).
 const STATE_BACKGROUND_POOL: u32 = 2;
 const STATE_LISTENER_POOL: u32 = 2;
 

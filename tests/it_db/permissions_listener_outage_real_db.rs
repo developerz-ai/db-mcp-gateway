@@ -18,7 +18,7 @@ use db_mcp_gateway::state::permissions::{
     DbType, GrantAction, GrantTarget, PermissionsChange, PermissionsSeed,
 };
 use sqlx::PgPool;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
@@ -144,11 +144,6 @@ async fn grant_changes_land_while_the_listener_cannot_reconnect() {
         .host("127.0.0.1")
         .port(proxy.port)
         .ssl_mode(PgSslMode::Disable);
-    let listener_pool = PgPoolOptions::new()
-        .max_connections(3)
-        .connect_with(via_proxy)
-        .await
-        .unwrap();
     let cache = PermissionsCache::new(Arc::new(PgPermissionsRepo::new(p.clone())), CACHE_TTL);
     let liveness = Liveness {
         ping_every: Duration::from_millis(250),
@@ -157,7 +152,7 @@ async fn grant_changes_land_while_the_listener_cannot_reconnect() {
     let (heard_tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
     let listener = tokio::spawn({
         let cache = cache.clone();
-        notify::listen_with(listener_pool, liveness, move |change| {
+        notify::listen_with(via_proxy, liveness, move |change| {
             let cache = cache.clone();
             let _ = heard_tx.send(change.clone());
             async move { cache.apply(&change).await }

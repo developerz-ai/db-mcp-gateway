@@ -392,3 +392,36 @@ async fn a_stuck_cancel_never_costs_the_next_call_its_budget() {
         .await
         .expect("the stuck cancel was bounded");
 }
+
+/// Rendering recurses once per nesting level, so the server's own nesting
+/// limit is what bounds it: scopes count against it like documents, and the
+/// deepest one it stores still renders.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn nested_code_scopes_are_bounded_by_the_servers_nesting_limit() {
+    let scopes = |levels: usize| {
+        (0..levels).fold(doc! { "nan": f64::NAN }, |scope, _| {
+            doc! { "c": Bson::JavaScriptCodeWithScope(JavaScriptCodeWithScope { code: "x".into(), scope }) }
+        })
+    };
+    let a = adapter("mongo").await;
+    let coll = unique_collection("mongodeep");
+    let mut stored = Vec::new();
+    for levels in [90, 250] {
+        let reply = side_client()
+            .database(TARGET_DB)
+            .run_command(doc! { "insert": &coll, "documents": [scopes(levels)] })
+            .await;
+        stored.push(reply.is_ok_and(|reply| reply.get_array("writeErrors").is_err()));
+    }
+    let read = run(&a, &format!(r#"{{"find":"{coll}"}}"#), None).await;
+    drop_collection(&side_client(), &coll).await;
+
+    assert_eq!(stored, [true, false]);
+    let rows = read.expect("the deepest stored scope renders").rows;
+    let mut value = &rows[0][0];
+    for _ in 0..90 {
+        value = &value["c"]["$scope"];
+    }
+    assert_eq!(*value, json!({ "nan": { "$numberDouble": "NaN" } }));
+}

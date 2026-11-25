@@ -273,8 +273,8 @@ jobs:
           echo "ghcr=$(digest "$REGISTRY/$IMAGE_NAME:$VERSION")" >> "$GITHUB_OUTPUT"
           echo "docr=$(digest "$DOCR_REGISTRY/$DOCR_IMAGE_NAME:$VERSION")" >> "$GITHUB_OUTPUT"
       # Keyless: the signature binds the digest to this workflow run's OIDC
-      # identity (`cosign verify --certificate-identity-regexp
-      # 'github.com/<repo>/.github/workflows/release.yml@refs/tags/v'`).
+      # identity (`cosign verify --certificate-identity
+      # https://github.com/<repo>/.github/workflows/release.yml@refs/tags/vX.Y.Z`).
       - name: sign the release index (cosign keyless)
         env:
           GHCR_DIGEST: ${{ steps.digest.outputs.ghcr }}

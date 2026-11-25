@@ -18,7 +18,7 @@ Every agent-facing error carries a `request_id`; it matches `audit_calls.request
 
 ### GatewayAuditUnavailable
 
-**Means.** Tool calls were answered `audit_unavailable` (the state DB refused the intent row or the completion row), or admin API requests failed because their audit row did: a write answers `500 internal` and is rolled back (unless only the reply to its commit was lost), an audited read answers `503 audit_unavailable`. Audit is synchronous (MUST #4), so those callers are getting no answers. Severity critical.
+**Means.** The durability of an audit row could not be confirmed. Tool calls were answered `audit_unavailable` (the intent row or the completion row failed), or admin API requests failed. An admin write answers `500 internal` when its audit insert, the cross-replica NOTIFY in the same transaction, or the commit failed: it is rolled back, unless only the reply to its commit was lost, so check `permissions_audit` by request id before repeating it. An audited admin read answers `503 audit_unavailable`. Audit is synchronous (MUST #4), so those callers are getting no answers. Severity critical.
 
 **How long it fires.** The alert looks at every scrape of the last 5m, not just the latest, so it clears up to 5m after its cause does, plus one evaluation interval (an evaluation just before the last such scrape leaves the window keeps it until the next one).
 - *Process still running.* The replica holds `audit_failure_recent{kind="write"}` at 1 for 15m after its last refusal, timed on its monotonic clock (no wall clock matters), so the alert clears 15m to 20m after the refusal, plus one evaluation interval. A refusal before Prometheus first saw the pod, which `increase()` cannot see, still fires when the first scrape comes within the 15m.

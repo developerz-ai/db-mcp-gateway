@@ -90,13 +90,16 @@ fn not_the_statements(sqlstate: &str, db: &dyn DatabaseError) -> bool {
 }
 
 /// Whether the server raised this error for a statement and the session goes
-/// on. Postgres names the source location in every error; a pooler answering
-/// for a server it cannot reach has none.
+/// on.
 fn judges_a_statement(db: &dyn DatabaseError) -> bool {
-    !is_fatal(db)
-        && db
-            .try_downcast_ref::<PgDatabaseError>()
-            .is_some_and(|db| db.file().is_some() || db.routine().is_some())
+    !is_fatal(db) && has_source_location(db)
+}
+
+/// Postgres names the source location in every error; a pooler answering for
+/// a server it cannot reach has none.
+fn has_source_location(db: &dyn DatabaseError) -> bool {
+    db.try_downcast_ref::<PgDatabaseError>()
+        .is_some_and(|db| db.file().is_some() || db.routine().is_some())
 }
 
 /// `FATAL` and `PANIC` end the session. No statement's own error does.
@@ -125,19 +128,29 @@ fn error_position(db: &dyn DatabaseError) -> Option<usize> {
 }
 
 /// Classify a failed `COMMIT`. A server refusal (deferred constraint,
-/// serialization failure) or a cancel means the transaction rolled back, so
-/// it keeps its statement-level classification. Anything else on a write —
-/// the link dropped, the reply was unreadable — leaves the commit's fate
-/// unknown, which the caller must not report as "nothing happened".
+/// serialization failure) means the transaction rolled back, so it keeps its
+/// statement-level classification. Anything else on a write — the link
+/// dropped, the reply was unreadable, a pooler answered (a refused login
+/// included: it is the pooler's, on its way back to the server) — leaves the
+/// commit's fate unknown, which the caller must not report as "nothing
+/// happened". A cancel or timeout is unknown to every caller as it is.
 pub(super) fn classify_commit(
     err: sqlx::Error,
     access: Access,
     origin: &Origin<'_>,
     sql: &str,
 ) -> ExecError {
-    let rolled_back = sqlstate(&err).is_some_and(|code| rolled_back_by_the_target(&code));
+    let db = err.as_database_error();
+    let refused = db.is_some_and(judges_a_statement);
+    let rolled_back = db.is_some_and(|db| {
+        (!is_fatal(db) || has_source_location(db))
+            && db.code().is_some_and(|c| rolled_back_by_the_target(&c))
+    });
     match classify(err, origin, sql) {
         ExecError::Unavailable | ExecError::Sql if access == Access::ReadWrite && !rolled_back => {
+            ExecError::CommitIndeterminate
+        }
+        ExecError::Connection if access == Access::ReadWrite && !refused => {
             ExecError::CommitIndeterminate
         }
         other => other,

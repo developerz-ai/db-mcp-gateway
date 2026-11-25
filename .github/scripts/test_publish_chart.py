@@ -31,7 +31,8 @@ case " $* " in
     echo "version: $version" > "$TMP_CHART/db-mcp-gateway/Chart.yaml"
     tar -czf "$out/db-mcp-gateway-$version.tgz" -C "$TMP_CHART" db-mcp-gateway ;;
   *" pull "*)
-    [[ -f $STORE/chart.tgz ]] || { echo 'Error: not found' >&2; exit 1; }
+    [[ -z ${PULL_ERROR:-} ]] || { printf '%s\n' "$PULL_ERROR" >&2; exit 1; }
+    [[ -f $STORE/chart.tgz ]] || { echo "Error: ghcr.io/o/charts/db-mcp-gateway:$version: not found" >&2; exit 1; }
     cp "$STORE/chart.tgz" "$work/published/db-mcp-gateway-$version.tgz"
     echo "Digest: $DIGEST" ;;
   *" push "*)
@@ -101,6 +102,32 @@ class PublishChart(unittest.TestCase):
         other = self.publish(epoch="1763000001")
         self.assertEqual((other.returncode, other.stdout), (1, ""))
         self.assertIn("other content", other.stderr)
+        self.assertEqual(sum(" push " in call for call in self.calls()), 1)
+
+    def test_only_a_missing_manifest_is_absence(self):
+        """What the pinned helm prints when the version may exist all the same:
+        refused, throttled, down, or its manifest or a blob unreadable. The
+        missing-manifest line it must not be taken for is the stub's own."""
+        ref = "ghcr.io/o/charts/db-mcp-gateway"
+        url = "https://ghcr.io/v2/o/charts/db-mcp-gateway"
+        head = f"Error: unexpected status from HEAD request to {url}/manifests/2.7.0: "
+        copy = "Error: failed to copy: httpReadSeeker: failed open: "
+        errors = [
+            *(head + s for s in ("401 Unauthorized", "403 Forbidden", "429 Too Many Requests",
+                                 "500 Internal Server Error", "503 Service Unavailable")),
+            f"{copy}content at {url}/manifests/{DIGEST} not found: not found",
+            f"{copy}could not fetch content descriptor {DIGEST} (application/vnd.cncf.helm"
+            ".chart.content.v1.tar+gzip) from remote: not found",
+            f"{copy}unexpected status code {url}/blobs/{DIGEST}: 500 Internal Server Error",
+            f'Error: failed to do request: Head "{url}/manifests/2.7.0": dial tcp: i/o timeout',
+            f"Error: {ref}:2.7.1: not found",
+            "Error: not found",
+        ]
+        self.assertEqual(self.publish().returncode, 0)
+        for error in errors:
+            run = self.publish(PULL_ERROR=error)
+            self.assertEqual((run.returncode, run.stdout), (1, ""), error)
+            self.assertIn(error, run.stderr)
         self.assertEqual(sum(" push " in call for call in self.calls()), 1)
 
     def test_the_archive_is_reproducible(self):

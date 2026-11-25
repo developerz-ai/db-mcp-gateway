@@ -24,6 +24,7 @@ use db_mcp_gateway::state::permissions::mysql::MysqlPermissionsRepo;
 use db_mcp_gateway::state::permissions::pg::{PgPermissionsRepo, notify};
 use db_mcp_gateway::transport::{AppState, McpState, OAuthState};
 use sqlx::PgPool;
+use sqlx::postgres::PgConnectOptions;
 use tokio_util::sync::CancellationToken;
 
 use super::{Shutdown, metrics};
@@ -102,7 +103,7 @@ pub(crate) async fn build_app_state(
 
 /// Spec 12 §"Storage backends" / #59: the permissions store the YAML selects
 /// and the grant cache over it. The default (no `permissions_store:`) is the
-/// state DB, with the `LISTEN/NOTIFY` listener on its own pool; MySQL opens a
+/// state DB, with the `LISTEN/NOTIFY` listener on its own connections; MySQL opens a
 /// separate pool keyed by `PERMISSIONS_DB_DSN` and relies on the cache TTL;
 /// `driver: none` (YAML-only) starts neither a store nor a listener.
 async fn build_permissions(
@@ -117,8 +118,7 @@ async fn build_permissions(
         PermissionsStoreDriver::Pg => {
             let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(state_db.clone()));
             let cache = PermissionsCache::new(repo.clone(), ttl).with_detached(detached.clone());
-            let listener_db = state::connect_listener(&config.state_db.url)
-                .await
+            let listener_db = state::listener_options(&config.state_db.url)
                 .map_err(|err| boot_db_error("permissions listener", err))?;
             spawn_permissions_listener(listener_db, cache.clone(), shutdown.drained.clone());
             Ok((repo, cache))
@@ -148,11 +148,15 @@ async fn build_permissions(
 /// another replica announces over `LISTEN/NOTIFY`, until the drain ends — a
 /// revocation must still bite requests admitted before SIGTERM. Postgres
 /// store only — the MySQL store has no such channel and relies on the TTL.
-/// `pool` is the listener's own ([`state::connect_listener`]), never the
+/// It connects on its own ([`state::listener_options`]), never through the
 /// request pool: the `LISTEN` connection is held for the life of the process.
-fn spawn_permissions_listener(pool: PgPool, cache: PermissionsCache, stop: CancellationToken) {
+fn spawn_permissions_listener(
+    options: PgConnectOptions,
+    cache: PermissionsCache,
+    stop: CancellationToken,
+) {
     tokio::spawn(async move {
-        let listen = notify::listen(pool, move |change| {
+        let listen = notify::listen(options, move |change| {
             let cache = cache.clone();
             async move { cache.apply(&change).await }
         });
