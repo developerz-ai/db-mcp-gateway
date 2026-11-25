@@ -408,7 +408,7 @@ fn documented_routes_are_mounted() {
     let code = src();
     let routes = mounted_routes(&code);
     assert!(
-        routes.contains(&("DELETE".to_string(), "/admin/v1/grants/:id".to_string())),
+        routes.contains(&("DELETE".to_string(), "/admin/v1/grants/{id}".to_string())),
         "router contract not read: {routes:?}"
     );
     // A path mounted for one method is not mounted for another.

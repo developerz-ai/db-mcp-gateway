@@ -1177,7 +1177,7 @@ async fn delete_invalidates_cached_authz_for_user() {
 }
 
 /// **Database mutations full-flush every user.** A PATCH or DELETE on
-/// `/admin/v1/databases/:id` fires `PermissionsCache::invalidate_all` —
+/// `/admin/v1/databases/{id}` fires `PermissionsCache::invalidate_all` —
 /// per-user invalidation isn't enough because a database row change (rename,
 /// soft-delete) can reach any user whose grants reference it. This test
 /// warms cached authz for two distinct identities, mutates the database
@@ -1772,7 +1772,7 @@ async fn admin_routes_are_concurrency_capped_per_identity() {
     delete_permissions_user(&pool, &admin_sub).await;
 }
 
-/// Slice 08 step 2 (admin revoke): `POST /admin/v1/users/:id/revoke-sessions`
+/// Slice 08 step 2 (admin revoke): `POST /admin/v1/users/{id}/revoke-sessions`
 /// kills every live session of the subject — its bearer is 401 on the next
 /// call — and writes exactly one audit row, in the revoke's transaction.
 #[tokio::test]

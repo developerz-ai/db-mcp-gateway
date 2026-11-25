@@ -1,4 +1,4 @@
-//! `POST /admin/v1/users/:id/revoke-sessions` — operator kill switch for one
+//! `POST /admin/v1/users/{id}/revoke-sessions` — operator kill switch for one
 //! subject: every live session and refresh chain, in one audited
 //! transaction (plan 101 slice 08 step 2).
 //!
