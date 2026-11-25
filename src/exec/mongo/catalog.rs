@@ -15,7 +15,9 @@ use super::super::query::{ExecQuery, SampleQuery, SchemaDetail, SchemaQuery};
 use super::super::rejection::RejectionKind;
 use super::super::sql_guard::Access;
 use super::MongoAdapter;
-use super::infer::infer_fields;
+use super::bson_json::raw_to_json;
+use super::dispatch::Render;
+use super::infer::{field_list, infer_fields};
 use super::rejector::is_system_collection;
 
 /// Indexes listed per collection. Mongo allows 64; the cap only bounds a
@@ -130,8 +132,8 @@ impl MongoAdapter {
     /// may list but not read is still listed, its sample withheld: one
     /// unreadable collection never sinks the whole listing.
     async fn sample(&self, collection: &str, query: &SchemaQuery<'_>) -> Result<Value, ExecError> {
-        match self.sample_documents(collection, query).await {
-            Ok(documents) => Ok(infer_fields(&documents)),
+        match self.sample_field_lists(collection, query).await {
+            Ok((lists, cut)) => Ok(infer_fields(&lists, cut)),
             Err(ExecError::Rejected(rejection))
                 if rejection.kind() == RejectionKind::PermissionDenied =>
             {
@@ -141,20 +143,25 @@ impl MongoAdapter {
         }
     }
 
-    /// Up to `query.sample_limit` documents of `collection`, through
-    /// `execute` like any `find` the caller could run.
-    async fn sample_documents(
+    /// The field lists (see [`field_list`]) of up to `query.sample_limit`
+    /// documents of `collection`, read by the `find` any caller could run,
+    /// and whether the result budget cut them short.
+    async fn sample_field_lists(
         &self,
         collection: &str,
         query: &SchemaQuery<'_>,
-    ) -> Result<Vec<Value>, ExecError> {
+    ) -> Result<(Vec<Value>, bool), ExecError> {
         let command = json!({ "find": collection, "filter": {} });
-        let found = self.read(&command, query.sample_limit, query).await?;
-        Ok(found
+        let found = self
+            .read_as(&command, query.sample_limit, query, field_list)
+            .await?;
+        let cut = found.truncated && found.rows.len() < query.sample_limit as usize;
+        let lists = found
             .rows
             .into_iter()
             .filter_map(|row| row.into_iter().next())
-            .collect())
+            .collect();
+        Ok((lists, cut))
     }
 
     /// `[{name, key, unique}]` for one collection.
@@ -201,8 +208,19 @@ impl MongoAdapter {
         row_limit: u32,
         query: &SchemaQuery<'_>,
     ) -> Result<ExecResult, ExecError> {
+        self.read_as(command, row_limit, query, raw_to_json).await
+    }
+
+    /// [`Self::read`], each document turned into its cell by `render`.
+    async fn read_as(
+        &self,
+        command: &Value,
+        row_limit: u32,
+        query: &SchemaQuery<'_>,
+        render: Render,
+    ) -> Result<ExecResult, ExecError> {
         let command = command.to_string();
-        self.execute(ExecQuery {
+        let query = ExecQuery {
             sql: &command,
             binds: &[],
             statement_timeout_ms: query.statement_timeout_ms,
@@ -210,8 +228,8 @@ impl MongoAdapter {
             access: Access::ReadOnly,
             dry_run: false,
             request_id: query.request_id,
-        })
-        .await
+        };
+        self.run(&query, render).await
     }
 }
 

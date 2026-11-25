@@ -41,9 +41,9 @@ const UNLOCK_ALL: &str = "SELECT pg_advisory_unlock_all()";
 /// `after_release` hook: wipe session state before a connection serves the
 /// next caller. A failed reset discards the connection.
 ///
-/// The driver's statement cache is emptied first — the zero-row column
-/// lookup is the one thing that prepares a named statement, and its text is
-/// the previous caller's SQL — so the cache and the server agree before
+/// The driver's statement cache is emptied first — every read is prepared
+/// as a named statement (`describe`), and its text is the previous caller's
+/// SQL — so the cache and the server agree before
 /// `DEALLOCATE ALL`. The read buffer is given back too: one huge row must
 /// not stay allocated on an idle connection.
 ///

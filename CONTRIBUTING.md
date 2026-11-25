@@ -114,10 +114,10 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
 ### Project Structure
 
-See [CLAUDE.md](CLAUDE.md) — it documents:
-- **Layers** (`src/transport/`, `src/auth/`, `src/authz/`, `src/tools/`, `src/exec/`, `src/audit/`, `src/config/`, `src/state/`)
-- **Conventions** (error handling, async patterns, logging, testing, code style)
-- **Commands** (build, test, lint, CI)
+See [CLAUDE.md](CLAUDE.md) and its scoped files:
+- [src/CLAUDE.md](src/CLAUDE.md) — **layers** and **conventions** (error handling, async patterns, logging, code style)
+- [tests/CLAUDE.md](tests/CLAUDE.md) — **testing** rules
+- [bin/CLAUDE.md](bin/CLAUDE.md) — **commands** beyond the essentials in the root file
 
 ---
 
@@ -145,7 +145,7 @@ Key rules:
 - **Tracing, not `println`** — use `tracing` spans with `request_id`, `user`, `server`, `database`.
 - **File size:** ≤300 LOC. Split by single responsibility.
 
-See [CLAUDE.md](CLAUDE.md#conventions) for full conventions.
+See [src/CLAUDE.md](src/CLAUDE.md#conventions) for full conventions.
 
 ### 2. Testing
 

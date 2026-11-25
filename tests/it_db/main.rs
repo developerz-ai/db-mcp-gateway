@@ -124,6 +124,7 @@ mod redis_timeout_real_db;
 mod refresh_tokens_real_db;
 mod run_query_e2e;
 mod run_query_sizing_e2e;
+mod run_scoped_activity_e2e;
 mod sample_table_authz_e2e;
 mod sample_table_columns_e2e;
 mod sample_table_kind_probe_e2e;

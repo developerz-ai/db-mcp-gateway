@@ -188,13 +188,13 @@ not_called 'ps --status running'
 rm "$work/calls.ready"
 (cd "$work/repo" && PATH="$work/tools" CALLS="$work/calls" EXPECT_FILTER='filter with spaces' \
   bash bin/test --test smoke -- --nocapture 'filter with spaces')
-called 'cargo test --all-targets --all-features --test smoke -- --nocapture filter with spaces'
+called 'cargo test --all-features --test smoke -- --nocapture filter with spaces'
 # With cargo-nextest installed bin/test runs it instead, args intact.
 rm "$work/calls.ready"
 ln -s stub "$work/tools/cargo-nextest"
 (cd "$work/repo" && PATH="$work/tools" CALLS="$work/calls" EXPECT_FILTER='filter with spaces' \
   bash bin/test --test smoke -- --nocapture 'filter with spaces')
-called 'cargo nextest run --all-targets --all-features --test smoke -- --nocapture filter with spaces'
+called 'cargo nextest run --all-features --test smoke -- --nocapture filter with spaces'
 rm "$work/tools/cargo-nextest"
 # The restored ci.yml parity stages: a mutable action ref fails the SHA-pin
 # scan (real code), and the token scanner's hit (exit 1) and tooling failure

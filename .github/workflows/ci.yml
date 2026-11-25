@@ -613,7 +613,7 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
 
-  # The single required check (ruleset, SET-3). GitHub reads a skipped
+  # The single required check (ruleset). GitHub reads a skipped
   # required job as passed, so each job above required on its own let a failed
   # `changes` merge a PR that ran nothing. `gate` always runs and passes only
   # when every job succeeded or was skipped by a `changes` filter that said

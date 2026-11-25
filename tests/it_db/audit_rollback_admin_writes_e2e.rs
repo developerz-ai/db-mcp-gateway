@@ -14,7 +14,6 @@ use axum::extract::Request;
 use axum::middleware::{self as axum_mw, Next};
 use axum::routing::post;
 use db_mcp_gateway::authz::PermissionsCache;
-use db_mcp_gateway::config::ConfigFile;
 use db_mcp_gateway::state::permissions::PermissionsRepo;
 use db_mcp_gateway::state::permissions::pg::PgPermissionsRepo;
 use db_mcp_gateway::transport::admin::databases::{self, DatabasesState};
@@ -26,6 +25,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::common::env::state_pool;
+use crate::common::gateway::config_file;
 
 const YAML: &str = r#"
 servers:
@@ -101,7 +101,7 @@ async fn audit_write_failure_rolls_back_a_database_create() {
     // A name no other test registers, so the count below is this test's.
     let db_name = format!("rollback_{}", Uuid::new_v4().simple());
     let yaml = YAML.replace("name: app\n", &format!("name: {db_name}\n"));
-    let config = ConfigFile::from_yaml_str(&yaml).expect("rollback yaml parses");
+    let config = config_file(&yaml);
     let state = DatabasesState {
         repo,
         state_db: pool.clone(),

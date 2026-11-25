@@ -18,6 +18,7 @@ use axum::Router;
 use axum::http::{HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use db_mcp_gateway::tools::audit_dispatch::failure_hold::audit_failures;
 use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder, PrometheusHandle};
 use metrics_util::MetricKindMask;
 use tokio_util::sync::CancellationToken;
@@ -79,10 +80,7 @@ pub(crate) fn install_recorder(shutdown: CancellationToken) -> anyhow::Result<Pr
     let handle = builder()?
         .install_recorder()
         .map_err(|err| anyhow::anyhow!("failed to install Prometheus recorder: {err}"))?;
-    describe_catalogue();
-    preregister::register_static();
-    loaded::record_build_info();
-    loaded::record_process_start();
+    register_boot_series();
     let refresher_stop = shutdown.clone();
     tokio::spawn(async move {
         held::run_refresher(held::held(), held::REFRESH_EVERY, refresher_stop).await;
@@ -132,6 +130,16 @@ async fn spawn_listener_with(
     Ok(local)
 }
 
+/// What the recorder exports from the moment it is installed: the catalogue's
+/// descriptions, the pre-registered counters and the build and start gauges.
+fn register_boot_series() {
+    describe_catalogue();
+    preregister::register_static();
+    loaded::record_build_info();
+    loaded::record_process_start();
+    audit_failures().publish();
+}
+
 /// `# HELP` and `# TYPE` for every catalogued series.
 fn describe_catalogue() {
     use catalogue::{CATALOGUE, Kind};
@@ -154,7 +162,13 @@ fn router(handle: PrometheusHandle, probe: &'static probes::ProbeState) -> Route
         .merge(probe_routes)
 }
 
+/// One render at a time: two overlapping scrapes could otherwise publish out
+/// of order, the older one clearing a failure the newer one had just set.
+static RENDERING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn render(handle: PrometheusHandle) -> Response {
+    let _rendering = RENDERING.lock().await;
+    audit_failures().publish();
     let mut response = handle.render().into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -163,5 +177,7 @@ async fn render(handle: PrometheusHandle) -> Response {
     response
 }
 
+#[cfg(test)]
+mod docs_tests;
 #[cfg(test)]
 mod tests;

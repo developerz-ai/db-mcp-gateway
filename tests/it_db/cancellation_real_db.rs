@@ -136,7 +136,7 @@ async fn pg_cancel_backend_fires_when_execute_future_dropped() {
 
     // Spawn a long-running query with a 30 s timeout so it outlives any
     // reasonable test run without the cancel.  CancelOnDrop (inside
-    // `run_query_inner`) fires `pg_cancel_backend` when this task is aborted.
+    // `run_query`) fires `pg_cancel_backend` when this task is aborted.
     let (marker, sql) = tagged_sleep("drop-cancel");
     let adapter_task = adapter.clone();
     let task = tokio::spawn(async move {
@@ -160,7 +160,7 @@ async fn pg_cancel_backend_fires_when_execute_future_dropped() {
     );
 
     // Abort the task.  This drops the `PgAdapter::execute` future chain:
-    //   tokio::time::timeout → run_query_inner → CancelOnDrop::drop fires
+    //   tokio::time::timeout → run_query → CancelOnDrop::drop fires
     //   → tokio::spawn(pg_cancel_backend(pid))
     task.abort();
 

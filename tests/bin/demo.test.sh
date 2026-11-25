@@ -20,15 +20,26 @@ port=${DEMO_PORT:-18443}
 if [[ -z "${GATEWAY_IMAGE:-}" ]]; then
   pinned=$(sed -n 's/.*image: \${GATEWAY_IMAGE:-\([^}]*\)}.*/\1/p' docker-compose.yml | head -1)
   version=$(sed -n 's/^version = "\(.*\)"/\1/p' ../../Cargo.toml | head -1)
-  # Cheap local checks first; origin is asked only when a fallback is
-  # possible. `ls-remote --exit-code` answers 2 only for "no such ref"; a
-  # lookup error (no network, no origin) is not proof the release is uncut.
+  # Cheap local checks first; the release repo is asked only when a fallback
+  # is possible. `ls-remote --exit-code` answers 2 only for "no such ref"; a
+  # lookup error (no network) is not proof the release is uncut.
   if [[ -n "$pinned" && -n "$version" && "${pinned##*:}" == "$version" ]] &&
     ! git -C ../.. rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
     remote=0
-    # git's own low-speed abort (portable; no coreutils `timeout` on macOS).
-    GIT_HTTP_LOW_SPEED_LIMIT=1 GIT_HTTP_LOW_SPEED_TIME=20 \
-      git -C ../.. ls-remote --exit-code --tags origin "v$version" >/dev/null 2>&1 || remote=$?
+    # The public HTTPS URL, never `origin`: an SSH origin ignores git's
+    # low-speed abort (the portable deadline; no coreutils `timeout` on
+    # macOS). Outside the checkout with git's repository variables cleared
+    # (GIT_DIR, GIT_CONFIG_COUNT, GIT_CONFIG_PARAMETERS, ...) and no user or
+    # system config, so no `insteadOf` redirects it; https only, no prompt.
+    (
+      # shellcheck disable=SC2046 # a list of variable names
+      unset $(git rev-parse --local-env-vars)
+      cd /
+      GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+        GIT_ALLOW_PROTOCOL=https GIT_HTTP_LOW_SPEED_LIMIT=1 GIT_HTTP_LOW_SPEED_TIME=20 \
+        git ls-remote --exit-code --tags https://github.com/developerz-ai/db-mcp-gateway.git \
+        "v$version"
+    ) >/dev/null 2>&1 || remote=$?
     if [[ $remote -eq 2 ]]; then
       export GATEWAY_IMAGE=${pinned%:*}:main
       printf 'note: release v%s is not cut yet; testing %s\n' "$version" "$GATEWAY_IMAGE" >&2

@@ -131,21 +131,26 @@ fn redact_role(message: &str, role: &str) -> String {
     }
     let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let mut out = String::with_capacity(message.len());
-    let mut rest = message;
-    while let Some(at) = rest.find(role) {
-        let before = rest[..at].chars().next_back();
-        let after = rest[at + role.len()..].chars().next();
-        out.push_str(&rest[..at]);
+    let mut copied = 0;
+    for (at, _) in message.match_indices(role) {
+        // Neighbours come from the whole message: a slice starting right
+        // after the previous match would hide a word character before `at`.
+        let before = message[..at].chars().next_back();
+        let after = message[at + role.len()..].chars().next();
         if before.is_some_and(is_word) || after.is_some_and(is_word) {
-            out.push_str(role);
-        } else {
-            out.push_str(ROLE_PLACEHOLDER);
+            continue;
         }
-        rest = &rest[at + role.len()..];
+        out.push_str(&message[copied..at]);
+        out.push_str(ROLE_PLACEHOLDER);
+        copied = at + role.len();
     }
-    out.push_str(rest);
+    out.push_str(&message[copied..]);
     out
 }
+
+#[cfg(test)]
+#[path = "redact_proptests.rs"]
+mod redact_proptests;
 
 #[cfg(test)]
 mod tests {
@@ -166,6 +171,8 @@ mod tests {
             "key gateway_ro_x and <role>."
         );
         assert_eq!(redact_role("no role here", "ro"), "no role here");
+        // Back-to-back copies are one longer word, not two whole words.
+        assert_eq!(redact_role("roro ro", "ro"), "roro <role>");
     }
 
     fn server_error(reply: &[u8]) -> RedisError {

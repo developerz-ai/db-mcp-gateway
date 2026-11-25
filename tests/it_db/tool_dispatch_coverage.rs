@@ -14,6 +14,7 @@
 use crate::common::audit::latest_audit;
 use crate::common::cleanup::delete_audit_calls;
 use crate::common::env::state_pool;
+use crate::common::gateway::config_file;
 use db_mcp_gateway::audit::drain::DetachedTasks;
 use db_mcp_gateway::audit::stream::StreamSinks;
 use std::sync::Arc;
@@ -49,7 +50,7 @@ impl Fixture {
         let repo: Arc<dyn PermissionsRepo> = Arc::new(PgPermissionsRepo::new(pool.clone()));
         Self {
             identity: identity(&format!("coverage-{}", Uuid::new_v4().simple())),
-            config: ConfigFile::from_yaml_str("servers: []\n").expect("empty config parses"),
+            config: config_file("servers: []\n"),
             registry: AdapterRegistry::new(),
             cache: PermissionsCache::new(repo, Duration::from_secs(30)),
             pool,

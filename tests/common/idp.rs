@@ -1,16 +1,19 @@
-//! In-process mock OIDC IdP, signed with a static RSA
-//! keypair committed under `tests/data/`. Lets integration tests walk the full
-//! login flow without a real IdP — see `auth_e2e.rs`.
+//! In-process mock OIDC IdPs, signed with a static RSA
+//! keypair committed under `tests/data/`. [`spawn_mock_idp`] walks the full
+//! login flow without a real IdP (see `auth_e2e.rs`); [`spawn_token_idp`] is
+//! discovery, JWKS and a token endpoint only, for tests that drive
+//! `OidcClient` verification directly with a hand-built ID token.
 //!
 //! Not security-sensitive: the private key is plainly in the repo, only used
 //! by tests, and never touches a production code path.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Form, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Redirect;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -22,7 +25,8 @@ use uuid::Uuid;
 
 const TEST_KEY_PEM: &str = include_str!("../data/test_idp_key.pem");
 const TEST_JWK: &str = include_str!("../data/test_idp_pub.jwk.json");
-const TEST_KID: &str = "test-kid-1";
+/// The `kid` the committed JWKS publishes.
+pub const TEST_KID: &str = "test-kid-1";
 /// Fixed HMAC secret used only when `MockTokenFlags::sign_with_hs256` is set.
 /// Never used in production; exists solely to mint an HS256 token the gateway
 /// must reject (A5 — algorithm pinned to RS256).
@@ -117,20 +121,48 @@ pub async fn spawn_mock_idp_with_flags(
 }
 
 async fn discovery(State(s): State<MockIdpState>) -> Json<Value> {
-    Json(json!({
-        "issuer": s.issuer,
-        "authorization_endpoint": format!("{}/authorize", s.issuer),
-        "token_endpoint": format!("{}/token", s.issuer),
-        "jwks_uri": format!("{}/jwks.json", s.issuer),
-        "response_types_supported": ["code"],
-        "subject_types_supported": ["public"],
-        "id_token_signing_alg_values_supported": ["RS256"],
-    }))
+    Json(discovery_document(&s.issuer))
 }
 
 async fn jwks(State(_): State<MockIdpState>) -> Json<Value> {
+    Json(jwks_document())
+}
+
+fn discovery_document(issuer: &str) -> Value {
+    json!({
+        "issuer": issuer,
+        "authorization_endpoint": format!("{issuer}/authorize"),
+        "token_endpoint": format!("{issuer}/token"),
+        "jwks_uri": format!("{issuer}/jwks.json"),
+        "response_types_supported": ["code"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"],
+    })
+}
+
+fn jwks_document() -> Value {
     let jwk: Value = serde_json::from_str(TEST_JWK).expect("static JWK is valid JSON");
-    Json(json!({ "keys": [jwk] }))
+    json!({ "keys": [jwk] })
+}
+
+/// Seconds since the UNIX epoch, for `iat` / `exp` / `nbf`.
+pub fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock past UNIX epoch")
+        .as_secs()
+}
+
+/// RS256-sign `claims` with the committed test key, naming `kid`.
+pub fn sign_rs256(claims: &Value, kid: &str) -> String {
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(kid.to_string());
+    jsonwebtoken::encode(
+        &header,
+        claims,
+        &EncodingKey::from_rsa_pem(TEST_KEY_PEM.as_bytes()).expect("static test key parses"),
+    )
+    .expect("ID token encoding never fails for our static inputs")
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,10 +257,7 @@ fn sign_id_token(
     nonce: &str,
     flags: &MockTokenFlags,
 ) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock past UNIX epoch")
-        .as_secs();
+    let now = now_secs();
     let email_verified = !flags.unverified_email;
     let mut claims = json!({
         "iss": issuer,
@@ -260,13 +289,89 @@ fn sign_id_token(
         )
         .expect("HS256 encoding never fails for our static inputs")
     } else {
-        let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(TEST_KID.to_string());
-        jsonwebtoken::encode(
-            &header,
-            &claims,
-            &EncodingKey::from_rsa_pem(TEST_KEY_PEM.as_bytes()).expect("static test key parses"),
-        )
-        .expect("ID token encoding never fails for our static inputs")
+        sign_rs256(&claims, TEST_KID)
     }
+}
+
+/// What the verify-only IdP's token endpoint was sent.
+#[derive(Debug)]
+pub struct TokenRequest {
+    /// The IdP's own issuer URL, for the `iss` claim.
+    pub issuer: String,
+    pub headers: HeaderMap,
+    pub form: HashMap<String, String>,
+}
+
+type MintIdToken = dyn Fn(&TokenRequest) -> Result<String, StatusCode> + Send + Sync;
+
+struct TokenIdpState {
+    issuer: String,
+    jwks_hits: Arc<AtomicUsize>,
+    mint: Box<MintIdToken>,
+}
+
+/// A running [`spawn_token_idp`].
+#[derive(Debug)]
+pub struct TokenIdp {
+    pub issuer: String,
+    /// JWKS fetches served so far.
+    pub jwks_hits: Arc<AtomicUsize>,
+}
+
+/// Discovery, JWKS and a token endpoint that accepts any code and answers
+/// with the ID token `mint` builds — or `mint`'s status, e.g. a 401 for
+/// client credentials it refuses. No `/authorize`: the caller skips straight
+/// to `OidcClient::exchange_and_verify`.
+pub async fn spawn_token_idp(
+    mint: impl Fn(&TokenRequest) -> Result<String, StatusCode> + Send + Sync + 'static,
+) -> TokenIdp {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock IdP");
+    let issuer = format!("http://{}", listener.local_addr().expect("local addr"));
+    let jwks_hits = Arc::new(AtomicUsize::new(0));
+    let state = Arc::new(TokenIdpState {
+        issuer: issuer.clone(),
+        jwks_hits: Arc::clone(&jwks_hits),
+        mint: Box::new(mint),
+    });
+    let app = Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            get(|State(s): State<Arc<TokenIdpState>>| async move {
+                Json(discovery_document(&s.issuer))
+            }),
+        )
+        .route(
+            "/jwks.json",
+            get(|State(s): State<Arc<TokenIdpState>>| async move {
+                s.jwks_hits.fetch_add(1, Ordering::SeqCst);
+                Json(jwks_document())
+            }),
+        )
+        .route("/token", post(token_only))
+        .with_state(state);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    TokenIdp { issuer, jwks_hits }
+}
+
+async fn token_only(
+    State(s): State<Arc<TokenIdpState>>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Result<Json<Value>, StatusCode> {
+    let request = TokenRequest {
+        issuer: s.issuer.clone(),
+        headers,
+        form,
+    };
+    let id_token = (s.mint)(&request)?;
+    Ok(Json(json!({
+        "access_token": "test-access",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "id_token": id_token,
+    })))
 }

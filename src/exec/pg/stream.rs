@@ -8,7 +8,9 @@ use sqlx::error::BoxDynError;
 use sqlx::postgres::types::Oid;
 use sqlx::postgres::{PgArgumentBuffer, PgArguments, PgRow, PgTypeInfo};
 use sqlx::query::Query;
-use sqlx::{Column, Either, Encode, Executor, Postgres, Row, Transaction, Type, TypeInfo};
+use sqlx::{
+    Column, Either, Encode, Executor, Postgres, Row, SqlSafeStr, Transaction, Type, TypeInfo,
+};
 use tokio::sync::Semaphore;
 
 use super::super::adapter::ExecError;
@@ -59,16 +61,12 @@ pub(super) async fn stream_rows(
     };
     let mut decoders_for_rows = Vec::new();
 
-    // Unnamed statement: ad-hoc SQL must not accumulate in the connection's
-    // prepared-statement cache. Running the caller's SQL is this path's job:
-    // the guard, the grant and the role's privileges bound it, not sqlx.
-    let mut sqlx_query = sqlx::query(sqlx::AssertSqlSafe(query.sql)).persistent(false);
-    for bind in query.binds {
-        sqlx_query = sqlx_query.bind(*bind);
-    }
-    for param in params {
-        sqlx_query = bind_param(sqlx_query, param);
-    }
+    // A read was prepared by `describe`, and the driver's cache hands that
+    // statement back: no second Parse. A write runs unnamed, so ad-hoc SQL
+    // does not accumulate in the connection's prepared-statement cache.
+    // Running the caller's SQL is this path's job: the guard, the grant and
+    // the role's privileges bound it, not sqlx.
+    let sqlx_query = bound_query(sqlx::AssertSqlSafe(query.sql), query.binds, params);
     // `Executor::fetch_many` (not the deprecated `Query::fetch_many`) is the
     // one stream that yields the statement's completion — and with it
     // `rows_affected` — alongside its rows.
@@ -128,6 +126,37 @@ pub(super) async fn stream_rows(
         }
     }
     Ok(collected)
+}
+
+/// `sql` with `binds`, then `params`, bound to its `$n` in that order.
+pub(super) fn bound_query<'q>(
+    sql: impl SqlSafeStr,
+    binds: &'q [&'q str],
+    params: &'q [QueryParam],
+) -> Query<'q, Postgres, PgArguments> {
+    let mut query = sqlx::query(sql).persistent(false);
+    for bind in binds {
+        query = query.bind(*bind);
+    }
+    for param in params {
+        query = bind_param(query, param);
+    }
+    query
+}
+
+/// The types [`bound_query`] binds `binds` and `params` with, in its order:
+/// a statement prepared with them takes those binds unchanged.
+pub(super) fn bound_types(binds: &[&str], params: &[QueryParam]) -> Vec<PgTypeInfo> {
+    let binds = binds.iter().map(|_| <&str as Type<Postgres>>::type_info());
+    let params = params.iter().map(|param| match param {
+        QueryParam::Null => UntypedNull::type_info(),
+        QueryParam::Bool(_) => <bool as Type<Postgres>>::type_info(),
+        QueryParam::Int(_) => <i64 as Type<Postgres>>::type_info(),
+        QueryParam::Float(_) => <f64 as Type<Postgres>>::type_info(),
+        QueryParam::Text(_) => <&str as Type<Postgres>>::type_info(),
+        QueryParam::Json(_) => <Value as Type<Postgres>>::type_info(),
+    });
+    binds.chain(params).collect()
 }
 
 fn bind_param<'q>(

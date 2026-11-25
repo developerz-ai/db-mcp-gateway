@@ -8,7 +8,7 @@
 |---|---|
 | #373 cargo-minor | Merge after 01; mongodb 3.10 raises MSRV → H7 first (`rust-version`, `README.md:15`, `CLAUDE.md` Stack). Verify in the release notes |
 | #374 / #375 axum-server 0.9 | One test compile error: `tests/it_offline/tls_reload.rs:81` (`from_tcp_rustls` returns `Result`). #375 shows an automated run in progress — check before pushing. Merge, then close #375 |
-| #372 `.mcp.json` | Close: `tests/public_tree.rs:330` forbids it by design; stop the writer (SET-6) |
+| #372 `.mcp.json` | Close: `tests/public_tree.rs:330` forbids it by design; stop the writer |
 | sqlx 0.9 wip branch `origin/dz/clear-rustsec-2023-0071-…` | Finish (never compiled; call sites wrapped, stub + lock done). Rebase, MSRV 1.94.1, stale text `CONTRIBUTING.md:228,273`, `.cargo/audit.toml`, skill `:52`; `bin/ci`; removes the only audit ignore. Land **after** 02 (shares `exec/pg/run.rs`). Label |
 | #218 archive/capture, #222 glama | H10 |
 | New issues to file | axum 0.8; toolchain 1.96 → current (`rust-toolchain.toml` + Dockerfile + blueprint together) |

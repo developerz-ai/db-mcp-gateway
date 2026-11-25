@@ -10,6 +10,7 @@ use crate::audit::stream::StreamSinks;
 use crate::audit::{self, AuditRow, OutcomeCode};
 use crate::exec::Access;
 
+use super::failure_hold::{FailedAuditWrite, audit_failures};
 use super::metric_names::{ACCESS_UNKNOWN, AUDIT_FALLBACK_FAILURES, CallLabels};
 use super::{Outcome, WriteState};
 
@@ -133,6 +134,7 @@ impl Drop for CancelledAuditGuard {
                 Ok(()) => sinks.send(&row, &tasks),
                 Err(err) => {
                     counter!(AUDIT_FALLBACK_FAILURES).increment(1);
+                    audit_failures().mark(FailedAuditWrite::Fallback);
                     tracing::error!(
                         %err,
                         class = %err.class(),

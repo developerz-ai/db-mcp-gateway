@@ -15,6 +15,8 @@ use db_mcp_gateway::exec::{Access, AdapterRegistry, ExecError, ExecQuery};
 use db_mcp_gateway::state;
 use std::io::Write;
 
+use crate::common::gateway::config_file;
+
 fn yaml_with_password(reference: &str) -> String {
     format!(
         r#"
@@ -38,8 +40,7 @@ fn file_reference_resolves_at_boot() {
     writeln!(file, "hunter2").unwrap();
     let path = file.path().display().to_string();
 
-    let cfg = ConfigFile::from_yaml_str(&yaml_with_password(&format!("${{FILE:{path}}}")))
-        .expect("YAML parses with FILE ref");
+    let cfg = config_file(&yaml_with_password(&format!("${{FILE:{path}}}")));
 
     // Sanity: the parsed Password is a File variant, not a literal.
     assert!(matches!(
@@ -60,8 +61,7 @@ fn env_reference_resolves_when_var_set() {
         std::env::set_var(&name, "from-env");
     }
 
-    let cfg = ConfigFile::from_yaml_str(&yaml_with_password(&format!("${{ENV:{name}}}")))
-        .expect("YAML parses with ENV ref");
+    let cfg = config_file(&yaml_with_password(&format!("${{ENV:{name}}}")));
     cfg.resolve_secrets().expect("env ref resolves cleanly");
 
     unsafe {
@@ -75,8 +75,7 @@ fn missing_env_aborts_boot_with_typed_error() {
     // Use a UUID-suffixed name so we don't accidentally collide with a real
     // var on the runner.
     let name = format!("DB_MCP_SECRET_MISSING_{}", uuid::Uuid::new_v4().simple());
-    let cfg = ConfigFile::from_yaml_str(&yaml_with_password(&format!("${{ENV:{name}}}")))
-        .expect("YAML parse succeeds — the ref is well-formed, just unset");
+    let cfg = config_file(&yaml_with_password(&format!("${{ENV:{name}}}")));
 
     match cfg.resolve_secrets() {
         Err(SecretError::EnvNotSet(n)) => assert_eq!(n, name),
@@ -87,10 +86,9 @@ fn missing_env_aborts_boot_with_typed_error() {
 #[test]
 #[serial_test::parallel(world)]
 fn missing_file_aborts_boot_with_typed_error() {
-    let cfg = ConfigFile::from_yaml_str(&yaml_with_password(
+    let cfg = config_file(&yaml_with_password(
         "${FILE:/nonexistent/db-mcp/secret-15-test}",
-    ))
-    .expect("YAML parse succeeds — well-formed FILE ref");
+    ));
 
     match cfg.resolve_secrets() {
         Err(SecretError::FileUnreadable { path, .. }) => assert!(
@@ -109,8 +107,7 @@ fn empty_file_aborts_boot() {
     let file = tempfile::NamedTempFile::new().expect("tempfile");
     let path = file.path().display().to_string();
 
-    let cfg = ConfigFile::from_yaml_str(&yaml_with_password(&format!("${{FILE:{path}}}")))
-        .expect("YAML parses");
+    let cfg = config_file(&yaml_with_password(&format!("${{FILE:{path}}}")));
 
     assert!(matches!(
         cfg.resolve_secrets(),
@@ -143,8 +140,7 @@ fn legacy_braced_syntax_is_rejected_at_parse() {
 #[test]
 #[serial_test::parallel(world)]
 fn unimplemented_backend_aborts_boot() {
-    let cfg = ConfigFile::from_yaml_str(&yaml_with_password("vault:secret/prod/app_ro"))
-        .expect("YAML parse succeeds");
+    let cfg = config_file(&yaml_with_password("vault:secret/prod/app_ro"));
 
     match cfg.resolve_secrets() {
         Err(SecretError::BackendNotImplemented(scheme)) => assert_eq!(scheme, "vault"),

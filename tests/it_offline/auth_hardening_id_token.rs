@@ -6,25 +6,17 @@
 //! drive the real `OidcClient::exchange_and_verify` path against an in-process
 //! IdP that omits the claim.
 //!
-//! Deliberately self-contained (no `tests/common`, no state DB): the mock only
-//! needs discovery, JWKS, and a token endpoint, so these run anywhere.
+//! The mock is `common::idp`'s verify-only IdP (no state DB): it only needs
+//! discovery, JWKS, and a token endpoint, so these run anywhere.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
-use axum::routing::{get, post};
-use axum::{Json, Router};
 use db_mcp_gateway::auth::{AuthConfig, AuthError, OidcClient};
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use serde_json::{Value, json};
+use serde_json::json;
 
-/// Same committed test keypair the e2e mock IdP uses. Not security-sensitive:
-/// the private key is plainly in the repo and never touches a prod path.
-const TEST_KEY_PEM: &str = include_str!("../data/test_idp_key.pem");
-const TEST_JWK: &str = include_str!("../data/test_idp_pub.jwk.json");
-const TEST_KID: &str = "test-kid-1";
+use crate::common::idp::{TEST_KID, now_secs, sign_rs256, spawn_token_idp};
+
 const CLIENT_ID: &str = "hardening-client";
 const NONCE: &str = "hardening-nonce";
 
@@ -34,15 +26,6 @@ enum Omitted {
     Nothing,
     Aud,
     Iss,
-}
-
-#[derive(Clone, Debug)]
-struct MockIdp {
-    issuer: String,
-    omitted: Omitted,
-    /// `kid` the minted ID token names.
-    kid: &'static str,
-    jwks_hits: Arc<AtomicUsize>,
 }
 
 /// Boot a mock IdP that mints an ID token missing `omitted`, and return an
@@ -59,71 +42,24 @@ async fn mock(
     kid: &'static str,
     issuer_suffix: &str,
 ) -> (OidcClient, Arc<AtomicUsize>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock IdP");
-    let issuer = format!("http://{}", listener.local_addr().expect("local addr"));
-    let jwks_hits = Arc::new(AtomicUsize::new(0));
-    let state = MockIdp {
-        issuer: issuer.clone(),
-        omitted,
-        kid,
-        jwks_hits: Arc::clone(&jwks_hits),
-    };
-    let app = Router::new()
-        .route("/.well-known/openid-configuration", get(discovery))
-        .route("/jwks.json", get(jwks))
-        .route("/token", post(token))
-        .with_state(state);
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
+    let idp = spawn_token_idp(move |req| Ok(sign_id_token(&req.issuer, omitted, kid))).await;
     let client = OidcClient::new(AuthConfig {
-        issuer: format!("{issuer}{issuer_suffix}"),
+        issuer: format!("{}{issuer_suffix}", idp.issuer),
         client_id: CLIENT_ID.to_string(),
         client_secret: "hardening-secret".into(),
         audience: CLIENT_ID.to_string(),
         ..AuthConfig::default()
     })
     .expect("OidcClient http builder");
-    (client, jwks_hits)
+    (client, idp.jwks_hits)
 }
 
-async fn discovery(State(idp): State<MockIdp>) -> Json<Value> {
-    Json(json!({
-        "issuer": idp.issuer,
-        "authorization_endpoint": format!("{}/authorize", idp.issuer),
-        "token_endpoint": format!("{}/token", idp.issuer),
-        "jwks_uri": format!("{}/jwks.json", idp.issuer),
-        "id_token_signing_alg_values_supported": ["RS256"],
-    }))
-}
-
-async fn jwks(State(idp): State<MockIdp>) -> Json<Value> {
-    idp.jwks_hits.fetch_add(1, Ordering::SeqCst);
-    let jwk: Value = serde_json::from_str(TEST_JWK).expect("static JWK is valid JSON");
-    Json(json!({ "keys": [jwk] }))
-}
-
-async fn token(State(idp): State<MockIdp>) -> Json<Value> {
-    Json(json!({
-        "access_token": "hardening-access",
-        "token_type": "Bearer",
-        "expires_in": 3600,
-        "id_token": sign_id_token(&idp),
-    }))
-}
-
-/// RS256-sign an otherwise fully valid ID token — correct `kid`, `exp`,
-/// `nonce`, `sub`, verified `email` — minus the omitted claim.
-fn sign_id_token(idp: &MockIdp) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock past UNIX epoch")
-        .as_secs();
+/// RS256-sign an otherwise fully valid ID token — `kid`, `exp`, `nonce`,
+/// `sub`, verified `email` — minus the omitted claim.
+fn sign_id_token(issuer: &str, omitted: Omitted, kid: &str) -> String {
+    let now = now_secs();
     let mut claims = json!({
-        "iss": idp.issuer,
+        "iss": issuer,
         "aud": CLIENT_ID,
         "sub": "hardening-subject",
         "exp": now + 3600,
@@ -134,20 +70,12 @@ fn sign_id_token(idp: &MockIdp) -> String {
         "groups": ["engineers"],
     });
     let object = claims.as_object_mut().expect("claims are a JSON object");
-    match idp.omitted {
+    match omitted {
         Omitted::Nothing => None,
         Omitted::Aud => object.remove("aud"),
         Omitted::Iss => object.remove("iss"),
     };
-
-    let mut header = Header::new(Algorithm::RS256);
-    header.kid = Some(idp.kid.to_string());
-    jsonwebtoken::encode(
-        &header,
-        &claims,
-        &EncodingKey::from_rsa_pem(TEST_KEY_PEM.as_bytes()).expect("static test key parses"),
-    )
-    .expect("ID token encoding never fails for our static inputs")
+    sign_rs256(&claims, kid)
 }
 
 /// Baseline: the happy path still verifies once the claims are required, so the

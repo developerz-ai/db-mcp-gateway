@@ -11,7 +11,7 @@ Make the gateway great for agents (fewer failed calls, self-explaining limits) a
 - Evidence level per row: **V** = re-read by the coordinator or executed; **R** = read by one agent; **P** = plausible, reproducing test first. Line refs are `ad833b7`; re-verify before trusting.
 
 ## Public-tree rules for this plan
-- `SET-n` rows: detail lives in the owner's private notes (ask the owner), not here. Slice 02 was published after 2.3.1 shipped.
+- Repository-settings rows: detail lives in the owner's private notes (ask the owner), not here. Slice 02 was published after 2.3.1 shipped.
 - Deployment and consumer-platform slices exist in their own repositories; nothing about them here.
 
 ## Plan files (execute in order)
@@ -69,4 +69,4 @@ Docs-only PRs of slice 07 (P0 first) may land any time after wave 0, between wav
 | H9 | Compatibility call in slice 02 | Owner; private |
 | H10 | #218 archive/capture policies; `glama.json`; `.coderabbit.yaml`; `.devin/` | Roadmap "not planned"; do glama sign-in; delete the other two if uninstalled |
 | H11 | MySQL query target; masking; JIT expiring grants; image signing | Next-plan candidates, in that order of evaluator impact: signing (S), expiry (M), MySQL (L), masking (L) |
-| H12 | `SET-n` repository settings | Owner applies; needs admin scope |
+| H12 | Repository settings | Owner applies; needs admin scope |

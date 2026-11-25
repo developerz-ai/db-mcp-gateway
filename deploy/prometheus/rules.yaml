@@ -14,18 +14,22 @@ groups:
   - name: db-mcp-gateway.audit
     rules:
       - alert: GatewayAuditUnavailable
-        # increase() needs two samples of a series, so a refusal before a new
-        # pod's first scrape (its series born above 0) would never show: the
-        # second clause catches a series that is non-zero but absent 5m ago,
-        # from a process that booted in the last 10m. Absent 5m ago alone is
-        # also every series after a scrape outage longer than the lookback:
-        # without the boot gate a long-lived pod's old count fired again.
-        expr: sum(increase(tool_calls{outcome="audit_unavailable"}[5m])) > 0 or sum((tool_calls{outcome="audit_unavailable"} > 0 unless tool_calls{outcome="audit_unavailable"} offset 5m) and on (job, instance) (time() - process_start_time_seconds < 600)) > 0
+        # The gauge is 1 until 15m after the last refusal, timed by the gateway
+        # on its monotonic clock, so a pod first scraped within those 15m still
+        # shows a refusal increase() cannot (a counter born above 0 has none),
+        # and no wall clock matters. max_over_time: any scrape of the last 5m
+        # counts, so one between two evaluations, or the last before a pod goes
+        # away, still fires. Resolves up to 5m after the hold (20m after the
+        # refusal), or within 5m of the last scrape when the pod goes away, plus
+        # one evaluation interval. Evaluate and scrape at least every 2m.
+        # An image without the gauge keeps only increase(): roll the image
+        # before these rules (GatewayOlderThanRules).
+        expr: sum(increase(tool_calls{outcome="audit_unavailable"}[5m])) > 0 or max(max_over_time(audit_failure_recent{kind="write"}[5m])) > 0
         labels:
           severity: critical
         annotations:
           summary: Tool calls refused because the audit store refused a write.
-          description: '{{ $value | humanize }} tool calls answered audit_unavailable in 5m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+          description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
           runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - alert: GatewayAuditWriteSlow
         expr: histogram_quantile(0.95, sum by (le) (rate(audit_write_duration_seconds_bucket[5m]))) > 0.25
@@ -37,15 +41,30 @@ groups:
           description: 'Audit write p95 is {{ $value | humanizeDuration }}. Every response waits on this insert; at 15 s it becomes audit_unavailable.'
           runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditwriteslow
       - alert: GatewayAuditFallbackFailures
-        # Second clause: a failure before a new pod's first scrape, gated on
-        # a boot in the last 20m, as in GatewayAuditUnavailable.
-        expr: sum(increase(audit_fallback_failures_total[15m])) > 0 or sum((audit_fallback_failures_total > 0 unless audit_fallback_failures_total offset 15m) and on (job, instance) (time() - process_start_time_seconds < 1200)) > 0
+        # As in GatewayAuditUnavailable; this gauge holds for 30m (resolves up
+        # to 35m after the failure plus one evaluation interval), increase()
+        # looks back 15m.
+        expr: sum(increase(audit_fallback_failures_total[15m])) > 0 or max(max_over_time(audit_failure_recent{kind="fallback"}[5m])) > 0
         labels:
           severity: warning
         annotations:
-          summary: Disconnect-path audit writes failed.
-          description: '{{ $value | humanize }} disconnect-path audit writes failed in 15m; those calls are recorded only once the reaper marks them abandoned.'
+          summary: Fallback audit writes failed.
+          description: 'Fallback audit writes (after a disconnect, or a failed completion write) failed in the last 35m. The reaper records those calls that committed an intent as abandoned; the others have no audit row.'
           runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditfallbackfailures
+      - alert: GatewayOlderThanRules
+        # A gateway target exporting no audit_failure_recent: an image older
+        # than these rules. Other programs export a build_info too, so a
+        # gateway is one that also exports audit_abandoned_total. Matched on
+        # every target label and within one scrape, so an outage takes both
+        # sides away; 15m outlasts a rollout.
+        expr: build_info and ignoring (version, git_sha) audit_abandoned_total unless ignoring (version, git_sha, kind) audit_failure_recent{kind="write"}
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: A gateway runs an image older than the alert rules.
+          description: '{{ $labels.instance }} runs {{ $labels.version }}, which exports no audit_failure_recent: an audit failure before its first scrape does not alert.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayolderthanrules
       - alert: GatewayAuditAbandoned
         expr: sum(increase(audit_abandoned_total[15m])) > 0
         labels:

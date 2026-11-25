@@ -62,6 +62,8 @@ pub struct RedisAdapter {
     db_label: String,
     /// The ACL username, redacted out of every server message.
     role: String,
+    /// Bound on waiting for a caller slot or a pooled connection.
+    acquire_timeout: Duration,
     /// Set when the server rejected the credentials; the registry then
     /// replaces this adapter so the password is resolved again.
     stale: AtomicBool,
@@ -134,16 +136,24 @@ impl RedisAdapter {
             callers: CallerSlots::new(sizing),
             db_label,
             role: database.role.clone(),
+            acquire_timeout: POOL_ACQUIRE_TIMEOUT,
             stale: AtomicBool::new(false),
         })
     }
 
-    /// A pooled connection, waited for at most [`POOL_ACQUIRE_TIMEOUT`] —
+    /// Replace the [`POOL_ACQUIRE_TIMEOUT`] bound, so a test can saturate
+    /// the pool without waiting out the production value.
+    pub fn with_acquire_timeout(mut self, wait: Duration) -> Self {
+        self.acquire_timeout = wait;
+        self
+    }
+
+    /// A pooled connection, waited for at most `acquire_timeout` —
     /// outside the statement budget, as on Postgres: a saturated pool is
     /// `unavailable`, never a `timeout` of the caller's command.
     async fn lease(&self) -> Result<Lease, ExecError> {
         let started = Instant::now();
-        let leased = tokio::time::timeout(POOL_ACQUIRE_TIMEOUT, self.pool.lease()).await;
+        let leased = tokio::time::timeout(self.acquire_timeout, self.pool.lease()).await;
         record_acquire_wait(&self.db_label, "query", started.elapsed());
         match leased {
             Ok(Ok(lease)) => Ok(lease),
@@ -237,7 +247,7 @@ impl DbAdapter for RedisAdapter {
         let command = rejector::validate_command(query.sql)
             .map_err(|err| ExecError::Forbidden(err.to_string()))?;
         // The caller's share of the pool first, as on Postgres.
-        let _slot = self.callers.take(POOL_ACQUIRE_TIMEOUT).await?;
+        let _slot = self.callers.take(self.acquire_timeout).await?;
         let lease = self.lease().await?;
         let budget =
             Duration::from_millis(u64::from(effective_timeout_ms(query.statement_timeout_ms)));

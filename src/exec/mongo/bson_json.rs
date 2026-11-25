@@ -1,17 +1,19 @@
 //! BSON → JSON rendering for tool responses.
 
-use mongodb::bson::{Bson, Document};
+use mongodb::bson::{Bson, Document, RawDocument};
 use serde_json::{Map, Value};
 
 use super::super::adapter::ExecError;
 
-/// Convert a `bson::Document` to a `serde_json::Value` using mongo's
+/// Convert a raw BSON document to a `serde_json::Value` using mongo's
 /// relaxed extended JSON format. Plain scalars / arrays / docs map 1:1;
 /// mongo-specific types (`ObjectId`, `Date`, `Decimal128`) render as the
 /// standard `{ "$oid": ... }` / `{ "$date": ... }` shapes operators
-/// expect — same rendering `mongosh` produces.
-pub(super) fn doc_to_json(doc: Document) -> Result<Value, ExecError> {
-    bson_to_json(Bson::Document(doc))
+/// expect — same rendering `mongosh` produces. Malformed BSON is the
+/// driver's opaque failure.
+pub(super) fn raw_to_json(raw: &RawDocument) -> Result<Value, ExecError> {
+    let document = Document::try_from(raw).map_err(|_| ExecError::Sql)?;
+    bson_to_json(Bson::Document(document))
 }
 
 /// A value that fails to serialize is an error, never a fabricated `null`
@@ -65,7 +67,7 @@ mod tests {
             "null": Bson::Null,
         };
         assert_eq!(
-            doc_to_json(doc).expect("renders"),
+            bson_to_json(Bson::Document(doc)).expect("renders"),
             json!({
                 "nan": { "$numberDouble": "NaN" },
                 "inf": { "$numberDouble": "Infinity" },
@@ -82,7 +84,7 @@ mod tests {
     fn other_values_keep_their_extended_json_shape() {
         let oid = ObjectId::parse_str("507f1f77bcf86cd799439011").expect("oid");
         let doc = doc! { "z": 1_i32, "a": 2_i64, "id": oid, "s": "x", "f": -0.25 };
-        let rendered = doc_to_json(doc).expect("renders");
+        let rendered = bson_to_json(Bson::Document(doc)).expect("renders");
         assert_eq!(
             rendered,
             json!({ "z": 1, "a": 2, "id": { "$oid": "507f1f77bcf86cd799439011" }, "s": "x", "f": -0.25 })

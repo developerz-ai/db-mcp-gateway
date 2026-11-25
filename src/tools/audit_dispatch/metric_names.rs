@@ -7,6 +7,7 @@ use crate::audit::OutcomeCode;
 use crate::config::ConfigFile;
 
 use super::AuditHeader;
+use super::failure_hold::{FailedAuditWrite, audit_failures};
 
 /// Per-call counter — `tool` is the tool name, `outcome` is the spec 03 code
 /// the client saw (`success`/`forbidden`/`audit_unavailable`/…), `access` is
@@ -64,6 +65,9 @@ impl CallLabels {
 
     /// Count one call: per tool always, per database when it named one.
     pub(super) fn count(&self, code: OutcomeCode, access: &'static str) {
+        if code == OutcomeCode::AuditUnavailable {
+            audit_failures().mark(FailedAuditWrite::Write);
+        }
         counter!(
             TOOL_CALLS,
             "tool" => self.tool,

@@ -14,7 +14,7 @@
 2. Second PR: `pages.yml` two jobs exactly as `fixed_layout` in `tests/bin/pages-workflow.test.sh` pins (`build` uploads, `deploy` `needs: build`, `artifact_name: github-pages`, `find -print -quit` guard, no process substitution). Run that script until 0 failed.
 3. Same PR: `--no-renames`; a `gate` job (`if: always()`, `needs:` every quality job incl. `changes`, `public-tree`, `secret-scan`) that fails on any result other than `success`, or `skipped` only when `changes` succeeded with `code == false`. Add a `scripts` job running `tests/bin/*.test.sh` (all five) — the gap that let a red guard merge.
 4. `merge.needs` gains `public-tree`, `secret-scan`.
-5. Owner: make `gate` the single required check in the ruleset, then remove classic protection (SET-3). Order matters: require `gate` before un-requiring the rest.
+5. Owner: make `gate` the single required check in the ruleset, then remove classic protection. Order matters: require `gate` before un-requiring the rest.
 
 ## Tests
 - `bash tests/bin/pages-workflow.test.sh`; `bin/ci`. A throwaway PR with a forced `changes` failure must leave `gate` red.

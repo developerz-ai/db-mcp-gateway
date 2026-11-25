@@ -133,10 +133,14 @@ impl DbRejection {
 /// [`MAX_MESSAGE_CHARS`].
 fn redact_role(text: &str, role: &str) -> String {
     let quoted_role = format!("\"{role}\"");
-    text.replace(&quoted_role, ROLE_PLACEHOLDER)
-        .chars()
-        .take(MAX_MESSAGE_CHARS)
-        .collect()
+    // Repeat until none is left: a single `replace` pass skips an occurrence
+    // that shares its opening quote with the previous one (`"app"app"`). Ends:
+    // every pass removes a role-name occurrence and the placeholder adds none.
+    let mut redacted = text.to_string();
+    while redacted.contains(&quoted_role) {
+        redacted = redacted.replace(&quoted_role, ROLE_PLACEHOLDER);
+    }
+    redacted.chars().take(MAX_MESSAGE_CHARS).collect()
 }
 
 impl fmt::Display for DbRejection {
@@ -173,6 +177,13 @@ mod tests {
             r#"permission denied to set role "<role>" for application"#
         );
         assert_eq!(r.to_string(), format!("42501 {}", r.message()));
+    }
+
+    #[test]
+    fn redacts_quoted_role_occurrences_that_share_a_quote() {
+        let r = DbRejection::new("42501", r#"role "app"app" and "app""app""#, "app");
+        assert!(!r.message().contains(r#""app""#), "{}", r.message());
+        assert_eq!(r.message(), r#"role "<role>"<role>" and "<role>""<role>""#);
     }
 
     #[test]

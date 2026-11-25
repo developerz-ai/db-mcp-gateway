@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::common::gateway::config_file;
 use crate::common::mongo_target;
 use db_mcp_gateway::config::{ConfigFile, Database, Password, Server};
 use db_mcp_gateway::exec::{Access, AdapterRegistry, ExecError, ExecQuery};
@@ -108,7 +109,7 @@ permissions:
         action: query_read
 "#
     );
-    ConfigFile::from_yaml_str(&yaml).expect("registry test yaml is well-formed")
+    config_file(&yaml)
 }
 
 fn target<'a>(config: &'a ConfigFile, server: &str) -> (&'a Server, &'a Database) {

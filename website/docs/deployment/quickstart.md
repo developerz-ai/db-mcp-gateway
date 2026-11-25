@@ -447,7 +447,8 @@ Names are fixed — dashboards and alerts are written against them. No label car
 | `tool_calls_by_db` | counter | `db` (`server/database`), `outcome`, `access` — only calls that named a database the config holds; a name the caller made up never becomes a label |
 | `query_duration_seconds` | histogram (fixed buckets 5 ms – 60 s) | `tool`, `db` (empty when the call named no configured database) |
 | `audit_write_duration_seconds` | histogram (fixed buckets 1 ms – 5 s) | — |
-| `audit_fallback_failures_total` | counter | — (a disconnect-path audit write failed; the row exists only once the reaper records it) |
+| `audit_fallback_failures_total` | counter | — (a call's detached audit write failed, after a disconnect or after its completion write failed. The reaper records the call as `abandoned` if it committed an intent, i.e. was about to reach a target; otherwise, e.g. `list_servers`, only the log has it) |
+| `audit_failure_recent` | gauge (`0`/`1`) | `kind` (`write`: an MCP tool call answered `audit_unavailable`, held 15 min; `fallback`: a detached write failed, after a disconnect or after the completion write failed, held 30 min) — `1` from a failure until the hold after the last one ends, timed on the gateway's monotonic clock; evaluated on every scrape, `0` from boot. A restart drops it, so a failure on a pod replaced before any scrape is not seen, nor is one during the shutdown drain (this listener stops at `SIGTERM`); admin API (`permissions_audit`) failures never set it |
 | `audit_abandoned_total` | counter | — (intents the reaper recorded as `abandoned`; only the lock-holding replica increments it, so `sum()` across replicas is exact) |
 | `audit_reaper_last_success_timestamp` | gauge | — (Unix seconds of the last completed reaper sweep; alert when it falls behind) |
 | `audit_pruner_runs_total` | counter | `result` (`ok`/`error`) |
@@ -467,7 +468,7 @@ Names are fixed — dashboards and alerts are written against them. No label car
 | `config_info` | gauge (`1`) | `hash` (first 12 hex of the SHA-256 of the parsed config with every credential field (`password`, `write_password`, `token`, `tokens`) removed; `${…}` references are never resolved) |
 | `tls_cert_not_after_timestamp` | gauge (unix seconds) | — (the served leaf certificate; absent with `TLS_DISABLED`) |
 | `build_info` | gauge (`1`) | `version`, `git_sha` (`unknown` when the build had no `GIT_SHA`) |
-| `process_start_time_seconds` | gauge (unix seconds) | — (set at boot; the audit alerts use it to tell a new pod's first scrape from scrapes resuming after an outage) |
+| `process_start_time_seconds` | gauge (unix seconds) | — (set at boot) |
 | `log_lines_dropped_total` | counter | — |
 
 `audit_stream_dropped_total` counts only syslog deliveries that failed. The `stdout` stream sink writes through the same non-blocking log queue as every other log line, so an audit row it drops when that queue is full is counted only in `log_lines_dropped_total` — the two are not separable by metric. Every stream sink is a best-effort copy; the state DB row is the record.

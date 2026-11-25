@@ -250,12 +250,12 @@ async fn bad_params_are_invalid_arguments_and_audited() {
     assert_eq!(db_type.as_deref(), Some("redis"));
 }
 
-/// `relacl` is `aclitem[]`, which has no binary form: the read runs a second
-/// time with it cast to text, params bound to both attempts — and a `;`
-/// followed by a comment still ends the statement the probe nests.
+/// `relacl` is `aclitem[]`, which has no binary form: the read runs with
+/// it cast to text, params bound — and a `;` followed by a comment still
+/// ends the statement the cast nests.
 #[tokio::test]
 #[serial_test::parallel(world)]
-async fn the_text_cast_retry_carries_params_and_trailing_comments() {
+async fn the_text_cast_carries_params_and_trailing_comments() {
     let gw = boot().await;
     let resp = run_query(
         &gw,

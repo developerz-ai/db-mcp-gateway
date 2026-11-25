@@ -10,7 +10,7 @@ use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
 use crate::common::pg_target::{adapter, is_yugabyte, owner_url};
-use db_mcp_gateway::exec::{Access, DbAdapter, ExecError, ExecQuery};
+use db_mcp_gateway::exec::{Access, DbAdapter, ExecError, ExecQuery, QueryParam};
 
 fn read(sql: &str, row_limit: u32) -> ExecQuery<'_> {
     ExecQuery {
@@ -102,9 +102,9 @@ async fn every_type_renders_as_the_spec_says() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// `relacl` is `aclitem[]`, which has no binary form: the server refuses
-/// the whole result in binary, so the gateway asks again with that column
-/// cast to text — and only that column.
+/// `relacl` is `aclitem[]`, which has no binary form: the server would
+/// refuse the result in binary, so the gateway runs it with that column cast
+/// to text — and only that column.
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn select_star_from_pg_class_decodes() {
@@ -153,10 +153,9 @@ async fn select_star_from_pg_class_decodes() {
     );
 }
 
-/// The driver cannot look up an internal type (`pg_node_tree`), so the
-/// first attempt fails before anything runs; the text-cast attempt is the
-/// one that runs the statement, and a timeout there is the answer, not that
-/// first refusal.
+/// The driver cannot look up an internal type (`pg_node_tree`): the read is
+/// described, found to need the cast, and only the text-cast statement
+/// runs — its timeout is the answer.
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn a_timeout_on_the_text_cast_attempt_is_a_timeout() {
@@ -206,4 +205,211 @@ async fn a_rollback_by_the_target_is_unavailable_not_a_syntax_error() {
     .execute(&owner)
     .await
     .expect("drop raising function");
+}
+
+/// A function whose every call leaves a session advisory lock behind — a
+/// lock a rollback does not release — and returns how many calls this
+/// session has made, this one included. Reads run in a read-only
+/// transaction, so the lock is the one side effect that can outlive a
+/// failed attempt and count it.
+async fn create_call_counter(owner: &sqlx::PgPool) -> String {
+    let function = format!("dbmcp_calls_{}", Uuid::new_v4().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION {function}() RETURNS int VOLATILE LANGUAGE plpgsql AS $$ \
+         DECLARE n int; BEGIN \
+         SELECT count(*) INTO n FROM pg_locks WHERE locktype = 'advisory' \
+         AND pid = pg_backend_pid() AND classid = 4242 AND objsubid = 2; \
+         PERFORM pg_advisory_lock(4242, n); RETURN n + 1; END $$"
+    )))
+    .execute(owner)
+    .await
+    .expect("create call counter");
+    function
+}
+
+/// A read with a column the driver cannot take runs exactly once: the cast
+/// is decided before the statement runs, never by retrying a failure.
+/// `aclitem[]` fails only while the first row is sent — after the
+/// statement's functions ran — and `pg_node_tree` while the driver looks the
+/// type up.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_read_needing_the_text_cast_runs_once() {
+    // YugabyteDB ships advisory locks behind a preview flag the dev stack
+    // leaves off: the counter has nothing to count with there.
+    if is_yugabyte() {
+        return;
+    }
+    let owner = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&owner_url())
+        .await
+        .expect("target-db reachable; run `bin/dev up`");
+    let calls = create_call_counter(&owner).await;
+    let adapter = adapter().await;
+    for sql in [
+        format!("SELECT {calls}() AS calls, relacl FROM pg_class WHERE relacl IS NOT NULL LIMIT 1"),
+        format!("SELECT {calls}() AS calls, ev_action FROM pg_rewrite LIMIT 1"),
+    ] {
+        let result = adapter
+            .execute(read(&sql, 1))
+            .await
+            .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+        assert_eq!(result.columns[0], "calls", "{sql}: {result:?}");
+        assert_eq!(
+            result.rows,
+            vec![vec![json!(1), result.rows[0][1].clone()]],
+            "{sql}"
+        );
+        assert!(result.rows[0][1].is_string(), "{sql}: {result:?}");
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP FUNCTION {calls}()")))
+        .execute(&owner)
+        .await
+        .expect("drop call counter");
+}
+
+/// The cast is decided from the statement's description with the caller's
+/// params, never from a run with every param NULL: `array_fill` refuses a
+/// NULL dimension while the statement is planned. A plain `LIMIT $1` takes
+/// the cast too.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_text_cast_read_keeps_params_a_null_would_break() {
+    let adapter = adapter().await;
+    for sql in [
+        "SELECT relname, relacl FROM pg_class WHERE relacl IS NOT NULL ORDER BY oid LIMIT $1",
+        "SELECT relname, relacl FROM pg_class WHERE relacl IS NOT NULL ORDER BY oid \
+         LIMIT array_length(array_fill(0, ARRAY[$1::int]), 1)",
+        "SELECT relname, ev_action FROM pg_class JOIN pg_rewrite ON ev_class = pg_class.oid \
+         ORDER BY pg_rewrite.oid LIMIT array_length(array_fill(0, ARRAY[$1::int]), 1)",
+    ] {
+        let result = adapter
+            .execute_with_params(read(sql, 10), &[QueryParam::Int(1)])
+            .await
+            .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+        assert_eq!(result.rows.len(), 1, "{sql}: {result:?}");
+        assert!(result.rows[0][1].is_string(), "{sql}: {result:?}");
+    }
+}
+
+/// A zero-row read needing the cast still names its columns, the cast one
+/// as `text`.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_zero_row_text_cast_read_keeps_its_columns() {
+    let adapter = adapter().await;
+    let result = adapter
+        .execute(read("SELECT oid, relacl FROM pg_class WHERE false", 1))
+        .await
+        .expect("zero-row read");
+    assert!(result.rows.is_empty(), "{result:?}");
+    assert_eq!(result.columns, vec!["oid", "relacl"]);
+    assert_eq!(result.column_types, vec!["OID", "TEXT"]);
+}
+
+/// The read every fallback test runs: `ev_action` sends it through the
+/// cursor description, whose planning folds the immutable call — the
+/// fallback is what is slow, not the read. Returns `(function, sql)`.
+async fn slow_fallback(owner: &sqlx::PgPool) -> (String, String) {
+    let function = format!("dbmcp_slow_{}", Uuid::new_v4().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION {function}(s int) RETURNS int IMMUTABLE LANGUAGE plpgsql AS \
+         $$ BEGIN PERFORM pg_sleep(s); RETURN s; END $$"
+    )))
+    .execute(owner)
+    .await
+    .expect("create slow function");
+    let sql = format!("SELECT {function}(8), ev_action FROM pg_rewrite LIMIT 1");
+    (function, sql)
+}
+
+/// A timeout, a cancel or a lost connection while the fallback describes a
+/// read is reported as itself, never as the type lookup that led there.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn an_operational_failure_while_describing_is_reported_as_itself() {
+    let owner = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&owner_url())
+        .await
+        .expect("target-db reachable; run `bin/dev up`");
+    let (function, sql) = slow_fallback(&owner).await;
+    let adapter = adapter().await;
+
+    let timed_out = adapter
+        .execute(ExecQuery {
+            statement_timeout_ms: Some(300),
+            ..read(&sql, 1)
+        })
+        .await;
+
+    let victim = read(&sql, 1);
+    let request_id = victim.request_id;
+    let (cancelled, ()) = tokio::join!(adapter.execute(victim), async {
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if adapter
+                .cancel_request(request_id)
+                .await
+                .expect("cancel runs")
+            {
+                return;
+            }
+        }
+        panic!("the fallback was never cancelled");
+    });
+
+    let victim = read(&sql, 1);
+    let tag = format!("dbmcp-{}-%", victim.request_id.simple());
+    let (lost, ()) = tokio::join!(adapter.execute(victim), async {
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let killed: Vec<bool> = sqlx::query_scalar(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE application_name LIKE $1 AND query LIKE 'DECLARE%'",
+            )
+            .bind(&tag)
+            .fetch_all(&owner)
+            .await
+            .expect("terminate runs");
+            if killed.contains(&true) {
+                return;
+            }
+        }
+        panic!("the fallback was never seen");
+    });
+
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP FUNCTION {function}(int)"
+    )))
+    .execute(&owner)
+    .await
+    .expect("drop slow function");
+    assert!(
+        matches!(timed_out, Err(ExecError::Timeout)),
+        "{timed_out:?}"
+    );
+    assert!(
+        matches!(cancelled, Err(ExecError::Cancelled)),
+        "{cancelled:?}"
+    );
+    assert!(matches!(lost, Err(ExecError::Unavailable)), "{lost:?}");
+}
+
+/// What the target refuses while the fallback plans the caller's statement
+/// is the caller's error, with its own code.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_refusal_while_describing_keeps_its_sqlstate() {
+    let adapter = adapter().await;
+    let err = adapter
+        .execute(read("SELECT 1 / 0, ev_action FROM pg_rewrite LIMIT 1", 1))
+        .await
+        .expect_err("division by zero");
+    let ExecError::Rejected(rejection) = err else {
+        panic!("{err:?}")
+    };
+    assert_eq!(rejection.sqlstate(), "22012");
+    assert_eq!(rejection.position(), None);
 }

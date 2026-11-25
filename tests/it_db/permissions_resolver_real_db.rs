@@ -12,12 +12,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::common::env::state_pool;
+use crate::common::gateway::config_file;
 use db_mcp_gateway::auth::{Identity, SessionId};
 use db_mcp_gateway::authz::{
     Decision, PermissionsCache, can_see_server_effective, evaluate_effective,
     loader::load_db_grants_for,
 };
-use db_mcp_gateway::config::{Action, ConfigFile};
+use db_mcp_gateway::config::Action;
 use db_mcp_gateway::state::permissions::pg::PgPermissionsRepo;
 use db_mcp_gateway::state::permissions::{
     DbType, GrantAction, GrantTarget, LiveGrant, Page, PermissionsChange, PermissionsDatabase,
@@ -220,7 +221,7 @@ permissions:
       - {{ server: {server}, database: app, action: query_read, constraints: {{ row_limit: 10000 }} }}
 "#
     );
-    let cfg = ConfigFile::from_yaml_str(&yaml).expect("yaml parses");
+    let cfg = config_file(&yaml);
 
     let id = identity_for(&sub, &["devs"]);
     let db_grants = load_db_grants_for(&repo, &id.user_sub).await.unwrap();
@@ -279,7 +280,7 @@ servers:
       - {{ name: app, role: ro, password: pw }}
 "#
     );
-    let cfg = ConfigFile::from_yaml_str(&yaml).expect("yaml parses");
+    let cfg = config_file(&yaml);
 
     let id = identity_for(&sub, &[]); // no YAML group → YAML alone would deny
     let db_grants = load_db_grants_for(&repo, &id.user_sub).await.unwrap();

@@ -1,0 +1,11 @@
+config: tests/data/check/good.yaml
+secrets: not resolved (--no-secrets)
+error: environment variable METRICS_BIND: boot refuses its value
+error: environment variable SESSION_CACHE_TTL_SECONDS: boot refuses its value
+error: environment variable SESSION_TTL_HOURS: boot refuses its value
+error: environment variable ALLOW_INSECURE_SIGNING_KEY: boot refuses its value
+error: environment variable GROUPS_MAX_AGE: boot refuses its value
+error: environment variable TRUSTED_PROXIES: boot refuses its value
+error: environment variable PG_CANCEL_POOL_SIZE: boot refuses its value
+error: environment variable STATE_DB_CONNECT_TIMEOUT_SECONDS: boot refuses its value
+result: invalid (8 error(s), 0 warning(s))

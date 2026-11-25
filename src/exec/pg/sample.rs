@@ -2,7 +2,7 @@
 
 use super::super::ident::Identifier;
 
-/// Fetches one row past `row_limit` so the row cap in `run_query_inner`
+/// Fetches one row past `row_limit` so the row cap in `run_query`
 /// can see there is more and set `truncated`. `LIMIT` is a number we
 /// produce, and both names are [`Identifier`]s, which cannot contain `"` —
 /// so the interpolation cannot escape its quotes.

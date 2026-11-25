@@ -1,24 +1,15 @@
 //! The IdP-facing login options (`OIDC_SCOPES`, `OIDC_TOKEN_AUTH_METHOD`,
 //! `OIDC_GROUPS_PREFIX`) and the groups-claim shapes real IdPs emit, driven
-//! through `OidcClient` against an in-process IdP. Self-contained like
-//! `auth_hardening_id_token`: discovery, JWKS and a token endpoint only.
+//! through `OidcClient` against `common::idp`'s verify-only IdP: discovery,
+//! JWKS and a token endpoint only.
 
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{get, post};
-use axum::{Form, Json, Router};
 use base64::Engine;
 use db_mcp_gateway::auth::{AuthConfig, AuthError, LoginOptions, OidcClient, VerifiedIdentity};
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{Value, json};
-use std::collections::HashMap;
 
-const TEST_KEY_PEM: &str = include_str!("../data/test_idp_key.pem");
-const TEST_JWK: &str = include_str!("../data/test_idp_pub.jwk.json");
-const TEST_KID: &str = "test-kid-1";
+use crate::common::idp::{TEST_KID, TokenRequest, now_secs, sign_rs256, spawn_token_idp};
+
 const CLIENT_ID: &str = "options-client";
 /// `:` and `/` must survive Basic encoding (RFC 6749 §2.3.1).
 const CLIENT_SECRET: &str = "s3cr:t/+";
@@ -31,18 +22,10 @@ enum ClientAuth {
     Basic,
 }
 
-#[derive(Clone, Debug)]
-struct MockIdp {
-    issuer: String,
-    /// The one way this IdP accepts client credentials, as some Okta apps do.
-    accepts: ClientAuth,
-    claim: &'static str,
-    groups: Value,
-}
-
 struct Login {
     claim: &'static str,
     groups: Value,
+    /// The one way the IdP accepts client credentials, as some Okta apps do.
     accepts: ClientAuth,
     options: &'static [(&'static str, &'static str)],
 }
@@ -68,51 +51,33 @@ fn options(vars: &[(&str, &str)]) -> LoginOptions {
 }
 
 async fn client(login: Login) -> OidcClient {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock IdP");
-    let issuer = format!("http://{}", listener.local_addr().expect("local addr"));
-    let idp = MockIdp {
-        issuer: issuer.clone(),
-        accepts: login.accepts,
-        claim: login.claim,
-        groups: login.groups,
-    };
-    let app = Router::new()
-        .route("/.well-known/openid-configuration", get(discovery))
-        .route("/jwks.json", get(jwks))
-        .route("/token", post(token))
-        .with_state(Arc::new(idp));
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+    let Login {
+        claim,
+        groups,
+        accepts,
+        options: vars,
+    } = login;
+    let idp = spawn_token_idp(move |req| {
+        if presented_credentials(req, accepts)
+            != Some((CLIENT_ID.to_owned(), CLIENT_SECRET.to_owned()))
+        {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        Ok(sign_id_token(&req.issuer, claim, &groups))
+    })
+    .await;
     OidcClient::with_options(
         AuthConfig {
-            issuer,
+            issuer: idp.issuer,
             client_id: CLIENT_ID.to_owned(),
             client_secret: CLIENT_SECRET.into(),
             audience: CLIENT_ID.to_owned(),
-            groups_claim: login.claim.to_owned(),
+            groups_claim: claim.to_owned(),
             ..AuthConfig::default()
         },
-        options(login.options),
+        options(vars),
     )
     .expect("OidcClient http builder")
-}
-
-async fn discovery(State(idp): State<Arc<MockIdp>>) -> Json<Value> {
-    Json(json!({
-        "issuer": idp.issuer,
-        "authorization_endpoint": format!("{}/authorize", idp.issuer),
-        "token_endpoint": format!("{}/token", idp.issuer),
-        "jwks_uri": format!("{}/jwks.json", idp.issuer),
-        "id_token_signing_alg_values_supported": ["RS256"],
-    }))
-}
-
-async fn jwks() -> Json<Value> {
-    let jwk: Value = serde_json::from_str(TEST_JWK).expect("static JWK is valid JSON");
-    Json(json!({ "keys": [jwk] }))
 }
 
 /// `(id, secret)` from a Basic header, each form-urldecoded.
@@ -134,37 +99,23 @@ fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
     Some((unescape(id)?, unescape(secret)?))
 }
 
-async fn token(
-    State(idp): State<Arc<MockIdp>>,
-    headers: HeaderMap,
-    Form(form): Form<HashMap<String, String>>,
-) -> Result<Json<Value>, StatusCode> {
-    let in_form = (form.get("client_id"), form.get("client_secret"));
-    let presented = match idp.accepts {
-        ClientAuth::Post if headers.get("authorization").is_none() => match in_form {
+/// The client credentials, if sent the one way the IdP accepts.
+fn presented_credentials(req: &TokenRequest, accepts: ClientAuth) -> Option<(String, String)> {
+    let in_form = (req.form.get("client_id"), req.form.get("client_secret"));
+    match accepts {
+        ClientAuth::Post if req.headers.get("authorization").is_none() => match in_form {
             (Some(id), Some(secret)) => Some((id.clone(), secret.clone())),
             _ => None,
         },
-        ClientAuth::Basic if in_form.1.is_none() => basic_credentials(&headers),
+        ClientAuth::Basic if in_form.1.is_none() => basic_credentials(&req.headers),
         _ => None,
-    };
-    if presented != Some((CLIENT_ID.to_owned(), CLIENT_SECRET.to_owned())) {
-        return Err(StatusCode::UNAUTHORIZED);
     }
-    Ok(Json(json!({
-        "access_token": "options-access",
-        "token_type": "Bearer",
-        "id_token": sign_id_token(&idp),
-    })))
 }
 
-fn sign_id_token(idp: &MockIdp) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock past UNIX epoch")
-        .as_secs();
+fn sign_id_token(issuer: &str, claim: &str, groups: &Value) -> String {
+    let now = now_secs();
     let mut claims = json!({
-        "iss": idp.issuer,
+        "iss": issuer,
         "aud": CLIENT_ID,
         "sub": "options-subject",
         "exp": now + 3600,
@@ -173,15 +124,8 @@ fn sign_id_token(idp: &MockIdp) -> String {
         "email": "options@example.com",
         "email_verified": true,
     });
-    claims[idp.claim] = idp.groups.clone();
-    let mut header = Header::new(Algorithm::RS256);
-    header.kid = Some(TEST_KID.to_owned());
-    jsonwebtoken::encode(
-        &header,
-        &claims,
-        &EncodingKey::from_rsa_pem(TEST_KEY_PEM.as_bytes()).expect("static test key parses"),
-    )
-    .expect("ID token encoding never fails for our static inputs")
+    claims[claim] = groups.clone();
+    sign_rs256(&claims, TEST_KID)
 }
 
 async fn login(login: Login) -> Result<VerifiedIdentity, AuthError> {

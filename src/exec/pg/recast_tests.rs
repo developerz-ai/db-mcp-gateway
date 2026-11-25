@@ -1,8 +1,7 @@
-//! The wrapper text, the terminator cut, the probe's types and when a read
-//! is tried again.
+//! The wrapper text, the terminator cut and the types the nested statement
+//! is proven with.
 
 use super::*;
-use crate::exec::rejection::DbRejection;
 
 #[test]
 fn only_the_columns_without_binary_form_are_cast() {
@@ -43,7 +42,7 @@ fn the_body_ends_before_the_terminator_whatever_trails_it() {
 }
 
 #[test]
-fn the_probe_is_prepared_with_the_params_types_and_run_on_nulls() {
+fn the_body_is_proven_with_the_params_types() {
     assert_eq!(param_types(&[]), "");
     let params = [
         QueryParam::Null,
@@ -57,26 +56,4 @@ fn the_probe_is_prepared_with_the_params_types_and_run_on_nulls() {
         param_types(&params),
         " (unknown, bool, int8, float8, text, jsonb)"
     );
-    assert_eq!(execute_with_nulls("p", 0), "EXECUTE p");
-    assert_eq!(execute_with_nulls("p", 2), "EXECUTE p(NULL, NULL)");
-}
-
-#[test]
-fn only_a_read_refused_for_a_missing_function_is_tried_again() {
-    let rejected = |code| ExecError::Rejected(DbRejection::new(code, "", ""));
-    let mut query = ExecQuery {
-        sql: "SELECT relacl FROM pg_class",
-        binds: &[],
-        statement_timeout_ms: None,
-        row_limit: 1,
-        access: Access::ReadOnly,
-        dry_run: false,
-        request_id: uuid::Uuid::nil(),
-    };
-    assert!(may_apply(&rejected(NO_BINARY_OUTPUT), &query));
-    assert!(!may_apply(&rejected("42601"), &query));
-    assert!(may_apply(&ExecError::Sql, &query));
-    assert!(!may_apply(&ExecError::Timeout, &query));
-    query.access = Access::ReadWrite;
-    assert!(!may_apply(&rejected(NO_BINARY_OUTPUT), &query));
 }

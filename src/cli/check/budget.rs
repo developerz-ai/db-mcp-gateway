@@ -12,9 +12,10 @@ const STATE_BACKGROUND_POOL: u32 = 2;
 const STATE_LISTENER_POOL: u32 = 2;
 
 /// Each Postgres tier's `pg_cancel_backend` pool, as boot sizes it
-/// (`PG_CANCEL_POOL_SIZE`); the error names the variable, never more.
+/// (`PG_CANCEL_POOL_SIZE`); the error names the variable, never its value.
 pub fn cancel_pool_size() -> Result<u32, String> {
-    init_cancel_pool_size_from_env().map_err(|err| err.to_string())
+    init_cancel_pool_size_from_env()
+        .map_err(|_| "invalid PG_CANCEL_POOL_SIZE: expected an integer from 1 to 32".to_string())
 }
 
 pub fn print(config: &ConfigFile, cancel: u32) {
