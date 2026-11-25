@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use hmac::digest::Key;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -71,7 +72,7 @@ impl FlowKey {
 
 /// HMAC-SHA256 (RFC 2104) over the concatenation of `message`.
 fn hmac_sha256(key: &[u8], message: &[&[u8]]) -> [u8; 32] {
-    let mut mac = Hmac::<Sha256>::new(&block_key(key).into());
+    let mut mac = Hmac::<Sha256>::new(&block_key(key));
     for part in message {
         mac.update(part);
     }
@@ -80,8 +81,8 @@ fn hmac_sha256(key: &[u8], message: &[&[u8]]) -> [u8; 32] {
 
 /// `key` as the one full block RFC 2104 makes of any key. `Hmac` would do it,
 /// but only through `new_from_slice`, whose error no length of key can cause.
-fn block_key(key: &[u8]) -> [u8; 64] {
-    let mut block = [0; 64];
+fn block_key(key: &[u8]) -> Key<Hmac<Sha256>> {
+    let mut block = Key::<Hmac<Sha256>>::default();
     match block.get_mut(..key.len()) {
         Some(head) => head.copy_from_slice(key),
         None => block[..32].copy_from_slice(&Sha256::digest(key)),
