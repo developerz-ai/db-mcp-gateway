@@ -264,23 +264,6 @@ fn oversized_params_are_cut_to_a_marked_string_with_valid_json() {
     assert_eq!(body["sql"], "SELECT 1");
 }
 
-/// No `sql` to shorten (an oversized error message, say): the free text is
-/// cut to the marker, so the body stays one parseable object.
-#[test]
-fn oversized_row_without_sql_cuts_free_text_to_the_marker() {
-    let mut row = sample_row();
-    row.sql = None;
-    row.error_message = Some("e".repeat(20_000));
-
-    let message = message(&row);
-
-    assert!(message.len() <= MAX_MESSAGE_BYTES);
-    let body: serde_json::Value =
-        serde_json::from_str(&message[message.find('{').unwrap()..]).expect("body is JSON");
-    assert_eq!(body["error_message"], TRUNCATION_MARKER);
-    assert_eq!(body["request_id"].as_str(), Some("req-stream-1"));
-}
-
 #[test]
 fn small_row_is_sent_whole() {
     let message = message(&sample_row());

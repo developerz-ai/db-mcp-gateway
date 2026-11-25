@@ -2,10 +2,10 @@ apiVersion: v2
 name: db-mcp-gateway
 description: Self-hosted MCP gateway — audited, SSO-gated, read-only database access for AI agents.
 type: application
-# The chart's own version; bumped with any template change.
+# A checkout's version only; release.yml publishes the chart as the release's.
 version: 0.1.0
 # The image tag deployed when image.tag is empty.
-appVersion: "2.5.2"
+appVersion: "2.6.0"
 # lifecycle.preStop.sleep (PodLifecycleSleepAction) is on by default from 1.30.
 kubeVersion: ">=1.30.0-0"
 home: https://github.com/developerz-ai/db-mcp-gateway

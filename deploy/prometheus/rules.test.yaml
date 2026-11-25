@@ -57,16 +57,16 @@ tests:
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 28m
         alertname: GatewayAuditUnavailable
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 30m
         alertname: GatewayAuditUnavailable
@@ -122,16 +122,16 @@ tests:
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 5m
         alertname: GatewayAuditUnavailable
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 7m
         alertname: GatewayAuditUnavailable
@@ -172,16 +172,16 @@ tests:
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 5m
         alertname: GatewayAuditUnavailable
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 7m
         alertname: GatewayAuditUnavailable
@@ -231,16 +231,16 @@ tests:
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 34m
         alertname: GatewayAuditUnavailable
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 36m
         alertname: GatewayAuditUnavailable
@@ -253,16 +253,16 @@ tests:
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 54m
         alertname: GatewayAuditUnavailable
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 56m
         alertname: GatewayAuditUnavailable
@@ -332,24 +332,24 @@ tests:
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 24m
         alertname: GatewayAuditUnavailable
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 28m
         alertname: GatewayAuditUnavailable
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 30m
         alertname: GatewayAuditUnavailable
@@ -362,24 +362,24 @@ tests:
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 64m
         alertname: GatewayAuditUnavailable
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 68m
         alertname: GatewayAuditUnavailable
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 70m
         alertname: GatewayAuditUnavailable
@@ -432,16 +432,16 @@ tests:
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 17m
         alertname: GatewayAuditUnavailable
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 19m
         alertname: GatewayAuditUnavailable
@@ -488,24 +488,24 @@ tests:
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 44m
         alertname: GatewayAuditUnavailable
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 48m
         alertname: GatewayAuditUnavailable
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 50m
         alertname: GatewayAuditUnavailable
@@ -566,16 +566,16 @@ tests:
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 16m
         alertname: GatewayAuditUnavailable
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 18m
         alertname: GatewayAuditUnavailable
@@ -620,24 +620,24 @@ tests:
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 25m
         alertname: GatewayAuditUnavailable
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 29m
         alertname: GatewayAuditUnavailable
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 31m
         alertname: GatewayAuditUnavailable
@@ -669,8 +669,8 @@ tests:
         exp_alerts:
           - exp_labels: { severity: critical }
             exp_annotations:
-              summary: Tool calls refused because the audit store refused a write.
-              description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+              summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+              description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
               runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - eval_time: 18m
         alertname: GatewayAuditUnavailable

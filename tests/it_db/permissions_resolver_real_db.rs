@@ -636,7 +636,7 @@ async fn second_replica_converges_after_a_notified_revoke() {
     let replica_b = PermissionsCache::new(repo, Duration::from_secs(600));
     let listener = tokio::spawn({
         let cache = replica_b.clone();
-        notify::listen(p.clone(), move |change| {
+        notify::listen((*p.connect_options()).clone(), move |change| {
             let cache = cache.clone();
             async move { cache.apply(&change).await }
         })

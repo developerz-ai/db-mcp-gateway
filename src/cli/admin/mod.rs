@@ -66,7 +66,7 @@ pub enum GrantsCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum SessionsCommand {
-    /// `POST /admin/v1/users/:id/revoke-sessions` — every session and refresh
+    /// `POST /admin/v1/users/{id}/revoke-sessions` — every session and refresh
     /// chain of one user.
     Revoke {
         #[command(flatten)]

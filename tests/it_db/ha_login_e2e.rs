@@ -9,71 +9,23 @@
 //! address) and the session signing key, as a real deployment does; the test
 //! plays the load balancer by sending the IdP's redirect to B.
 
-use std::sync::Arc;
-use std::time::Duration;
-
-use arc_swap::ArcSwap;
-use db_mcp_gateway::auth::jwt::SessionJwt;
-use db_mcp_gateway::auth::oauth::{
-    AuthCodes, AuthFacade, ClientRegistry, PendingFlows, RefreshTokens,
-};
-use db_mcp_gateway::auth::{AuthConfig, OidcClient, ServiceTokenStore, SessionStore};
-use db_mcp_gateway::config::Config;
-use db_mcp_gateway::transport::{self, AppState};
 use reqwest::{StatusCode, Url};
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tokio::net::TcpListener;
 use uuid::Uuid;
 
 use super::oauth_consent::{CONFIG_YAML, hidden_field, query_param};
 use crate::common::audit::assert_audit_outcome;
 use crate::common::cleanup::delete_audit_calls;
 use crate::common::env::state_pool;
-use crate::common::gateway::{bind, config_file, no_redirect_client, serve};
-use crate::common::idp::{MockIdpHandle, MockUser, spawn_mock_idp};
+use crate::common::gateway::{GatewayBuilder, bind, no_redirect_client};
+use crate::common::idp::{MockUser, spawn_mock_idp};
 
 // RFC 7636 Appendix B test vector.
 const PKCE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const PKCE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 const HTTPS_REDIRECT: &str = "https://app.example/cb";
 const LOOPBACK_REDIRECT: &str = "http://127.0.0.1:54612/callback";
-
-/// Serve one replica on `listener` with every login store in the state DB.
-/// `idp_redirect` is the shared OIDC redirect URL.
-fn spawn_replica(pool: &PgPool, idp: &MockIdpHandle, listener: TcpListener, idp_redirect: &str) {
-    let addr = listener.local_addr().expect("listener address");
-    let auth_config = AuthConfig {
-        issuer: idp.issuer.clone(),
-        client_id: idp.client_id.clone(),
-        client_secret: idp.client_secret.clone().into(),
-        audience: idp.client_id.clone(),
-        redirect_url: idp_redirect.to_string(),
-        ..AuthConfig::default()
-    };
-    let config = config_file(CONFIG_YAML);
-    let tokens = ServiceTokenStore::from_config(&config.service_accounts).expect("tokens");
-    let auth = AuthFacade {
-        jwt: SessionJwt::new(&auth_config.session_signing_key),
-        flows: PendingFlows::with_db(pool.clone(), &auth_config.session_signing_key),
-        codes: AuthCodes::with_db(pool.clone()),
-        refresh: RefreshTokens::with_db(pool.clone(), Duration::from_secs(3600)),
-        config: Arc::new(auth_config.clone()),
-        sessions: SessionStore::new(pool.clone()),
-        oidc: OidcClient::new(auth_config).expect("oidc client"),
-        service_tokens: Arc::new(ArcSwap::from_pointee(tokens)),
-    };
-    let mut state = AppState::for_tests(config, pool.clone(), auth);
-    state.oauth.client_registry = ClientRegistry::with_db(pool.clone());
-    let config = Config {
-        bind: addr,
-        ..Config::default()
-    };
-    serve(
-        listener,
-        transport::router(&config, state).expect("router builds"),
-    );
-}
 
 struct Pair {
     a: String,
@@ -94,9 +46,13 @@ async fn spawn_pair() -> Pair {
     let idp = spawn_mock_idp("test-client", "test-secret", user).await;
     let ((listener_a, addr_a), (listener_b, addr_b)) = (bind().await, bind().await);
     let (a, b) = (format!("http://{addr_a}"), format!("http://{addr_b}"));
-    let idp_redirect = format!("{a}/auth/callback");
-    spawn_replica(&pool, &idp, listener_a, &idp_redirect);
-    spawn_replica(&pool, &idp, listener_b, &idp_redirect);
+    for listener in [listener_a, listener_b] {
+        GatewayBuilder::new(CONFIG_YAML)
+            .idp(&idp)
+            .db_login_stores(&pool)
+            .public_url(&a)
+            .spawn_on(listener, pool.clone());
+    }
     Pair {
         a,
         b,
@@ -284,6 +240,93 @@ async fn racing_redemptions_on_two_replicas_mint_one_grant() {
             .await
             .unwrap();
     assert_eq!(chains, 1, "exactly one grant for one code");
+    sqlx::query("DELETE FROM oauth_refresh_tokens WHERE user_sub = $1")
+        .bind(&pair.sub)
+        .execute(&pair.pool)
+        .await
+        .unwrap();
+    pair.cleanup(&client_id).await;
+}
+
+/// The state DB dies under a running gateway: every login path says so, with a
+/// retryable 503 of its own and nothing about the database in it.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn login_paths_name_a_dead_state_db() {
+    let pair = spawn_pair().await;
+    let dead = state_pool().await;
+    let user = MockUser {
+        email: "outage@example.com".into(),
+        sub: pair.sub.clone(),
+        groups: vec!["engineers".into()],
+    };
+    let idp = spawn_mock_idp("test-client", "test-secret", user).await;
+    let gw = GatewayBuilder::new(CONFIG_YAML)
+        .idp(&idp)
+        .db_login_stores(&dead)
+        .spawn(dead.clone())
+        .await;
+    // A bearer of a live session, from the healthy pair.
+    let client_id = pair.register(&pair.a, LOOPBACK_REDIRECT).await;
+    let callback = pair
+        .login(&pair.a, &pair.a, &client_id, LOOPBACK_REDIRECT)
+        .await;
+    let code = query_param(&location(&callback), "code").expect("code");
+    let token = pair.redeem(&pair.a, &code, LOOPBACK_REDIRECT).await;
+    let token: Value = token.json().await.unwrap();
+    let bearer = token["access_token"].as_str().expect("access token");
+    dead.close().await;
+
+    let http = &pair.http;
+    let login = http.post(format!("{}/auth/login", gw.url));
+    let mcp = http
+        .post(format!("{}/mcp", gw.url))
+        .bearer_auth(bearer)
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}));
+    for (path, request) in [("/auth/login", login), ("/mcp", mcp)] {
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert!(!response.headers().contains_key("www-authenticate"));
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["category"], "unavailable", "{path}: {body}");
+        assert_eq!(body["error"]["code"], "state_db_unavailable", "{path}");
+        assert!(!body.to_string().contains("postgres"), "{path}: {body}");
+    }
+
+    let callback = http
+        .get(format!("{}/auth/callback?code=c&state=s", gw.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(callback.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let page = callback.text().await.unwrap();
+    assert!(page.contains("Sign-in temporarily unavailable"), "{page}");
+
+    let redeem = [
+        ("grant_type", "authorization_code"),
+        ("code", "c"),
+        ("redirect_uri", LOOPBACK_REDIRECT),
+        ("code_verifier", PKCE_VERIFIER),
+    ];
+    let refresh = [("grant_type", "refresh_token"), ("refresh_token", "r")];
+    let revoke = [("token", bearer)];
+    for (path, form) in [
+        ("token", &redeem[..]),
+        ("token", &refresh[..]),
+        ("revoke", &revoke[..]),
+    ] {
+        let response = http
+            .post(format!("{}/{path}", gw.url))
+            .form(form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"], "temporarily_unavailable", "{path}: {body}");
+        assert!(!body.to_string().contains("postgres"), "{path}: {body}");
+    }
+
     sqlx::query("DELETE FROM oauth_refresh_tokens WHERE user_sub = $1")
         .bind(&pair.sub)
         .execute(&pair.pool)

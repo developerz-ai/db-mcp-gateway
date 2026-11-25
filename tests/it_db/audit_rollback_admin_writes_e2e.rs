@@ -3,7 +3,8 @@
 //! databases and grants routes. The production middleware always sets a
 //! request id, so — as there — a bespoke router injects an `AdminActor` with
 //! an empty one, which trips the `permissions_audit.request_id` CHECK
-//! (migration 0005) inside the handler's transaction.
+//! (migration 0005) inside the handler's transaction. The failure must also
+//! show in `audit_failure_recent`, the series the audit alerts read.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,13 +13,17 @@ use arc_swap::ArcSwap;
 use axum::Router;
 use axum::extract::Request;
 use axum::middleware::{self as axum_mw, Next};
-use axum::routing::post;
+use axum::routing::{get, post};
 use db_mcp_gateway::authz::PermissionsCache;
 use db_mcp_gateway::state::permissions::PermissionsRepo;
 use db_mcp_gateway::state::permissions::pg::PgPermissionsRepo;
+use db_mcp_gateway::tools::audit_dispatch::failure_hold::audit_failures;
+use db_mcp_gateway::transport::admin::ReadState;
+use db_mcp_gateway::transport::admin::audit_calls;
 use db_mcp_gateway::transport::admin::databases::{self, DatabasesState};
 use db_mcp_gateway::transport::admin::grants::{self, GrantsState};
 use db_mcp_gateway::transport::admin::middleware::AdminActor;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -79,6 +84,21 @@ async fn post_json(url: String, body: Value) -> StatusCode {
         .status()
 }
 
+/// The hold is process-wide, so each test here runs alone (`serial(world)`)
+/// and starts from none: the failure it then sees is its own.
+fn start_without_failures() {
+    audit_failures().reset();
+    assert!(!scrape_shows_a_failed_write());
+}
+
+/// Whether a scrape now would show a recent failed audit write.
+fn scrape_shows_a_failed_write() -> bool {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    metrics::with_local_recorder(&recorder, || audit_failures().publish());
+    let body = recorder.handle().render();
+    body.contains(r#"audit_failure_recent{kind="write"} 1"#)
+}
+
 async fn count(pool: &PgPool, sql: &'static str, key: &str) -> i64 {
     sqlx::query_scalar(sql)
         .bind(key)
@@ -94,8 +114,9 @@ fn repo_and_cache(pool: &PgPool) -> (Arc<dyn PermissionsRepo>, PermissionsCache)
 }
 
 #[tokio::test]
-#[serial_test::parallel(world)]
+#[serial_test::serial(world)]
 async fn audit_write_failure_rolls_back_a_database_create() {
+    start_without_failures();
     let pool = state_pool().await;
     let (repo, cache) = repo_and_cache(&pool);
     // A name no other test registers, so the count below is this test's.
@@ -130,11 +151,13 @@ async fn audit_write_failure_rolls_back_a_database_create() {
         rows, 0,
         "the database row must roll back with its audit row"
     );
+    assert!(scrape_shows_a_failed_write());
 }
 
 #[tokio::test]
-#[serial_test::parallel(world)]
+#[serial_test::serial(world)]
 async fn audit_write_failure_rolls_back_a_grant_create() {
+    start_without_failures();
     let pool = state_pool().await;
     let (repo, cache) = repo_and_cache(&pool);
     let user_sub = format!("grant-rollback-{}", Uuid::new_v4().simple());
@@ -180,4 +203,43 @@ async fn audit_write_failure_rolls_back_a_grant_create() {
         .unwrap();
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(grants, 0, "the grant row must roll back with its audit row");
+    assert!(scrape_shows_a_failed_write());
+}
+
+/// An audited read whose row cannot be written: no row, no response.
+#[tokio::test]
+#[serial_test::serial(world)]
+async fn audit_write_failure_refuses_an_audited_read() {
+    start_without_failures();
+    let pool = state_pool().await;
+    let (repo, _) = repo_and_cache(&pool);
+    // Only this pool is closed: the state DB itself stays up for other tests.
+    let closed = state_pool().await;
+    closed.close().await;
+    let state = ReadState {
+        repo,
+        state_db: closed,
+        config: Arc::new(ArcSwap::from_pointee(config_file(YAML))),
+    };
+    let url = serve(
+        Router::new()
+            .route("/audit/calls", get(audit_calls::stream))
+            .with_state(state),
+    )
+    .await;
+
+    let response = reqwest::get(format!("{url}/audit/calls")).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "audit_unavailable", "{body}");
+    assert!(scrape_shows_a_failed_write());
+    let rows = count(
+        &pool,
+        "SELECT count(*) FROM audit_calls WHERE tool = 'admin.audit_calls' \
+         AND user_email = $1 AND request_id = ''",
+        "admin-rollback@example.com",
+    )
+    .await;
+    assert_eq!(rows, 0);
 }

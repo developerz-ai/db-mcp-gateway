@@ -26,20 +26,27 @@ use db_mcp_gateway::state::permissions::{
     DbType, GrantAction, GrantTarget, PermissionsChange, PermissionsSeed,
 };
 use sqlx::PgPool;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use tracing_subscriber::fmt::MakeWriter;
 use uuid::Uuid;
 
 const CACHE_TTL: Duration = Duration::from_secs(600);
 const CONVERGE_WITHIN: Duration = Duration::from_secs(10);
-const RECOVERED: &str = "permissions listener recovered; grant cache flushed";
+pub(crate) const HEARD_NO_PING: &str = "heard no ping within the liveness deadline";
+pub(crate) const RECOVERED: &str = "permissions listener recovered; grant cache flushed";
 
 #[derive(Clone, Default)]
-struct Logs(Arc<Mutex<Vec<u8>>>);
+pub(crate) struct Logs(Arc<Mutex<Vec<u8>>>);
 
 impl Logs {
-    fn contains(&self, needle: &str) -> bool {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).contains(needle)
+    pub(crate) fn contains(&self, needle: &str) -> bool {
+        self.count(needle) > 0
+    }
+
+    pub(crate) fn count(&self, needle: &str) -> usize {
+        String::from_utf8_lossy(&self.0.lock().unwrap())
+            .matches(needle)
+            .count()
     }
 }
 
@@ -62,7 +69,7 @@ impl<'a> MakeWriter<'a> for Logs {
 
 /// Capture this thread's log lines. `#[tokio::test]` is current-thread, so
 /// the spawned listener logs here too.
-fn capture_logs() -> (Logs, tracing::subscriber::DefaultGuard) {
+pub(crate) fn capture_logs() -> (Logs, tracing::subscriber::DefaultGuard) {
     let logs = Logs::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(logs.clone())
@@ -72,13 +79,13 @@ fn capture_logs() -> (Logs, tracing::subscriber::DefaultGuard) {
 }
 
 /// One user holding one live `query_read` grant.
-struct Seeded {
-    sub: String,
-    server: String,
-    grant_id: Uuid,
+pub(crate) struct Seeded {
+    pub(crate) sub: String,
+    pub(crate) server: String,
+    pub(crate) grant_id: Uuid,
 }
 
-async fn seed(pool: &PgPool, tag: &str) -> Seeded {
+pub(crate) async fn seed(pool: &PgPool, tag: &str) -> Seeded {
     let sub = format!("{tag}-{}", Uuid::new_v4().simple());
     let server = format!("{tag}-server-{}", Uuid::new_v4().simple());
     let repo = PgPermissionsRepo::new(pool.clone());
@@ -103,7 +110,7 @@ async fn seed(pool: &PgPool, tag: &str) -> Seeded {
     }
 }
 
-async fn cleanup(pool: &PgPool, seeded: &Seeded) {
+pub(crate) async fn cleanup(pool: &PgPool, seeded: &Seeded) {
     let deletes = [
         (
             "DELETE FROM permissions_grants WHERE user_id IN \
@@ -139,20 +146,20 @@ fn identity(sub: &str) -> Identity {
     }
 }
 
-/// A second replica: its own cache, fed by its own listener on `pool`.
-struct Replica {
+/// A second replica: its own cache, fed by its own listener.
+pub(crate) struct Replica {
     cache: PermissionsCache,
-    flushes: Arc<AtomicUsize>,
-    listener: tokio::task::JoinHandle<()>,
+    pub(crate) flushes: Arc<AtomicUsize>,
+    pub(crate) listener: tokio::task::JoinHandle<()>,
 }
 
-fn replica(state: &PgPool, listener_pool: PgPool, liveness: Liveness) -> Replica {
+pub(crate) fn replica(state: &PgPool, listener: PgConnectOptions, liveness: Liveness) -> Replica {
     let repo = Arc::new(PgPermissionsRepo::new(state.clone()));
     let cache = PermissionsCache::new(repo, CACHE_TTL);
     let flushes = Arc::new(AtomicUsize::new(0));
     let listener = tokio::spawn({
         let (cache, flushes) = (cache.clone(), flushes.clone());
-        notify::listen_with(listener_pool, liveness, move |change| {
+        notify::listen_with(listener, liveness, move |change| {
             let (cache, flushes) = (cache.clone(), flushes.clone());
             async move {
                 if change == PermissionsChange::All {
@@ -170,12 +177,12 @@ fn replica(state: &PgPool, listener_pool: PgPool, liveness: Liveness) -> Replica
 }
 
 impl Replica {
-    async fn grant_count(&self, sub: &str) -> usize {
+    pub(crate) async fn grant_count(&self, sub: &str) -> usize {
         self.cache.get_for(&identity(sub)).await.unwrap().len()
     }
 
     /// Every (re)subscribe flushes once, so this counts subscriptions.
-    async fn await_flushes(&self, at_least: usize) {
+    pub(crate) async fn await_flushes(&self, at_least: usize) {
         eventually("listener (re)subscribed", || async {
             self.flushes.load(Ordering::SeqCst) >= at_least
         })
@@ -183,7 +190,7 @@ impl Replica {
     }
 }
 
-async fn eventually<F, Fut>(what: &str, mut check: F)
+pub(crate) async fn eventually<F, Fut>(what: &str, mut check: F)
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = bool>,
@@ -200,7 +207,7 @@ where
 
 /// Another replica's admin revoke: the row change and its `NOTIFY` commit
 /// together.
-async fn revoke_and_notify(pool: &PgPool, seeded: &Seeded) {
+pub(crate) async fn revoke_and_notify(pool: &PgPool, seeded: &Seeded) {
     let mut tx = pool.begin().await.unwrap();
     let revoked = grants::tx_revoke_grant(&mut tx, seeded.grant_id).await;
     assert!(revoked.unwrap());
@@ -210,16 +217,8 @@ async fn revoke_and_notify(pool: &PgPool, seeded: &Seeded) {
     tx.commit().await.unwrap();
 }
 
-fn state_options() -> PgConnectOptions {
+pub(crate) fn state_options() -> PgConnectOptions {
     PgConnectOptions::from_str(&state_db_url()).expect("STATE_DB_URL parses")
-}
-
-async fn pool_with(options: PgConnectOptions) -> PgPool {
-    PgPoolOptions::new()
-        .max_connections(3)
-        .connect_with(options)
-        .await
-        .expect("state DB up (run `bin/dev up`)")
 }
 
 #[tokio::test]
@@ -230,14 +229,17 @@ async fn revoke_lands_after_the_listener_backend_is_terminated() {
     let seeded = seed(&p, "liveness-kill").await;
     // Lets `pg_stat_activity` single out this test's listener backend.
     let app = format!("liveness-{}", Uuid::new_v4().simple());
-    let listener_pool = pool_with(state_options().application_name(&app)).await;
-    let b = replica(&p, listener_pool, Liveness::default());
+    let b = replica(
+        &p,
+        state_options().application_name(&app),
+        Liveness::default(),
+    );
     b.await_flushes(1).await;
     assert_eq!(b.grant_count(&seeded.sub).await, 1);
 
     let killed: i64 = sqlx::query_scalar(
         "SELECT count(*) FILTER (WHERE pg_terminate_backend(pid)) FROM pg_stat_activity \
-         WHERE application_name = $1 AND query ILIKE 'LISTEN %'",
+         WHERE application_name = $1 AND (query ILIKE 'LISTEN %' OR query = 'SELECT 1')",
     )
     .bind(&app)
     .fetch_one(&p)
@@ -274,7 +276,7 @@ async fn revoke_lands_after_the_listener_connection_goes_silent() {
         ping_every: Duration::from_millis(250),
         deadline: Duration::from_secs(2),
     };
-    let b = replica(&p, pool_with(via_proxy).await, liveness);
+    let b = replica(&p, via_proxy, liveness);
     b.await_flushes(1).await;
     assert_eq!(b.grant_count(&seeded.sub).await, 1);
 
@@ -290,7 +292,7 @@ async fn revoke_lands_after_the_listener_connection_goes_silent() {
         b.grant_count(&seeded.sub).await == 0
     })
     .await;
-    assert!(logs.contains("heard no ping within the liveness deadline"));
+    assert!(logs.contains(HEARD_NO_PING));
     eventually("recovery is logged", || async { logs.contains(RECOVERED) }).await;
 
     b.listener.abort();

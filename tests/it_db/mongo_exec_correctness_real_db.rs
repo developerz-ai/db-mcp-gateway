@@ -1,7 +1,8 @@
 //! Real-mongo tests for what the adapter answers, not just that it answers:
 //! non-finite doubles render as Extended JSON (never a fabricated `null`), a
 //! role missing a privilege is a permission refusal (never a syntax error),
-//! and a saturated pool is `unavailable` (never the caller's `timeout`).
+//! a saturated pool is `unavailable` (never the caller's `timeout`), and a
+//! call's server-side cleanup never takes the next call's connection.
 //!
 //! Audit assertion intentionally skipped: these drive the adapter directly,
 //! never the tool-dispatch path that writes audit rows.
@@ -9,7 +10,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mongodb::bson::{Document, doc};
+use mongodb::bson::{Bson, Document, JavaScriptCodeWithScope, doc};
+use mongodb::error::ErrorKind;
 use serde_json::json;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -63,6 +65,10 @@ async fn non_finite_doubles_render_as_extended_json() {
             "inf": f64::INFINITY,
             "ninf": f64::NEG_INFINITY,
             "nested": [f64::NAN, 2.5],
+            "code": Bson::JavaScriptCodeWithScope(JavaScriptCodeWithScope {
+                code: "x".into(),
+                scope: doc! { "nan": f64::NAN, "list": [f64::NEG_INFINITY, 2.5] },
+            }),
             "nothing": null,
         }],
     )
@@ -81,6 +87,13 @@ async fn non_finite_doubles_render_as_extended_json() {
             "inf": { "$numberDouble": "Infinity" },
             "ninf": { "$numberDouble": "-Infinity" },
             "nested": [{ "$numberDouble": "NaN" }, 2.5],
+            "code": {
+                "$code": "x",
+                "$scope": {
+                    "nan": { "$numberDouble": "NaN" },
+                    "list": [{ "$numberDouble": "-Infinity" }, 2.5],
+                },
+            },
             "nothing": null,
         })]]
     );
@@ -162,40 +175,68 @@ async fn unauthorized_is_a_permission_refusal_not_a_syntax_error() {
     assert_eq!(rejection.to_string(), "13 not authorized");
 }
 
-/// A TCP forwarder to the target that swallows the first client write
-/// carrying `marker` and then holds that connection silent: the command
-/// holding it never gets a reply, however fast the server would have been.
-/// Resolves `swallowed` once that write has arrived.
-async fn stalling_proxy(marker: String) -> (u16, tokio::sync::oneshot::Receiver<()>) {
+/// A TCP forwarder to the target that swallows the first client write on a
+/// connection carrying one of `markers` and then holds that connection
+/// silent: the command holding it never gets a reply, however fast the server
+/// would have been. `swallowed` gets one message per swallowed write.
+async fn stalling_proxy(markers: Vec<String>) -> (u16, Swallowed) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
     let port = listener.local_addr().expect("proxy addr").port();
-    let (swallowed_tx, swallowed) = tokio::sync::oneshot::channel();
-    let swallowed_tx = Arc::new(std::sync::Mutex::new(Some(swallowed_tx)));
-    let marker = Arc::new(marker.into_bytes());
+    let (swallowed_tx, swallowed) = tokio::sync::mpsc::unbounded_channel();
+    let markers = Arc::new(markers);
     tokio::spawn(async move {
         while let Ok((client, _)) = listener.accept().await {
-            tokio::spawn(forward(client, marker.clone(), swallowed_tx.clone()));
+            tokio::spawn(forward(client, markers.clone(), swallowed_tx.clone()));
         }
     });
     (port, swallowed)
 }
 
-type Signal = Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>;
+type Swallowed = tokio::sync::mpsc::UnboundedReceiver<String>;
+type Signal = tokio::sync::mpsc::UnboundedSender<String>;
 
-async fn forward(mut client: TcpStream, marker: Arc<Vec<u8>>, swallowed: Signal) {
+/// The next swallowed marker. Bounded: the accept loop keeps the sender
+/// alive, so a missed marker would otherwise wait forever.
+async fn next_swallowed(swallowed: &mut Swallowed) -> String {
+    tokio::time::timeout(Duration::from_secs(10), swallowed.recv())
+        .await
+        .expect("the command reaches the proxy within 10 s")
+        .expect("the proxy signals")
+}
+
+/// An adapter on the target through the proxy at `port`, with a pool of one.
+async fn pool_of_one(port: u16, detached: DetachedTasks) -> MongoAdapter {
+    let sizing = PoolSizing {
+        max_connections: 1,
+        ..PoolSizing::default()
+    };
+    let mut via_proxy = server("mongo-one");
+    via_proxy.host = "127.0.0.1".to_string();
+    via_proxy.port = port;
+    MongoAdapter::open(&via_proxy, &database(), sizing, detached)
+        .await
+        .expect("client builds")
+}
+
+async fn forward(mut client: TcpStream, markers: Arc<Vec<String>>, swallowed: Signal) {
     let Ok(mut server) = TcpStream::connect((TARGET_HOST, TARGET_PORT)).await else {
         return;
     };
     let (mut up, mut down) = ([0u8; 16 * 1024], [0u8; 16 * 1024]);
-    let mut scan = MarkerScan::new(&marker);
+    let mut scans: Vec<_> = markers
+        .iter()
+        .map(|marker| (marker, MarkerScan::new(marker.as_bytes())))
+        .collect();
     loop {
         tokio::select! {
             read = client.read(&mut up) => {
                 let Ok(n @ 1..) = read else { return };
-                if scan.feed(&up[..n]) {
-                    if let Some(tx) = swallowed.lock().unwrap().take() {
-                        let _ = tx.send(());
-                    }
+                let hit = scans
+                    .iter_mut()
+                    .filter_map(|(marker, scan)| scan.feed(&up[..n]).then_some(marker.as_str()))
+                    .next();
+                if let Some(marker) = hit {
+                    let _ = swallowed.send(marker.to_owned());
                     // Keep both sockets open and silent until the test ends.
                     return std::future::pending().await;
                 }
@@ -256,17 +297,8 @@ fn marker_scan_matches_across_read_boundaries() {
 #[serial_test::parallel(world)]
 async fn a_saturated_pool_is_unavailable_not_timeout() {
     let stalled = unique_collection("mongosat");
-    let (port, swallowed) = stalling_proxy(stalled.clone()).await;
-    let sizing = PoolSizing {
-        max_connections: 1,
-        ..PoolSizing::default()
-    };
-    let mut via_proxy = server("mongo-sat");
-    via_proxy.host = "127.0.0.1".to_string();
-    via_proxy.port = port;
-    let a = MongoAdapter::open(&via_proxy, &database(), sizing, DetachedTasks::new())
-        .await
-        .expect("client builds");
+    let (port, mut swallowed) = stalling_proxy(vec![stalled.clone()]).await;
+    let a = pool_of_one(port, DetachedTasks::new()).await;
     let held = format!(r#"{{"count":"{stalled}","query":{{}}}}"#);
     let count = format!(
         r#"{{"count":"{}","query":{{}}}}"#,
@@ -276,12 +308,7 @@ async fn a_saturated_pool_is_unavailable_not_timeout() {
     let held_call = run(&a, &held, Some(10_000));
     let waiting_call = async {
         // The command is written only once its call holds the connection.
-        // Bounded: the accept loop keeps the sender alive, so a missed
-        // marker would otherwise wait forever.
-        tokio::time::timeout(Duration::from_secs(10), swallowed)
-            .await
-            .expect("the held command reaches the proxy within 10 s")
-            .expect("the proxy signals");
+        next_swallowed(&mut swallowed).await;
         let started = Instant::now();
         (run(&a, &count, Some(1_000)).await, started.elapsed())
     };
@@ -296,4 +323,113 @@ async fn a_saturated_pool_is_unavailable_not_timeout() {
         elapsed >= Duration::from_secs(4) && elapsed < Duration::from_secs(8),
         "waited {elapsed:?}"
     );
+}
+
+/// A row cap that cuts a cursor leaves none open on the server: the driver
+/// closes an open one with a `killCursors` nothing reserves a connection
+/// for, and a stuck one would hold the pool's only connection through the
+/// next call's budget.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_row_cap_cut_leaves_no_cursor_to_clean_up() {
+    let coll = unique_collection("mongocut");
+    insert(&coll, (0..300).map(|i| doc! { "i": i }).collect()).await;
+    let (port, mut swallowed) = stalling_proxy(vec!["killCursors".to_owned()]).await;
+    let a = pool_of_one(port, DetachedTasks::new()).await;
+    let find = format!(r#"{{"find":"{coll}"}}"#);
+    let sorted = format!(
+        r#"{{"aggregate":"{coll}","pipeline":[{{"$group":{{"_id":"$i"}}}},{{"$sort":{{"_id":1}}}}],"cursor":{{}}}}"#
+    );
+    let plain = format!(r#"{{"aggregate":"{coll}","pipeline":[],"cursor":{{}}}}"#);
+
+    let mut results = Vec::new();
+    for sql in [&find, &sorted, &plain, &find] {
+        results.push(run(&a, sql, Some(1_000)).await);
+        // Time for the driver's detached cleanup, were there one, to start.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    drop_collection(&side_client(), &coll).await;
+
+    assert!(swallowed.try_recv().is_err(), "killCursors was sent");
+    for result in results {
+        let result = result.expect("each call runs inside its own budget");
+        assert_eq!(result.rows.len(), 100);
+        assert!(result.truncated);
+    }
+}
+
+/// A timed-out call's `currentOp` / `killOp` runs on the call's own
+/// reservation, so a stuck one delays the next caller's acquire — outside its
+/// statement budget, and only up to the cleanup bound — never the command.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_stuck_cancel_never_costs_the_next_call_its_budget() {
+    let stalled = unique_collection("mongostuck");
+    let (port, mut swallowed) = stalling_proxy(vec![stalled.clone(), "currentOp".to_owned()]).await;
+    let detached = DetachedTasks::new();
+    let a = pool_of_one(port, detached.clone()).await;
+
+    let held = run(
+        &a,
+        &format!(r#"{{"count":"{stalled}","query":{{}}}}"#),
+        Some(200),
+    )
+    .await;
+    assert!(matches!(held, Err(ExecError::Timeout)), "{held:?}");
+    assert_eq!(next_swallowed(&mut swallowed).await, stalled);
+    assert_eq!(next_swallowed(&mut swallowed).await, "currentOp");
+
+    let next = format!(
+        r#"{{"count":"{}","query":{{}}}}"#,
+        unique_collection("mongostucknext")
+    );
+    let started = Instant::now();
+    let next = run(&a, &next, Some(1_000)).await;
+    let elapsed = started.elapsed();
+    assert!(next.is_ok(), "{next:?} after {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5), "waited {elapsed:?}");
+    detached
+        .drain(Duration::from_secs(2))
+        .await
+        .expect("the stuck cancel was bounded");
+}
+
+/// Rendering recurses once per nesting level, so the server's own nesting
+/// limit is what bounds it: scopes count against it like documents, and the
+/// deepest one it stores still renders.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn nested_code_scopes_are_bounded_by_the_servers_nesting_limit() {
+    let scopes = |levels: usize| {
+        (0..levels).fold(doc! { "nan": f64::NAN }, |scope, _| {
+            doc! { "c": Bson::JavaScriptCodeWithScope(JavaScriptCodeWithScope { code: "x".into(), scope }) }
+        })
+    };
+    let a = adapter("mongo").await;
+    let coll = unique_collection("mongodeep");
+    let mut stored = Vec::new();
+    for levels in [90, 250] {
+        let reply = side_client()
+            .database(TARGET_DB)
+            .run_command(doc! { "insert": &coll, "documents": [scopes(levels)] })
+            .await;
+        stored.push(reply);
+    }
+    let read = run(&a, &format!(r#"{{"find":"{coll}"}}"#), None).await;
+    drop_collection(&side_client(), &coll).await;
+
+    let refused = stored.pop().expect("two inserts").expect_err("250 levels");
+    let ErrorKind::Command(refused) = refused.kind.as_ref() else {
+        panic!("not the server's answer: {refused:?}");
+    };
+    // 15, Overflow: "BSONObj exceeds maximum nested object depth".
+    assert_eq!(refused.code, 15, "{refused:?}");
+    let reply = stored.pop().expect("two inserts").expect("90 levels");
+    assert!(reply.get_array("writeErrors").is_err(), "{reply:?}");
+    let rows = read.expect("the deepest stored scope renders").rows;
+    let mut value = &rows[0][0];
+    for _ in 0..90 {
+        value = &value["c"]["$scope"];
+    }
+    assert_eq!(*value, json!({ "nan": { "$numberDouble": "NaN" } }));
 }

@@ -3,7 +3,7 @@
 
 use serde_json::json;
 
-use super::REASON_DESCRIPTION;
+use super::{REASON_DESCRIPTION, RUN_SCOPED_DESCRIPTION};
 use crate::mcp::limits::{
     result_cap, row_ceiling, run_query_default_rows, sample_default_rows, timeout_ceiling,
 };
@@ -162,7 +162,9 @@ pub(super) fn cancel_query() -> Tool {
                 "server":   { "type": "string" },
                 "database": { "type": "string" },
                 "request_id": { "type": "string", "format": "uuid" },
-                "reason":   { "type": "string", "description": REASON_DESCRIPTION }
+                "reason":   { "type": "string", "description": REASON_DESCRIPTION },
+                "run_scoped": { "type": "boolean", "default": false,
+                                "description": RUN_SCOPED_DESCRIPTION }
             },
             "required": ["server", "database", "request_id"],
             "additionalProperties": false

@@ -107,10 +107,10 @@ Permission changes land via PR → merge → operator runs `kill -HUP` on the ga
 
 ## Admin operations
 
-There is no in-band admin UI. **Planned, not built:** the CLI below is scheduled in plan 101 slice 08 (operator tooling); the binary ships no subcommands today. Until it lands, revoke sessions with the audited admin API (`POST /admin/v1/users/:id/revoke-sessions`, [admin-api.md](../deployment/admin-api.md)) or SQL against the state DB, and read audit history from `audit_calls` directly. The planned operator actions are CLI subcommands of the gateway binary, run inside the container, against the state DB:
+There is no in-band admin UI. The gateway binary's admin subcommands are thin clients of the audited admin API ([CLI](../deployment/cli.md#admin-commands), [admin-api.md](../deployment/admin-api.md)):
 
-- `gateway admin revoke-session <user_email>`
-- `gateway admin list-active-sessions`
-- `gateway admin replay-audit <query>` (for compliance investigations)
+- `db-mcp-gateway grants list` / `grants apply <file>`
+- `db-mcp-gateway sessions revoke <id, user_sub or email>`
+- `db-mcp-gateway audit query` / `audit export --out <file>` (for compliance investigations)
 
-Admin commands authenticate via a separate mechanism (Unix socket / shell access), not SSO — they're for whoever has prod shell access.
+They authenticate by SSO: `db-mcp-gateway login` runs the gateway's own OAuth flow, and the session must carry the admin group. They hold no privilege of their own and never open the state DB. There is no subcommand that lists active sessions. The other subcommands (`mint-service-token`, `roles`, `doctor`) change no grant and no session.

@@ -22,7 +22,7 @@ pub(super) fn invalid_body(rejection: &JsonRejection, request_id: &str) -> Admin
     error.with_request_id(request_id)
 }
 
-/// A malformed UUID in `:id`.
+/// A malformed UUID in `{id}`.
 pub(super) fn invalid_id(entity: &str, request_id: &str) -> AdminError {
     AdminError::invalid(format!("invalid {entity} id")).with_request_id(request_id)
 }
@@ -120,12 +120,19 @@ pub(super) fn check_unchanged(
     }
 }
 
+/// A deadlock or serialization abort: another admin's write won.
+pub(super) fn is_conflict(err: &RepoError) -> bool {
+    matches!(
+        err,
+        RepoError::Sqlx(sqlx::Error::Database(db_err))
+            if matches!(db_err.code().as_deref(), Some("40P01" | "40001"))
+    )
+}
+
 /// Map a store failure: a deadlock or serialization abort is a retryable
 /// `conflict`; everything else is a redacted `internal`.
 pub(super) fn store_error(stage: &'static str, err: RepoError, request_id: &str) -> AdminError {
-    if let RepoError::Sqlx(sqlx::Error::Database(db_err)) = &err
-        && matches!(db_err.code().as_deref(), Some("40P01" | "40001"))
-    {
+    if is_conflict(&err) {
         return AdminError::conflict("concurrent admin change; retry").with_request_id(request_id);
     }
     internal(stage, err, request_id)

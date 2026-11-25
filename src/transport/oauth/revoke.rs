@@ -7,6 +7,7 @@ use serde::Deserialize;
 
 use super::super::app_state::OAuthState;
 use super::helpers::{form_rejected, oauth_error};
+use crate::auth::AuthError;
 
 #[derive(Debug, Deserialize)]
 pub struct RevokeForm {
@@ -49,13 +50,17 @@ pub async fn revoke(
     };
     let auth = &state.auth;
 
-    if auth.revoke_token(token).await.is_err() {
+    if let Err(err) = auth.revoke_token(token).await {
         // No error source: `AuthError::State` wraps a sqlx::Error that can
         // carry the DSN.
         tracing::warn!("token revocation failed (state DB)");
+        let error = match err {
+            AuthError::StateUnavailable => "temporarily_unavailable",
+            _ => "server_error",
+        };
         return oauth_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "server_error",
+            error,
             "token revocation is temporarily unavailable; retry",
         );
     }

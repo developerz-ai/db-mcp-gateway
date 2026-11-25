@@ -388,5 +388,8 @@ async fn revoke_with_closed_pool_is_an_error() {
     let store = RefreshTokens::with_db(pool.clone(), TTL);
     pool.close().await;
     let result = store.revoke(&sessions, &token()).await;
-    assert!(matches!(result, Err(AuthError::State(_))), "got {result:?}");
+    assert!(
+        matches!(result, Err(AuthError::StateUnavailable)),
+        "got {result:?}"
+    );
 }

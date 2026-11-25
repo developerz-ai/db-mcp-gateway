@@ -10,17 +10,15 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use clap::Parser;
-use db_mcp_gateway::audit::drain::DRAIN_TIMEOUT;
 use db_mcp_gateway::auth::{AuthConfig, ServiceTokenStore};
 use db_mcp_gateway::config::{Config, ConfigFile};
 use db_mcp_gateway::state;
 use db_mcp_gateway::transport::tls;
-use tokio_util::sync::CancellationToken;
 
 use startup::{
-    AuthGcTargets, build_app_state, connect_state_db, init_logging, install_recorder, serve,
-    spawn_audit_pruner, spawn_audit_reaper, spawn_auth_state_gc, spawn_dropped_lines_exporter,
-    spawn_metrics_listener,
+    AuthGcTargets, Shutdown, build_app_state, connect_state_db, init_logging, install_recorder,
+    serve, spawn_audit_pruner, spawn_audit_reaper, spawn_auth_state_gc,
+    spawn_dropped_lines_exporter, spawn_metrics_listener,
 };
 
 fn main() -> anyhow::Result<ExitCode> {
@@ -111,20 +109,19 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     let auth_config = AuthConfig::from_env()?;
     auth_config.check_bind(config.bind)?;
 
-    // One token stops everything that is not the request path: background
-    // loops, metrics upkeep and listener, the SIGHUP loop. Cancelled by the
-    // signal handler, and again below in case `serve` returns on an error.
-    let stop = CancellationToken::new();
-    // Cancelled only after `serve` returns, i.e. once in-flight requests are
-    // drained; the permissions listener keeps applying revocations until then.
-    let drained = CancellationToken::new();
+    let shutdown = Shutdown::default();
 
     // Install the Prometheus recorder before anything starts emitting metrics.
     // `install_recorder` registers a process-wide global — tests bootstrap
     // with no recorder for that reason.
-    let metrics_handle = install_recorder(stop.clone())?;
-    spawn_metrics_listener(config.metrics_bind, metrics_handle, stop.clone()).await?;
-    spawn_dropped_lines_exporter(dropped_log_lines, stop.clone());
+    let metrics_handle = install_recorder(shutdown.finished.clone())?;
+    spawn_metrics_listener(
+        config.metrics_bind,
+        metrics_handle,
+        shutdown.finished.clone(),
+    )
+    .await?;
+    spawn_dropped_lines_exporter(dropped_log_lines, shutdown.finished.clone());
 
     let state_db = connect_state_db(&config).await?;
     // Pruner and GC get their own two connections so a long prune never holds
@@ -144,8 +141,7 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         &config,
         auth_config,
         service_tokens,
-        stop.clone(),
-        drained.clone(),
+        &shutdown,
         &state_db,
     )
     .await?;
@@ -153,15 +149,19 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     spawn_audit_pruner(
         background_db.clone(),
         config.audit_retention_days,
-        stop.clone(),
+        shutdown.stop.clone(),
     );
     spawn_audit_reaper(
         background_db.clone(),
         app_state.mcp.audit_sinks.clone(),
         app_state.mcp.detached.clone(),
-        stop.clone(),
+        shutdown.stop.clone(),
     );
-    startup::spawn_state_pool_sampler("background", background_db.clone(), stop.clone());
+    startup::spawn_state_pool_sampler(
+        "background",
+        background_db.clone(),
+        shutdown.finished.clone(),
+    );
     let auth = &app_state.oauth.auth;
     spawn_auth_state_gc(
         AuthGcTargets {
@@ -171,37 +171,22 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
             refresh: auth.refresh.clone(),
             client_registry: app_state.oauth.client_registry.clone(),
         },
-        stop.clone(),
+        shutdown.stop.clone(),
     );
     // Cloned before `serve` takes the state: the detached audit work must be
     // drained after the listener stops, and the request pool closed after that.
     let detached = app_state.mcp.detached.clone();
 
-    let served = serve(&config, app_state, config_path.to_path_buf(), stop.clone()).await;
-
-    // `serve` returns once the drain window closes. Stop the background loops,
-    // let detached audit writes finish (bounded), then close the pools so
-    // in-flight state-DB statements complete instead of being cut at exit.
-    stop.cancel();
-    drained.cancel();
-    if let Err(error) = detached.drain(DRAIN_TIMEOUT).await {
-        tracing::error!(%error, "detached audit work still running at shutdown; the reaper will mark it abandoned");
-    }
-    close_pool("background", background_db).await;
-    close_pool("request", state_db).await;
+    let served = serve(
+        &config,
+        app_state,
+        config_path.to_path_buf(),
+        shutdown.stop.clone(),
+    )
+    .await;
+    let pools = [("background", background_db), ("request", state_db)];
+    shutdown.finish(&detached, pools).await;
     served
-}
-
-/// Close a state-DB pool, bounded so a wedged connection cannot hold the pod
-/// past its termination grace period.
-async fn close_pool(name: &'static str, pool: sqlx::PgPool) {
-    const CLOSE_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
-    if tokio::time::timeout(CLOSE_BOUND, pool.close())
-        .await
-        .is_err()
-    {
-        tracing::warn!(pool = name, "state DB pool did not close within bound");
-    }
 }
 
 /// Insecure target TLS should not go unnoticed in a deploy log; `--check`

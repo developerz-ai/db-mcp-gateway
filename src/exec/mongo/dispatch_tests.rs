@@ -33,6 +33,7 @@ fn aggregate_gets_a_trailing_limit_stage() {
             .expect("cursor")
             .get_i64("batchSize")
             .ok(),
-        Some(5)
+        // One past the limit, so the first reply closes the cursor.
+        Some(6)
     );
 }

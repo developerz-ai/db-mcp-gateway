@@ -117,7 +117,7 @@ fn every_mounted_path_is_documented() {
     let mounted: BTreeSet<String> = source
         .split('"')
         .filter(|s| s.starts_with("/admin/v1/"))
-        .map(|s| s.replace(":id", "{id}"))
+        .map(str::to_string)
         .collect();
     assert!(!mounted.is_empty());
     assert_eq!(mounted, documented, "router paths vs openapi.json paths");

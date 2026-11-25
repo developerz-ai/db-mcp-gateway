@@ -63,6 +63,56 @@ fn every_database_local_grant_follows_a_connect_to_that_database() {
     }
 }
 
+/// The operator's session must land in the database the gateway connects to.
+#[test]
+fn postgres_statements_name_the_connect_name() {
+    let yaml = PG.replace("\\nDROP DATABASE app;\"", "\", connect_name: app_prod_v2");
+    let sql = rendered(&yaml).remove(0).unwrap();
+    for role in ["ro", "rw"] {
+        let grant = format!("GRANT CONNECT ON DATABASE \"app_prod_v2\" TO \"{role}\";\n");
+        let connect = r"\connect -reuse-previous=on 'dbname=''app_prod_v2'''";
+        assert!(sql.contains(&format!("{grant}{connect}\n")), "{sql}");
+    }
+    assert!(!sql.contains("\"app\""), "{sql}");
+    assert!(
+        sql.starts_with("-- server `prod`, database `app` (`app_prod_v2` on the server):"),
+        "{sql}"
+    );
+}
+
+#[test]
+fn a_connect_name_with_a_line_break_is_refused() {
+    let yaml = PG.replace(
+        "\\nDROP DATABASE app;\"",
+        "\", connect_name: \"app\\nDROP DATABASE app;\"",
+    );
+    let err = rendered(&yaml).remove(0).unwrap_err();
+    assert!(matches!(err, CliError::Invalid(_)), "{err}");
+}
+
+/// `connect_name` is the database the role reads and, unless `auth_database`
+/// says otherwise, the one its user lives in: what the adapter authenticates to.
+#[test]
+fn mongo_statements_name_the_connect_name() {
+    let yaml = "servers:
+  - name: docs
+    kind: mongo
+    host: mongo.internal
+    databases:
+      - { name: app, connect_name: app_prod_v2, role: ro, password: x }
+      - { name: crm, connect_name: crm_v2, auth_database: admin, role: ro, password: x }
+permissions: []
+";
+    let scripts = rendered(yaml);
+    let [Ok(app), Ok(crm)] = scripts.as_slice() else {
+        panic!("two scripts: {scripts:?}")
+    };
+    assert!(app.contains("getSiblingDB(\"app_prod_v2\")"), "{app}");
+    assert!(app.contains("db: \"app_prod_v2\""), "{app}");
+    assert!(crm.contains("getSiblingDB(\"admin\")"), "{crm}");
+    assert!(crm.contains("db: \"crm_v2\""), "{crm}");
+}
+
 #[test]
 fn mongo_selects_its_database_as_data() {
     let yaml = "servers:

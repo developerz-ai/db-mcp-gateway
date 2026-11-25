@@ -35,10 +35,7 @@ pub async fn login(State(state): State<OAuthState>) -> Result<Response, AuthErro
         .authorize_url(&csrf_state, &secrets.nonce, &secrets.idp_challenge())
         .await?;
     // The store logged the cause; full or unreachable, a retryable 503.
-    auth.flows
-        .insert(&csrf_state)
-        .await
-        .map_err(|_| AuthError::StoreFull)?;
+    auth.flows.insert(&csrf_state).await?;
     Ok(no_store(Json(LoginResponse {
         login_url: url.to_string(),
         state: csrf_state,
@@ -188,8 +185,8 @@ pub async fn logout(
 ) -> Result<StatusCode, AuthError> {
     let auth = &state.auth;
     // Every session and refresh chain of this subject, in one state-DB
-    // transaction; a failure is a 5xx (`AuthError::State`), never a 204 that
-    // leaves bearers live.
+    // transaction; a failure is a 5xx (a state-DB `AuthError`), never a 204
+    // that leaves bearers live.
     let revoked = auth.logout(&identity).await?;
     tracing::debug!(user_sub = %identity.user_sub, revoked, "logout revoked every session and refresh chain");
     Ok(StatusCode::NO_CONTENT)
@@ -211,19 +208,25 @@ impl IntoResponse for AuthError {
             // serving — so this arm is only reachable if a future caller
             // constructs an `OidcClient` lazily. Treat it as internal.
             AuthError::HttpClient | AuthError::State(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            // Store full: gateway is overloaded, client should retry.
-            AuthError::StoreFull => StatusCode::SERVICE_UNAVAILABLE,
+            // Overloaded, or its state DB is down: the client should retry.
+            AuthError::StoreFull | AuthError::StateUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         };
         let (category, code) = auth_error_fields(&self);
         let mut body = serde_json::json!({
             "error": { "category": category, "code": code },
         });
+        if matches!(self, AuthError::StateUnavailable) {
+            body["error"]["message"] = STATE_UNAVAILABLE_MESSAGE.into();
+        }
         if status == StatusCode::UNAUTHORIZED {
             body["login_url"] = serde_json::Value::String(LOGIN_URL.to_string());
         }
         (status, Json(body)).into_response()
     }
 }
+
+const STATE_UNAVAILABLE_MESSAGE: &str =
+    "the gateway's state database is unavailable; try again in a moment";
 
 /// Canonical login endpoint. Bearer middleware and `IntoResponse` both surface
 /// it on 401 so agents always have one stable place to send the user.
@@ -243,6 +246,7 @@ pub(crate) fn auth_error_fields(err: &AuthError) -> (&'static str, &'static str)
         AuthError::EmailUnverified => ("internal", "oidc_email_unverified"),
         AuthError::HttpClient => ("internal", "oidc_http_client_init_failed"),
         AuthError::State(_) => ("internal", "state_db_error"),
+        AuthError::StateUnavailable => ("unavailable", "state_db_unavailable"),
         AuthError::StoreFull => ("overloaded", "auth_store_full"),
     }
 }

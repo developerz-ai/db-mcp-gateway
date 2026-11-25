@@ -280,8 +280,8 @@ async fn expired_session_is_rejected() {
     cleanup(&pool, &user_sub).await;
 }
 
-/// A state-DB failure is `AuthError::State` — the gateway's fault, which the
-/// transport maps to 5xx — never a credential error that would force re-login.
+/// A dead state DB is `AuthError::StateUnavailable` — the gateway's fault, which
+/// the transport maps to 503 — never a credential error that would force re-login.
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn lookup_with_closed_pool_is_a_state_error() {
@@ -292,6 +292,6 @@ async fn lookup_with_closed_pool_is_a_state_error() {
         .lookup(Uuid::new_v4().into())
         .await
         .expect_err("closed pool");
-    assert!(matches!(err, AuthError::State(_)), "got {err:?}");
+    assert!(matches!(err, AuthError::StateUnavailable), "got {err:?}");
     assert!(!err.is_credential_failure());
 }

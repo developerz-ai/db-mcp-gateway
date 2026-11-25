@@ -106,6 +106,20 @@ pub(super) fn run_scope<'a>(ctx: ToolCtx<'a>) -> Option<&'a str> {
     ctx.request.upstream.run_id()
 }
 
+const RUN_SCOPED_REFUSED: &str =
+    "`run_scoped` needs a service-account call that carries the `x-dbmcp-run-id` header";
+
+/// `Err` with the refusal when the caller passed `run_scoped: true` and
+/// `scope` ([`run_scope`]) narrows nothing. A precondition only: it changes no
+/// answer, it refuses the one that would have been account-wide. Reads nothing
+/// but the call itself, so it comes before any lookup and probes nothing.
+pub(super) fn ensure_run_scoped(run_scoped: bool, scope: Option<&str>) -> Result<(), &'static str> {
+    if run_scoped && scope.is_none() {
+        return Err(RUN_SCOPED_REFUSED);
+    }
+    Ok(())
+}
+
 /// `Err` with the `reason_required` outcome when the grant demands a reason
 /// and the caller gave none (or a blank one). Applies to every tool that
 /// reaches the target DB, so no tool is a reason-free side door.
@@ -192,6 +206,19 @@ mod tests {
             let bound = grant.unwrap_or(CEILING).min(CEILING);
             proptest::prop_assert!(effective_row_limit(caller, grant, default) <= bound);
         }
+    }
+
+    #[test]
+    fn run_scoped_is_refused_only_without_a_scope() {
+        assert_eq!(
+            ensure_run_scoped(true, None),
+            Err(RUN_SCOPED_REFUSED),
+            "nothing scopes the call"
+        );
+        assert_eq!(ensure_run_scoped(true, Some("run-a")), Ok(()));
+        assert_eq!(ensure_run_scoped(false, None), Ok(()));
+        assert_eq!(ensure_run_scoped(false, Some("run-a")), Ok(()));
+        assert!(RUN_SCOPED_REFUSED.contains("`run_scoped`"));
     }
 
     #[test]

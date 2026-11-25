@@ -28,8 +28,8 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: Tool calls refused because the audit store refused a write.
-          description: 'Tool calls were answered audit_unavailable in the last 20m. Audit is synchronous (MUST #4): the state DB is refusing audit writes and agents get no answers.'
+          summary: Tool calls or admin API requests failed because their audit row was not confirmed durable.
+          description: 'In the last 20m tool calls were answered audit_unavailable, or admin API requests failed, because the durability of their audit row could not be confirmed (its write, the NOTIFY beside it or the commit failed). Audit is synchronous (MUST #4): those callers get no answers.'
           runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditunavailable
       - alert: GatewayAuditWriteSlow
         expr: histogram_quantile(0.95, sum by (le) (rate(audit_write_duration_seconds_bucket[5m]))) > 0.25

@@ -24,7 +24,7 @@ RUN tar -xJf "/dl/${TARGETARCH}.tar.xz" -C /dl --strip-components=1
 # Matches rust-toolchain.toml exactly. When the two drift, the toolchain file
 # wins and rustup re-downloads inside the builder on every cache miss — bump
 # both together.
-FROM rust:1.96.0-slim-bookworm@sha256:4732ca96fd086cb9be682050c3f0176288eebaac2b80aa2bcefccfaf198e1950 AS chef
+FROM rust:1.100.0-slim-bookworm@sha256:bb875b0f8ce726053e259034848c471840e96bfe591fd52556178ae9a05e6126 AS chef
 COPY --from=chef-bin /dl/cargo-chef /usr/local/cargo/bin/cargo-chef
 WORKDIR /src
 

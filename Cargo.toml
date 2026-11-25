@@ -8,7 +8,7 @@ members = ["third_party/sqlx-sqlite-noop"]
 
 [package]
 name = "db-mcp-gateway"
-version = "2.5.2"
+version = "2.6.0"
 edition = "2024"
 rust-version = "1.94.1"
 description = "Self-hosted MCP gateway for credentialled, audited, policy-scoped database access by AI agents — read-only by default, writes opt-in per grant"
@@ -43,7 +43,7 @@ required-features = ["bench-harness"]
 # the one async file read (`config::secret`), and `io-util` for the
 # syslog sink's TCP/TLS writes. Add a feature when code needs it.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs", "io-util"] }
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.8", features = ["macros"] }
 axum-server = { version = "0.9", features = ["tls-rustls"] }
 # rustls 0.23 requires explicit CryptoProvider selection — we pick aws-lc-rs
 # at boot in `transport::tls::install_crypto_provider`.
@@ -143,6 +143,9 @@ url = "2"
 # PKCE S256 for the MCP OAuth bridge: base64url-no-pad(sha256(verifier))
 # compared against the client's code_challenge.
 sha2 = "0.11"
+# HMAC-SHA256 for the login secrets derived from the session signing key; the
+# version sqlx and mongodb already put in the lock.
+hmac = "0.13"
 base64 = "0.23"
 # DB-credential hygiene: keep resolved passwords in a heap buffer that zeroes
 # on drop and refuses to `Debug`-print in the clear. `secrecy::SecretString`

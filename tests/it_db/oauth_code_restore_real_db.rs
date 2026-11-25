@@ -97,7 +97,7 @@ async fn a_failed_promotion_puts_the_code_back_for_any_replica() {
 
     let (status, body) = redeem(&broken, &code).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(body["error"], "server_error");
+    assert_eq!(body["error"], "temporarily_unavailable");
     let (status, body) = redeem(&healthy, &code).await;
     assert_eq!(status, StatusCode::OK, "the retry redeems: {body}");
     delete_grants(&pool, &sub).await;

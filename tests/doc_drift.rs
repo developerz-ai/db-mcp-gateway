@@ -352,14 +352,14 @@ fn env_reads() -> BTreeSet<String> {
 }
 
 /// A documented path with its parameter segments (`:id`, `<id>`, `{id}`, `…`)
-/// normalised to `:id`.
+/// normalised to `{id}`, as the router mounts it.
 fn normalise(path: &str) -> String {
     let path = path.split('?').next().unwrap_or(path);
     let path = path.trim_end_matches(['.', ',', ')', ':', '`']);
     path.split('/')
         .map(|seg| {
             let param = seg.starts_with([':', '<', '{']) || seg == "…" || seg == "...";
-            if param { ":id" } else { seg }
+            if param { "{id}" } else { seg }
         })
         .collect::<Vec<_>>()
         .join("/")
@@ -408,7 +408,7 @@ fn documented_routes_are_mounted() {
     let code = src();
     let routes = mounted_routes(&code);
     assert!(
-        routes.contains(&("DELETE".to_string(), "/admin/v1/grants/:id".to_string())),
+        routes.contains(&("DELETE".to_string(), "/admin/v1/grants/{id}".to_string())),
         "router contract not read: {routes:?}"
     );
     // A path mounted for one method is not mounted for another.

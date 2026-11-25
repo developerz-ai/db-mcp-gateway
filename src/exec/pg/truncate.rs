@@ -21,22 +21,25 @@
 //! Reads only. A truncated *write* is drained and committed instead (see
 //! `run`): rolling it back would report rows as written that were not.
 
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{Connection, PgPool, Postgres, Transaction};
 
 use super::cancel::{Backend, cancel_backend};
+use super::error::is_query_canceled;
 
-/// Cancel the backend then roll back the (aborted) read transaction. Cleanup
-/// outcome is deliberately NOT propagated to the caller: the truncated rows
-/// already collected are the result, and a valid truncated read must not be
-/// turned into a client-visible failure by cleanup noise.
+/// Cancel the backend then roll back the (aborted) read transaction, waiting
+/// for the server's answer. Cleanup outcome is deliberately NOT propagated to
+/// the caller: the truncated rows already collected are the result, and a
+/// valid truncated read must not be turned into a client-visible failure by
+/// cleanup noise.
 ///
 /// A cancel that matches no backend is accepted without a warning —
-/// equivalent to success. Cancellation execution errors and `rollback`
-/// errors are logged at `warn` for operator observability but never surfaced
-/// to the client. Contract documented in
+/// equivalent to success, and so is the cancelled statement's own error.
+/// Cancellation execution errors, any other error of the statement and
+/// `rollback` errors are logged at `warn` for operator observability but never
+/// surfaced to the client. Contract documented in
 /// `website/docs/initial-idea/05-credentials.md`.
 pub(super) async fn cancel_and_rollback(
-    tx: Transaction<'_, Postgres>,
+    mut tx: Transaction<'_, Postgres>,
     cancel_pool: &PgPool,
     backend: &Backend,
 ) {
@@ -46,6 +49,14 @@ pub(super) async fn cancel_and_rollback(
     // request path never leaks credentials.
     if cancel_backend(cancel_pool, backend).await.is_err() {
         tracing::warn!(pid = backend.pid, "pg_cancel_backend on truncation failed");
+    }
+    // The statement's end — as a rule the cancel's `57014` — is still unread.
+    // The driver reads it before it sends anything else, so a `rollback` now
+    // would return it without having sent `ROLLBACK`.
+    if let Err(err) = tx.ping().await
+        && !is_query_canceled(&err)
+    {
+        tracing::warn!(pid = backend.pid, "draining a truncated read failed");
     }
     // The backend is now in an aborted-transaction state — only ROLLBACK is
     // valid on it, and this is a read-only transaction with nothing to lose.
