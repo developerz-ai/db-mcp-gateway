@@ -116,18 +116,24 @@ pub(super) fn classify_commit(
     }
 }
 
-/// "cached plan must not change result type": a definition changed between
-/// the statement's `Parse` and its `Bind`. Revalidation comes before
-/// execution, so the statement did not run, and the same one planned afresh
-/// may. Told from any other `0A000` by the raising C function: the message
-/// is localised, the function name is not.
+/// "cached plan must not change result type" of the statement itself: a
+/// definition changed between its `Parse` and its `Bind`. Revalidation comes
+/// before execution, so nothing ran and the same call, planned afresh, may
+/// succeed. Told from any other `0A000` by the raising C function: the
+/// message is localised, the function name is not.
+///
+/// Raised by a plan the statement's own functions keep, it has a context: by
+/// then the statement was running, its side effects outside the transaction
+/// (a session lock, a sequence) stand, and the function may fail the same
+/// way every time. That one is the statement's error, not a retry.
 fn is_stale_plan(err: &sqlx::Error) -> bool {
     is_feature_not_supported(err)
         && err
             .as_database_error()
             .and_then(|db| db.try_downcast_ref::<PgDatabaseError>())
-            .and_then(PgDatabaseError::routine)
-            == Some("RevalidateCachedQuery")
+            .is_some_and(|db| {
+                db.routine() == Some("RevalidateCachedQuery") && db.r#where().is_none()
+            })
 }
 
 fn sqlstate(err: &sqlx::Error) -> Option<String> {

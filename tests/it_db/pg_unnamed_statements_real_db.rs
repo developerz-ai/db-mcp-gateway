@@ -29,9 +29,11 @@ use crate::common::pg_target::{
     owner_url, server, single_connection_adapter, target_port, writable_adapter, writable_database,
 };
 use db_mcp_gateway::audit::drain::DetachedTasks;
+use db_mcp_gateway::config::Password;
 use db_mcp_gateway::exec::{
-    Access, ActivityQuery, DbAdapter, ExecError, ExecQuery, ExplainQuery, GuardedSql, Identifier,
-    PgAdapter, PoolSizing, QueryParam, SampleQuery, SchemaDetail, SchemaQuery, TableStatsQuery,
+    Access, ActivityQuery, DbAdapter, ExecError, ExecQuery, ExecResult, ExplainQuery, GuardedSql,
+    Identifier, PgAdapter, PoolSizing, QueryParam, SampleQuery, SchemaDetail, SchemaQuery,
+    TableStatsQuery,
 };
 
 fn statement(sql: &str, access: Access) -> ExecQuery<'_> {
@@ -170,7 +172,9 @@ async fn a_first_seen_type_does_not_lose_the_statement() {
 }
 
 /// The same `SELECT *` from several callers while the table gains columns:
-/// no read fails and every row is as wide as its header.
+/// no read fails, every row is as wide as its header, and no header goes
+/// back to an older table — the zero-row read's included, which has nothing
+/// but its description to go by.
 #[tokio::test]
 #[serial_test::parallel(world)]
 async fn reads_survive_schema_changes_between_them() {
@@ -186,20 +190,30 @@ async fn reads_survive_schema_changes_between_them() {
     )
     .await;
     let adapter = Arc::new(adapter().await);
+    let zero_rows = format!("SELECT * FROM {table} WHERE id < 0");
+    let before = adapter.execute(read(&zero_rows)).await.expect("zero rows");
+    assert_eq!(before.columns, ["id"]);
     let done = Arc::new(AtomicBool::new(false));
     let readers: Vec<_> = (0..4)
         .map(|at| {
-            let (adapter, done, table) = (adapter.clone(), done.clone(), table.clone());
+            let (adapter, done) = (adapter.clone(), done.clone());
+            let sql = match at {
+                0 => zero_rows.clone(),
+                _ => format!("SELECT * FROM {table}"),
+            };
             tokio::spawn(async move {
-                let filter = if at == 0 { "WHERE id < 0" } else { "" };
-                let sql = format!("SELECT * FROM {table} {filter}");
                 let mut failures = Vec::new();
+                let mut width = 0;
                 while !done.load(Ordering::Relaxed) {
                     match adapter.execute(read(&sql)).await {
-                        Ok(result) => assert!(
-                            result.rows.iter().all(|r| r.len() == result.columns.len()),
-                            "{result:?}"
-                        ),
+                        Ok(result) => {
+                            let columns = result.columns.len();
+                            assert!(columns >= width, "{columns} columns after {width}");
+                            width = columns;
+                            let rows = if at == 0 { 0 } else { 2 };
+                            assert_eq!(result.rows.len(), rows, "{result:?}");
+                            assert!(result.rows.iter().all(|row| row.len() == columns));
+                        }
                         Err(err) => failures.push(format!("{err:?}")),
                     }
                 }
@@ -214,22 +228,28 @@ async fn reads_survive_schema_changes_between_them() {
     let last = adapter
         .execute(read(&format!("SELECT * FROM {table}")))
         .await;
+    let after = adapter.execute(read(&zero_rows)).await;
     done.store(true, Ordering::Relaxed);
     let outcomes = futures::future::join_all(readers).await;
     run(&owner, format!("DROP TABLE {table}")).await;
     for outcome in outcomes {
         assert_eq!(outcome.expect("reader"), Vec::<String>::new());
     }
-    assert_eq!(last.expect("last read").columns.len(), 21);
+    let last = last.expect("last read");
+    assert_eq!(last.columns.len(), 21);
+    let after = after.expect("zero rows");
+    assert!(after.rows.is_empty());
+    assert_eq!(after.columns, last.columns);
 }
 
-/// "cached plan must not change result type", provoked inside one statement:
-/// a SQL-level prepared statement whose table changes under it with the
-/// search path. Nothing in the caller's SQL is there to fix — unlike any
-/// other `0A000`, raised by a function or by the server itself.
+/// "cached plan must not change result type" from a plan a function keeps —
+/// a SQL-level prepared statement whose table changes with the search path —
+/// comes once the statement is running: its own error, never a retry. So is
+/// any other `0A000`, raised by a function under that very message or by the
+/// server.
 #[tokio::test]
 #[serial_test::parallel(world)]
-async fn a_stale_plan_is_retryable_and_no_other_0a000_is() {
+async fn a_stale_plan_inside_a_running_statement_is_not_retryable() {
     let owner = owner().await;
     let name = format!("dbmcp_stale_{}", Uuid::new_v4().simple());
     run(
@@ -249,13 +269,20 @@ async fn a_stale_plan_is_retryable_and_no_other_0a000_is() {
     )
     .await;
     let adapter = adapter().await;
-    let stale = adapter.execute(read(&format!("SELECT {name}()"))).await;
-    let raised = adapter
-        .execute(read(&format!("SELECT {name}_raise()")))
-        .await;
-    let unsupported = adapter
-        .execute(read("SELECT 1 UNION SELECT 2 FOR UPDATE"))
-        .await;
+    let writer = writable_adapter().await;
+    let stale = format!("SELECT {name}()");
+    let insert = format!("INSERT INTO {name}_a.t SELECT {name}()");
+    let raised = format!("SELECT {name}_raise()");
+    let unsupported = "SELECT 1 UNION SELECT 2 FOR UPDATE";
+    let outcomes = [
+        (adapter.execute(read(&stale)).await, stale.as_str()),
+        (
+            writer.execute(statement(&insert, Access::ReadWrite)).await,
+            insert.as_str(),
+        ),
+        (adapter.execute(read(&raised)).await, raised.as_str()),
+        (adapter.execute(read(unsupported)).await, unsupported),
+    ];
     run(
         &owner,
         format!(
@@ -264,13 +291,157 @@ async fn a_stale_plan_is_retryable_and_no_other_0a000_is() {
         ),
     )
     .await;
-    assert!(matches!(stale, Err(ExecError::Unavailable)), "{stale:?}");
-    for other in [raised, unsupported] {
-        let Err(ExecError::Rejected(rejection)) = other else {
-            panic!("{other:?}")
-        };
-        assert_eq!(rejection.sqlstate(), "0A000");
+    for (outcome, sql) in outcomes {
+        assert_refused(outcome, "0A000", sql);
     }
+}
+
+/// The same error for the statement's own plan, at its `Bind`: nothing ran —
+/// the function in it would have raised — so the call is retryable, and the
+/// retry answers. A read and a write.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_plan_stale_before_the_statement_runs_is_retryable() {
+    let owner = owner().await;
+    let name = format!("dbmcp_bind_{}", Uuid::new_v4().simple());
+    run(
+        &owner,
+        format!(
+            "CREATE SCHEMA {name}_b; CREATE TABLE {name} (x int); INSERT INTO {name} VALUES (1); \
+             CREATE TABLE {name}_b.{name} (x int, y text); \
+             CREATE FUNCTION {name}_ran() RETURNS int VOLATILE LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE EXCEPTION 'ran' USING ERRCODE = 'P0001'; END $$"
+        ),
+    )
+    .await;
+    let switch = SearchPathSwitch::start(&name).await;
+    let mut target = server();
+    target.port = switch.port;
+    target.databases[0].write_role = Some(TARGET_USER.to_string());
+    target.databases[0].write_password = Some(Password::Literal(TARGET_PASSWORD.into()));
+    let a = PgAdapter::open(
+        &target,
+        &target.databases[0],
+        PoolSizing::default(),
+        DetachedTasks::new(),
+    )
+    .await
+    .expect("adapter over the switch");
+    let mut outcomes = Vec::new();
+    for (sql, access) in [
+        (
+            format!("SELECT *, public.{name}_ran() FROM {name}"),
+            Access::ReadOnly,
+        ),
+        (
+            format!("UPDATE {name} SET x = 2 RETURNING *, public.{name}_ran()"),
+            Access::ReadWrite,
+        ),
+    ] {
+        switch.armed.store(true, Ordering::SeqCst);
+        let stale = a.execute(statement(&sql, access)).await;
+        let switched = !switch.armed.load(Ordering::SeqCst);
+        // Again, its plan sound: now it runs, as far as its own error.
+        outcomes.push((sql.clone(), stale, switched));
+        assert_refused(a.execute(statement(&sql, access)).await, "P0001", &sql);
+    }
+    let plain = a.execute(read(&format!("SELECT * FROM {name}"))).await;
+    run(
+        &owner,
+        format!("DROP FUNCTION {name}_ran(); DROP SCHEMA {name}_b CASCADE; DROP TABLE {name}"),
+    )
+    .await;
+    for (sql, stale, switched) in outcomes {
+        assert!(switched, "{sql}: no Bind was intercepted");
+        assert!(
+            matches!(stale, Err(ExecError::Unavailable)),
+            "{sql}: {stale:?}"
+        );
+    }
+    let plain = plain.expect("untouched table");
+    assert_eq!(plain.rows, vec![vec![json!(1)]], "the write left no trace");
+}
+
+/// A TCP forwarder to the target that, once each time it is `armed`, changes
+/// the transaction's search path between the `Parse` and the `Bind` of a
+/// statement over `table` — what makes the server find its plan stale.
+struct SearchPathSwitch {
+    port: u16,
+    armed: Arc<AtomicBool>,
+}
+
+impl SearchPathSwitch {
+    async fn start(table: &str) -> Self {
+        let listener = TcpListener::bind((TARGET_HOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let armed: Arc<AtomicBool> = Arc::default();
+        let (arm, table) = (armed.clone(), table.to_owned());
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                tokio::spawn(Self::serve(client, arm.clone(), table.clone()));
+            }
+        });
+        Self { port, armed }
+    }
+
+    /// The driver sends one batch and reads its whole answer before the
+    /// next, so a batch is one read here and the two never interleave.
+    async fn serve(mut client: TcpStream, armed: Arc<AtomicBool>, table: String) {
+        let mut server = TcpStream::connect((TARGET_HOST, target_port()))
+            .await
+            .expect("target-db reachable; run `bin/dev up`");
+        let (mut from_client, mut from_server) = (vec![0u8; 65536], vec![0u8; 65536]);
+        let mut parsed = false;
+        loop {
+            tokio::select! {
+                read = client.read(&mut from_client) => {
+                    let Ok(n @ 1..) = read else { return };
+                    let batch = &from_client[..n];
+                    if batch[0] == b'P' {
+                        parsed = batch.windows(table.len()).any(|w| w == table.as_bytes());
+                    }
+                    if batch[0] == b'B' && parsed && armed.swap(false, Ordering::SeqCst) {
+                        server.write_all(&switch_path(&table)).await.unwrap();
+                        let mut answer = Vec::new();
+                        // ReadyForQuery, in a transaction: the answer's end.
+                        while !answer.ends_with(b"Z\0\0\0\x05T") {
+                            let n = server.read(&mut from_server).await.unwrap();
+                            assert!(n > 0, "target closed the connection");
+                            answer.extend_from_slice(&from_server[..n]);
+                        }
+                    }
+                    if server.write_all(&from_client[..n]).await.is_err() {
+                        return;
+                    }
+                }
+                read = server.read(&mut from_server) => {
+                    let Ok(n @ 1..) = read else { return };
+                    if client.write_all(&from_server[..n]).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `set_config` over the extended protocol under a name of its own: a simple
+/// query would destroy the unnamed statement waiting for its `Bind`.
+fn switch_path(table: &str) -> Vec<u8> {
+    let sql = format!("SELECT set_config('search_path', '{table}_b', true)");
+    let mut batch = Vec::new();
+    for (kind, body) in [
+        (b'P', [b"switch\0", sql.as_bytes(), b"\0\0\0"].concat()),
+        (b'B', b"\0switch\0\0\0\0\0\0\0".to_vec()),
+        (b'E', b"\0\0\0\0\0".to_vec()),
+        (b'C', b"Sswitch\0".to_vec()),
+        (b'S', Vec::new()),
+    ] {
+        batch.push(kind);
+        batch.extend_from_slice(&(body.len() as u32 + 4).to_be_bytes());
+        batch.extend_from_slice(&body);
+    }
+    batch
 }
 
 /// A TCP forwarder to the target that reads both directions of every
@@ -282,7 +453,8 @@ struct WireRecorder {
 
 #[derive(Default)]
 struct Seen {
-    parses: usize,
+    /// The text of every Parse.
+    parses: Vec<String>,
     violations: Vec<String>,
 }
 
@@ -352,7 +524,7 @@ impl Seen {
         let name = body[name_at..].split(|b| *b == 0).next().unwrap_or(&[]);
         let text = String::from_utf8_lossy(body);
         if kind == b'P' {
-            self.parses += 1;
+            self.parses.push(text.to_string());
         }
         if kind != b'E' && !name.is_empty() {
             self.violations
@@ -399,6 +571,14 @@ async fn forward(
     let _ = to.shutdown().await;
 }
 
+/// `outcome` is the target's refusal of `sql`, with `sqlstate`.
+fn assert_refused(outcome: Result<ExecResult, ExecError>, sqlstate: &str, sql: &str) {
+    let Err(ExecError::Rejected(rejection)) = outcome else {
+        panic!("{sql}: {outcome:?}")
+    };
+    assert_eq!(rejection.sqlstate(), sqlstate, "{sql}");
+}
+
 /// The recorder sees what it is there for: the driver's own defaults.
 #[tokio::test]
 #[serial_test::parallel(world)]
@@ -432,7 +612,7 @@ async fn the_wire_recorder_flags_what_a_pooler_cannot_serve() {
     select().execute(&mut *tx).await.expect("unnamed");
     let seen = wire.take();
     assert_eq!(seen.violations, Vec::<String>::new());
-    assert!(seen.parses > 0);
+    assert!(!seen.parses.is_empty());
     sqlx::query("SELECT 1")
         .execute(&mut *tx)
         .await
@@ -487,19 +667,36 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
 
     // Reads: a failed statement first, so the first-seen types after it are
     // looked up on a connection that has just rolled back.
-    for sql in [
-        "SELECT 1 / 0".to_string(),
-        format!("SELECT nope FROM {name}"),
-        format!("SELECT * FROM {name}"),
-        format!("SELECT e FROM {name} WHERE false"),
-        "SELECT relacl FROM pg_class LIMIT 1".to_string(),
-        "SELECT ev_action FROM pg_rewrite LIMIT 1".to_string(),
-        "SELECT 1 / 0, ev_action FROM pg_rewrite LIMIT 1".to_string(),
-        "SELECT generate_series(1, 100000)".to_string(),
-        "SELECT * FROM dbmcp_no_such_table".to_string(),
+    let nope = format!("SELECT nope FROM {name}");
+    for (sql, sqlstate) in [
+        ("SELECT 1 / 0", "22012"),
+        (nope.as_str(), "42703"),
+        ("SELECT * FROM dbmcp_no_such_table", "42P01"),
+        ("SELECT 1 / 0, ev_action FROM pg_rewrite LIMIT 1", "22012"),
     ] {
-        let _ = a.execute(read(&sql)).await;
+        assert_refused(a.execute(read(sql)).await, sqlstate, sql);
     }
+    let star = format!("SELECT * FROM {name}");
+    let none = format!("SELECT e FROM {name} WHERE false");
+    for (sql, rows) in [
+        (star.as_str(), 1),
+        (none.as_str(), 0),
+        ("SELECT relacl FROM pg_class WHERE relname = 'pg_class'", 1),
+        ("SELECT ev_action FROM pg_rewrite LIMIT 1", 1),
+    ] {
+        let result = a
+            .execute(read(sql))
+            .await
+            .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
+        assert_eq!(result.rows.len(), rows, "{sql}");
+        assert!(!result.truncated && !result.columns.is_empty(), "{sql}");
+    }
+    let capped = a
+        .execute(read("SELECT generate_series(1, 100000)"))
+        .await
+        .expect("capped read");
+    assert!(capped.truncated);
+    assert_eq!(capped.rows.len(), 100);
     let all = format!("SELECT * FROM {name} WHERE id = $1");
     let found = a
         .execute_with_params(read(&all), &[QueryParam::Int(1)])
@@ -567,19 +764,18 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
 
     // Writes: committed, rolled back, refused.
     for dry_run in [false, true] {
-        a.execute(ExecQuery {
-            dry_run,
-            ..statement(&update, Access::ReadWrite)
-        })
-        .await
-        .expect("write");
+        let written = a
+            .execute(ExecQuery {
+                dry_run,
+                ..statement(&update, Access::ReadWrite)
+            })
+            .await
+            .expect("write");
+        assert_eq!(written.rows_affected, Some(1));
     }
     let refused = format!("INSERT INTO {name} (id) VALUES (1)");
-    assert!(
-        a.execute(statement(&refused, Access::ReadWrite))
-            .await
-            .is_err()
-    );
+    let outcome = a.execute(statement(&refused, Access::ReadWrite)).await;
+    assert_refused(outcome, "23505", &refused);
 
     // A cancel by request id, on each tier, while `db_activity` is asked.
     for access in [Access::ReadOnly, Access::ReadWrite] {
@@ -615,10 +811,14 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
             "SELECT ev_action FROM pg_rewrite LIMIT 2"
         };
         let cut = Duration::from_micros(150 * at);
-        let _ = tokio::time::timeout(cut, a.execute(read(sql))).await;
+        // Cut short or done first: a drop before it must never fail it.
+        if let Ok(outcome) = tokio::time::timeout(cut, a.execute(read(sql))).await {
+            outcome.unwrap_or_else(|err| panic!("after a drop: {sql}: {err:?}"));
+        }
     }
     let dropped = a.execute(read("SELECT pg_sleep(5)"));
-    let _ = tokio::time::timeout(Duration::from_millis(300), dropped).await;
+    let dropped = tokio::time::timeout(Duration::from_millis(300), dropped).await;
+    assert!(dropped.is_err(), "{dropped:?}");
 
     // The backend killed under the statement.
     let victim = read("SELECT pg_sleep(5)");
@@ -641,7 +841,8 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
         panic!("never killed");
     });
     assert!(matches!(killed, Err(ExecError::Unavailable)), "{killed:?}");
-    a.execute(read("SELECT 1")).await.expect("recovered");
+    let recovered = a.execute(read("SELECT 1")).await.expect("recovered");
+    assert_eq!(recovered.rows, vec![vec![json!(1)]]);
 
     detached
         .drain(Duration::from_secs(5))
@@ -653,7 +854,19 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
     )
     .await;
     let seen = wire.take();
-    assert!(seen.parses > 100, "recorded {} parses", seen.parses);
+    // Both routes to the text cast were on the wire, up to the cast itself.
+    for route in [
+        "DECLARE dbmcp_columns",
+        "q.c1::text AS \"relacl\"",
+        "q.c1::text AS \"ev_action\"",
+        "SELECT * FROM",
+        "UPDATE",
+    ] {
+        assert!(
+            seen.parses.iter().any(|text| text.contains(route)),
+            "nothing parsed holds {route}"
+        );
+    }
     assert!(
         seen.violations.is_empty(),
         "{} violations, first: {:?}",
