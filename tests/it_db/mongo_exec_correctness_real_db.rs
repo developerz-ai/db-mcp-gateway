@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mongodb::bson::{Bson, Document, JavaScriptCodeWithScope, doc};
+use mongodb::error::ErrorKind;
 use serde_json::json;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -412,12 +413,19 @@ async fn nested_code_scopes_are_bounded_by_the_servers_nesting_limit() {
             .database(TARGET_DB)
             .run_command(doc! { "insert": &coll, "documents": [scopes(levels)] })
             .await;
-        stored.push(reply.is_ok_and(|reply| reply.get_array("writeErrors").is_err()));
+        stored.push(reply);
     }
     let read = run(&a, &format!(r#"{{"find":"{coll}"}}"#), None).await;
     drop_collection(&side_client(), &coll).await;
 
-    assert_eq!(stored, [true, false]);
+    let refused = stored.pop().expect("two inserts").expect_err("250 levels");
+    let ErrorKind::Command(refused) = refused.kind.as_ref() else {
+        panic!("not the server's answer: {refused:?}");
+    };
+    // 15, Overflow: "BSONObj exceeds maximum nested object depth".
+    assert_eq!(refused.code, 15, "{refused:?}");
+    let reply = stored.pop().expect("two inserts").expect("90 levels");
+    assert!(reply.get_array("writeErrors").is_err(), "{reply:?}");
     let rows = read.expect("the deepest stored scope renders").rows;
     let mut value = &rows[0][0];
     for _ in 0..90 {

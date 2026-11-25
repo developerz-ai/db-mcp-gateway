@@ -67,11 +67,13 @@ networkPolicy:
 ```bash
 # X.Y.Z = the gateway release to run: chart version, appVersion and image tag are the same
 chart=ghcr.io/developerz-ai/db-mcp-gateway/charts/db-mcp-gateway
-digest=$(helm pull "oci://$chart" --version X.Y.Z 2>&1 | sed -n 's/^Digest: //p')
-cosign verify "$chart@$digest" \
-  --certificate-identity https://github.com/developerz-ai/db-mcp-gateway/.github/workflows/release.yml@refs/tags/vX.Y.Z \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  && helm install gateway ./db-mcp-gateway-X.Y.Z.tgz -n gateway -f my-values.yaml
+dir=$(mktemp -d)   # fresh, so only an archive this pull saved can be installed
+helm pull "oci://$chart" --version X.Y.Z -d "$dir" > "$dir/pull.log" 2>&1 \
+  && digest=$(sed -n 's/^Digest: //p' "$dir/pull.log") \
+  && cosign verify "$chart@$digest" \
+      --certificate-identity https://github.com/developerz-ai/db-mcp-gateway/.github/workflows/release.yml@refs/tags/vX.Y.Z \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  && helm install gateway "$dir/db-mcp-gateway-X.Y.Z.tgz" -n gateway -f my-values.yaml
 ```
 
 This installs the archive that was pulled, by the digest that was verified. The identity names the exact tag: one that matches any release tag would also accept an older signed chart put under the version you asked for. Without verification: `helm install gateway "oci://$chart" --version X.Y.Z …`, or from a checkout `helm install gateway ./deploy/helm/db-mcp-gateway …`.
