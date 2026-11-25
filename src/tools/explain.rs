@@ -2,7 +2,7 @@
 //! plain EXPLAIN never executes the user's statement.
 //!
 //! Same authz / audit / AST-guard path as `run_query`: the inner SQL is gated
-//! through `GuardedSql::parse` at the caller's grant level, so a data write
+//! through `GuardedSql::parse_async` at the caller's grant level, so a data write
 //! can be explained only under a `query_write` grant (it is planned as the
 //! write role). `analyze: true` does execute the statement, so it is refused
 //! for anything but a read; the read runs inside the read-only transaction
@@ -142,7 +142,7 @@ async fn compute_outcome(
     } else {
         Access::ReadOnly
     };
-    let sql = match GuardedSql::parse(&args.sql, grant_access) {
+    let sql = match GuardedSql::parse_async(&args.sql, grant_access).await {
         Ok(sql) => sql,
         Err(err) => return guard_rejected(&err),
     };

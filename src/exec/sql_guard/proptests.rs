@@ -6,6 +6,8 @@
 
 use super::*;
 use proptest::prelude::*;
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
 
 /// Pieces the two lexers are most likely to read differently: quotes,
 /// escapes, string prefixes, comment openers, operator characters, line

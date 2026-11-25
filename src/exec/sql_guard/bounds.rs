@@ -11,6 +11,13 @@
 //! Counts only, never grammar: a count cannot be smaller than the structure
 //! the parser builds from the words.
 
+use std::num::NonZeroUsize;
+use std::sync::OnceLock;
+
+use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::sync::Semaphore;
+use tokio::task::block_in_place;
+
 use super::GuardError;
 use super::pg_scan::{Kind, Lexeme};
 
@@ -33,6 +40,40 @@ const PARSER_STACK: usize = 32 << 20;
 /// within the bounds, whatever is left of the caller's.
 pub(super) fn with_parser_stack<T>(f: impl FnOnce() -> T) -> T {
     stacker::grow(PARSER_STACK, f)
+}
+
+/// A longer statement is guarded off the async worker: one at the length cap
+/// takes 40 ms as a matter of course and 150 ms at the end of its work budget,
+/// one this long at most 15 ms.
+const MAX_BYTES_ON_WORKER: usize = 4 * 1024;
+
+/// Run `f` for a statement of `bytes` bytes with the thread's other tasks
+/// moved elsewhere, where there is elsewhere. Not `spawn_blocking`: the
+/// statement is borrowed, and once `f` starts there is nothing to cancel.
+///
+/// Off the worker, as many run at once as there are cores. The rest wait
+/// their turn asynchronously, so a caller that goes away while waiting leaves
+/// the queue and its statement is never parsed. The wait needs no deadline of
+/// its own: at most the gateway's concurrent requests wait, each for turns of
+/// under a second.
+pub(super) async fn off_the_worker<T>(bytes: usize, f: impl FnOnce() -> T) -> T {
+    let multi_thread = Handle::try_current()
+        .is_ok_and(|runtime| runtime.runtime_flavor() == RuntimeFlavor::MultiThread);
+    if !multi_thread || bytes <= MAX_BYTES_ON_WORKER {
+        return f();
+    }
+    // Never closed, so a permit always comes.
+    let _turn = turns().acquire().await.ok();
+    block_in_place(f)
+}
+
+/// Statements guarded off the worker at once.
+pub(super) fn turns() -> &'static Semaphore {
+    static TURNS: OnceLock<Semaphore> = OnceLock::new();
+    TURNS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        Semaphore::new(cores)
+    })
 }
 
 pub(super) fn check_length(sql: &str) -> Result<(), GuardError> {

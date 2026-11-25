@@ -2,6 +2,7 @@ use super::*;
 
 mod attribute_notation;
 mod bounds;
+mod budget;
 mod denied_families;
 mod denied_functions;
 mod denied_relations;

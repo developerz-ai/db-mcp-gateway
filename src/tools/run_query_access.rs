@@ -13,13 +13,17 @@ use crate::tools::audit_dispatch::{
 
 /// The access `sql` needs, after the guard at the caller's grant level:
 /// `ReadWrite` only for a data write under a `query_write` grant.
-pub(super) fn statement_access(sql: &str, writes_allowed: bool) -> Result<Access, Box<Outcome>> {
+pub(super) async fn statement_access(
+    sql: &str,
+    writes_allowed: bool,
+) -> Result<Access, Box<Outcome>> {
     let grant = if writes_allowed {
         Access::ReadWrite
     } else {
         Access::ReadOnly
     };
-    GuardedSql::parse(sql, grant)
+    GuardedSql::parse_async(sql, grant)
+        .await
         .map(|guarded| guarded.required_access())
         .map_err(|err| Box::new(guard_rejected(&err)))
 }

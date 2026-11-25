@@ -9,8 +9,8 @@ use std::time::Duration;
 use super::*;
 
 /// For one statement, so generous for a loaded machine: the slowest takes
-/// about 60 ms optimised. What it guards against is time that grows faster
-/// than the text.
+/// about 3 ms optimised, the work budget of its length. What it guards against
+/// is time that grows faster than the text.
 const DEADLINE: Duration = Duration::from_secs(10);
 
 /// Set for the process that runs the cases.
@@ -41,6 +41,20 @@ const OPENERS: &[&str] = &[
     "TRIM(",
     "LATERAL (",
     "SELECT * FROM (",
+    "NOT (a).",
+    "CAST(a.",
+    "(a).",
+    "f(a.",
+    "CASE a.",
+    "a.NOT ",
+    "EXTRACT(",
+    "POSITION(a IN ",
+    "XMLELEMENT(",
+    "(a).b(",
+    "ARRAY[a.",
+    "OVERLAY(",
+    "WITH a AS (",
+    "((SELECT 1) UNION ",
 ];
 
 /// Runs itself again as the process that measures, so the one filter that

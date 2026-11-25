@@ -146,7 +146,12 @@ fn assert_answers(nest: (&str, &str), depth: usize, link: &'static str, core: Co
 
     let cut = statement.cut_after_the_chain(MAX_SQL_BYTES - 4);
     let got = on_worker_stack(move || is_read_only(&cut));
-    assert!(matches!(got, Err(GuardError::Parse(_))), "{case}: {got:?}");
+    // Each level of some nests reads the whole chain again.
+    let refused = matches!(
+        got,
+        Err(GuardError::Parse(_) | GuardError::TooMuchWork { .. })
+    );
+    assert!(refused, "{case}: {got:?}");
 }
 
 fn assert_every_nest_answers(core: Core) {
