@@ -136,6 +136,7 @@ mod service_tokens_e2e;
 mod service_upstream_e2e;
 mod session_cache_real_db;
 mod session_max_age_e2e;
+mod sql_guard_bounds_e2e;
 mod sql_guard_differential;
 mod sql_guard_location_e2e;
 mod sql_guard_refusals_e2e;

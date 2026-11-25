@@ -26,6 +26,7 @@
 //! differently from sqlparser: a Unicode-escaped identifier (`U&"…"`), or
 //! any text the two split into different tokens (`lexical`, `pg_scan`).
 //! A relation showing other sessions' statements is refused by name.
+//! The statement's length and structure are bounded first (`bounds`).
 //! Conservative on purpose: better to reject a legitimate exotic statement
 //! than quietly send an unintended one.
 //!
@@ -43,6 +44,7 @@
 //! were manually enumerated — that's the class of gap this module exists to
 //! close, and the reason the walk is now visitor-driven, not hand-recursion.
 
+mod bounds;
 mod denylist;
 mod lexical;
 mod pg_scan;
@@ -54,14 +56,15 @@ mod proptests;
 #[cfg(test)]
 mod tests;
 
-use sqlparser::ast::{Statement, UtilityOption, Visit};
+use sqlparser::ast::{Statement, Visit};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::Location;
 use std::ops::ControlFlow;
 
+use bounds::{check_bounds, check_length, with_parser_stack};
 use lexical::check_lexical;
-use shape::check_statement_shape;
+use shape::{check_statement_shape, explain_analyzes};
 use visitor::GuardVisitor;
 
 /// How much a query is allowed to do, decided upstream by the caller's grant
@@ -125,6 +128,8 @@ pub enum GuardError {
     UnicodeEscapedIdentifier,
     #[error("the SQL text is ambiguous: {0}")]
     AmbiguousTokens(&'static str),
+    #[error("the statement has more than {limit} {what}; split it into smaller statements")]
+    TooComplex { limit: usize, what: &'static str },
     #[error(
         "relation `{0}` is not allowed (it shows other sessions' statements); use the db_activity tool"
     )]
@@ -190,7 +195,15 @@ pub fn check_sql(sql: &str, access: Access) -> Result<(), GuardError> {
 
 /// [`check_sql`], returning the access the admitted statement needs.
 fn guard(sql: &str, access: Access) -> Result<Access, GuardError> {
-    check_lexical(sql)?;
+    check_length(sql)?;
+    let lexemes = check_lexical(sql)?;
+    check_bounds(sql, &lexemes)?;
+    with_parser_stack(|| inspect(sql, access))
+}
+
+/// Parse, walk and drop the tree: sqlparser work only, and all of it, so no
+/// part of a tree — partial or refused — outlives the stack sized for it.
+fn inspect(sql: &str, access: Access) -> Result<Access, GuardError> {
     let dialect = PostgreSqlDialect {};
     let statements = Parser::parse_sql(&dialect, sql).map_err(|e| match e {
         ParserError::ParserError(message) | ParserError::TokenizerError(message) => {
@@ -271,27 +284,4 @@ fn required_access(stmt: &Statement) -> Access {
         Statement::Query(_) => Access::ReadOnly,
         _ => Access::ReadWrite,
     }
-}
-
-/// Whether an `EXPLAIN` carries `ANALYZE` — i.e. whether Postgres will actually
-/// *run* the statement instead of only planning it.
-///
-/// Postgres accepts the flag two ways and sqlparser models them differently:
-/// the bare keyword form (`EXPLAIN ANALYZE …`) sets `analyze`, while the
-/// parenthesised form (`EXPLAIN (ANALYZE, FORMAT JSON) …`) leaves `analyze`
-/// false and lands the flag in `options`. Both execute; both must be caught.
-///
-/// Postgres also accepts the British spelling `ANALYSE` for the option, so
-/// both names match.
-///
-/// An explicit `(ANALYZE false)` is rejected too: the guard does not interpret
-/// option arguments, and there is no reason to write that form.
-fn explain_analyzes(analyze: bool, options: Option<&[UtilityOption]>) -> bool {
-    analyze
-        || options.is_some_and(|opts| {
-            opts.iter().any(|opt| {
-                let name = &opt.name.value;
-                name.eq_ignore_ascii_case("analyze") || name.eq_ignore_ascii_case("analyse")
-            })
-        })
 }

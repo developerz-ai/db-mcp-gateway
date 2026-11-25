@@ -26,7 +26,9 @@ const DIFFERENT_TOKENS: &str = "Postgres would split this text into different to
 /// statement Postgres runs was a string or a comment to the guard.
 ///
 /// Last, the names in the relation denylist, which are refused as words.
-pub(super) fn check_lexical(sql: &str) -> Result<(), GuardError> {
+///
+/// Returns the lexemes the two lexers agree on.
+pub(super) fn check_lexical(sql: &str) -> Result<Vec<Lexeme>, GuardError> {
     let tokens = Tokenizer::new(&PostgreSqlDialect {}, sql)
         .tokenize_with_location()
         .map_err(|err| GuardError::Parse(SqlLocation::of(err.location)))?;
@@ -42,7 +44,7 @@ pub(super) fn check_lexical(sql: &str) -> Result<(), GuardError> {
     }
     match tokens.iter().find_map(denied_relation_name) {
         Some(denied) => Err(GuardError::DeniedRelation(denied)),
-        None => Ok(()),
+        None => Ok(postgres),
     }
 }
 

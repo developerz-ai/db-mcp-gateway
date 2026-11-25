@@ -73,6 +73,10 @@ tls:
       name: ""
     dnsNames: []
 
+# Runtime worker threads (TOKIO_WORKER_THREADS). Unset, the runtime starts one
+# per node core: the memory limit must hold that many statement checks at once.
+workerThreads: 4
+
 # Anything else the gateway reads (website/docs/deployment/quickstart.md env
 # table): plain values or valueFrom refs.
 extraEnv: []

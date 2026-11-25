@@ -110,6 +110,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # version in the same commit.
 sqlx = { version = "=0.9.1", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "macros", "migrate", "json", "postgres", "mysql", "mysql-rsa", "uuid", "chrono", "bigdecimal"] }
 sqlparser = { version = "0.64", features = ["visitor"] }
+# The SQL guard's parser stack (`src/exec/sql_guard/bounds.rs`). Already in the
+# graph through sqlparser.
+stacker = "0.1"
 async-trait = "0.1"
 # Mongo target adapter (#57 scaffold + #58 exec). Disable default features so
 # we never pull native-tls's openssl link; rustls matches the rest of the

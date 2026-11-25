@@ -1,6 +1,7 @@
 use super::*;
 
 mod attribute_notation;
+mod bounds;
 mod denied_families;
 mod denied_functions;
 mod denied_relations;

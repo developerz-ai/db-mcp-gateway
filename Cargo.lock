@@ -908,6 +908,7 @@ dependencies = [
  "sha2",
  "sqlparser",
  "sqlx",
+ "stacker",
  "tempfile",
  "thiserror",
  "tokio",
