@@ -6,6 +6,12 @@
 //! share one transaction: an audit failure rolls the data back (CLAUDE.md
 //! MUST #4) and a rolled-back write notifies no one. Local invalidation runs
 //! only after commit, so a failed write never bumps a cache revision.
+//!
+//! A `permissions_audit` row that did not become durable — its insert, or
+//! the rest of the transaction carrying it, failed — also starts the
+//! `audit_failure_recent` hold, like a refused tool call. A deadlock or
+//! serialization abort after the insert does not: that is a conflict between
+//! two admins, answered `conflict`.
 
 use serde_json::Value as JsonValue;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -17,10 +23,11 @@ use crate::audit::permissions::{
 use crate::authz::PermissionsCache;
 use crate::state::permissions::pg::{notify, users};
 use crate::state::permissions::{PermissionsChange, RepoError};
+use crate::tools::audit_dispatch::failure_hold::{FailedAuditWrite, audit_failures};
 
 use super::error::AdminError;
 use super::middleware::AdminActor;
-use super::validation::{internal, store_error};
+use super::validation::{internal, is_conflict, store_error};
 
 pub(super) struct AuditedTx<'a> {
     tx: Transaction<'static, Postgres>,
@@ -105,9 +112,10 @@ impl<'a> AuditedTx<'a> {
             after,
             request_id: request_id.to_string(),
         };
-        permissions::log(&mut *self.tx, &row)
-            .await
-            .map_err(|err| internal("audit log", err, request_id))
+        permissions::log(&mut *self.tx, &row).await.map_err(|err| {
+            audit_failures().mark(FailedAuditWrite::Write);
+            internal("audit log", err, request_id)
+        })
     }
 
     /// Queue the cross-replica notification (when the write can change a
@@ -121,15 +129,23 @@ impl<'a> AuditedTx<'a> {
         if let Some(change) = &change {
             notify::tx_notify(&mut self.tx, change)
                 .await
-                .map_err(|err| store_error("notify", err, request_id))?;
+                .map_err(|err| row_lost("notify", err, request_id))?;
         }
         self.tx
             .commit()
             .await
-            .map_err(|err| store_error("commit tx", RepoError::Sqlx(err), request_id))?;
+            .map_err(|err| row_lost("commit tx", RepoError::Sqlx(err), request_id))?;
         if let Some(change) = change {
             cache.spawn_apply(change);
         }
         Ok(())
     }
+}
+
+/// The transaction failed with its audit row already in it.
+fn row_lost(stage: &'static str, err: RepoError, request_id: &str) -> AdminError {
+    if !is_conflict(&err) {
+        audit_failures().mark(FailedAuditWrite::Write);
+    }
+    store_error(stage, err, request_id)
 }

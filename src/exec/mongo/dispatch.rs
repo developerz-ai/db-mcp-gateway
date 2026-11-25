@@ -13,7 +13,7 @@ use super::super::adapter::{
 use super::super::budget::ResultBudget;
 use super::super::query::ExecQuery;
 use super::bson_json::bson_to_json;
-use super::cancel;
+use super::cancel::{self, Reservation};
 use super::{CONNECT_TIMEOUT, MongoAdapter, rejector};
 
 /// What one document of a cursor becomes in the result.
@@ -32,23 +32,29 @@ impl MongoAdapter {
 
         // The caller's share of the pool, then a connection of it, both
         // taken outside the time budget as the pg adapter's acquire is.
-        let _slot = self.callers.take(CONNECT_TIMEOUT).await?;
-        let _connection = self.reserve_connection().await?;
+        let slot = self.callers.take(CONNECT_TIMEOUT).await?;
+        let reservation = Reservation {
+            _connection: self.reserve_connection().await?,
+            _slot: slot,
+        };
         let effective_ms = effective_timeout_ms(query.statement_timeout_ms);
         let budget = Duration::from_millis(u64::from(effective_ms) + TOKIO_TIMEOUT_SLACK_MS);
-        match tokio::time::timeout(budget, self.dispatch(query, effective_ms, render)).await {
+        let dispatch = self.dispatch(query, effective_ms, render, reservation);
+        match tokio::time::timeout(budget, dispatch).await {
             Ok(result) => result,
             Err(_elapsed) => Err(ExecError::Timeout),
         }
     }
 
     /// Parse, stamp the DB-side budget, and run one already-accepted command.
+    /// `reservation` is held until the command is done, its cancel included.
     /// Split out of [`Self::run`] so the `tokio::time::timeout` there covers the cursor drain as well as the initial dispatch.
     async fn dispatch(
         &self,
         query: &ExecQuery<'_>,
         effective_ms: u32,
         render: Render,
+        reservation: Reservation,
     ) -> Result<ExecResult, ExecError> {
         let mut cmd: Document = serde_json::from_str(query.sql).map_err(|_| ExecError::Sql)?;
         let command_name = first_command_name(&cmd).ok_or(ExecError::Sql)?;
@@ -61,8 +67,12 @@ impl MongoAdapter {
         // Marker for the cancel guard's `currentOp` lookup — see
         // `cancel::stamp_marker` and `DbAdapter::execute`'s doc comment.
         let marker = cancel::stamp_marker(&mut cmd);
-        let mut kill_guard =
-            cancel::KillOpOnDrop::armed(self.client.clone(), marker, self.detached.clone());
+        let mut kill_guard = cancel::KillOpOnDrop::armed(
+            self.client.clone(),
+            marker,
+            self.detached.clone(),
+            reservation,
+        );
 
         let started = Instant::now();
         // Wrapped in a block so `?` inside it is captured into `result`
@@ -219,6 +229,10 @@ struct Rows {
 /// would discard: `row_limit + 1` documents (one past the cap, so
 /// `truncated` can still be detected). A caller's own smaller `find` limit
 /// is kept. `count` and `distinct` answer in one reply and need nothing.
+///
+/// An aggregation's batch is one larger than its `$limit`: a batch the limit
+/// fills exactly leaves the cursor open on the server, for the driver to
+/// close with a `killCursors` that no permit reserves a connection for.
 fn cap_server_side(cmd: &mut Document, command: &str, row_limit: u32) {
     let cap = i64::from(row_limit) + 1;
     match command {
@@ -235,7 +249,7 @@ fn cap_server_side(cmd: &mut Document, command: &str, row_limit: u32) {
             if let Ok(pipeline) = cmd.get_array_mut("pipeline") {
                 pipeline.push(Bson::Document(doc! { "$limit": cap }));
             }
-            cmd.insert("cursor", doc! { "batchSize": cap });
+            cmd.insert("cursor", doc! { "batchSize": cap + 1 });
         }
         _ => {}
     }

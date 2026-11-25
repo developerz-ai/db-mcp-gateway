@@ -64,14 +64,17 @@ async fn replica(pool: &PgPool, admin: bool, refresh: RefreshTokens) -> TestGate
     let cache = PermissionsCache::new(repo.clone(), CACHE_TTL);
     let (subscribed, mut ready) = mpsc::unbounded_channel();
     let listener_cache = cache.clone();
-    tokio::spawn(notify::listen(pool.clone(), move |change| {
-        let cache = listener_cache.clone();
-        let subscribed = subscribed.clone();
-        async move {
-            cache.apply(&change).await;
-            let _ = subscribed.send(());
-        }
-    }));
+    tokio::spawn(notify::listen(
+        (*pool.connect_options()).clone(),
+        move |change| {
+            let cache = listener_cache.clone();
+            let subscribed = subscribed.clone();
+            async move {
+                cache.apply(&change).await;
+                let _ = subscribed.send(());
+            }
+        },
+    ));
     tokio::time::timeout(WAIT, ready.recv())
         .await
         .expect("permissions listener subscribes");

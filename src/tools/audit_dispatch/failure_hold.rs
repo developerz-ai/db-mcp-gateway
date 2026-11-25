@@ -13,8 +13,9 @@ const AUDIT_FAILURE_RECENT: &str = "audit_failure_recent";
 const WRITE_HOLD: Duration = Duration::from_secs(15 * 60);
 const FALLBACK_HOLD: Duration = Duration::from_secs(30 * 60);
 
-/// Which audit write failed: `Write` answered the client `audit_unavailable`;
-/// `Fallback` is the drop-path retry.
+/// Which audit write failed: `Write` failed the request — a tool call
+/// answered `audit_unavailable`, or an admin API request whose row could not
+/// be written; `Fallback` is the drop-path retry.
 #[derive(Debug, Clone, Copy)]
 pub enum FailedAuditWrite {
     Write,
@@ -91,6 +92,14 @@ impl AuditFailures {
             let recent = self.hold(kind).active_at(now);
             gauge!(AUDIT_FAILURE_RECENT, "kind" => label).set(f64::from(u8::from(recent)));
         }
+    }
+
+    /// Forget every failure. The set is process-wide: a test that asserts a
+    /// mark must first drop the ones other tests in its binary left.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reset(&self) {
+        self.write.last_failure.store(None);
+        self.fallback.last_failure.store(None);
     }
 
     #[cfg(test)]

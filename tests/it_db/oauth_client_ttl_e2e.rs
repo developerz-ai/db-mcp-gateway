@@ -10,23 +10,14 @@
 //! `oauth_clients` table), as is the commit-failure test (it adds a trigger
 //! to `oauth_refresh_tokens`); the rest touch only their own rows.
 
-use std::sync::Arc;
-
-use arc_swap::ArcSwap;
-use db_mcp_gateway::auth::jwt::SessionJwt;
-use db_mcp_gateway::auth::oauth::{
-    AuthCodes, AuthFacade, ClientRegistry, GrantIdentity, PendingFlows, RefreshTokens,
-};
-use db_mcp_gateway::auth::{AuthConfig, OidcClient, ServiceTokenStore, SessionStore};
-use db_mcp_gateway::config::Config;
-use db_mcp_gateway::transport::{self, AppState};
+use db_mcp_gateway::auth::oauth::{AuthCodes, ClientRegistry, GrantIdentity, RefreshTokens};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::common::env::state_pool;
-use crate::common::gateway::{EMPTY_YAML, bind, config_file, no_redirect_client, serve};
+use crate::common::gateway::{EMPTY_YAML, GatewayBuilder, no_redirect_client};
 use crate::common::idp::{MockUser, spawn_mock_idp};
 
 // RFC 7636 Appendix B test vector.
@@ -55,39 +46,14 @@ pub(crate) async fn spawn_gateway_with(
         groups: vec!["engineers".into()],
     };
     let idp = spawn_mock_idp("test-client", "test-secret", user).await;
-    let (listener, addr) = bind().await;
-    let url = format!("http://{addr}");
-    let auth_config = AuthConfig {
-        issuer: idp.issuer.clone(),
-        client_id: idp.client_id.clone(),
-        client_secret: idp.client_secret.clone().into(),
-        audience: idp.client_id.clone(),
-        redirect_url: format!("{url}/auth/callback"),
-        ..AuthConfig::default()
-    };
-    let config = config_file(EMPTY_YAML);
-    let tokens = ServiceTokenStore::from_config(&config.service_accounts).expect("tokens");
-    let auth = AuthFacade {
-        jwt: SessionJwt::new(&auth_config.session_signing_key),
-        config: Arc::new(auth_config.clone()),
-        sessions: SessionStore::new(pool.clone()),
-        oidc: OidcClient::new(auth_config).expect("oidc client"),
-        flows: PendingFlows::default(),
-        codes,
-        refresh,
-        service_tokens: Arc::new(ArcSwap::from_pointee(tokens)),
-    };
-    let mut state = AppState::for_tests(config, pool.clone(), auth);
-    state.oauth.client_registry = registry;
-    let config = Config {
-        bind: addr,
-        ..Config::default()
-    };
-    serve(
-        listener,
-        transport::router(&config, state).expect("router builds"),
-    );
-    url
+    GatewayBuilder::new(EMPTY_YAML)
+        .idp(&idp)
+        .registry(registry)
+        .codes(codes)
+        .refresh(refresh)
+        .spawn(pool.clone())
+        .await
+        .url
 }
 
 async fn register(http: &reqwest::Client, gateway: &str) -> String {

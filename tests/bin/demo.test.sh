@@ -56,6 +56,19 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
 "${compose[@]}" up -d --wait >/dev/null 2>&1 || fail 'demo did not come up'
 
+# Again on what is already there: the one-shot `mint-token` re-runs and exits,
+# and `--wait` must read that as done, up or stopped or removed; the token and
+# the key are kept. A service that cannot start is still a failure.
+for before in '' stop down; do
+  [[ -z $before ]] || "${compose[@]}" "$before" >/dev/null 2>&1 || fail "demo did not $before"
+  "${compose[@]}" up -d --wait >/dev/null 2>&1 || fail "re-running up --wait failed (after: ${before:-up})"
+done
+if GATEWAY_IMAGE=db-mcp-gateway:no-such-image \
+    "${compose[@]}" up -d --wait --pull never >/dev/null 2>&1; then
+  fail 'up --wait succeeded with a gateway that cannot start'
+fi
+"${compose[@]}" up -d --wait >/dev/null 2>&1 || fail 'demo did not recover'
+
 # The walkthrough's order: `up --wait` returned on a healthy gateway; the
 # one-shot `ready` prints the line.
 printed=$("${compose[@]}" run --rm -T ready 2>/dev/null) || fail 'the ready service did not exit 0'

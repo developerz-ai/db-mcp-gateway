@@ -38,6 +38,13 @@ impl Proxy {
         Self { addr, conns }
     }
 
+    /// Blackhole every open connection; new ones still go through.
+    pub fn freeze_all(&self) {
+        for conn in self.conns.lock().unwrap().iter() {
+            conn.frozen.cancel();
+        }
+    }
+
     /// Blackhole every connection that has sent `LISTEN`; returns how many.
     pub fn freeze_listeners(&self) -> usize {
         let conns = self.conns.lock().unwrap();

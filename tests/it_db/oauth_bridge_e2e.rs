@@ -1018,5 +1018,5 @@ async fn revoke_during_state_db_outage_is_503() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["error"], "server_error");
+    assert_eq!(body["error"], "temporarily_unavailable");
 }

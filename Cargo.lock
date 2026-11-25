@@ -884,6 +884,7 @@ dependencies = [
  "db-mcp-gateway",
  "futures",
  "getrandom 0.3.4",
+ "hmac",
  "jsonwebtoken",
  "libc",
  "metrics",

@@ -77,8 +77,8 @@ The config parser knows `kind: mysql` and `kind: mssql`, but boot validation rej
 
 ## Phase 8 — Operator ergonomics
 
-- `gateway admin …` subcommands (revoke session, list active sessions, replay audit query).
-- Helm chart (`deploy/helm/db-mcp-gateway`, optional cert-manager `Certificate`), kustomize base, Prometheus alerts, Grafana dashboard and runbook (`deploy/`) ✅ — [Kubernetes](../deployment/kubernetes.md). Publishing the chart to a chart repository on the release tag is still open.
+- CLI subcommands `login`, `grants`, `sessions revoke`, `audit`, `roles`, `doctor`, `mint-service-token` ✅ — [CLI](../deployment/cli.md). Listing active sessions: not built.
+- Helm chart (`deploy/helm/db-mcp-gateway`, optional cert-manager `Certificate`), kustomize base, Prometheus alerts, Grafana dashboard and runbook (`deploy/`) ✅ — [Kubernetes](../deployment/kubernetes.md). `release.yml` publishes the chart to GHCR as an OCI artifact on the release tag ✅.
 - Example `docker-compose` polished — lives in `examples/` in this repo, not a separate repo.
 - Provisioning SQL per engine — documented in [target roles](../deployment/target-roles.md) ✅; bundled templates not planned.
 

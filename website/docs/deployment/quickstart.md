@@ -119,7 +119,7 @@ The env→YAML unification is still pending, so these come from the environment,
 | `MCP_PATH` | `/mcp` | Absolute path the MCP endpoint mounts at. A path the gateway already serves (`/healthz`, `/auth/…`, `/admin…`, `/.well-known…`, …) aborts boot |
 | `METRICS_BIND` | `127.0.0.1:9090` | Internal listener: Prometheus `/metrics`, plus `/healthz` and `/readyz` for probes that should not reach the public port — separate from `GATEWAY_BIND`, which does not serve `/metrics`. Set `0.0.0.0:9090` for an in-cluster scrape and fence the port with a NetworkPolicy; must differ from `GATEWAY_BIND` |
 | `MAX_CONCURRENT_REQUESTS` / `MAX_CONCURRENT_PER_IDENTITY` | `512` / `16` | In-flight ceilings (global → 503, per caller → 429). `0` aborts boot |
-| `STATE_DB_POOL_SIZE` | `10` | Request-path state-DB pool. `0`, or more than the concurrent-request ceiling (512), aborts boot. `1` works: pruner/GC/reaper use a separate fixed pool of 2, and the permissions `LISTEN` connection (plus its liveness ping) another fixed pool of 2 |
+| `STATE_DB_POOL_SIZE` | `10` | Request-path state-DB pool. `0`, or more than the concurrent-request ceiling (512), aborts boot. `1` works: pruner/GC/reaper use a separate fixed pool of 2, and the permissions `LISTEN` and its liveness ping 2 connections of their own. Behind a pooler, see the [pooler contract](pooler-contract.md#the-state-db-behind-a-pooler) |
 | `PG_CANCEL_POOL_SIZE` | `2` | Connections in each Postgres tier's dedicated cancel pool (the pool `pg_cancel_backend` runs on, so a cancel never queues behind the queries it cancels). One per tier per database: a database with a `write_role` holds two. Integer `1`–`32`; anything else aborts boot |
 | `STATE_DB_CONNECT_TIMEOUT_SECONDS` | `60` | How long boot keeps retrying the state DB (backoff 0.5 s doubling to 8 s; each attempt waits up to 5 s, never past the budget; no attempt starts with under 0.5 s left) before exiting. `0` = one attempt. Whole seconds, `0`–`3600`; anything else aborts boot. A malformed `STATE_DB_URL` or a failed migration is not retried. The HTTP listener binds only once the state DB is up, so `/healthz` and `/readyz` do not answer while boot retries — give a Kubernetes `startupProbe` at least this budget, or liveness restarts the pod mid-retry |
 | `OIDC_ISSUER` | — (required) | IdP issuer URL (OIDC discovery base). A trailing slash is ignored |
@@ -145,7 +145,7 @@ The env→YAML unification is still pending, so these come from the environment,
 | `SENTRY_DSN` / `SENTRY_ENVIRONMENT` | unset (disabled) / `development` | GlitchTip/Sentry error tracking; every event passes a credential scrubber |
 | `RUST_LOG` | `info,sqlx::query=warn` | Log filter. Invalid directives are skipped. The `audit_stream` target always logs at INFO regardless |
 
-> **Shutdown.** On `SIGTERM` the gateway stops accepting work, gives in-flight requests up to 80 s (the 75 s `/mcp` request timeout + 5 s), waits up to 20 s for detached audit writes, then closes its request and background state-DB pools (≤ 10 s each). Set `terminationGracePeriodSeconds: 120` or more, or Kubernetes `SIGKILL`s a pod mid-drain.
+> **Shutdown.** On `SIGTERM` the gateway stops accepting work, gives in-flight requests up to 80 s (the 75 s `/mcp` request timeout + 5 s), waits up to 20 s for detached audit writes, then closes its request and background state-DB pools (≤ 10 s each). The `METRICS_BIND` listener serves until that is done. Set `terminationGracePeriodSeconds: 120` or more, or Kubernetes `SIGKILL`s a pod mid-drain.
 
 > **Cert rotation.** A `SIGHUP` re-reads `TLS_CERT_PATH` + `TLS_KEY_PATH` in place. The `SIGHUP` handler is installed with TLS off too, so the signal never kills the process. Send it from outside the container — the image is distroless, with no shell and no `kill`: `docker kill --signal=HUP <container>` under Docker; under Kubernetes a reload sidecar in a pod with `shareProcessNamespace: true`, or a rolling restart. In-flight connections keep their old cert until they close; new handshakes pick up the new one. Kubernetes does not send `SIGHUP` on its own — `terminationGracePeriodSeconds` only governs `SIGTERM` at shutdown — so operators must wire the reload signal explicitly. Cert-manager integration can automate this once #17 lands the infra stack.
 
@@ -192,7 +192,7 @@ Most restrictive value wins when multiple grants match. See [../initial-idea/06-
 
 | You need | Why |
 |---|---|
-| Docker + docker-compose (or k8s manifests) | Run the gateway image. On Kubernetes, use the in-repo Helm chart or kustomize base: [Kubernetes](kubernetes.md). |
+| Docker + docker-compose (or k8s manifests) | Run the gateway image. On Kubernetes, use the published Helm chart or the in-repo kustomize base: [Kubernetes](kubernetes.md). |
 | One Postgres instance for *gateway state* (sessions + audit) | Keep gateway state separate from your prod DBs |
 | Network reachability gateway → each target DB | Self-evident |
 | An OIDC IdP whose ID token carries a verified `email` and a `groups` claim | Identity. Guides: [Okta](idp/okta.md), [Entra ID](idp/entra.md), [Google Workspace](idp/google.md) (needs a broker), [Keycloak](idp/keycloak.md) |
@@ -448,7 +448,7 @@ Names are fixed — dashboards and alerts are written against them. No label car
 | `query_duration_seconds` | histogram (fixed buckets 5 ms – 60 s) | `tool`, `db` (empty when the call named no configured database) |
 | `audit_write_duration_seconds` | histogram (fixed buckets 1 ms – 5 s) | — |
 | `audit_fallback_failures_total` | counter | — (a call's detached audit write failed, after a disconnect or after its completion write failed. The reaper records the call as `abandoned` if it committed an intent, i.e. was about to reach a target; otherwise, e.g. `list_servers`, only the log has it) |
-| `audit_failure_recent` | gauge (`0`/`1`) | `kind` (`write`: an MCP tool call answered `audit_unavailable`, held 15 min; `fallback`: a detached write failed, after a disconnect or after the completion write failed, held 30 min) — `1` from a failure until the hold after the last one ends, timed on the gateway's monotonic clock; evaluated on every scrape, `0` from boot. A restart drops it, so a failure on a pod replaced before any scrape is not seen, nor is one during the shutdown drain (this listener stops at `SIGTERM`); admin API (`permissions_audit`) failures never set it |
+| `audit_failure_recent` | gauge (`0`/`1`) | `kind` (`write`: an MCP tool call answered `audit_unavailable`, or an admin API request whose audit row could not be written, held 15 min; `fallback`: a detached write failed, after a disconnect or after the completion write failed, held 30 min) — `1` from a failure until the hold after the last one ends, timed on the gateway's monotonic clock; evaluated on every scrape, `0` from boot. A restart drops it, so a failure on a pod replaced before any scrape is not seen. This listener serves through the shutdown drain, so a failure during it is seen if a scrape lands before the process exits |
 | `audit_abandoned_total` | counter | — (intents the reaper recorded as `abandoned`; only the lock-holding replica increments it, so `sum()` across replicas is exact) |
 | `audit_reaper_last_success_timestamp` | gauge | — (Unix seconds of the last completed reaper sweep; alert when it falls behind) |
 | `audit_pruner_runs_total` | counter | `result` (`ok`/`error`) |
@@ -545,4 +545,4 @@ Point them at [../usage/first-query.md](../usage/first-query.md) — 5-minute ha
 
 ## Helm / Kubernetes
 
-The Helm chart (`deploy/helm/db-mcp-gateway`) and a kustomize base ship in this repository, with Prometheus alerts, a Grafana dashboard and a runbook: see [Kubernetes](kubernetes.md).
+The Helm chart (`deploy/helm/db-mcp-gateway`, published as `oci://ghcr.io/developerz-ai/db-mcp-gateway/charts/db-mcp-gateway`) and a kustomize base ship in this repository, with Prometheus alerts, a Grafana dashboard and a runbook: see [Kubernetes](kubernetes.md).

@@ -8,8 +8,10 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use axum::Router;
 use db_mcp_gateway::auth::jwt::SessionJwt;
-use db_mcp_gateway::auth::oauth::{AuthCodes, AuthFacade, PendingFlows, RefreshTokens};
-use db_mcp_gateway::auth::{AuthConfig, OidcClient, ServiceTokenStore, SessionStore};
+use db_mcp_gateway::auth::oauth::{
+    AuthCodes, AuthFacade, ClientRegistry, PendingFlows, RefreshTokens,
+};
+use db_mcp_gateway::auth::{AuthConfig, LoginOptions, OidcClient, ServiceTokenStore, SessionStore};
 use db_mcp_gateway::authz::PermissionsCache;
 use db_mcp_gateway::config::{AdminConfig, AdminGroup, Config, ConfigFile};
 use db_mcp_gateway::state::permissions::PermissionsRepo;
@@ -110,6 +112,11 @@ pub struct GatewayBuilder {
     cache: Option<PermissionsCache>,
     repo: Option<Arc<dyn PermissionsRepo>>,
     refresh: RefreshTokens,
+    codes: AuthCodes,
+    registry: ClientRegistry,
+    db_flows: bool,
+    login_options: LoginOptions,
+    public_url: Option<String>,
 }
 
 impl GatewayBuilder {
@@ -121,6 +128,11 @@ impl GatewayBuilder {
             cache: None,
             repo: None,
             refresh: RefreshTokens::default(),
+            codes: AuthCodes::default(),
+            registry: ClientRegistry::default(),
+            db_flows: false,
+            login_options: LoginOptions::default(),
+            public_url: None,
         }
     }
 
@@ -162,15 +174,55 @@ impl GatewayBuilder {
         self
     }
 
+    /// Share an authorization-code store with the test.
+    pub fn codes(mut self, codes: AuthCodes) -> Self {
+        self.codes = codes;
+        self
+    }
+
+    pub fn registry(mut self, registry: ClientRegistry) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    /// Every login store in the state DB, as in production: flows, codes,
+    /// refresh chains and the client registry.
+    pub fn db_login_stores(mut self, pool: &PgPool) -> Self {
+        self.db_flows = true;
+        self.codes = AuthCodes::with_db(pool.clone());
+        self.refresh = RefreshTokens::with_db(pool.clone(), Duration::from_secs(3600));
+        self.registry = ClientRegistry::with_db(pool.clone());
+        self
+    }
+
+    pub fn login_options(mut self, options: LoginOptions) -> Self {
+        self.login_options = options;
+        self
+    }
+
+    /// The base URL the IdP redirects to when it is not this gateway's own
+    /// address (a load balancer's).
+    pub fn public_url(mut self, url: &str) -> Self {
+        self.public_url = Some(url.to_owned());
+        self
+    }
+
     pub async fn spawn(self, pool: PgPool) -> TestGateway {
-        let (listener, addr) = bind().await;
+        let (listener, _) = bind().await;
+        self.spawn_on(listener, pool)
+    }
+
+    /// [`Self::spawn`] on a listener the test bound itself.
+    pub fn spawn_on(self, listener: TcpListener, pool: PgPool) -> TestGateway {
+        let addr = listener.local_addr().expect("listener address");
         let url = format!("http://{addr}");
+        let public_url = self.public_url.as_deref().unwrap_or(&url);
         let auth_config = AuthConfig {
             issuer: self.idp.issuer,
             client_id: self.idp.client_id.clone(),
             client_secret: self.idp.client_secret.into(),
             audience: self.idp.client_id,
-            redirect_url: format!("{url}/auth/callback"),
+            redirect_url: format!("{public_url}/auth/callback"),
             ..AuthConfig::default()
         };
         let mut config_file = config_file(&self.yaml);
@@ -179,9 +231,16 @@ impl GatewayBuilder {
         }
         let service_tokens = ServiceTokenStore::from_config(&config_file.service_accounts)
             .expect("fixture tokens satisfy the boot rules");
-        let auth = auth_facade(&pool, &auth_config, self.refresh, service_tokens);
+        let mut auth = auth_facade(&pool, &auth_config, self.refresh, service_tokens);
+        auth.codes = self.codes;
+        auth.oidc = OidcClient::with_options(auth_config.clone(), self.login_options)
+            .expect("OidcClient http builder");
+        if self.db_flows {
+            auth.flows = PendingFlows::with_db(pool.clone(), &auth_config.session_signing_key);
+        }
         let sessions = auth.sessions.clone();
         let mut state = AppState::for_tests(config_file, pool.clone(), auth);
+        state.oauth.client_registry = self.registry;
         if let Some(repo) = self.repo {
             // Keep the cache reading the same store the admin API writes.
             let ttl = Duration::from_secs(Config::default().permissions_cache_ttl_seconds);

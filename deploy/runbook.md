@@ -18,7 +18,7 @@ Every agent-facing error carries a `request_id`; it matches `audit_calls.request
 
 ### GatewayAuditUnavailable
 
-**Means.** Tool calls were answered `audit_unavailable`: the state DB refused the intent row or the completion row. Audit is synchronous (MUST #4), so agents are getting no answers. Severity critical.
+**Means.** The durability of an audit row could not be confirmed. Tool calls were answered `audit_unavailable` (the intent row or the completion row failed), or admin API requests failed. An admin write answers `500 internal` when its audit insert, the cross-replica NOTIFY in the same transaction, or the commit failed: it is rolled back, unless only the reply to its commit was lost, so check `permissions_audit` by request id before repeating it. An audited admin read answers `503 audit_unavailable`. Audit is synchronous (MUST #4), so those callers are getting no answers. Severity critical.
 
 **How long it fires.** The alert looks at every scrape of the last 5m, not just the latest, so it clears up to 5m after its cause does, plus one evaluation interval (an evaluation just before the last such scrape leaves the window keeps it until the next one).
 - *Process still running.* The replica holds `audit_failure_recent{kind="write"}` at 1 for 15m after its last refusal, timed on its monotonic clock (no wall clock matters), so the alert clears 15m to 20m after the refusal, plus one evaluation interval. A refusal before Prometheus first saw the pod, which `increase()` cannot see, still fires when the first scrape comes within the 15m.
@@ -27,10 +27,10 @@ Every agent-facing error carries a `request_id`; it matches `audit_calls.request
 
 **Does not cover.**
 - A failure no scrape saw while its hold lasted: the pod was replaced or restarted first, its first scrape came later than the hold, or a scrape outage (or Prometheus outage) outlasted it. Gateway logs and, for calls with an intent, [GatewayAuditAbandoned](#gatewayauditabandoned) remain.
-- Failures while a pod shuts down: the metrics listener stops at `SIGTERM`, before in-flight calls drain (up to 80 s) and detached audit writes finish (up to 20 s).
+- A failure at the very end of a shutdown: the metrics listener serves through the drain of in-flight calls (up to 80 s), of detached audit writes (up to 20 s) and the pool closes, then stops with no linger, so one after the last scrape is not seen. A draining pod is scraped only while it stays a target: the chart's and the kustomize base's metrics Service sets `publishNotReadyAddresses` for that. Images 2.6.0 and older stop the listener at `SIGTERM`.
 - Scrape or rule evaluation intervals of 5m or more: nothing may fall inside the 5m window. Keep both at 2m or less (the chart scrapes every 30 s).
 - A failure before the first scrape of an image without the gauge (2.4.1 and older).
-- Admin API requests refused because their `permissions_audit` write failed (also `audit_unavailable`, HTTP 503): they neither count nor set the gauge.
+- Admin API failures on images 2.6.0 and older, which set no gauge for them. On later ones they set `audit_failure_recent` but are not in `tool_calls`, so the gauge is their only signal. A deadlock or serialization abort between two admins (`conflict`) is not an audit failure and sets nothing.
 - Which deployment: on a Prometheus shared by several gateways the alert is one, without labels. While it fires for one it does not re-fire for another.
 
 **First checks.**

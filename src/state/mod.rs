@@ -45,9 +45,6 @@ const BACKGROUND_SESSION_SQL: &str =
 /// Background work (pruner, GC, reaper) is sequential and low-rate; two
 /// connections keep it off the request pool without competing with it.
 const BACKGROUND_POOL_SIZE: u32 = 2;
-/// The permissions listener pins one connection for `LISTEN` and briefly
-/// takes a second for its liveness ping.
-const LISTENER_POOL_SIZE: u32 = 2;
 /// How long a state-DB caller waits for a pooled connection.
 pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -84,13 +81,12 @@ pub async fn connect_background(url: &str) -> Result<PgPool, StateDbError> {
     open_pg(url, BACKGROUND_POOL_SIZE, BACKGROUND_SESSION_SQL).await
 }
 
-/// Connect the **listener** pool: the permissions `LISTEN` connection and its
-/// liveness ping. Its own pool because the listener holds its connection for
-/// the life of the process — taken from the request pool, it deadlocked every
-/// request at `STATE_DB_POOL_SIZE=1`. Call after [`connect`]: it does not
-/// migrate.
-pub async fn connect_listener(url: &str) -> Result<PgPool, StateDbError> {
-    open_pg(url, LISTENER_POOL_SIZE, BACKGROUND_SESSION_SQL).await
+/// How the permissions listener connects: it opens its own `LISTEN` and ping
+/// connections, never one of the request pool's. The `LISTEN` connection is
+/// held for the life of the process, and on the request pool it deadlocked
+/// every request at `STATE_DB_POOL_SIZE=1`.
+pub fn listener_options(url: &str) -> Result<PgConnectOptions, StateDbError> {
+    PgConnectOptions::from_str(url).map_err(StateDbError::Connect)
 }
 
 /// The timeouts are `SET` per connection in `after_connect`, not sent as the

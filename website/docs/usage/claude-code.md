@@ -66,7 +66,7 @@ Signing out (`POST /auth/logout`) ends **every** session for your identity — e
 ### `401` vs `5xx`
 
 - **`401`** (with a `WWW-Authenticate` header) means your credential is missing, expired or revoked. Claude Code re-runs the sign-in; that is the fix.
-- **`5xx`** (`500`/`503`, no `WWW-Authenticate`) means the gateway itself could not check your credential — typically its state database is briefly unavailable. Signing in again will not help; retry in a moment. Your session is still valid.
+- **`5xx`** (`500`/`503`, no `WWW-Authenticate`) means the gateway itself could not check your credential — typically its state database is briefly unavailable (`503` with code `state_db_unavailable`). Signing in again will not help; retry in a moment. Your session is still valid.
 
 ## Verify it works
 

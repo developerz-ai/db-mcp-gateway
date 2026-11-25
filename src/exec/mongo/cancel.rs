@@ -24,12 +24,29 @@
 //!   narrow) — `maxTimeMS` remains the hard backstop either way, exactly as
 //!   it did before this module existed.
 
+use std::time::Duration;
+
 use mongodb::Client;
 use mongodb::bson::{Bson, Document, doc};
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::audit::drain::DetachedTasks;
+
+/// Longest a detached cancel may keep the command's [`Reservation`]. Below
+/// the 5 s acquire wait, so a caller queued behind a stuck cancel still gets
+/// its connection. Dropping a stuck cancel closes the connection it was on.
+const CANCEL_BOUND: Duration = Duration::from_secs(3);
+
+/// What one command holds of the pool while it runs: a connection, and its
+/// caller's share of them.
+#[derive(Debug)]
+pub struct Reservation {
+    // Declared first, so a connection is free before its caller's share is.
+    pub(super) _connection: OwnedSemaphorePermit,
+    pub(super) _slot: Option<OwnedSemaphorePermit>,
+}
 
 /// Stamp a unique `comment` on `cmd` and return the marker. Unconditional
 /// overwrite — same rationale as the `maxTimeMS` stamp in `dispatch`: a
@@ -53,6 +70,12 @@ pub struct KillOpOnDrop {
     armed: Option<(Client, String)>,
     /// Where the detached kill runs, so a shutdown drain waits for it.
     detached: DetachedTasks,
+    /// The command's own reservation; the kill inherits it rather than
+    /// taking one. The dropped command's connection is closed, so the kill
+    /// finds that connection's place in the pool free and can never wait on
+    /// the commands it is freeing; released here instead, the next command's
+    /// checkout would wait on the kill inside its own statement budget.
+    reservation: Option<Reservation>,
 }
 
 impl std::fmt::Debug for KillOpOnDrop {
@@ -69,10 +92,16 @@ impl std::fmt::Debug for KillOpOnDrop {
 }
 
 impl KillOpOnDrop {
-    pub fn armed(client: Client, marker: String, detached: DetachedTasks) -> Self {
+    pub fn armed(
+        client: Client,
+        marker: String,
+        detached: DetachedTasks,
+        reservation: Reservation,
+    ) -> Self {
         Self {
             armed: Some((client, marker)),
             detached,
+            reservation: Some(reservation),
         }
     }
 
@@ -100,34 +129,41 @@ impl Drop for KillOpOnDrop {
         // with no parent otherwise, and an operator seeing "killOp failed"
         // could not map it back to a request.
         let span = tracing::Span::current();
+        let reservation = self.reservation.take();
         // Detached: the parent future is being dropped, so we can't await
         // inline. Runs on a fresh, tracked task independent of the dropped
         // future.
         self.detached.spawn(
             async move {
-                let admin = client.database("admin");
-                let opids = find_opids_by_marker(&admin, &marker).await;
-                for opid in opids {
-                    if let Err(err) = admin.run_command(doc! { "killOp": 1, "op": opid }).await {
-                        // `killOp` commonly fails with "unauthorized" when
-                        // the role lacks the privilege documented in the
-                        // module docs — that is an expected, not
-                        // exceptional, outcome for operators who haven't
-                        // opted in. Warn, don't error: `maxTimeMS` is still
-                        // the backstop. Log only the driver's error
-                        // category — never `%err`, whose `Display` can
-                        // surface `Authentication` / `ServerSelection`
-                        // messages carrying credentials or hostnames
-                        // (CLAUDE.md `src/exec/**` redaction rule).
-                        tracing::warn!(
-                            error_kind = classify_mongo_error(&err),
-                            "killOp failed during mongo cancel (missing privilege, or op already finished)"
-                        );
-                    }
+                let kill = kill_ops_by_marker(&client, &marker);
+                if tokio::time::timeout(CANCEL_BOUND, kill).await.is_err() {
+                    tracing::warn!("mongo cancel gave up: no answer within its bound");
                 }
+                drop(reservation);
             }
             .instrument(span),
         );
+    }
+}
+
+/// `killOp` every operation [`find_opids_by_marker`] finds.
+async fn kill_ops_by_marker(client: &Client, marker: &str) {
+    let admin = client.database("admin");
+    for opid in find_opids_by_marker(&admin, marker).await {
+        if let Err(err) = admin.run_command(doc! { "killOp": 1, "op": opid }).await {
+            // `killOp` commonly fails with "unauthorized" when the role lacks
+            // the privilege documented in the module docs — that is an
+            // expected, not exceptional, outcome for operators who haven't
+            // opted in. Warn, don't error: `maxTimeMS` is still the backstop.
+            // Log only the driver's error category — never `%err`, whose
+            // `Display` can surface `Authentication` / `ServerSelection`
+            // messages carrying credentials or hostnames (CLAUDE.md
+            // `src/exec/**` redaction rule).
+            tracing::warn!(
+                error_kind = classify_mongo_error(&err),
+                "killOp failed during mongo cancel (missing privilege, or op already finished)"
+            );
+        }
     }
 }
 
@@ -189,76 +225,5 @@ async fn find_opids_by_marker(admin: &mongodb::Database, marker: &str) -> Vec<Bs
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stamp_marker_inserts_comment_and_returns_it() {
-        let mut cmd = doc! { "find": "users" };
-        let marker = stamp_marker(&mut cmd);
-        assert_eq!(cmd.get_str("comment").unwrap(), marker);
-        // Sanity: markers are actually unique, not a constant placeholder.
-        let mut cmd2 = doc! { "find": "users" };
-        let marker2 = stamp_marker(&mut cmd2);
-        assert_ne!(marker, marker2);
-    }
-
-    /// A caller-supplied `comment` must never survive the stamp — otherwise
-    /// it could collide with (or be crafted to match) another request's
-    /// marker and confuse the currentOp lookup.
-    #[test]
-    fn stamp_marker_overwrites_existing_comment() {
-        let mut cmd = doc! { "find": "users", "comment": "caller-supplied" };
-        let marker = stamp_marker(&mut cmd);
-        assert_eq!(cmd.get_str("comment").unwrap(), marker);
-        assert_ne!(marker, "caller-supplied");
-    }
-
-    /// `disarm()` must prevent the detached spawn on drop. `Client::with_options`
-    /// never opens a connection until first use (same posture as `mod.rs`'s
-    /// own tests), so this is safe to construct without a real mongo
-    /// instance — the assertion is just that `armed` is `None` after
-    /// `disarm()`, which is what `Drop::drop` checks before spawning.
-    #[tokio::test]
-    async fn disarm_prevents_drop_from_spawning() {
-        use mongodb::options::{ClientOptions, ServerAddress};
-
-        let options = ClientOptions::builder()
-            .hosts(vec![ServerAddress::Tcp {
-                host: "localhost".to_string(),
-                port: Some(27017),
-            }])
-            .build();
-        let client = Client::with_options(options).expect("client constructs");
-
-        let mut guard =
-            KillOpOnDrop::armed(client, "unused-marker".to_string(), DetachedTasks::new());
-        assert!(guard.armed.is_some());
-        guard.disarm();
-        assert!(guard.armed.is_none());
-        // Drop now runs with `armed == None` — `Drop::drop`'s `let Some(...)
-        // = ... else { return }` returns immediately, no spawn.
-    }
-
-    /// `Debug` must never leak the mongo client (credentials in
-    /// `ClientOptions`) or the request-scoped marker. Mirrors
-    /// `MongoAdapter::debug_does_not_leak_credentials`.
-    #[tokio::test]
-    async fn debug_does_not_leak_client_or_marker() {
-        use mongodb::options::{ClientOptions, ServerAddress};
-
-        let options = ClientOptions::builder()
-            .hosts(vec![ServerAddress::Tcp {
-                host: "leak-host".to_string(),
-                port: Some(27017),
-            }])
-            .build();
-        let client = Client::with_options(options).expect("client constructs");
-        let marker = "leak-marker-should-not-appear";
-        let guard = KillOpOnDrop::armed(client, marker.to_string(), DetachedTasks::new());
-        let rendered = format!("{guard:?}");
-        assert!(rendered.contains("armed"));
-        assert!(!rendered.contains(marker), "leaked marker: {rendered}");
-        assert!(!rendered.contains("leak-host"), "leaked host: {rendered}");
-    }
-}
+#[path = "cancel_tests.rs"]
+mod tests;

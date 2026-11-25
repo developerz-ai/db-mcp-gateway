@@ -210,7 +210,7 @@ The binary is its own operator tool (reference: [deployment/cli](../deployment/c
 - **`--healthcheck`** GETs the local `/healthz` (from `GATEWAY_BIND`; TLS unverified on loopback, no credential sent) and exits `0`/`1` — the healthcheck for the distroless image.
 - **`login`, `grants list|apply`, `sessions revoke`, `audit query|export`** are clients of the audited admin API (spec 12) and hold no privilege of their own. `login` is the gateway's own OAuth flow run as a native app (RFC 8252: DCR with a loopback redirect, PKCE S256); the session token is stored in a `0600` file and a group- or world-readable one is refused.
 - **`mint-service-token <name>`** replaces the shell script's logic (spec 14); `bin/mint-service-token` is a wrapper.
-- **`roles`** prints the provisioning SQL for each configured database's read and write roles and never connects; **`doctor`** connects as each configured Postgres role and reports superuser/admin attributes, write or `CREATE` privileges on the read role, and in-scope relations it cannot read, plus `max_connections` against the budget. Doctor runs catalog reads in a rolled-back `READ ONLY` transaction. Neither grants anything (MUST #3).
+- **`roles`** prints the provisioning SQL for each configured database's read and write roles and never connects; **`doctor`** connects to each database's `connect_name` as each configured Postgres role and reports superuser/admin attributes, write or `CREATE` privileges on the read role, and in-scope relations it cannot read, plus `max_connections` against the budget. Doctor runs catalog reads, as unnamed statements, in a rolled-back `READ ONLY` transaction. Neither grants anything (MUST #3).
 
 ## What is *not* in config
 

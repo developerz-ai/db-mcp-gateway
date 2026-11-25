@@ -82,6 +82,28 @@ fn assert_restricted(pod: &Value, container: &Value, at: &str) {
     );
 }
 
+/// A draining pod is not ready, yet still has audit failures to show: its
+/// metrics endpoint stays published, its client port does not.
+#[test]
+fn only_the_metrics_service_publishes_pods_that_are_not_ready() {
+    for path in [
+        "deploy/helm/db-mcp-gateway/templates/service.yaml",
+        "deploy/kustomize/base/service.yaml",
+    ] {
+        let text = read(path);
+        let (client, metrics) = text.split_once("\n---\n").expect("two Services");
+        assert!(client.contains("targetPort: gateway"), "{path}");
+        assert!(!client.contains("publishNotReadyAddresses"), "{path}");
+        assert!(metrics.contains("targetPort: metrics"), "{path}");
+        assert!(
+            metrics.contains("\n  publishNotReadyAddresses: true\n"),
+            "{path}"
+        );
+        assert!(!metrics.contains("targetPort: gateway"), "{path}");
+        assert_eq!(metrics.matches("targetPort:").count(), 1, "{path}");
+    }
+}
+
 #[test]
 fn deploy_pins_the_crate_version_and_parsing_configs() {
     let version = env!("CARGO_PKG_VERSION");

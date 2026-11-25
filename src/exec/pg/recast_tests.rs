@@ -1,5 +1,4 @@
-//! The wrapper text, the terminator cut and the types the nested statement
-//! is proven with.
+//! The wrapper text and the terminator cut.
 
 use super::*;
 
@@ -39,21 +38,4 @@ fn the_body_ends_before_the_terminator_whatever_trails_it() {
     );
     assert_eq!(body(" ;; -- c\n ;(SELECT 1);"), "(SELECT 1)");
     assert_eq!(statement_body(" ; "), None);
-}
-
-#[test]
-fn the_body_is_proven_with_the_params_types() {
-    assert_eq!(param_types(&[]), "");
-    let params = [
-        QueryParam::Null,
-        QueryParam::Bool(true),
-        QueryParam::Int(1),
-        QueryParam::Float(0.5),
-        QueryParam::Text("x".into()),
-        QueryParam::Json(serde_json::json!({"a": 1})),
-    ];
-    assert_eq!(
-        param_types(&params),
-        " (unknown, bool, int8, float8, text, jsonb)"
-    );
 }

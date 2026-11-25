@@ -82,7 +82,7 @@ Every `PATCH` body accepts an optional `expected_updated_at` — the `updated_at
 
 ## Audit guarantees
 
-Every mutating call (POST/PATCH/DELETE) writes a `permissions_audit` row in the **same transaction** as the data change. If the audit insert fails the data write rolls back too — there is no best-effort audit (CLAUDE.md non-negotiable #4).
+Every mutating call (POST/PATCH/DELETE) writes a `permissions_audit` row in the **same transaction** as the data change. If the audit insert fails the data write rolls back too — there is no best-effort audit (CLAUDE.md non-negotiable #4). Such a failure, and an audited read refused `audit_unavailable`, set `audit_failure_recent{kind="write"}` for 15 min, so the audit alert fires for admin requests as it does for tool calls.
 
 Audit shape (one row per write):
 

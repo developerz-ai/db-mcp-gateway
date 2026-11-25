@@ -3,7 +3,10 @@
 //!
 //! - No prepared statement has a name. A name would outlive its transaction
 //!   behind a transaction-mode pooler that tracks statements by their text,
-//!   and fail the next caller's identical read after DDL (`0A000`).
+//!   and fail the next caller's identical read after DDL (`0A000`). Nor is
+//!   any prepared in SQL: `PREPARE` outlives its transaction on the backend,
+//!   and one a caller abandons before its `DEALLOCATE` fails the next caller's
+//!   there (`42P05`, #411).
 //! - Nothing is parsed or bound outside a transaction. The driver syncs
 //!   between `Parse` and `Bind`; outside a transaction such a pooler may send
 //!   the two to different backends, and the `Bind` would run whatever another
@@ -22,8 +25,10 @@ use sqlx::postgres::{PgConnectOptions, PgDatabaseError, PgPoolOptions, PgSslMode
 use sqlx::{ConnectOptions, Connection, PgConnection};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
+use crate::common::log_capture::BufWriter;
 use crate::common::pg_target::{
     TARGET_DB, TARGET_HOST, TARGET_PASSWORD, TARGET_USER, adapter, ensure_read_role, is_yugabyte,
     owner_url, server, single_connection_adapter, target_port, writable_adapter, writable_database,
@@ -614,25 +619,25 @@ async fn a_plan_stale_before_the_statement_runs_is_retryable() {
 /// One protocol message. Only a connection's first, the startup, has no
 /// type byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Frame {
-    kind: Option<u8>,
-    raw: Vec<u8>,
+pub(super) struct Frame {
+    pub(super) kind: Option<u8>,
+    pub(super) raw: Vec<u8>,
 }
 
 impl Frame {
-    fn body(&self) -> &[u8] {
+    pub(super) fn body(&self) -> &[u8] {
         &self.raw[usize::from(self.kind.is_some()) + 4..]
     }
 }
 
 /// Cuts a byte stream, however TCP splits it, into whole messages.
-struct Frames {
+pub(super) struct Frames {
     startup_pending: bool,
     pending: Vec<u8>,
 }
 
 impl Frames {
-    fn from_client() -> Self {
+    pub(super) fn from_client() -> Self {
         Self {
             startup_pending: true,
             pending: Vec::new(),
@@ -647,7 +652,7 @@ impl Frames {
     }
 
     /// The messages `bytes` completes.
-    fn feed(&mut self, bytes: &[u8]) -> Vec<Frame> {
+    pub(super) fn feed(&mut self, bytes: &[u8]) -> Vec<Frame> {
         self.pending.extend_from_slice(bytes);
         let (mut frames, mut at) = (Vec::new(), 0);
         while let Some(end) = self.end_of_message(at) {
@@ -671,7 +676,7 @@ impl Frames {
 }
 
 /// A message as it stands on the wire.
-fn message(kind: u8, body: &[u8]) -> Vec<u8> {
+pub(super) fn message(kind: u8, body: &[u8]) -> Vec<u8> {
     let len = (body.len() as u32 + 4).to_be_bytes();
     [&[kind], &len[..], body].concat()
 }
@@ -759,7 +764,7 @@ impl SearchPathSwitch {
 /// The target's end of a forwarded connection. Neither end waits to fill a
 /// packet: the small writes of a relay would each cost a delayed ACK, and
 /// the gateway's own short budgets with it.
-async fn connect_target(client: &TcpStream) -> TcpStream {
+pub(super) async fn connect_target(client: &TcpStream) -> TcpStream {
     let server = TcpStream::connect((TARGET_HOST, target_port()))
         .await
         .expect("target-db reachable; run `bin/dev up`");
@@ -905,6 +910,16 @@ impl Seen {
         if matches!(kind, b'P' | b'B' | b'Q') {
             self.messages.push((kind, text.to_string()));
         }
+        // A Parse's text follows the statement's name.
+        let sql = match kind {
+            b'P' => text.split('\0').nth(1),
+            b'Q' => Some(text.as_ref()),
+            _ => None,
+        };
+        if sql.is_some_and(prepares_in_sql) {
+            self.violations
+                .push(format!("{} prepares in SQL: {text:?}", kind as char));
+        }
         // Parse starts with the statement's name; Bind with the portal's,
         // then the statement's; Describe and Close with which of the two
         // they are for, then its name.
@@ -931,6 +946,15 @@ impl Seen {
                 .push(format!("{what} outside a transaction: {text:?}"));
         }
     }
+}
+
+/// Whether one of `sql`'s statements starts with `PREPARE`.
+fn prepares_in_sql(sql: &str) -> bool {
+    sql.split(';').any(|one| {
+        one.trim_start()
+            .get(.."PREPARE ".len())
+            .is_some_and(|start| start.eq_ignore_ascii_case("PREPARE "))
+    })
 }
 
 /// Copy `from` to `to` in whole messages, showing each to `observe` before it
@@ -1061,6 +1085,22 @@ fn the_recorder_judges_by_the_state_the_server_reported() {
         seen.client(&mut session, &frame);
         assert_eq!(seen.violations.len(), 1, "{:?}", seen.violations);
         assert!(seen.violations[0].contains(" names a statement"));
+    }
+
+    // A statement prepared in SQL, over either protocol.
+    for (kind, body) in [
+        (b'P', &b"\0PREPARE s AS\nSELECT 1\0\0\0"[..]),
+        (b'Q', b"SELECT 1; prepare s AS SELECT 1\0"),
+    ] {
+        let mut session = Session {
+            in_transaction: true,
+            unanswered: 0,
+        };
+        let mut seen = Seen::default();
+        let frame = Frames::from_server().feed(&message(kind, body)).remove(0);
+        seen.client(&mut session, &frame);
+        assert_eq!(seen.violations.len(), 1, "{:?}", seen.violations);
+        assert!(seen.violations[0].contains(" prepares in SQL"));
     }
 }
 
@@ -1423,6 +1463,174 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
         "{} violations, first: {:?}",
         seen.violations.len(),
         &seen.violations[..seen.violations.len().min(5)]
+    );
+}
+
+/// The gateway's own warnings while `work` runs, one line each. The test's
+/// runtime is this one thread, so a thread-local subscriber sees all of it.
+async fn warnings<T>(work: impl Future<Output = T>) -> (T, Vec<String>) {
+    let log = BufWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(log.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let done = work.await;
+    drop(guard);
+    let lines = log.contents();
+    let own = lines.lines().filter(|l| l.contains("db_mcp_gateway::"));
+    (done, own.map(str::to_owned).collect())
+}
+
+/// A TCP forwarder to the target that keeps the ReadyForQuery answering a
+/// `ROLLBACK` back until it is let go.
+struct HeldRollback {
+    port: u16,
+    /// The target answered, and its answer is kept back.
+    held: Arc<Notify>,
+    let_go: Arc<Notify>,
+}
+
+impl HeldRollback {
+    async fn start() -> Self {
+        let listener = TcpListener::bind((TARGET_HOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (held, let_go): (Arc<Notify>, Arc<Notify>) = Default::default();
+        let (holds, release) = (held.clone(), let_go.clone());
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                tokio::spawn(Self::serve(client, holds.clone(), release.clone()));
+            }
+        });
+        Self { port, held, let_go }
+    }
+
+    /// The driver sends nothing while it waits for the answer to a
+    /// `ROLLBACK`, so waiting here holds up nothing else.
+    async fn serve(mut client: TcpStream, held: Arc<Notify>, let_go: Arc<Notify>) {
+        let mut server = connect_target(&client).await;
+        let (mut client_chunk, mut server_chunk) = (vec![0u8; 65536], vec![0u8; 65536]);
+        let (mut client_frames, mut server_frames) = (Frames::from_client(), Frames::from_server());
+        let mut rolling_back = false;
+        loop {
+            tokio::select! {
+                read = client.read(&mut client_chunk) => {
+                    let Ok(n @ 1..) = read else { return };
+                    for frame in client_frames.feed(&client_chunk[..n]) {
+                        rolling_back |= frame.kind == Some(b'Q') && frame.body() == b"ROLLBACK\0";
+                        if server.write_all(&frame.raw).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                read = server.read(&mut server_chunk) => {
+                    let Ok(n @ 1..) = read else { return };
+                    for frame in server_frames.feed(&server_chunk[..n]) {
+                        // Only the rollback's own leaves the session idle.
+                        if rolling_back && frame.kind == Some(b'Z') && frame.body() == b"I" {
+                            rolling_back = false;
+                            held.notify_one();
+                            let_go.notified().await;
+                        }
+                        if client.write_all(&frame.raw).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The rows of a truncated read wait for the server's answer to the
+/// `ROLLBACK`, not only for its being sent.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_truncated_read_waits_for_its_rollback_to_be_answered() {
+    let relay = HeldRollback::start().await;
+    let mut target = server();
+    target.port = relay.port;
+    let a = PgAdapter::open(
+        &target,
+        &target.databases[0],
+        PoolSizing::default(),
+        DetachedTasks::new(),
+    )
+    .await
+    .expect("adapter over the relay");
+    for sql in [
+        "SELECT generate_series(1, 5000000)",
+        "SELECT generate_series(1, 101)",
+    ] {
+        let mut capped = std::pin::pin!(a.execute(read(sql)));
+        tokio::select! {
+            early = &mut capped => panic!("{sql}: answered before its rollback: {early:?}"),
+            () = relay.held.notified() => {}
+        }
+        let early = tokio::time::timeout(Duration::from_millis(300), &mut capped).await;
+        assert!(early.is_err(), "{sql}: did not wait: {early:?}");
+        relay.let_go.notify_one();
+        assert!(capped.await.expect("capped read").truncated, "{sql}");
+    }
+}
+
+/// A read cut off at the row cap ends its transaction itself: `ROLLBACK` went
+/// out by the time the rows are handed over, whether the
+/// cancel caught the statement or came after it, and neither is a warning.
+/// None is left queued for the connection's release.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_truncated_read_is_rolled_back_before_it_answers() {
+    let wire = WireRecorder::start().await;
+    ensure_read_role().await;
+    let a = wire.adapter(1, DetachedTasks::new()).await;
+    // Caught by the cancel; and done before it.
+    for sql in [
+        "SELECT generate_series(1, 5000000)",
+        "SELECT generate_series(1, 101)",
+    ] {
+        a.execute(read("SELECT 1")).await.expect("warm");
+        wire.take();
+        let (capped, warned) = warnings(async {
+            let capped = a.execute(read(sql)).await.expect("capped read");
+            // Read before anything else runs: the release is a task.
+            (capped, wire.take())
+        })
+        .await;
+        let (capped, seen) = capped;
+        assert!(capped.truncated, "{sql}");
+        assert_eq!(capped.rows.len(), 100, "{sql}");
+        assert_eq!(warned, Vec::<String>::new(), "{sql}");
+        assert!(seen.sent(b'Q', "pg_cancel_backend"), "{sql}");
+        assert!(
+            seen.sent(b'Q', "ROLLBACK"),
+            "{sql}: not rolled back yet: {:?}",
+            seen.messages
+        );
+        let next = a.execute(read("SELECT 1")).await.expect("next call");
+        assert_eq!(next.rows, vec![vec![json!(1)]], "{sql}");
+        let seen = wire.take();
+        assert!(!seen.sent(b'Q', "ROLLBACK"), "{sql}: left to the release");
+        assert_eq!(seen.violations, Vec::<String>::new(), "{sql}");
+    }
+}
+
+/// A rollback that did fail is still the operator's to see: here the backend
+/// ends itself behind the rows the read keeps.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_failed_rollback_after_truncation_is_still_a_warning() {
+    let a = single_connection_adapter().await;
+    let sql = "SELECT g FROM generate_series(1, 101) g \
+               UNION ALL SELECT pg_terminate_backend(pg_backend_pid())::int";
+    let (capped, warned) = warnings(a.execute(read(sql))).await;
+    assert!(capped.expect("still an answer").truncated);
+    assert!(
+        warned
+            .iter()
+            .any(|line| line.contains("rollback after truncation failed")),
+        "{warned:?}"
     );
 }
 

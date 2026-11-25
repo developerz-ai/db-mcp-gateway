@@ -1,6 +1,6 @@
 # Kubernetes
 
-The repository ships a Helm chart ([`deploy/helm/db-mcp-gateway`](https://github.com/developerz-ai/db-mcp-gateway/tree/main/deploy/helm/db-mcp-gateway)), a minimal kustomize base mirroring it ([`deploy/kustomize/base`](https://github.com/developerz-ai/db-mcp-gateway/tree/main/deploy/kustomize/base)), Prometheus alerts, a Grafana dashboard and a runbook ([`deploy/`](https://github.com/developerz-ai/db-mcp-gateway/tree/main/deploy)). The chart is installed from a checkout; it is not yet published to a chart repository.
+The repository ships a Helm chart ([`deploy/helm/db-mcp-gateway`](https://github.com/developerz-ai/db-mcp-gateway/tree/main/deploy/helm/db-mcp-gateway)), a minimal kustomize base mirroring it ([`deploy/kustomize/base`](https://github.com/developerz-ai/db-mcp-gateway/tree/main/deploy/kustomize/base)), Prometheus alerts, a Grafana dashboard and a runbook ([`deploy/`](https://github.com/developerz-ai/db-mcp-gateway/tree/main/deploy)). Each release publishes the chart at its own version as a signed OCI artifact, `oci://ghcr.io/developerz-ai/db-mcp-gateway/charts/db-mcp-gateway` (from the first release after 2.6.0).
 
 **Requires Kubernetes ≥ 1.30**: the pod's `preStop` hook is the native `sleep` action (`PodLifecycleSleepAction`, on by default from 1.30). The image is distroless — there is no shell for an `exec` hook. The chart's `kubeVersion` refuses older clusters.
 
@@ -65,8 +65,18 @@ networkPolicy:
 ```
 
 ```bash
-helm install gateway ./deploy/helm/db-mcp-gateway -n gateway -f my-values.yaml
+# X.Y.Z = the gateway release to run: chart version, appVersion and image tag are the same
+chart=ghcr.io/developerz-ai/db-mcp-gateway/charts/db-mcp-gateway
+dir=$(mktemp -d)   # fresh, so only an archive this pull saved can be installed
+helm pull "oci://$chart" --version X.Y.Z -d "$dir" > "$dir/pull.log" 2>&1 \
+  && digest=$(sed -n 's/^Digest: //p' "$dir/pull.log") \
+  && cosign verify "$chart@$digest" \
+      --certificate-identity https://github.com/developerz-ai/db-mcp-gateway/.github/workflows/release.yml@refs/tags/vX.Y.Z \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  && helm install gateway "$dir/db-mcp-gateway-X.Y.Z.tgz" -n gateway -f my-values.yaml
 ```
+
+This installs the archive that was pulled, by the digest that was verified. The identity names the exact tag: one that matches any release tag would also accept an older signed chart put under the version you asked for. Without verification: `helm install gateway "oci://$chart" --version X.Y.Z …`, or from a checkout `helm install gateway ./deploy/helm/db-mcp-gateway …`.
 
 Validate the config before it reaches the cluster: `db-mcp-gateway --check --no-secrets --config config.yml` ([CLI](cli.md)).
 
@@ -82,7 +92,7 @@ Validate the config before it reaches the cluster: `db-mcp-gateway --check --no-
 | Config | `config` → ConfigMap mounted at `/etc/gateway/config/config.yml`. A `checksum/config` annotation rolls the pods on change: Kubernetes sends no `SIGHUP` |
 | Secrets | `secrets.existingSecret` → `STATE_DB_URL`, `SESSION_SIGNING_KEY`, `OIDC_CLIENT_SECRET` (optional key) as env vars; `secretMounts` → read-only files for `${FILE:…}` refs (re-read on every pool open, so a rotated password needs only a pool reopen); `extraEnv` for anything else in the [env table](quickstart.md#the-environment-variables-the-gateway-reads) |
 | TLS | `tls.secretName` (a `kubernetes.io/tls` Secret) mounted at `/etc/gateway/tls`. `tls.certManager.enabled` adds a cert-manager `Certificate` writing that Secret; it needs `tls.certManager.issuerRef.name` and a non-empty `dnsNames`, or the chart refuses to render. The gateway re-reads the PEMs only on `SIGHUP` or restart: wire a reloader annotation (`podAnnotations`) or restart on renewal — `GatewayTlsCertExpiringSoon` catches a renewal that never reached the pod |
-| Metrics | `METRICS_BIND=0.0.0.0:9090` behind its own `<release>-metrics` ClusterIP Service — never route an Ingress to it: its labels name every configured database. `metrics.serviceMonitor.enabled` and `metrics.prometheusRule.enabled` add the prometheus-operator resources |
+| Metrics | `METRICS_BIND=0.0.0.0:9090` behind its own `<release>-metrics` ClusterIP Service — never route an Ingress to it: its labels name every configured database. That Service alone sets `publishNotReadyAddresses`, so a draining pod stays a scrape target; it exposes no client port. `metrics.serviceMonitor.enabled` and `metrics.prometheusRule.enabled` add the prometheus-operator resources |
 | NetworkPolicy | On by default. Ingress: the gateway port from `networkPolicy.ingress.gatewayFrom` — a non-empty list of peers (ingress controller, agent namespaces), or `any` to open it to every source; the chart refuses it empty. The metrics port only from `metricsFrom` (default: namespace `monitoring`); an empty `metricsFrom` closes the metrics port rather than opening it. Egress: DNS to kube-dns, then `stateDb`, `idp`, `targets[]`, `extra[]` — each `{ to, ports }`. An empty `to` allows every destination on those ports: narrow each to CIDRs or selectors. Syslog audit sinks and GlitchTip go in `extra`. Target egress must be chosen: scoped `targets[]` (each with a non-empty `to`) or `anyTarget.enabled`; the chart refuses neither, an empty `to`, or `anyTarget` alongside a fenced `stateDb.to` |
 
 Every value is documented in [`values.yaml`](https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/helm/db-mcp-gateway/values.yaml). Pin the image by digest with `image.digest`.
