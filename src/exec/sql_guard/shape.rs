@@ -1,7 +1,7 @@
 //! Top-level statement-shape check: which statement families the guard
 //! admits at all under a given [`Access`].
 
-use sqlparser::ast::{OnInsert, Set, Statement};
+use sqlparser::ast::{OnInsert, Set, Statement, UtilityOption};
 
 use super::{Access, GuardError};
 
@@ -66,4 +66,27 @@ fn check_on_insert(on: Option<&OnInsert>) -> Result<(), GuardError> {
         Some(OnInsert::DuplicateKeyUpdate(_) | OnInsert::OnConflict(_)) => Ok(()),
         _ => Err(GuardError::NotAllowed("unsupported ON clause")),
     }
+}
+
+/// Whether an `EXPLAIN` carries `ANALYZE` — i.e. whether Postgres will actually
+/// *run* the statement instead of only planning it.
+///
+/// Postgres accepts the flag two ways and sqlparser models them differently:
+/// the bare keyword form (`EXPLAIN ANALYZE …`) sets `analyze`, while the
+/// parenthesised form (`EXPLAIN (ANALYZE, FORMAT JSON) …`) leaves `analyze`
+/// false and lands the flag in `options`. Both execute; both must be caught.
+///
+/// Postgres also accepts the British spelling `ANALYSE` for the option, so
+/// both names match.
+///
+/// An explicit `(ANALYZE false)` is rejected too: the guard does not interpret
+/// option arguments, and there is no reason to write that form.
+pub(super) fn explain_analyzes(analyze: bool, options: Option<&[UtilityOption]>) -> bool {
+    analyze
+        || options.is_some_and(|opts| {
+            opts.iter().any(|opt| {
+                let name = &opt.name.value;
+                name.eq_ignore_ascii_case("analyze") || name.eq_ignore_ascii_case("analyse")
+            })
+        })
 }

@@ -6,8 +6,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::Subscriber;
 use tracing_appender::non_blocking::{ErrorCounter, WorkerGuard};
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::filter::Directive;
+use tracing_subscriber::filter::{Directive, filter_fn};
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 /// Used when `RUST_LOG` is unset or empty. Before this default the filter fell
@@ -54,6 +55,14 @@ where
         .with_target(true)
         .with_writer(writer)
         .finish()
+        .with(filter_fn(|metadata| !is_parser_target(metadata.target())))
+}
+
+/// The SQL parser's debug lines carry statement text and whole syntax trees.
+/// A filter of its own rather than a directive: no `RUST_LOG` value, span
+/// directives included, turns them on.
+fn is_parser_target(target: &str) -> bool {
+    target == "sqlparser" || target.starts_with("sqlparser::")
 }
 
 /// Invalid `RUST_LOG` directives are skipped, as before — a typo in a log
@@ -160,6 +169,27 @@ mod tests {
         assert_eq!(line["span"]["tool"], "run_query", "{line}");
         assert_eq!(line["span"]["server"], "local", "{line}");
         assert_eq!(line["span"]["db"], "app", "{line}");
+    }
+
+    #[test]
+    fn parser_lines_stay_off_under_every_rust_log() {
+        for rust_log in ["trace", "sqlparser::parser=trace", "[tool_dispatch]=trace"] {
+            let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let sink = buf.clone();
+            let subscriber =
+                super::json_subscriber(env_filter(Some(rust_log)).expect("filter"), move || {
+                    BufSink(sink.clone())
+                });
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info_span!("tool_dispatch").in_scope(|| {
+                    tracing::debug!(target: "sqlparser::parser", "select agent_sql");
+                    tracing::info!(target: "audit_stream", "audit-row");
+                });
+            });
+            let out = String::from_utf8(buf.lock().expect("buffer").clone()).expect("utf8");
+            assert!(out.contains("audit-row"), "{rust_log}: {out}");
+            assert!(!out.contains("agent_sql"), "{rust_log}: {out}");
+        }
     }
 
     #[test]
