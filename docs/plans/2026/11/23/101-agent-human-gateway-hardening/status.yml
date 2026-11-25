@@ -4,21 +4,21 @@ status: in_progress
 created_by: sebi
 worked_by: claude
 owner: sebi
-percent: 95
-current_focus: "Final wave: #382-#386, #395, #397, #398 and the slice 10-12 leftovers in one PR; H2 in its own PR next; then 2.5.0, deployment bumps, consumer run-scoped cancel. Slice follow-ups in 03-08 stay listed below; owner rows open."
+percent: 98
+current_focus: "Shipped: #400-#402, #404, #405, #408-#410, v2.4.1, v2.5.0, v2.5.1, v2.5.2 (smoke-tested), both deployments bumped. Open: H2 as draft #412 for the owner; leftovers in #413; follow-ups #378, #379, #375, #403, #406, #407, #411."
 slices:
   - {file: 01-unblock-main.md, status: done, percent: 100, note: "`gate` is the single required CI check (ruleset + classic protection), 2026-11-24, owner approved"}
-  - {file: 02-security-patch.md, status: done, percent: 100, note: "#377 + #380, v2.3.1, GHSA-j6xv-c57r-59rw published; H2 (pg_query second parser) built, in its own PR after the final wave"}
-  - {file: 03-exec-correctness.md, status: in_progress, percent: 95, note: "#381; follow-ups: Mongo NaN in code_with_scope, Mongo cleanup without permit, pipeline $lookup to system.*"}
-  - {file: 04-auth-transport.md, status: in_progress, percent: 95, note: "#381; follow-ups: dedicated login error for a state-DB outage, hmac crate"}
-  - {file: 05-audit-state.md, status: in_progress, percent: 90, note: "#381; follow-ups: abandoned rows carry no params, syslog last-resort cut on a huge error_message"}
-  - {file: 06-agent-surface.md, status: in_progress, percent: 95, note: "#381 incl. PR6 (params, explain summary, history sql_sha256) + security-review fixes"}
-  - {file: 07-docs-onboarding.md, status: in_progress, percent: 90, note: "#381; demo re-run --wait on kept volumes exits 1 (Compose v5.8 + one-shot `ready`)"}
-  - {file: 08-operator-tooling.md, status: in_progress, percent: 90, note: "#381: CLI (--check/--healthcheck/roles/doctor/admin), metrics catalogue, deploy/ rules+dashboard+runbook+Helm+kustomize, HA login state (0022), admin API O10 (0023), config O13; chart not published to a chart repo"}
-  - {file: 09-ci-cd.md, status: in_progress, percent: 90, note: "#381 incl. wave b (C10-C14); owner: repo settings (private notes)"}
-  - {file: 10-dev-experience.md, status: in_progress, percent: 95, note: "X8 done in the final wave: root CLAUDE.md under 10 KB, scoped files, drift tests"}
-  - {file: 11-repo-cleanup.md, status: in_progress, percent: 95, note: "dead-API row done in the final wave except is_read_only, which rides with H2; authz::evaluate and insert_rotated have integration-test callers and stay, TlsConfig::is_enabled gained a production caller"}
-  - {file: 12-tests.md, status: in_progress, percent: 95, note: "#381 + final wave: sentry_scrub/redact_role proptests, injectable Redis acquire timeout, one mock IdP; config builder partial: ha_login_e2e, oauth_client_ttl_e2e and oauth_refresh_bounds_e2e still build AuthConfig/Config by hand"}
+  - {file: 02-security-patch.md, status: done, percent: 100, note: "#377 + #380, v2.3.1, GHSA-j6xv-c57r-59rw published; guard hardening #401 and #405 (2.4.1, 2.5.1); H2 (second parser) built and open as draft #412 for the owner"}
+  - {file: 03-exec-correctness.md, status: in_progress, percent: 98, note: "#381, #400, #408 (reads run once, unnamed statements, 2.5.x); leftovers in #413"}
+  - {file: 04-auth-transport.md, status: in_progress, percent: 98, note: "#381; leftovers in #413"}
+  - {file: 05-audit-state.md, status: in_progress, percent: 98, note: "#381; leftovers in #413"}
+  - {file: 06-agent-surface.md, status: done, percent: 100, note: "#381 incl. PR6; run-scoped activity and cancel #400"}
+  - {file: 07-docs-onboarding.md, status: in_progress, percent: 98, note: "#381; demo re-run on kept volumes in #413"}
+  - {file: 08-operator-tooling.md, status: in_progress, percent: 98, note: "#381, #400 (audit alerts, --check env), chart not published to a chart repository (#413)"}
+  - {file: 09-ci-cd.md, status: in_progress, percent: 98, note: "#381 incl. wave b; `gate` is the single required check; dependency upgrades #378, #379, #375 stay tracked"}
+  - {file: 10-dev-experience.md, status: done, percent: 100, note: "X8 done: root CLAUDE.md under 10 KB (#400), drift tests; `bin/test` honours --test; dev YugabyteDB stops cleanly"}
+  - {file: 11-repo-cleanup.md, status: done, percent: 100, note: "dead-API row done (#400), except authz::evaluate and insert_rotated, which integration tests call"}
+  - {file: 12-tests.md, status: in_progress, percent: 98, note: "#400; hand-built AuthConfig in three it_db files in #413"}
 decisions:
   - {date: 2026-11-23, by: sebi, rows: [H3, H4, H6], decision: "accept recommendations"}
   - {date: 2026-11-23, by: sebi, rows: [H7], decision: "MSRV 1.94.1 yes"}
@@ -27,6 +27,6 @@ decisions:
   - {date: 2026-11-23, by: sebi, rows: [H1, H9], decision: "full work: advisory drafted, published with 2.3.1; deny other-session statement views"}
   - {date: 2026-11-24, by: sebi, rows: [required-checks], decision: "make `gate` the single required check — applied after #381 merged"}
   - {date: 2026-11-24, by: sebi, rows: [H2], decision: "ship the second parser, in its own PR (asked after it was built, before any commit)"}
-evidence: ["#376", "#377", "#380", "v2.3.1", "GHSA-j6xv-c57r-59rw", "#381", "#394", "#393", "v2.4.0", "#396", "release-smoke 2.4.0 green (4/4)"]
+evidence: ["#376", "#377", "#380", "v2.3.1", "GHSA-j6xv-c57r-59rw", "#381", "#394", "#393", "v2.4.0", "#396", "release-smoke 2.4.0 green (4/4)", "#400", "#401", "v2.4.1", "#404", "v2.5.0", "#405", "#409", "v2.5.1", "#408", "#410", "v2.5.2", "release-smoke green on 2.4.1, 2.5.0, 2.5.1, 2.5.2 (4/4 each)"]
 notes: "Human rows H1-H12 in overview.md. Repo-settings detail: owner's private notes. Deployment and consumer slices tracked in their own repositories."
-last_updated: 2026-11-24
+last_updated: 2026-11-25
