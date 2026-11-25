@@ -20,7 +20,7 @@ resources:
   - pdb.yaml
 images:
   - name: ghcr.io/developerz-ai/db-mcp-gateway
-    newTag: "2.5.2"
+    newTag: "2.6.0"
 configMapGenerator:
   - name: db-mcp-gateway-config
     files:
