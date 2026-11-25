@@ -24,7 +24,7 @@
 
 services:
   gateway:
-    image: ghcr.io/developerz-ai/db-mcp-gateway:2.6.0  # pin a release; never :latest in production
+    image: ghcr.io/developerz-ai/db-mcp-gateway:2.6.1  # pin a release; never :latest in production
     container_name: db-mcp-gateway
     ports:
       - "8443:8443"  # HTTPS MCP endpoint
