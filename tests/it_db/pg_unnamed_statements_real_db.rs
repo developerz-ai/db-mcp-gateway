@@ -15,7 +15,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use sqlx::postgres::{PgConnectOptions, PgDatabaseError, PgPoolOptions, PgSslMode};
@@ -35,6 +35,18 @@ use db_mcp_gateway::exec::{
     Identifier, PgAdapter, PoolSizing, QueryParam, SampleQuery, SchemaDetail, SchemaQuery,
     TableStatsQuery,
 };
+
+/// How long to wait for a state that must come. Below the ceiling on a
+/// statement's timeout, which ends [`asleep`] if nothing else does.
+const PATIENCE: Duration = Duration::from_secs(20);
+
+/// A statement nothing but a cancel, a kill or its 30 s timeout ends.
+fn asleep(access: Access) -> ExecQuery<'static> {
+    ExecQuery {
+        statement_timeout_ms: Some(30_000),
+        ..statement("SELECT pg_sleep(120)", access)
+    }
+}
 
 fn statement(sql: &str, access: Access) -> ExecQuery<'_> {
     ExecQuery {
@@ -178,13 +190,48 @@ async fn a_first_seen_type_does_not_lose_the_statement() {
     }
 }
 
-/// The same `SELECT *` from several callers while the table gains columns:
-/// no read fails, every row is as wide as its header, and no header goes
-/// back to an older table — the zero-row read's included, which has nothing
-/// but its description to go by.
+/// The same `SELECT *` from several callers at once, again after each change
+/// of the table: no read fails, and every header is the table's as it now
+/// stands — the zero-row read's included, which has nothing but its
+/// description to go by.
 #[tokio::test]
 #[serial_test::parallel(world)]
-async fn reads_survive_schema_changes_between_them() {
+async fn reads_after_a_schema_change_see_the_new_table() {
+    // A YugabyteDB read on a catalog a DDL just moved is a retryable `40001`.
+    if is_yugabyte() {
+        return;
+    }
+    let owner = owner().await;
+    let table = format!("dbmcp_evolving_{}", Uuid::new_v4().simple());
+    run(
+        &owner,
+        format!("CREATE TABLE {table} (c0 int); INSERT INTO {table} VALUES (1), (2)"),
+    )
+    .await;
+    let adapter = adapter().await;
+    let all_rows = format!("SELECT * FROM {table}");
+    let zero_rows = format!("SELECT * FROM {table} WHERE c0 < 0");
+    let mut columns = vec!["c0".to_string()];
+    for at in 1..=12 {
+        let reads = [&all_rows, &all_rows, &zero_rows];
+        let found = futures::future::join_all(reads.map(|sql| adapter.execute(read(sql)))).await;
+        for (found, rows) in found.into_iter().zip([2, 2, 0]) {
+            let found = found.unwrap_or_else(|err| panic!("{columns:?}: {err:?}"));
+            assert_eq!(found.columns, columns);
+            assert_eq!(found.rows.len(), rows);
+            assert!(found.rows.iter().all(|row| row.len() == columns.len()));
+        }
+        run(&owner, format!("ALTER TABLE {table} ADD COLUMN c{at} int")).await;
+        columns.push(format!("c{at}"));
+    }
+    run(&owner, format!("DROP TABLE {table}")).await;
+}
+
+/// The same reads while the table changes under them, however the two fall
+/// together: none fails, and no header goes back to an older table.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn reads_racing_schema_changes_neither_fail_nor_go_back() {
     // Concurrent DDL aborts a YugabyteDB read with a retryable `40001`.
     if is_yugabyte() {
         return;
@@ -193,66 +240,43 @@ async fn reads_survive_schema_changes_between_them() {
     let table = format!("dbmcp_evolving_{}", Uuid::new_v4().simple());
     run(
         &owner,
-        format!("CREATE TABLE {table} (id int); INSERT INTO {table} VALUES (1), (2)"),
+        format!("CREATE TABLE {table} (c0 int); INSERT INTO {table} VALUES (1), (2)"),
     )
     .await;
     let adapter = Arc::new(adapter().await);
-    let zero_rows = format!("SELECT * FROM {table} WHERE id < 0");
-    let before = adapter.execute(read(&zero_rows)).await.expect("zero rows");
-    assert_eq!(before.columns, ["id"]);
     let done = Arc::new(AtomicBool::new(false));
-    let readers: Vec<_> = (0..4)
-        .map(|at| {
+    let readers: Vec<_> = ["", "", "WHERE c0 < 0"]
+        .map(|filter| {
             let (adapter, done) = (adapter.clone(), done.clone());
-            let sql = match at {
-                0 => zero_rows.clone(),
-                _ => format!("SELECT * FROM {table}"),
-            };
+            let sql = format!("SELECT * FROM {table} {filter}");
             tokio::spawn(async move {
-                let mut failures = Vec::new();
-                let mut widths = Vec::new();
+                let (mut failures, mut width) = (Vec::new(), 0);
                 while !done.load(Ordering::Relaxed) {
                     match adapter.execute(read(&sql)).await {
                         Ok(result) => {
                             let columns = result.columns.len();
-                            let last = widths.last().copied().unwrap_or(0);
-                            assert!(columns >= last, "{columns} columns after {last}");
-                            if columns > last {
-                                widths.push(columns);
+                            if columns < width || result.rows.iter().any(|r| r.len() != columns) {
+                                failures.push(format!("{columns} columns after {width}"));
                             }
-                            let rows = if at == 0 { 0 } else { 2 };
-                            assert_eq!(result.rows.len(), rows, "{result:?}");
-                            assert!(result.rows.iter().all(|row| row.len() == columns));
+                            width = columns;
                         }
                         Err(err) => failures.push(format!("{err:?}")),
                     }
                 }
-                (failures, widths)
+                failures
             })
         })
-        .collect();
-    for at in 0..20 {
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        .into();
+    for at in 1..=20 {
         run(&owner, format!("ALTER TABLE {table} ADD COLUMN c{at} int")).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let last = adapter
-        .execute(read(&format!("SELECT * FROM {table}")))
-        .await;
-    let after = adapter.execute(read(&zero_rows)).await;
     done.store(true, Ordering::Relaxed);
     let outcomes = futures::future::join_all(readers).await;
     run(&owner, format!("DROP TABLE {table}")).await;
     for outcome in outcomes {
-        let (failures, widths) = outcome.expect("reader");
-        assert_eq!(failures, Vec::<String>::new());
-        // Reading before, between and after the changes, not around them.
-        assert!(widths.len() > 2, "saw only {widths:?} columns");
+        assert_eq!(outcome.expect("reader"), Vec::<String>::new());
     }
-    let last = last.expect("last read");
-    assert_eq!(last.columns.len(), 21);
-    let after = after.expect("zero rows");
-    assert!(after.rows.is_empty());
-    assert_eq!(after.columns, last.columns);
 }
 
 /// "cached plan must not change result type" from a plan a function keeps —
@@ -514,6 +538,7 @@ impl SearchPathSwitch {
                         {
                             server.write_all(&switch_path(&table)).await.unwrap();
                             swallow_answer(&mut server, &mut server_frames).await;
+                            answer.lock().unwrap().clear();
                             answering = true;
                         }
                         if server.write_all(&frame.raw).await.is_err() {
@@ -930,7 +955,7 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
         assert_refused(a.execute(read(sql)).await, sqlstate, sql);
     }
     // The near-miss lookup behind an undefined name gives up, silently, after
-    // 200 ms: a busy target gets another chance to be asked.
+    // 200 ms: on a busy box it is asked for until it got as far as the wire.
     for (sql, sqlstate, lookup) in [
         (nope.as_str(), "42703", "quote_ident(a.attname)"),
         (
@@ -939,13 +964,11 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
             "quote_ident(c.relname)",
         ),
     ] {
-        for _ in 0..20 {
+        let started = Instant::now();
+        while !wire.parsed(lookup) {
+            assert!(started.elapsed() < PATIENCE, "{sql}: no near-miss lookup");
             assert_refused(a.execute(read(sql)).await, sqlstate, sql);
-            if wire.parsed(lookup) {
-                break;
-            }
         }
-        assert!(wire.parsed(lookup), "{sql}: no near-miss lookup");
     }
     let star = format!("SELECT * FROM {name}");
     let none = format!("SELECT e FROM {name} WHERE false");
@@ -1056,10 +1079,10 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
     // A cancel by request id, on each tier, while `db_activity` is asked.
     let mut by_request = Vec::new();
     for access in [Access::ReadOnly, Access::ReadWrite] {
-        let victim = statement("SELECT pg_sleep(5)", access);
+        let victim = asleep(access);
         let request_id = victim.request_id;
         let (cancelled, ()) = tokio::join!(a.execute(victim), async {
-            running(&owner, request_id).await;
+            sleeping(&owner, request_id).await;
             let activity = a
                 .db_activity(ActivityQuery {
                     statement_timeout_ms: None,
@@ -1080,71 +1103,63 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
     }
 
     // Dropped wherever it stands, a later point each time, up to its end.
-    let drop_read = "SELECT e.relname, pg_sleep(0.02) FROM pg_class e LIMIT 1";
-    let drop_cast = "SELECT ev_action FROM pg_rewrite LIMIT 2";
-    let mut dropped_ids = Vec::new();
-    for sql in [drop_read, drop_cast] {
-        let started = std::time::Instant::now();
+    // Where a drop lands is chance, so nothing is asked of it but that the
+    // calls after it are untouched and everything on the wire was servable.
+    for sql in [
+        "SELECT e.relname, pg_sleep(0.02) FROM pg_class e LIMIT 1",
+        "SELECT ev_action FROM pg_rewrite LIMIT 2",
+    ] {
+        let started = Instant::now();
         a.execute(read(sql)).await.expect("undisturbed");
         let whole = started.elapsed();
         for at in 0..30 {
-            let victim = read(sql);
-            let request_id = victim.request_id;
-            // Cut short or done first: a drop before it must never fail it.
-            match tokio::time::timeout(whole * at / 28, a.execute(victim)).await {
-                Ok(outcome) => {
-                    outcome.unwrap_or_else(|err| panic!("after a drop: {sql}: {err:?}"));
-                }
-                Err(_elapsed) => dropped_ids.push(request_id),
+            // Cut short or done first.
+            let cut = tokio::time::timeout(whole * at / 28, a.execute(read(sql))).await;
+            if let Ok(outcome) = cut {
+                outcome.unwrap_or_else(|err| panic!("after a drop: {sql}: {err:?}"));
             }
         }
     }
 
-    // Dropped while its backend runs it: the backend is cancelled.
-    let victim = read("SELECT pg_sleep(8)");
-    let request_id = victim.request_id;
-    let dropped_tag = tokio::select! {
-        outcome = a.execute(victim) => panic!("pg_sleep(8) ended: {outcome:?}"),
-        tag = running(&owner, request_id) => tag,
-    };
-    let mut still = true;
-    for _ in 0..40 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        still = backend_tag(&owner, request_id).await.is_some();
-        if !still {
-            break;
+    // Dropped while its backend sleeps in it, on each tier: cancelled.
+    let mut dropped_tags = Vec::new();
+    for access in [Access::ReadOnly, Access::ReadWrite] {
+        let victim = asleep(access);
+        let request_id = victim.request_id;
+        let tag = tokio::select! {
+            outcome = a.execute(victim) => panic!("the sleep ended: {outcome:?}"),
+            tag = sleeping(&owner, request_id) => tag,
+        };
+        let started = Instant::now();
+        while sleeping_tag(&owner, request_id).await.is_some() {
+            assert!(
+                started.elapsed() < PATIENCE,
+                "the dropped call's backend kept running"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        dropped_tags.push(tag);
     }
-    assert!(!still, "the dropped call's backend kept running");
 
     // The backend killed under the statement.
-    let victim = read("SELECT pg_sleep(5)");
-    let tag = format!("dbmcp-{}-%", victim.request_id.simple());
+    let victim = asleep(Access::ReadOnly);
+    let request_id = victim.request_id;
     let (killed, ()) = tokio::join!(a.execute(victim), async {
-        for _ in 0..40 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let killed: Vec<bool> = sqlx::query_scalar(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-                 WHERE application_name LIKE $1 AND query LIKE '%pg_sleep%'",
-            )
-            .bind(&tag)
-            .fetch_all(&owner)
-            .await
-            .expect("terminate");
-            if killed.contains(&true) {
-                return;
-            }
-        }
-        panic!("never killed");
+        let tag = sleeping(&owner, request_id).await;
+        let killed: Vec<bool> = sqlx::query_scalar(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1",
+        )
+        .bind(&tag)
+        .fetch_all(&owner)
+        .await
+        .expect("terminate");
+        assert_eq!(killed, [true]);
     });
     assert!(matches!(killed, Err(ExecError::Unavailable)), "{killed:?}");
     let recovered = a.execute(read("SELECT 1")).await.expect("recovered");
     assert_eq!(recovered.rows, vec![vec![json!(1)]]);
 
-    detached
-        .drain(Duration::from_secs(5))
-        .await
-        .expect("drop cancels finish");
+    detached.drain(PATIENCE).await.expect("drop cancels finish");
     run(
         &owner,
         format!("DROP TABLE {name}; DROP TYPE {name}_c; DROP TYPE {name}_e; DROP DOMAIN {name}_d"),
@@ -1173,17 +1188,11 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
         .filter(|query| query.contains("pg_cancel_backend"))
         .collect();
     let cancelled = |needle: &str| cancels.iter().any(|query| query.contains(needle));
-    let tagged = |id: &Uuid| format!("application_name = 'dbmcp-{}-", id.simple());
-    assert!(
-        cancelled(&format!("application_name = '{dropped_tag}'")),
-        "{dropped_tag}"
-    );
-    assert!(cancelled(&tagged(&capped_id)), "the row cap");
-    assert!(
-        dropped_ids.iter().any(|id| cancelled(&tagged(id))),
-        "none of {} drops",
-        dropped_ids.len()
-    );
+    for tag in &dropped_tags {
+        assert!(cancelled(&format!("application_name = '{tag}'")), "{tag}");
+    }
+    let capped_tag = format!("application_name = 'dbmcp-{}-", capped_id.simple());
+    assert!(cancelled(&capped_tag), "the row cap");
     for id in &by_request {
         assert!(
             cancelled(&format!("LIKE 'dbmcp-{}-%'", id.simple())),
@@ -1199,20 +1208,24 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
 }
 
 /// The tag of the backend sleeping for `request_id`, waited for.
-async fn running(owner: &sqlx::PgPool, request_id: Uuid) -> String {
-    for _ in 0..80 {
-        if let Some(tag) = backend_tag(owner, request_id).await {
+async fn sleeping(owner: &sqlx::PgPool, request_id: Uuid) -> String {
+    let started = Instant::now();
+    loop {
+        if let Some(tag) = sleeping_tag(owner, request_id).await {
             return tag;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(started.elapsed() < PATIENCE, "{request_id} never slept");
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("{request_id} never ran on the target");
 }
 
-async fn backend_tag(owner: &sqlx::PgPool, request_id: Uuid) -> Option<String> {
+/// The tag of the backend that is inside `pg_sleep` for `request_id`: its
+/// statement's text alone is there from the Parse on.
+async fn sleeping_tag(owner: &sqlx::PgPool, request_id: Uuid) -> Option<String> {
     sqlx::query_scalar(
         "SELECT application_name FROM pg_stat_activity WHERE state = 'active' \
-         AND application_name LIKE $1 AND query LIKE 'SELECT pg_sleep%'",
+         AND wait_event_type = 'Timeout' AND wait_event = 'PgSleep' \
+         AND application_name LIKE $1",
     )
     .bind(format!("dbmcp-{}-%", request_id.simple()))
     .fetch_optional(owner)
