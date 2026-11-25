@@ -23,13 +23,13 @@ Every agent-facing error carries a `request_id`; it matches `audit_calls.request
 **How long it fires.** The alert looks at every scrape of the last 5m, not just the latest, so it clears up to 5m after its cause does, plus one evaluation interval (an evaluation just before the last such scrape leaves the window keeps it until the next one).
 - *Process still running.* The replica holds `audit_failure_recent{kind="write"}` at 1 for 15m after its last refusal, timed on its monotonic clock (no wall clock matters), so the alert clears 15m to 20m after the refusal, plus one evaluation interval. A refusal before Prometheus first saw the pod, which `increase()` cannot see, still fires when the first scrape comes within the 15m.
 - *Pod replaced or restarted.* The hold is in memory and goes with the process. If a scrape saw it, the alert clears within 5m of the last such scrape, as does `increase()` over 5m, plus one evaluation interval. A resolve right after a rollout or a crash is not proof the state DB recovered; check `/readyz` and the logs.
-- *Image 2.4.1 and older* has no gauge: `increase()`, plus any refusal counted by a process up under 10m (by its wall-clock start stamp); that clears 10m after the boot, or 10m after its first scrape if its clock runs fast, plus one evaluation interval. With a clock 10m slow or more, only `increase()` is left.
+- *Image 2.4.1 and older* has no gauge, only `increase()`: a refusal before its first scrape is missed ([GatewayOlderThanRules](#gatewayolderthanrules)).
 
 **Does not cover.**
 - A failure no scrape saw while its hold lasted: the pod was replaced or restarted first, its first scrape came later than the hold, or a scrape outage (or Prometheus outage) outlasted it. Gateway logs and, for calls with an intent, [GatewayAuditAbandoned](#gatewayauditabandoned) remain.
 - Failures while a pod shuts down: the metrics listener stops at `SIGTERM`, before in-flight calls drain (up to 80 s) and detached audit writes finish (up to 20 s).
 - Scrape or rule evaluation intervals of 5m or more: nothing may fall inside the 5m window. Keep both at 2m or less (the chart scrapes every 30 s).
-- An old image (no gauge) whose pod is replaced between its only failing scrape and the next evaluation.
+- A failure before the first scrape of an image without the gauge (2.4.1 and older).
 - Admin API requests refused because their `permissions_audit` write failed (also `audit_unavailable`, HTTP 503): they neither count nor set the gauge.
 - Which deployment: on a Prometheus shared by several gateways the alert is one, without labels. While it fires for one it does not re-fire for another.
 
@@ -59,11 +59,19 @@ Every agent-facing error carries a `request_id`; it matches `audit_calls.request
 - *Recoverable:* calls that committed an intent row before reaching a target (`run_query`, `explain`, `describe_schema`, `sample_table`, `table_stats`, `db_activity`, `cancel_query`). Once the state DB is back, the reaper writes an `abandoned` row for each, about 2m20s after the intent at the earliest, with the caller, target, SQL, reason and access. The real outcome, row count and timing are lost; the `audit write failed` log line has the outcome when the completion write was the one that failed.
 - *Not recoverable:* calls with no intent. `list_servers`, `list_databases`, `get_query_history` and `whoami` never commit one; nor does any call that ended before its intent (bad arguments, `forbidden`, `forbidden_sql`, `reason_required`), or whose intent write itself failed. None of these reached a target. No audit row will appear; the gateway's `ERROR` lines for the `request_id` are the only trace.
 
-The gauge holds for 30m after a replica's last such failure and goes with the process, so the alert clears 30m to 35m after it (within 15m, by `increase()`, when the process is gone), plus one evaluation interval. Image 2.4.1 and older: any such failure counted by a process up under 20m. Limits are under [GatewayAuditUnavailable](#gatewayauditunavailable).
+The gauge holds for 30m after a replica's last such failure and goes with the process, so the alert clears 30m to 35m after it (within 15m, by `increase()`, when the process is gone), plus one evaluation interval. Limits are under [GatewayAuditUnavailable](#gatewayauditunavailable).
 
 **First checks.** Same as [GatewayAuditUnavailable](#gatewayauditunavailable) — the state DB was refusing writes at that moment. Check that [GatewayAuditReaperStale](#gatewayauditreaperstale) is not also firing.
 
 **Fixes.** Fix the state DB; the reaper then closes the calls that have an intent. For the rest, keep the log lines.
+
+### GatewayOlderThanRules
+
+**Means.** For 15m the named instance has exported the gateway's `build_info` and `audit_abandoned_total` but no `audit_failure_recent`: its image is older than these rules (2.4.1 and older lack the gauge). Until it is rolled, [GatewayAuditUnavailable](#gatewayauditunavailable) and [GatewayAuditFallbackFailures](#gatewayauditfallbackfailures) have only `increase()` for it, so an audit failure before its first scrape is missed. Image 2.3.1 and older export no `build_info`, so this alert does not name them either.
+
+**First checks.** The `version` label of the alert against the image you meant to run; a stalled or paused rollout; a rollback.
+
+**Fixes.** Roll the image. If it has to stay, use the rules shipped with it: `deploy/prometheus/rules.yaml` at that image's tag. Order for every upgrade: the image first, then the rules. The chart applies both in one upgrade, so this fires there only when the rollout takes longer than 15m.
 
 ### GatewayAuditAbandoned
 

@@ -22,15 +22,9 @@ groups:
         # away, still fires. Resolves up to 5m after the hold (20m after the
         # refusal), or within 5m of the last scrape when the pod goes away, plus
         # one evaluation interval. Evaluate and scrape at least every 2m.
-        # Last clause: replicas without the gauge (image 2.4.1 and older). A
-        # process up under 10m with a non-zero count failed in those 10m,
-        # whatever an earlier process on the instance reported; it resolves 10m
-        # after the boot, or after the first scrape if its clock is fast, plus
-        # one evaluation interval. Matched on every target label, so a replaced
-        # pod's leftovers on the same instance do not count, and against the
-        # gauge as of now: what runs now decides. Drop it once no such replica
-        # is deployed.
-        expr: sum(increase(tool_calls{outcome="audit_unavailable"}[5m])) > 0 or max(max_over_time(audit_failure_recent{kind="write"}[5m])) > 0 or sum(tool_calls{outcome="audit_unavailable"} > 0 and ignoring (tool, outcome, access) (time() - process_start_time_seconds < 600 unless process_start_time_seconds == process_start_time_seconds offset 10m) unless ignoring (tool, outcome, access, kind) audit_failure_recent{kind="write"}) > 0
+        # An image without the gauge keeps only increase(): roll the image
+        # before these rules (GatewayOlderThanRules).
+        expr: sum(increase(tool_calls{outcome="audit_unavailable"}[5m])) > 0 or max(max_over_time(audit_failure_recent{kind="write"}[5m])) > 0
         labels:
           severity: critical
         annotations:
@@ -49,15 +43,28 @@ groups:
       - alert: GatewayAuditFallbackFailures
         # As in GatewayAuditUnavailable; this gauge holds for 30m (resolves up
         # to 35m after the failure plus one evaluation interval), increase()
-        # looks back 15m, the clause for replicas without the gauge covers the
-        # first 20m of a process.
-        expr: sum(increase(audit_fallback_failures_total[15m])) > 0 or max(max_over_time(audit_failure_recent{kind="fallback"}[5m])) > 0 or sum(audit_fallback_failures_total > 0 and (time() - process_start_time_seconds < 1200 unless process_start_time_seconds == process_start_time_seconds offset 20m) unless ignoring (kind) audit_failure_recent{kind="fallback"}) > 0
+        # looks back 15m.
+        expr: sum(increase(audit_fallback_failures_total[15m])) > 0 or max(max_over_time(audit_failure_recent{kind="fallback"}[5m])) > 0
         labels:
           severity: warning
         annotations:
           summary: Fallback audit writes failed.
           description: 'Fallback audit writes (after a disconnect, or a failed completion write) failed in the last 35m. The reaper records those calls that committed an intent as abandoned; the others have no audit row.'
           runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayauditfallbackfailures
+      - alert: GatewayOlderThanRules
+        # A gateway target exporting no audit_failure_recent: an image older
+        # than these rules. Other programs export a build_info too, so a
+        # gateway is one that also exports audit_abandoned_total. Matched on
+        # every target label and within one scrape, so an outage takes both
+        # sides away; 15m outlasts a rollout.
+        expr: build_info and ignoring (version, git_sha) audit_abandoned_total unless ignoring (version, git_sha, kind) audit_failure_recent{kind="write"}
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: A gateway runs an image older than the alert rules.
+          description: '{{ $labels.instance }} runs {{ $labels.version }}, which exports no audit_failure_recent: an audit failure before its first scrape does not alert.'
+          runbook_url: https://github.com/developerz-ai/db-mcp-gateway/blob/main/deploy/runbook.md#gatewayolderthanrules
       - alert: GatewayAuditAbandoned
         expr: sum(increase(audit_abandoned_total[15m])) > 0
         labels:
