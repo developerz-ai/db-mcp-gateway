@@ -23,7 +23,7 @@ else is using the same Postgres/MySQL/Mongo/Redis — never run one.
 
 | Step | Command | What it proves |
 |------|---------|----------------|
-| install | `bin/setup` (`--hooks` also sets `core.hooksPath .githooks`) | host prerequisites, cargo-nextest + cargo-audit at CI's versions, `cargo fetch --locked`, the six default dev services healthy; log in `target/setup.log` |
+| install | `bin/setup` (`--hooks` also sets `core.hooksPath .githooks`) | host prerequisites, cargo-nextest + cargo-audit at CI's versions, `cargo fetch --locked`, the eight default dev services healthy; log in `target/setup.log` |
 | format | `bin/fmt` | rewrites; `bin/lint` only checks |
 | unit loop | `bin/test --unit` | lib + bin unit tests and `tests/it_offline` — no Docker, no database |
 | one DB suite | `bin/test --test it_db <module>::` | that module against the real dev stack (target DB never mocked) |
@@ -40,8 +40,9 @@ subset: pre-commit = fmt + staged token scan, pre-push = clippy +
 
 `bin/test` (full, or with `--test it_db …`) runs
 `docker compose -f docker-compose.dev.yml up -d --wait` before cargo, so the
-six default services (`state-db`, `target-db`, `permissions-mysql`,
-`target-mongo`, `target-redis`, `target-dragonfly`) must be healthy. A stack
+eight default services (`state-db`, `target-db`, `target-pool-db`,
+`target-pooler`, `permissions-mysql`, `target-mongo`, `target-redis`,
+`target-dragonfly`) must be healthy. A stack
 that never became healthy returns 75 without invoking cargo and names each
 unhealthy service. Test arguments are forwarded unchanged (cargo-nextest when
 installed, else `cargo test`).

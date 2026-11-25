@@ -24,12 +24,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
 
+use crate::common::gateway::config_file;
 use crate::common::pg_target::{
-    TARGET_DB, TARGET_HOST, TARGET_PASSWORD, TARGET_USER, adapter, ensure_read_role, is_yugabyte,
-    owner_url, server, single_connection_adapter, target_port, writable_adapter, writable_database,
+    PORT_PLACEHOLDER, TARGET_DB, TARGET_HOST, TARGET_PASSWORD, TARGET_USER, adapter, config_yaml,
+    ensure_read_role, is_yugabyte, owner_url, server, single_connection_adapter, target_port,
+    writable_adapter, writable_database,
 };
 use db_mcp_gateway::audit::drain::DetachedTasks;
-use db_mcp_gateway::config::Password;
+use db_mcp_gateway::config::{Password, Server};
 use db_mcp_gateway::exec::{
     Access, ActivityQuery, DbAdapter, ExecError, ExecQuery, ExecResult, ExplainQuery, GuardedSql,
     Identifier, PgAdapter, PoolSizing, QueryParam, SampleQuery, SchemaDetail, SchemaQuery,
@@ -1424,6 +1426,141 @@ async fn every_target_statement_is_servable_by_a_transaction_mode_pooler() {
         seen.violations.len(),
         &seen.violations[..seen.violations.len().min(5)]
     );
+}
+
+/// A transaction-mode pooler's port (`target-pooler`, localhost:6432). The
+/// suite otherwise runs against the direct target, so this port is not read
+/// from `TARGET_DB_PORT`.
+const POOLER_PORT: u16 = 6432;
+
+/// The gateway adapter over the pooler, with one client connection so the
+/// aborted read's backend is necessarily the next read's backend.
+async fn pooled_adapter() -> PgAdapter {
+    let yaml = config_yaml(&format!(
+        "servers:\n  - name: pooled\n    kind: postgres\n    host: localhost\n    port: {PORT_PLACEHOLDER}\n    tls: insecure\n    pool:\n      max_connections: 1\n    databases:\n      - name: {TARGET_DB}\n        role: {TARGET_USER}\n        password: \"{TARGET_PASSWORD}\"\npermissions: []\n"
+    ))
+    .replace(&target_port().to_string(), &POOLER_PORT.to_string());
+    let config = config_file(&yaml);
+    let target: &Server = &config.servers[0];
+    PgAdapter::open(
+        target,
+        &target.databases[0],
+        PoolSizing {
+            max_connections: 1,
+            ..PoolSizing::default()
+        },
+        DetachedTasks::new(),
+    )
+    .await
+    .expect("the transaction-mode pooler is reachable")
+}
+
+/// A described text cast that runs long enough to cancel mid-read. The cast
+/// is the path that prepares a statement for the driver's description.
+fn slow_text_cast() -> ExecQuery<'static> {
+    ExecQuery {
+        statement_timeout_ms: Some(30_000),
+        ..statement(
+            "SELECT relacl::text, pg_sleep(120) FROM pg_class WHERE relname = 'pg_class'",
+            Access::ReadOnly,
+        )
+    }
+}
+
+/// The text cast on the pooler: cancel it while it runs, then serve the same
+/// read on the backend it left behind. A named `dbmcp_recast` prepared by the
+/// cancelled description survives ROLLBACK on that backend, so the next
+/// `PREPARE` fails with `42P05` unless the proof is unnamed. This is the
+/// regression the direct connection cannot show: its DEALLOCATE and session
+/// cleanup land on the same connection.
+#[tokio::test]
+#[serial_test::serial(world)]
+async fn a_cancelled_pooled_text_cast_leaves_no_named_statement_behind() {
+    if is_yugabyte() {
+        return;
+    }
+    // A second pool over the pooler, to observe and cancel the gateway's
+    // backend. It takes its own server connection, so the gateway's single
+    // client connection still reuses one backend across reads.
+    let owner = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&format!(
+            "postgres://{TARGET_USER}:{TARGET_PASSWORD}@{TARGET_HOST}:{POOLER_PORT}/{TARGET_DB}"
+        ))
+        .await
+        .expect("the pooler's backend is observable");
+    let adapter = pooled_adapter().await;
+    let victim = slow_text_cast();
+    let request_id = victim.request_id;
+    let deadline = Instant::now() + PATIENCE;
+    let (cancelled, ()) = tokio::join!(adapter.execute(victim), async {
+        // The tag is set inside the transaction before the description, so
+        // the cancel lands after `dbmcp_recast` was prepared but before the
+        // read answered. Do not wait on `wait_event = 'PgSleep'`: the cast
+        // may still be describing when the backend is ready to cancel.
+        loop {
+            let found = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT FROM pg_stat_activity \
+                 WHERE application_name LIKE $1 AND state = 'active')",
+            )
+            .bind(format!("dbmcp-{}-%", request_id.simple()))
+            .fetch_one(&owner)
+            .await
+            .expect("pg_stat_activity");
+            if found {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the read never became active");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The tag is set inside the transaction before the description; a
+        // cancel can land while the statement is parsed, so do not filter on
+        // `state = 'active'` and do not demand that the first attempt wins.
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let cancelled: Vec<bool> = sqlx::query_scalar(
+                "SELECT pg_cancel_backend(pid) FROM pg_stat_activity \
+                 WHERE application_name LIKE $1",
+            )
+            .bind(format!("dbmcp-{}-%", request_id.simple()))
+            .fetch_all(&owner)
+            .await
+            .expect("cancel the described read");
+            if cancelled.contains(&true) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "cancel reached no backend");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    assert!(Instant::now() < deadline, "too late to tell from a timeout");
+    assert!(
+        matches!(cancelled, Err(ExecError::Cancelled)),
+        "{cancelled:?}"
+    );
+
+    // The same gateway connection now holds the backend the abort left
+    // behind. Asking it for its own prepared statements proves the proof was
+    // not left on that backend for the next caller.
+    let leaked = adapter
+        .execute(read(
+            "SELECT name FROM pg_prepared_statements WHERE name = 'dbmcp_recast'",
+        ))
+        .await
+        .expect("pg_prepared_statements on the reused backend");
+    assert!(
+        leaked.rows.is_empty(),
+        "a named recast proof survived: {leaked:?}"
+    );
+
+    let sql = "SELECT relacl::text FROM pg_class WHERE relname = 'pg_class'";
+    let again = adapter
+        .execute(read(sql))
+        .await
+        .unwrap_or_else(|err| panic!("same read on the reused backend: {err:?}"));
+    assert_eq!(again.rows.len(), 1, "{again:?}");
+    assert_eq!(again.column_types, ["TEXT"], "{again:?}");
+    assert!(again.rows[0][0].as_str().is_some(), "{again:?}");
 }
 
 /// The tag of the backend sleeping for `request_id`, once it is: inside

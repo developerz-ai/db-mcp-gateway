@@ -34,7 +34,7 @@ When you do hive, a big task is not one agent doing more; it is a **team sharing
 
 ### Who runs which checks
 
-**No agent runs the full `bin/test`, `bin/ci`/`bin/check`, or a bare `cargo test`.** Full `bin/test` is nextest (else `cargo test`) `--all-targets --all-features` over the whole crate *and* brings the docker stack up (always `docker compose -f docker-compose.dev.yml up -d --wait`, waiting for all six default services to become healthy; a stack that never becomes healthy returns 75 without running cargo). Run N times concurrently it does not parallelise — the `bin/` wrappers queue on `.git/dbmcp-heavy.lock` (compiles) and `.git/dbmcp-db.lock` (the shared dev DBs), so N agents just wait in line. A raw `cargo test` skips both locks and fights the others over one `state-db`.
+**No agent runs the full `bin/test`, `bin/ci`/`bin/check`, or a bare `cargo test`.** Full `bin/test` is nextest (else `cargo test`) `--all-targets --all-features` over the whole crate *and* brings the docker stack up (always `docker compose -f docker-compose.dev.yml up -d --wait`, waiting for all eight default services to become healthy; a stack that never becomes healthy returns 75 without running cargo). Run N times concurrently it does not parallelise — the `bin/` wrappers queue on `.git/dbmcp-heavy.lock` (compiles) and `.git/dbmcp-db.lock` (the shared dev DBs), so N agents just wait in line. A raw `cargo test` skips both locks and fights the others over one `state-db`.
 
 | | Agent (per iteration) | Coordinator (once, at the end) |
 |---|---|---|

@@ -1,7 +1,10 @@
 //! The wrapper text, the terminator cut and the types the nested statement
 //! is proven with.
 
+use super::super::stream::bound_types;
 use super::*;
+use sqlx::TypeInfo;
+use sqlx::postgres::PgTypeInfo;
 
 #[test]
 fn only_the_columns_without_binary_form_are_cast() {
@@ -41,9 +44,27 @@ fn the_body_ends_before_the_terminator_whatever_trails_it() {
     assert_eq!(statement_body(" ; "), None);
 }
 
+/// The proof is the unnamed `prepare_with` with the types the run binds. The
+/// source is the guard: no named `PREPARE` to survive an abort and collide on
+/// a pooled backend, and no param-type list drifting from `bound_types`.
 #[test]
-fn the_body_is_proven_with_the_params_types() {
-    assert_eq!(param_types(&[]), "");
+fn the_single_statement_proof_is_unnamed() {
+    let source = include_str!("recast.rs");
+    let at = source
+        .find("async fn prove_single_statement")
+        .expect("proof function");
+    let proof = &source[at..];
+    let proof = &proof[..proof.find("\n///").expect("end of proof function")];
+    assert!(proof.contains(".prepare_with("), "{proof}");
+    assert!(proof.contains("bound_types(binds, params)"), "{proof}");
+    assert!(!proof.contains("PREPARE"), "{proof}");
+    assert!(!proof.contains("DEALLOCATE"), "{proof}");
+    assert!(!source.contains("dbmcp_recast"), "{source}");
+    assert!(!source.contains("fn param_types"), "{source}");
+}
+
+#[test]
+fn the_proof_uses_the_types_the_run_binds() {
     let params = [
         QueryParam::Null,
         QueryParam::Bool(true),
@@ -52,8 +73,11 @@ fn the_body_is_proven_with_the_params_types() {
         QueryParam::Text("x".into()),
         QueryParam::Json(serde_json::json!({"a": 1})),
     ];
+    let types = bound_types(&["bound"], &params);
+    let names: Vec<&str> = types.iter().map(TypeInfo::name).collect();
     assert_eq!(
-        param_types(&params),
-        " (unknown, bool, int8, float8, text, jsonb)"
+        names,
+        ["TEXT", "?", "BOOL", "INT8", "FLOAT8", "TEXT", "JSONB"]
     );
+    assert_eq!(types[0], PgTypeInfo::with_name("TEXT"), "a bind is text");
 }

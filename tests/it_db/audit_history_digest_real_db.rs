@@ -124,10 +124,22 @@ async fn every_row_carries_its_digest_and_the_lookup_seeks_it() {
     // The production statement, planned as a generic prepared plan (what a
     // cached sqlx statement runs after five executions): the digest must be
     // an index condition, or a rare hash still walks the caller's history.
-    // Simple protocol: an extended-protocol prepare would demand the `$n`.
-    let plan = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "EXPLAIN (GENERIC_PLAN) {HISTORY_BY_DIGEST_SQL}"
+    // Bind the actual caller for the planner: `GENERIC_PLAN` sees no value for
+    // `$1` and falls back to the broad `(user_sub, server, database)` index,
+    // which hides whether a seek on the digest is possible at all. The other
+    // parameters still follow the production statement exactly.
+    let plan = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN {HISTORY_BY_DIGEST_SQL}"
     )))
+    .bind(&sub)
+    .bind("prod")
+    .bind("app")
+    .bind(Option::<chrono::DateTime<chrono::Utc>>::None)
+    .bind(Option::<chrono::DateTime<chrono::Utc>>::None)
+    .bind(Option::<uuid::Uuid>::None)
+    .bind(10_i64)
+    .bind(Option::<&str>::None)
+    .bind(hash.as_str())
     .fetch_all(&mut *tx)
     .await
     .expect("explain")

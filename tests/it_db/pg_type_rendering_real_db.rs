@@ -269,6 +269,71 @@ async fn a_read_needing_the_text_cast_runs_once() {
         .expect("drop call counter");
 }
 
+/// A cancelled read does not run its SQL twice. The cancel lands while the
+/// described fallback is being planned, before the statement body runs; the
+/// read after it therefore reports exactly one call. A retry of the
+/// cancelled read, or a second execution of the fallback, would report two.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_cancelled_read_runs_once() {
+    if is_yugabyte() {
+        return;
+    }
+    let owner = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&owner_url())
+        .await
+        .expect("target-db reachable; run `bin/dev up`");
+    let calls = create_call_counter(&owner).await;
+    let adapter = adapter().await;
+    let sql = format!(
+        "SELECT {calls}() AS calls, relacl::text AS acl, pg_sleep(120) \
+         FROM pg_class WHERE relacl IS NOT NULL LIMIT 1"
+    );
+    let victim = ExecQuery {
+        statement_timeout_ms: Some(30_000),
+        ..read(&sql, 1)
+    };
+    let request_id = victim.request_id;
+    let (cancelled, ()) = tokio::join!(adapter.execute(victim), async {
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if adapter
+                .cancel_request(request_id)
+                .await
+                .expect("cancel runs")
+            {
+                return;
+            }
+        }
+        panic!("the cancelled read was never seen");
+    });
+    assert!(
+        matches!(cancelled, Err(ExecError::Cancelled)),
+        "{cancelled:?}"
+    );
+
+    let sql = format!(
+        "SELECT {calls}() AS calls, relacl::text AS acl \
+         FROM pg_class WHERE relacl IS NOT NULL LIMIT 1"
+    );
+    let again = adapter
+        .execute(read(&sql, 1))
+        .await
+        .unwrap_or_else(|err| panic!("same read after cancel: {err:?}"));
+    assert_eq!(
+        again.rows,
+        vec![vec![json!(1), again.rows[0][1].clone()]],
+        "the cancel never ran the statement, the next read ran it once: {again:?}"
+    );
+    assert!(again.rows[0][1].is_string(), "{again:?}");
+
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP FUNCTION {calls}()")))
+        .execute(&owner)
+        .await
+        .expect("drop call counter");
+}
+
 /// A plain read's functions run once too, though its text is parsed twice.
 #[tokio::test]
 #[serial_test::parallel(world)]

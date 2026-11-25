@@ -64,6 +64,7 @@ binary(it_global) | (binary(it_db) & (
   | test(=permissions_pruner_real_db::pruner_hard_deletes_expired_soft_deleted_permissions_rows)
   | test(=pg_error_hints_real_db::near_misses_are_only_names_the_read_role_can_see)
   | test(=pg_error_redaction_real_db::a_cancel_refused_at_login_carries_no_server_text)
+  | test(=pg_unnamed_statements_real_db::a_cancelled_pooled_text_cast_leaves_no_named_statement_behind)
   | test(=pool_sizing_real_db::redis_sweep_closes_connections_idle_past_the_timeout)
   | test(=reaper_stream_real_db::reaped_row_reaches_the_stream_sink)
   | test(=redis_bounded_values_real_db::the_server_is_never_asked_for_an_unbounded_reply)
