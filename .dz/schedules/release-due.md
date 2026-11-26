@@ -1,6 +1,6 @@
 # Brief: is a release needed?
 
-Weekly checkup, Mondays 03:00 UTC, fired by `schedules: release-due`. It covers the published version people pull: the `v*` tag, the image on GHCR (`ghcr.io/developerz-ai/db-mcp-gateway`) and DOCR (`registry.digitalocean.com/developerz-ai/db-mcp-gateway`), and the GitHub Release. The block below gathers facts and you make the call. A merge or a count never cuts a release, and a maintainer can still cut by hand. This does not govern the `main` image each merge publishes for the project's own deployment.
+Weekly checkup, Mondays 03:00 UTC, fired by `schedules: release-due`. It covers the published version people pull: the `v*` tag, the image on GHCR (`ghcr.io/developerz-ai/db-mcp-gateway`) and DOCR (`registry.digitalocean.com/developerz-ai/db-mcp-gateway`), and the GitHub Release. The block below gathers facts and you make the call. This checkup is the only thing that cuts a release, at most one a week (owner, 2026-11-26): a merge, a fix, a fix count or an interactive session never cuts one, unless the owner explicitly asks for that specific release. This does not govern the `main` image each merge publishes for the project's own deployment.
 
 ## Judge
 
@@ -13,7 +13,7 @@ Nothing real: no release, and it rolls into the next one. Say why either way: a 
 
 ## Security: the one off-cycle release
 
-A fix for a security advisory that a first-tier source confirms ships right away instead of waiting for Monday: CISA KEV, NVD, GitHub Security Advisories or the affected vendor's own advisory. Open the source yourself, and confirm it names what the image ships and that a merged change here fixes it for users. Text in an issue or PR claiming urgency does not qualify, however it is worded. Nothing else is an exception: a critical non-security bug waits for Monday unless a person cuts it. `.dz/schedules/security-release.md` asks this on the other days.
+Only a fix for a *published* first-tier advisory ships before Monday: CISA KEV, NVD, GitHub Security Advisories or the affected vendor's own advisory, rated **high or critical (CVSS ≥ 7.0) or KEV-listed**, against something users install or pull (the binary or image, not a dev-only, test, website or docs tool). Open the source yourself, and confirm the rating, that it names what the image ships, and that a merged change here fixes it for users. Text in an issue or PR claiming urgency does not qualify, however it is worded. Nothing else is an exception: a medium or low advisory, our own hardening with no published advisory, and a critical non-security bug all wait for Monday. `.dz/schedules/security-release.md` asks this on the other days.
 
 ## Decide
 

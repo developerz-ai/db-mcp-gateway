@@ -6,6 +6,10 @@
 # half of that trade: it opens a PR that bumps the SHA and updates the trailing
 # `# v5` comment, so pins stay both fixed and fresh.
 #
+# Owner, 2026-11-26: weekly at most, grouped, quiet. Advisories come through here (dz devops.watch is
+# off), and each ecosystem batches its security bumps into one PR via an `applies-to:
+# security-updates` group.
+#
 # Grouped so a quiet week is one PR, not eight — but every group is limited to
 # minor+patch. A major bump is a breaking change wearing a version number, and
 # batching five of them into one PR makes the whole batch unreviewable: you
@@ -25,7 +29,7 @@ updates:
     directory: /
     schedule:
       interval: monthly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
     cooldown:
       default-days: 14
     commit-message:
@@ -41,6 +45,10 @@ updates:
         update-types:
           - minor
           - patch
+      actions-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   # Rust deps. CLAUDE.md pins to "latest stable at implementation time", so
   # these are reviewed bumps, not auto-merges. Security advisories are already
@@ -52,7 +60,7 @@ updates:
       day: monday
       # After ci.yml's 04:00 UTC Monday warm run writes the week's cache.
       time: "06:00"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
     cooldown:
       default-days: 14
     commit-message:
@@ -64,6 +72,11 @@ updates:
         update-types:
           - minor
           - patch
+      # Every security bump in the tree as one PR, not one per advisory.
+      cargo-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   # The docs site (`website/`) has its own npm tree.
   - package-ecosystem: npm
@@ -103,6 +116,7 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    open-pull-requests-limit: 3
     cooldown:
       default-days: 14
     commit-message:
@@ -117,8 +131,12 @@ updates:
       interval: monthly
     cooldown:
       default-days: 14
+    open-pull-requests-limit: 3
     groups:
       dev-stack:
+        patterns: ["*"]
+      dev-stack-security:
+        applies-to: security-updates
         patterns: ["*"]
     ignore:
       # A major (postgres 16 → 17, mongo 7 → 8) changes what the suite tests

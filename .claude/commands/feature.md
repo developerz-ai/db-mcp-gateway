@@ -1,5 +1,5 @@
 ---
-description: End-to-end feature/bug-sweep workflow for db-mcp-gateway — understand, diagnose against a real deployment, explore in parallel, split into layer-disjoint slices, build with a hive of parallel agents in this one checkout (never worktrees), gate with bin/ci against real Postgres, PR (security-review-labelled where required), squash-merge, release on a v* tag. Tracks in GitHub issues. Reads intent from the prompt.
+description: End-to-end feature/bug-sweep workflow for db-mcp-gateway — understand, diagnose against a real deployment, explore in parallel, split into layer-disjoint slices, build with a hive of parallel agents in this one checkout (never worktrees), gate with bin/ci against real Postgres, PR (security-review-labelled where required), squash-merge. Never cuts a release. Tracks in GitHub issues. Reads intent from the prompt.
 argument-hint: <what you want built or fixed, plain language> [+ reference URL(s)]
 allowed-tools: Read, Write, Edit, Glob, Grep, Bash, Agent, Task, SendMessage, TaskCreate, TaskUpdate, TaskList, Skill, WebFetch, mcp__codegraph, mcp__sentry-mcp
 ---
@@ -113,9 +113,9 @@ An agent owns *its own files and its own tests*; whole-crate green is the coordi
 
    Then watch it (`gh pr checks <pr> --watch`), fix failures, address review comments, and squash-merge when green (`gh pr merge <pr> --squash`). Fixes land from **this one checkout**, so at most one PR is in flight at a time: parallel *building* is fine, parallel *merging* is not. Gotcha: **0 registered checks reads as "pass"** — wait for a plausible count *and* zero pending, or it merges RED right after a rebase. Never force-push `main`; never `--no-verify` (fix the hook).
 
-9. **Ship: image on merge, release on tag** — two different things, and only one is automatic.
+9. **Ship: image on merge; releases are not this session's** — two different things, and only one happens here.
    - **On merge to `main`**, `ci.yml` builds per-arch images and pushes a multi-arch manifest to **GHCR and DOCR** under the short-SHA and `main` tags; the deployment's image updater tracks the DOCR tag. Confirm the `build` + `merge` jobs went green and the short-SHA tag exists — that, not the merge, is what rolls.
-   - **A release is a `v*` tag.** `vX.Y.Z` runs `release.yml`: multi-arch build → GHCR + DOCR at semver + `:latest` → a GitHub Release operators pull. Only cut a tag when asked, then confirm the workflow ran and the image is publicly pullable.
+   - **A release is a `v*` tag** (`release.yml`: GHCR + DOCR at semver + `:latest`, a GitHub Release). A feature session never cuts a `v*` tag or opens a `chore(release)` PR. Releases come only from the weekly Monday `release-due` schedule, or the strict security exception in `.dz/schedules/security-release.md` (a published high/critical advisory). The one override: the owner explicitly asks for a specific release in this session.
    - **Never edit a deployment from here.** A new runtime env var goes in `.env.example` + `config/example.yaml` + a PR-body callout for a human to mirror; a real infra change is a separate PR in the deployment's own repo.
 
 10. **Watch + close.** CI green, GlitchTip clean in the feature area, audit log correct — every DB call traced to an SSO identity, no credential in any response, log or error. **Re-verify the original symptom is gone** using whatever proved it in step 3. `Fixes #NNN` auto-closes each child; verify each flipped, close stragglers by hand with a link to the PR, then close the parent yourself. Broken → forward-fix on a branch. Credential leak, authz bypass or audit gap → stop and tell the user.

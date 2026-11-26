@@ -32,7 +32,7 @@ $ARGUMENTS
 ## 4. After the merge
 - Confirm merged → `git checkout main && git pull` → clean tree. Read the `ci.yml` run on `main` you triggered, and the image build it publishes.
 - Update `status.yml`: slice `status`/`percent`, an `evidence:` line per merged PR or verified deploy, `current_focus` for the next wave. Commit it with the next wave's PR, never alone.
-- Deploys: verify in the target (the running version, a probe passing), not from a green run. Releases follow `.dz/schedules/release-due.md`: a `chore(release)` PR alone, the `v*` tag on its merge commit after it lands, never moved or deleted.
+- Deploys: verify in the target (the running version, a probe passing), not from a green run. A session never cuts a release unless the owner explicitly asks for that one; releases come from the weekly `.dz/schedules/release-due.md`: a `chore(release)` PR alone, the `v*` tag on its merge commit after it lands, never moved or deleted.
 
 ## Human rows
 Breaking changes (tool surface, error codes, config schema, audit shape), security calls, secrets only the owner holds, anything weakening a `CLAUDE.md` non-negotiable: never decide them. Record a recommendation and the blocker in `status.yml`. When the owner decides in-session, record it as a dated decision (`by: <owner>`) next to the guard or doc it changes.
