@@ -180,6 +180,7 @@ scout:
   survey: broken_only
 
 # devops: off (owner, 2026-11-26: one PR per advisory was too much noise). Advisories arrive through
-# Dependabot instead, batched weekly per ecosystem (.github/dependabot.yml); cargo-audit still gates CI.
+# Dependabot instead, one grouped security PR per ecosystem per run (.github/dependabot.yml);
+# cargo-audit still gates CI.
 devops:
   watch: "off"  # quoted: YAML 1.1 parsers read a bare off as false

@@ -6,9 +6,9 @@
 # half of that trade: it opens a PR that bumps the SHA and updates the trailing
 # `# v5` comment, so pins stay both fixed and fresh.
 #
-# Owner, 2026-11-26: weekly at most, grouped, quiet. Advisories come through here (dz devops.watch is
-# off), and each ecosystem batches its security bumps into one PR via an `applies-to:
-# security-updates` group.
+# Owner, 2026-11-26: grouped and quiet. Advisories come through here (dz devops.watch is off). Security
+# updates ignore the schedule and PR limit below, so they can land any day; an `applies-to:
+# security-updates` group batches the fixes one run finds into one PR per ecosystem.
 #
 # Grouped so a quiet week is one PR, not eight — but every group is limited to
 # minor+patch. A major bump is a breaking change wearing a version number, and
@@ -45,10 +45,14 @@ updates:
         update-types:
           - minor
           - patch
+      # Minor+patch only, like `actions` above: a major security fix still gets its own PR.
       actions-security:
         applies-to: security-updates
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch
 
   # Rust deps. CLAUDE.md pins to "latest stable at implementation time", so
   # these are reviewed bumps, not auto-merges. Security advisories are already
