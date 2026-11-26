@@ -1,27 +1,10 @@
-//! The text cast for a read whose result has a column the driver cannot
-//! take.
+//! Recasting helpers for Postgres reads whose result columns the driver
+//! cannot take in binary form.
 //!
-//! The driver asks for every result in binary and looks every unfamiliar
-//! column type up in the catalog first. Two kinds of type defeat that, and
-//! with it the whole statement: a type with no binary output function (an
-//! extension type that never wrote one, or `aclitem` inside `relacl`'s
-//! array), which the server refuses at `Bind` (`42883`) — or, as an array's
-//! element, only while it sends the first row, after the statement's
-//! functions ran; and an internal type (category `Z`: `pg_node_tree`, as in
-//! `pg_class.relpartbound`, or `pg_ndistinct` …), whose catalog row the
-//! driver cannot read. Those columns, and only those, are cast to `text` by
-//! wrapping the caller's statement:
-//!
-//! ```sql
-//! SELECT q.c1 AS "oid", q.c2::text AS "relacl" FROM (
-//! <caller's statement>
-//! ) AS q(c1, c2)
-//! ```
-//!
-//! The wrapper reads its columns by position, so duplicate or odd output
-//! names survive, and it keeps them as the column names. It runs in the
-//! read's own read-only transaction instead of the caller's statement, which
-//! is not changed, only nested.
+//! The gateway wraps the caller's statement in a projection that casts only
+//! unsupported columns to text. That includes arrays whose element type has
+//! no binary output function. The projection uses column position so
+//! duplicate output names survive.
 //!
 //! Whether a read needs the wrapper is decided before it runs (see
 //! `describe`), never by retrying a failure: the read runs once (#382).
@@ -30,10 +13,9 @@
 //! the text is proven a single statement first. That `Parse` is the unnamed
 //! statement's and executes nothing: an SQL `PREPARE` would outlive a call
 //! abandoned before its `DEALLOCATE` on a backend a transaction-mode pooler
-//! hands to the next caller (#411). The one name used, the cursor below, ends
-//! with its transaction. When the driver cannot describe the
+//! hands to the next caller (#411). When the driver cannot describe the
 //! statement at all (a category-`Z` column), its columns are read from a
-//! cursor over a wrapper that reads no row of it: the cursor is declared
+//! transaction-local cursor over a wrapper that reads no row of it. It is declared
 //! over the extended protocol with the caller's own params, and its row
 //! description fetched over the simple protocol, whose types the driver
 //! does not look up. Nothing runs with a made-up param value (#383).
@@ -73,8 +55,10 @@ pub(super) async fn text_cast_sql(
     Ok(Some(wrap(body, &columns)))
 }
 
-/// `query`'s result columns, name and type OID, read without the driver's
-/// type lookup and without running the statement.
+/// The columns of `query`'s statement when the driver could not describe it.
+/// `LIMIT 0` forces the planner to resolve every output column without the
+/// server running the statement, so no row is read twice (#382). Cancelling
+/// that describe cancels the backend; nothing runs with a made-up param.
 pub(super) async fn row_description(
     tx: &mut Transaction<'_, Postgres>,
     query: &ExecQuery<'_>,

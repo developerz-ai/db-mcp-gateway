@@ -39,6 +39,57 @@ services:
       timeout: 3s
       retries: 10
 
+  # Scratch Postgres and a transaction-mode PgBouncer for the pooled-backend
+  # regression in pg_unnamed_statements_real_db.rs. Separate from `target-db`
+  # so its prepared-statement state is never shared with the other suites.
+  # No persistent volume: recreating the container starts a fresh backend.
+  target-pool-db:
+    image: postgres:16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d
+    environment:
+      POSTGRES_USER: ${TARGET_DB_USER:-app}
+      POSTGRES_PASSWORD: ${TARGET_DB_PASSWORD:-app-dev-only}
+      POSTGRES_DB: ${TARGET_DB_NAME:-app}
+      # Postgres 16 defaults to SCRAM; the pooler's userlist uses md5.
+      POSTGRES_INITDB_ARGS: --auth-host=md5
+    ports:
+      - "127.0.0.1:5436:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TARGET_DB_USER:-app}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  target-pooler:
+    image: edoburu/pgbouncer:v1.26.1-p0@sha256:8638aa563607256d3c7440437534195f1066a92b68015d89ae9d6b935b444a6d
+    depends_on:
+      target-pool-db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${TARGET_DB_USER:-app}:${TARGET_DB_PASSWORD:-app-dev-only}@target-pool-db:5432/${TARGET_DB_NAME:-app}
+      AUTH_TYPE: md5
+      LISTEN_PORT: 6432
+      POOL_MODE: transaction
+      # A reserved slot in practice for the gateway's separate cancel query.
+      # Cycle through idle backends so the test can positively match a PID.
+      DEFAULT_POOL_SIZE: 2
+      SERVER_ROUND_ROBIN: 1
+      MAX_CLIENT_CONN: 10
+      TARGET_DB_USER: ${TARGET_DB_USER:-app}
+      TARGET_DB_PASSWORD: ${TARGET_DB_PASSWORD:-app-dev-only}
+      TARGET_DB_NAME: ${TARGET_DB_NAME:-app}
+      # Nothing between two client transactions may clear the backend's
+      # prepared statements: the regression must see a leaked named statement
+      # exactly as a production transaction pooler would.
+      SERVER_RESET_QUERY_ALWAYS: 0
+    ports:
+      # Bind to localhost only (see state-db above).
+      - "127.0.0.1:6432:6432"
+    healthcheck:
+      test: ["CMD-SHELL", "PGPASSWORD=\"$$TARGET_DB_PASSWORD\" psql -h 127.0.0.1 -p 6432 -U \"$$TARGET_DB_USER\" -d \"$$TARGET_DB_NAME\" -tAc 'SELECT 1' >/dev/null"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
   # Mysql permissions store for #59. Optional — only opened when
   # `permissions_store.driver = mysql` in YAML. State DB itself stays pg.
   permissions-mysql:

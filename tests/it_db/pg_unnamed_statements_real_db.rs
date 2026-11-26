@@ -28,7 +28,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
+use crate::common::audit::{calls_for_request, find_audit, latest_audit};
+use crate::common::gateway::{LoggedInGateway, spawn_logged_in};
+use crate::common::idp::MockUser;
 use crate::common::log_capture::BufWriter;
+use crate::common::mcp::call_tool;
 use crate::common::pg_target::{
     TARGET_DB, TARGET_HOST, TARGET_PASSWORD, TARGET_USER, adapter, ensure_read_role, is_yugabyte,
     owner_url, server, single_connection_adapter, target_port, writable_adapter, writable_database,
@@ -806,7 +810,7 @@ fn switch_path(table: &str) -> Vec<u8> {
 
 /// A TCP forwarder to the target that reads both directions of every
 /// connection and keeps what a transaction-mode pooler could not serve.
-struct WireRecorder {
+pub(super) struct WireRecorder {
     port: u16,
     seen: Arc<Mutex<Seen>>,
 }
@@ -816,6 +820,15 @@ struct Seen {
     /// Every Parse, Bind and simple query, in the order they came.
     messages: Vec<(u8, String)>,
     violations: Vec<String>,
+    recast_executions: usize,
+    probe_executions: usize,
+}
+
+#[derive(Default)]
+struct ProofBarrier {
+    captured: AtomicBool,
+    reached: Notify,
+    release: Notify,
 }
 
 /// One connection's transaction state, as its server last reported it.
@@ -825,35 +838,54 @@ struct Session {
     /// Queries and Syncs not answered yet: what follows one before its
     /// answer runs in a state nobody has seen.
     unanswered: usize,
+    hold_proof: bool,
+    parsed_recast: bool,
+    bound_recast: bool,
+    parsed_probe: bool,
+    bound_probe: bool,
 }
 
 impl WireRecorder {
-    async fn start() -> Self {
+    pub(super) async fn start() -> Self {
+        Self::relay(target_port(), None).await
+    }
+
+    async fn relay(upstream: u16, barrier: Option<Arc<ProofBarrier>>) -> Self {
         let listener = TcpListener::bind((TARGET_HOST, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen: Arc<Mutex<Seen>> = Arc::default();
         let record = seen.clone();
         tokio::spawn(async move {
             while let Ok((client, _)) = listener.accept().await {
-                let server = connect_target(&client).await;
+                let server = TcpStream::connect((TARGET_HOST, upstream)).await.unwrap();
+                client.set_nodelay(true).unwrap();
+                server.set_nodelay(true).unwrap();
                 let (from_client, to_client) = client.into_split();
                 let (from_server, to_server) = server.into_split();
                 let session: Arc<Mutex<Session>> = Arc::default();
                 let (state, record) = (session.clone(), record.clone());
+                let gate_proof = barrier.clone();
                 tokio::spawn(forward(
                     from_client,
                     to_server,
                     Frames::from_client(),
                     move |frame| {
                         let mut session = state.lock().unwrap();
+                        if is_proof(frame)
+                            && gate_proof.as_ref().is_some_and(|gate| {
+                                !gate.captured.swap(true, Ordering::Relaxed)
+                            })
+                        {
+                            session.hold_proof = true;
+                        }
                         record.lock().unwrap().client(&mut session, frame);
                     },
                 ));
-                tokio::spawn(forward(
+                tokio::spawn(forward_answers(
                     from_server,
                     to_client,
-                    Frames::from_server(),
-                    move |frame| session.lock().unwrap().server(frame),
+                    session,
+                    barrier.clone(),
                 ));
             }
         });
@@ -861,7 +893,7 @@ impl WireRecorder {
     }
 
     /// An adapter of both tiers whose every connection is recorded.
-    async fn adapter(&self, max_connections: u32, detached: DetachedTasks) -> PgAdapter {
+    pub(super) async fn adapter(&self, max_connections: u32, detached: DetachedTasks) -> PgAdapter {
         let mut target = server();
         target.port = self.port;
         target.databases = vec![writable_database()];
@@ -881,6 +913,12 @@ impl WireRecorder {
     /// What was recorded since the last call.
     fn take(&self) -> Seen {
         std::mem::take(&mut *self.seen.lock().unwrap())
+    }
+
+    /// Executions of the marked body, with and without the required text cast.
+    pub(super) fn read_once_executions(&self) -> (usize, usize) {
+        let seen = self.seen.lock().unwrap();
+        (seen.recast_executions, seen.probe_executions)
     }
 }
 
@@ -909,6 +947,26 @@ impl Seen {
         };
         if matches!(kind, b'P' | b'B' | b'Q') {
             self.messages.push((kind, text.to_string()));
+        }
+        match kind {
+            b'P' => {
+                session.parsed_recast = text.contains("q.c1::text AS \"relacl\"");
+                session.parsed_probe = text.contains("'read-once-probe' = 'read-once-probe'");
+            }
+            b'B' => {
+                session.bound_recast = session.parsed_recast;
+                session.bound_probe = session.parsed_probe;
+            }
+            b'E' => {
+                self.recast_executions += usize::from(session.bound_recast);
+                self.probe_executions += usize::from(session.bound_probe);
+            }
+            b'Q' if text.trim_start().starts_with("SELECT ")
+                && text.contains("'read-once-probe' = 'read-once-probe'") =>
+            {
+                self.probe_executions += 1;
+            }
+            _ => {}
         }
         // A Parse's text follows the statement's name.
         let sql = match kind {
@@ -971,6 +1029,55 @@ async fn forward(
         for frame in frames.feed(&chunk[..n]) {
             observe(&frame);
             whole.extend_from_slice(&frame.raw);
+        }
+        if to.write_all(&whole).await.is_err() {
+            return;
+        }
+    }
+    let _ = to.shutdown().await;
+}
+
+fn is_proof(frame: &Frame) -> bool {
+    let text = String::from_utf8_lossy(frame.body());
+    match frame.kind {
+        Some(b'P') => text.split('\0').nth(1).is_some_and(|sql| {
+            sql.starts_with("DECLARE dbmcp_recast ")
+        }),
+        Some(b'Q') => text.starts_with("PREPARE dbmcp_recast"),
+        _ => false,
+    }
+}
+
+/// Hold the proof's entire reply until the client has disconnected. Other
+/// frontend sessions, including the independent cancel connection, keep flowing.
+async fn forward_answers(
+    mut from: impl AsyncRead + Unpin,
+    mut to: impl AsyncWrite + Unpin,
+    session: Arc<Mutex<Session>>,
+    mut barrier: Option<Arc<ProofBarrier>>,
+) {
+    let mut frames = Frames::from_server();
+    let mut chunk = vec![0u8; 65536];
+    let mut held = Vec::new();
+    while let Ok(n @ 1..) = from.read(&mut chunk).await {
+        let mut whole = Vec::new();
+        for frame in frames.feed(&chunk[..n]) {
+            let holding = {
+                let mut state = session.lock().unwrap();
+                state.server(&frame);
+                state.hold_proof && barrier.is_some()
+            };
+            if holding {
+                held.extend_from_slice(&frame.raw);
+                if frame.kind == Some(b'Z') {
+                    let gate = barrier.take().expect("armed proof barrier");
+                    gate.reached.notify_one();
+                    gate.release.notified().await;
+                    whole.append(&mut held);
+                }
+            } else {
+                whole.extend_from_slice(&frame.raw);
+            }
         }
         if to.write_all(&whole).await.is_err() {
             return;
@@ -1632,6 +1739,243 @@ async fn a_failed_rollback_after_truncation_is_still_a_warning() {
             .any(|line| line.contains("rollback after truncation failed")),
         "{warned:?}"
     );
+}
+
+const POOLER_PORT: u16 = 6432;
+const POOL_TARGET_PORT: u16 = 5436;
+const ABORT_BUDGET: Duration = Duration::from_secs(5);
+
+async fn pooled_gateway(port: u16) -> LoggedInGateway {
+    let yaml = format!(
+        r#"
+servers:
+  - name: pooled
+    kind: postgres
+    host: localhost
+    port: {port}
+    tls: insecure
+    databases:
+      - name: {TARGET_DB}
+        role: {TARGET_USER}
+        password: "{TARGET_PASSWORD}"
+permissions:
+  - group: engineers
+    grants:
+      - server: pooled
+        database: {TARGET_DB}
+        action: query_read
+        constraints:
+          statement_timeout_ms: 30000
+"#
+    );
+    spawn_logged_in(
+        &yaml,
+        MockUser {
+            sub: format!("pooled-{}", Uuid::new_v4().simple()),
+            email: "pooler-abort@example.com".to_string(),
+            groups: vec!["engineers".to_string()],
+        },
+    )
+    .await
+}
+
+async fn pooled_read(gw: &LoggedInGateway, sql: &str) -> serde_json::Value {
+    call_tool(
+        gw,
+        "run_query",
+        json!({"server": "pooled", "database": TARGET_DB, "sql": sql}),
+    )
+    .await
+}
+
+/// Keep the HTTP socket itself so dropping it closes the authenticated request.
+async fn start_abortable_read(gw: &LoggedInGateway, sql: &str) -> TcpStream {
+    let host = gw.url.strip_prefix("http://").expect("local HTTP gateway");
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "run_query",
+            "arguments": {"server": "pooled", "database": TARGET_DB, "sql": sql}
+        }
+    });
+    let body = body.to_string();
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        gw.bearer,
+        body.len()
+    );
+    let mut client = TcpStream::connect(host).await.expect("connect to MCP gateway");
+    client.write_all(request.as_bytes()).await.expect("send MCP call");
+    client
+}
+
+async fn pooled_cancel_audit(gw: &LoggedInGateway, previous: Option<&str>) -> String {
+    tokio::time::timeout(ABORT_BUDGET, async {
+        loop {
+            if let Some(row) = find_audit(&gw.state_db, &gw.user_sub, "run_query").await
+                && Some(row.request_id.as_str()) != previous
+            {
+                assert_eq!(row.outcome, "cancelled");
+                assert_eq!(row.user_sub, gw.user_sub);
+                assert_eq!(row.user_email, "pooler-abort@example.com");
+                assert_eq!(row.server.as_deref(), Some("pooled"));
+                assert_eq!(row.database.as_deref(), Some(TARGET_DB));
+                assert_eq!(
+                    row.error_message.as_deref(),
+                    Some("client disconnected before completion")
+                );
+                return row.request_id;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("client abort audit before the deadline")
+}
+
+/// A transaction pooler can hand the exact backend to another caller even
+/// when the original gateway connection has not finished cleaning up.
+#[tokio::test]
+#[serial_test::serial(world)]
+async fn aborted_pooled_text_casts_leave_the_backend_reusable() {
+    if is_yugabyte() {
+        return;
+    }
+    let gate = Arc::new(ProofBarrier::default());
+    let wire = WireRecorder::relay(POOLER_PORT, Some(gate.clone())).await;
+    let owner = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&format!(
+            "postgres://{TARGET_USER}:{TARGET_PASSWORD}@{TARGET_HOST}:{POOL_TARGET_PORT}/{TARGET_DB}"
+        ))
+        .await
+        .expect("scratch Postgres reachable directly");
+    let expected_acl: String = sqlx::query_scalar(
+        "SELECT relacl::text FROM pg_class WHERE oid = 'pg_catalog.pg_class'::regclass",
+    )
+    .fetch_one(&owner)
+    .await
+    .unwrap();
+    let gw = pooled_gateway(wire.port).await;
+    let slow = "SELECT relacl, pg_sleep(120) FROM pg_class \
+                WHERE oid = 'pg_catalog.pg_class'::regclass \
+                AND 'read-once-probe' = 'read-once-probe'";
+    let mut previous = None;
+    let mut aborted = Vec::new();
+    for at_proof in [true, false] {
+        let client = start_abortable_read(&gw, slow).await;
+        let pid: i32 = if at_proof {
+            tokio::time::timeout(ABORT_BUDGET, gate.reached.notified())
+                .await
+                .expect("server processed the statement proof");
+            sqlx::query_scalar(
+                "SELECT pid FROM pg_stat_activity WHERE application_name LIKE 'dbmcp-%' \
+                 AND state = 'idle in transaction' AND query LIKE '%pg_sleep(120)%'",
+            )
+            .fetch_one(&owner)
+            .await
+            .expect("identify the backend held at the proof")
+        } else {
+            tokio::time::timeout(ABORT_BUDGET, async {
+                loop {
+                    if let Some(pid) = sqlx::query_scalar(
+                        "SELECT pid FROM pg_stat_activity WHERE application_name LIKE 'dbmcp-%' \
+                         AND wait_event = 'PgSleep' AND query LIKE '%pg_sleep(120)%'",
+                    )
+                    .fetch_optional(&owner)
+                    .await
+                    .unwrap()
+                    {
+                        break pid;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the cast body reached execution")
+        };
+        {
+            let seen = wire.seen.lock().unwrap();
+            assert_eq!(seen.recast_executions, usize::from(!at_proof));
+            assert_eq!(seen.probe_executions, usize::from(!at_proof));
+        }
+        drop(client);
+        let deadline = tokio::time::Instant::now() + ABORT_BUDGET;
+        let request_id = pooled_cancel_audit(&gw, previous.as_deref()).await;
+        if at_proof {
+            gate.release.notify_one();
+        }
+        aborted.push(request_id);
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                let idle: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE pid = $1 AND state = 'idle')",
+                )
+                .bind(pid)
+                .fetch_one(&owner)
+                .await
+                .unwrap();
+                if idle {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the victim backend returned to the pool before statement timeout");
+        let seen = wire.take();
+        assert!(seen.violations.is_empty(), "{:?}", seen.violations);
+        assert_eq!(seen.recast_executions, usize::from(!at_proof));
+        assert_eq!(seen.probe_executions, usize::from(!at_proof));
+
+        // Require the same PID back, not merely the same PgBouncer client.
+        // Asking for the prepared names inside the read observes that session.
+        let after = "SELECT relacl, pg_backend_pid(), \
+                     (SELECT count(*) FROM pg_prepared_statements WHERE name = 'dbmcp_recast') \
+                     FROM pg_class WHERE oid = 'pg_catalog.pg_class'::regclass \
+                     AND 'read-once-probe' = 'read-once-probe'";
+        let mut reused = false;
+        for _ in 0..8 {
+            let reply = tokio::time::timeout_at(deadline, pooled_read(&gw, after))
+                .await
+                .expect("read recovered before the cancelled body could time out");
+            assert_eq!(reply["result"]["isError"], false, "{reply}");
+            let body: serde_json::Value = serde_json::from_str(
+                reply["result"]["content"][0]["text"].as_str().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["rows"][0][0], expected_acl);
+            assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+            assert_eq!(body["column_types"], json!(["TEXT", "INT4", "INT8"]));
+            assert_eq!(body["rows"][0][2], 0, "named proof leaked: {body}");
+            let row = latest_audit(&gw.state_db, &gw.user_sub, "run_query", after).await;
+            assert_eq!(row.outcome, "success");
+            assert_eq!(row.user_sub, gw.user_sub);
+            assert_eq!(row.user_email, "pooler-abort@example.com");
+            assert_eq!(row.server.as_deref(), Some("pooled"));
+            assert_eq!(row.database.as_deref(), Some(TARGET_DB));
+            assert_eq!(
+                calls_for_request(&gw.state_db, &row.request_id).await.len(),
+                1
+            );
+            previous = Some(row.request_id);
+            let seen = wire.take();
+            assert!(seen.violations.is_empty(), "{:?}", seen.violations);
+            assert_eq!(seen.recast_executions, 1);
+            assert_eq!(seen.probe_executions, 1);
+            if body["rows"][0][1] == pid {
+                reused = true;
+                break;
+            }
+        }
+        assert!(reused, "PgBouncer did not return victim backend {pid}");
+    }
+    for request_id in aborted {
+        assert_eq!(calls_for_request(&gw.state_db, &request_id).await.len(), 1);
+    }
 }
 
 /// The tag of the backend sleeping for `request_id`, once it is: inside

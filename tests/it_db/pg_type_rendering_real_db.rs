@@ -9,7 +9,9 @@ use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
+use super::pg_unnamed_statements_real_db::WireRecorder;
 use crate::common::pg_target::{adapter, is_yugabyte, owner_url};
+use db_mcp_gateway::audit::drain::DetachedTasks;
 use db_mcp_gateway::exec::{Access, DbAdapter, ExecError, ExecQuery, QueryParam};
 
 fn read(sql: &str, row_limit: u32) -> ExecQuery<'_> {
@@ -267,6 +269,80 @@ async fn a_read_needing_the_text_cast_runs_once() {
         .execute(&owner)
         .await
         .expect("drop call counter");
+}
+
+/// Observe the body running on PostgreSQL and count its Executes on the wire,
+/// where rollback and session cleanup cannot erase evidence of a retry.
+#[tokio::test]
+#[serial_test::parallel(world)]
+async fn a_cancelled_read_runs_once() {
+    if is_yugabyte() {
+        return;
+    }
+    crate::common::pg_target::ensure_read_role().await;
+    let owner = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&owner_url())
+        .await
+        .expect("target-db reachable; run `bin/dev up`");
+    let wire = WireRecorder::start().await;
+    let detached = DetachedTasks::new();
+    let adapter = wire.adapter(1, detached.clone()).await;
+    let sql = "SELECT relacl, pg_sleep(120) FROM pg_class \
+               WHERE oid = 'pg_catalog.pg_class'::regclass \
+               AND 'read-once-probe' = 'read-once-probe'";
+    let victim = ExecQuery {
+        statement_timeout_ms: Some(30_000),
+        ..read(sql, 1)
+    };
+    let request_id = victim.request_id;
+    assert_eq!(wire.read_once_executions(), (0, 0));
+    let (cancelled, ()) = tokio::join!(adapter.execute(victim), async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let executing: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE application_name LIKE $1 \
+                     AND wait_event = 'PgSleep')",
+                )
+                .bind(format!("dbmcp-{}-%", request_id.simple()))
+                .fetch_one(&owner)
+                .await
+                .expect("observe the body from another session");
+                if executing {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("text-cast read reached its executing body");
+        assert_eq!(wire.read_once_executions(), (1, 1));
+        assert!(adapter.cancel_request(request_id).await.expect("cancel runs"));
+    });
+    assert!(
+        matches!(cancelled, Err(ExecError::Cancelled)),
+        "{cancelled:?}"
+    );
+
+    let sql = "SELECT relacl FROM pg_class WHERE oid = 'pg_catalog.pg_class'::regclass \
+               AND 'read-once-probe' = 'read-once-probe'";
+    let again = adapter
+        .execute(read(sql, 1))
+        .await
+        .unwrap_or_else(|err| panic!("same read after cancel: {err:?}"));
+    let expected: String = sqlx::query_scalar(
+        "SELECT relacl::text FROM pg_class WHERE oid = 'pg_catalog.pg_class'::regclass",
+    )
+    .fetch_one(&owner)
+        .await
+        .expect("read the expected ACL directly");
+    assert_eq!(again.rows, vec![vec![json!(expected)]]);
+    assert_eq!(again.column_types, ["TEXT"]);
+    detached
+        .drain(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(wire.read_once_executions(), (2, 2));
 }
 
 /// A plain read's functions run once too, though its text is parsed twice.

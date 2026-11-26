@@ -55,17 +55,24 @@ cp .env.example .env
 ./bin/mcp-call run_query '{"server":"local","database":"shop","sql":"select * from orders"}'
 ```
 
-`bin/setup` checks Cargo and Docker before installing missing host packages and tools, fetches Rust dependencies with `cargo fetch --locked`, and starts all six dependency services, waiting for health. Tool output goes to `target/setup.log`; a failed stage prints its message and the log's last 20 lines. The log stays local — it can hold environment values, so never paste it publicly. Without `--hooks` it leaves your git config alone and prints how to opt in.
+`bin/setup` checks Cargo and Docker before installing missing host packages and tools, fetches Rust dependencies with `cargo fetch --locked`, and starts all eight dependency services, waiting for health. Tool output goes to `target/setup.log`; a failed stage prints its message and the log's last 20 lines. The log stays local — it can hold environment values, so never paste it publicly. Without `--hooks` it leaves your git config alone and prints how to opt in.
 
 Just want to try the gateway, no Rust toolchain? `cd examples/demo && docker compose up -d --wait` runs the published image with a seeded database and a dev-only service token, then `docker compose run --rm ready` prints the `claude mcp add` line.
 
 `bin/dev` defaults to `up`. Running it after setup is safe: it ensures the same dependency services are up, not a second stack. This spins up:
 - State PostgreSQL (gateway metadata, sessions, audit log): `localhost:5433`
 - Target PostgreSQL (testing gateway queries): `localhost:5434`
+- Scratch PostgreSQL (observe or set up pooler tests): `127.0.0.1:5436`
+- Transaction-mode PgBouncer (uses scratch PostgreSQL): `127.0.0.1:6432`
 - Target MongoDB: `localhost:27018`
 - MySQL permissions store: `localhost:3307`
 - Target Redis (`kind: redis`): `localhost:6380`
 - Target Dragonfly (`kind: redis`): `localhost:6381`
+
+Run `bin/test --test it_db aborted_pooled_text_casts_leave_the_backend_reusable`
+to exercise client disconnects before and during text-cast execution and then
+check that the same backend still serves reads. The scratch ports are fixed;
+the pooler does not use the ordinary target database.
 
 YugabyteDB is **not** in the default stack (it boots in ~21 s and takes ~0.5–0.9 GiB RAM). It sits behind the compose profile `yugabyte`: `bin/test-yugabyte` starts it with the state DB, YSQL on `localhost:5435` (`TARGET_YB_PORT`).
 
@@ -110,7 +117,7 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
 (`aarch64-unknown-linux-gnu` for arm64.) Remove the block if a link fails; nothing in the repo depends on it.
 
-**Dev container.** [`.devcontainer/`](.devcontainer/) merges a Rust workspace container over `docker-compose.dev.yml` and starts it with the six default services, under the same compose project `bin/dev up` uses — opening it joins a running stack instead of starting a second one. The workspace shares the host network, so `.env`, the tests and the `localhost` ports work unchanged (Linux, or Docker Desktop with host networking enabled). It has no Docker CLI: run `bin/test --unit`, `cargo nextest run …` and `cargo run -- --config config/dev.yaml` inside; `bin/dev`, `bin/test`, `bin/seed` and `bin/run` drive Docker and stay on the host.
+**Dev container.** [`.devcontainer/`](.devcontainer/) merges a Rust workspace container over `docker-compose.dev.yml` and starts it with the eight default services, under the same compose project `bin/dev up` uses — opening it joins a running stack instead of starting a second one. The workspace shares the host network, so `.env`, the tests and the `localhost` ports work unchanged (Linux, or Docker Desktop with host networking enabled). It has no Docker CLI: run `bin/test --unit`, `cargo nextest run …` and `cargo run -- --config config/dev.yaml` inside; `bin/dev`, `bin/test`, `bin/seed` and `bin/run` drive Docker and stay on the host.
 
 ### Project Structure
 
@@ -160,7 +167,7 @@ bin/test --unit    # --lib --bins + tests/it_offline; what the pre-push hook run
 ```
 
 Before invoking cargo, `bin/test` always runs the idempotent
-`docker compose -f docker-compose.dev.yml up -d --wait`, waiting for all six
+`docker compose -f docker-compose.dev.yml up -d --wait`, waiting for all eight
 services to become healthy even when the state DB is already running. A stack
 that never became healthy returns **75** without running cargo, and the report
 names every unhealthy service with its state and health. **75** is reserved for
@@ -311,7 +318,7 @@ an entry in the final list — so a stopped gate never hides the work that did
 not run.
 
 `bin/setup` prepares native/Rust dependencies, installs cargo-nextest and
-cargo-audit, and starts the six default Compose services; it does **not**
+cargo-audit, and starts the eight default Compose services; it does **not**
 install website dependencies. Run `cd website && npm ci` to have every job run.
 
 The gate mirrors ci.yml's SHA-pin validation and secret-scan: a local gate
