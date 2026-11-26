@@ -89,7 +89,7 @@ services:
   # which the gateway refuses as a role; tests create a least-privilege ACL
   # user (`+@read`, key-scoped) through it, as an operator would.
   target-redis:
-    image: redis:8.4-alpine@sha256:ff72f74e4f471df79ed920aa8bbc35efe72ff8a1f8acdc50aad5dbb9b14a4034
+    image: redis:8.10-alpine@sha256:7958cfbb9d152f87dadfbc89f1b0b15938f0b81ff8982feb327476f4911935c3
     command: ["redis-server", "--requirepass", "${TARGET_REDIS_PASSWORD:-redis-dev-only}", "--save", "", "--appendonly", "no"]
     ports:
       # Bind to localhost only (see state-db above).
