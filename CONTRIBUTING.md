@@ -348,15 +348,15 @@ posts is marked as coming from a bot. Its policy is [`.dz/maintainer/maintainer.
 What that means for you:
 
 - **Issues.** A bug report needs steps, expected, actual and version (the issue form asks for
-  them). If the agent asks for one of them and hears nothing, it reminds you at 7 days and closes
-  the issue at 14. Answer on the closed issue and it reopens. Issues quiet for 30 days are swept:
+  them). If the agent asks for one of them and hears nothing, it reminds you and closes the issue
+  after 60 days. Answer on the closed issue and it reopens. Issues quiet for 60 days are swept:
   the agent comments before closing, never closes first. Reply to keep your issue open.
 - **Pull requests.** A PR merges when the required checks are green and the review has nothing
   left open. The `main-protection` ruleset is the single authority for which checks a merge
   requires; read the live list with `gh api repos/developerz-ai/db-mcp-gateway/rulesets` rather
   than trusting a copy in the docs. When the next move is yours (a red required check, an open
-  review thread, a conflict), the agent pings at 7 and 14 days and closes the PR at 21 (28 for a
-  draft). Push or reply and it picks the PR back up.
+  review thread, a conflict), the agent pings you and closes the PR after 60 days without a move
+  from you. Push or reply and it picks the PR back up.
 - **Commit with an email linked to your GitHub account** (`git config user.email` matches an
   address on <https://github.com/settings/emails>). The ruleset requires an extra human approval
   for a commit not attributed to a GitHub account, so such a PR silently parks instead of merging.
