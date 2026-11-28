@@ -5,6 +5,8 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+import textwrap
 import unittest
 
 sys.dont_write_bytecode = True
@@ -117,6 +119,56 @@ class Workflow(unittest.TestCase):
     def test_every_skip_output_is_emitted_by_changes(self):
         outputs = set(re.findall(r"^      (\w+): \$\{\{ steps\.diff\.outputs\.\1 \}\}$", self.workflow, re.M))
         self.assertEqual({o for o in SKIP_ONLY_WHEN.values() if o}, outputs)
+
+
+class ChangesFilter(unittest.TestCase):
+    """Runs the real `changes` step script from ci.yml over a throwaway PR checkout."""
+
+    @staticmethod
+    def step_script():
+        with open(CI_YML, encoding="utf-8") as f:
+            workflow = f.read()
+        found = re.search(r"^      - id: diff\n(?:.*\n)*?        run: \|\n((?:          .*\n|\n)+)", workflow, re.M)
+        assert found, "ci.yml has no `changes` step with id diff"
+        return textwrap.dedent(found.group(1))
+
+    def outputs(self, changed_paths):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = os.path.join(tmp, "repo")
+            env = {
+                **os.environ,
+                "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+                "GITHUB_EVENT_NAME": "pull_request",
+                "GITHUB_OUTPUT": os.path.join(tmp, "out"),
+                "RUNNER_TEMP": tmp,
+                "BEFORE": "",
+            }
+
+            def git(*args):
+                subprocess.run(["git", "-C", repo, "-c", "commit.gpgsign=false", *args], env=env, check=True, capture_output=True)
+
+            os.mkdir(repo)
+            git("init", "-q")
+            git("commit", "-q", "--allow-empty", "-m", "base")
+            for path in changed_paths:
+                os.makedirs(os.path.dirname(os.path.join(repo, path)) or repo, exist_ok=True)
+                with open(os.path.join(repo, path), "w", encoding="utf-8") as f:
+                    f.write("x\n")
+            git("add", "-A")
+            git("commit", "-q", "-m", "pr")
+            subprocess.run(["bash", "-euo", "pipefail", "-c", self.step_script()], cwd=repo, env=env, check=True, capture_output=True)
+            with open(env["GITHUB_OUTPUT"], encoding="utf-8") as f:
+                return dict(line.strip().split("=", 1) for line in f if "=" in line)
+
+    def test_a_dz_brief_alone_is_docs_only(self):
+        self.assertEqual(self.outputs([".dz/schedules/release-due.md"])["code"], "false")
+
+    def test_the_maintainer_policy_runs_the_code_jobs(self):
+        changed = [".dz/schedules/release-due.md", ".dz/maintainer/maintainer.yml"]
+        self.assertEqual(self.outputs(changed)["code"], "true")
+
+    def test_a_source_change_runs_the_code_jobs(self):
+        self.assertEqual(self.outputs(["src/main.rs"])["code"], "true")
 
 
 class Cli(unittest.TestCase):
