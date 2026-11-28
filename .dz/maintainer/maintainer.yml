@@ -177,4 +177,4 @@ devops:
 
 # care: docs_drift off (census 2026-11-28: 47 tasks, 8 docs-only merges, 33 failed). flaky_tests keeps its default.
 care:
-  docs_drift: off
+  docs_drift: "off"
