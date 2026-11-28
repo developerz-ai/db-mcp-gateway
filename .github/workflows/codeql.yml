@@ -3,16 +3,11 @@ name: codeql
 # Static analysis of the Rust sources (CodeQL `rust`, build-mode none: it
 # extracts from source, so no compile and no cache). Advisory: findings land
 # in the Security tab; nothing here is a required check or in ci.yml's `gate`.
+# Runs on `main` pushes and weekly, not on PRs: it gates nothing, so a PR run
+# only added ~8 min of runner time per push to every PR touching `src/`.
 on:
   push:
     branches: [main]
-  pull_request:
-    paths:
-      - "src/**"
-      - "benchmarks/harness/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/codeql.yml"
   schedule:
     - cron: "17 5 * * 3"
   workflow_dispatch:
@@ -21,8 +16,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: false
 
 jobs:
   analyze:
