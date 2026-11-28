@@ -145,7 +145,7 @@ class ChangesFilter(unittest.TestCase):
             }
 
             def git(*args):
-                subprocess.run(["git", "-C", repo, *args], env=env, check=True, capture_output=True)
+                subprocess.run(["git", "-C", repo, "-c", "commit.gpgsign=false", *args], env=env, check=True, capture_output=True)
 
             os.mkdir(repo)
             git("init", "-q")
