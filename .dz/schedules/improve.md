@@ -1,10 +1,9 @@
-# Brief: monthly improvement
+# Brief: improvement
 
-Fired every Monday by `schedules: improve`. **Act only on the first Monday of the month:**
-`[ "$(date -u +%-d)" -le 7 ]`. On any other Monday stop here, file nothing, open nothing.
+Fired on the first and third Monday of the month by `schedules: improve` (`weeks_of_month: [1, 3]`).
 
-Once a month, leave the gateway measurably better. `CLAUDE.md` binds every change, and `non_goals` in the policy file are off limits. A red `main`,
-a missing publish and a stuck Dependabot PR belong to `health`.
+Each run, leave the gateway measurably better. `CLAUDE.md` binds every change, and `non_goals` in the policy file are off limits. A red `main` is filed by the platform's `cron.base_red_ask`;
+a missing publish and a stuck Dependabot PR are not this brief's.
 
 ## Signals
 
@@ -37,13 +36,13 @@ Check no open PR or issue already covers it. If nothing is worth changing, do no
 
 ## Rows
 
-- `gate`: `bin/ci` on fresh `main` finds something broken or flaky; address the root cause, never a retry or a skip. A red `main` belongs to `health`.
+- `gate`: `bin/ci` on fresh `main` finds something broken or flaky; address the root cause, never a retry or a skip. A red `main` is filed by `cron.base_red_ask`.
 - `advisories`: `cargo audit` finds advisories; prioritize them before dependency majors, one per PR.
-- `dependency-majors`: `cargo outdated` if installed, else the Dependabot PRs closed red, identifies dependency majors Dependabot could not land; one per PR. A stuck Dependabot PR belongs to `health`.
+- `dependency-majors`: `cargo outdated` if installed, else the Dependabot PRs closed red, identifies dependency majors Dependabot could not land; one per PR. A stuck Dependabot PR is not this brief's.
 - `open-bugs`: `gh issue list --state open --label bug --json number,title,url` identifies open bugs, each starting from a test that fails on `main`.
 - `spec-drift`: Spec drift under `website/docs/`; a behaviour change updates the spec in the same PR.
 - `weekly-lanes`: `weekly.yml`'s `audit`, `outdated` and `load-gate` runs on `main`; read a red run's log before acting, and a missing secret or setting is escalated once, never skipped.
-- `release-smoke`: `release-smoke.yml` runs; a red one on the Latest release is `health`'s `last-tag-published` ask, not a second one.
+- `release-smoke`: `release-smoke.yml` runs; a red one on the Latest release is not this brief's to file.
 - `hidden-failures`: swallowed errors and CI skips, made visible; a documented deliberate fallback stays.
 - `speed`: a measured improvement from the load gate, numbers from both sides on one runner class.
 - `simplification`: dead code, duplicated logic, files past 300 LOC, slow or flaky tests.

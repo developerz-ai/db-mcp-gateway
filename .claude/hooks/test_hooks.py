@@ -121,9 +121,8 @@ class PostEditTest(unittest.TestCase):
         self.assertIn("300 LOC", post_edit.size_note("src/big.rs", self.root))
         self.assertIsNone(post_edit.size_note("src/small.rs", self.root))
 
-    def test_release_and_brief_notes(self):
+    def test_release_note(self):
         self.assertIn("chore(release)", post_edit.version_note("Cargo.toml"))
-        self.assertIn("brief_rows", post_edit.brief_note(".dz/schedules/health.md"))
         self.assertIsNone(post_edit.version_note("README.md"))
 
     def test_committed_migration_note(self):

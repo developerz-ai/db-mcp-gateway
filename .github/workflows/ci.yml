@@ -37,7 +37,7 @@ jobs:
   #
   #   code     the PR or push touches more than docs. Docs = `website/`,
   #            `docs/`, `.claude/` (its hooks are tested by workflow-lint.yml)
-  #            and `*.md`, except under `.dz/` (tests/brief_rows.rs reads it).
+  #            and `*.md`.
   #            PRs only: a `main` push always runs the Rust jobs, because
   #            `build` publishes this commit's image and the previous commit's
   #            run may have failed (nothing here proves it passed).
@@ -110,7 +110,7 @@ jobs:
           # Docs-only skips on a PR alone (see `code` above). An empty diff is
           # not docs-only: it runs everything.
           if [ "$GITHUB_EVENT_NAME" = pull_request ] && [ -s "$changed" ] \
-              && ! matches '^\.dz/' && ! grep -qvzE '^(website/|docs/|\.claude/)|\.md$' "$changed"; then
+              && ! grep -qvzE '^(website/|docs/|\.claude/)|\.md$' "$changed"; then
             code=false
           fi
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then

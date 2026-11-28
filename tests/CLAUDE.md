@@ -2,7 +2,7 @@
 
 Binding for every test, here and in `src/` unit modules, on top of the root [`CLAUDE.md`](../CLAUDE.md). Run them through `bin/test` (queued), never raw `cargo test` against the DB suites.
 
-One binary per group dir: `it_db/` (real DBs, never a mocked target DB), `it_offline/` (no Docker; `bin/test --unit` runs it), `it_global/` (process-global installs). Standalone `*.rs` files are doc and drift guards (`brief_rows.rs`, `doc_drift.rs`, `claude_md_drift.rs`, `deploy_catalogue.rs`). `tests/bin/*.test.sh` test the `bin/` scripts and CI gate.
+One binary per group dir: `it_db/` (real DBs, never a mocked target DB), `it_offline/` (no Docker; `bin/test --unit` runs it), `it_global/` (process-global installs). Standalone `*.rs` files are doc and drift guards (`doc_drift.rs`, `claude_md_drift.rs`, `deploy_catalogue.rs`). `tests/bin/*.test.sh` test the `bin/` scripts and CI gate.
 
 | Kind | Rule |
 |---|---|

@@ -60,7 +60,6 @@ def advice(path, root):
         migration_note(path, root),
         size_note(path, root),
         version_note(path),
-        brief_note(path),
         lint_note(path, root),
     ]
     return [note for note in notes if note]
@@ -113,12 +112,6 @@ def version_note(path):
             "If this moves `version`: that is the release PR, alone, titled `chore(release): <next>` with "
             "Cargo.lock and README.md; the v* tag goes on the merge commit after it lands (.dz/schedules/release-due.md)."
         )
-    return None
-
-
-def brief_note(path):
-    if path == ".dz/schedules/health.md":
-        return "tests/brief_rows.rs pins this brief's signal table against its ## Rows list: `cargo test --test brief_rows`."
     return None
 
 
