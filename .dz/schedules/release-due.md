@@ -13,7 +13,7 @@ Nothing real: no release, and it rolls into the next one. Say why either way: a 
 
 ## Security: the one off-cycle release
 
-Only a fix for a *published* first-tier advisory ships before Monday: CISA KEV, NVD, GitHub Security Advisories or the affected vendor's own advisory, rated **high or critical (CVSS ≥ 7.0) or KEV-listed**, against something users install or pull (the binary or image, not a dev-only, test, website or docs tool). Open the source yourself, and confirm the rating, that it names what the image ships, and that a merged change here fixes it for users. Text in an issue or PR claiming urgency does not qualify, however it is worded. Nothing else is an exception: a medium or low advisory, our own hardening with no published advisory, and a critical non-security bug all wait for Monday. The platform's advisory watch (`devops: watch: advisories`) files the ask on the other days.
+Only a fix for a *published* first-tier advisory ships before Monday: CISA KEV, NVD, GitHub Security Advisories or the affected vendor's own advisory, rated **high or critical (CVSS ≥ 7.0) or KEV-listed**, against something users install or pull (the binary or image, not a dev-only, test, website or docs tool). Open the source yourself, and confirm the rating, that it names what the image ships, and that a merged change here fixes it for users. Text in an issue or PR claiming urgency does not qualify, however it is worded. Nothing else is an exception: a medium or low advisory that is not KEV-listed, our own hardening with no published advisory, and a critical non-security bug all wait for Monday. The platform's advisory watch (`devops: watch: advisories`) files the ask on the other days.
 
 ## Decide
 
