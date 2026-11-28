@@ -135,7 +135,7 @@ def check_gh(args):
     if args[:2] == ["pr", "merge"] and "--admin" in args:
         return "--admin bypasses the main-protection ruleset: get the required checks green."
     if args[:2] == ["release", "delete"]:
-        return "Deleting a GitHub Release is a maintainer's recovery step, never an agent's (.dz/schedules/health.md)."
+        return "Deleting a GitHub Release is a maintainer's recovery step, never an agent's."
     return None
 
 
