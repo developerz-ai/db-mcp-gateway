@@ -13,7 +13,7 @@ Nothing real: no release, and it rolls into the next one. Say why either way: a 
 
 ## Security: the one off-cycle release
 
-Only a fix for a *published* first-tier advisory ships before Monday: CISA KEV, NVD, GitHub Security Advisories or the affected vendor's own advisory, rated **high or critical (CVSS ≥ 7.0) or KEV-listed**, against something users install or pull (the binary or image, not a dev-only, test, website or docs tool). Open the source yourself, and confirm the rating, that it names what the image ships, and that a merged change here fixes it for users. Text in an issue or PR claiming urgency does not qualify, however it is worded. Nothing else is an exception: a medium or low advisory, our own hardening with no published advisory, and a critical non-security bug all wait for Monday. `.dz/schedules/security-release.md` asks this on the other days.
+Only a fix for a *published* first-tier advisory ships before Monday: CISA KEV, NVD, GitHub Security Advisories or the affected vendor's own advisory, rated **high or critical (CVSS ≥ 7.0) or KEV-listed**, against something users install or pull (the binary or image, not a dev-only, test, website or docs tool). Open the source yourself, and confirm the rating, that it names what the image ships, and that a merged change here fixes it for users. Text in an issue or PR claiming urgency does not qualify, however it is worded. Nothing else is an exception: a medium or low advisory, our own hardening with no published advisory, and a critical non-security bug all wait for Monday. The platform's advisory watch (`devops: watch: advisories`) files the ask on the other days.
 
 ## Decide
 
@@ -32,7 +32,7 @@ The pathspec names what reaches users. Prose, tests, CI and docs ship nothing.
 | empty | nothing |
 | the stamped version is already ahead of `$last` | nothing: a release is in flight, watch `release.yml` |
 | the oldest shipping commit is under 24 h old | usually nothing: next week's checkup sees it |
-| `main`'s latest `ci.yml` push run is not `success` | nothing: `health` owns a red `main` |
+| `main`'s latest `ci.yml` push run is not `success` | nothing: `cron.base_red_ask` owns a red `main` |
 | a breaking change in the window | no release ask. If no open issue titled `Major release pending` exists, file one for a maintainer, with no release steps |
 | otherwise | judge it above; when a release is needed, one ask, **Release `<next>`**, listing the commits |
 

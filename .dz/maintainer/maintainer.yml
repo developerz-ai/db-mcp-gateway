@@ -140,8 +140,8 @@ escalate:
   # of the platform's hardcoded asks (security, license, CLA), which this list cannot remove.
   ask_before_acting: [breaking_change]
 
-# The checkups nothing else triggers. Bot-authored alarm issues never pass intake, so a red `main`
-# or a tag that did not publish reaches the bot only through `health`.
+# The checkups nothing else triggers. A red `main` reaches the agent through the platform's
+# `cron.base_red_ask`, so there is no `health` schedule (census 2026-11-28: 270 firings, 8 asks, 0 merges).
 schedules:
   # Weekly and judged, so a merge never cuts a release (owner, 2026-11-01: "no auto, not dependabot,
   # us developerz.ai AI decides if needed"). One weekday per repo, so the fleet is not hit at once.
@@ -149,20 +149,11 @@ schedules:
     days: [mon]
     hours_utc: [3]
     brief_file: .dz/schedules/release-due.md
-  # The one exception, so a published high/critical advisory fix does not wait up to a week for the
-  # slot above. It only files an ask on the strict criteria in its brief (owner, 2026-11-26).
-  - name: security-release
-    days: [tue, wed, thu, fri, sat, sun]
-    hours_utc: [6]
-    brief_file: .dz/schedules/security-release.md
-  # Weekly (owner, 2026-11-06: routine maintenance weekly, CVE daily). Security has its own lanes.
-  - name: health
-    days: [mon]
-    hours_utc: [7]
-    brief_file: .dz/schedules/health.md
-  # Monthly: fires every Monday and the brief acts only on the first Monday of the month.
+  # First and third Monday of the month (census 2026-11-28: the best scheduled return, 59 firings,
+  # 25 product merges). `weeks_of_month` does the gating; the brief carries no date check.
   - name: improve
     days: [mon]
+    weeks_of_month: [1, 3]
     hours_utc: [8]
     brief_file: .dz/schedules/improve.md
 
@@ -174,14 +165,16 @@ schedules:
 branches:
   close_inactive_after_days: 60
 
-# scout: the platform's daily survey of this repo files only what is already BROKEN
-# (red CI, failing tests, a security advisory, a broken build or link) — never an
-# improvement idea. `full` lets it file ideas too; `off` stops the survey.
+# scout: the platform's survey of this repo files only what is already BROKEN (red CI, failing
+# tests, a security advisory, a broken build or link), never an improvement idea. `off` stops it.
 scout:
   survey: broken_only
 
-# devops: off (owner, 2026-11-26: one PR per advisory was too much noise). Advisories arrive through
-# Dependabot instead, one grouped security PR per ecosystem per run (.github/dependabot.yml);
-# cargo-audit still gates CI.
+# devops: the advisory watch is on (this repo ships to users). It replaces the daily security-release
+# schedule; Dependabot still opens grouped security PRs.
 devops:
-  watch: "off"  # quoted: YAML 1.1 parsers read a bare off as false
+  watch: advisories
+
+# care: docs_drift off (census 2026-11-28: 47 tasks, 8 docs-only merges, 33 failed). flaky_tests keeps its default.
+care:
+  docs_drift: off
